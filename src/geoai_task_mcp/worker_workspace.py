@@ -52,6 +52,14 @@ WORKTREE_ROOT_ENV = "GEOAI_TASK_MCP_WORKTREE_ROOT"
 BWRAP_ENV = "GEOAI_TASK_MCP_BWRAP"
 SANDBOX_BACKEND_ENV = "GEOAI_TASK_MCP_SANDBOX_BACKEND"
 SANDBOX_WORKSPACE = "/workspace"
+# B834: the coordinator-owned host repository (``workspace.repo``) bound
+# read-only for worker MCP authority lookups (Source Graph / Session Manager
+# / AI Memory / KB), distinct from the isolated writable worktree above.
+# Under bubblewrap this is the ONLY sandbox-visible alias for that host path
+# -- the real host path itself is absent inside the mount namespace, so any
+# code that embeds a host path string into adapter/MCP config would silently
+# reference a path the sandboxed process cannot see.
+SANDBOX_AUTHORITY_REPO = "/authority-repo"
 MAX_SEED_FILES = 20_000
 MAX_VALIDATION_COMMANDS = 32
 MAX_VALIDATION_SECONDS = 1_800
@@ -629,6 +637,70 @@ def provision_isolated_task_queue_db(repo: Path, home: Path) -> Path:
         except Exception:
             pass
     return destination
+
+
+def provision_worker_mcp_runtime(
+    workspace: "WorkerWorkspace",
+    *,
+    request_id: str,
+    task_id: str,
+    runner: str,
+    topic: str,
+    backend: str,
+    source_graph_targets: list[str] | tuple[str, ...],
+    session_topic: str,
+) -> Any:
+    """B834: provision this request's isolated worker MCP config + audit ledger.
+
+    Thin, additive wrapper around ``worker_ai_tools_mcp.generate_worker_mcp_runtime``
+    so ``process_launcher.py`` can provision the per-request MCP surface from
+    the same import block it already uses for workspace helpers. Runs on the
+    HOST side, before the sandboxed adapter process starts, so it may write
+    freely under ``workspace.home``.
+
+    Derives BOTH repository bindings from ``workspace`` itself (the caller no
+    longer passes a bare ``repo`` value) and rewrites them for the sandbox
+    backend that will actually run the worker: under bubblewrap only the
+    bound sandbox aliases (``SANDBOX_WORKSPACE``, ``SANDBOX_AUTHORITY_REPO``)
+    are visible inside the mount namespace, so embedding the real host paths
+    there would silently reference something the sandboxed process cannot
+    read (see ``sandbox_argv``'s bubblewrap branch and
+    ``resolve_validation_pythonpath`` for the same backend-aware pattern).
+    Landlock confines writes only, never reads, so the real host paths are
+    used directly there.
+    """
+
+    if backend not in ("landlock", "bubblewrap"):
+        raise WorkspaceError(f"unsupported_sandbox_backend:{backend}")
+    if not workspace.repo.is_dir():
+        raise WorkspaceError(f"authority_repo_not_directory:{workspace.repo}")
+    if backend == "bubblewrap":
+        worker_repo = Path(SANDBOX_WORKSPACE)
+        authority_repo = Path(SANDBOX_AUTHORITY_REPO)
+    else:
+        worker_repo = workspace.path
+        authority_repo = workspace.repo
+
+    from . import worker_ai_tools_mcp
+
+    try:
+        return worker_ai_tools_mcp.generate_worker_mcp_runtime(
+            home=workspace.home,
+            request_id=request_id,
+            task_id=task_id,
+            runner=runner,
+            topic=topic,
+            repo=worker_repo,
+            authority_repo=authority_repo,
+            source_graph_targets=source_graph_targets,
+            session_topic=session_topic,
+        )
+    except worker_ai_tools_mcp.WorkerToolError as exc:
+        # Provisioning/config-injection failure must reject the launch, not
+        # silently degrade to a worker without a working tool surface --
+        # WorkspaceError is already in process_launcher's caught-and-rejected
+        # exception tuple, WorkerToolError is not.
+        raise WorkspaceError(f"worker_mcp_runtime_provisioning_failed:{exc}") from exc
 
 
 def configured_worktree_root() -> Path:
@@ -1307,6 +1379,7 @@ def sandbox_argv(
         *validation_binds,
         "--bind", str(workspace.path), SANDBOX_WORKSPACE,
         "--ro-bind", str(workspace.path / ".git"), f"{SANDBOX_WORKSPACE}/.git",
+        "--ro-bind", str(workspace.repo), SANDBOX_AUTHORITY_REPO,
         "--chdir", SANDBOX_WORKSPACE,
     ]
     node_root = _node_install_root(adapter_argv[0])

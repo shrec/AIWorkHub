@@ -1,0 +1,98 @@
+{
+  "schema_id": "geoai.task_mcp.aiworkinghub_dynamic_worker_mcp_authority_repair_b834_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKINGHUB_DYNAMIC_WORKER_MCP_AUTHORITY_REPAIR_B834_V1",
+  "runner": "claude_sonnet5_aiworkinghub_dynamic_worker_mcp_authority_repair_b834_v1",
+  "topic": "task_mcp",
+  "mode": "candidate_recovery_and_authority_repair",
+  "recovered_from_commit": "742099f332d57cd84109b0f964c1487cac54477d",
+  "recovery_method": "git diff of the shared pre-existing files (agent_tool_instructions.py, process_launcher.py, runtime_adapters.py, worker_workspace.py) between the candidate commit and its parent 1581ca9ce applied cleanly onto byte-identical current worktree copies; worker_ai_tools_mcp.py and the b833 test/eval were new files at the candidate commit and were recovered verbatim via git show, then repaired.",
+  "defects_repaired": [
+    {
+      "id": "single_repo_binding_hid_missing_authority_db",
+      "description": "worker_ai_tools_mcp bound only ENV_REPO (the isolated git worktree) and pointed every AITools/*.py invocation at it; the worktree lacks source_graph.db/session.db/ai_memory.db (gitignored), so transcript_graph.py's connect() silently created an empty sqlite file there and reported it as a successful, if empty, call.",
+      "fix": "Added a second, immutable ENV_AUTHORITY_REPO binding (the coordinator-owned host repository the worktree was created from). Every Source Graph/Session Manager/AI Memory/KB call now runs that repository's OWN copy of the relevant AITools/*.py script (so each script's __file__-relative default database path resolves correctly) and pre-validates the resolved database file exists and is non-empty via storage.json before invoking -- see worker_ai_tools_mcp._resolve_authority_db / AuthorityBinding."
+    },
+    {
+      "id": "query_argument_discarded_when_target_declared",
+      "description": "source_graph_query computed resolved_target = ctx.source_graph_targets[0] if ctx.source_graph_targets else bounded_query, then passed resolved_target (not the caller's query) as the CLI search term whenever any target had been declared for the task -- the caller's actual semantic query was silently replaced by targets[0].",
+      "fix": "The CLI argv now always uses bounded_query (the caller's real search term). target, when supplied, is validated against the declared allowlist and used ONLY to constrain/filter the returned payload to file-path-bearing entries under that prefix (see _filter_by_scope); omitting target no longer touches the query at all."
+    },
+    {
+      "id": "zero_hit_and_cache_hit_calls_satisfied_the_live_call_gate",
+      "description": "verify_audit_ledger incremented live_source_graph_calls for any entry with tool=='source_graph' and ok==true, including cache_hit==true entries and entries with hit_count==0 -- an empty or cached-only result satisfied the code-task completion gate.",
+      "fix": "live_source_graph_calls now requires ok==true AND cache_hit==false AND hit_count>0. Every counted entry's authority_source/authority_state is also collected into a new authority_index_identity field so the ledger records real authority identity, not a bare ok/fail bit."
+    },
+    {
+      "id": "bubblewrap_embedded_a_host_path_absent_inside_the_sandbox",
+      "description": "provision_worker_mcp_runtime always passed the real host workspace.path (and, if authority_repo had simply been added the same way, workspace.repo) into generate_worker_mcp_runtime regardless of sandbox backend; under bubblewrap only /workspace and the bound home are visible inside the mount namespace, so an embedded real host path would be unreadable by the sandboxed MCP server process.",
+      "fix": "provision_worker_mcp_runtime now takes the resolved sandbox backend and rewrites BOTH bindings to the bound sandbox aliases (SANDBOX_WORKSPACE='/workspace', new SANDBOX_AUTHORITY_REPO='/authority-repo') under bubblewrap, and to the real host paths under landlock (which confines writes only, never reads). sandbox_argv's bubblewrap branch adds --ro-bind <workspace.repo> /authority-repo alongside the existing workspace/.git binds."
+    },
+    {
+      "id": "worker_mcp_config_injection_silently_degraded_to_no_tools",
+      "description": "runtime_adapters.inject_worker_mcp_config returned the plan UNCHANGED (by explicit design, per its own docstring) whenever the generated MCP config path failed to resolve to an existing file for an adapter that requires the worker MCP surface -- a provisioning bug would launch a fully tool-less worker rather than rejecting the launch.",
+      "fix": "For claude_cli/deepseek_copilot_cli/glm_copilot_cli, an unresolvable or missing config path now raises ValueError, which process_launcher._launch_isolated's existing (LaunchRejected, ProjectContextError, WorkspaceError, OSError, ValueError) handler catches and turns into a rejected launch via self._blocked(...) -- never a silent no-tools launch."
+    }
+  ],
+  "authority_resolution": {
+    "registry_source": ".aiworkinghub/config/storage.json (read from ctx.authority_repo only, never ctx.repo)",
+    "policy": "until a component's authority.canonical_active is true, its declared legacy_source is used read-only; canonical_durable_path (under durable_root) is used once canonical_active flips true",
+    "components": {
+      "source_graph.source_graph": "AITools/source_graph.db",
+      "sessions.session": "AITools/session.db",
+      "sessions.transcript": "AITools/transcript_graph.db",
+      "memory.memory": "AITools/ai_memory/ai_memory.db",
+      "kb.kb": "AITools/kb.db"
+    },
+    "fail_closed_conditions": [
+      "storage.json registry entry missing for the component",
+      "declared canonical/legacy path missing from the registry entry",
+      "resolved database path does not exist",
+      "resolved database file is empty (size <= 0)",
+      "resolved database path escapes ctx.authority_repo"
+    ],
+    "reported_fields": ["authority_source (legacy|canonical)", "authority_state (raw storage.json authority.state)"]
+  },
+  "sandbox_path_mapping": {
+    "landlock": {
+      "repo_env_value": "real host workspace.path",
+      "authority_repo_env_value": "real host workspace.repo",
+      "note": "Landlock confines writes only (never restricts reads), so both real host paths are directly readable with no additional grant; no write grant was added for authority_repo, preserving read-only access."
+    },
+    "bubblewrap": {
+      "repo_env_value": "SANDBOX_WORKSPACE=/workspace (pre-existing bind)",
+      "authority_repo_env_value": "SANDBOX_AUTHORITY_REPO=/authority-repo (new read-only bind)",
+      "bind_flag": "--ro-bind <workspace.repo> /authority-repo"
+    }
+  },
+  "cache_isolation": {
+    "cache_key_fields": ["tool", "task_id", "request_id", "authority_repo", "mode", "query", "scope", "budget", "bundle_type"],
+    "guarantee": "two distinct (task_id, request_id, authority_repo) contexts never share a cached source_graph result even for an identical query/mode/budget"
+  },
+  "test_file": "tools/geoai-task-mcp/tests/test_aiworkinghub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+  "companion_test_file": "tools/geoai-task-mcp/tests/test_aiworkinghub_dynamic_worker_mcp_b833_v1.py",
+  "read_first": [
+    "AGENTS.md",
+    ".aiworkinghub/config/storage.json",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/agent_tool_instructions.py"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_dynamic_worker_mcp_b833_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkinghub_dynamic_worker_mcp_b833_v1.json",
+    "tools/geoai-task-mcp/eval/aiworkinghub_dynamic_worker_mcp_authority_repair_b834_v1.json"
+  ],
+  "not_modified": [
+    "tools/geoai-task-mcp/eval/aiworkinghub_context_optimization_b829_v1.json",
+    "tools/geoai-task-mcp/eval/aiworkinghub_context_optimization_rows_b829_v1.jsonl"
+  ],
+  "known_limitations": [
+    "The underlying AITools/*.py scripts (kb.py, ai_memory.py, transcript_graph.py, source_graph.py) open their SQLite databases via a plain sqlite3.connect(path), which SQLite opens SQLITE_OPEN_READWRITE by default even for a read-only workload; kb.py additionally issues PRAGMA journal_mode=WAL at connect time. Against a genuinely read-only-bound authority path (no write grant under either sandbox backend, by design), a write-mode-dependent PRAGMA can fail. That failure is NOT papered over: _run_fixed_argv treats any non-zero exit as a WorkerToolError, so the call fails closed (ok=false, a recorded violation) rather than fabricating a result. Modifying those AITools/*.py scripts' connection modes is out of this task's allowed_writes scope; a follow-up task should either move the affected AITools scripts to a read-only-mode sqlite3 URI connection, or confirm the production databases are already left in WAL mode (a journal_mode=WAL no-op requires no write) so this class of call succeeds in practice."
+  ]
+}

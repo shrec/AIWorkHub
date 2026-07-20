@@ -499,6 +499,59 @@ def build_runtime_command(
     )
 
 
+def inject_worker_mcp_config(
+    plan: RuntimeAdapterPlan,
+    worker_mcp_config_path: PathValue,
+) -> RuntimeAdapterPlan:
+    """Return a new plan with the B833 worker MCP config flag appended.
+
+    ``claude_cli`` receives ``--mcp-config <path> --strict-mcp-config``;
+    ``deepseek_copilot_cli``/``glm_copilot_cli`` receive
+    ``--additional-mcp-config <path>``. ``codex_cli`` is unchanged here --
+    Codex instead picks up its worker MCP server from the isolated
+    ``$HOME/.codex/config.toml`` the launcher provisions alongside this
+    config (see ``worker_ai_tools_mcp.generate_worker_mcp_runtime``).
+
+    A non-launchable plan or a manual-only plan is returned UNCHANGED -- it
+    was never going to receive the flag regardless of MCP provisioning.
+
+    For an adapter that DOES require the worker MCP surface (``claude_cli``,
+    ``deepseek_copilot_cli``, ``glm_copilot_cli``), a config path that fails
+    to resolve to an existing, non-symlink file raises ``ValueError`` instead
+    of silently returning the plan unchanged (B834 repair: the B833 candidate
+    degraded to "launch without worker tools" here, which is exactly the
+    silent-degradation failure mode the generated-config-is-mandatory
+    requirement forbids -- a provisioning problem must reject the launch).
+    """
+
+    if not plan.launchable or plan.manual_only:
+        return plan
+    if plan.adapter_id not in {"claude_cli", DEEPSEEK_COPILOT_ADAPTER, GLM_COPILOT_ADAPTER}:
+        return plan
+    try:
+        resolved = Path(worker_mcp_config_path).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"worker_mcp_config_unresolvable:{worker_mcp_config_path}:{exc}") from exc
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError(f"worker_mcp_config_missing_or_not_a_file:{resolved}")
+
+    if plan.adapter_id == "claude_cli":
+        argv = [*plan.argv, "--mcp-config", str(resolved), "--strict-mcp-config"]
+    else:
+        argv = [*plan.argv, "--additional-mcp-config", str(resolved)]
+
+    return RuntimeAdapterPlan(
+        adapter_id=plan.adapter_id,
+        argv=argv,
+        cwd=plan.cwd,
+        executable=plan.executable,
+        launchable=plan.launchable,
+        manual_only=plan.manual_only,
+        validation_ok=plan.validation_ok,
+        validation_reason=plan.validation_reason,
+    )
+
+
 def build_adapter_command(
     adapter_id: str,
     prompt: str,
@@ -539,6 +592,7 @@ __all__ = [
     "RuntimeAdapterPlan",
     "build_adapter_command",
     "build_runtime_command",
+    "inject_worker_mcp_config",
     "resolve_deepseek_model",
     "resolve_executable",
     "resolve_glm_model",

@@ -78,6 +78,23 @@ POLICY = ToolPolicy(
 )
 
 
+# B833: informational cross-reference only. Deliberately NOT part of
+# ``POLICY`` -- adding it there would change ``render_canonical()`` /
+# ``render_projection()`` byte output, which is pinned exactly by
+# ``tools/geoai-task-mcp/eval/aiworkinghub_agent_tool_instruction_activation_
+# b821_v1.json``. Kept here so callers/tests have one canonical place to
+# check the dynamic worker MCP tool names against the policy module without
+# hand-duplicating the list.
+WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
+    "geoai_worker_source_graph_query",
+    "geoai_worker_session_current_state",
+    "geoai_worker_ai_memory_search",
+    "geoai_worker_kb_search",
+    "geoai_worker_kb_get",
+    "geoai_worker_kb_related",
+)
+
+
 def _lines(policy: ToolPolicy = POLICY) -> list[str]:
     return [
         f"# {policy.title}",
@@ -197,6 +214,7 @@ __all__ = [
     "PROJECTION_MAX_BYTES",
     "PROVIDERS",
     "START",
+    "WORKER_MCP_TOOL_NAMES",
     "ToolPolicy",
     "build_apply_plan",
     "diff_projection",

@@ -44,6 +44,7 @@ except ImportError:
 
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
+from . import worker_ai_tools_mcp
 try:
     from . import deepseek_credentials
 except ImportError:  # optional host-only credential helper in some worktrees
@@ -59,6 +60,7 @@ from .worker_workspace import (
     create_workspace,
     enforce_scope,
     promote,
+    provision_worker_mcp_runtime,
     run_validations,
     sandbox_argv,
     select_sandbox_backend,
@@ -831,6 +833,86 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
         )
 
 
+def _worker_mcp_bundle_payload(
+    context_result: project_context.ProjectContextResult | None,
+) -> dict[str, Any]:
+    """Best-effort parse of the same bundle JSON already sent to the worker.
+
+    Never raises: a malformed/absent bundle degrades to an empty dict, which
+    the two helpers below turn into safe defaults (no target allowlist, the
+    task's own topic for Session Manager).
+    """
+    if context_result is None or not context_result.prompt_bundle.strip():
+        return {}
+    try:
+        return json.loads(context_result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+    except (IndexError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _worker_mcp_source_graph_targets(
+    context_result: project_context.ProjectContextResult | None,
+) -> list[str]:
+    payload = _worker_mcp_bundle_payload(context_result)
+    targets = (payload.get("source_graph") or {}).get("targets")
+    return [str(t) for t in targets] if isinstance(targets, list) else []
+
+
+def _worker_mcp_session_topic(
+    context_result: project_context.ProjectContextResult | None,
+    fallback_topic: str,
+) -> str:
+    payload = _worker_mcp_bundle_payload(context_result)
+    topic = (payload.get("session") or {}).get("topic")
+    return str(topic) if isinstance(topic, str) and topic.strip() else fallback_topic
+
+
+def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
+    """Bounded, redacted B833 completion-gate summary.
+
+    Gated only for ``task_context_policy.task_type == "code"`` (a
+    ``project_context`` contract must be present to reach that value at all).
+    Data-classification and research tasks -- and any task without a
+    ``project_context`` contract -- are exempt and never blocked here; they
+    keep whatever policy already applied to them (e.g. the immutable input
+    shard for data tasks). Fails CLOSED on a gated task: a missing worker_mcp
+    runtime record, an unreadable ledger, or zero verified live
+    ``source_graph`` calls all resolve to ``satisfied: False``. A tampered or
+    forged ledger line is dropped by ``verify_audit_ledger`` before it ever
+    reaches this count, so a worker cannot satisfy the gate by writing text
+    that merely looks like an audit entry.
+    """
+    task_type = str(
+        ((metadata.get("project_context") or {}).get("task_context_policy") or {}).get("task_type") or ""
+    )
+    worker_mcp_meta = metadata.get("worker_mcp") or {}
+    gated = task_type == "code"
+    result: dict[str, Any] = {"gated": gated, "task_type": task_type, "satisfied": True, "reason": ""}
+    if not gated:
+        return result
+    ledger_path = worker_mcp_meta.get("audit_ledger_path")
+    key_path = worker_mcp_meta.get("audit_hmac_key_path")
+    if not ledger_path or not key_path:
+        result["satisfied"] = False
+        result["reason"] = "worker_mcp_runtime_not_provisioned"
+        return result
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        Path(str(ledger_path)),
+        Path(str(key_path)),
+        task_id=str(metadata["task_id"]),
+        runner=str(metadata["runner"]),
+        topic=str(metadata["topic"]),
+        request_id=request_id,
+    )
+    # Bounded/redacted by construction: verify_audit_ledger never returns raw
+    # paths, prompts, or database contents -- only counts and a short reason.
+    result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
+    if not verification.get("ok") or verification.get("live_source_graph_calls", 0) <= 0:
+        result["satisfied"] = False
+        result["reason"] = verification.get("reason") or "no_live_source_graph_mcp_call_recorded"
+    return result
+
+
 def build_worker_prompt(
     *,
     task_id: str,
@@ -1226,6 +1308,16 @@ class ProcessManager:
                 })
 
                 workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                worker_mcp_runtime = provision_worker_mcp_runtime(
+                    workspace,
+                    request_id=request_id,
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                    backend=sandbox_backend,
+                    source_graph_targets=_worker_mcp_source_graph_targets(context_result),
+                    session_topic=_worker_mcp_session_topic(context_result, topic),
+                )
                 prompt = build_worker_prompt(
                     task_id=task_id,
                     runner=runner,
@@ -1247,6 +1339,14 @@ class ProcessManager:
                 if not getattr(plan, "launchable", False):
                     reason = getattr(plan, "reason", "adapter_not_launchable")
                     raise LaunchRejected(reason or "adapter_not_launchable")
+                if isinstance(plan, runtime_adapters.RuntimeAdapterPlan):
+                    worker_mcp_config_path = {
+                        "claude_cli": worker_mcp_runtime.claude_mcp_config_path,
+                        runtime_adapters.DEEPSEEK_COPILOT_ADAPTER: worker_mcp_runtime.copilot_mcp_config_path,
+                        runtime_adapters.GLM_COPILOT_ADAPTER: worker_mcp_runtime.copilot_mcp_config_path,
+                    }.get(adapter_id)
+                    if worker_mcp_config_path is not None:
+                        plan = runtime_adapters.inject_worker_mcp_config(plan, worker_mcp_config_path)
                 worker_argv = sandbox_argv(
                     workspace,
                     adapter_id,
@@ -1284,6 +1384,16 @@ class ProcessManager:
                         context_result.metadata if context_result is not None else None
                     ),
                     "project_context_delivery": context_delivery,
+                    "worker_mcp": {
+                        "schema_id": worker_ai_tools_mcp.RUNTIME_SCHEMA_ID,
+                        "server_name": worker_mcp_runtime.server_name,
+                        "tool_names": list(worker_mcp_runtime.tool_names),
+                        "audit_ledger_path": str(worker_mcp_runtime.audit_ledger_path),
+                        "audit_hmac_key_path": str(worker_mcp_runtime.audit_hmac_key_path),
+                        "claude_mcp_config_path": str(worker_mcp_runtime.claude_mcp_config_path),
+                        "copilot_mcp_config_path": str(worker_mcp_runtime.copilot_mcp_config_path),
+                        "codex_config_toml_path": str(worker_mcp_runtime.codex_config_toml_path),
+                    },
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
                     "required_outputs": list(card.get("required_outputs") or []),
@@ -2133,6 +2243,7 @@ class ProcessManager:
             required_output_records: list[dict[str, Any]] = []
             review_result: dict[str, Any] | None = None
             release_result: dict[str, Any] | None = None
+            worker_mcp_gate: dict[str, Any] | None = None
             cleanup = True
             try:
                 if terminal_state != "exited":
@@ -2172,6 +2283,12 @@ class ProcessManager:
                                 metadata.get("allow_unchanged_required_outputs") or []
                             ),
                         )
+                        worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
+                        if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
+                            raise WorkspaceError(
+                                "validation_live_source_graph_mcp_call_missing:"
+                                + str(worker_mcp_gate.get("reason") or "")
+                            )
                         validations = run_validations(
                             workspace, metadata.get("validation") or []
                         )
@@ -2324,6 +2441,7 @@ class ProcessManager:
                 "project_context": metadata.get("project_context"),
                 "project_context_delivery": metadata.get("project_context_delivery"),
                 "project_context_acknowledgement": context_ack,
+                "worker_mcp_gate": worker_mcp_gate,
             })
             if cleanup:
                 try:

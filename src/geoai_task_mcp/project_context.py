@@ -282,7 +282,10 @@ def _canonical_json_output(
         raise ProjectContextError(f"context_tool_malformed_json:{name}:{exc.msg}") from exc
     if not isinstance(payload, dict):
         raise ProjectContextError(f"context_tool_malformed_json:{name}:object_required")
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    # Compact separators here (no space padding) keep the canonicalized tool
+    # payload dense; it is still embedded once as a JSON-text string value in
+    # the outer bundle, so shaving inner whitespace is pure savings.
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     encoded = canonical.encode("utf-8")
     if len(encoded) <= max_bytes:
         return canonical, False
@@ -294,14 +297,16 @@ def _canonical_json_output(
         "original_hit_count": _json_hit_count(payload),
         "preview": "",
     }
-    overhead = len(json.dumps(wrapper, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+    overhead = len(
+        json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
     wrapper["preview"] = encoded[: max(0, max_bytes - overhead - 8)].decode(
         "utf-8", errors="ignore"
     )
-    bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True)
+    bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     while len(bounded.encode("utf-8")) > max_bytes and wrapper["preview"]:
         wrapper["preview"] = wrapper["preview"][:-64]
-        bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True)
+        bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return bounded, True
 
 
@@ -655,39 +660,53 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     raw_sections = sections
     sections = _suppress_irrelevant_sections(raw_sections)
 
-    prompt_payload = {
-        "schema_id": SCHEMA_ID,
-        "required": required,
-        "task_context_policy": {
-            "task_type": contract["task_type"],
-            "source_graph_required": contract["source_graph"]["required"],
+    # Progressive-disclosure bootstrap packet: a compact schema marker, only
+    # the task-context policy the model cannot already read off
+    # WORKER_CONTRACT_JSON (primary_context steer + the immutable input shard,
+    # which is not otherwise echoed into the contract), and non-empty
+    # evidence. Query/budget/targets/session-topic/caps/hashes are already in
+    # the card or metadata, so they are not repeated here.
+    prompt_payload: dict[str, Any] = {"schema_id": SCHEMA_ID}
+    if contract["task_type"] != "code" or contract.get("input_shard"):
+        policy: dict[str, Any] = {
             "primary_context": (
                 "immutable_input_shard"
                 if contract["task_type"] == "data_classification"
                 else "source_graph"
             ),
-            "immutable_input_shard": contract.get("input_shard") or "",
-        },
-        "source_graph": {
-            "mode": contract["source_graph"]["mode"],
-            "query": contract["source_graph"]["query"],
-            "budget": contract["source_graph"]["budget"],
-            "targets": contract["source_graph"]["targets"],
-            "targets_origin": contract["source_graph"]["targets_origin"],
-        },
-        "session": contract["session"],
-        "sections": [
-            {
-                key: value
-                for key, value in section.items()
-                if key not in {"tool", "bytes", "sha256"}
-            }
-            for section in sections
-        ],
-    }
+        }
+        if contract.get("input_shard"):
+            policy["immutable_input_shard"] = contract["input_shard"]
+        prompt_payload["task_context_policy"] = policy
+    prompt_payload["source_graph"] = {"mode": contract["source_graph"]["mode"]}
+
+    prompt_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if section.get("content_suppressed") or not str(section.get("content") or "").strip():
+            # Zero-hit optional tools and empty/degraded evidence carry no
+            # bootstrap value; their facts still live in metadata below.
+            continue
+        entry: dict[str, Any] = {
+            "name": section["name"],
+            "hit_count": section["hit_count"],
+            "content": section["content"],
+        }
+        if section["name"] == "source_graph" and section.get("target"):
+            entry["target"] = section["target"]
+        if section.get("truncated"):
+            entry["truncated"] = True
+        if section.get("degraded_reason"):
+            entry["degraded_reason"] = section["degraded_reason"]
+        if not section.get("requested", True):
+            entry["requested"] = False
+        if not section.get("executed", True):
+            entry["executed"] = False
+        prompt_sections.append(entry)
+    prompt_payload["sections"] = prompt_sections
+
     bundle = (
         "PROJECT_CONTEXT_BUNDLE:\n"
-        + json.dumps(prompt_payload, ensure_ascii=False, indent=2, sort_keys=True)
+        + json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
     )
     encoded = bundle.encode("utf-8")
     if len(encoded) > MAX_BUNDLE_BYTES:
