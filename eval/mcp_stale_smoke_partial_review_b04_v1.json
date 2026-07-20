@@ -1,0 +1,97 @@
+{
+  "schema_id": "geoai.mcp_stale_smoke_partial_review.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_PARTIAL_REVIEW_B04_V1",
+  "reviewed_at": "2026-07-08T14:00:00.000000+00:00",
+  "source_audit": "DEEPSEEK_TASK_MCP_STALE_RECOVERY_REVIEW_B03_V1",
+  "target_task": "DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1",
+  "mode": "partial_processing_artifact_review_no_status_mutation",
+  "verdict": "RECOVER",
+  "verdict_detail": {
+    "recommendation": "safe_recover_stale",
+    "reason": "All 3 present files predate task (pre-B119 test scripts with different B-numbers). B119 never produced its 2 eval/data output files. Test assertions are stale (live server has 20 tools, tests assert 15 or 11).",
+    "force_required": false,
+    "human_review_required": false
+  },
+  "artifact_analysis": {
+    "present_files": [
+      {
+        "path": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+        "mtime": "2026-07-04T14:46:31+00:00",
+        "relationship_to_b119": "predates_task_input",
+        "reason": "B-number B109 != B119, mtime before B119 claimed_at 2026-07-05T18:30:46",
+        "is_b119_output": false
+      },
+      {
+        "path": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+        "mtime": "2026-07-04T21:29:03+00:00",
+        "relationship_to_b119": "predates_task_input",
+        "reason": "B-number B110 != B119, mtime before B119 claimed_at",
+        "is_b119_output": false
+      },
+      {
+        "path": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+        "mtime": "2026-07-04T09:06:18+00:00",
+        "relationship_to_b119": "predates_task_input",
+        "reason": "B-number mvp_contract_audit_v1 != B119, mtime before B119 claimed_at",
+        "is_b119_output": false
+      }
+    ],
+    "missing_files": [
+      {
+        "path": "tools/geoai-task-mcp/eval/mcp_stale_smoke_inventory_refresh_b119_v1.json",
+        "status": "confirmed_missing"
+      },
+      {
+        "path": "tools/geoai-task-mcp/data/tasking/mcp_stale_smoke_inventory_refresh_next_wave_b119_v1.json",
+        "status": "confirmed_missing"
+      }
+    ],
+    "git_provenance": {
+      "repo_tracking": "tools/geoai-task-mcp/ is NOT tracked in main GeoAI git repo (has own .git). Present test files not in main repo git history.",
+      "note": "All three present files have mtimes before B119 claim time. B119 did not modify them."
+    }
+  },
+  "smoke_test_results": {
+    "b109_stdio_subprocess_client_smoke": {
+      "exit_code": 1,
+      "verdict": "FAIL",
+      "failure_point": "total_tools_visible == 15 assertion",
+      "live_value": 20,
+      "expected_value": 15,
+      "note": "Smoke script itself passes (frozen_contract_v1=true), but stale hardcoded count in test wrapper fails. 9 new tools since B108/B109 baseline."
+    },
+    "b110_stdio_concurrent_client_smoke": {
+      "exit_code": 1,
+      "verdict": "FAIL",
+      "failure_point": "total_tools_visible == 15 assertion",
+      "live_value": 20,
+      "expected_value": 15,
+      "note": "Same stale count as B109. Smoke script itself passes (concurrent_contract_v1=true)."
+    },
+    "mvp_contract_audit": {
+      "exit_code": 1,
+      "verdict": "FAIL",
+      "failure_point": "live vs audit tool-name mismatch",
+      "live_tool_count": 20,
+      "audited_tool_count": 11,
+      "note": "Audit only knows 11 tools; live server registers 20. 9 tools missing from audit artifact."
+    }
+  },
+  "new_tools_since_baseline": [
+    "geoai_cli_adapter_audit_summary_readonly",
+    "geoai_cli_adapter_plan_readonly",
+    "geoai_cli_adapter_report_readonly",
+    "geoai_supervisor_loop_status",
+    "geoai_task_auto_pickup_dryrun",
+    "geoai_task_codex_handoff",
+    "geoai_task_codex_handoff_markdown",
+    "geoai_task_review_summarize"
+  ],
+  "summary": {
+    "b119_never_completed": true,
+    "present_files_are_inputs_not_outputs": true,
+    "all_tests_fail_stale_inventory": true,
+    "safe_for_recover_stale": true,
+    "blockers_for_recovery": []
+  }
+}

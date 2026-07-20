@@ -1,0 +1,14 @@
+{
+  "schema_id": "geoai.task_mcp.card_authority_output_policy.final_coordinator_review.b614.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_CARD_AUTHORITY_OUTPUT_POLICY_B614_V1",
+  "reviewed_by": "codex",
+  "coordinator_verdict": "REJECT_CANDIDATE_RETAIN_FAILED_SUBSET_FOR_B616",
+  "accepted_code_paths": 0,
+  "reason": "The retained candidate was produced against a stale isolated baseline. Its full pytest collection fails because project_context is absent, and its card-scoped smoke reaches a NameError before any new B614 assertions execute. Whole-file promotion would overwrite newer canonical Task MCP code.",
+  "preserved_findings": [
+    "exact card-scoped claim-start/review/usage authority remains a valid desired repair",
+    "explicit allow_unchanged_required_outputs with at least one changed output remains a valid desired repair"
+  ],
+  "next_task": "CLAUDE_SONNET5_TASK_MCP_CARD_AUTHORITY_OUTPUT_POLICY_REPAIR_B616_V1",
+  "rollback": "No B614 worker code was promoted."
+}

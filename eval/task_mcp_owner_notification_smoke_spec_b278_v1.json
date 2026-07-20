@@ -1,0 +1,295 @@
+{
+  "eval_id": "task_mcp_owner_notification_smoke_spec_b278_v1",
+  "task_id": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_SPEC_B278_V1",
+  "runner": "claude_task_mcp_notify_smoke_b278",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "owner_notification_smoke_spec_no_launch",
+  "verdict": "PASS",
+  "no_external_paid_model_launched": true,
+  "no_subprocess_model_launch": true,
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local spec turning the already-read B277 event taxonomy + envelope schema into fixture-driven smoke scenarios. No new external MCP-SDK/API/library question is open; server.py's existing FastMCP tool surface is only read, never modified."
+  },
+  "builds_on": [
+    "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (task_mcp_owner_notification_loop_spec_b277_v1.json -- 5-kind event taxonomy: completion, failure, stale, usage, duplicate_runner; envelope schema; caller-owned delta-cursor design; honest pull-not-push framing)",
+    "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (task_mcp_autolaunch_dryrun_spec_b276_v1.json -- 4-gate safety model, dryrun-only launch templates, LAUNCH_IMPLEMENTED=false invariant reused here to justify 'no subprocess model launch')",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (current tool surface: geoai_completion_inbox returns exactly 4 facets -- review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts; no error/exception facet exists today, confirmed by direct reading of the tool's docstring; unmodified by this task)"
+  ],
+  "summary": "This is a SPEC-ONLY smoke-test artifact (no code changes to server.py, completion_inbox.py, or any _.py module; no subprocess launches a model CLI; no live SQLite write). It turns B277's 5-kind event taxonomy into 6 fixture-driven smoke scenarios (completion, blocked, duplicate-runner, stale, usage, error) plus 2 edge cases (no-pending-task, tool_error-vs-failure disambiguation), each with an exact synthetic fixture, the expected classified event_kind, the exact envelope+payload the classifier should produce, and a deterministic owner-facing one-line summary template. Every scenario is a pure in-memory dict fed to the ALREADY-DEFINED B277 classification rule (lifecycle_state / validation_status / stale threshold / usage-record presence / collision_guard output) -- no new tool is registered, no live queue row is read or written, and no claude/codex/deepseek process is spawned anywhere in this spec.",
+  "protocol_sections": {
+    "section_0_scope_and_label_mapping": {
+      "title": "Scope + honesty note on card-wording vs B277 canonical enum",
+      "canonical_event_kind_enum_unchanged": "completion | failure | stale | usage | duplicate_runner (B277 section_2 envelope_schema.event_kind -- NOT modified by this task)",
+      "card_wording_to_canonical_mapping": {
+        "completion": "completion (unchanged)",
+        "blocked": "failure -- this task card's word 'blocked' is an OWNER-FACING DISPLAY LABEL for B277's canonical 'failure' event_kind (trigger_condition: validation_status==FAIL or blocker_reason non-null, i.e. the task IS blocked). It is NOT a new enum value; no envelope.event_kind ever contains the literal string 'blocked'.",
+        "duplicate-runner": "duplicate_runner (unchanged)",
+        "stale": "stale (unchanged)",
+        "usage": "usage (unchanged)",
+        "error": "tool_error -- a NEW smoke-test-only category, distinct from 'failure'. See section_2. Not added to the B277 envelope enum; exists only as a smoke-test assertion about how the (still unimplemented) delta tool must degrade when its READ SOURCE errors, not when a task's own validation fails."
+      },
+      "no_new_mcp_tool_registered": true,
+      "server_py_modified": false,
+      "no_overclaim_note": "This spec does not implement geoai_completion_inbox_delta (still proposed-only per B277 section_2b) and does not add a 6th value to the event_kind enum in any executable code. 'error' is a smoke-test scenario category only, describing a required degrade-gracefully behavior for a FUTURE implementation task."
+    },
+    "section_1_smoke_scenarios": {
+      "title": "6 fixture-driven smoke scenarios, no live queue mutation, no model launch",
+      "fixture_method": "Each scenario supplies a synthetic in-memory task-card dict shaped like a taskctl JSONL row (or, for tool_error, a synthetic subprocess/JSON failure condition) and states the expected output of the ALREADY-DEFINED B277 classification rule. 'Smoke test' means: exercise every event_kind branch plus the disambiguating edge cases with a minimal, fast, deterministic fixture set -- not a live launch, not a load/stress test, not a real subprocess call.",
+      "scenarios": {
+        "scenario_completion": {
+          "fixture": {
+            "task_id": "FIXTURE_TASK_COMPLETION_01",
+            "lifecycle_state": "review",
+            "runner": "fixture_runner_a",
+            "topic": "task_mcp",
+            "priority": "high",
+            "objective": "fixture objective text",
+            "allowed_writes": ["fixture/path/a.json"],
+            "updated_at": "2026-07-08T10:00:00+00:00",
+            "review_at": "2026-07-08T10:05:00+00:00",
+            "validation_status": "PASS"
+          },
+          "source_facet": "completion_inbox.review_queue",
+          "expected_event_kind": "completion",
+          "expected_payload": {
+            "task_id": "FIXTURE_TASK_COMPLETION_01",
+            "runner": "fixture_runner_a",
+            "claimed_by": "fixture_runner_a",
+            "topic": "task_mcp",
+            "priority": "high",
+            "objective": "fixture objective text",
+            "allowed_writes": ["fixture/path/a.json"],
+            "updated_at": "2026-07-08T10:00:00+00:00",
+            "review_at": "2026-07-08T10:05:00+00:00",
+            "validation_status": "PASS",
+            "runner_task_batch_mismatch": false
+          },
+          "owner_facing_summary_template": "Task {task_id} (runner {runner}) is ready for your review; validation {validation_status}.",
+          "owner_facing_summary_rendered": "Task FIXTURE_TASK_COMPLETION_01 (runner fixture_runner_a) is ready for your review; validation PASS."
+        },
+        "scenario_blocked": {
+          "fixture": {
+            "task_id": "FIXTURE_TASK_BLOCKED_02",
+            "lifecycle_state": "processing",
+            "runner": "fixture_runner_b",
+            "topic": "task_mcp",
+            "validation_status": "FAIL",
+            "validation_error": "shell test exited 1",
+            "blocker_reason": "owner_delivery_channel_undecided",
+            "last_recorded_at": "2026-07-08T09:00:00+00:00"
+          },
+          "source_facet": "completion_inbox.latest_validation_facts",
+          "expected_event_kind": "failure",
+          "expected_payload": {
+            "task_id": "FIXTURE_TASK_BLOCKED_02",
+            "runner": "fixture_runner_b",
+            "topic": "task_mcp",
+            "validation_status": "FAIL",
+            "validation_error": "shell test exited 1",
+            "blocker_reason": "owner_delivery_channel_undecided",
+            "last_recorded_at": "2026-07-08T09:00:00+00:00"
+          },
+          "owner_facing_summary_template": "Task {task_id} (runner {runner}) is BLOCKED: {blocker_reason}; last validation {validation_status}.",
+          "owner_facing_summary_rendered": "Task FIXTURE_TASK_BLOCKED_02 (runner fixture_runner_b) is BLOCKED: owner_delivery_channel_undecided; last validation FAIL."
+        },
+        "scenario_duplicate_runner": {
+          "fixture": {
+            "task_id": "FIXTURE_TASK_DUP_03",
+            "conflicting_runner_a": "fixture_runner_c1",
+            "conflicting_runner_b": "fixture_runner_c2",
+            "task_id_batch_token": "278",
+            "runner_batch_token_a": "277",
+            "runner_batch_token_b": "278",
+            "mismatch_type": "batch_token_mismatch"
+          },
+          "source_facet": "core.collision_guard + completion_inbox.runner_mismatch_warnings",
+          "expected_event_kind": "duplicate_runner",
+          "expected_payload": {
+            "task_id": "FIXTURE_TASK_DUP_03",
+            "conflicting_runner_a": "fixture_runner_c1",
+            "conflicting_runner_b": "fixture_runner_c2",
+            "task_id_batch_token": "278",
+            "runner_batch_token_a": "277",
+            "runner_batch_token_b": "278",
+            "mismatch_type": "batch_token_mismatch"
+          },
+          "owner_facing_summary_template": "Task {task_id} has a runner conflict ({mismatch_type}): {conflicting_runner_a} (batch {runner_batch_token_a}) vs {conflicting_runner_b} (batch {runner_batch_token_b}); task batch is {task_id_batch_token}.",
+          "owner_facing_summary_rendered": "Task FIXTURE_TASK_DUP_03 has a runner conflict (batch_token_mismatch): fixture_runner_c1 (batch 277) vs fixture_runner_c2 (batch 278); task batch is 278."
+        },
+        "scenario_stale": {
+          "fixture": {
+            "task_id": "FIXTURE_TASK_STALE_04",
+            "lifecycle_state": "processing",
+            "runner": "fixture_runner_d",
+            "topic": "task_mcp",
+            "claimed_at": "2026-07-06T10:00:00+00:00",
+            "last_activity_at": "2026-07-06T10:00:00+00:00",
+            "stale_processing_hours_threshold": 24.0
+          },
+          "source_facet": "completion_inbox.stale_processing",
+          "expected_event_kind": "stale",
+          "expected_payload": {
+            "task_id": "FIXTURE_TASK_STALE_04",
+            "runner": "fixture_runner_d",
+            "topic": "task_mcp",
+            "claimed_at": "2026-07-06T10:00:00+00:00",
+            "last_activity_at": "2026-07-06T10:00:00+00:00",
+            "hours_since_activity": 54.0,
+            "stale_processing_hours_threshold": 24.0
+          },
+          "owner_facing_summary_template": "Task {task_id} (runner {runner}) has been claimed for {hours_since_activity}h with no activity, exceeding the {stale_processing_hours_threshold}h threshold.",
+          "owner_facing_summary_rendered": "Task FIXTURE_TASK_STALE_04 (runner fixture_runner_d) has been claimed for 54.0h with no activity, exceeding the 24.0h threshold."
+        },
+        "scenario_usage": {
+          "fixture": {
+            "task_id": "FIXTURE_TASK_USAGE_05",
+            "runner": "fixture_runner_e",
+            "topic": "task_mcp",
+            "model": "claude-sonnet-5",
+            "usage_input_tokens": 12000,
+            "usage_output_tokens": 800,
+            "cost_usd": 0.21
+          },
+          "source_facet": "core.usage_report",
+          "expected_event_kind": "usage",
+          "expected_payload": {
+            "task_id": "FIXTURE_TASK_USAGE_05",
+            "runner": "fixture_runner_e",
+            "topic": "task_mcp",
+            "model": "claude-sonnet-5",
+            "usage_input_tokens": 12000,
+            "usage_output_tokens": 800,
+            "cost_usd": 0.21
+          },
+          "owner_facing_summary_template": "Task {task_id} (runner {runner}, model {model}) recorded usage: {usage_input_tokens} in / {usage_output_tokens} out tokens, ~${cost_usd}.",
+          "owner_facing_summary_rendered": "Task FIXTURE_TASK_USAGE_05 (runner fixture_runner_e, model claude-sonnet-5) recorded usage: 12000 in / 800 out tokens, ~$0.21."
+        },
+        "scenario_tool_error": {
+          "fixture_condition": {
+            "simulated_failure": "taskctl subprocess (list/show) exits non-zero, OR its stdout is not valid JSON, OR task_queue_v1.sqlite is temporarily locked/unreadable",
+            "example_stderr": "sqlite3.OperationalError: database is locked",
+            "example_exit_code": 1
+          },
+          "source_facet": "none -- the read source itself failed before any facet (review_queue/stale_processing/runner_mismatch_warnings/latest_validation_facts/usage_report/collision_guard) could be produced",
+          "expected_event_kind": "tool_error (NOT part of the B277 envelope enum; see section_0)",
+          "expected_behavior": "The (future, still-unimplemented) delta tool MUST catch the subprocess/JSON/sqlite exception, return a bounded error result (never raise past the MCP boundary, never crash the server process, never retry-loop indefinitely), and MUST NOT synthesize a false completion/failure/stale/usage/duplicate_runner event from partial or corrupt data.",
+          "expected_payload": {
+            "task_id": null,
+            "runner": null,
+            "topic": null,
+            "error_kind": "read_source_failure",
+            "error_message": "sqlite3.OperationalError: database is locked",
+            "source_attempted": "taskctl.py list/show subprocess"
+          },
+          "owner_facing_summary_template": "The task-notification read source failed ({error_kind}): {error_message}. No task event could be classified this cycle; retry next loop iteration.",
+          "owner_facing_summary_rendered": "The task-notification read source failed (read_source_failure): sqlite3.OperationalError: database is locked. No task event could be classified this cycle; retry next loop iteration.",
+          "distinct_from_failure_note": "This is explicitly NOT the 'failure'/'blocked' event_kind: 'failure' means a WORKER's task validation failed (a row with real data exists, its validation_status is FAIL). 'tool_error' means no row could be read at all -- the classification pipeline itself broke, so the owner is told about a plumbing problem, not a task problem."
+        }
+      }
+    },
+    "section_2_tool_error_definition": {
+      "title": "Why 'error' needed a 6th category instead of folding into 'failure'",
+      "rationale": "Folding a read-source crash into 'failure' would make a task_id show up with validation_status=FAIL when the real problem is that taskctl/sqlite could not be read at all -- an owner acting on that event would investigate the WRONG task's validation instead of the plumbing. Keeping tool_error separate (task_id=null, no source_facet) makes the distinction visible in the payload shape itself, not just in prose.",
+      "not_implemented_anywhere": "No server.py tool, no completion_inbox.py facet, and no exception-handling code exists for this today. All four completion_inbox facets in the current codebase (review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts) let taskctl subprocess/JSON errors propagate uncaught; this is recorded as an open gap and next-wave item, not fixed by this spec."
+    },
+    "section_3_edge_cases": {
+      "no_pending_task": {
+        "title": "Empty-queue edge case (acceptance requirement)",
+        "fixture": {
+          "review_queue": [],
+          "stale_processing": [],
+          "runner_mismatch_warnings": [],
+          "latest_validation_facts": [],
+          "usage_records": [],
+          "collision_guard_conflicts": []
+        },
+        "expected_behavior": "Zero events emitted. The (future) geoai_completion_inbox_delta call returns {events: [], next_cursor: <unchanged-or-advanced-per-B277-section_2b>, counts: {by_kind: {}}, truncated: false, authority_flags: {...all false...}}. This is NOT an error condition and must NOT be classified as tool_error -- an empty queue is a valid, successfully-read state with no notifications to raise.",
+        "owner_facing_summary_rendered": "No pending task-notification events for this topic/cursor."
+      },
+      "duplicate_runner_conflict_detail": {
+        "cross_reference": "see section_1_smoke_scenarios.scenario_duplicate_runner for the full fixture+payload; this edge case entry only re-confirms the acceptance requirement that duplicate-runner is a covered scenario, not a second design."
+      }
+    },
+    "section_4_owner_facing_summary_index": {
+      "title": "One deterministic summary template per scenario (all 6 + no_pending_task)",
+      "templates": {
+        "completion": "Task {task_id} (runner {runner}) is ready for your review; validation {validation_status}.",
+        "blocked_failure": "Task {task_id} (runner {runner}) is BLOCKED: {blocker_reason}; last validation {validation_status}.",
+        "duplicate_runner": "Task {task_id} has a runner conflict ({mismatch_type}): {conflicting_runner_a} (batch {runner_batch_token_a}) vs {conflicting_runner_b} (batch {runner_batch_token_b}); task batch is {task_id_batch_token}.",
+        "stale": "Task {task_id} (runner {runner}) has been claimed for {hours_since_activity}h with no activity, exceeding the {stale_processing_hours_threshold}h threshold.",
+        "usage": "Task {task_id} (runner {runner}, model {model}) recorded usage: {usage_input_tokens} in / {usage_output_tokens} out tokens, ~${cost_usd}.",
+        "tool_error": "The task-notification read source failed ({error_kind}): {error_message}. No task event could be classified this cycle; retry next loop iteration.",
+        "no_pending_task": "No pending task-notification events for this topic/cursor."
+      },
+      "rendering_rule": "Plain Python str.format() over the exact payload field names in section_1 -- no external templating library, no LLM-generated summary text, deterministic and reproducible byte-for-byte given the same payload."
+    },
+    "section_5_authority_flags": {
+      "title": "Authority Flags (ALL FALSE, same shape as B277 section_4 plus no new flags)",
+      "flags": {
+        "runtime_authority": false,
+        "default_authority": false,
+        "support_authority": false,
+        "model_weight_write": false,
+        "score_apply": false,
+        "canonical_lexicon_mutation": false,
+        "atlas_bank_mutation": false,
+        "queue_write_apply": false,
+        "audit_write_apply": false,
+        "agent_or_process_launch_apply": false,
+        "notification_push_authority": false,
+        "cursor_persistence_write_apply": false,
+        "owner_delivery_channel_apply": false,
+        "training_launch": false
+      }
+    }
+  },
+  "gates": {
+    "spec_only_no_server_py_modification": true,
+    "spec_only_no_new_tool_registered": true,
+    "no_subprocess_model_launch_anywhere": true,
+    "six_smoke_scenarios_defined_completion_blocked_duplicate_runner_stale_usage_error": true,
+    "each_scenario_has_fixture_expected_event_kind_expected_payload_owner_summary": true,
+    "no_pending_task_edge_case_defined": true,
+    "duplicate_runner_edge_case_defined": true,
+    "tool_error_distinguished_from_failure_with_rationale": true,
+    "canonical_b277_enum_not_silently_changed": true,
+    "authority_flags_all_false": true,
+    "artifact_under_25mb": true,
+    "next_wave_blockers_explicit_no_overclaim": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "queue_write_apply": false,
+    "audit_write_apply": false,
+    "agent_or_process_launch_apply": false,
+    "notification_push_authority": false,
+    "cursor_persistence_write_apply": false,
+    "owner_delivery_channel_apply": false,
+    "training_launch": false
+  },
+  "neural_bridge_note": "This spec introduces no learned decision authority and no regex/keyword cue router: every scenario's event_kind is a fixed 1:1 mapping from an already-recorded fixture field state (mirroring the B277 deterministic mapping) to one of 6 taxonomy labels -- a deterministic support-boundary/evidence-extraction mapping used only to validate a future read-only tool's classification correctness, not a routing or intelligence decision. Owner-facing summary rendering (section_4) is plain str.format(), explicitly not an LLM call, so it introduces no new neural surface either. If a future task teaches a controller to PRIORITIZE, DEDUP, or NATURAL-LANGUAGE-SUMMARIZE these events beyond the fixed templates, that becomes a neural curriculum target per neural_bridge_priority; this task only defines the deterministic smoke-test shape.",
+  "files_changed": [
+    "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_spec_b278_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_owner_notification_smoke_spec_next_wave_b278_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh"
+  ],
+  "production_mcp_server_api_altered": false,
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "do_not_mark_done": true
+}

@@ -1,0 +1,32 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_priority_distill_next_wave.v1",
+  "parent_task_id": "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_DISTILL_REAL_B122_V1",
+  "runner": "claude_task_mcp_handoff_distill_b122",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B122 real distillation built 3394 rows from 3394 handoff-reached real task cards (of 3445 total in the registry). Labels derived from a documented multi-signal rule (blocker/status, real elapsed-time percentiles, and review_summarizer's own real risk/hygiene computations) -- risk_level retained only as a comparison baseline, not authority. Class balance: {'high': 439, 'needs_codex_judgment': 1462, 'low': 1493}. No taskctl subprocess calls, no queue mutation, no training launch.",
+  "invariants_verified": {
+    "REAL_SOURCE_TASK_CARDS": true,
+    "REAL_REVIEW_SUMMARIZER_FUNCTIONS_USED": true,
+    "LABEL_NOT_RISK_LEVEL_ECHO": true,
+    "NO_QUEUE_MUTATION": true,
+    "NO_PROCESS_LAUNCH": true,
+    "NO_TRAINING_LAUNCH": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "CLASS_BALANCE_NON_DEGENERATE": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_NEURAL_DRYRUN_B123_V1",
+      "objective": "Neural bridge: train/evaluate a small learned classifier (offline, no runtime wiring) on the B122 handoff-priority curriculum rows (bitnnv2/data/curriculum/mcp_codex_handoff_priority_targets_b119_v1.jsonl), measuring held-out accuracy vs the deterministic_baseline reported here. Stays a measured dry-run/probe; no production routing authority.",
+      "runner": "claude_task_mcp_handoff_neural_dryrun_b123",
+      "topic": "task_mcp",
+      "depends_on": [
+        "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_DISTILL_REAL_B122_V1"
+      ],
+      "ready": true
+    }
+  ],
+  "blockers": []
+}

@@ -1,0 +1,106 @@
+{
+  "eval_id": "mcp_runner_topic_allowlist_enforcement_b119_v1",
+  "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+  "date": "2026-07-05",
+  "mode": "implementation_gated_core_patch_no_launch",
+  "builds_on": [
+    "mcp_runner_topic_allowlist_design_b118_v1"
+  ],
+  "verdict": "PASS",
+  "summary": "Implemented the B118-designed runner/topic allowlist as a deterministic safety layer in core.py: check_runner_topic_allowlist() (pure decision fn) + RUNNER_TOPIC_ALLOWLIST (11 claude_*/deepseek_* runner/topic pairs) + CODEX_RUNNER wildcard-topic entry, wired into run_taskctl() so it runs AFTER the existing GEOAI_TASK_MCP_ALLOW_WRITES gate (narrows an open gate; never widens/replaces it) and BEFORE the real subprocess call for any WRITE_COMMANDS action. auto_pickup() now always passes its runner/topic through for enforcement. mark_review()/mark_done()/export_jsonl() gained optional runner/topic kwargs (default None) so existing server.py call sites (which pass no identity) are byte-for-byte unaffected -- server.py and launch_queue_contract.py were NOT touched (forbidden).",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/tests/runner_topic_allowlist_enforcement_smoke.py",
+    "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh"
+  ],
+  "not_touched": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py"
+  ],
+  "enforcement_summary": {
+    "check_fn": "geoai_task_mcp.core.check_runner_topic_allowlist(runner, topic, action) -> {allowed, reason}",
+    "wired_into": "geoai_task_mcp.core.run_taskctl() -- only for args[0] in WRITE_COMMANDS, only after allow_write and writes_allowed() both true",
+    "layer_order": [
+      "1. GEOAI_TASK_MCP_ALLOW_WRITES gate (unchanged; still blocks with 'blocked_write' if closed, regardless of identity)",
+      "2. malformed-identity sanity check (empty/null-byte/non-token-charset) -- runs first among the new checks",
+      "3. runner_topic_allowlist lookup (exact-match (runner,topic)->allowed_actions, or codex wildcard-topic)"
+    ],
+    "activation_condition": "only runs when caller supplies runner and/or topic (not both None); call sites that omit identity skip this layer entirely and keep prior behavior",
+    "audit_tags_added": [
+      "blocked_malformed_runner_or_topic",
+      "blocked_runner_topic_not_in_allowlist"
+    ],
+    "call_sites_now_enforced": [
+      "auto_pickup(runner, topic) -- always passes identity through"
+    ],
+    "call_sites_optionally_enforced": [
+      "mark_review(task_id, runner=None, topic=None)",
+      "mark_done(task_id, runner=None, topic=None)",
+      "export_jsonl(runner=None, topic=None)"
+    ]
+  },
+  "test_results": {
+    "runner_topic_allowlist_enforcement_smoke.py": {
+      "sub_tests": [
+        "test_allowlist_matrix_pure",
+        "test_malformed_fixtures_pure",
+        "test_partial_and_unknown_identity_pure",
+        "test_read_only_tools_unaffected",
+        "test_write_gate_checked_before_allowlist",
+        "test_allowlist_denies_without_subprocess",
+        "test_malformed_audit_tag",
+        "test_allowed_identity_proceeds_isolated"
+      ],
+      "result": "ALL PASS"
+    },
+    "test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh": "PASS",
+    "taskctl_verify": "PASS",
+    "regression_checks": {
+      "test_mcp_autopickup_dryrun_b118_v1.sh": "PASS (unaffected)",
+      "smoke.sh": "PASS (unaffected)",
+      "mcp_codex_handoff_e2e.py": "PASS (unaffected, 70/70)",
+      "cli_adapter_dryrun_smoke.py": "PASS (unaffected)",
+      "readonly_tools_smoke.py": "PASS for all core.py-related checks; pre-existing unrelated collision_guard failure confirmed present BEFORE this patch too (isolated via git stash of core.py only) -- caused by concurrent parallel B119 workers mutating the shared queue, not by this change"
+    }
+  },
+  "acceptance": {
+    "small_explicit_allowlist_added": true,
+    "unknown_runner_rejected": true,
+    "unknown_topic_rejected": true,
+    "empty_null_path_traversal_shell_meta_rejected": true,
+    "read_only_tools_unaffected": true,
+    "every_denied_write_audited": true,
+    "no_secret_env_values_logged": true,
+    "no_process_launch_enabled": true,
+    "write_gate_bypass_impossible": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "gates": {
+    "allowlist_matches_b118_design_matrix_exactly": true,
+    "all_8_malformed_fixtures_denied": true,
+    "codex_wildcard_topic_action_set_correct": true,
+    "gate_priority_preserved_write_gate_first": true,
+    "allowlist_never_widens_write_gate": true,
+    "server_py_not_mutated": true,
+    "launch_queue_contract_not_mutated": true,
+    "no_git_add_A_used": true,
+    "neural_routing_separate_concern": true,
+    "codex_finalizer_role_preserved": true
+  },
+  "safety_invariants": {
+    "write_gate_default_off": true,
+    "deterministic_gates_remain": true,
+    "neural_is_routing_only_not_safety_authority": true,
+    "no_regex_keyword_launch_authority": true,
+    "no_process_launch_code": true,
+    "codex_done_monopoly": true,
+    "worker_cannot_finalize_own_task": true,
+    "runner_topic_exact_match_only": true
+  },
+  "neural_bridge_note": "This allowlist is a DETERMINISTIC SAFETY BOUNDARY (per GeoAI neural-control-first doctrine), not a neural learning target. The neural controller may later learn to choose AMONG allowed runner/topic identities for adapter/routing decisions (B108/B109); this static allowlist is the hard boundary that blocks any identity not on the list from mutating the parent queue regardless of what a neural router selects.",
+  "known_gap_deferred": {
+    "description": "geoai_task_mark_review/geoai_task_mark_done/geoai_task_export_jsonl MCP tool functions in server.py do not pass a runner/topic identity to core.py, so the new allowlist layer is not yet reachable through those three tool surfaces in production (only through auto_pickup, which always supplies identity). core.py now exposes optional runner/topic kwargs on mark_review/mark_done/export_jsonl so a future task can wire identity through server.py (forbidden for this task: server_py_mutation) without any further core.py change.",
+    "follow_up_task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_SERVER_WIRING_B120_V1"
+  }
+}

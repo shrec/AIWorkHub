@@ -1,0 +1,40 @@
+{
+  "schema_id": "geoai.task_mcp_live_tool_inventory_reverify_next_wave.b251.v1",
+  "source_task_id": "CLAUDE_TASK_MCP_LIVE_TOOL_INVENTORY_REVERIFY_B251_V1",
+  "note": "Coordinated source_patch is forbidden for this reverify task. The proposals below are candidate follow-up cards for a future coder task; they do not authorize a worker to self-create task cards.",
+  "proposals": [
+    {
+      "proposal_id": "TASK_MCP_README_EXPOSED_TOOLS_SYNC_NEXT",
+      "target": "tools/geoai-task-mcp/README.md:53-71",
+      "action": "Rewrite the 'Exposed Tools' section to list all 20 live tools (or generate it from server.py's @mcp.tool() registry + cli_adapter_readonly_tool.READONLY_TOOL_NAMES to avoid future drift).",
+      "priority": "medium"
+    },
+    {
+      "proposal_id": "TASK_MCP_FROZEN_CONTRACT_V2_OR_SEPARATE_INVENTORY_TEST",
+      "target": "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py:65-84",
+      "action": "Either (a) keep this file scoped explicitly to the B108 schema-fingerprint set and rename readonly_tool_count/write_gated_tool_count keys to make clear they are a B108 SUBSET count, not the live total, or (b) add a companion 'live full inventory' fixture separate from the frozen fingerprint contract so downstream tests stop conflating the two.",
+      "priority": "medium"
+    },
+    {
+      "proposal_id": "TASK_MCP_STDIO_SMOKE_COUNT_REBASE",
+      "target": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh:88-89, tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh:108-109",
+      "action": "Rebase readonly_tool_count/write_gated_tool_count assertions onto the live 20-tool inventory (or import from the same source-of-truth used by the proposed live-inventory fixture above) once TASK_MCP_FROZEN_CONTRACT_V2 lands.",
+      "priority": "medium",
+      "already_tracked_as_known_failure_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2]"
+    },
+    {
+      "proposal_id": "TASK_MCP_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_REBASE",
+      "target": "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh:192",
+      "action": "Rebase the frozen collision_rows==3 assertion onto the current bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl row count (drifted to 6 per B250's own note); this is unrelated to MCP tool count but shares the same 'frozen assertion drifted' failure cluster.",
+      "priority": "low"
+    },
+    {
+      "proposal_id": "TASK_MCP_B250_TAXONOMY_PATCH",
+      "target": "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json:39-55 and its test tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh",
+      "action": "Add geoai_task_codex_handoff_markdown as a TIER_1_READ_ONLY_NAVIGATION member_tool (implemented:true), flip geoai_supervisor_loop_status.implemented from schema_only_pending_wiring to true now that B11 landed it live, and update total_tools accordingly (20 implemented + TIER_3(4)+TIER_4(1) reserved placeholders = 25 tier-taxonomy entries, if TIER_3/4 placeholders are retained as-is).",
+      "priority": "medium",
+      "note": "This is the freshest artifact in the repo (same day as this reverify) and is the most actionable single patch target for a coordinated follow-up."
+    }
+  ],
+  "neural_bridge_note": "All 5 proposals above are deterministic doc/test-fixture rebases (evidence/validator role), not a cognitive routing decision -- no neural migration target is implied by this reverify task itself. MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 (tracked separately) remains the neural target for adapter/runner/topic SELECTION, which none of these count-assertion fixes touch."
+}

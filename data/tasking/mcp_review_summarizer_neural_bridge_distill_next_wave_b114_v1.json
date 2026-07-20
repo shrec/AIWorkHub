@@ -1,0 +1,47 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_neural_bridge_distill_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+  "runner": "deepseek_task_mcp_review_summarizer_neural_b114",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B114 neural bridge distill complete. Emitted 41 curriculum rows across 7 skills: abstain_detection, review_actionable_detection, review_priority_classification, runner_grouping, status_action_classification, tool_affordance_reasoning, topic_grouping. All rows are stage=verified. Promote to distilled_training_target after owner review.",
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "PROCESS_LAUNCH_AUTHORITY_FALSE": true,
+    "WRITE_GATE_ENABLED_FALSE": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
+      "objective": "End-to-end smoke test via MCP stdio transport: start server, call geoai_task_review_summarize via JSON-RPC, verify response shape",
+      "runner": "deepseek_task_mcp_review_summarizer_b115",
+      "topic": "task_mcp",
+      "depends_on": [
+        "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
+      ],
+      "priority": "task_mcp_b115_stdio_smoke",
+      "ready": true
+    },
+    {
+      "task_id": "NEURAL_CURRICULUM_PROMOTE_DISTILL_ROWS_B114_V1",
+      "objective": "Promote B114 verified distill rows to distilled_training_target stage and integrate into neural curriculum",
+      "runner": "codex",
+      "topic": "neural_curriculum",
+      "depends_on": [
+        "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
+      ],
+      "priority": "neural_curriculum_promote",
+      "ready": false,
+      "blocked_reason": "Requires owner review of distill rows before promotion to training targets"
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py review DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1 after review",
+    "Owner to review distill rows in eval/mcp_review_summarizer_neural_bridge_distill_rows_b114_v1.jsonl",
+    "After owner approval: promote rows to distilled_training_target stage"
+  ]
+}

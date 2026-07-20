@@ -1,0 +1,73 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_markdown_render_next_wave.v1",
+  "parent_task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1",
+  "runner": "claude_task_mcp_handoff_render_b119",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B119 Codex handoff MARKDOWN renderer complete. Added render_codex_handoff_markdown (pure, single-argument, deterministic function over the existing build_codex_handoff_report dict shape) and build_codex_handoff_markdown_report (read-only wrapper that reuses build_codex_handoff_report's review-queue/show-only I/O and adds markdown + markdown_contract fields, additive-only over every B116 field). Registered one new read-only MCP tool geoai_task_codex_handoff_markdown in server.py (tool count 18->19). Fixture dir sha256 and live review-queue stdout both identical before/after; only review-queue/show taskctl commands issued; write gate default-off; no process/agent launch; no runtime switch. B116 regression (70/70) stays green untouched. 41/41 new checks pass; taskctl verify PASS.",
+  "invariants_verified": {
+    "READONLY": true,
+    "PURE_FUNCTION_RENDERER": true,
+    "DETERMINISTIC_OUTPUT": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_FIXTURE": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_LIVE": true,
+    "NO_WRITE_TASKCTL_COMMAND_ISSUED": true,
+    "SINGLE_TOOL_ADDED_ONLY": true,
+    "B116_REGRESSION_GREEN": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_NEURAL_PRIORITY_RENDER_B120_V1",
+      "objective": "Neural-bridge: the B119 markdown renderer lists handoff tasks in review-queue order (deterministic, not risk-prioritized). Distill the same risk/hygiene/allowed_writes fields already computed by build_codex_handoff_report into curriculum/feature-axis rows so a learned controller can choose the DISPLAY ORDER (which task Codex should read first in the rendered packet) instead of a hardcoded sort. Deterministic risk_level/commit_hygiene stay as the evidence extractor / baseline; the renderer's current queue-order pass-through is a temporary baseline only. Emit trainable rows + a measured neural dry-run that scores learned-order vs a naive high-risk-first heuristic on held-out fixture batches.",
+      "runner": "claude_task_mcp_handoff_render_b120",
+      "topic": "task_mcp",
+      "depends_on": ["CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"],
+      "priority": "task_mcp_b120_handoff_markdown_neural_priority",
+      "read_first": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+        "tools/geoai-task-mcp/eval/mcp_codex_handoff_markdown_render_b119_v1.json"
+      ],
+      "ready": true
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_STDIO_SMOKE_B120_V1",
+      "objective": "Add a stdio-subprocess smoke check for the new geoai_task_codex_handoff_markdown tool (mirroring the existing b109/b110 stdio smoke pattern) and, in the same task, bump the frozen server tool-count assertions in test_mcp_stdio_subprocess_client_smoke_b109_v1.sh / test_mcp_stdio_concurrent_client_smoke_b110_v1.sh / test_mvp_contract_audit_v1.sh from the stale count to 19 (including geoai_task_codex_handoff and geoai_task_codex_handoff_markdown) since those frozen-inventory tests were already flagged stale in the B116 eval and are still failing at baseline.",
+      "runner": "claude_task_mcp_handoff_render_b120",
+      "topic": "task_mcp",
+      "depends_on": ["CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"],
+      "priority": "task_mcp_b120_handoff_markdown_stdio_smoke",
+      "ready": true
+    }
+  ],
+  "blockers": [],
+  "preexisting_failures_for_owner": [
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "issue": "frozen tool-count assertion still stale (now off by 3: expected != 19); already flagged in the B116 eval, unchanged by B119",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "issue": "same stale frozen tool-count assertion, now off by 3 (expected 19)",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+      "issue": "stale audit tool-name list still missing several tools including geoai_task_codex_handoff and geoai_task_codex_handoff_markdown; predates b106, already flagged in B116 eval",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+      "issue": "collision-guard row drift (expected 3, got 6); unrelated to B119 files, unchanged since B116",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1"
+    }
+  ],
+  "follow_up_actions": [
+    "Codex to run taskctl.py review CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1 finalize (worker returns to review, does not mark done)",
+    "Owners of b109/b110 stdio smoke + mvp_contract_audit to refresh their frozen tool inventory to 19 (add geoai_task_codex_handoff + geoai_task_codex_handoff_markdown)"
+  ]
+}

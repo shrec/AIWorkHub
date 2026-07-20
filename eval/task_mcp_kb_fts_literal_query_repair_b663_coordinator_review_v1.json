@@ -1,0 +1,13 @@
+{
+  "schema_id": "geoai.coordinator_review.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_KB_FTS_LITERAL_QUERY_REPAIR_B663_V1",
+  "reviewed_by": "codex",
+  "reviewed_at": "2026-07-19T09:35:00Z",
+  "verdict": "ACCEPT_AFTER_ENVIRONMENT_REVALIDATION",
+  "worker_terminal_outcome": "validation_failed",
+  "worker_failure_class": "isolated interpreter lacked pytest",
+  "project_venv_tests": "24/24 PASS",
+  "literal_cli_smoke": "PASS_NO_TRACEBACK",
+  "production_db_write": false,
+  "promoted_paths": 3
+}

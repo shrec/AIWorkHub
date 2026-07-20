@@ -1,0 +1,68 @@
+{
+  "schema_id": "geoai.coordinator_review.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VSCODE_NATIVE_APP_B615_V1",
+  "review_id": "task_mcp_vscode_native_mcp_app_b615_final_coordinator_review_v1",
+  "reviewed_at": "2026-07-18T19:59:00Z",
+  "coordinator": "codex",
+  "worker_terminal_state": "validation_failed",
+  "verdict": "ACCEPT_AFTER_BOUNDED_COORDINATOR_FIXES",
+  "accepted_scope": "Native read-only VS Code Remote Webview backed by one repo-local Task MCP stdio session and the three canonical dashboard read tools.",
+  "worker_candidate_partition": {
+    "accepted": [
+      "native VS Code Webview UI and dark theme",
+      "one bounded MCP stdio child/session",
+      "three read-only dashboard MCP tools",
+      "canonical dashboard snapshot/detail builders",
+      "strict CSP and fixed Webview message/tool allowlists",
+      "Remote-SSH installation and workspace-host execution"
+    ],
+    "rejected": [
+      "stale worktree changes outside B615 allowed_writes",
+      "the overstrict snapshot test assertion that required every optional section to be truncated"
+    ]
+  },
+  "coordinator_fixes": [
+    "Captured child identity in exit/error handlers and ignored stale exit events after a replacement child starts.",
+    "Added server metadata before response bounding so the final serialized snapshot/detail remains inside its declared cap.",
+    "Corrected the oversized snapshot test to require an ordered non-empty truncation prefix and a final response below 4 MiB.",
+    "Redacted Remote-SSH host-absolute paths at the extension-host to Webview boundary while preserving repo-relative task metadata."
+  ],
+  "security_and_authority": {
+    "read_only": true,
+    "dashboard_write_authority": false,
+    "task_lifecycle_authority": false,
+    "process_launch_from_webview": false,
+    "arbitrary_mcp_tool_proxy": false,
+    "coordinator_token_exposed": false,
+    "http_or_browser_dependency": false,
+    "iframe": false,
+    "host_absolute_paths_redacted_before_webview": true
+  },
+  "validation": {
+    "node_extension_check": "PASS",
+    "node_webview_check": "PASS",
+    "extension_static_smoke": "PASS_25_OF_25",
+    "dashboard_mcp_pytest": "PASS_16_OF_16",
+    "live_out_of_process_mcp": {
+      "result": "PASS",
+      "transport": "mcp.client.stdio.stdio_client plus mcp.ClientSession",
+      "required_tools_visible": 3,
+      "health_readonly": true,
+      "snapshot_groups_read": true,
+      "real_task_detail_read": true
+    },
+    "taskctl_verify": "PASS",
+    "collision_guard": "PASS_107_ACTIVE_CARDS_NO_OVERLAP"
+  },
+  "final_file_hashes_sha256": {
+    "tools/vscode-geoai-task-operations/package.json": "12779684c956a226484bb59dd4b5dcd4d44393b43b8d5d09a4018ede92380417",
+    "tools/vscode-geoai-task-operations/extension.js": "86996d9adb79dad2fe3cc5817882a1944bfbd9da7b30fa2e5749f7b7fceb189a",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "42bc99e1eb2cba6023d7447b67bde663d796cd00ec4e92ed09da18ac0bb31f09",
+    "tools/vscode-geoai-task-operations/media/app.js": "708e533b5b1ca2d6b6f7e5003288475a9fce4d81c22eca41acbbc8a392e48edd",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py": "00d8e996bb51fbc2d9ec63dd2f394ba8e0087b43872fc39d1ab57cc1f650bc44",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py": "57dbfa7a351da91b3e72da64e94fd68f8eccba1fe8fb2be9ae5a5f32c46d3d8b",
+    "tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py": "9af7b3184fa5a8e3d4433e72fae9d682b25dffaa30a2719e444bb137baa54f8a"
+  },
+  "score_effect": "Task MCP operator UX improved; no Signal Atlas score change.",
+  "remaining_boundary": "This first native app is intentionally read-only; lifecycle mutations require a separate capability-gated review."
+}

@@ -1,0 +1,98 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_server_wiring_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
+  "timestamp": "2026-07-04T22:00:00+00:00",
+  "verdict": "PENDING_TEST",
+  "runner": "deepseek_task_mcp_review_summarizer_b111",
+  "topic": "task_mcp",
+  "mode": "mcp_readonly_tool_server_wiring_no_launch_authority",
+  "objective": "Wire the B110 review_summarizer core as a read-only geoai_task_review_summarize MCP tool in server.py, preserving default-off writes and no process/model launch.",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh",
+  "test_source": "tools/geoai-task-mcp/tests/mcp_review_summarizer_server_wiring_smoke.py",
+  "module_modified": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+  "module_depends_on": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "acceptance_criteria": {
+    "tool_visible": "geoai_task_review_summarize appears in MCP tool list with frozen read-only input schema",
+    "output_shape": "tool output includes grouped tasks and Codex review checklist shape",
+    "no_taskctl_mutation": "must not call taskctl done/start/review/auto-pickup/add-card or mutate queue",
+    "no_agent_model_launch": "must not launch agent/model process",
+    "test_passes": "bash tools/geoai-task-mcp/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh passes",
+    "verify_passes": "python3 AITools/taskctl.py verify passes"
+  },
+  "authority_flags": {
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false,
+    "write_gate_default_off": true
+  },
+  "forbidden_operations": [
+    "queue_mutation",
+    "agent_launch",
+    "model_launch",
+    "write_gate_enable_by_default",
+    "shell_true",
+    "network_call",
+    "secret_logging",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "invariants": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "SUBPROCESS_LAUNCH_TRIPWIRE_ZERO": true,
+    "INPUT_SCHEMA_FROZEN": true,
+    "EXISTING_TOOLS_UNTOUCHED": true
+  },
+  "server_tool_schema": {
+    "tool_name": "geoai_task_review_summarize",
+    "parameters": {
+      "task_ids": {
+        "type": "list[str] | None",
+        "required": false,
+        "description": "Optional filter: only include these task_ids in the checklist"
+      },
+      "batch_label": {
+        "type": "str | None",
+        "required": false,
+        "description": "Optional label for this review batch"
+      }
+    },
+    "output_shape": {
+      "ok": "bool",
+      "review_queue_raw": "str",
+      "task_count": "int",
+      "fetch_errors": "list[dict]",
+      "grouped_tasks": "dict[str, list[str]]",
+      "codex_review_checklist": "list[dict]",
+      "summary": {
+        "total_tasks": "int",
+        "topics": "dict[str, int]",
+        "runners": "dict[str, int]",
+        "fetch_error_count": "int"
+      },
+      "authority_flags": "dict[str, bool]",
+      "server_tool": "str",
+      "contract": "str"
+    },
+    "frozen_input_schema": true,
+    "no_write_gate_params": true,
+    "no_mutation_params": true
+  },
+  "wiring_details": {
+    "import_added": "from . import review_summarizer",
+    "function_added": "geoai_task_review_summarize with @mcp.tool() decorator",
+    "existing_tools_preserved": true,
+    "cli_adapter_register_preserved": true,
+    "main_function_unchanged": true
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_INTEGRATION_B112_V1"
+}

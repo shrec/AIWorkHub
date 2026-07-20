@@ -1,0 +1,58 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_CONTRACT_B07_V1",
+  "runner": "claude_task_mcp_supervisor_contract_b07",
+  "topic": "task_mcp",
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "queue_order": 7234,
+  "priority": "task_mcp_b07_supervisor_loop_contract",
+  "mode": "mcp_supervisor_contract_no_launch_no_source_patch",
+  "objective": "Define the minimal safe MCP supervisor loop contract for Codex-managed worker pickup/review/result reporting, without enabling real process launch or touching task statuses.",
+  "read_first": [
+    "tools/geoai-task-mcp/data/tasking/runner_topic_allowlist_patch_next_wave_b06_v1.json",
+    "tools/geoai-task-mcp/eval/runner_topic_allowlist_patch_b06_v1.json",
+    "tools/geoai-task-mcp/contracts/agent_launcher_mvp_b02_v1.json",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
+  ],
+  "acceptance": [
+    "Must specify MCP request/response schema for Codex -> MCP -> worker CLI -> MCP -> Codex flow.",
+    "Must include dryrun-only lifecycle states: planned, dispatched_dryrun, worker_review_ready, codex_reviewed, blocked.",
+    "Must include safety boundaries: no credential read, no daemon start, no real process launch, no writes unless explicit future gate.",
+    "Must include error taxonomy for collision, stale task, runner/topic mismatch, missing artifact, and failed validation.",
+    "Must not patch source code in this task.",
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh passes.",
+    "python3 AITools/taskctl.py verify passes."
+  ],
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "forbidden": [
+    "source_patch",
+    "daemon_start",
+    "real_agent_launch",
+    "credential_read",
+    "credential_write",
+    "write_gate_enable",
+    "task_status_mutation",
+    "network_operation",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "authority_flags": {
+    "runtime_authority": false,
+    "agent_launch_enabled": false,
+    "credential_access": false,
+    "workflow_switch": false,
+    "source_patch": false
+  },
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only. Never git add -A / git add . / mixed-task commit.",
+  "handoff_note": "გაუშვი პარალელური სუბაგენტები და რომ დასრულდება დაუბრუნე კოდექსს რევიუსთვის"
+}

@@ -1,0 +1,64 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_parser_fix_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1",
+  "timestamp": "2026-07-04T22:30:00+00:00",
+  "verdict": "PASS",
+  "runner": "deepseek_task_mcp_review_parser_fix_b113",
+  "topic": "task_mcp",
+  "mode": "mcp_review_summarizer_parser_fix_readonly",
+  "objective": "Fix the B112 MCP review summarizer real-queue warnings by making the review-line parser suffix-tolerant and ensuring empty-queue results include fetch_errors=[], preserving read-only/no-launch invariants.",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_parser_fix_b113_v1.sh",
+  "test_source": "tools/geoai-task-mcp/tests/mcp_review_summarizer_real_queue_integration.py",
+  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "fixes_applied": [
+    {
+      "id": "B113_REGEX_SUFFIX_TOLERANT",
+      "file": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+      "line": 32,
+      "change": "Removed $ anchor from _REVIEW_LINE_RE, added optional (?:\\s+.*)? suffix group. Now matches lines like '[topic] [runner] task_id — description'.",
+      "old_pattern": "r\"^\\s*\\[(?P<topic>[^\\]]+)\\]\\s*\\[(?P<runner>[^\\]]+)\\]\\s*(?P<task_id>\\S+)$\"",
+      "new_pattern": "r\"^\\s*\\[(?P<topic>[^\\]]+)\\]\\s*\\[(?P<runner>[^\\]]+)\\]\\s*(?P<task_id>\\S+)(?:\\s+.*)?$\""
+    },
+    {
+      "id": "B113_FETCH_ERRORS_EMPTY",
+      "file": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+      "line": 110,
+      "change": "Added 'fetch_errors': [] to empty-queue early-return dict for schema consistency.",
+      "old": "return dict without fetch_errors key",
+      "new": "return dict includes 'fetch_errors': []"
+    }
+  ],
+  "acceptance_results": {
+    "regex_suffix_tolerant": "PASS — real queue lines with ' — description' suffix parse into task entries",
+    "fetch_errors_empty": "PASS — empty queue result includes fetch_errors=[]",
+    "queue_unchanged": "PASS — live queue sha256 before/after remains byte-identical",
+    "no_queue_mutation": "PASS — no taskctl done/review/start/auto-pickup/add-card calls",
+    "no_agent_launch": "PASS — process_launch and agent_launch flags false",
+    "test_passes": "PASS — bash test exits 0",
+    "verify_passes": "PASS — python3 AITools/taskctl.py verify exits 0"
+  },
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER": true
+  },
+  "warnings_resolved": [
+    "B112_REGEX_DESCRIPTION_SUFFIX — regex now suffix-tolerant",
+    "B112_EMPTY_FETCH_ERRORS_ABSENT — fetch_errors=[] added to empty path"
+  ],
+  "forbidden_operations_verified": [
+    "live_queue_mutation",
+    "agent_launch",
+    "model_launch",
+    "write_gate_enable"
+  ],
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1"
+}

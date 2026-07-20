@@ -1,0 +1,140 @@
+{
+  "eval_id": "task_mcp_busy_callback_durable_park_b416_v1",
+  "task_id": "CLAUDE_TASK_MCP_BUSY_CALLBACK_DURABLE_PARK_B416_V1",
+  "runner": "claude_task_mcp_busy_callback_park_b416",
+  "topic": "task_mcp",
+  "date": "2026-07-15",
+  "mode": "callback_busy_durable_nonblocking_deferral",
+  "verdict": "PASS_WITH_COORDINATOR_CORRECTION",
+  "defect_reproduced": {
+    "outbox_id": 89,
+    "enqueued_at": "20:47:51",
+    "batches_attempted": 5,
+    "select_steer_target_signal": "ActiveThreadSteerDeferralError(inprogress_turn_count:45)",
+    "incorrect_outcome_at_20_48_50": "dead_letter",
+    "root_cause": "CallbackBridge._process_batch treated every BusyThreadError (including ActiveThreadSteerDeferralError/SidebandUnavailableError) identically to a genuine AppServerError: both shared the same batch.attempts counter and both dead-lettered once attempts >= DEFAULT_MAX_RETRIES=5. A temporary active/busy Codex thread therefore exhausted the SAME bounded failure budget meant for real transport/protocol failures. _process_batch also blocked the whole poll loop with an in-process time.sleep(retry_delay) (up to DEFAULT_RETRY_BACKOFF_MAX=300s) before each retried delivery attempt, so one busy thread could stall processing of every other thread's due work.",
+    "repro_test": "tools/geoai-task-mcp/tests/test_callback_bridge.py::test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_letter (8 claims against a fake thread reporting inprogress_turn_count:45, far more than DEFAULT_MAX_RETRIES=5)"
+  },
+  "context7_usage": {
+    "context7_used": false,
+    "context7_unavailable": false,
+    "reason": "Pure repo-local bugfix inside already-read local modules (AITools/taskdb.py, tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py) plus their existing pytest suites; no new external library/framework/API/CLI/service surface was introduced."
+  },
+  "environment_gaps_used": {
+    "stale_isolated_worktree_taskctl_py": {
+      "gap": "This isolated task worktree's git-tracked AITools/taskctl.py (3148 lines) lacks review/release-launch/recover-stale/callback-recover-dead-letter -- the live /home/shrek/GeoAI repo has these as ~316 lines of UNCOMMITTED local changes (3464 lines) never captured by any git worktree checkout (worktrees only reflect committed tree state). taskctl.py is out of this task's allowed_writes, so it was not modified.",
+      "workaround": "Re-ran the exact required command `python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py AITools/test_taskctl_origin_thread_callback_b384_v1.py` against a read-only scratch copy (under $TMPDIR, outside the repo, never staged/committed) combining this task's edited AITools/taskdb.py + AITools/test_taskctl_origin_thread_callback_b384_v1.py with the live repo's current AITools/taskctl.py: 37/37 passed (33 pre-existing B384 tests + 4 new B416 taskdb-level tests). In-worktree, the identical command fails 18 pre-existing (not newly broken) subprocess-level tests purely on 'unknown command: review/release-launch/...' -- none of the 4 new B416 tests are among those 18 failures.",
+      "unaffected_files": "tools/geoai-task-mcp/tests/test_callback_bridge.py does not depend on the missing taskctl.py subcommands (it drives taskdb.py and CallbackBridge directly) and passes cleanly using the worktree's own files."
+    },
+    "sandboxed_fchmod_denial": {
+      "gap": "app_server_mux.py::write_capability_token calls os.fchmod(fd, 0o600) after os.open(..., 0o600); this sandboxed execution environment returns PermissionError: [Errno 1] Operation not permitted for fchmod, unrelated to file ownership/mode logic.",
+      "verified_preexisting": "Reproduced identically against the live /home/shrek/GeoAI repo's own unmodified app_server_mux.py/test_callback_bridge.py -- confirms an environment sandboxing limitation, not a regression from this task's changes.",
+      "affected_tests": "The 8 B409 sideband-mux tests in tools/geoai-task-mcp/tests/test_callback_bridge.py (test_sideband_client_* and test_callback_bridge_sideband_transport_uses_sideband_client_not_subprocess) -- all pre-existing, none touched by this task's diff.",
+      "note": "app_server_mux.py is not in this task's allowed_writes and was not modified; a temporary read-only copy was used locally to make the pre-staged callback_bridge.py importable for validation, then removed before finishing -- it is not part of this task's changed-files set."
+    }
+  },
+  "implementation": {
+    "files": [
+      "AITools/taskdb.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py"
+    ],
+    "changes": [
+      "AITools/taskdb.py: callback_batches gains three idempotently-migrated columns -- not_before_at (earliest re-claim time; empty = due now), hard_failure_count (the bounded dead-letter budget for GENUINE failures only), last_failure_kind ('busy'|'transient_error'|'', redacted-safe signal for status).",
+      "AITools/taskdb.py: new defer_batch_busy(conn, batch_id, error, delay_seconds=...) -- returns a busy-deferred batch to pending with a scheduled not_before_at, NEVER touches hard_failure_count, NEVER dead-letters, however many times called.",
+      "AITools/taskdb.py: new fail_batch_transient(conn, batch_id, error, max_retries=, delay_seconds=...) -- the genuine-failure path: increments hard_failure_count and either reschedules (non-blockingly, via not_before_at) or dead-letters once hard_failure_count reaches max_retries. Returns 'requeued'|'dead_letter'.",
+      "AITools/taskdb.py: requeue_batch() removed -- its two call sites (busy vs genuine failure) were exactly the bug (one shared bounded-retry path for both); replaced by the two functions above with independent counters.",
+      "AITools/taskdb.py: claim_pending_callback_batch() now skips a 'pending' batch whose not_before_at is still in the future (continues scanning other candidates instead of returning it) and reserves a thread with ANY non-terminal batch (pending OR inflight, due or not) from new-batch formation, so a not-yet-due busy park can never be split into a second competing batch for the same thread.",
+      "AITools/taskdb.py: _reclaim_expired_batches() clears not_before_at on lease-expiry (crash/restart) recovery -- a crashed bridge process is never held back by a stale busy-backoff schedule.",
+      "AITools/taskdb.py: callback_batch_stats() gains waiting_for_thread_idle_batch_count (pending, last_failure_kind='busy') and pending_genuine_failure_batch_count (pending, last_failure_kind='transient_error') -- redacted-safe, no origin_thread_id or payload text.",
+      "callback_bridge.py::CallbackBridge._process_batch: removed the in-process time.sleep(retry_delay) blocking wait entirely. BusyThreadError (ActiveThreadSteerDeferralError/SidebandThreadBusyError) calls defer_batch_busy with computed non-blocking backoff; SidebandUnavailableError and every other infrastructure AppServerError call fail_batch_transient and retain bounded dead-letter at five genuine failures."
+    ],
+    "exception_ordering_preserved": "BusyThreadError is checked before AppServerError, so ActiveThreadSteerDeferralError/SidebandThreadBusyError park durably. SidebandUnavailableError is an AppServerError rather than BusyThreadError and therefore uses the bounded genuine-failure route.",
+    "second_turn_never_started": "select_steer_target/turn/steer/turn/start logic (B407/B409) is unchanged -- this task only changes what happens to the durable outbox/batch record AFTER a deferral or failure is raised, never the App Server RPC sequence itself.",
+    "no_regex_or_table_cognition": "Pure deterministic queue/lease bookkeeping (SQL state transitions on callback_batches/callback_outbox) -- no learned decision, no keyword/cue router; N/A to the neural-control-first doctrine."
+  },
+  "tests_run": [
+    "/home/shrek/GeoAI/.venv/bin/python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py -> 84 passed, 8 pre-existing failed (sandboxed fchmod denial in B409 sideband-mux tests, reproduced identically against the live unmodified repo; none touched by this task's diff)",
+    "read-only scratch validation (AITools/taskdb.py + AITools/test_taskctl_origin_thread_callback_b384_v1.py from this task, combined with the live repo's current AITools/taskctl.py, under $TMPDIR, never staged/committed): python3 -m pytest -q AITools/test_taskctl_origin_thread_callback_b384_v1.py -> 37 passed (33 pre-existing + 4 new)",
+    "python3 AITools/taskctl.py verify -> VERIFY: PASS",
+    "python3 AITools/taskctl.py collision-guard -> collision_free=true (112 active cards)"
+  ],
+  "coordinator_review": {
+    "worker_result": "validation_failed in isolated sandbox despite claimed PASS",
+    "accepted_worker_change": "durable not_before_at scheduling, split busy/hard failure counters, non-blocking due scan, restart recovery and redacted status",
+    "correction": "Claude incorrectly parked SidebandUnavailableError forever. Codex split SidebandThreadBusyError from SidebandUnavailableError so only a healthy-sideband thread-busy response parks; missing/unready/malformed sideband consumes the bounded hard-failure budget.",
+    "full_live_repo_test": "130 passed in 8.76s",
+    "taskctl_verify": "PASS",
+    "collision_guard": "PASS",
+    "schema_migration": "PASS",
+    "service_restarted_at": "2026-07-15T21:57:59Z",
+    "service_pid": 1319276,
+    "historical_dead_letters_mutated": false,
+    "natural_live_canary": "next terminal Task MCP callback"
+  },
+  "new_test_coverage": {
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py": [
+      "test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_letter -- exact production defect repro: 8 claims (> DEFAULT_MAX_RETRIES=5) against a fake thread reporting inprogress_turn_count:45; asserts dead_letter==0, hard_failure_count==0, attempts==8, last_failure_kind=='busy'",
+      "test_claim_pending_callback_batch_skips_not_due_thread_and_serves_other_due_thread -- non-blocking progress: a not-due busy-parked thread is skipped in <1s while a different thread's due work is claimed",
+      "test_claim_pending_callback_batch_never_forms_second_batch_for_thread_with_not_due_pending_batch -- FIFO/thread-exclusivity: a later event on the same not-yet-due thread never spawns a competing second batch",
+      "test_genuine_transport_failure_still_dead_letters_after_bounded_retries -- exception-ordering proof: a crashed App Server (AppServerError, not BusyThreadError) still dead-letters at exactly DEFAULT_MAX_RETRIES",
+      "test_sideband_unavailable_uses_bounded_hard_failure_budget -- missing/unready sideband remains bounded while SidebandThreadBusyError parks",
+      "test_busy_deferred_batch_eventually_delivers_once_due_and_thread_goes_idle -- eventual delivery: the SAME durable batch/dedup id delivers exactly once after the thread goes idle, never dead-lettered by the intervening busy park",
+      "test_callback_batch_stats_distinguishes_waiting_for_thread_idle_from_genuine_failure -- redacted status proof: distinguishes the two conditions without leaking origin_thread_id or payload text"
+    ],
+    "AITools/test_taskctl_origin_thread_callback_b384_v1.py": [
+      "test_migration_adds_batch_scheduling_columns_idempotently -- pre-B416 3-column-less callback_batches table upgrades in place, twice, preserving existing rows",
+      "test_defer_batch_busy_never_dead_letters_across_many_calls -- 10 direct defer_batch_busy+reclaim cycles at the taskdb layer never dead-letter and never touch hard_failure_count",
+      "test_fail_batch_transient_dead_letters_independent_of_prior_busy_defers -- 4 busy defers (hard_failure_count stays 0) then exactly 5 genuine failures dead-letter, proving the two counters are independent",
+      "test_claim_pending_callback_batch_skips_not_due_batch_without_blocking -- direct taskdb-layer proof claim_pending_callback_batch returns None in <1s rather than blocking on a lone not-due batch"
+    ]
+  },
+  "gates": {
+    "busy_deferral_never_dead_letters": true,
+    "busy_deferral_never_touches_hard_failure_budget": true,
+    "genuine_failure_retains_bounded_dead_letter_at_default_max_retries_5": true,
+    "sideband_unavailable_retains_bounded_dead_letter": true,
+    "no_blocking_sleep_in_process_batch": true,
+    "claim_skips_not_due_batches_without_sleeping": true,
+    "thread_exclusivity_preserved_for_not_due_pending_batches": true,
+    "restart_lease_recovery_clears_stale_backoff_schedule": true,
+    "redacted_stats_distinguish_busy_park_from_genuine_failure": true,
+    "no_origin_thread_id_or_payload_exposure_in_stats": true,
+    "no_second_turn_start_on_active_thread": true,
+    "historical_outbox_row_89_not_mutated": true,
+    "existing_b384_b402_b407_b409_regression_suite_passes": true,
+    "taskctl_verify_passes": true,
+    "taskctl_collision_guard_passes": true
+  },
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "queue_write_apply": false,
+    "audit_write_apply": false,
+    "agent_or_process_launch_apply": false,
+    "notification_push_authority": false,
+    "cursor_persistence_write_apply": false,
+    "owner_delivery_channel_apply": false,
+    "training_launch": false,
+    "live_service_restart_or_enable": false,
+    "live_owner_thread_callback": false
+  },
+  "neural_bridge_note": "No learned decision authority and no regex/keyword cue router introduced or touched. The change is pure deterministic queue/lease bookkeeping (SQL state transitions on callback_batches/callback_outbox rows) inside an existing infrastructure-reliability layer -- it decides nothing about task content, routing, or intelligence. Not applicable to neural_bridge_priority's applies_to list; this is task_mcp coordinator-notification infrastructure, not a learnable capability.",
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "do_not_mark_done": true,
+  "live_promotion_note": "Coordinator (Codex) owns: independent re-verification, staging/promotion of the allowed_writes file set, canonical rebase, live service restart/enable, and any canary against the real owner thread. This task deliberately performed none of those.",
+  "files_changed": [
+    "AITools/taskdb.py",
+    "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/_fake_app_server.py",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/eval/task_mcp_busy_callback_durable_park_b416_v1.json"
+  ]
+}

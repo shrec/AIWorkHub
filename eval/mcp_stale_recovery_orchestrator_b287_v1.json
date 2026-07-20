@@ -1,0 +1,31 @@
+{
+  "action_types": [
+    "kill_zombie",
+    "requeue",
+    "mark_done",
+    "escalate"
+  ],
+  "authority_flags": {
+    "agent_launch": false,
+    "audit_write": false,
+    "process_launch": false,
+    "queue_write": false,
+    "runtime_authority": false,
+    "support_authority": false
+  },
+  "metrics": {
+    "by_action": {
+      "escalate": 1,
+      "kill_zombie": 1,
+      "mark_done": 1,
+      "requeue": 1
+    },
+    "recovery_actions": 4,
+    "stale_processing": 4
+  },
+  "runner": "claude_task_mcp_stale_recovery_b287",
+  "schema_id": "geoai.mcp_stale_recovery_orchestrator.b287.v1",
+  "task_id": "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B287_V1",
+  "topic": "task_mcp",
+  "verdict": "PASS"
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=GeoAI Task MCP callback bridge to originating Codex thread
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shrek/GeoAI
+Environment=GEOAI_REPO=/home/shrek/GeoAI
+ExecStart=/home/shrek/GeoAI/.venv/bin/geoai-task-callback-bridge --transport sideband --app-server-timeout-seconds 45 --lease-seconds 405 daemon
+TimeoutStartSec=infinity
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

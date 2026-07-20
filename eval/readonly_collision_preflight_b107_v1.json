@@ -1,0 +1,33 @@
+{
+  "eval_id": "readonly_collision_preflight_b107_v1",
+  "task_id": "CLAUDE_TASK_MCP_READONLY_COLLISION_PREFLIGHT_B107_V1",
+  "date": "2026-07-04",
+  "mode": "mcp_readonly_cli_plan_tool_collision_preflight",
+  "builds_on": "cli_adapter_readonly_tool_b106_v1",
+  "verdict": "PASS",
+  "summary": "Added a READ-ONLY collision preflight to plan_command_readonly: would_collide + collision_preflight fields report whether the plan's task_id/runner would collide with an ACTIVE claim (pending/processing/review/blocked). Reads the same task-card JSONL the tasking collision guard scans (scripts/build_tasking_parallel_group_collision_guard_v1.py: load_cards + canonical_status + ACTIVE_STATUSES) with a plain file read -- no lock acquired, no claim written, no queue/audit mutation, no subprocess/exec/fork/shell code added. Card source is env-overridable (GEOAI_TASK_MCP_COLLISION_CARDS_PATH, falling back to the existing BITNN_TASK_CARDS_PATH override) so tests point it at an isolated temp file. write_gate stays default-off; secret redaction unchanged.",
+  "would_collide_true_case": true,
+  "would_collide_false_case": true,
+  "state_mutated": false,
+  "write_gate_default_off": true,
+  "launch_present": false,
+  "redaction_preserved": true,
+  "public_api_added": {
+    "collision_cards_path(repo=None)": "resolve read-only card source path (env-overridable)",
+    "collision_preflight(task_id, runner, topic, repo=None)": "would_collide + detail dict, plain read-only file read",
+    "plan_command_readonly(...)": "now also returns plan['would_collide'] and plan['collision_preflight']"
+  },
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py",
+    "tools/geoai-task-mcp/tests/test_readonly_collision_preflight_b107_v1.sh",
+    "tools/geoai-task-mcp/eval/readonly_collision_preflight_b107_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_readonly_collision_preflight_b107_v1.sh -> PASS",
+    "bash tools/geoai-task-mcp/tests/test_cli_adapter_readonly_tool_b106_v1.sh -> PASS (no regression)",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ],
+  "test_result": "PASS",
+  "verify_result": "PASS",
+  "no_commit": true
+}

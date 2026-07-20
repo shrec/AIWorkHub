@@ -1,0 +1,68 @@
+{
+  "schema_id": "geoai.task_mcp_source_patch_deconflict_next_wave.b09.v1",
+  "proposal_id": "MCP_SOURCE_PATCH_DECONFLICT_NEXT_WAVE_B09_V1",
+  "status": "proposal_only_not_applied_this_task",
+  "source_task": "DEEPSEEK_TASK_MCP_SOURCE_PATCH_DECONFLICT_B09_V1",
+
+  "this_task_scope": {
+    "artifacts_added": [
+      "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_b09_v1.json",
+      "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
+      "tools/geoai-task-mcp/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
+      "tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
+    ],
+    "source_code_changed": false,
+    "process_launch": false,
+    "task_status_mutated": false,
+    "write_gate": "off (untouched)"
+  },
+
+  "deconflict_result": {
+    "verdict": "SAFE_TO_PROCEED",
+    "write_lane_claimants_total": 9,
+    "write_lane_claimants_already_done": 9,
+    "write_lane_claimants_active": 0,
+    "write_lane_claimants_blocked": 0,
+    "write_lane_claimants_pending": 0,
+    "b08_wiring_blocked": false
+  },
+
+  "proposed_next_wave_tasks": [
+    {
+      "task_id_suggestion": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1",
+      "summary": "Apply the B08 contract's future_source_patch_paths patches to core.py and server.py: add supervisor_loop_status() pure function implementing the 7-step derivation_algorithm (reusing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state), then register @mcp.tool() geoai_supervisor_loop_status in server.py. Ship with live-wired smoke tests for all 6 B08 scenarios. B09 confirms: zero active write-lane conflicts — SAFE TO PROCEED.",
+      "owner": "future coder task (Claude or DeepSeek coder), not created by this worker",
+      "requires_source_patch": true,
+      "b09_deconflict_status": "LANE_CLEAR",
+      "safe_plan_reference": "See ordered_safe_plan_for_b08_wiring in task_mcp_source_patch_deconflict_b09_v1.json"
+    },
+    {
+      "task_id_suggestion": "DEEPSEEK_TASK_MCP_SOURCE_PATCH_DECONFLICT_REFRESH_B10_V1",
+      "summary": "Periodic refresh: re-run the B09 inventory against the live machine_task_cards_v1.jsonl to catch any new write-lane claimants that emerged after B08 wiring. Should run after every N new task_mcp cards are added or after any major wave.",
+      "owner": "future audit task, not created by this worker",
+      "requires_source_patch": false,
+      "b09_deconflict_status": "FUTURE_REFRESH"
+    }
+  ],
+
+  "not_applied_generalization": {
+    "note": "Informational only — these follow-ups are NOT created or applied by this worker. Each is its own future reviewed, gated, additive task.",
+    "generalization_target": "The B09 inventory/classify/safe-plan pattern is reusable for any future source-patch deconfliction need (not just core.py/server.py). A generalized deconflict tool could read a target path list, scan the live queue for write-lane claimants, classify them, and emit a safe/blocked verdict — but this is a future tool design task, not part of B09."
+  },
+
+  "rollback": {
+    "action": "Delete the 4 files this task added (eval JSON, eval JSONL, this next_wave file, test script). No source file was changed by this task.",
+    "trigger_conditions": [
+      "a new task_mcp card emerges with core.py or server.py in allowed_writes that was not covered by this inventory",
+      "B08 wiring coder discovers a write-lane conflict B09 missed"
+    ]
+  },
+
+  "neural_bridge_note": {
+    "doctrine": "This task performs a deterministic safety/support-boundary audit (inventory + classification + safe-plan), permitted under CLAUDE.md's explicit carve-out for controller/verifier layers. It introduces no keyword/regex cognition for task-type, tool, or route selection. The source-patch deconfliction pattern is a pre-wiring safety gate, not a cognitive routing decision.",
+    "migration_task_id_unaffected": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "not_a_bare_promise": true
+  },
+
+  "verdict": "PROPOSAL_ONLY_NOT_APPLIED"
+}

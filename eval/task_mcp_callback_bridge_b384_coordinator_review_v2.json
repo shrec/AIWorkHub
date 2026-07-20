@@ -1,0 +1,65 @@
+{
+  "schema_id": "geoai.task_mcp.callback_bridge_b384.coordinator_review.v2",
+  "reviewer": "codex_coordinator",
+  "review_date": "2026-07-15",
+  "verdict": "REJECT_REPAIR_PROTOCOL_AND_DURABILITY",
+  "candidate": {
+    "request_id": "6ed0e3becef04ffaabda4617fb002ad2",
+    "worktree": "/tmp/geoai-task-mcp-worktrees/6ed0e3becef04ffaabda4617fb002ad2/worktree",
+    "taskdb_sha256": "1ce3c70ab4a36f5ce0a8fdc497710e6684f3bcffa22ac4f781570b2ee9364b40",
+    "callback_bridge_sha256": "01931746b075c90fbe9e2db5a96edbce81f6438655396b7f6075e45f39020976",
+    "test_callback_bridge_sha256": "a4f4b9bb83bcc0202caa9b452911bb75dca3e6797d51d97c39f1e5c0949f29fb",
+    "worker_exit_code": 0,
+    "launcher_terminal_outcome": "validation_failed"
+  },
+  "local_protocol_authority": {
+    "codex_cli_version": "0.144.1",
+    "generated_with": "codex app-server generate-json-schema",
+    "client_request_schema_sha256": "5bae99085b24b4865694f23047f9ef6f36d414d72391b0a7c36e93ffff714cc2",
+    "server_notification_schema_sha256": "899cbd9cabc67a675babb78c3eac113080ea38fc4f6cce3bc2ddad4dbd8040c1"
+  },
+  "blocking_findings": [
+    {
+      "id": "WIRE_SCHEMA_MISMATCH",
+      "finding": "The candidate sends initialize.params={} although the installed schema requires clientInfo, and sends turn/start params {message,cwd,clientUserMessageId} although the installed schema requires threadId and input[]. It also emits a jsonrpc field even though the documented app-server wire omits that header.",
+      "impact": "A fake server shaped around the candidate can pass while the real installed Codex App Server rejects the wake sequence."
+    },
+    {
+      "id": "REQUEST_CORRELATION_INCOMPLETE",
+      "finding": "Only initialize response id is correlated. thread/resume uses a generated id but does not verify the matching response id; turn/start does not consume and correlate its response before waiting for turn/completed, nor does completion prove the expected thread/turn.",
+      "impact": "Unrelated interleaved responses or notifications can be misattributed as the requested wake."
+    },
+    {
+      "id": "OUTBOX_CLAIM_NOT_ATOMIC",
+      "finding": "claim_pending_callback performs SELECT followed by an unconditional UPDATE and commit. Two daemons can select and claim the same pending outbox row.",
+      "impact": "Exactly-once delivery is not established under concurrent bridge daemons."
+    },
+    {
+      "id": "STALE_MATCH_TOO_WEAK",
+      "finding": "supersede_stale_outbox_entries checks only task status review/blocked. It does not require that the outbox episode equals the current claim episode or that the queued transition equals the task's current normalized terminal outcome.",
+      "impact": "An old episode or different terminal transition can wake a newly reviewed task."
+    },
+    {
+      "id": "MIGRATION_NOT_FAIL_CLOSED",
+      "finding": "The old-schema backfill uses COALESCE(claimed_at, created_at) without NULLIF for empty claimed_at, and the table-rebuild migration catches every exception, rolls back, then silently continues even when the old lifetime UNIQUE constraint may remain.",
+      "impact": "Episode-key behavior is not guaranteed on upgraded real databases."
+    },
+    {
+      "id": "VALIDATION_RED",
+      "finding": "The registered full validation did not pass and the launcher correctly returned validation_failed. Worker-authored 57/57 tests do not supersede the contract's full suite or the installed-schema mismatch.",
+      "impact": "The candidate cannot be promoted or enabled."
+    }
+  ],
+  "required_repair": [
+    "Generate and consume the installed App Server schema in tests; initialize with clientInfo and turn/start with threadId plus input=[{type:text,text:fixed_prompt}]. Correlate initialize, thread/resume and turn/start response ids and the matching terminal notification.",
+    "Make outbox claim one SQLite transaction with a conditional state update and prove exactly one winner with two concurrent connections.",
+    "Supersede unless task status, current terminal transition and current episode all match the outbox row; prove old-episode/current-review and different-transition/current-review negatives.",
+    "Make migration idempotent and fail closed, correctly backfill empty claimed_at, verify the resulting unique index columns, and cover an actual old-schema fixture.",
+    "Run the entire registered suite plus installed-schema fake/real disposable canary; do not send a callback to the owner's live thread and do not enable the daemon before Codex acceptance."
+  ],
+  "production_state": {
+    "callback_daemon_enabled": false,
+    "real_owner_thread_callback_sent": false,
+    "candidate_promoted": false
+  }
+}

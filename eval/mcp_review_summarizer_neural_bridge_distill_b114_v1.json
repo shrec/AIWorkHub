@@ -1,0 +1,146 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_neural_bridge_distill_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+  "timestamp": "2026-07-05T12:12:42.075599+00:00",
+  "verdict": "PASS",
+  "runner": "deepseek_task_mcp_review_summarizer_neural_b114",
+  "topic": "task_mcp",
+  "mode": "mcp_review_summarizer_neural_distill_no_launch",
+  "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization, without making the deterministic summarizer a runtime authority.",
+  "build_script": "tools/geoai-task-mcp/scripts/build_mcp_review_summarizer_neural_bridge_distill_b114_v1.py",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_neural_bridge_distill_b114_v1.sh",
+  "outputs": {
+    "distill_rows_jsonl": "tools/geoai-task-mcp/eval/mcp_review_summarizer_neural_bridge_distill_rows_b114_v1.jsonl",
+    "eval_json": "tools/geoai-task-mcp/eval/mcp_review_summarizer_neural_bridge_distill_b114_v1.json",
+    "next_wave_json": "tools/geoai-task-mcp/data/tasking/mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json"
+  },
+  "acceptance_results": {
+    "curriculum_rows_emitted": 41,
+    "skills_covered": [
+      "abstain_detection",
+      "review_actionable_detection",
+      "review_priority_classification",
+      "runner_grouping",
+      "status_action_classification",
+      "tool_affordance_reasoning",
+      "topic_grouping"
+    ],
+    "skill_counts": {
+      "review_priority_classification": 6,
+      "review_actionable_detection": 6,
+      "topic_grouping": 5,
+      "runner_grouping": 6,
+      "status_action_classification": 6,
+      "abstain_detection": 4,
+      "tool_affordance_reasoning": 8
+    },
+    "review_priority_covered": true,
+    "review_actionable_covered": true,
+    "topic_grouping_covered": true,
+    "runner_grouping_covered": true,
+    "status_distinction_covered": true,
+    "abstain_detection_covered": true,
+    "tool_affordance_covered": true,
+    "process_launch_authority_false": true,
+    "write_gate_enabled_false": true,
+    "no_live_queue_mutation": true,
+    "no_agent_launch": true,
+    "no_model_launch": true,
+    "jsonl_valid": true,
+    "eval_json_valid": true
+  },
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "PROCESS_LAUNCH_AUTHORITY_FALSE": true,
+    "WRITE_GATE_ENABLED_FALSE": true
+  },
+  "curriculum_coverage": {
+    "review_priority": {
+      "covered": true,
+      "labels": [
+        "PRIORITY_HIGH",
+        "PRIORITY_MEDIUM",
+        "PRIORITY_LOW",
+        "PRIORITY_NONE",
+        "PRIORITY_UNKNOWN"
+      ]
+    },
+    "topic_grouping": {
+      "covered": true,
+      "topics": [
+        "coding",
+        "stem",
+        "translation",
+        "capability_eval",
+        "general_reasoning"
+      ]
+    },
+    "runner_grouping": {
+      "covered": true,
+      "runners": [
+        "claude_coding",
+        "claude_stem",
+        "deepseek_coding",
+        "claude_translate",
+        "claude_capability_eval",
+        "claude_general_reasoning"
+      ]
+    },
+    "status_distinction": {
+      "covered": true,
+      "action_classes": [
+        "REVIEW_READY_ACTIONABLE",
+        "BLOCKED_NEEDS_UNBLOCK",
+        "PENDING_WAITING_WORKER",
+        "DONE_NO_ACTION",
+        "UNKNOWN_ABSTAIN"
+      ]
+    },
+    "abstain_detection": {
+      "covered": true,
+      "conditions": [
+        "empty_queue",
+        "all_fetch_errors",
+        "write_gate_disabled",
+        "no_process_launch"
+      ]
+    },
+    "tool_affordance": {
+      "covered": true,
+      "sections": [
+        "ok",
+        "review_queue_raw",
+        "task_count",
+        "fetch_errors",
+        "grouped_tasks",
+        "codex_review_checklist",
+        "summary",
+        "authority_flags"
+      ]
+    }
+  },
+  "neural_bridge_compliance": {
+    "deterministic_summarizer_not_runtime_authority": true,
+    "curriculum_rows_for_neural_learning": true,
+    "no_regex_cue_routing_in_rows": true,
+    "stage_marked": "verified",
+    "migration_path": "Rows are 'verified' stage. Promote to 'distilled_training_target' after owner review and integration into actual neural curriculum."
+  },
+  "forbidden_operations_verified": [
+    "live_queue_mutation",
+    "agent_launch",
+    "model_launch",
+    "write_gate_enable_by_default",
+    "network_call",
+    "secret_logging",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  }
+}

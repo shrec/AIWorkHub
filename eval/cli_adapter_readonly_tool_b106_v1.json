@@ -1,0 +1,70 @@
+{
+  "eval_id": "cli_adapter_readonly_tool_b106_v1",
+  "task_id": "CLAUDE_TASK_MCP_CLI_ADAPTER_READONLY_TOOL_B106_V1",
+  "date": "2026-07-04",
+  "mode": "mcp_readonly_cli_plan_tool_no_process_launch",
+  "builds_on": "cli_adapter_dryrun_contract_b105_v1",
+  "verdict": "PASS",
+  "summary": "Added a strictly READ-ONLY MCP tool contract module cli_adapter_readonly_tool.py that exposes the B105 dryrun adapter as read-only tools: plan_command_readonly returns a validated would-run launch plan WITHOUT appending any audit entry (plan_dryrun audit=False), audit_summary_readonly returns a read-only summary of the write-gate audit log (core.read_audit_log), and readonly_tool_report returns both in one call. Launches nothing: no subprocess/exec/fork/shell code exists and no env flag can enable launch (launch_enabled()=False, LAUNCH_IMPLEMENTED=False). Read-only holds even with GEOAI_TASK_MCP_ALLOW_WRITES=1 -- the plan tool writes ZERO audit lines. Env values (incl. secrets) are redacted in plan/report/audit output. server.py is intentionally untouched; register(mcp) makes the future gated wiring a one-liner (tracked in the next wave).",
+  "gates": {
+    "readonly_plan_output_only": true,
+    "plan_tool_writes_no_audit_entry": true,
+    "readonly_holds_with_allow_writes_flag": true,
+    "audit_summary_view_is_read_only": true,
+    "no_process_launch_code": true,
+    "no_subprocess_import_in_module": true,
+    "launch_impossible_even_with_allow_launch_flag": true,
+    "allowlist_validation_reused_from_b105": true,
+    "manual_only_adapter_never_local_command": true,
+    "secret_env_values_redacted": true,
+    "no_secret_in_plan_report_or_audit": true,
+    "write_gate_off_by_default": true,
+    "audit_read_reuses_core_read_audit_log": true,
+    "audit_path_env_overridable": true,
+    "server_py_untouched_wiring_deferred": true,
+    "register_exposes_exactly_readonly_surface": true,
+    "parent_queue_unmutated": true,
+    "no_network_call": true,
+    "test_isolation_safe_parallel_friendly": true,
+    "smoke_test_passes": true,
+    "shell_test_passes": true
+  },
+  "invariant": {
+    "readonly": true,
+    "launch_implemented": false,
+    "launch_enabled_by_default": false,
+    "launch_enable_flag_has_no_effect": "GEOAI_TASK_MCP_ALLOW_LAUNCH ignored; no launcher exists in this contract",
+    "plan_audit_write": "plan_command_readonly calls plan_dryrun(audit=False); zero audit lines appended even with GEOAI_TASK_MCP_ALLOW_WRITES=1",
+    "write_gate_default": "GEOAI_TASK_MCP_ALLOW_WRITES=0 (off)",
+    "audit_read_reuse": "core.read_audit_log",
+    "audit_path_override_env": "GEOAI_TASK_MCP_AUDIT_LOG_PATH"
+  },
+  "readonly_tools": [
+    "geoai_cli_adapter_plan_readonly",
+    "geoai_cli_adapter_audit_summary_readonly",
+    "geoai_cli_adapter_report_readonly"
+  ],
+  "public_api": {
+    "plan_command_readonly(task_id, runner, topic, adapter_id, argv, env=None, repo=None)": "validated plan dict; writes nothing; redacts env",
+    "audit_summary_readonly(max_entries=100, repo=None)": "read-only audit-log summary (counts + last N entries)",
+    "readonly_tool_report(task_id, runner, topic, adapter_id, argv, env=None, max_audit_entries=20, repo=None)": "{plan, audit_summary} in one read-only call",
+    "redact_env(env)": "name -> <redacted-secret>|<set>|<unset>; never a value",
+    "launch_enabled()": "always False",
+    "contract_summary()": "static read-only contract shape, no side effects",
+    "register(mcp)": "register the 3 read-only tools on a FastMCP-like server; returns names; NOT called here (server wiring deferred)"
+  },
+  "neural_bridge_note": "Static command/adapter allowlist (inherited from B105) is a human-configured SAFETY boundary, not a runtime cue router. Future adapter/runner/topic launch selection must become a LEARNED routing + abstain policy tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1; no regex/keyword cognition becomes launch authority. This module is a read-only VIEW and decides no capability.",
+  "no_launch_code_marker": "This module and its tests contain NO process-launch code: no subprocess import, no child-process spawn, no os-level exec/fork, no shell invocation. Launch/process code arrives only in gated follow-ups behind all launch_preconditions.",
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py",
+    "tools/geoai-task-mcp/tests/cli_adapter_readonly_tool_smoke.py",
+    "tools/geoai-task-mcp/tests/test_cli_adapter_readonly_tool_b106_v1.sh",
+    "tools/geoai-task-mcp/eval/cli_adapter_readonly_tool_b106_v1.json",
+    "tools/geoai-task-mcp/eval/cli_adapter_readonly_tool_rows_b106_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/cli_adapter_readonly_tool_next_wave_b106_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_cli_adapter_readonly_tool_b106_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ]
+}

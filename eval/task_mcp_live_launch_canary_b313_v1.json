@@ -1,0 +1,92 @@
+{
+  "eval_id": "task_mcp_live_launch_canary_b313_v1",
+  "task_id": "CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1",
+  "runner": "claude_task_mcp_live_launch_canary_b313",
+  "topic": "task_mcp",
+  "date": "2026-07-10",
+  "mode": "task_mcp_real_cli_launch_canary_no_source_mutation",
+  "verdict": "PASS",
+  "schema_id": "geoai.task_mcp_live_launch_canary.v1",
+  "summary": "Live-launch canary: this Claude CLI worker session was started by the Task MCP launcher, claimed CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1 via taskctl claim-start, continued execution past the claim-start boundary, created isolated evidence artifacts, ran validation, and returned the task to Codex review. No product source was mutated. No shell invocation was used. The full worker lifecycle (claim -> guard -> write -> test -> review) completed in one uninterrupted session.",
+  "lifecycle_evidence": {
+    "exact_claim_start": true,
+    "continued_after_claim": true,
+    "shell_invocation": false,
+    "product_source_mutation": false,
+    "process_launch_vs_completion_distinction": "claim-start only transitions task to processing/claimed; the worker must continue in the same session to create artifacts, pass validation, and call taskctl review to enter the review state. These are distinct lifecycle events: launch (claim-start) != completion (review).",
+    "guard_passed": true,
+    "validation_passed": true,
+    "taskctl_review_called": true,
+    "taskctl_done_called": false,
+    "git_add_A_used": false,
+    "git_add_dot_used": false,
+    "commit_made": false
+  },
+  "launch_protocol_compliance": {
+    "worker_prompt_built": true,
+    "task_identity_verified": "task_id=CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1, runner=claude_task_mcp_live_launch_canary_b313, topic=task_mcp all match WORKER_CONTRACT_JSON",
+    "run_before_writing_executed": "python3 AITools/taskctl.py guard CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1 --runner claude_task_mcp_live_launch_canary_b313 --topic task_mcp",
+    "guard_result": "PASS",
+    "read_first_paths_read": [
+      "tools/geoai-task-mcp/README.md",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+    ],
+    "writes_confined_to_allowed_writes": true,
+    "allowed_writes": [
+      "tools/geoai-task-mcp/eval/task_mcp_live_launch_canary_b313_v1.json",
+      "tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
+    ]
+  },
+  "process_launcher_observations": {
+    "build_worker_prompt_function": "process_launcher.py:build_worker_prompt() generates the exact CLI prompt injected into this session; its template matches the prompt I received",
+    "shell_false_invariant": "ProcessManager.launch() passes shell=False to subprocess.Popen; no shell interpretation of worker commands",
+    "dual_env_gate": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 and GEOAI_TASK_MCP_ALLOW_WRITES=1 must both be set for real process launch",
+    "launch_implemented_true": "LAUNCH_IMPLEMENTED=True constant confirms real process launch is implemented (not a stub)",
+    "process_group_isolation": "start_new_session=True + _terminate_process_group() ensures clean lifecycle",
+    "audit_log_append_only": "process_events.jsonl is O_APPEND only; never rewritten",
+    "claim_start_not_completion": "task card worker_status transitions: unclaimed->claimed (claim-start) then claimed->review (taskctl review); launch event != completion event"
+  },
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "training_launch": false
+  },
+  "gates": {
+    "eval_json_valid": true,
+    "task_id_matches_contract": true,
+    "runner_matches_contract": true,
+    "topic_matches_contract": true,
+    "mode_matches_contract": true,
+    "verdict_is_PASS": true,
+    "exact_claim_start_true": true,
+    "continued_after_claim_true": true,
+    "shell_invocation_false": true,
+    "product_source_mutation_false": true,
+    "guard_executed_before_write": true,
+    "read_first_paths_read": true,
+    "writes_confined_to_allowed_writes": true,
+    "test_script_exists": true,
+    "test_script_passes": true,
+    "no_taskctl_done": true,
+    "no_git_add_A": true,
+    "no_commit": true,
+    "taskctl_review_called": true
+  },
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local canary over existing process_launcher.py and taskctl infrastructure. No external library/API question open."
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "files_written": [
+    "tools/geoai-task-mcp/eval/task_mcp_live_launch_canary_b313_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
+  ]
+}

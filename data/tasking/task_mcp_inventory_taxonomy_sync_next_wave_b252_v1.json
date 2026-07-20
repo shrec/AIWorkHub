@@ -1,0 +1,39 @@
+{
+  "schema_id": "geoai.task_mcp_inventory_taxonomy_sync_next_wave.b252.v1",
+  "source_task_id": "CLAUDE_TASK_MCP_INVENTORY_TAXONOMY_SYNC_PLAN_B252_V1",
+  "note": "This planning task recommends exactly ONE coordinated source_patch follow-up task bundling all 5 B251 inventory-drift proposals. The object below does not authorize a worker to self-create the task card -- it is a proposal for the coordinator/Codex to instantiate.",
+  "recommended_task": {
+    "proposal_task_id": "CLAUDE_TASK_MCP_INVENTORY_TAXONOMY_SYNC_PATCH_B253_V1",
+    "mode": "source_patch",
+    "objective": "Apply the coordinated MCP inventory/taxonomy sync patch: rebase every stale 'tool count' or 'tier membership' assertion in the repo onto the live 20-tool inventory (16 read-only + 4 write-gated) in a single atomic change, closing the drift class B107->B11 opened rather than patching it piecemeal.",
+    "bundles_proposals": [
+      "TASK_MCP_README_EXPOSED_TOOLS_SYNC_NEXT",
+      "TASK_MCP_FROZEN_CONTRACT_V2_OR_SEPARATE_INVENTORY_TEST",
+      "TASK_MCP_STDIO_SMOKE_COUNT_REBASE",
+      "TASK_MCP_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_REBASE",
+      "TASK_MCP_B250_TAXONOMY_PATCH"
+    ],
+    "allowed_writes": [
+      "tools/geoai-task-mcp/README.md",
+      "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
+      "tools/geoai-task-mcp/tests/mcp_live_tool_inventory_fixture.py",
+      "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+      "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
+      "tools/geoai-task-mcp/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh"
+    ],
+    "new_file_note": "tools/geoai-task-mcp/tests/mcp_live_tool_inventory_fixture.py is a NEW companion fixture (proposal 2, option b) -- a single source-of-truth list of the 20 live tools + tier split, derived from server.py @mcp.tool() decorators + cli_adapter_readonly_tool.READONLY_TOOL_NAMES, that README generation and the stdio smoke tests should both import instead of re-deriving or hardcoding counts.",
+    "pre_patch_step": "Re-run a static AST-based live inventory count (same method as tests/test_task_mcp_live_tool_inventory_reverify_b251_v1.sh step 5) immediately before patching, in case another worker has changed server.py/cli_adapter_readonly_tool.py since this plan's baseline (2026-07-07T21:00:00Z reverify). Do not copy this plan's counts blindly if the live AST count differs.",
+    "acceptance": [
+      "README.md 'Exposed Tools' section lists all live tools with correct tier split.",
+      "mcp_client_smoke_contract_freeze.py B108 tuples remain byte-identical (renamed export only, historical fingerprint values untouched); new companion fixture added.",
+      "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh and test_mcp_stdio_concurrent_client_smoke_b110_v1.sh assert the live readonly/write_gated counts (imported from the companion fixture, not hardcoded).",
+      "test_mcp_neural_launch_routing_dryrun_b109_v1.sh asserts collision_rows length against a freshly re-derived live curriculum row count, not a hardcoded historical number.",
+      "task_mcp_orchestrator_mvp_protocol_b250_v1.json TIER_1 includes geoai_task_codex_handoff_markdown (implemented:true) and geoai_supervisor_loop_status.implemented==true; its paired test total_tools assertion updated in the same change.",
+      "Full parallel test bundle for tools/geoai-task-mcp/tests re-run green after the patch (bounded worker pool, do not oversubscribe if other workers are active)."
+    ],
+    "priority": "medium",
+    "rationale_for_single_coordinated_task": "All 5 proposals rebase test/doc assertions onto the SAME underlying live-inventory fact (20 tools, 16/4 tier split). Splitting them into 5 separate patch tasks risks each worker deriving the count independently and landing mutually inconsistent numbers -- which already happened once inside B251 itself (STALE_3's 14-vs-16 arithmetic slip, corrected by this plan). A single task with one source-of-truth derivation step, applied atomically across all 8 target files, eliminates that failure mode."
+  }
+}

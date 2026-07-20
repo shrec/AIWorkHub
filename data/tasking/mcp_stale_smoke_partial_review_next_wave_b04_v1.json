@@ -1,0 +1,29 @@
+{
+  "schema_id": "geoai.mcp_stale_smoke_partial_review_next_wave.v1",
+  "generated_by": "DEEPSEEK_TASK_MCP_STALE_SMOKE_PARTIAL_REVIEW_B04_V1",
+  "generated_at": "2026-07-08T14:00:00.000000+00:00",
+  "mode": "codex_execution_only",
+  "note": "Codex should run recover-stale for B119 (safe, no force needed). Then re-queue B119 for a fresh worker to update the stale test assertions.",
+  "actions": [
+    {
+      "action": "recover-stale",
+      "group": "safe_no_artifacts",
+      "count": 1,
+      "risk": "NONE — present files predate task (different B-numbers), 2 B119 outputs confirmed missing. No B119 artifacts to clobber.",
+      "commands": [
+        "python3 AITools/taskctl.py recover-stale DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"
+      ]
+    },
+    {
+      "action": "requeue_after_recover",
+      "note": "After recovery, B119 will be pending. A fresh worker should claim it and update the 3 test files' stale tool-count assertions (15->20 total tools, 11->? readonly) plus produce the 2 eval/data outputs.",
+      "required_updates": [
+        "Update total_tools_visible from 15 to 20 in B109/B110 shell tests",
+        "Update readonly_tool_count if changed",
+        "Update mvp_contract_audit tool list to include 9 new tools",
+        "Produce mcp_stale_smoke_inventory_refresh_b119_v1.json",
+        "Produce mcp_stale_smoke_inventory_refresh_next_wave_b119_v1.json"
+      ]
+    }
+  ]
+}

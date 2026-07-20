@@ -1,0 +1,68 @@
+{
+  "eval_id": "cli_adapter_dryrun_contract_b105_v1",
+  "task_id": "CLAUDE_TASK_MCP_CLI_ADAPTER_DRYRUN_CONTRACT_B105_V1",
+  "date": "2026-07-04",
+  "mode": "mcp_cli_adapter_contract_no_process_launch",
+  "builds_on": "phase2_orchestration_contract_b104_v1",
+  "verdict": "PASS",
+  "summary": "Added DRYRUN-ONLY CLI adapter contract module cli_adapter_dryrun.py: validates argv against a static command allowlist, produces a would-run plan, and appends append-only audit entries via core.write_audit_entry. Launches nothing: no subprocess/exec/fork/shell code exists and no env flag can enable launch (LAUNCH_IMPLEMENTED=False, launch_enabled()=False). Write gate stays OFF by default; env values (incl. secrets) are redacted in plan and audit output.",
+  "gates": {
+    "no_process_launch_code": true,
+    "no_subprocess_import_in_module": true,
+    "launch_impossible_even_with_allow_launch_flag": true,
+    "allowlist_validation_only": true,
+    "manual_only_adapter_never_local_command": true,
+    "blocked_commands_audited": true,
+    "secret_env_values_redacted": true,
+    "no_secret_in_audit_log": true,
+    "write_gate_off_by_default": true,
+    "audit_reuses_core_write_audit_entry": true,
+    "audit_path_env_overridable": true,
+    "parent_queue_unmutated": true,
+    "no_network_call": true,
+    "test_isolation_safe_parallel_friendly": true,
+    "smoke_test_passes": true,
+    "shell_test_passes": true
+  },
+  "invariant": {
+    "launch_implemented": false,
+    "launch_enabled_by_default": false,
+    "launch_enable_flag_has_no_effect": "GEOAI_TASK_MCP_ALLOW_LAUNCH ignored; no launcher exists in this contract",
+    "write_gate_default": "GEOAI_TASK_MCP_ALLOW_WRITES=0 (off)",
+    "audit_reuse": "core.write_audit_entry",
+    "audit_path_override_env": "GEOAI_TASK_MCP_AUDIT_LOG_PATH"
+  },
+  "command_allowlist": [
+    "claude",
+    "codex",
+    "python3 AITools/taskctl.py auto-pickup",
+    "python3 AITools/taskctl.py contract",
+    "python3 AITools/taskctl.py show",
+    "python3 AITools/taskctl.py review",
+    "python3 AITools/taskctl.py collision-guard",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py usage"
+  ],
+  "public_api": {
+    "validate_command(argv)": "CommandValidation(ok, binary, argv, decision, blocked_reason, is_manual_only)",
+    "plan_dryrun(task_id, runner, topic, adapter_id, argv, repo=None, audit=True)": "plan dict; executes nothing; appends audit entry",
+    "redact_env(env)": "name -> <redacted-secret>|<set>|<unset>; never a value",
+    "build_argv_template(adapter_id, prompt, repo=None)": "argv-list template only; [] for deepseek_manual",
+    "launch_enabled()": "always False",
+    "contract_summary()": "static contract shape, no side effects"
+  },
+  "neural_bridge_note": "Static command allowlist is a human-configured SAFETY boundary, not a runtime cue router. Future adapter/runner/topic launch selection must become a LEARNED routing + abstain policy tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1; no regex/keyword cognition becomes launch authority.",
+  "no_launch_code_marker": "This module and its tests contain NO process-launch code: no subprocess import, no child-process spawn, no os-level exec/fork, no shell invocation. Launch/process code arrives only in gated Phase-2 follow-ups behind all launch_preconditions.",
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+    "tools/geoai-task-mcp/tests/cli_adapter_dryrun_smoke.py",
+    "tools/geoai-task-mcp/tests/test_cli_adapter_dryrun_contract_b105_v1.sh",
+    "tools/geoai-task-mcp/eval/cli_adapter_dryrun_contract_b105_v1.json",
+    "tools/geoai-task-mcp/eval/cli_adapter_dryrun_contract_rows_b105_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/cli_adapter_dryrun_contract_next_wave_b105_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_cli_adapter_dryrun_contract_b105_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "schema_id": "geoai.task_mcp.validation_env_prefix_repair.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VALIDATION_ENV_PREFIX_B625_V1",
+  "worker_terminal_label": "validation_failed",
+  "worker_terminal_disposition": "environment_only_private_home_missing_pytest",
+  "coordinator_verdict": "ACCEPT_WITH_BOUNDED_CORRECTION",
+  "root_cause": "A leading PYTHONPATH=<value> validation token was passed as argv[0] instead of a validation-scoped environment override.",
+  "accepted_scope": {
+    "assignment_names": ["PYTHONPATH"],
+    "max_leading_assignments": 1,
+    "shell": false,
+    "parent_environment_mutation": false,
+    "evidence_contains_values": false,
+    "relative_components_must_exist_beneath_worktree": true,
+    "worktree_root_component": ".",
+    "approved_absolute_components": ["current_interpreter_user_site_packages_only"],
+    "bubblewrap_absolute_mount": "read_only_private_validation_mount"
+  },
+  "rejected": [
+    "unknown_environment_assignment",
+    "multiple_environment_assignments",
+    "empty_component",
+    "traversal",
+    "unapproved_absolute_path",
+    "non_directory",
+    "symlink_component",
+    "glob",
+    "command_substitution",
+    "parameter_expansion",
+    "shell_metacharacters"
+  ],
+  "coordinator_validation": {
+    "worker_workspace_process_launcher_security_tests": "60 passed",
+    "py_compile": "PASS",
+    "live_card_validation_prefix_commands": 16,
+    "live_card_validation_prefix_tasks": 8,
+    "live_card_parse_failures": 0,
+    "scoped_subprocess_no_leak_test": "PASS"
+  },
+  "changed_paths": {
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py": "b09a27a4b8be31039c198bcbd0ce7db9e9b2946e33afb278b16a31e419dea5b2",
+    "tools/geoai-task-mcp/tests/test_worker_workspace.py": "9c6cea868c1fab5a300f74f9ec5672d83e295700179eb49c3c1a3372202d934e"
+  },
+  "preserved": [
+    "process_launcher",
+    "callback_bridge",
+    "dashboard",
+    "runner_authority",
+    "promotion_policy",
+    "required_output_policy",
+    "archive_restore",
+    "liveness",
+    "provider_credentials"
+  ],
+  "remaining_blocker": "reload the long-lived Task MCP server so it consumes current B623 runner authority and B625 validation parsing"
+}

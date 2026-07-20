@@ -1,0 +1,22 @@
+{
+  "schema_id": "geoai.readonly_tools_smoke_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_READONLY_TOOL_SMOKE_V1",
+  "timestamp": "2026-07-04T09:00:00+00:00",
+  "next_wave": [
+    {
+      "task_id_hint": "DEEPSEEK_TASK_MCP_READONLY_TOOL_SMOKE_INTEGRATION_V1",
+      "topic": "task_mcp",
+      "runner": "deepseek_task_mcp_readonly_smoke_v1",
+      "priority": 2,
+      "reason": "If v1 smoke passes but reveals gaps, a v2 integration round may wire MCP server start/stop and stdio transport testing."
+    },
+    {
+      "task_id_hint": "DEEPSEEK_TASK_MCP_WRITE_GATE_AUDIT_V1",
+      "topic": "task_mcp",
+      "runner": "deepseek_task_mcp_write_audit_v1",
+      "priority": 1,
+      "reason": "Systematic audit that every write-gated tool is unreachable with ALLOW_WRITES=0, including edge cases (empty runner, missing topic)."
+    }
+  ],
+  "notes": "These are suggested follow-on tasks; not yet in the formal queue. Codex decides promotion."
+}

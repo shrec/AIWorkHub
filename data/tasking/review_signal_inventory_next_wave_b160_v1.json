@@ -1,0 +1,98 @@
+{
+  "next_wave_id": "review_signal_inventory_next_wave_b160_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SIGNAL_INVENTORY_B160_V1",
+  "date": "2026-07-06",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued. Inventory identified 6 signal categories, 6 MCP exposure gaps, and 7 recommended neural priority target fields. Follow-up tasks below are ordered by priority (P0->P1->P2).",
+  "inventory_summary": {
+    "total_cards_scanned": "~2700",
+    "signal_categories": ["risk", "change_size", "validation", "cost", "collision", "staleness"],
+    "gaps_found": 6,
+    "neural_targets_recommended": 7
+  },
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_SIGNAL_COMPACT_VIEW_B161_V1",
+      "goal": "Add a new MCP tool geoai_task_review_compact that returns only the P0 neural priority fields (risk_level, change_scope, collision_risk) plus task_id, topic, runner, and status for every review-queue task in a single compact response. No mutation, no card_json dump.",
+      "mode": "NO_COMMIT",
+      "priority": "P0",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_review_signal_compact_view_b161_v1.sh",
+        "tools/geoai-task-mcp/eval/review_signal_compact_view_b161_v1.json"
+      ],
+      "acceptance": [
+        "new MCP tool returns <=5 fields per task for the full review queue",
+        "no card_json included; no write-gate change",
+        "bash test passes"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_SIGNAL_PER_TASK_VALIDATION_B162_V1",
+      "goal": "Add per-task validation-result storage so taskctl review can record test pass/fail, and MCP can expose validation_gate per task. Currently verify is queue-wide only.",
+      "mode": "NO_COMMIT",
+      "priority": "P1",
+      "allowed_writes": [
+        "AITools/taskdb.py",
+        "AITools/taskctl.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_per_task_validation_b162_v1.sh"
+      ],
+      "acceptance": [
+        "taskdb schema extended with validation_result column or events table row",
+        "taskctl review --test-pass/--test-fail flag records result",
+        "MCP geoai_task_show returns validation_gate field",
+        "bash test passes"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_SIGNAL_COST_JOIN_B163_V1",
+      "goal": "Join usage_report token/cost data into geoai_task_show and geoai_task_review_compact so cost signals are available without a separate MCP call.",
+      "mode": "NO_COMMIT",
+      "priority": "P1",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_cost_join_b163_v1.sh"
+      ],
+      "acceptance": [
+        "geoai_task_show response includes input_tokens, output_tokens, cost_usd when usage exists",
+        "no new DB table; joins from existing usage_events",
+        "bash test passes"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_SIGNAL_NEURAL_PRIORITY_DRYRUN_B164_V1",
+      "goal": "Train a shadow neural priority ranker on the B160 inventory fields and measure ranking agreement with Codex review order on historical finished tasks. Uses the P0-P2 target fields from this inventory.",
+      "mode": "NO_COMMIT",
+      "priority": "P1",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/scripts/train_review_neural_priority_dryrun_b164_v1.py",
+        "tools/geoai-task-mcp/eval/review_neural_priority_dryrun_b164_v1.json",
+        "bitnnv2/data/curriculum/review_priority_targets_b164_v1.jsonl",
+        "tools/geoai-task-mcp/tests/test_review_neural_priority_dryrun_b164_v1.sh"
+      ],
+      "acceptance": [
+        "ranking agreement measured against Codex actual review order",
+        "P0 fields alone achieve >=0.7 rank correlation",
+        "no runtime authority; shadow-only with abstain label",
+        "bash test passes"
+      ]
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SIGNAL_STALENESS_TIER_B165_V1",
+      "goal": "Add staleness_tier signal computed from age_hours and review_wait_hours percentiles, exposed in geoai_task_review_compact for automated staleness flagging.",
+      "mode": "NO_COMMIT",
+      "priority": "P2",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_staleness_tier_b165_v1.sh"
+      ],
+      "acceptance": [
+        "staleness_tier enum: fresh(<24h), normal(24h-7d), aging(7d-30d), stale(>30d)",
+        "computed from actual timestamps at query time",
+        "bash test passes"
+      ]
+    }
+  ]
+}

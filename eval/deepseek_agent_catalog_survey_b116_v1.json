@@ -1,0 +1,242 @@
+{
+  "eval_id": "deepseek_agent_catalog_survey_b116_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AGENT_CATALOG_SURVEY_B116_V1",
+  "date": "2026-07-05",
+  "timestamp": "2026-07-05T12:37:36.089888+00:00",
+  "mode": "adapter_survey_no_launch_no_install",
+  "source": "deepseek-ai/awesome-deepseek-agent GitHub catalog (2026-07-05 snapshot)",
+  "verdict": "PASS",
+  "summary": "Scored 23 catalog entries across 6 dimensions. Top: deepseek_tui, claude_code, reasonix, copilot_cli, codex. DeepSeek-TUI is S-tier (score=23/24).",
+  "authority_flags": {
+    "launch_enabled": false,
+    "install_performed": false,
+    "workflow_switch": false,
+    "write_gate_default_off": true
+  },
+  "scoring_dimensions": [
+    "cli_availability",
+    "mcp_compatibility",
+    "non_interactive_mode",
+    "auditability",
+    "sandboxability",
+    "cost_control_fit"
+  ],
+  "max_score": 24,
+  "total_candidates": 23,
+  "tiers": {
+    "S_TIER": {
+      "ids": [
+        "deepseek_tui"
+      ],
+      "count": 1,
+      "threshold": "score >= 20"
+    },
+    "A_TIER": {
+      "ids": [
+        "claude_code",
+        "reasonix"
+      ],
+      "count": 2,
+      "threshold": "16 <= score < 20"
+    },
+    "B_TIER": {
+      "ids": [
+        "copilot_cli",
+        "codex",
+        "crush",
+        "oh_my_pi",
+        "langcli",
+        "opencode",
+        "pi",
+        "qwen_code"
+      ],
+      "count": 8,
+      "threshold": "12 <= score < 16"
+    }
+  },
+  "top_worker_candidates": [
+    {
+      "rank": 1,
+      "id": "deepseek_tui",
+      "name": "DeepSeek-TUI",
+      "kind": "terminal_cli",
+      "overall_score": 23,
+      "tier": "S_TIER",
+      "scores": {
+        "cli_availability": 4,
+        "mcp_compatibility": 4,
+        "non_interactive_mode": 4,
+        "auditability": 3,
+        "sandboxability": 4,
+        "cost_control_fit": 4
+      }
+    },
+    {
+      "rank": 2,
+      "id": "claude_code",
+      "name": "Claude Code",
+      "kind": "terminal_cli",
+      "overall_score": 17,
+      "tier": "A_TIER",
+      "scores": {
+        "cli_availability": 4,
+        "mcp_compatibility": 3,
+        "non_interactive_mode": 4,
+        "auditability": 3,
+        "sandboxability": 1,
+        "cost_control_fit": 2
+      }
+    },
+    {
+      "rank": 3,
+      "id": "reasonix",
+      "name": "Reasonix",
+      "kind": "terminal_cli",
+      "overall_score": 16,
+      "tier": "A_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 3,
+        "non_interactive_mode": 2,
+        "auditability": 2,
+        "sandboxability": 2,
+        "cost_control_fit": 4
+      }
+    },
+    {
+      "rank": 4,
+      "id": "copilot_cli",
+      "name": "GitHub Copilot CLI",
+      "kind": "terminal_cli",
+      "overall_score": 14,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 4,
+        "mcp_compatibility": 3,
+        "non_interactive_mode": 2,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 2
+      }
+    },
+    {
+      "rank": 5,
+      "id": "codex",
+      "name": "Codex (OpenAI)",
+      "kind": "terminal_cli",
+      "overall_score": 13,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 2,
+        "non_interactive_mode": 3,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 2
+      }
+    },
+    {
+      "rank": 6,
+      "id": "crush",
+      "name": "Crush",
+      "kind": "terminal_cli",
+      "overall_score": 13,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 3,
+        "non_interactive_mode": 1,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 3
+      }
+    },
+    {
+      "rank": 7,
+      "id": "oh_my_pi",
+      "name": "Oh My Pi",
+      "kind": "terminal_cli",
+      "overall_score": 13,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 3,
+        "non_interactive_mode": 2,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 2
+      }
+    },
+    {
+      "rank": 8,
+      "id": "langcli",
+      "name": "Langcli",
+      "kind": "terminal_cli",
+      "overall_score": 12,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 2,
+        "non_interactive_mode": 2,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 2
+      }
+    },
+    {
+      "rank": 9,
+      "id": "opencode",
+      "name": "OpenCode",
+      "kind": "terminal_cli",
+      "overall_score": 12,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 2,
+        "non_interactive_mode": 1,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 3
+      }
+    },
+    {
+      "rank": 10,
+      "id": "pi",
+      "name": "Pi",
+      "kind": "terminal_cli",
+      "overall_score": 12,
+      "tier": "B_TIER",
+      "scores": {
+        "cli_availability": 3,
+        "mcp_compatibility": 2,
+        "non_interactive_mode": 1,
+        "auditability": 2,
+        "sandboxability": 1,
+        "cost_control_fit": 3
+      }
+    }
+  ],
+  "gates": {
+    "launch_enabled": false,
+    "install_performed": false,
+    "next_experiment_disabled_by_default": true,
+    "no_process_launch_code": true,
+    "no_api_key_write": true,
+    "no_workflow_switch": true,
+    "survey_readonly": true
+  },
+  "recommended_next_adapter_experiment": {
+    "candidate_id": "deepseek_tui",
+    "reason": "Highest score (S-tier). Native MCP client+server, sandboxed tools (Seatbelt/Landlock), one-shot mode (deepseek -p), direct api.deepseek.com.",
+    "disabled_by_default": true,
+    "mode": "dryrun_plan_only_no_launch",
+    "preconditions": [
+      "shutil.which('deepseek') presence probe ONLY (read-only, never spawns)",
+      "ALLOW_LAUNCH=0 (default, unchanged)",
+      "ALLOW_WRITES=0 (default, unchanged)",
+      "No install performed",
+      "Adapter registration is data-only"
+    ]
+  },
+  "neural_bridge_note": "Survey is deterministic data artifact. Future adapter SELECTION must be LEARNED routing (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1). No regex/keyword cue router."
+}

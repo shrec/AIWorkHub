@@ -1,0 +1,72 @@
+{
+  "schema_id": "geoai.task_mcp_supervisor_loop_status_wiring_next_wave.b11.v1",
+  "proposal_id": "MCP_SUPERVISOR_LOOP_STATUS_WIRING_NEXT_WAVE_B11_V1",
+  "status": "design_only_not_applied_this_task",
+  "source_task": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_RETRY_B11_V1",
+  "supersedes": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_B10_V1 (stale, no artifacts) and closes the B09 proposal CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1",
+
+  "this_task_scope": {
+    "artifacts_added_or_modified": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (supervisor_loop_status, LIFECYCLE_TO_SUPERVISOR_STATE, _parse_show_task_card, _extract_collision_report -- additive append only)",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_supervisor_loop_status tool -- additive insert only)",
+      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_b11_v1.json",
+      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_rows_b11_v1.jsonl",
+      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_wiring_next_wave_b11_v1.json",
+      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh"
+    ],
+    "source_code_changed": true,
+    "source_code_change_type": "additive_append_only_no_existing_lines_touched",
+    "process_launch": false,
+    "task_status_mutated": false,
+    "write_gate": "off (untouched)"
+  },
+
+  "wiring_status": {
+    "verdict": "COMPLETE",
+    "note": "The B08 contract's future_source_patch_paths for core.py and server.py are now both applied and test-covered. This closes the open wiring gap that B10 falsely claimed done and that B09 left as its sole open proposal."
+  },
+
+  "not_applied_generalization_next_wave": {
+    "note": "Informational only -- not created or applied by this worker. Each remains its own future reviewed, gated, additive task.",
+    "proposed_next_wave_tasks": [
+      {
+        "task_id_suggestion": "MCP_SUPERVISOR_LOOP_STATUS_REAL_CALLER_INTEGRATION_V1",
+        "summary": "Wire an actual Codex/supervisor consumer to call geoai_supervisor_loop_status with a real previous_snapshot held from its own last observation, instead of the current per-call synthetic/no-snapshot usage in this task's tests. This is a caller-side integration task, not a change to the tool itself.",
+        "owner": "future integration task, not created by this worker",
+        "requires_source_patch": "caller-side only; supervisor_loop_status itself needs no change"
+      }
+    ]
+  },
+
+  "required_tests_verified_by_this_task": [
+    "core.supervisor_loop_status callable + LIFECYCLE_TO_SUPERVISOR_STATE mapping exact",
+    "server.geoai_supervisor_loop_status registered, existing ~15+ tools preserved",
+    "live_real_task (clean_task) scenario against the live queue",
+    "not_found scenario (stdout-string miss detection, not returncode)",
+    "runner_topic_mismatch: 4-example direct cross-validation + 2 tool-integration calls (mismatched + allowed control)",
+    "fixture_missing_artifact: pure filesystem existence check",
+    "fixture_collision: scan_collisions cross-validation + full tool-integration via monkeypatched collision_guard",
+    "fixture_stale_task: worker_status unclaimed->claimed mismatch",
+    "fixture_failed_validation: relay-only verdict=failed, plus verdict=None/passed control",
+    "server_tool_wiring: registered tool callable, exact output_schema keys, queue/manifest/audit-log byte-identical before/after",
+    "full-session no-mutation proof (sha256 of queue jsonl + manifest + audit log identical before vs after all 8 scenario groups)",
+    "taskctl verify PASS"
+  ],
+
+  "rollback": {
+    "action": "Revert the two additive hunks in core.py/server.py (pure append/insert, no reordering of existing code) and delete the 4 new artifact files this task added. No other file is touched.",
+    "trigger_conditions": [
+      "a future audit finds an undocumented task_status_mutation or audit_write reachable from supervisor_loop_status",
+      "the B08 error_taxonomy is revised and this implementation diverges from the new spec"
+    ]
+  },
+
+  "neural_bridge_note": {
+    "doctrine": "supervisor_loop_status is a deterministic safety/support-boundary derivation composed entirely of pre-existing pure/read-only functions (show_task, check_runner_topic_allowlist, collision_guard, _lifecycle_state) -- it introduces no new keyword/regex cue-router cognition for task-type, tool, or route selection. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
+    "migration_task_id_unaffected": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "curriculum_path_unaffected": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "not_a_bare_promise": true
+  },
+
+  "verdict": "WIRING_COMPLETE_MINIMAL_NEXT_WAVE_NO_BUSYWORK"
+}

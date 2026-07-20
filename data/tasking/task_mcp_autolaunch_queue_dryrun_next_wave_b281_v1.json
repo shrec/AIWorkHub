@@ -1,0 +1,130 @@
+{
+  "schema_id": "geoai.task_mcp_autolaunch_queue_dryrun_next_wave.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1",
+  "runner": "deepseek_task_mcp_autolaunch_b281",
+  "topic": "task_mcp",
+  "created_at": "2026-07-08",
+  "status": "dryrun_spec_complete",
+  "next_wave_cards": [
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1",
+      "runner": "claude_task_mcp_queue_request_b282",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_queue_request_tool_implement_readonly_envelope",
+      "objective": "Implement the geoai_task_queue_request MCP tool in server.py per B281 section_1 queue_request_envelope schema. The tool accepts a queue_request JSON, validates it against the schema, checks idempotency (same request_id = no-op if still live), and returns the request status. No process launch -- the tool is a write-through to a new queue_requests JSONL append-only log at tools/geoai-task-mcp/data/audit/mcp_queue_requests_b282_v1.jsonl.",
+      "acceptance": [
+        "New tool geoai_task_queue_request registered additively in server.py; existing tools unchanged (list_tools count check)",
+        "queue_request JSON validated against B281 section_1 schema; rejects malformed requests",
+        "Idempotency: same request_id submitted twice returns {status: 'duplicate', original_status: <current_state>}",
+        "Valid requests appended to mcp_queue_requests_b282_v1.jsonl with all envelope fields",
+        "request_id is deterministic sha1(task_id + runner + requested_at)[:16]",
+        "No process spawn; LAUNCH_IMPLEMENTED remains false",
+        "Shell test validates schema, idempotency, and append behavior"
+      ],
+      "depends_on": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1 (this spec)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/queue_request.py",
+        "tools/geoai-task-mcp/eval/mcp_queue_request_tool_b282_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_queue_request_tool_b282_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B283_V1",
+      "runner": "claude_task_mcp_stale_recovery_b283",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_stale_recovery_orchestrator_readonly_detect",
+      "objective": "Implement a stale_recovery_orchestrator module that consumes build_completion_inbox()['stale_processing'] and produces a ranked recovery action list per B281 section_2 stale_recovery_flow. Actions: requeue (reset to pending with new runner), mark_done (superseded), kill_zombie (SIGTERM/SIGKILL if PID alive), or escalate_to_owner (unkillable zombie). No automatic execution of kill/requeue -- only detection and ranked recommendation.",
+      "acceptance": [
+        "Module produces recovery_actions list from stale_processing facet input",
+        "Each action has: task_id, action_type (requeue|mark_done|kill_zombie|escalate), confidence, reason",
+        "Zombie detection: checks /proc/<pid> for recorded worker PIDs from launch log",
+        "Ranking: kill_zombie > requeue > mark_done > escalate (most recoverable first)",
+        "No automatic kill/requeue execution; all actions are recommendations only",
+        "Shell test with fixture stale_processing data covering all 4 action types"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 (needs queue_request log for PID tracking)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/stale_recovery.py",
+        "tools/geoai-task-mcp/eval/mcp_stale_recovery_orchestrator_b283_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_stale_recovery_orchestrator_b283_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B284_V1",
+      "runner": "claude_task_mcp_cost_ledger_b284",
+      "topic": "task_mcp",
+      "priority": "medium",
+      "mode": "mcp_cost_ledger_aggregator_readonly_union",
+      "objective": "Implement geoai_task_cost_ledger MCP tool that UNIONs the 15-field launch log (B276 section_3) and geoai_task_usage_report (existing tool) into a unified per-topic/per-runner/per-day cost view per B281 section_3 reconciliation_rules. Read-only: consumes two existing read paths, produces aggregates. No new write path.",
+      "acceptance": [
+        "New tool geoai_task_cost_ledger registered additively in server.py",
+        "UNION of launch_log + taskctl_usage with dedup by (task_id, runner, model)",
+        "Aggregates: total_cost_usd by topic, by runner, by day; per-task detail on request",
+        "Reconciliation rule: launch_log wins for gate events, taskctl_usage wins for final token counts",
+        "No write to any file; pure read-only aggregation",
+        "Shell test with fixture launch log + usage data"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 (needs launch log to have entries)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cost_ledger.py",
+        "tools/geoai-task-mcp/eval/mcp_cost_ledger_aggregator_b284_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_cost_ledger_aggregator_b284_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CODEX_TASK_MCP_QUEUE_ORCHESTRATION_LOOP_WIRING_B285_V1",
+      "runner": "codex_task_mcp_queue_loop_b285",
+      "topic": "task_mcp",
+      "priority": "critical",
+      "mode": "codex_orchestration_loop_queue_integration",
+      "objective": "Wire the full B281 queue flow into Codex's orchestration loop: auto_pickup -> queue_request creation (if CLAIMED and needs launch) -> completion_inbox delta polling -> review -> cost ledger recording. This is the FIRST task that actually connects the MCP queue tools into Codex's real orchestration cadence, replacing the manual 'copy command block to worker' flow.",
+      "acceptance": [
+        "Codex loop: auto_pickup -> detect CLAIMED -> create queue_request -> poll completion_inbox -> review -> commit",
+        "Stale detection integrated: Codex checks stale_processing each loop iteration, triggers recovery actions",
+        "Cost ledger consulted before launching: if topic budget exceeded, skip launch and notify owner",
+        "DeepSeek manual adapter: Codex prints the command block for owner to copy (unchanged from current flow)",
+        "Dry-run mode (--dryrun) prints what WOULD be launched without creating queue_request"
+      ],
+      "depends_on": [
+        "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1",
+        "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B283_V1",
+        "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B284_V1",
+        "CLAUDE_TASK_MCP_COMPLETION_INBOX_DELTA_TOOL_B278_V1 (B277 next_wave, for delta polling)"
+      ],
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
+        "AITools/taskctl.py",
+        ".github/copilot-instructions.md"
+      ]
+    }
+  ],
+  "blockers": [
+    "LAUNCH_IMPLEMENTED_STILL_FALSE: G4 gate (B276 section_2) must be set to true before any process is actually spawned. This requires CODEX_TASK_MCP_AUTOLAUNCH_WIRE_PROCESS_B279_V1 to complete first.",
+    "OWNER_DELIVERY_CHANNEL_UNDECIDED: Per B277 blocker 1, no notification target exists for stale/failure/collision events that need owner attention.",
+    "DEEPSEEK_MANUAL_ADAPTER_IS_BY_DESIGN: DeepSeek runs as a separate chat session; the queue flow for deepseek_manual is always 'print command block for owner to copy' -- this is correct behavior, not a gap."
+  ],
+  "notes": {
+    "b281_synthesis_value": "B281 connects three previously separate specs (B276 autolaunch, B277 notification loop, B275 completion_inbox) into ONE coherent end-to-end queue flow. Before B281, each spec described its own piece; B281 defines how they compose: queue_request -> gate check -> launch -> completion_inbox detection -> stale recovery -> usage accounting -> cost ledger.",
+    "state_machine_formalization": "The 9-state/12-transition state machine in B281 section_4 is the first formal specification of the FULL task lifecycle across all MCP tools. Previously, lifecycle was implicit across taskctl states + completion_inbox facets + B276 launch states. B281 makes it explicit and testable.",
+    "implementation_order": "B282 (queue_request tool) -> B283 (stale recovery) + B284 (cost ledger) can run in parallel after B282. B278 (delta tool, B277 next_wave) is a prerequisite for B285 (Codex loop wiring). B279 (process spawn, B276 next_wave) is the final gate before any real launch."
+  }
+}

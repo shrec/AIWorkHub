@@ -1,0 +1,137 @@
+{
+  "schema_id": "geoai.review_artifact_strictness_guard_eval.v1",
+  "contract": "B120_v1_review_artifact_strictness_guard_readonly",
+  "task_id": "CLAUDE_TASK_MCP_REVIEW_ARTIFACT_STRICTNESS_GUARD_B120_V1",
+  "runner": "claude_task_mcp_review_strict_b120",
+  "topic": "task_mcp",
+  "mode": "review_artifact_strictness_guard_no_queue_mutation",
+  "verdict": "PASS",
+  "checks_total": 3,
+  "checks_passed": 3,
+  "checks_failed": 0,
+  "acceptance_results": {
+    "mcp_full_wave_dryrun_harness_b119_v1": "PASS - invalid=False reviewer_action=accept_for_codex_review reasons=[]",
+    "mcp_codex_handoff_markdown_render_b119_v1": "PASS - invalid=False reviewer_action=accept_for_codex_review reasons=[]",
+    "launch_queue_persist_audit_b119_v1": "PASS - invalid=False reviewer_action=accept_for_codex_review reasons=[]"
+  },
+  "wave_results": [
+    {
+      "wave": "mcp_full_wave_dryrun_harness_b119_v1",
+      "invalid": false,
+      "invalid_reasons": [],
+      "reviewer_action": "accept_for_codex_review",
+      "checked": {
+        "eval_json": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_full_wave_dryrun_harness_b119_v1.json",
+          "exists": true,
+          "size_bytes": 19961,
+          "verdict": "PASS",
+          "has_metric_container": true,
+          "has_bare_counts_only": false,
+          "reasons": []
+        },
+        "rows_jsonl": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_full_wave_dryrun_harness_rows_b119_v1.jsonl",
+          "exists": true,
+          "size_bytes": 20096,
+          "reasons": []
+        },
+        "test_script": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_mcp_full_wave_dryrun_harness_b119_v1.sh",
+          "exists": true,
+          "size_bytes": 7960,
+          "effective_line_count": 133,
+          "has_substance": true,
+          "is_unbound_positional": false,
+          "reasons": []
+        },
+        "extra_scripts": [
+          {
+            "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/scripts/build_mcp_full_wave_dryrun_harness_b119_v1.py",
+            "exists": true,
+            "size_bytes": 22166,
+            "effective_line_count": 410,
+            "has_dummy_marker": false,
+            "has_real_io": true,
+            "is_unbound_positional": false,
+            "reasons": []
+          }
+        ]
+      }
+    },
+    {
+      "wave": "mcp_codex_handoff_markdown_render_b119_v1",
+      "invalid": false,
+      "invalid_reasons": [],
+      "reviewer_action": "accept_for_codex_review",
+      "checked": {
+        "eval_json": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_codex_handoff_markdown_render_b119_v1.json",
+          "exists": true,
+          "size_bytes": 5241,
+          "verdict": "PASS",
+          "has_metric_container": true,
+          "has_bare_counts_only": false,
+          "reasons": []
+        },
+        "rows_jsonl": null,
+        "test_script": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
+          "exists": true,
+          "size_bytes": 13928,
+          "effective_line_count": 270,
+          "has_substance": true,
+          "is_unbound_positional": false,
+          "reasons": []
+        },
+        "extra_scripts": []
+      }
+    },
+    {
+      "wave": "launch_queue_persist_audit_b119_v1",
+      "invalid": false,
+      "invalid_reasons": [],
+      "reviewer_action": "accept_for_codex_review",
+      "checked": {
+        "eval_json": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/launch_queue_persist_audit_b119_v1.json",
+          "exists": true,
+          "size_bytes": 5732,
+          "verdict": "PASS",
+          "has_metric_container": true,
+          "has_bare_counts_only": false,
+          "reasons": []
+        },
+        "rows_jsonl": null,
+        "test_script": {
+          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh",
+          "exists": true,
+          "size_bytes": 11242,
+          "effective_line_count": 201,
+          "has_substance": true,
+          "is_unbound_positional": false,
+          "reasons": []
+        },
+        "extra_scripts": []
+      }
+    }
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_QUEUE_MUTATION": true,
+    "MACHINE_READABLE_INVALID_REASONS": true,
+    "MACHINE_READABLE_REVIEWER_ACTION": true,
+    "FULL_WAVE_REPAIR_ACCEPTED": true,
+    "LIVE_WAVES_PASS": true
+  },
+  "authority_flags": {
+    "readonly": true,
+    "process_launch": false,
+    "queue_mutation": false,
+    "status_mutation": false,
+    "write_gate_disable": false,
+    "subprocess_launch_tripwire_zero": true,
+    "queue_mutation_tripwire_zero": true
+  }
+}

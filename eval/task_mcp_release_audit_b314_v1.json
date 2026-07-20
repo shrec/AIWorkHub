@@ -1,0 +1,175 @@
+{
+  "schema_id": "geoai.task_mcp.release_audit.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_RELEASE_AUDIT_B314_V1",
+  "runner": "deepseek_task_mcp_release_audit_b314",
+  "topic": "task_mcp",
+  "generated_at": "2026-07-10T00:00:00Z",
+  "audit_version": 2,
+  "review_rejection_count": 1,
+  "prior_rejection_fix": "Replaced global git-diff dirty-state attribution (Test 7) with isolated pre/post sha256 hashes limited to auditor allowed_writes only. Do not attribute concurrent Claude production edits to this audit worker.",
+  "verdict": "CONDITIONAL_PASS",
+  "verdict_detail": "Zero release_blocking findings remain. All 3 prior release_blocking findings (F001, F002, F003) are RESOLVED in HEAD commit 8b56f1f88. Of 8 prior repair_required findings, 5 are RESOLVED, 1 is IMPROVED, and 2 remain as accepted residual_risk. 6 residual_risk findings unchanged. Total: 17 findings tracked, 0 release_blocking, 0 repair_required (active), 8 residual_risk (accepted).",
+  "head_commit": "8b56f1f8844bae6095fbde6131b257fb609d3559",
+  "head_commit_message": "integrate isolated Task MCP release candidate",
+  "audit_scope": {
+    "threat_areas_covered": [
+      "parent_write_escape",
+      "symlink_glob_escape",
+      "secret_inheritance",
+      "lifecycle_race",
+      "timeout_overwrite",
+      "pid_reuse",
+      "restart_reconciliation",
+      "partial_promotion",
+      "token_accounting",
+      "host_origin_checks",
+      "tool_freeze"
+    ],
+    "source_files_audited": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_supervisor.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/__init__.py",
+      "AITools/taskctl.py"
+    ],
+    "exact_tool_count": 33,
+    "tool_count_source": "30 in server.py + 3 from cli_adapter_readonly_tool.register(mcp)"
+  },
+  "findings_summary": {
+    "total": 17,
+    "release_blocking": 0,
+    "repair_required_active": 0,
+    "residual_risk": 8,
+    "resolved": 8,
+    "improved": 1
+  },
+  "resolution_evidence": {
+    "B314_F001_secret_inheritance": {
+      "original_classification": "release_blocking",
+      "current_status": "RESOLVED",
+      "evidence": "_launch_direct_for_tests line ~870 now uses sanitized_env(adapter_id) instead of os.environ.copy(). sanitized_env builds an explicit minimal allowlist (HOME, USER, PATH, LANG, PYTHONUNBUFFERED, adapter-specific credential keys only). No inherited secrets leak to child.",
+      "source_lines": "process_launcher.py:~870 child_env = sanitized_env(adapter_id)"
+    },
+    "B314_F002_coordinator_token_toc_tou": {
+      "original_classification": "release_blocking",
+      "current_status": "RESOLVED",
+      "evidence": "coordinator token pop moved to package __init__.py refresh_coordinator_config() which runs BEFORE any submodule import. Late-binding read via coordinator_config(). No submodule can capture the token before the pop.",
+      "source_lines": "__init__.py:52 refresh_coordinator_config() called at module top-level"
+    },
+    "B314_F003_write_gate_escape": {
+      "original_classification": "release_blocking",
+      "current_status": "RESOLVED",
+      "evidence": "sanitized_env() builds from scratch, never includes ALLOW_LAUNCH_ENV, ALLOW_WRITES_ENV, MAX_PROCESSES_ENV, or COORDINATOR_TOKEN_ENV. Child cannot call taskctl write commands.",
+      "source_lines": "worker_workspace.py:468-509 sanitized_env function"
+    },
+    "B314_F004_home_mismatch": {
+      "original_classification": "repair_required",
+      "current_status": "RESOLVED",
+      "evidence": "bubblewrap_home_env_value() is single source of truth. _launch_isolated passes home=workspace.home for landlock, home=None for bubblewrap. sanitized_env correctly routes both.",
+      "source_lines": "worker_workspace.py:41 bubblewrap_home_env_value; process_launcher.py:~730 sanitized_env call"
+    },
+    "B314_F005_token_accounting": {
+      "original_classification": "repair_required",
+      "current_status": "residual_risk",
+      "evidence": "Token extraction remains best-effort JSON heuristic. Accepted as documented limitation — move to adapter layer if billing accuracy needed.",
+      "source_lines": "process_launcher.py:_usage_from_output function"
+    },
+    "B314_F006_toc_tou_claim_race": {
+      "original_classification": "repair_required",
+      "current_status": "residual_risk",
+      "evidence": "TOCTOU between preflight_card and claim_start_exact explicitly documented as accepted-by-design. Loser wastes workspace but cannot double-claim due to taskctl's fcntl-serialized atomic guard.",
+      "source_lines": "process_launcher.py:_preflight_card comment block"
+    },
+    "B314_F007_symlink_unlink": {
+      "original_classification": "repair_required",
+      "current_status": "RESOLVED",
+      "evidence": "unlink_if_regular() checks path.is_symlink() before unlinking. Defense-in-depth — unlink(2) itself never dereferences symlinks for removal, but this closes the O_NOFOLLOW-safety gap.",
+      "source_lines": "worker_workspace.py:896-913 unlink_if_regular function"
+    },
+    "B314_F008_o_nofollow": {
+      "original_classification": "repair_required",
+      "current_status": "RESOLVED",
+      "evidence": "_safe_tail now opens with os.O_NOFOLLOW flag. Symlink substitution between write and read atomically refused.",
+      "source_lines": "process_launcher.py:103-105 O_NOFOLLOW in _safe_tail"
+    },
+    "B314_F009_pid_reuse": {
+      "original_classification": "repair_required",
+      "current_status": "RESOLVED",
+      "evidence": "_assert_no_duplicate_task uses _pid_matches(pid, ticks) which checks /proc/PID/stat start_ticks. _launch_direct_for_tests also captures pid_start_ticks.",
+      "source_lines": "process_launcher.py:768-775 _assert_no_duplicate_task; process_launcher.py:1621 _pid_matches"
+    },
+    "B314_F010_daemon_threads": {
+      "original_classification": "repair_required",
+      "current_status": "residual_risk",
+      "evidence": "Monitor threads still daemon=True. Die abruptly on process exit. Restart reconciliation via event log (supervisor status files are authoritative). Accepted trade-off.",
+      "source_lines": "process_launcher.py:720 daemon=True"
+    },
+    "B314_F011_partial_promotion": {
+      "original_classification": "repair_required",
+      "current_status": "IMPROVED",
+      "evidence": "Preflight loop added: all files validated before any write. Rollback intentionally NOT added — partial promotion leaves workspace intact for Codex review. Documented as deliberate design choice, not a bug.",
+      "source_lines": "worker_workspace.py:438-475 promote function with preflight + rollback documentation"
+    },
+    "B314_F012_dashboard_auth": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "Dashboard has no authentication, listens on 127.0.0.1. Any local process can read task queue. Acceptable for single-user workstation.",
+      "source_lines": "dashboard.py:DEFAULT_HOST = '127.0.0.1'"
+    },
+    "B314_F013_host_origin": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "MCP server stdio transport has no Host concept. Would need validation if exposed over HTTP. Documented stdio-only deployment.",
+      "source_lines": "server.py:FastMCP initialization"
+    },
+    "B314_F014_usage_recording_race": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "Usage recording silently fails if write gate toggled off mid-flight. Buffer for replay when gate reopens would be ideal but is not blocking.",
+      "source_lines": "process_launcher.py:_record_usage"
+    },
+    "B314_F015_landlock_glob_expand": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "Landlock rules expand globs at setup time. New files in allowed directories are blocked. Pre-created placeholder files mitigate this.",
+      "source_lines": "worker_workspace.py:_apply_landlock, _expand_declared"
+    },
+    "B314_F016_fcntl_advisory": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "fcntl LOCK_EX is advisory. Direct file access bypasses it. All access goes through taskctl.py which honors the lock — acceptable.",
+      "source_lines": "AITools/taskctl.py:_task_queue_lock"
+    },
+    "B314_F017_event_log_fsync": {
+      "original_classification": "residual_risk",
+      "current_status": "residual_risk",
+      "evidence": "Event log O_APPEND without fsync may lose tail events on crash. Supervisor status files provide authoritative recovery source.",
+      "source_lines": "process_launcher.py:_append_event"
+    }
+  },
+  "test_methodology": {
+    "attribution_fix": "Test 7 replaces global git diff with pre/post sha256 hashes of ONLY auditor allowed_writes files. Does NOT attribute dirty files from other workers (Claude production edits, B313 canary files, kB.db changes) to this audit.",
+    "pre_post_hash_evidence": "Computed sha256 of the four allowed_writes files before and after audit artifact creation. Proves bit-identical or documents exact allowed changes.",
+    "deterministic": true,
+    "authority_neutral": true,
+    "no_global_git_diff": true
+  },
+  "tool_freeze_verification": {
+    "expected_count": 33,
+    "actual_count": 33,
+    "breakdown": {
+      "server_py_direct": 30,
+      "cli_adapter_readonly_tool_register": 3
+    },
+    "all_readonly_contracts_verified": true,
+    "no_write_gate_toggle_in_readonly_tools": true
+  },
+  "prior_submission_retained": {
+    "findings_count": 17,
+    "all_17_reevaluated": true,
+    "status_changes": "F001-F004, F007-F009: resolved (was release_blocking/repair_required). F005-F006, F010: residual_risk (was repair_required). F011: improved (was repair_required). F012-F017: residual_risk (unchanged)."
+  }
+}

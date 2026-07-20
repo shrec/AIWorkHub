@@ -1,0 +1,68 @@
+{
+  "schema_id": "geoai.task_mcp_owner_notification_loop_spec_next_wave.v1",
+  "task_id": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1",
+  "runner": "claude_task_mcp_owner_notify_b277",
+  "topic": "task_mcp",
+  "created_at": "2026-07-08",
+  "status": "spec_complete_no_implementation",
+  "next_wave_cards": [
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_DELTA_TOOL_B278_V1",
+      "runner": "claude_task_mcp_delta_tool_b278",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_completion_inbox_delta_implement_readonly",
+      "objective": "Implement geoai_completion_inbox_delta(topic, since_cursor, limit) exactly per B277 section_2b/section_2 (deterministic event_id, caller-owned cursor_token format, 5-kind event envelope). Pure function over existing completion_inbox.build_completion_inbox() + core.collision_guard() + core.usage_report() outputs -- no new mutation, no cursor persisted server-side.",
+      "acceptance": [
+        "New tool registered additively in server.py; all 24 existing tools still present (list_tools count check)",
+        "event_id is deterministic (same underlying state -> same event_id across two calls)",
+        "cursor round-trip: passing back next_cursor from call N returns 0 already-seen events on call N+1 given no new state change",
+        "all 5 event_kinds (completion, failure, stale, usage, duplicate_runner) reachable via fixture-injected task states",
+        "authority_flags on every event and top-level are all false",
+        "no write to task_queue_v1.sqlite; DB fingerprint unchanged before/after"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (this spec)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox_delta.py",
+        "tools/geoai-task-mcp/eval/mcp_completion_inbox_delta_b278_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_delta_b278_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CODEX_TASK_MCP_ORCHESTRATION_LOOP_CURSOR_WIRING_B279_V1",
+      "runner": "codex_task_mcp_cursor_wiring_b279",
+      "topic": "task_mcp",
+      "priority": "medium",
+      "mode": "codex_owned_cursor_persistence_decision",
+      "objective": "Decide and implement WHERE Codex's own orchestration loop persists since_cursor between iterations (session-local state file vs a small dedicated JSON under tools/geoai-task-mcp/data/ vs in-memory only for a single continuous session). This is a Codex-authority decision (cursor consumer identity, retention policy, multi-session semantics) that a worker cannot make unilaterally per B277 section_2b (cursor is caller-owned, not server-owned).",
+      "acceptance": [
+        "Documented cursor storage location and retention policy",
+        "Wired into Codex's existing auto-pickup-equivalent loop cadence",
+        "No change to geoai_completion_inbox_delta's stateless contract"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_COMPLETION_INBOX_DELTA_TOOL_B278_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json"
+      ]
+    }
+  ],
+  "blockers": [
+    "OWNER_DELIVERY_CHANNEL_UNDECIDED: no email/Slack/desktop-notify target exists or is chosen; wiring one requires owner-approved external credentials/infra that this task has no authority to select. Cannot be closed by a worker task card alone -- needs an explicit owner decision on channel + credential storage before any implementation task is scoped.",
+    "NO_ARTIFACT_BODY_READ_STILL_OPEN: the B277 event taxonomy is metadata-only (task-card fields); reading and summarizing the actual JSON/JSONL artifact bodies a worker produced is explicitly out of scope for this spec and unaddressed by any next_wave card here -- would need its own read-policy/size-budget design (artifacts can exceed the 25MB single-file budget in aggregate across many tasks).",
+    "TRUE_PUSH_MECHANISM_NOT_DESIGNED: this spec only covers an agent-loop-driven automatic pull (section_3); a real push (inotify on task_queue_v1.sqlite, a DB trigger, or a message queue) was explicitly NOT designed here and would be a separate, larger architecture task with its own risk review (write-path changes to a shared, concurrently-written SQLite file)."
+  ],
+  "notes": {
+    "b276_gap_closure_status": {
+      "PUSH_MISSING": "partially addressed -- automatic-within-agent-loop pull defined (section_3); true push explicitly deferred (blocker 3 above)",
+      "NO_DELTA_CURSOR": "design closed in this spec (section_2b); implementation deferred to B278",
+      "NO_ARTIFACT_BODY_READ": "still open, not attempted (blocker 2 above)",
+      "NO_OWNER_DELIVERY_CHANNEL": "still open, needs owner decision (blocker 1 above)",
+      "NO_ACK_OR_DEDUP_MARKER": "partially addressed -- deterministic event_id enables caller-side dedup (section_2b); no server-side ack state added (by design, keeps tool stateless)"
+    }
+  }
+}

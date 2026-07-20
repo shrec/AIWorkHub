@@ -1,0 +1,17 @@
+{"class":"write","gated":true,"kind":"tool","name":"geoai_task_auto_pickup","note":"claims+starts next task; blocked rc=126 unless ALLOW_WRITES=1 AND allow_write=True","safe":true,"taskctl_subcmd":"auto-pickup"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_collision_guard","note":"runs collision guard for active cards","safe":true,"taskctl_subcmd":"collision-guard"}
+{"class":"write","gated":true,"kind":"tool","name":"geoai_task_export_jsonl","note":"exports SQLite queue back to JSONL manifest; write-gated","safe":true,"taskctl_subcmd":"export-jsonl"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_health","note":"taskctl verify; read-only health+write-gate probe","safe":true,"taskctl_subcmd":"verify"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_list","note":"list cards by status/topic","safe":true,"taskctl_subcmd":"list"}
+{"class":"write","gated":true,"kind":"tool","name":"geoai_task_mark_done","note":"finalizes reviewed task; write-gated","safe":true,"taskctl_subcmd":"done"}
+{"class":"write","gated":true,"kind":"tool","name":"geoai_task_mark_review","note":"marks task ready for Codex review; write-gated","safe":true,"taskctl_subcmd":"review"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_pending_for_runner","note":"taskctl 'export' dump for a runner (read-only); distinct from write 'export-jsonl'","safe":true,"taskctl_subcmd":"export"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_review_queue","note":"subcmd 'review-queue' distinct from write 'review'; not in WRITE_COMMANDS","safe":true,"taskctl_subcmd":"review-queue"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_show","note":"show one card by task_id","safe":true,"taskctl_subcmd":"show"}
+{"class":"read","gated":false,"kind":"tool","name":"geoai_task_usage_report","note":"subcmd 'usage-report'; bare 'usage' in WRITE_COMMANDS is invoked by no tool","safe":true,"taskctl_subcmd":"usage-report"}
+{"detail":"WRITE_COMMANDS includes 'start' and 'usage' which are invoked by no registered tool (over-guard superset); harmless, fail-safe direction (core.py:24-31).","id":"F1","kind":"finding","severity":"info"}
+{"detail":"core.py:13 DEFAULT_REPO hardcodes '/home/shrek/GeoAI' fallback; overridable via GEOAI_REPO env but not submodule-neutral. README/MCP-config also hardcode this path.","id":"F2","kind":"finding","severity":"low"}
+{"detail":"geoai_task_pending_for_runner maps to taskctl 'export' (dump) classified read-only; distinct string from write 'export-jsonl' so not caught by WRITE_COMMANDS by design.","id":"F3","kind":"finding","severity":"info"}
+{"detail":"MCP tool contract v1 not frozen (MVP_ROADMAP Phase 3 unchecked) and external MCP-client smoke test pending (Phase 0 unchecked) -> not yet submodule-ready.","id":"F4","kind":"finding","severity":"low"}
+{"detail":"tools/geoai-task-mcp is already an independent nested git repo (git toplevel == tool dir) with pyproject.toml present and logs/ gitignored -> submodule conversion is mechanically ready once contract is frozen.","id":"F5","kind":"finding","severity":"info"}
+{"detail":"README 'Exposed Tools' (7 read / 4 write) matches server.py registrations exactly; no README/code drift.","id":"F6","kind":"finding","severity":"info"}

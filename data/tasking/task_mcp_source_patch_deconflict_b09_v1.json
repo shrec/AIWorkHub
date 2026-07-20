@@ -1,0 +1,58 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_SOURCE_PATCH_DECONFLICT_B09_V1",
+  "runner": "deepseek_task_mcp_source_deconflict_b09",
+  "topic": "task_mcp",
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "queue_order": 7255,
+  "priority": "task_mcp_b09_source_patch_lane_deconflict_before_status_tool_wiring",
+  "mode": "source_patch_lane_audit_no_source_patch",
+  "objective": "Audit stale/pending task_mcp cards that still claim core.py/server.py write lanes and produce a safe deconflict plan before wiring the B08 supervisor status tool.",
+  "read_first": [
+    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_b09_v1.json",
+    "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
+  ],
+  "acceptance": [
+    "Must inventory queued/stale cards that claim tools/geoai-task-mcp/src/geoai_task_mcp/core.py or server.py.",
+    "Must classify each lane claimant as active_needed, stale_superseded, already_done, or needs_owner_review.",
+    "Must produce an ordered safe plan for when B09 supervisor status tool wiring may touch core.py/server.py.",
+    "Must not patch source code, mutate task statuses, enable launch, or enable writes.",
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh passes.",
+    "python3 AITools/taskctl.py verify passes."
+  ],
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "forbidden": [
+    "source_patch",
+    "core_py_write",
+    "server_py_write",
+    "daemon_start",
+    "real_agent_launch",
+    "credential_read",
+    "write_gate_enable",
+    "task_status_mutation",
+    "network_operation",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "authority_flags": {
+    "runtime_authority": false,
+    "agent_launch_enabled": false,
+    "credential_access": false,
+    "workflow_switch": false,
+    "source_patch": false
+  },
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only. Never git add -A / git add . / mixed-task commit.",
+  "handoff_note": "გაუშვი პარალელური სუბაგენტები და რომ დასრულდება დაუბრუნე კოდექსს რევიუსთვის"
+}

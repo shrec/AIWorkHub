@@ -1,0 +1,74 @@
+{
+  "eval_id": "launch_queue_persist_audit_b119_v1",
+  "task_id": "CLAUDE_TASK_MCP_LAUNCH_QUEUE_PERSIST_AUDIT_B119_V1",
+  "date": "2026-07-05",
+  "mode": "launch_queue_persistence_no_process_launch",
+  "builds_on": "launch_disabled_queue_contract_b117_v1",
+  "runner": "claude_task_mcp_launch_persist_b119",
+  "topic": "task_mcp",
+  "verdict": "PASS",
+  "summary": "Added launch_queue_persist.py: append-only JSONL persistence + read-back audit for the disabled-by-default launch_queue_contract's LaunchRequest/LaunchDecision/ProcessLogEntry schemas. persist_intent()/persist_transition() call the unmodified contract (enqueue_intent -> evaluate_launch -> build_log_entry) and append one scrubbed record per call; the log file is opened in append mode only and is never truncated or rewritten. With both env gates unset (default) every persisted record's decision/to_state is blocked_launch_disabled; forcing BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH and GEOAI_TASK_MCP_ALLOW_WRITES on still yields blocked_launch_disabled records because no launcher is implemented (LAUNCH_IMPLEMENTED stays a constant False in the contract module). No subprocess/exec/fork/spawn/system/popen/shell/network code exists anywhere in the new module. Secrets never leak: persisted env_gate_status carries only the two explicit gate NAMEs mapped to '<set>'/'<unset>' tokens, and _scrub_entry drops any stray top-level key outside the frozen ProcessLogEntry schema as defense in depth.",
+  "gates": {
+    "append_only_never_truncates": true,
+    "append_only_byte_prefix_preserved_across_calls": true,
+    "blocked_launch_disabled_with_gates_unset": true,
+    "blocked_launch_disabled_even_with_both_gates_on": true,
+    "no_process_launch_code": true,
+    "no_subprocess_import_in_module": true,
+    "no_os_level_fork_exec_spawn_system_popen": true,
+    "no_shell_invocation": true,
+    "no_network_or_api_call": true,
+    "no_forbidden_call_fires_at_runtime": true,
+    "env_recorded_as_status_tokens_not_values": true,
+    "no_secret_env_value_leak": true,
+    "no_secret_env_name_leak_beyond_two_gates": true,
+    "scrub_entry_drops_stray_schema_keys": true,
+    "resolve_log_path_precedence_explicit_over_env_over_default": true,
+    "read_persisted_log_accurate_counts": true,
+    "read_persisted_log_all_blocked_flag_correct": true,
+    "isolation_safe_parallel_friendly_via_log_path_override": true,
+    "module_loaded_by_path_no_package_init_import": true,
+    "sibling_contract_module_loaded_by_path": true,
+    "parent_queue_unmutated": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "invariant": {
+    "launch_implemented": false,
+    "launch_enabled_by_default": false,
+    "persistence_never_changes_the_permitted_verdict": "persist_transition/persist_intent call evaluate_launch() unmodified; permitted stays False regardless of env gate state because no launcher exists in launch_queue_contract",
+    "append_only": "log file opened with mode='a' only; no code path opens with 'w' or truncates",
+    "env_gate_default": "0 (off)"
+  },
+  "schema": {
+    "process_log_persisted_keys": [
+      "request_id", "task_id", "runner", "topic", "adapter_id", "from_state",
+      "to_state", "decision", "blocked_reason", "env_gate_status", "ts"
+    ]
+  },
+  "env": {
+    "log_path_env": "GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH",
+    "log_path_default_rel": "tools/geoai-task-mcp/logs/launch_queue_audit.jsonl",
+    "precedence": "explicit log_path kwarg > GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH > repo-root default"
+  },
+  "public_api": {
+    "resolve_log_path(repo=None, log_path=None)": "-> Path, pure, never opens the file",
+    "persist_transition(request, decision=None, ts=None, repo=None, log_path=None)": "-> dict, appends one scrubbed ProcessLogEntry record; decision defaults to evaluate_launch(request)",
+    "persist_intent(task_id=, runner=, topic=, adapter_id=, ..., repo=None, log_path=None)": "-> dict(request, decision, persisted_entry); full pure enqueue->evaluate->persist pipeline",
+    "read_persisted_log(repo=None, log_path=None, max_entries=200)": "-> dict summary (total_entries, entries_by_decision, entries_by_to_state, all_blocked_launch_disabled, last_entries); read-only",
+    "contract_summary()": "-> dict, pure introspection of this persistence module's contract shape",
+    "_scrub_entry(entry)": "-> dict restricted to the frozen ProcessLogEntry schema; internal defense-in-depth helper exercised directly by the test"
+  },
+  "neural_bridge_note": "This module is a deterministic evidence/audit substrate only (append-only JSONL persistence of an already-pure contract's schemas); it decides no capability. Future adapter/runner/topic launch selection remains scoped to the learned routing + abstain policy tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 -- no regex/keyword cognition becomes launch or persistence authority here.",
+  "no_launch_code_marker": "This module and its test contain NO process-launch code: no subprocess import, no child-process spawn, no os-level fork/exec/spawn/system/popen, no shell invocation, no network/API call. Launch/process code arrives only in the gated Phase-2 follow-up (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1) behind all launch_preconditions.",
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
+    "tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh",
+    "tools/geoai-task-mcp/eval/launch_queue_persist_audit_b119_v1.json",
+    "tools/geoai-task-mcp/data/tasking/launch_queue_persist_audit_next_wave_b119_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ]
+}

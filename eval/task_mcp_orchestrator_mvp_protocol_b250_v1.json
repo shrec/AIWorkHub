@@ -1,0 +1,288 @@
+{
+  "schema_id": "geoai.task_mcp_orchestrator_mvp_execution_protocol.b250.v1",
+  "contract_id": "task_mcp_orchestrator_mvp_protocol_b250_v1",
+  "task_id": "CLAUDE_TASK_MCP_ORCHESTRATOR_MVP_EXECUTION_PROTOCOL_B250_V1",
+  "runner": "claude_task_mcp_orchestrator_protocol_b250",
+  "topic": "task_mcp",
+  "mode": "orchestrator_protocol_design_no_source_patch",
+  "roadmap_phase": "Phase 1 (Safe Local Automation) -> Phase 2 (Agent Launcher MVP), MVP_ROADMAP.md",
+
+  "purpose": "Define the MVP execution protocol for the future local Task MCP orchestrator: Codex submits prompts, MCP invokes available CLI/model runners, records completion, and returns artifacts for Codex review. This is a SPEC/GATE-DEFINITION deliverable (JSON policy artifact + JSONL rows + shell test) -- it patches NO source file, starts NO daemon, executes NO CLI runner, reads NO credential, and mutates NO task status.",
+
+  "consolidation_note": "This protocol is NOT greenfield. A real MVP protocol already exists across agent_launcher_mvp_b02_v1, task_mcp_supervisor_loop_contract_b07_v1, task_mcp_supervisor_loop_status_tool_b08_v1, phase2_orchestration_contract_b104_v1, mcp_runner_topic_allowlist_design_b118_v1 (+ b119 enforcement), and mcp_codex_handoff_e2e_b116_v1. This artifact CONSOLIDATES that existing vocabulary (lifecycle states, error-taxonomy codes, adapter ids, safety boundaries) verbatim and adds only what those artifacts left unspecified end-to-end: a single tool-authority-tier taxonomy (24 tools, corrected to include the already-committed geoai_task_auto_pickup_dryrun), explicit timeout/concurrency rules referencing BOTH real timeout constants in the repo -- the b104 sandbox-ceiling bounded_timeout_seconds_default=3600s (not yet reachable, TIER_4-only) AND the currently-enforced core.py DEFAULT_TIMEOUT_SECONDS=60s subprocess bound (governs every live TIER_1/TIER_2 taskctl call today) -- and a merged review-handoff field list. It does not invent competing state/error vocabulary.",
+
+  "builds_on": [
+    "agent_launcher_mvp_b02_v1",
+    "task_mcp_supervisor_loop_contract_b07_v1",
+    "task_mcp_supervisor_loop_status_tool_b08_v1",
+    "phase2_orchestration_contract_b104_v1",
+    "cli_adapter_readonly_tool_b106_v1",
+    "readonly_tool_server_wiring_b107_v1",
+    "mcp_review_summarizer_server_wiring_b111_v1",
+    "mcp_codex_handoff_e2e_b116_v1",
+    "mcp_runner_topic_allowlist_design_b118_v1",
+    "mcp_batch_collision_guard_b119_v1",
+    "review_signal_inventory_b160_v1"
+  ],
+
+  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/geoai-task-mcp/src/. No .py file is created or modified by this task, no daemon is started, no CLI runner is executed, and no credential/secret is read or logged.",
+
+  "nested_repo_state_note": "tools/geoai-task-mcp is its own nested git repo (HEAD dbb54e6 'Add agent launcher MVP contract' at authoring time) shared with other concurrent workers. At authoring time it is dirty from an IN-FLIGHT, uncommitted task (session_latest.md: 'B11 task_mcp ... implement ... core.py/server.py'): src/geoai_task_mcp/core.py, server.py, review_summarizer.py, and several eval/mcp_launch_routing_targets* / mcp_neural_launch_routing_dryrun_b109* files are mid-patch. This protocol deliberately does NOT read or depend on the CURRENT byte-for-byte state of those dirty files -- it grounds every tool/behavior claim in already-authored, self-contained contract/eval JSON artifacts (b02/b07/b08/b104/b106/b107/b111/b116/b118/b119) instead, so this artifact stays correct regardless of how B11 resolves. Do not re-derive tool counts or line numbers from the dirty tree; re-verify live via geoai_task_health / an MCP tool listing before relying on an exact number in production. Distinct from the dirty-tree caveat: this artifact DOES ground tool_authority_tiers in the STABLE, already-committed HEAD (dbb54e6) reading of server.py -- e.g. geoai_task_auto_pickup_dryrun (@mcp.tool(), landed in the b118 wave this artifact already lists in builds_on) is included below precisely because HEAD content is safe and already-committed, unlike the dirty B11 core.py/server.py edits this note excludes. Live-registered tool count at HEAD today is 18 (15 direct @mcp.tool() defs in server.py + 3 dynamically registered via cli_adapter_readonly_tool.register(mcp)); this matches the 18 entries below marked implemented:true (14 in TIER_1 + 4 in TIER_2) -- the remaining 6 entries (TIER_1's geoai_supervisor_loop_status + all 4 TIER_3 tools + TIER_4's 1 reserved slot) are schema-only/not-yet-wired/not-yet-implemented, for 24 tools total across all 4 tiers.",
+
+  "tool_authority_tiers": {
+    "description": "Every current or planned MCP tool/endpoint in this orchestrator belongs to exactly one of 4 authority tiers. Tier assignment is the mechanism that satisfies acceptance criterion 2 (separate read-only supervisor tools from write/execute tools), refined one level further: launch PLANNING is distinguished from launch EXECUTION, and execution remains entirely unimplemented.",
+    "tiers": [
+      {
+        "tier": "TIER_1_READ_ONLY_NAVIGATION",
+        "authority": "zero mutation authority; safe unconditionally regardless of any env gate; observes taskctl/queue/audit-log state only",
+        "gate": "none",
+        "member_tools": [
+          {"tool_name": "geoai_task_health", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_review_queue", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_list", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_show", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_pending_for_runner", "implemented": true, "source_task_id": "phase0", "notes": "maps to taskctl 'export' (dump), classified read-only per mvp_contract_audit_v1 finding F3 -- distinct string from write action 'export-jsonl'"},
+          {"tool_name": "geoai_task_auto_pickup_dryrun", "implemented": true, "source_task_id": "b118_wave (server.py @mcp.tool(), landed HEAD commit dbb54e6-ancestor 3f9ce1e 'Finalize MCP B118 smoke and dry-run tasks', 2026-07-05)", "notes": "READ-ONLY: previews which task auto_pickup WOULD claim for a runner/topic via core.auto_pickup_dryrun(); uses only the read-only 'export' path, never invokes the write-gated auto-pickup command, provides no alternate write path and cannot bypass GEOAI_TASK_MCP_ALLOW_WRITES. Confirmed present via git show HEAD:src/geoai_task_mcp/server.py (stable committed HEAD, not the dirty in-flight B11 tree) -- this entry was missing from an earlier revision of this taxonomy; corrected here."},
+          {"tool_name": "geoai_task_collision_guard", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_usage_report", "implemented": true, "source_task_id": "phase0"},
+          {"tool_name": "geoai_task_audit_log_read", "implemented": true, "source_task_id": "audit_log_read_tool_b104_v1"},
+          {"tool_name": "geoai_cli_adapter_plan_readonly", "implemented": true, "source_task_id": "cli_adapter_readonly_tool_b106_v1 / readonly_tool_server_wiring_b107_v1", "notes": "returns a would-run plan WITHOUT appending an audit entry (plan_dryrun audit=False); read-only holds even with GEOAI_TASK_MCP_ALLOW_WRITES=1"},
+          {"tool_name": "geoai_cli_adapter_audit_summary_readonly", "implemented": true, "source_task_id": "cli_adapter_readonly_tool_b106_v1 / readonly_tool_server_wiring_b107_v1"},
+          {"tool_name": "geoai_cli_adapter_report_readonly", "implemented": true, "source_task_id": "cli_adapter_readonly_tool_b106_v1 / readonly_tool_server_wiring_b107_v1"},
+          {"tool_name": "geoai_task_review_summarize", "implemented": true, "source_task_id": "mcp_review_summarizer_server_wiring_b111_v1", "notes": "frozen input schema (task_ids, batch_label); no taskctl mutation calls"},
+          {"tool_name": "geoai_task_codex_handoff", "implemented": true, "source_task_id": "mcp_codex_handoff_e2e_b116_v1", "notes": "70/70 checks PASS; per-task task_id/allowed_writes/validation/risks/commit_hygiene/recommended_stage_list report; zero-mutation verified against fixture AND live queue (sha256/stdout identical before-after)"},
+          {"tool_name": "geoai_supervisor_loop_status", "implemented": "schema_only_pending_wiring", "source_task_id": "task_mcp_supervisor_loop_status_tool_b08_v1", "notes": "contract frozen with input/output schema + derivation_algorithm + 6 smoke_cases; future_source_patch_paths names core.py (new supervisor_loop_status() pure function) and server.py (new @mcp.tool() registration) as the NOT-YET-APPLIED wiring; a concurrent B11 workflow is touching core.py/server.py at authoring time -- do not assume this landed, re-check live tool listing"}
+        ]
+      },
+      {
+        "tier": "TIER_2_WRITE_GATED_LIFECYCLE",
+        "authority": "mutates task_status/worker_status via taskctl only (no parallel store); requires the pre-existing GEOAI_TASK_MCP_ALLOW_WRITES gate (default '0') AND, for task_mcp-topic callers, the PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check (core.check_runner_topic_allowlist)",
+        "gate": "GEOAI_TASK_MCP_ALLOW_WRITES=1 (required) + runner/topic allowlist action check (required)",
+        "member_tools": [
+          {"tool_name": "geoai_task_auto_pickup", "implemented": true, "source_task_id": "phase0", "allowlist_action": "auto-pickup", "denied_to": ["codex"]},
+          {"tool_name": "geoai_task_mark_review", "implemented": true, "source_task_id": "phase0", "allowlist_action": "review", "denied_to": []},
+          {"tool_name": "geoai_task_mark_done", "implemented": true, "source_task_id": "phase0", "allowlist_action": "done", "denied_to": ["all claude_*/deepseek_* worker runners -- codex-only finalization"]},
+          {"tool_name": "geoai_task_export_jsonl", "implemented": true, "source_task_id": "phase0", "allowlist_action": "export-jsonl", "denied_to": ["all worker runners -- admin/codex-only"]}
+        ]
+      },
+      {
+        "tier": "TIER_3_LAUNCH_PLAN_DRYRUN_ONLY",
+        "authority": "plans/describes a hypothetical worker launch and NEVER executes one; launch_implemented is a hard constant false (agent_launcher_mvp_b02_v1.invariant, launch_queue_contract.py.LAUNCH_IMPLEMENTED); would_run_argv is an argv-list TEMPLATE only, never passed to subprocess/exec/fork/shell",
+        "gate": "none required to CALL the tool (it only plans); no gate can promote it to execution because no execution code path exists in this tier",
+        "member_tools": [
+          {"tool_name": "geoai_agent_launch_task", "implemented": "schema_only_not_yet_wired", "source_task_id": "agent_launcher_mvp_b02_v1 / task_mcp_supervisor_loop_contract_b07_v1 (leg 1)", "notes": "no wiring eval found referencing this tool_name outside the two design contracts; treat as schema-only until a dedicated wiring task lands"},
+          {"tool_name": "geoai_agent_task_status", "implemented": "schema_only_not_yet_wired", "source_task_id": "agent_launcher_mvp_b02_v1 / task_mcp_supervisor_loop_contract_b07_v1 (leg 4)"},
+          {"tool_name": "geoai_agent_collect_result", "implemented": "schema_only_not_yet_wired", "source_task_id": "agent_launcher_mvp_b02_v1 / task_mcp_supervisor_loop_contract_b07_v1 (leg 3)"},
+          {"tool_name": "geoai_agent_cancel_task", "implemented": "schema_only_not_yet_wired", "source_task_id": "agent_launcher_mvp_b02_v1"}
+        ]
+      },
+      {
+        "tier": "TIER_4_GATED_LAUNCH_EXECUTION_RESERVED",
+        "authority": "the ONLY tier that would ever spawn a real child process; currently has ZERO implementing code anywhere in the repo",
+        "gate": "requires BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1, PLUS runner/topic allowlist pass, PLUS command_allowlist match, PLUS taskctl collision-guard preflight pass, PLUS concurrency_cap not exceeded (see launch_preconditions below)",
+        "member_tools": [
+          {"tool_name": "(reserved, name not yet assigned)", "implemented": false, "owner_task": "CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1 (deferred, not this task, not created by this task)", "notes": "launch_queue_contract.py.attempt_start() ALWAYS raises LaunchDisabledError even when both env gates are forced to '1', because LAUNCH_IMPLEMENTED is a Python constant False, not a toggle. No env value in existence today can start a process."}
+        ]
+      }
+    ]
+  },
+
+  "execution_flow": {
+    "description": "One supervised loop = 4 legs, reused verbatim from task_mcp_supervisor_loop_contract_b07_v1.flow_legs. Only legs 1 and 4 are exercised for real today (TIER_1/TIER_3 read+plan calls); legs 2 and 3 are schema-reserved for the future TIER_4 gated launch executor.",
+    "legs": [
+      {"leg": 1, "name": "codex_to_mcp_dispatch_request", "actor_from": "codex", "actor_to": "mcp_server", "mcp_tool": "geoai_agent_launch_task", "tier": "TIER_3", "produces": "decision in {launch_planned, launch_blocked_disabled, launch_blocked_invalid_command, launch_blocked_precondition_failed}", "lifecycle_transition": "null -> planned -> dispatched_dryrun (or -> blocked)"},
+      {"leg": 2, "name": "mcp_to_worker_cli_argv_handoff", "actor_from": "mcp_server", "actor_to": "worker_cli (claude_cli | codex_cli | deepseek_manual)", "mcp_tool": null, "tier": "TIER_4 (unreachable today)", "mechanism": "NOT an MCP round-trip, NOT executed by this or any current task; would_run_argv is a template only. The existing worker protocol this WOULD reuse is exactly the loop this Claude worker session itself runs: python3 AITools/taskctl.py auto-pickup/brief/show/stage/guard-staged/review.", "lifecycle_transition": "dispatched_dryrun -> worker_review_ready", "causer": "external: the worker itself running `taskctl review <task_id>`; MCP never causes this, only later observes it"},
+      {"leg": 3, "name": "worker_cli_to_mcp_result_report", "actor_from": "worker_cli", "actor_to": "mcp_server", "mcp_tool": "geoai_agent_collect_result", "tier": "TIER_3", "produces": "verdict in {pending, not_applicable_mvp} -- always one of these two today because no worker process was ever really launched by MCP", "lifecycle_transition": "worker_review_ready (report only; no MCP-caused state change)"},
+      {"leg": 4, "name": "mcp_to_codex_status_and_handoff", "actor_from": "mcp_server", "actor_to": "codex", "mcp_tool": "geoai_agent_task_status (dryrun projection) / geoai_supervisor_loop_status (B08 richer projection, pending wiring) / geoai_task_codex_handoff (B116, LIVE, implemented)", "tier": "TIER_1 (read-only observation) + TIER_3 (dryrun projection)", "produces": "supervisor_state derived read-only from core._lifecycle_state via lifecycle_state_to_supervisor_state_mapping; never written back", "lifecycle_transition": "worker_review_ready -> codex_reviewed", "codex_action_after_receiving": "python3 AITools/taskctl.py review <task_id> --runner <runner> (worker-side, already happened) followed by python3 AITools/taskctl.py done <task_id> (Codex-side finalize) -- both REAL, EXISTING, gated commands entirely outside this MCP contract's scope"}
+    ]
+  },
+
+  "lifecycle_states": {
+    "planned": {"description": "A dispatch request passed all preconditions but no audit entry has been written yet.", "task_status_mutation": false},
+    "dispatched_dryrun": {"description": "The dispatch plan's audit entry has been appended (decision=launch_planned, launch_enabled=false, launch_implemented=false). Ceiling state actually reachable end-to-end today.", "task_status_mutation": false},
+    "worker_review_ready": {"description": "The task card's OWN canonical status/worker_status (owned by AITools/taskdb.py) shows review/ready_for_review because a worker independently ran `taskctl review <task_id>`.", "task_status_mutation": false},
+    "codex_reviewed": {"description": "Codex has read a worker_review_ready task's status/result report and made a finalization decision. Records no new field on the task card itself.", "task_status_mutation": false},
+    "blocked": {"description": "Any error-taxonomy condition halted progression. Reachable from any other state. Never partially mutates the task card.", "task_status_mutation": false}
+  },
+  "lifecycle_transitions": [
+    {"from": null, "to": "planned", "trigger": "leg 1 request passes all preconditions", "leg": 1},
+    {"from": "planned", "to": "dispatched_dryrun", "trigger": "audit entry appended for the plan", "leg": 1},
+    {"from": "dispatched_dryrun", "to": "worker_review_ready", "trigger": "external: worker runs `taskctl review <task_id>` on its own", "leg": 2},
+    {"from": "worker_review_ready", "to": "codex_reviewed", "trigger": "codex reads leg-4 status and examines the report", "leg": 4},
+    {"from": "planned", "to": "blocked", "trigger": "error_taxonomy match at leg 1 (collision | runner_topic_mismatch | missing_artifact)", "leg": 1},
+    {"from": "dispatched_dryrun", "to": "blocked", "trigger": "error_taxonomy match at leg 4 re-check (stale_task) OR timeout_rules.on_exceed (proposed, see timeout_rules)", "leg": 4},
+    {"from": "worker_review_ready", "to": "blocked", "trigger": "error_taxonomy match at leg 3/4 (failed_validation)", "leg": 4}
+  ],
+  "lifecycle_state_to_supervisor_state_mapping": {
+    "note": "Reused verbatim from task_mcp_supervisor_loop_status_tool_b08_v1; read-only projection of core._lifecycle_state, never written back.",
+    "mapping": {"pending": "planned", "processing": "dispatched_dryrun", "review": "worker_review_ready", "finished": "codex_reviewed", "blocked": "blocked"}
+  },
+
+  "error_taxonomy": {
+    "note": "Frozen 5-code taxonomy reused verbatim from task_mcp_supervisor_loop_contract_b07_v1; this protocol adds no 6th code to the FROZEN set (see timeout_rules.on_exceed for a clearly-marked PROPOSED, not-yet-frozen extension).",
+    "collision": {"trigger": "Two or more active task cards declare overlapping allowed_writes paths.", "detected_at_leg": 1, "example_reason": "collision:<file_path>:<conflicting_task_id>"},
+    "stale_task": {"trigger": "Cached view of a task card no longer matches the LIVE card when re-checked (TOCTOU race).", "detected_at_leg": 4, "example_reason": "stale_task:worker_status_changed:<task_id>:<observed_before>-><observed_now>"},
+    "runner_topic_mismatch": {"trigger": "(runner, topic, action) fails core.check_runner_topic_allowlist.", "detected_at_leg": 1, "example_reason": "one of: unknown_runner_topic_pair | malformed_runner:invalid_characters | malformed_topic:invalid_characters | action_not_allowed_for_runner_topic:<action> | per_wave_action_not_allowed:<action> | codex_action_not_allowed:<action>"},
+    "missing_artifact": {"trigger": "A path in read_first/allowed_writes does not exist on disk when preflighted.", "detected_at_leg": 1, "example_reason": "missing_artifact:<relative_path>"},
+    "failed_validation": {"trigger": "A task card's validation command would exit nonzero when run by the worker.", "detected_at_leg": 4, "example_reason": "failed_validation:<command>:exit_<code>", "notes": "schema-reserved: dryrun-only mode always reports verdict=not_applicable_mvp, so this branch is never exercised end-to-end today"}
+  },
+
+  "timeout_rules": {
+    "bounded_timeout_seconds_default": 3600,
+    "source": "phase2_orchestration_contract_b104_v1.sandbox.bounded_timeout_seconds_default -- the sandbox ceiling constant reserved for the future TIER_4 gated launch executor (leg 2, worker CHILD PROCESS bound). This is NOT the only timeout constant in this nested repo: see live_enforced_timeout_constant below for a second, real, CURRENTLY-ENFORCED timeout constant that already governs every TIER_1/TIER_2 taskctl subprocess call made today. An earlier revision of this artifact incorrectly asserted exclusivity for this constant (a false claim of exhaustive verification); corrected here to cite both constants.",
+    "applies_to_leg": 2,
+    "current_reachability": "NOT reachable end-to-end today FOR LEG 2 SPECIFICALLY: leg 2 (mcp_to_worker_cli_argv_handoff) is never executed under this or any current contract (TIER_4 has zero implementing code; launch_queue_contract.py.attempt_start() always raises LaunchDisabledError). This protocol specifies the rule for the future TIER_4 gated launch executor; the 3600s bounded_timeout_seconds_default enforces nothing today. This does NOT mean no timeout is enforced anywhere in the system today -- see live_enforced_timeout_constant: a second, distinct, ACTIVE timeout already bounds every current TIER_1/TIER_2 subprocess call to taskctl.py.",
+    "live_enforced_timeout_constant": {
+      "name": "DEFAULT_TIMEOUT_SECONDS",
+      "env_override": "GEOAI_TASK_MCP_TIMEOUT",
+      "default_value_seconds": 60,
+      "source": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py:16 -- DEFAULT_TIMEOUT_SECONDS = int(os.environ.get('GEOAI_TASK_MCP_TIMEOUT', '60')), verified at git show HEAD:src/geoai_task_mcp/core.py (stable HEAD, not the dirty B11 tree)",
+      "mechanism": "core.run_taskctl(args, ..., timeout=DEFAULT_TIMEOUT_SECONDS) passes this value as the `timeout=` kwarg into the synchronous child-process call it makes for every 'python3 AITools/taskctl.py <args>' invocation the MCP server issues (Python subprocess module, run-and-wait style, argv-list form, non-shell invocation -- consistent with shell_execution_policy.no_shell_true above)",
+      "scope": "governs every currently-live TIER_1/TIER_2 tool call that shells out to taskctl.py, e.g. geoai_task_health, geoai_task_review_queue, geoai_task_list, geoai_task_show, geoai_task_pending_for_runner, geoai_task_auto_pickup, geoai_task_auto_pickup_dryrun, geoai_task_collision_guard, geoai_task_usage_report, geoai_task_export_jsonl, geoai_task_audit_log_read, geoai_task_mark_review, geoai_task_mark_done",
+      "distinct_from_bounded_timeout_seconds_default": "this is a SEPARATE, CURRENTLY-ACTIVE subprocess timeout for taskctl CLI calls (default 60s, applies today); bounded_timeout_seconds_default=3600 is a different, not-yet-reachable sandbox ceiling reserved for a future TIER_4 gated WORKER-PROCESS launch (leg 2). Neither constant governs or overrides the other; they bound different subprocess calls at different tiers.",
+      "currently_enforced": true
+    },
+    "per_adapter_note": {
+      "claude_cli": "future ceiling <= bounded_timeout_seconds_default; no override above ceiling permitted",
+      "codex_cli": "same ceiling",
+      "deepseek_manual": "not applicable -- human_in_the_loop=true, no local process to bound; a manual handoff would use a soft reminder, never a hard kill"
+    },
+    "concurrency_cap_default": 1,
+    "concurrency_source": "phase2_orchestration_contract_b104_v1.sandbox.concurrency_cap_default",
+    "concurrency_rule": "at most 1 concurrent gated launch per GEOAI_REPO cwd-pin at any time; over-cap requests are blocked (decision=launch_blocked_precondition_failed) and audited, never silently queued",
+    "on_exceed": {
+      "status": "PROPOSED extension, NOT part of the frozen 5-code error_taxonomy above -- flagged for owner sign-off before promotion so any future taxonomy bump is deliberate, never silent",
+      "proposed_code": "execution_timeout",
+      "proposed_shape": {"code": "execution_timeout", "reason": "execution_timeout:<task_id>:<bounded_timeout_seconds_default>", "detected_at_leg": 2, "blocked": true},
+      "proposed_action": "the future TIER_4 executor kills the child process (SIGTERM then SIGKILL) and records this outcome; supervisor_state transitions dispatched_dryrun -> blocked, mirroring the existing dispatched_dryrun->blocked transition trigger set"
+    }
+  },
+
+  "safety_model": {
+    "credential_handling": {
+      "no_credential_read": true,
+      "no_credential_log": true,
+      "detail": "No code path in this protocol reads credential/secret env values or files. Reuses core.py's existing _sanitize_env_for_audit() pattern: only env var NAMES + set/unset boolean tokens may ever be logged (env_gate_status_tokens()), never values. env_scrub for a future TIER_4 launch passes only PYTHONPATH, GEOAI_REPO, PATH, and allowlisted GEOAI_TASK_MCP_* flag NAMES; all other env is dropped before any child process would see it."
+    },
+    "shell_execution_policy": {
+      "no_shell_true": true,
+      "argv_list_only": true,
+      "no_arbitrary_command": true,
+      "detail": "would_run_argv is always an argv LIST, never a shell string; no future launcher may enable shell-mode invocation. command_allowlist restricts the only launchable binaries to 'claude' and 'codex' (deepseek_manual is manual_only, never a local process) plus exactly 7 python3 AITools/taskctl.py subcommands verified verbatim from phase2_orchestration_contract_b104_v1.command_allowlist: auto-pickup, contract, show, review, collision-guard, verify, usage. Anything else is blocked and audited -- no arbitrary command is ever prepared or run."
+    },
+    "per_project_isolation": {
+      "scope_today": "single GEOAI_REPO cwd-pin per launch request + taskctl's own allowed_writes enforcement -- NOT a multi-repo/multi-tenant sandbox",
+      "non_goal_source": "MVP_ROADMAP.md Non-goals: 'No central multi-project server yet.' and 'No rewrite of taskctl.py.'",
+      "mechanism": "cwd is pinned to a single GEOAI_REPO value per request (parameterized repo root, not hardcoded per-tenant path); a launched worker (future TIER_4) would be confined to that one working tree; allowed_writes scoping is enforced by taskctl, not duplicated by the orchestrator",
+      "known_gap_flagged": "core.py:13 DEFAULT_REPO hardcodes an owner-specific fallback path (overridable via GEOAI_REPO env) per mvp_contract_audit_v1 finding F2 -- not submodule-neutral yet; tracked in this artifact's next_wave, not fixed by this task"
+    },
+    "daemon_policy": {
+      "no_daemon_start": true,
+      "detail": "No new long-running process, listener, or background loop. The MCP server remains the existing stdio request/response FastMCP process; this protocol adds no additional daemon and no new server entrypoint."
+    },
+    "network_policy": {
+      "no_network_launch": true,
+      "detail": "Orchestrator opens no new listeners; a future launched worker (TIER_4) would inherit host network only, never a new orchestrator-managed socket/API call."
+    },
+    "write_gate_policy": {
+      "two_independent_gates": ["GEOAI_TASK_MCP_ALLOW_WRITES (real, implemented, default '0', gates TIER_2 write tools)", "GEOAI_TASK_MCP_ALLOW_LAUNCH (proposed name only, referenced consistently across b02/b104/b118; LAUNCH_IMPLEMENTED remains a Python constant False in launch_queue_contract.py so this flag currently gates nothing that exists)"],
+      "both_required_for_future_launch": true,
+      "additional_gate_for_task_mcp_topic": "PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check (core.check_runner_topic_allowlist), unchanged by this task"
+    }
+  },
+
+  "command_allowlist": {
+    "launchable_binaries": ["claude", "codex"],
+    "manual_only_adapter": ["deepseek_manual"],
+    "allowed_taskctl_subcommands": ["auto-pickup", "contract", "show", "review", "collision-guard", "verify", "usage"],
+    "source": "phase2_orchestration_contract_b104_v1.command_allowlist (verbatim, 9-entry array: 2 binaries + 7 taskctl subcommands)",
+    "no_arbitrary_command": true
+  },
+
+  "adapters": {
+    "claude_cli": {"kind": "local_cli", "disabled_by_default": true, "human_in_the_loop": false, "review_role": "worker", "boundary": "runs exactly one claimed task inside allowed_writes, runs validation, calls taskctl review, never finalizes done"},
+    "codex_cli": {"kind": "local_cli", "disabled_by_default": true, "human_in_the_loop": false, "review_role": "reviewer_finalizer", "boundary": "orchestrator/reviewer/finalizer; a launched Codex WORKER instance must NOT self-review or finalize a task it executed -- separation of duties"},
+    "deepseek_manual": {"kind": "manual_external", "disabled_by_default": true, "human_in_the_loop": true, "review_role": "worker", "boundary": "no local process and no API key is ever held by the orchestrator; orchestrator only renders a handoff packet for a human to paste; returns to Codex review like any worker"}
+  },
+
+  "review_handoff_contract": {
+    "trigger": "a worker task reaches taskctl review state",
+    "command": "python3 AITools/taskctl.py review <task_id> --runner <runner>",
+    "finalizer": "codex",
+    "separation_of_duties": "the adapter that executed a task is never the adapter that reviews or finalizes it",
+    "packet_fields_merged_from_b104_b117_b116": [
+      "task_id", "runner", "topic", "adapter_id", "allowed_writes", "allowed_writes_count",
+      "changed_paths", "tests_run", "validation_commands", "validation_present", "verdict",
+      "token_cost_report", "audit_log_ref", "review_command", "finalizer",
+      "risks", "commit_hygiene", "recommended_stage_list"
+    ],
+    "risks_shape": "list[{code, severity, detail}] -- e.g. missing_validation, shared_file_write, declared_risk (from human_brief.risk)",
+    "commit_hygiene_shape": "{status: ok|warn, no_git_add_all: bool, mixed_task_commit_forbidden: bool, scoped_stage_only: bool}",
+    "worker_must_not": ["run taskctl done", "create follow-up task cards", "self-review own executed task"],
+    "live_implementing_tool": "geoai_task_codex_handoff (mcp_codex_handoff_e2e_b116_v1, 70/70 checks PASS) -- the only tool in this contract that ALREADY emits risks[]/commit_hygiene{}/recommended_stage_list live over the real review queue"
+  },
+
+  "stale_facts_flagged_not_trusted": [
+    {"artifact": "README.md 'Exposed Tools' (12 total: 8 read + 4 write)", "status": "stale", "correction": "live count moved 16->17 as of 2026-07-05 per mcp_codex_handoff_e2e_b116_v1.tool_inventory_note; a concurrent B11 in-flight task may move it further -- do not cite README's 12 as current"},
+    {"artifact": "task_mcp_source_patch_deconflict_b09_v1.json core.py line numbers (e.g. 'insert after line ~497')", "status": "stale", "correction": "pre-B11-patch; core.py has grown +425 lines since per session_latest.md"},
+    {"artifact": "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh / test_mcp_stdio_concurrent_client_smoke_b110_v1.sh / test_mvp_contract_audit_v1.sh / test_mcp_neural_launch_routing_dryrun_b109_v1.sh", "status": "known pre-existing failures, not this task's concern", "correction": "frozen tool-count/audit-list assertions now wrong (16 vs 17, missing 5 tool names) and a collision-guard row-count drift (3 vs 6); documented in mcp_codex_handoff_e2e_b116_v1.preexisting_failures_not_caused_by_b116; this protocol's own test validates only its own new JSON shape"}
+  ],
+
+  "known_exposure_gaps_for_next_wave": [
+    {"category": "risk", "gap": "No aggregated risk score across queue; human_brief.risk is optional text, not enumerated.", "source": "review_signal_inventory_b160_v1.json"},
+    {"category": "validation", "gap": "No per-task test-pass/fail state stored; verify is queue-wide, not per-task.", "source": "review_signal_inventory_b160_v1.json"},
+    {"category": "cost", "gap": "Cost not joined into task card view; requires a separate geoai_task_usage_report call. No cumulative cost per topic.", "source": "review_signal_inventory_b160_v1.json"},
+    {"category": "collision", "gap": "Per-card collision state not surfaced in show/list; requires a full guard scan.", "source": "review_signal_inventory_b160_v1.json"},
+    {"category": "staleness", "gap": "No computed staleness score or age-hours in tool response; raw timestamps only.", "source": "review_signal_inventory_b160_v1.json"}
+  ],
+
+  "neural_bridge_note": {
+    "doctrine": "Per GeoAI neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This protocol adds NO cue router: the tool-authority tiers, lifecycle state machine, and error taxonomy are static, human-authored safety/interface boundaries (deterministic classifiers reused from core._lifecycle_state / core.check_runner_topic_allowlist), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
+    "migration_task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "curriculum_path": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "not_a_bare_promise": true
+  },
+
+  "this_task_forbidden_operations_confirmed_not_taken": {
+    "note": "Exact mapping to THIS task's own FORBIDDEN constraint list (7 items). All confirmed false/not-taken by this deliverable.",
+    "daemon_start": false,
+    "cli_runner_execution": false,
+    "source_patch": false,
+    "credential_access": false,
+    "task_status_mutation": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+
+  "protocol_safety_invariants_for_future_implementers": {
+    "note": "Broader invariant set (superset of this task's own forbidden list) that any FUTURE coder task implementing TIER_3/TIER_4 wiring must preserve, reused verbatim from task_mcp_supervisor_loop_contract_b07_v1.forbidden_operations_confirmed_not_taken.",
+    "source_patch": false,
+    "daemon_start": false,
+    "real_agent_launch": false,
+    "credential_read": false,
+    "credential_write": false,
+    "write_gate_enable": false,
+    "task_status_mutation": false,
+    "network_operation": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+
+  "acceptance": {
+    "minimal_tools_state_transitions_timeout_review_handoff_specified": "pass",
+    "read_only_vs_write_execute_tools_separated": "pass -- 4-tier tool_authority_tiers taxonomy (TIER_1 read-only navigation, TIER_2 write-gated lifecycle, TIER_3 launch-plan dryrun-only, TIER_4 gated launch execution reserved/not-implemented)",
+    "safety_model_credentials_shell_per_project_isolation_defined": "pass -- safety_model.credential_handling / safety_model.shell_execution_policy / safety_model.per_project_isolation",
+    "test_script_validates_protocol_json_shape": "pass -- see tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh"
+  },
+
+  "rollback": {
+    "action": "Delete the 4 new artifact files introduced by this task (this protocol, its rows jsonl, its next_wave proposal, its test). Nothing outside tools/geoai-task-mcp/{eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
+    "trigger_conditions": [
+      "any lifecycle state or error_taxonomy code diverges from the 5+5 frozen in task_mcp_supervisor_loop_contract_b07_v1",
+      "any tool_authority_tier gains an undocumented task_status_mutation or process-launch capability",
+      "a future implementation flips TIER_4 launch_implemented to true without a dedicated gated-executor task"
+    ]
+  },
+
+  "verdict": "PASS"
+}

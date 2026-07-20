@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geoai-task-mcp"
+version = "0.2.0"
+description = "MCP server for GeoAI task queue orchestration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.0.0"
+]
+
+[project.scripts]
+geoai-task-mcp = "geoai_task_mcp.server:main"
+aiworkinghub = "geoai_task_mcp.server:main"
+aiwh = "geoai_task_mcp.server:main"
+aiworkinghub-mcp = "geoai_task_mcp.server:main"
+geoai-task-mcp-health = "geoai_task_mcp.health:main"
+geoai-task-dashboard = "geoai_task_mcp.dashboard:main"
+geoai-task-callback-bridge = "geoai_task_mcp.callback_bridge:main"
+geoai-task-deepseek-credential = "geoai_task_mcp.deepseek_credentials:main"
+geoai-app-server-mux = "geoai_task_mcp.app_server_mux:main"
+geoai-task-reconciler = "geoai_task_mcp.task_reconciler:main"
+
+[tool.setuptools.package-data]
+geoai_task_mcp = ["dashboard_static/*"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

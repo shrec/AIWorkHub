@@ -1,0 +1,73 @@
+{
+  "eval_id": "mcp_completion_inbox_wiring_b275_v1",
+  "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_WIRING_B275_V1",
+  "runner": "claude_task_mcp_completion_inbox_b275",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "mcp_completion_inbox_wiring_readonly_no_launch",
+  "builds_on": "mcp_launch_queue_readonly_wiring_b252_v1 (server.py wiring pattern), AITools/task_activity_facts.py (stale_workers/validation_failures precedent), AITools/taskctl.py::_runner_task_batch_mismatch (mismatch logic mirrored)",
+  "verdict": "PASS",
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local wiring: one new module (completion_inbox.py) composing already-existing local read-only helpers (core.list_tasks/core.show_task, mirroring review_summarizer._collect_review_cards) into a new @mcp.tool() on an already-live FastMCP server instance. No external MCP-SDK/API question was open."
+  },
+  "summary": "Added tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py, a READ-ONLY module combining 4 facets for Codex orchestration: review_queue (canonical-state 'review' cards), stale_processing (canonical-state 'processing' cards whose updated_at/started_at/claimed_at is older than stale_processing_hours, default 24h -- matching AITools/task_activity_facts.py's STALE_WORKER_HOURS precedent), runner_mismatch_warnings (batch-token mismatches between a runner name and the task_id it claimed, a local pure replica of AITools/taskctl.py::_runner_task_batch_mismatch lines 264-295), and latest_validation_facts (validation_status/validation_error/blocker_reason as currently recorded per task). All data is fetched via core.list_tasks()+core.show_task() -- the SAME read-only taskctl.py 'list'/'show' subcommands taskctl.py itself uses internally (cmd_list/cmd_show -> _load_cards() -> taskdb.load_cards() -> bitnnv2/data/tasking/task_queue_v1.sqlite), never a write command and never a new subprocess/exec path. Wired as one new additive @mcp.tool() geoai_completion_inbox(topic, limit, stale_processing_hours) in server.py; every pre-existing tool (B106/B107 readonly set, B110/B111/B116 review-summarizer set, B08 supervisor-loop, B252 launch-queue readonly set) is untouched.",
+  "gates": {
+    "readonly_tool_only_no_execute_spawn_subprocess_beyond_taskctl_list_show": true,
+    "no_write_command_ever_issued_done_review_start_autopickup_addcard_exportjsonl": true,
+    "write_gate_default_off_and_forced_on_both_produce_identical_readonly_output": true,
+    "authority_flags_all_false_process_agent_shell_queue_audit": true,
+    "runner_task_batch_mismatch_fires_only_on_genuine_mismatch": true,
+    "runner_task_batch_mismatch_silent_on_matched_or_tokenless_pairs": true,
+    "additive_wiring_preexisting_tools_intact": true,
+    "server_py_no_subprocess_exec_fork_shell_pattern": true,
+    "completion_inbox_py_no_subprocess_exec_fork_shell_pattern": true,
+    "schema_valid_json_schema": true,
+    "parent_queue_db_byte_identical_before_after_live_tool_call": true,
+    "parent_queue_unmutated": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "invariant": {
+    "readonly": true,
+    "launch_implemented": false,
+    "queue_write": false,
+    "audit_write": false,
+    "read_path_matches_taskctl_internal_path": "core.list_tasks/core.show_task -> taskctl.py cmd_list/cmd_show -> _load_cards() -> taskdb.load_cards() -> bitnnv2/data/tasking/task_queue_v1.sqlite",
+    "batch_mismatch_source_of_truth": "AITools/taskctl.py:264-295 (_runner_batch_token/_task_batch_token/_runner_task_batch_mismatch), replicated locally per the core.py::_lifecycle_state import-light precedent",
+    "stale_processing_default_threshold_hours": 24.0
+  },
+  "new_readonly_tool": "geoai_completion_inbox",
+  "public_api": {
+    "geoai_completion_inbox(topic=None, limit=200, stale_processing_hours=24.0)": "dict with review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, fetch_errors, authority_flags, mutation; writes nothing"
+  },
+  "fields_exposed": {
+    "review_queue[]": ["task_id", "runner", "claimed_by", "topic", "priority", "objective", "allowed_writes", "updated_at", "review_at", "validation_status", "runner_task_batch_mismatch"],
+    "stale_processing[]": ["task_id", "runner", "claimed_by", "topic", "last_activity_at", "last_activity_field", "stale_hours", "runner_task_batch_mismatch"],
+    "runner_mismatch_warnings[]": ["task_id", "runner", "claimed_by", "topic", "lifecycle_state", "warning"],
+    "latest_validation_facts[]": ["task_id", "runner", "topic", "lifecycle_state", "validation_status", "validation_error", "blocker_reason", "last_activity_at"],
+    "top_level": ["tool", "contract", "generated_at", "readonly", "authority_flags", "filters", "counts", "fetch_errors", "mutation"]
+  },
+  "read_only_no_agent_launch_property": {
+    "asserted_by": "test_mcp_completion_inbox_wiring_b275_v1.sh sections 1, 6, 7",
+    "no_launch_code_marker": "server.py and completion_inbox.py contain no process-launch code: no subprocess.Popen, no os-level exec/fork/spawn/system/popen, no shell=True, no pty.spawn -- the only subprocess this module reaches is the pre-existing core.run_taskctl (python3 taskctl.py list/show, both read-only taskctl subcommands, never an agent/model process).",
+    "queue_db_fingerprint_check": "bitnnv2/data/tasking/task_queue_v1.sqlite size+mtime asserted byte-identical before/after a live geoai_completion_inbox MCP call",
+    "authority_flags_forced_on_check": "GEOAI_TASK_MCP_ALLOW_WRITES=1 forced and the tool still reports every write/launch authority flag False"
+  },
+  "neural_bridge_note": "This wiring adds no new decision authority: all 4 facets are pure views over already-recorded card fields (status/worker_status/timestamps/validation_status) and a deterministic batch-token string comparison -- a support-boundary correctness check per CLAUDE.md's neural-control-first carve-out, not a learned routing decision. No regex/keyword cue router is introduced for task-type or route selection.",
+  "tooling_gap_note": "tools/geoai-task-mcp/ is not covered by any source_graph indexer (source_graph.py/cgraph.py/source_graph_universal.py project-root maps stop at bitnnv2/*, AITools/, scripts/, tokenizer/, dashboard/) -- see kb bug.tools_geoai_task_mcp_not_indexed (ACTIVE since 2026-07-05). Read taskctl.py via source_graph.py context/body/sql-on-function_bodies (fully indexed, AITools project) as instructed; server.py/core.py/review_summarizer.py under tools/geoai-task-mcp/ required a direct Read per the same documented, pre-existing workaround (fix owed: add tools/geoai-task-mcp to indexer project roots, not attempted here since it is outside this task's allowed_writes).",
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh",
+    "tools/geoai-task-mcp/eval/mcp_completion_inbox_wiring_b275_v1.json",
+    "tools/geoai-task-mcp/data/tasking/mcp_completion_inbox_wiring_next_wave_b275_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true
+}

@@ -1,0 +1,84 @@
+{
+  "schema_id": "geoai.task_mcp.eval.worker_ai_infra_context_b437.v1",
+  "task_id": "CODEX_GPT55_TASK_MCP_AI_INFRA_CONTEXT_RUNTIME_B437_V1",
+  "timestamp_utc": "2026-07-16T09:12:00Z",
+  "before": {
+    "context_policy": "B434 injected a bounded project_context bundle but did not distinguish code, data classification and research task requirements.",
+    "source_graph": "A successful Source Graph command with an empty JSON object could be treated as collected context.",
+    "delivery": "Prompt injection was recorded through prompt hashes/context metadata, but worker acknowledgement was not a separate bounded contract.",
+    "dashboard": "Process and task detail views did not expose compact per-task Source Graph/Session/AI Memory/KB telemetry."
+  },
+  "after": {
+    "context_policy": "project_context validates task_type code/data_classification/research, Source Graph required/non-gating policy, exact declared targets, derived target metadata, and immutable input-shard primary context for data classification.",
+    "source_graph": "Required code tasks fail before claim on empty Source Graph JSON hit_count=0; data-classification tasks may report Source Graph hit_count=0 when explicitly non-gating.",
+    "context_bundle": "Source Graph, Session current-state, optional AI Memory, and KB sections carry requested/executed/hit_count/bytes/sha256/truncated/degraded metadata while raw content remains only inside the bounded prompt bundle.",
+    "delivery": "Common Codex/Claude/DeepSeek prompts include one receipt schema; process events record injected delivery separately from bounded worker acknowledgement parsed from stdout tail.",
+    "dashboard": "read_process_runs and task detail return compact ai_infra_context telemetry: Source Graph hits/bytes, Session hits, AI Memory hits, KB hits, injected, acknowledged, degraded reason, and deterministic byte-estimate labels only.",
+    "byte_metric": "estimated_raw_context_vs_bundle_bytes is labeled deterministic_byte_estimate_not_token_or_cost_truth and does not assert token or cost savings."
+  },
+  "canaries": {
+    "non_empty_process_manager_source_graph": "B437 fixture Source Graph bundle with sections/items produced source_graph.hit_count > 0 and exact declared target precedence over natural-language query.",
+    "required_empty_fail_before_claim": "code task with Source Graph payload {} returned blocked source_graph_required_empty_result and claim_start_exact was not called.",
+    "data_task_non_gating": "data_classification task with source_graph.required=false and immutable input shard returned primary_context=immutable_input_shard and source_graph.hit_count=0.",
+    "receipt_semantics": "PROJECT_CONTEXT_RECEIPT with schema geoai.task_mcp.worker_context_receipt.v1 parsed acknowledged=true; injected remains delivery metadata.",
+    "dashboard_redaction": "process log event containing raw_context_content=MUST_NOT_RENDER returned compact ai_infra_context and did not serialize the raw marker."
+  },
+  "commands": [
+    {
+      "cmd": "/home/shrek/GeoAI/.venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
+      "result": "pass",
+      "returncode": 0,
+      "stdout": "5 passed, 1 warning in 0.23s",
+      "stderr_note": "pytest cache warning only: cache path creation blocked by sandbox permissions"
+    },
+    {
+      "cmd": "/home/shrek/GeoAI/.venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py tools/geoai-task-mcp/tests/test_dashboard.py",
+      "result": "blocked_preexisting_environment_or_out_of_scope",
+      "returncode": 1,
+      "stdout": "36 passed, 11 failed, 2 warnings in 0.47s",
+      "failures": [
+        "B434 fixture chmod calls fail with PermissionError in this isolated sandbox before exercising B437 code paths.",
+        "test_callback_bridge_health_batch_stats_never_expose_full_thread_id fails because imported taskdb lacks claim_pending_callback_batch in this worktree.",
+        "archive and health-identity dashboard tests return 503 from the same out-of-scope taskdb/dashboard support mismatch."
+      ]
+    },
+    {
+      "cmd": "python3 -m py_compile tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
+      "result": "pass",
+      "returncode": 0
+    },
+    {
+      "cmd": "python3 AITools/taskctl.py verify",
+      "result": "pass",
+      "returncode": 0,
+      "stdout": "VERIFY: PASS"
+    },
+    {
+      "cmd": "python3 AITools/taskctl.py collision-guard",
+      "result": "blocked_unrelated_collision",
+      "returncode": 1,
+      "stdout": "COLLISION: bitnnv2/data/dictionary/dictionary_engine_v1.manifest.json between DEEPSEEK_LEXICON_MORPHOLOGY_B400_SELECTIVE_APPLY_B436_V1 and DEEPSEEK_V4PRO_LEXICON_SEMANTIC_LITERAL_SELECTIVE_APPLY_B402_V1"
+    }
+  ],
+  "telemetry_fields": [
+    "ai_infra_context.source_graph.hit_count",
+    "ai_infra_context.source_graph.bytes",
+    "ai_infra_context.session_current_state.hit_count",
+    "ai_infra_context.ai_memory.hit_count",
+    "ai_infra_context.kb.hit_count",
+    "ai_infra_context.injected",
+    "ai_infra_context.acknowledged",
+    "ai_infra_context.estimate.label"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.js",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/index.html",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.css",
+    "tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_worker_ai_infra_context_b437_v1.json",
+    "tools/geoai-task-mcp/README.md"
+  ]
+}

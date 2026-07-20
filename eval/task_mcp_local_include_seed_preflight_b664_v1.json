@@ -1,0 +1,50 @@
+{
+  "schema_id": "geoai.task_mcp.local_include_seed_preflight_b664_v1.worker_evidence.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_LOCAL_INCLUDE_SEED_PREFLIGHT_B664_V1",
+  "worker_terminal_state": "review",
+  "summary": "Added fail-fast local-quoted-include dependency preflight to worker_workspace.create_workspace. The _resolve_local_quoted_includes function scans declared C/CUDA/header read inputs for #include \"...\" directives, recursively resolves them using compiler-style current-directory-then-include-roots lookup, seeds exact live-parent regular files byte-for-byte, deduplicates cycles, and fails closed with exact missing-dependency diagnostics before worker launch. Angle-bracket includes are never followed. Symlink rejection and MAX_SEED_FILES bounds are preserved.",
+  "changes": {
+    "worker_workspace.py": {
+      "added_functions": [
+        "_resolve_local_quoted_includes",
+        "_validate_include_roots",
+        "_resolve_one_quoted_include"
+      ],
+      "added_constants": [
+        "_HEADER_FILE_SUFFIXES",
+        "_QUOTED_INCLUDE_RE",
+        "_DEFAULT_INCLUDE_ROOTS"
+      ],
+      "modified_functions": ["create_workspace (one-line integration call after _expand_declared)"]
+    }
+  },
+  "acceptance_evidence": {
+    "b646_canary": "PASS -- S0 (parse_place_spatial_sidecar_v1.h), S4 (parse_place_spatial_s4_motion_time_v1.h), and S6 (parse_place_spatial_s6_shadow_v1.h) seeded transitively from the B646 feature packet; nonexistent S3/S5/s2_rigid_metric not seeded",
+    "unresolvable_fails_closed": "PASS -- WorkspaceError raised with exact missing dependency list",
+    "angle_bracket_never_followed": "PASS -- #include <stddef.h> not resolved even when file exists in include root",
+    "recursive_resolution": "PASS -- A->B->C transitive closure seeded",
+    "cycle_deduplication": "PASS -- x.h<->y.h both seeded, no infinite loop",
+    "symlink_rejection": "PASS -- include target symlink silently skipped",
+    "max_seed_files": "PASS -- combined limit enforced on transitive closure",
+    "b660_backward_compat": "PASS -- terminal recursive-glob behavior unchanged"
+  },
+  "forbidden_not_violated": [
+    "angle_include_hydration",
+    "system_header_copy",
+    "compiler_invocation",
+    "symlink_seed_acceptance",
+    "seed_limit_removal",
+    "allowed_write_scope_change",
+    "promotion_change",
+    "lifecycle_change",
+    "atlas_store_mutation"
+  ],
+  "test_results": {
+    "b664_inline_suite": "25 PASS, 0 FAIL",
+    "b664_fixture_suite": "pending_pytest_in_coordinator_env",
+    "existing_worker_workspace_suite": "pending_pytest_in_coordinator_env",
+    "b660_regression": "pending_pytest_in_coordinator_env",
+    "python_compile": "PASS",
+    "json_tool": "PASS"
+  }
+}

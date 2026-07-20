@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "geoai-task-mcp": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "geoai_task_mcp.server"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/shrek/GeoAI/tools/geoai-task-mcp/src",
+        "GEOAI_REPO": "/home/shrek/GeoAI",
+        "GEOAI_TASK_MCP_ALLOW_WRITES": "0"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,7 @@
+{
+  "schema_id": "geoai.mcp_full_wave_harness_real_repair_next_wave.v1",
+  "task_id": "CLAUDE_TASK_MCP_FULL_WAVE_HARNESS_REAL_REPAIR_B122_V1",
+  "verdict": "PASS",
+  "summary": "B122 repaired the B121 hollow full-wave dryrun harness: real read-only sqlite/jsonl queue reads (3445 live cards, source=sqlite_readonly), real sha256 before/after over the actual queue inputs, 65 real runner/topic pickup simulations, and 3 engineered-failure detector fixtures (collision/stale-manifest/write-gate) that all demonstrably catch synthetic bad states without ever mutating the live queue.",
+  "tasks": []
+}

@@ -1,0 +1,81 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VALIDATION_EXEC_SCRATCH_B753_V1",
+  "runner": "claude_sonnet5_task_mcp_validation_exec_scratch_b753_v1",
+  "topic": "task_mcp",
+  "logical_topic": "task_mcp_validation_runtime",
+  "title": "Make isolated Task MCP validation scratch executable and eliminate false rc=126 failures",
+  "objective": "Fix the exact B751 infrastructure failure: validation commands running under the retained Landlock worktree currently inherit HOME/tmp on a noexec /tmp mount, so a test that compiles and executes a native ELF fails with permission denied even when the product passes. Provide a bounded per-request executable validation scratch with fail-closed cleanup and regression coverage without weakening filesystem scope or exposing credentials.",
+  "priority": "high",
+  "queue_order": 753001,
+  "recommended_model": "claude-sonnet-5",
+  "mode": "validation_exec_scratch_repair",
+  "read_first": [
+    "AGENTS.md",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "tools/geoai-task-mcp/logs/processes/64165cc7a85949ca88e8106c1d42e176.request.json"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+  ],
+  "acceptance": [
+    "Reproduce B751's rc=126 with a validation command that compiles a minimal C executable into inherited TMPDIR and runs it; distinguish noexec from compiler/product failure.",
+    "Give each isolated validation run a private executable scratch directory that is inside the validation sandbox's writable authority. Prefer an explicitly probed exec-capable tmpfs/path and fail closed if no safe executable scratch exists; never chmod or remount a shared filesystem.",
+    "Preserve Landlock/bubblewrap scope, shell-free validation argv parsing, provider credential isolation, isolated task DB and parent-repo immutability. The repair must not add arbitrary writable directories or leak the parent environment.",
+    "Set TMPDIR/TMP/TEMP consistently only for validation, include the scratch in the sandbox allowlist, use request-unique 0700 ownership, reject symlinks and clean it after success, failure, timeout and cancellation.",
+    "Add tests for compile+execute success, normal non-native validation, deliberate test failure propagation, timeout, cleanup, symlink rejection, no credential leakage and concurrent request isolation. Existing worker_workspace/process_launcher tests must pass.",
+    "Do not touch task queue semantics, callback routing, dashboard, model code, roadmap/STATE, commits or remote state. Stop at Codex review."
+  ],
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_workspace.py tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+  ],
+  "forbidden": [
+    "shell_true",
+    "shared_world_writable_scratch",
+    "mount_or_remount",
+    "chmod_shared_tmp",
+    "arbitrary_writable_path",
+    "credential_passthrough",
+    "parent_repo_validation_write",
+    "task_queue_semantics_change",
+    "callback_change",
+    "dashboard_change",
+    "model_code_change",
+    "roadmap_edit",
+    "state_edit",
+    "git_commit",
+    "git_push",
+    "taskctl_done_by_worker"
+  ],
+  "commit_contract": "NO_COMMIT. Worker fixes and tests only the isolated validation executable-scratch boundary, then stops at Codex review.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "focus",
+      "budget": 100,
+      "query": "run_validations sanitized_env TMPDIR landlock executable scratch cleanup",
+      "targets": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      ]
+    },
+    "session": {"topic": "Task MCP validation executable scratch B753", "limit": 16},
+    "ai_memory": {"query": "B751 validation rc126 noexec TMPDIR", "limit": 8},
+    "kb": {"query": "Landlock executable temporary directory validation sandbox", "limit": 8}
+  }
+}

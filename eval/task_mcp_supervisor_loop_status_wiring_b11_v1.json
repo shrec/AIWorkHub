@@ -1,0 +1,101 @@
+{
+  "schema_id": "geoai.task_mcp_supervisor_loop_status_wiring_eval.b11.v1",
+  "task_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_RETRY_B11_V1",
+  "timestamp": "2026-07-07T20:10:00+00:00",
+  "verdict": "PASS",
+  "runner": "claude_task_mcp_supervisor_wiring_retry_b11",
+  "topic": "task_mcp",
+  "mode": "source_patch_merge_aware_single_owner",
+  "objective": "Retry the stale-claimed B10 wiring task: add read-only core.supervisor_loop_status() + @mcp.tool() geoai_supervisor_loop_status implementing the B08 contract's 7-step derivation, additively on top of the dirty (uncommitted) B119/B116/B111 core.py/server.py changes, without reverting any of that in-flight work.",
+  "supersedes_stale_task": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_B10_V1",
+  "supersedes_reason": "B10 self-reported worker_status=done but left zero source signature: no supervisor_loop_status symbol, no geoai_supervisor_loop_status tool, no B10 eval/rows/next_wave/test artifacts anywhere in the nested repo history or working tree.",
+  "contract_implemented": "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+  "test_harness": "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh",
+  "modules_under_test": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (supervisor_loop_status, LIFECYCLE_TO_SUPERVISOR_STATE, _parse_show_task_card, _extract_collision_report)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_supervisor_loop_status tool)"
+  ],
+  "merge_awareness": {
+    "nested_repo": "tools/geoai-task-mcp (own git repo, distinct from outer GeoAI repo)",
+    "preflight_result": "core.py and server.py were ALREADY dirty (uncommitted) before this task started, carrying B119 runner/topic allowlist code and the B116/B119 geoai_task_codex_handoff_markdown tool. This task's patch is a pure append: the new function block was added after the file's true EOF (previously ending at _parse_jsonl) in core.py, and the new @mcp.tool() block was inserted in server.py's existing blank lines between geoai_task_codex_handoff_markdown and the B107 cli_adapter_readonly_tool.register(mcp) comment/call -- zero existing lines touched or reordered above either insertion point.",
+    "git_diff_stat_before_this_task": "core.py +224/-25, server.py +26 (pre-existing dirty state, confirmed via git diff --stat in the nested repo before any edit)",
+    "no_revert_confirmed": true,
+    "no_git_add_A_used": true,
+    "commit_made": false
+  },
+  "checks_total": 71,
+  "checks_passed": 71,
+  "checks_failed": 0,
+  "scenarios_covered": [
+    "live_real_task",
+    "not_found",
+    "runner_topic_mismatch",
+    "fixture_missing_artifact",
+    "fixture_collision",
+    "fixture_stale_task",
+    "fixture_failed_validation",
+    "server_tool_wiring"
+  ],
+  "acceptance_results": {
+    "merge_aware_preflight_recorded_no_revert": "PASS - dirty core.py/server.py content (B119 allowlist block, B116/B119 codex_handoff_markdown tool) confirmed present and untouched after this task's patch",
+    "pure_read_derive_function": "PASS - core.supervisor_loop_status introduces zero new subprocess/exec/network/daemon-launch calls; composes only pre-existing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state, all of which call run_taskctl with allow_write defaulting False (never True) for these read-only subcommands (show, collision-guard)",
+    "no_write_mode_taskctl_call": "PASS - grep of the new function body confirms no allow_write=True call site and no reference to WRITE_COMMANDS/write_audit_entry",
+    "server_tool_registered_pattern_followed": "PASS - @mcp.tool() geoai_supervisor_loop_status matches the exact FROZEN READ-ONLY CONTRACT docstring style of geoai_task_codex_handoff/geoai_task_codex_handoff_markdown; inserted after the last existing tool and before cli_adapter_readonly_tool.register(mcp); all ~15+ pre-existing tools spot-checked present and unchanged (17 @mcp.tool() decorators total after this addition)",
+    "six_b08_scenarios_covered": "PASS - live real task, fixture collision, fixture stale_task, runner_topic_mismatch, missing_artifact, failed_validation all exercised end-to-end against the real wired core.supervisor_loop_status (plus not_found and full server-tool wiring as required extras of the output_schema/derivation_algorithm)",
+    "no_mutation_proof": "PASS - sha256 of bitnnv2/data/tasking/machine_task_cards_v1.jsonl + machine_task_cards_manifest_v1.json + tools/geoai-task-mcp/logs/audit.jsonl identical before vs after all 8 scenario functions (including the 71-check full run and the live server-tool call)",
+    "bash_test_exit": "PASS - test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh exits 0",
+    "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns VERIFY: PASS"
+  },
+  "acceptance_criteria": [
+    "preflight dirty core.py/server.py and record merge-awareness summary; do not revert or overwrite existing non-B11 changes",
+    "core.supervisor_loop_status() is a PURE read/derive function reusing existing queue helpers only; no subprocess/exec/network/daemon-launch/audit-write/write-mode taskctl call",
+    "register @mcp.tool() geoai_supervisor_loop_status in server.py without disturbing existing ~15+ tools",
+    "cover the B08 six scenarios",
+    "prove no audit/task-status/queue mutation occurs during tool calls",
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh passes",
+    "python3 AITools/taskctl.py verify passes"
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "PURE_FUNCTION_DERIVATION": true,
+    "NO_NEW_SUBPROCESS_EXEC_NETWORK": true,
+    "NO_DAEMON_LAUNCH": true,
+    "NO_AUDIT_WRITE": true,
+    "NO_WRITE_GATE_TOGGLE": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER": true,
+    "MANIFEST_UNCHANGED_BEFORE_AFTER": true,
+    "AUDIT_LOG_UNCHANGED_BEFORE_AFTER": true,
+    "EXISTING_TOOLS_PRESERVED": true,
+    "DIRTY_PRIOR_WORK_PRESERVED_NOT_REVERTED": true,
+    "SIX_B08_SCENARIOS_GREEN": true
+  },
+  "forbidden_operations_verified": [
+    "daemon_start",
+    "subprocess_launch_new",
+    "exec_shell",
+    "network_call",
+    "task_status_mutation",
+    "audit_write",
+    "credential_access",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "b10_stale_claim_note": {
+    "b10_task_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_B10_V1",
+    "b10_worker_status_claimed": "done",
+    "b10_review_verdict": "REJECTED_SUPERSEDED_NO_B10_ARTIFACTS",
+    "b10_evidence_of_absence": [
+      "no supervisor_loop_status / geoai_supervisor_loop_status symbol anywhere in nested-repo git history (git log --all --grep) or working tree before this task",
+      "none of B10's own allowed_writes artifact files existed (eval/rows/next_wave/test)",
+      "confirmed independently by full-file read of core.py/server.py before this task's edits"
+    ]
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "commit_contract": "NO_COMMIT per task contract; working tree left with new/modified files present but uncommitted. Codex finalizes.",
+  "rows_ref": "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_rows_b11_v1.jsonl",
+  "next_wave_ref": "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_wiring_next_wave_b11_v1.json"
+}

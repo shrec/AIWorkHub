@@ -1,0 +1,4 @@
+{"task_id": "T1", "status": "pending", "runner": "R1", "topic": "t1", "allowed_writes": ["file_a", "file_b"]}
+{"task_id": "T2", "status": "processing", "runner": "R2", "topic": "t2", "allowed_writes": ["file_b", "file_c"]}
+{"task_id": "T3", "status": "pending", "runner": "R1", "topic": "t1", "allowed_writes": ["file_d"]}
+{"task_id": "T_FINISHED", "status": "finished", "runner": "R1", "topic": "t1", "allowed_writes": ["file_a"]}

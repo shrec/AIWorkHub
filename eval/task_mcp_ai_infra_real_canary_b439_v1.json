@@ -1,0 +1,10 @@
+{
+  "task_id": "DEEPSEEK_TASK_MCP_AI_INFRA_REAL_CANARY_B439_V1",
+  "model": "deepseek_v4_pro",
+  "observed_task_type": "code",
+  "observed_primary_context": "source_graph",
+  "source_graph_target": "ProcessManager",
+  "source_graph_nonempty": true,
+  "observed_section_names": ["source_graph", "session_current_state", "ai_memory", "kb"],
+  "context_guidance_statement": "The injected SourceGraph focus bundle resolved the exact ProcessManager hot-function surface (84 hits, top suspect _finalize_isolated_request at review_priority 80) without opening any source file, confirming that the B439 real-worker path receives a non-empty targets-origin=declared bundle. The Session Manager, AI Memory, and KB sections provided current-state evidence and a known-gap record (bug.tools_geoai_task_mcp_not_indexed) that prevented wasted indexer queries during this measurement-only canary."
+}

@@ -1,0 +1,231 @@
+{
+  "eval_id": "task_mcp_autolaunch_dryrun_spec_b276_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1",
+  "runner": "deepseek_task_mcp_autolaunch_dryrun_b276",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "task_mcp_autolaunch_dryrun_spec_no_execution",
+  "verdict": "PASS",
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "training_launch": false
+  },
+  "builds_on": [
+    "mcp_launch_queue_contract_b104_v1 (LAUNCHABLE_BINARIES, env-gate contract)",
+    "mcp_completion_inbox_wiring_b275_v1 (review_queue, stale_processing, runner_mismatch_warnings)",
+    "mcp_neural_launch_routing_migration_b254_v1 (neural routing targets, abstain classes)",
+    "taskctl.py auto-pickup / taskctl.py guard / taskctl.py stage pipeline"
+  ],
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local spec: command templates for already-known CLI tools (claude, codex), safety gates from existing env-contract, and completion path from existing taskctl.py + completion_inbox.py. No external MCP-SDK/API question open."
+  },
+  "summary": "Drafted a dryrun-only protocol for MCP-driven model autolaunch. Defines per-model command templates (claude_cli, codex_cli, deepseek_manual), four mandatory safety gates (env dual-gate, taskctl guard, allowed_writes enforcement, LAUNCH_IMPLEMENTED=false), a 15-field log/usage/accounting schema, and the completion return path from worker write -> taskctl review -> completion_inbox -> Codex finalize. No actual CLI launch code exists; every launch_authority flag is false. Artifact size: <10KB JSON, well under 25MB limit.",
+  "protocol_sections": {
+    "section_1_command_templates": {
+      "title": "Per-Model CLI Command Templates",
+      "description": "Exact command-line templates for each supported agent adapter. Templates are dryrun-only documentation; no template is executed by this spec or by the current MCP server code.",
+      "adapters": {
+        "claude_cli": {
+          "binary": "claude",
+          "binary_path_check": "which claude || echo 'CLAUDE_NOT_FOUND'",
+          "template": "claude --print --allowedTools Bash,Read,Write,Edit,Grep,Glob,WebSearch,WebFetch --max-turns 200 --output-format text --model claude-sonnet-4-5 --dangerously-skip-permissions --system-prompt-file tools/geoai-task-mcp/data/agent_prompts/claude_worker_system_b276_v1.txt '<owner_prompt>'",
+          "env_required": ["GEOAI_TASK_MCP_ALLOW_LAUNCH=1", "GEOAI_TASK_MCP_ALLOW_WRITES=1"],
+          "pre_launch_checks": [
+            "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic>",
+            "python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic> --dryrun"
+          ],
+          "completion_poll": "poll taskctl.py show <task_id> for lifecycle_state=review; then completion_inbox.py reports review_queue",
+          "stale_timeout_seconds": 7200,
+          "max_concurrent": 4,
+          "cost_model": "claude_api_per_token"
+        },
+        "codex_cli": {
+          "binary": "codex",
+          "binary_path_check": "which codex || echo 'CODEX_NOT_FOUND'",
+          "template": "codex exec --model gpt-5.5 --max-turns 200 --allowed-tools all --task-file <task_card_path>",
+          "env_required": ["GEOAI_TASK_MCP_ALLOW_LAUNCH=1", "GEOAI_TASK_MCP_ALLOW_WRITES=1"],
+          "pre_launch_checks": [
+            "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic>",
+            "python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic> --dryrun"
+          ],
+          "completion_poll": "poll taskctl.py show <task_id> for lifecycle_state=review; then completion_inbox.py reports review_queue",
+          "stale_timeout_seconds": 7200,
+          "max_concurrent": 2,
+          "cost_model": "codex_api_per_token"
+        },
+        "deepseek_manual": {
+          "binary": "N/A",
+          "binary_path_check": "echo 'DEEPSEEK_MANUAL_ADAPTER_NO_LOCAL_BINARY'",
+          "template": "გაუშვი: python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic>\nდა შემდეგ იმუშავე task-ზე. დასრულების შემდეგ: python3 AITools/taskctl.py review <task_id>",
+          "env_required": [],
+          "pre_launch_checks": ["python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic> --dryrun"],
+          "completion_poll": "manual: owner copies command block to DeepSeek chat, worker reports back via taskctl.py review",
+          "stale_timeout_seconds": 86400,
+          "max_concurrent": null,
+          "cost_model": "deepseek_api_per_token"
+        }
+      }
+    },
+    "section_2_safety_gates": {
+      "title": "Mandatory Safety Gates (4-layer)",
+      "description": "Every model autolaunch MUST pass ALL four gates before a process is spawned. Gates are checked in order; failure at any gate blocks the launch and records a blocked_launch entry.",
+      "gates": [
+        {
+          "gate_id": "G1_env_dual_gate",
+          "name": "Environment Dual-Gate",
+          "check": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1",
+          "default": "both '0' (disabled)",
+          "failure_action": "block_launch_with_reason: env_gates_disabled",
+          "note": "Mirrors launch_queue_contract.py ALLOW_LAUNCH_ENV / ALLOW_WRITES_ENV. Both must be explicitly set to '1' by the owner."
+        },
+        {
+          "gate_id": "G2_taskctl_guard",
+          "name": "Taskctl Guard Check",
+          "check": "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic>",
+          "expected_output": "guard: PASS",
+          "failure_action": "block_launch_with_reason: taskctl_guard_failed",
+          "note": "Ensures the task is still in a launchable state (not already claimed by another runner, not stale, not blocked)."
+        },
+        {
+          "gate_id": "G3_allowed_writes_enforcement",
+          "name": "Allowed Writes Pre-Flight",
+          "check": "Verify task card allowed_writes are non-empty, within repo boundaries, and do not include forbidden paths (runtime/, registry/, defaults/)",
+          "failure_action": "block_launch_with_reason: allowed_writes_violation",
+          "note": "Each adapter receives only its task's allowed_writes as writable paths. Any write outside this set is a post-hoc violation caught by taskctl.py guard-staged."
+        },
+        {
+          "gate_id": "G4_launch_implemented_flag",
+          "name": "LAUNCH_IMPLEMENTED Toggle",
+          "check": "LAUNCH_IMPLEMENTED constant in launch_queue_contract.py is True before any real launch",
+          "current_value": false,
+          "failure_action": "block_launch_with_reason: launch_not_implemented",
+          "note": "This spec is dryrun-only. G4 will remain FAIL until a future implementation task sets LAUNCH_IMPLEMENTED=True and wires real process-spawn code."
+        }
+      ]
+    },
+    "section_3_log_usage_accounting": {
+      "title": "Log, Usage, and Accounting Schema",
+      "description": "Every autolaunch attempt records a structured log entry with these 15 fields. The log is append-only JSONL stored at tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl.",
+      "fields": {
+        "launch_id": "UUID v4, unique per launch attempt",
+        "task_id": "task card id from queue",
+        "runner": "runner name (e.g., claude_coding)",
+        "topic": "topic (e.g., coding)",
+        "adapter": "claude_cli | codex_cli | deepseek_manual",
+        "model": "model identifier string (e.g., claude-sonnet-4-5, gpt-5.5, deepseek-v4-pro)",
+        "launch_requested_at": "ISO-8601 UTC timestamp when launch was requested",
+        "launch_completed_at": "ISO-8601 UTC timestamp when process exited (null if still running/stale)",
+        "exit_code": "integer process exit code (null if still running)",
+        "gates_passed": ["G1", "G2", "G3", "G4"],
+        "gates_failed": ["list of gate ids that blocked launch"],
+        "usage_input_tokens": "integer, from model API response",
+        "usage_output_tokens": "integer, from model API response",
+        "cost_usd": "float, estimated cost in USD",
+        "error_message": "string, last stderr line or exception message if launch failed",
+        "stale_detected_at": "ISO-8601 UTC, set when stale_timeout exceeded without completion"
+      }
+    },
+    "section_4_completion_return_path": {
+      "title": "Completion Return Path",
+      "description": "After a worker finishes its task, the completion flows back to Codex review through this deterministic path.",
+      "steps": [
+        {
+          "step": 1,
+          "actor": "worker (Claude/Codex/DeepSeek)",
+          "action": "Write outputs to allowed_writes paths",
+          "verification": "files exist and are non-empty"
+        },
+        {
+          "step": 2,
+          "actor": "worker",
+          "action": "Run task validation (shell test + taskctl.py verify)",
+          "verification": "test PASS, verify PASS"
+        },
+        {
+          "step": 3,
+          "actor": "worker",
+          "action": "Run: python3 AITools/taskctl.py review <task_id> --runner <runner>",
+          "verification": "task lifecycle_state transitions to 'review'"
+        },
+        {
+          "step": 4,
+          "actor": "completion_inbox (MCP tool)",
+          "action": "geoai_completion_inbox() detects task in review_queue",
+          "verification": "task appears in review_queue[] with validation_status"
+        },
+        {
+          "step": 5,
+          "actor": "Codex (coordinator)",
+          "action": "Review worker output: check allowed_writes, run taskctl.py guard-staged, validate artifacts",
+          "verification": "Codex review verdict: PASS/FAIL/BLOCKED"
+        },
+        {
+          "step": 6,
+          "actor": "Codex",
+          "action": "If PASS: taskctl.py stage <task_id> && taskctl.py guard-staged <task_id> && git commit. If FAIL: create repair task.",
+          "verification": "committed or repair task created"
+        }
+      ],
+      "invariants": {
+        "no_auto_commit_by_worker": "Workers prefer NO_COMMIT; Codex finalizes allowed_writes only",
+        "no_git_add_A": "Never git add -A or git add .; use explicit path staging",
+        "no_mixed_task_commit": "One commit per task; never sweep unrelated dirty files"
+      }
+    },
+    "section_5_authority_flags": {
+      "title": "Authority Flags (ALL FALSE)",
+      "description": "Every authority flag is explicitly false. This spec grants zero runtime, default, support, model, or score authority.",
+      "flags": {
+        "process_launch_authority": false,
+        "runtime_authority": false,
+        "default_authority": false,
+        "support_authority": false,
+        "model_weight_write": false,
+        "score_apply": false,
+        "canonical_lexicon_mutation": false,
+        "atlas_bank_mutation": false,
+        "training_launch": false
+      }
+    }
+  },
+  "gates": {
+    "dryrun_only_no_cli_launch_code": true,
+    "command_templates_documented_not_executed": true,
+    "four_layer_safety_gates_defined": true,
+    "log_usage_accounting_schema_complete": true,
+    "completion_return_path_defined": true,
+    "all_authority_flags_false": true,
+    "launch_implemented_false": true,
+    "artifact_under_25mb": true,
+    "no_external_process_spawn": true,
+    "no_subprocess_import": true
+  },
+  "invariants": {
+    "dryrun_only": true,
+    "launch_implemented": false,
+    "queue_write": false,
+    "audit_write": false,
+    "workflow_switch": false,
+    "parent_queue_mutation": false,
+    "neural_routing_note": "Model/adapter selection (claude_cli vs codex_cli vs deepseek_manual) must eventually become a learned neural routing decision per neural-control-first doctrine. The static adapter map in this spec is a human-configured safety boundary, not intelligence. Future neural routing targets are tracked in mcp_neural_launch_routing_migration_b254_v1."
+  },
+  "files_written": [
+    "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_dryrun_spec_next_wave_b276_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true
+}

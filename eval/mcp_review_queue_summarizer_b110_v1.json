@@ -1,0 +1,87 @@
+{
+  "schema_id": "geoai.mcp_review_queue_summarizer_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1",
+  "timestamp": "2026-07-04T21:19:37+00:00",
+  "verdict": "PENDING_TEST",
+  "runner": "deepseek_task_mcp_review_summarizer_b110",
+  "topic": "task_mcp",
+  "mode": "mcp_review_queue_summarizer_readonly",
+  "objective": "Read-only MCP review queue summarizer: inspect taskctl review queue, group finished worker tasks by topic/runner, return Codex-ready review checklist without mutating the queue.",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_queue_summarizer_b110_v1.sh",
+  "test_source": "tools/geoai-task-mcp/tests/mcp_review_queue_summarizer_smoke.py",
+  "module_source": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "acceptance_criteria": {
+    "review_queue_inspection": "must call taskctl review-queue (read-only) and parse output",
+    "task_grouping": "must group finished tasks by topic/runner key",
+    "codex_checklist": "must return validation commands, allowed_writes count, and commit contract per task",
+    "no_mutation": "must never call taskctl done/review/start/add-card or mutate queue/audit logs",
+    "subprocess_tripwire": "SUBPROCESS_LAUNCH_TRIPWIRE must be 0",
+    "contract_test_stubbed": "must include smoke test with stubbed taskctl backend and subprocess launch tripwire=0",
+    "test_passes": "bash tools/geoai-task-mcp/tests/test_mcp_review_queue_summarizer_b110_v1.sh passes",
+    "verify_passes": "python3 AITools/taskctl.py verify passes"
+  },
+  "authority_flags": {
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "forbidden_operations": [
+    "queue_mutation",
+    "status_mutation",
+    "agent_launch",
+    "subprocess_run_unstubbed",
+    "write_gate_enable_by_default",
+    "secret_logging"
+  ],
+  "invariants": {
+    "READONLY": true,
+    "LAUNCH_IMPLEMENTED": false,
+    "SUBPROCESS_LAUNCH_TRIPWIRE": 0,
+    "all_authority_flags_false": true,
+    "no_write_path_exists": true
+  },
+  "output_schema": {
+    "ok": "bool",
+    "review_queue_raw": "str",
+    "task_count": "int",
+    "fetch_errors": "list[dict]",
+    "grouped_tasks": "dict[str, list[str]]",
+    "codex_review_checklist": "list[dict]",
+    "summary": {
+      "total_tasks": "int",
+      "topics": "dict[str, int]",
+      "runners": "dict[str, int]",
+      "fetch_error_count": "int"
+    },
+    "authority_flags": {
+      "write_gate_enabled": "bool",
+      "readonly": "bool",
+      "process_launch": "bool",
+      "agent_launch": "bool",
+      "shell_invocation": "bool",
+      "queue_write": "bool",
+      "audit_write": "bool",
+      "subprocess_launch_tripwire_zero": "bool"
+    }
+  },
+  "codex_review_checklist_item_schema": {
+    "task_id": "str",
+    "runner": "str",
+    "topic": "str",
+    "status": "str",
+    "worker_status": "str",
+    "validation_commands": "list[str]",
+    "allowed_writes_count": "int",
+    "allowed_writes": "list[str]",
+    "commit_contract": "str",
+    "mode": "str",
+    "priority": "str",
+    "objective": "str"
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  }
+}

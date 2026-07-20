@@ -1,0 +1,71 @@
+{
+  "evidence_schema": "geoai.task_mcp.b407_active_turn_steer_bridge_evidence.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_ACTIVE_TURN_STEER_BRIDGE_B407_V1",
+  "verdict": "SAME_SERVER_ADAPTER_ACCEPTED_TRANSPORT_TOPOLOGY_BLOCKED",
+  "summary": "Fixed the measured defect: callback_bridge.py's deliver_callback()/deliver_callback_batch() called thread/resume then unconditionally turn/start, so a callback bound to an already-active Codex thread either started a second hidden turn or (via the busy-thread path) waited/deferred without ever appending to the in-flight turn. Verified the real installed App Server v2 JSON Schema export (/tmp/geoai-codex-app-server-schema/v2, generated before this session by prior tooling) for ThreadResumeResponse/Thread/ThreadStatus/Turn/TurnStatus/TurnSteerParams/TurnSteerResponse/CodexErrorInfo -- result.thread.status is a discriminated union ({type:idle}/{type:active,activeFlags:[...]}/{type:notLoaded}/{type:systemError}), result.thread.turns is fully populated on thread/resume, Turn.status is one of completed/interrupted/failed/inProgress, TurnSteerParams requires threadId+expectedTurnId+input, TurnSteerResponse requires only turnId, and CodexErrorInfo has an activeTurnNotSteerable{turnKind: review|compact} variant returned when turn/start or turn/steer targets a non-steerable active turn. Implemented select_steer_target(resume_response) (pure, unit-tested) which returns None for idle (existing turn/start+wait-for-turn/completed path, unchanged) or the single inProgress turn's id for active-with-exactly-one-inProgress-turn (new turn/steer path), and raises the new ActiveThreadSteerDeferralError(BusyThreadError) subclass for every other shape: notLoaded/systemError/unrecognized status, zero or multiple inProgress turns. Added AppServerClient.turn_steer() (sends threadId+expectedTurnId+input+clientUserMessageId, treats a matching TurnSteerResponse.turnId as full delivery acknowledgement without waiting for turn/completed, raises AppServerError on a turnId identity mismatch (hard, non-retryable) and ActiveThreadSteerDeferralError on any turn/steer error response (stale expectedTurnId race, activeTurnNotSteerable review/compact, or any other rejection) -- bounded deferral, never a second turn/start). Both deliver_callback() and deliver_callback_batch() now route through a shared _deliver_turn() helper that calls thread_resume() once, then dispatches to turn_start() or turn_steer() based on select_steer_target() -- turn/start is never sent to an already-active thread. ActiveThreadSteerDeferralError subclasses the existing BusyThreadError so CallbackBridge._process_batch's existing except BusyThreadError branch (requeue-or-dead-letter after DEFAULT_MAX_RETRIES, client never torn down) handles every new deferral case for free with zero changes to the batch/outbox/lease machinery; the branch was updated to surface the real exception message (str(exc)) as the requeue/dead-letter reason instead of a hardcoded 'thread_busy' string, for dashboard/last_error visibility distinguishing e.g. inprogress_turn_count:0 from activeTurnNotSteerable from thread_status_not_steerable:notLoaded.",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/_fake_app_server.py",
+    "tools/geoai-task-mcp/eval/task_mcp_active_turn_steer_bridge_b407_v1.json"
+  ],
+  "not_modified": [
+    "AITools/taskdb.py -- read_first only (durable outbox/batch/lease primitives called by CallbackBridge unchanged; no batching/outbox schema change was needed for this repair), not in this task's allowed_writes, not touched."
+  ],
+  "schema_verification": {
+    "method": "Read the installed Codex App Server's own experimental v2 JSON Schema export, already generated in a temporary directory (/tmp/geoai-codex-app-server-schema/v2) by prior session tooling -- not regenerated or copied into the repo by this task (no codex binary reachable via PATH in this worktree's shell; the pre-existing temp export was read directly, itself outside the repository).",
+      "TurnSteerParams.json": "required = [expectedTurnId, input, threadId]",
+      "TurnSteerResponse.json": "required = [turnId] (only property)",
+      "ThreadResumeResponse.json -> Thread": "required includes status, turns (turns fully populated on thread/resume per its own description, not just thread/read)",
+      "ThreadStatus (oneOf)": "NotLoadedThreadStatus{type:notLoaded} | IdleThreadStatus{type:idle} | SystemErrorThreadStatus{type:systemError} | ActiveThreadStatus{type:active, activeFlags:[ThreadActiveFlag]}",
+      "Turn.status (TurnStatus enum)": "[completed, interrupted, failed, inProgress]",
+      "CodexErrorInfo.activeTurnNotSteerable": "{turnKind: NonSteerableTurnKind[review|compact]} -- documented as 'Returned when turn/start or turn/steer is submitted while the current active turn cannot accept same-turn steering, for example /review or manual /compact'",
+    "conclusion": "Confirms the implementation's exact routing decision (idle->turn/start, active-with-one-inProgress-turn->turn/steer, everything else->bounded deferral) and the activeTurnNotSteerable error shape used by _fake_app_server.py's --active-not-steerable scenario and AppServerClient.turn_steer()'s error handling."
+  },
+  "real_bug_fixed": {
+    "bug": "deliver_callback()/deliver_callback_batch() called self.thread_resume(thread_id) purely for its identity-check side effect and then unconditionally called self.turn_start(...) regardless of the resumed thread's actual status -- an already-active thread (one still running a long CEO review turn) would either receive a second concurrent turn/start (if the real App Server permits queueing rather than erroring) or hit the pre-existing generic busy-error path with no way to ever append feedback into the in-flight turn; the callback would sit as a dead letter/timeout instead of being delivered.",
+    "fix": "select_steer_target() inspects result.thread.status/result.thread.turns from the SAME thread/resume response already being made and returns either None (idle -> unchanged turn/start path) or the exact single inProgress turn id (active -> new turn/steer path) or raises a bounded ActiveThreadSteerDeferralError for every ambiguous/non-steerable shape -- turn/start is now structurally never reachable when the thread is already active.",
+    "status": "FIXED -- proven by test_active_thread_steers_existing_turn_without_turn_start_or_wait (turn/steer succeeds, no turn/completed ever sent by the fake server, no hang) and test_turn_start_is_forbidden_and_rejected_on_an_active_thread (defense-in-depth: the fake server itself rejects any turn/start reaching it while active, catching a future regression loudly)."
+  },
+  "test_counts": {
+    "test_callback_bridge": "73 passed, 0 failed (51 pre-existing B384/B402 + 22 new B407: select_steer_target unit tests for idle/active-one/active-zero/active-multi/notLoaded/systemError/malformed-turns/missing-thread x8, ActiveThreadSteerDeferralError-is-a-BusyThreadError-subclass, full-wire active-steer happy path, zero/multi-inprogress deferral x2, activeTurnNotSteerable deferral, stale-expectedTurnId deferral, turnId-identity-mismatch hard error, notLoaded/systemError deferral x2 (parametrized), turn/start-forbidden-on-active defense-in-depth, deterministic-clientUserMessageId-reused-across-steer-and-start (duplicate suppression), run_once() E2E delivering via steer when thread already active, run_once() E2E requeuing the whole batch (not dead-lettering) on activeTurnNotSteerable)",
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "PASS (collision_free=true, 110 active cards)",
+    "environment_note": "Bare `python3` in this worktree's shell has no pytest installed; ran via the project's own venv (/home/shrek/GeoAI/.venv/bin/python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py) which is the same interpreter used by this repo's own tooling. taskctl.py verify/collision-guard were run the same way.",
+    "full_geoai_task_mcp_suite_note": "The broader tools/geoai-task-mcp/tests/ suite (run for collateral-regression visibility only, not part of this task's validation list) shows pre-existing failures/errors in test_worktree_taskdb_path_repair_b328_v1.py, test_process_launcher_security.py, and test_worker_workspace.py that reproduce identically on an unmodified checkout of this worktree (landlock/detached-worktree/supervisor-status assumptions that do not hold inside this particular sandboxed worker environment) -- unrelated to and unaffected by this task's callback_bridge.py/_fake_app_server.py/test_callback_bridge.py changes, none of which touch those files."
+  },
+  "security_invariants": {
+    "turn_start_on_active_thread": "FORBIDDEN and structurally unreachable -- select_steer_target() is called on every delivery before any turn RPC is sent; turn/start is only ever reached when it returns None (idle). Defense-in-depth: _fake_app_server.py additionally rejects any turn/start it receives while configured active, verified by test_turn_start_is_forbidden_and_rejected_on_an_active_thread.",
+    "second_hidden_turn_for_active_callback": "Eliminated -- deliver_callback()/deliver_callback_batch() now share one _deliver_turn() call path with exactly one thread/resume and exactly one of {turn/start, turn/steer}, never both.",
+    "mark_delivered_before_exact_acknowledgement": "Unaffected -- CallbackBridge._process_batch() still only calls taskdb.mark_batch_delivered() after AppServerClient.deliver_callback_batch() returns without raising; turn_steer() only returns normally after a synchronous, identity-checked TurnSteerResponse.turnId == expectedTurnId (any error or mismatch raises before returning), so the existing mark-delivered call site is provably never reached early. Proven negatively by test_active_turn_steer_response_identity_mismatch_is_hard_error and the various deferral tests, all of which raise before any delivered-marking code could run.",
+    "live_owner_thread_canary_by_worker": "Not performed -- every test in this session used tests/_fake_app_server.py as a real subprocess (never a mocked subprocess.run) or a temp SQLite outbox; the real codex binary was never invoked and no real Codex thread id was ever addressed.",
+    "service_restart_or_enable_by_worker": "Not performed -- no systemd/service command was run.",
+    "direct_live_queue_mutation": "Not performed -- all outbox/batch state was exercised only through taskdb.py's own primitives (claim_pending_callback_batch, mark_batch_delivered, requeue_batch, mark_batch_dead_letter) against temp SQLite DBs, never a raw UPDATE.",
+    "worker_output_or_untrusted_text_in_callback_prompt": "Unchanged -- build_callback_prompt()/build_batch_callback_prompt() were not touched; prompt content still comes only from the same validated task_id/state/event_id/request_id fields, now passed unchanged into either turn_start() or turn_steer() by _deliver_turn().",
+    "full_origin_thread_exposure": "Unchanged -- no new code path logs or returns a full thread id; redacted_thread_suffix() untouched.",
+    "taskctl_done_by_worker / git_commit / git_push / git_add_A / git_add_dot": "None invoked. Worker stopped after implementation + the exact validation commands listed in this task's contract."
+  },
+  "blockers": [
+    "The production VS Code OpenAI extension owns a long-lived App Server over private stdio. A separately spawned bridge App Server does not share its in-memory active-turn state, reports the visible owner thread idle, and therefore cannot safely steer the current UI turn."
+  ],
+  "notes": {
+    "codex_not_installed_in_this_worktree_shell": "No `codex` binary is reachable via PATH in this isolated worktree's shell (checked: `which codex`, `codex --version` both fail). This task's schema-verification requirement was still satisfiable because a v2 App Server JSON Schema export already existed at /tmp/geoai-codex-app-server-schema (generated by prior tooling on this host, timestamped today, outside the repository) -- read directly rather than regenerated, and never copied into the repo, per this task's constraint. Codex should independently re-verify (or regenerate) the schema against the trusted host's installed binary if the App Server version has moved since that export.",
+    "live_canary_and_service_re_enable": "Codex performed the live canary. The separate bridge-owned App Server reported the extension-owned visible thread idle, entered turn/start and did not complete for more than six minutes. Codex stopped and disabled the service, killed the hidden App Server process group and requeued the durable batch. B409 now owns the extension-App-Server mux repair."
+  },
+  "coordinator_live_canary": {
+    "performed_at": "2026-07-15T11:59:24Z",
+    "result": "FAILED_TRANSPORT_TOPOLOGY",
+    "extension_app_server_observed": true,
+    "extension_app_server_parent": "VS Code remote extension host",
+    "fresh_bridge_app_server_observed": true,
+    "fresh_server_saw_visible_thread_active": false,
+    "hidden_turn_wait_exceeded_seconds": 360,
+    "service_active_after_canary": false,
+    "service_enabled_after_canary": false,
+    "durable_batch_requeued": true,
+    "successor_task": "CLAUDE_SONNET5_TASK_MCP_VSCODE_OWNED_APP_SERVER_MUX_B409_V1"
+  },
+  "runner": "claude_coding",
+  "topic": "coding",
+  "generated_from": "measured_host_validation_run_2026_07_15"
+}

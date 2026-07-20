@@ -1,0 +1,70 @@
+{
+  "aggregates": {
+    "by_day": {
+      "2026-07-09": {
+        "cost_usd": 0.12,
+        "input_tokens": 5,
+        "output_tokens": 7,
+        "records": 1,
+        "total_tokens": 12
+      },
+      "unknown": {
+        "cost_usd": 1.0,
+        "input_tokens": 40,
+        "output_tokens": 60,
+        "records": 3,
+        "total_tokens": 100
+      }
+    },
+    "by_runner": {
+      "runner_a": {
+        "cost_usd": 0.42,
+        "input_tokens": 15,
+        "output_tokens": 27,
+        "records": 2,
+        "total_tokens": 42
+      },
+      "runner_b": {
+        "cost_usd": 0.7,
+        "input_tokens": 30,
+        "output_tokens": 40,
+        "records": 2,
+        "total_tokens": 70
+      }
+    },
+    "by_topic": {
+      "lexicon": {
+        "cost_usd": 0.42,
+        "input_tokens": 15,
+        "output_tokens": 27,
+        "records": 2,
+        "total_tokens": 42
+      },
+      "signal_atlas": {
+        "cost_usd": 0.7,
+        "input_tokens": 30,
+        "output_tokens": 40,
+        "records": 2,
+        "total_tokens": 70
+      }
+    }
+  },
+  "authority_flags": {
+    "agent_launch": false,
+    "audit_write": false,
+    "process_launch": false,
+    "queue_write": false,
+    "runtime_authority": false,
+    "support_authority": false
+  },
+  "metrics": {
+    "launch_rows": 2,
+    "union_rows": 3,
+    "usage_rows": 2
+  },
+  "runner": "claude_task_mcp_cost_ledger_b288",
+  "schema_id": "geoai.mcp_cost_ledger_aggregator.b288.v1",
+  "task_id": "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B288_V1",
+  "topic": "task_mcp",
+  "verdict": "PASS"
+}

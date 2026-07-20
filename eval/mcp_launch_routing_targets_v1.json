@@ -1,0 +1,60 @@
+{
+  "eval_id": "mcp_launch_routing_targets_b108_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_NEURAL_LAUNCH_ROUTING_TARGETS_B108_V1",
+  "date": "2026-07-04",
+  "mode": "mcp_neural_routing_curriculum_no_launch",
+  "builds_on": [
+    "cli_adapter_readonly_tool_b106_v1",
+    "readonly_collision_preflight_b107_v1",
+    "readonly_tool_server_wiring_b107_v1"
+  ],
+  "verdict": "PASS",
+  "summary": "Generated 29 neural curriculum rows for learned adapter/runner/topic launch-routing + abstain: 12 positive (real task cards), 12 collision-aware abstain, 5 synthetic abstain, 1 held-out. Safety gates remain deterministic; no regex/keyword launch authority introduced. No process launch code exists in these artifacts.",
+  "counts": {
+    "total_rows": 29,
+    "positive": 12,
+    "collision_aware_abstain": 12,
+    "synthetic_abstain": 5,
+    "heldout": 1,
+    "abstain_total": 17,
+    "non_abstain_total": 12
+  },
+  "abstain_reasons": {
+    "collision_detected": 2,
+    "collision_detected_same_task": 2,
+    "collision_detected_both": 2,
+    "mode_not_trainable": 3,
+    "topic_ambiguous": 3,
+    "safety_boundary_unclear": 4,
+    "deepseek_manual_only": 1
+  },
+  "adapter_distribution": {
+    "deepseek_manual": 12,
+    "claude_cli": 12,
+    "unknown": 5
+  },
+  "safety_invariants": {
+    "deterministic_gates_remain": true,
+    "neural_is_routing_only_not_safety_authority": true,
+    "no_regex_keyword_launch_authority": true,
+    "no_process_launch_code": true,
+    "write_gate_default_off": true
+  },
+  "gates": {
+    "all_rows_have_safety_section": true,
+    "no_regex_keyword_authority_in_any_row": true,
+    "all_abstain_rows_have_reason": true,
+    "collision_abstain_rows_have_collision_context": true,
+    "positive_rows_not_abstain": true,
+    "heldout_set_exists": true,
+    "curriculum_jsonl_valid": true,
+    "eval_jsonl_valid": true
+  },
+  "neural_bridge_note": "These curriculum rows are TRAINING TARGETS for a learned neural router that selects adapter/runner/topic from task context and abstains when evidence is insufficient. The static TOPIC_TO_ADAPTER mapping and infer_adapter() function are curriculum LABEL GENERATORS only — they are NOT runtime launch authority. The collision preflight (B107) provides read-only evidence for abstain decisions. Production routing must be the neural model's learned dispatch, not a regex/keyword cue router. Safety gates (write gate, allowlist) remain deterministic boundaries after the neural router selects.",
+  "files_written": [
+    "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json",
+    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_rows_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/mcp_launch_routing_targets_next_wave_v1.json"
+  ]
+}

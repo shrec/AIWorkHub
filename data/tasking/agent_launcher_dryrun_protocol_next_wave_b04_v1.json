@@ -1,0 +1,54 @@
+{
+  "next_wave_id": "agent_launcher_dryrun_protocol_next_wave_b04_v1",
+  "parent_task": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps launch DISABLED by default and adds NO process-spawn code. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_TASK_MCP_TOPIC_GAP_B05_V1",
+      "goal": "Close the REAL gap measured while building B04: core.RUNNER_TOPIC_ALLOWLIST has no 'task_mcp' topic entry and no pattern for per-wave runner names (e.g. claude_task_mcp_launcher_dryrun_b04); a composed request using this wave's own (runner, topic) is blocked_precondition_failed via core.check_runner_topic_allowlist. Decide and implement either (a) an explicit task_mcp topic entry keyed on a stable base runner name, or (b) a documented wave-suffix normalization rule before allowlist lookup.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_runner_topic_allowlist_task_mcp_gap_b05_v1.sh",
+        "tools/geoai-task-mcp/eval/runner_topic_allowlist_task_mcp_gap_b05_v1.json"
+      ],
+      "acceptance": [
+        "task_mcp topic (or a documented wave-runner normalization) resolves allowed=true for legitimate task_mcp workers",
+        "unknown/typo'd pairs still resolve allowed=false (no widening beyond task_mcp)",
+        "existing 11-pair allowlist entries and CODEX_RUNNER wildcard byte-for-byte unaffected"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_PROMPT_COMPOSER_MODULE_B05_V1",
+      "goal": "Promote this task's prompt_composition_policy (contract-json + read_first-paths, char-budget truncate_and_flag) from JSON-documented formula to a real compose_prompt(task_id, prompt_char_budget=20000) function in cli_adapter_dryrun.py, reusing taskctl.py contract <task_id> output; still composes text only, still starts no process.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_dryrun_prompt_composer_b05_v1.sh",
+        "tools/geoai-task-mcp/eval/dryrun_prompt_composer_b05_v1.json"
+      ],
+      "acceptance": [
+        "compose_prompt() output matches this task's measured formula (contract json + read_first path list)",
+        "over-budget input truncates and sets prompt_truncated=true; never silently drops the flag",
+        "no subprocess/network code added; no queue mutation"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_TOKEN_BUDGET_B106_V1",
+      "goal": "Already-proposed (B105 next-wave): attach a strict blocked_over_budget mode as an alternative to truncate_and_flag, mapped to taskctl usage/token_cost_reporting_fields. Not duplicated here; referenced so this protocol's default (truncate_and_flag) is understood as the interim policy.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_dryrun_token_budget_b106_v1.sh",
+        "tools/geoai-task-mcp/eval/dryrun_token_budget_b106_v1.json"
+      ],
+      "acceptance": [
+        "over-budget plan reported blocked_over_budget when strict mode requested, never silently continued",
+        "token_cost_reporting_fields populated per task and per adapter",
+        "no secret env value recorded"
+      ]
+    }
+  ]
+}

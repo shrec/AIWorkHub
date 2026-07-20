@@ -1,0 +1,29 @@
+{
+  "schema_id": "geoai.task_mcp.coordinator_review.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_MULTI_INPROGRESS_CALLBACK_REPAIR_B471_V1",
+  "date": "2026-07-16",
+  "verdict": "ACCEPT_SELECTOR_COMPONENT_RUNTIME_BLOCKER_MOVED_TO_B472",
+  "accepted": {
+    "selector": "multiple historical inProgress turns select only a unique maximum non-null startedAt",
+    "ambiguous_or_missing_recency": "durable busy park",
+    "server_authority": "turn/steer expectedTurnId remains final precondition",
+    "mux_projection": "startedAt preserved as routing metadata"
+  },
+  "verification": {
+    "callback_bridge_pytest": "95 passed",
+    "app_server_mux_pytest": "40 passed",
+    "taskctl_verify": "PASS",
+    "collision_guard": "PASS"
+  },
+  "live_canary": {
+    "result": "PARKED",
+    "evidence": "46 inProgress rows remained visible through the legacy singleton sideband endpoint",
+    "newly_isolated_blocker": "three concurrent VS Code extension-host mux processes share one fixed sideband.sock/cap path; the newest process shadows the origin thread owner",
+    "followup": "B472 per-instance sideband registry and thread-owner routing"
+  },
+  "authority": {
+    "coordinator_reviewed": true,
+    "worker_did_not_restart_live_service": true,
+    "no_callback_row_was_lost": true
+  }
+}

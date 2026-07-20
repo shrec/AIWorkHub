@@ -1,0 +1,55 @@
+{
+  "next_wave_id": "launch_queue_persist_audit_next_wave_b119_v1",
+  "parent_task": "CLAUDE_TASK_MCP_LAUNCH_QUEUE_PERSIST_AUDIT_B119_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). launch_queue_contract stays PURE; launch_queue_persist.py now gives it durable append-only audit, but launch remains DISABLED by default until the FINAL gated task wires GEOAI_TASK_MCP_ALLOW_LAUNCH behind ALL launch_preconditions (both gates + allowlist + collision preflight + cwd/env sandbox + concurrency cap + audit). Adapter/runner/topic SELECTION must stay a learned router migration (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, curriculum already seeded at bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_LAUNCH_PLAN_TOOL_DRYRUN_V1",
+      "goal": "Expose a read-only geoai_launch_plan MCP tool (server.py) that returns describe_intent() (would-run argv + resolved adapter + collision preflight) plus the new persisted-audit summary from launch_queue_persist.read_persisted_log(), and executes nothing. Dry-run is the only behaviour; starts no process even with ALLOW_LAUNCH unset.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/tests/test_launch_plan_tool_dryrun_v1.sh",
+        "tools/geoai-task-mcp/eval/launch_plan_tool_dryrun_v1.json"
+      ],
+      "acceptance": [
+        "plan tool returns a plan dict + persisted-audit summary and spawns no process with ALLOW_LAUNCH unset",
+        "collision preflight result included",
+        "no launch/spawn/exec tool registered on the server"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_LAUNCH_RUNNER_TOPIC_ALLOWLIST_V1",
+      "goal": "Implement the static runner/topic allowlist safety-boundary module (design already drafted under mcp_runner_topic_allowlist_design_b118_v1.json): which runner/topic pairs may EVER be prepared for a future launch; any unknown/off-topic pair is blocked and its refusal persisted via launch_queue_persist. Static human-configured boundary only; NOT the intelligence layer (learned selection stays deferred to the neural migration).",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_runner_topic_allowlist.py",
+        "tools/geoai-task-mcp/tests/test_launch_runner_topic_allowlist_v1.sh",
+        "tools/geoai-task-mcp/eval/launch_runner_topic_allowlist_v1.json"
+      ],
+      "acceptance": [
+        "unknown/off-topic runner-topic pair is blocked and its refusal appended to the audit log",
+        "allowlist is static config, no regex/keyword cue router",
+        "launch stays disabled"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1",
+      "goal": "FINAL: wire the GEOAI_TASK_MCP_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate; permit a real launch ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass (allowlist, collision preflight, cwd/env sandbox, concurrency cap, and the append-only audit this task added). Default stays fully disabled; rollback = unset the flag; the executor adapter never reviews/finalizes its own task.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/tests/test_orch_gated_enablement_b106_v1.sh",
+        "tools/geoai-task-mcp/eval/orch_gated_enablement_b106_v1.json"
+      ],
+      "acceptance": [
+        "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",
+        "default stays disabled; blocked attempts audited via launch_queue_persist; rollback = unset ALLOW_LAUNCH",
+        "the executor adapter never reviews/finalizes its own task"
+      ]
+    }
+  ]
+}

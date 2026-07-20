@@ -1,0 +1,72 @@
+{
+  "schema_id": "geoai.task_mcp_owner_notification_smoke_spec_next_wave.v1",
+  "task_id": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_SPEC_B278_V1",
+  "runner": "claude_task_mcp_notify_smoke_b278",
+  "topic": "task_mcp",
+  "created_at": "2026-07-08",
+  "status": "spec_complete_no_implementation",
+  "next_wave_cards": [
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_PYTEST_B279_V1",
+      "runner": "claude_task_mcp_notify_smoke_pytest_b279",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "smoke_spec_to_executable_pytest",
+      "objective": "Turn this B278 JSON smoke spec into an EXECUTABLE pytest file: monkeypatch completion_inbox.build_completion_inbox()'s internal taskctl subprocess calls to return each of the 6 fixture dicts from section_1_smoke_scenarios verbatim, then assert the classification and payload the spec claims. This is the first task that actually RUNS a fixture through code instead of only describing the expected shape in JSON.",
+      "acceptance": [
+        "New pytest file imports completion_inbox.py and core.py unmodified -- no edits to either module",
+        "All 6 scenarios (completion, blocked/failure, duplicate_runner, stale, usage, tool_error) plus no_pending_task pass as monkeypatched unit tests",
+        "tool_error scenario asserts the current code path's ACTUAL behavior today (likely an uncaught exception) is captured and reported honestly -- if it currently crashes instead of degrading, the test records that as a FAILING/xfail case, not a silent pass",
+        "No live SQLite write; no subprocess spawn of claude/codex/deepseek CLI anywhere in the test file",
+        "All authority_flags remain false"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_SPEC_B278_V1 (this spec)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_spec_b278_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_pytest_b279_v1.json"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_TOOL_ERROR_HANDLING_B280_V1",
+      "runner": "claude_task_mcp_tool_error_handling_b280",
+      "topic": "task_mcp",
+      "priority": "medium",
+      "mode": "completion_inbox_error_facet_implement",
+      "objective": "Confirmed gap from this spec's section_2: completion_inbox.build_completion_inbox() today lets any taskctl subprocess/JSON/sqlite failure propagate uncaught -- there is no 'tool_error' facet or bounded-exception path. Add a 5th read-only facet (e.g. 'read_errors': list[dict]) that catches subprocess/JSON-decode/OSError exceptions per underlying taskctl call and reports them structurally, WITHOUT changing the meaning or shape of the existing 4 facets and WITHOUT adding any write path.",
+      "acceptance": [
+        "New facet is purely additive; review_queue/stale_processing/runner_mismatch_warnings/latest_validation_facts keep their exact current shape for all current callers",
+        "A simulated taskctl subprocess failure (e.g. monkeypatched non-zero exit) produces one read_errors entry and does NOT crash the geoai_completion_inbox tool call",
+        "No new write-gated tool; geoai_completion_inbox stays read-only",
+        "Regression test proves the 4 existing facets are byte-identical for a fixture where nothing errors"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_PYTEST_B279_V1 (needs the xfail/actual-behavior evidence from B279 first)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_spec_b278_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+        "tools/geoai-task-mcp/eval/mcp_completion_inbox_tool_error_handling_b280_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh"
+      ]
+    }
+  ],
+  "blockers": [
+    "TOOL_ERROR_HANDLING_UNIMPLEMENTED: completion_inbox.py has no exception boundary around its taskctl subprocess/JSON-decode calls today; this spec only describes the REQUIRED degrade-gracefully behavior (section_2), it does not add try/except code to completion_inbox.py (that file is not in this task's allowed_writes). A worker cannot claim 'tool_error handling exists' until B280 lands and its regression test passes.",
+    "OWNER_DELIVERY_CHANNEL_UNDECIDED (carried over from B277, still unresolved): no email/Slack/desktop-notify target is chosen; none of the 6 smoke scenarios in this spec include an actual delivery step -- they only validate that the RIGHT event+summary WOULD be produced. Delivery wiring still needs an explicit owner decision on channel + credential storage before any implementation task is scoped.",
+    "GEOAI_COMPLETION_INBOX_DELTA_STILL_NOT_IMPLEMENTED (carried over from B277 section_2b): this spec assumes a future geoai_completion_inbox_delta(topic, since_cursor) tool exists to run these classifications against; no such tool is registered in server.py as of this task. Smoke scenarios here are fixture-vs-expected-output pairs for that future tool's test suite, not proof the tool itself works, because it does not exist yet."
+  ],
+  "notes": {
+    "b277_gap_closure_status_carryover": {
+      "NO_ARTIFACT_BODY_READ": "still open, unaddressed by this smoke spec (out of scope -- fixtures here are task-card metadata only, same as B277)",
+      "NO_OWNER_DELIVERY_CHANNEL": "still open, see blockers above",
+      "NO_TRUE_PUSH": "still open, unaddressed -- smoke scenarios validate classification correctness only, not a push mechanism"
+    },
+    "new_gap_discovered_by_this_task": "TOOL_ERROR_HANDLING_UNIMPLEMENTED (see blockers) -- this is a genuinely new finding: B277's taxonomy assumed every read always succeeds; this smoke spec is the first artifact to explicitly test the failure-of-the-read-itself case and found no handling code exists for it."
+  }
+}

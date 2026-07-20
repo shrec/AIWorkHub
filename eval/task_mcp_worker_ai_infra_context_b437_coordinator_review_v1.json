@@ -1,0 +1,47 @@
+{
+  "schema_id": "geoai.codex_coordinator_review.task_mcp_worker_ai_infra_context.b437.v1",
+  "task_id": "CODEX_GPT55_TASK_MCP_AI_INFRA_CONTEXT_RUNTIME_B437_V1",
+  "reviewed_at": "2026-07-16T09:18:00Z",
+  "reviewer": "codex_coordinator",
+  "verdict": "ACCEPTED_WITH_COORDINATOR_RECEIPT_PARSER_REPAIR",
+  "accepted_capabilities": {
+    "task_context_policy": [
+      "code",
+      "data_classification",
+      "research"
+    ],
+    "code_source_graph_empty_result": "FAIL_BEFORE_CLAIM",
+    "data_classification_primary_context": "immutable_input_shard",
+    "telemetry_states": [
+      "requested",
+      "retrieved",
+      "injected",
+      "worker_acknowledged"
+    ],
+    "dashboard_sections": [
+      "source_graph",
+      "session_current_state",
+      "ai_memory",
+      "kb"
+    ]
+  },
+  "coordinator_repairs": {
+    "receipt_adapter_parity": "Parse bounded receipt text from plain output, Codex item.agent_message, DeepSeek data.content and Claude message.content blocks.",
+    "receipt_integrity": "Acknowledged is true only for a 64-hex bundle SHA matching launch metadata and a positive section_count.",
+    "prompt_receipt_template": "Carries the exact context-bundle SHA and exact section count; prompt SHA remains delivery metadata and is not self-attested by the worker."
+  },
+  "verification": {
+    "b437_focused": "5/5 PASS",
+    "b434_dashboard_process_launcher_runtime_regression": "78/78 PASS",
+    "total": "83/83 PASS",
+    "taskctl_verify": "PASS",
+    "collision_guard": "PASS"
+  },
+  "authority_boundary": {
+    "retrieved_and_injected": "runtime evidence",
+    "worker_acknowledged": "hash-bound worker receipt",
+    "semantic_cognitive_use": "not cryptographically observable; require output/evidence review",
+    "token_savings": "bounded deterministic byte estimate only, not token or cost truth"
+  },
+  "next_gate": "Run one real post-promotion code-task canary and require dashboard acknowledged=true with a matching non-empty SourceGraph bundle before treating the runtime path as end-to-end closed."
+}

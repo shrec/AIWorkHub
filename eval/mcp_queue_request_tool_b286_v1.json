@@ -1,0 +1,29 @@
+{
+  "authority_flags": {
+    "process_launch": false,
+    "queue_write_gated": true,
+    "runtime_authority": false,
+    "support_authority": false,
+    "training_authority": false
+  },
+  "checks": {
+    "duplicate_runner_no_append": true,
+    "idempotency_no_second_append": true,
+    "launch_still_disabled": true,
+    "unknown_adapter_no_append": true,
+    "write_gate_off_no_append": true,
+    "write_gate_on_one_append": true
+  },
+  "metrics": {
+    "gate_off_log_created": false,
+    "gate_on_lines_after_first": 1,
+    "launch_implemented": false,
+    "lines_after_duplicate_runner": 1,
+    "lines_after_idempotent_retry": 1
+  },
+  "runner": "claude_task_mcp_queue_request_b286",
+  "schema_id": "geoai.mcp_queue_request_tool.b286.v1",
+  "task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1",
+  "topic": "task_mcp",
+  "verdict": "PASS"
+}

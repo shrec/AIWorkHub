@@ -1,0 +1,40 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1",
+  "runner": "claude_task_mcp_live_launch_canary_b313",
+  "topic": "task_mcp",
+  "mode": "task_mcp_real_cli_launch_canary_no_source_mutation",
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "priority": "critical",
+  "objective": "Prove the real Task MCP launcher can start one exact Claude CLI worker, continue beyond claim-start, create isolated evidence, run validation, and return the task to Codex review without touching product source.",
+  "read_first": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/eval/task_mcp_live_launch_canary_b313_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
+  ],
+  "acceptance": [
+    "evidence JSON records this exact task_id, runner, topic, mode, and a PASS verdict",
+    "evidence distinguishes process launch from task completion and records exact_claim_start=true, continued_after_claim=true, shell_invocation=false, product_source_mutation=false",
+    "test validates the evidence fields without network access or queue mutation",
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh passes",
+    "python3 AITools/taskctl.py verify passes"
+  ],
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "forbidden": [
+    "product_source_mutation",
+    "runtime_default_change",
+    "taskctl_done",
+    "git_add_A",
+    "git_add_dot",
+    "commit",
+    "network_fetch"
+  ],
+  "commit_contract": "NO_COMMIT; Codex reviews and finalizes the exact two allowed_writes plus coordinator-owned queue state."
+}

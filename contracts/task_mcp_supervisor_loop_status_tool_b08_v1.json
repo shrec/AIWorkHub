@@ -1,0 +1,189 @@
+{
+  "schema_id": "geoai.task_mcp_supervisor_loop_status_tool_contract.b08.v1",
+  "contract_id": "task_mcp_supervisor_loop_status_tool_b08_v1",
+  "task_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_B08_V1",
+  "mode": "readonly_tool_contract_and_smoke_no_server_patch",
+  "roadmap_phase": "Phase 2 - Agent Launcher MVP / Supervisor Loop",
+  "builds_on": [
+    "task_mcp_supervisor_loop_contract_b07_v1",
+    "mcp_runner_topic_allowlist_design_b118_v1",
+    "mcp_batch_collision_guard_b119_v1",
+    "agent_launcher_mvp_b02_v1"
+  ],
+  "purpose": "Define the input/output schema, derivation algorithm, and smoke-case plan for a NEW read-only MCP tool, geoai_supervisor_loop_status, that implements B07's leg-4 observation (mcp_to_codex_status_and_handoff) over the LIVE queue: task_id -> supervisor_state + detected error. This artifact is design/schema ONLY. It adds no server wiring, no subprocess/exec/fork/shell/network code beyond what tools/geoai-task-mcp/src/geoai_task_mcp/core.py already runs read-only, and it patches NO source file. It does not enable real process launch and does not mutate any task status.",
+  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/geoai-task-mcp/src/. No .py file is created or modified by this task. tools/geoai-task-mcp is a nested git repo shared with other concurrent workers; any dirty src/ files observed at task time belong to OTHER in-flight tasks, not this one.",
+
+  "tool_schema": {
+    "tool_name": "geoai_supervisor_loop_status",
+    "authority_profile": "same_as_geoai_task_codex_handoff_b116: frozen read-only contract, no write-gate toggle, no mutation parameters",
+    "input_schema": {
+      "task_id": {"type": "string", "required": true},
+      "runner": {"type": "string", "required": false, "description": "optional identity hint; when supplied, cross-checked read-only against core.check_runner_topic_allowlist -- never used to gate a write, only to detect runner_topic_mismatch for reporting"},
+      "topic": {"type": "string", "required": false, "description": "optional identity hint; see runner"},
+      "supervisor_request_id": {"type": "string", "required": false, "description": "opaque correlation id echoed back; not persisted to any new store"},
+      "previous_snapshot": {"type": ["object", "null"], "required": false, "shape": {"status": "string", "worker_status": "string"}, "description": "caller-supplied (Codex-held) prior observation of this task's status/worker_status, used ONLY to detect stale_task by comparison against the live re-read; the tool itself keeps no server-side snapshot store"},
+      "reported_validation_verdict": {"type": ["string", "null"], "required": false, "enum": [null, "passed", "failed"], "description": "caller-supplied out-of-band result of leg-3 (worker_cli_to_mcp_result_report); this tool never runs validation itself -- failed_validation can only be reported, never independently derived, matching B07's leg-3 reality_in_this_contract note"}
+    },
+    "output_schema": {
+      "task_id": {"type": "string"},
+      "supervisor_request_id": {"type": ["string", "null"]},
+      "state": {"type": "string", "enum": ["planned", "blocked", "not_found"], "description": "unchanged B02/B07 coarse state -- not_found means core.show_task returned no card for task_id"},
+      "taskctl_status": {"type": ["object", "null"], "description": "verbatim core.show_task(task_id) result; null when state==not_found; taskctl JSONL/SQLite remains sole source of truth"},
+      "process_state": {"type": "string", "const": "no_process_local_only_mvp"},
+      "last_updated": {"type": "string"},
+      "supervisor_state": {"type": ["string", "null"], "enum": ["planned", "dispatched_dryrun", "worker_review_ready", "codex_reviewed", "blocked", null], "description": "derived read-only per lifecycle_state_to_supervisor_state_mapping; null only when state==not_found"},
+      "error": {"type": ["object", "null"], "shape": "error_taxonomy_entry (code, reason, detected_at_leg, blocked)", "description": "populated only when supervisor_state==blocked; exactly one of the 5 B07 error_taxonomy codes"}
+    }
+  },
+
+  "derivation_algorithm": {
+    "principle": "Pure composition of functions that ALREADY EXIST in core.py, read-only, no new cue-router cognition added -- mirrors B07's neural_bridge_note carve-out (deterministic safety/support-boundary classifier, not a learned routing decision).",
+    "reused_functions": [
+      "core.show_task(task_id) -- leg-4 taskctl_status source",
+      "core.check_runner_topic_allowlist(runner, topic, action) -- runner_topic_mismatch detection, UNCHANGED",
+      "core.collision_guard(print_json=True) -> wraps scripts.build_tasking_parallel_group_collision_guard_v1.scan_collisions via taskctl collision-guard, UNCHANGED",
+      "core._lifecycle_state(card) -- pending/processing/review/blocked/finished classifier, UNCHANGED"
+    ],
+    "ordered_steps": [
+      {"step": 1, "name": "fetch_status", "action": "taskctl_status = core.show_task(task_id)", "on_miss": "if the card cannot be parsed out of taskctl_status (e.g. 'task not found' in stdout/stderr): state=not_found, taskctl_status=null, supervisor_state=null, error=null; STOP"},
+      {"step": 2, "name": "runner_topic_mismatch_check", "action": "if runner is not None or topic is not None: decision = core.check_runner_topic_allowlist(runner, topic, action='review'); if not decision['allowed']: error={code:'runner_topic_mismatch', reason:f'runner_topic_mismatch:{decision[\"reason\"]}', detected_at_leg:1, blocked:true}, supervisor_state='blocked'; STOP"},
+      {"step": 3, "name": "missing_artifact_check", "action": "for each path in card.read_first + card.allowed_writes (from taskctl_status card fields): if not Path(repo_root/path).exists(): error={code:'missing_artifact', reason:f'missing_artifact:{path}', detected_at_leg:1, blocked:true}, supervisor_state='blocked'; STOP", "note": "pure filesystem existence check, no read of file contents"},
+      {"step": 4, "name": "collision_check", "action": "guard = core.collision_guard(print_json=True); if not guard.collision_free: for fc in guard.file_collisions: if task_id in fc.conflicting_tasks: error={code:'collision', reason:f'collision:{fc.file}:{task_id}', detected_at_leg:1, blocked:true}, supervisor_state='blocked'; STOP"},
+      {"step": 5, "name": "stale_task_check", "action": "if previous_snapshot is not None: cur = {status: card.status, worker_status: card.worker_status}; if cur != previous_snapshot: error={code:'stale_task', reason:f'stale_task:worker_status_changed:{task_id}:{previous_snapshot}->{cur}', detected_at_leg:4, blocked:true}, supervisor_state='blocked'; STOP"},
+      {"step": 6, "name": "failed_validation_check", "action": "if reported_validation_verdict == 'failed': error={code:'failed_validation', reason:f'failed_validation:reported_by_caller:{task_id}', detected_at_leg:4, blocked:true}, supervisor_state='blocked'; STOP", "note": "schema-reserved per B07 leg-3 reality_in_this_contract: this tool NEVER runs validation itself and cannot independently detect this condition in dryrun-only mode; it can only relay a caller-reported verdict"},
+      {"step": 7, "name": "clean_mapping", "action": "no error condition matched: supervisor_state = lifecycle_state_to_supervisor_state_mapping[core._lifecycle_state(card)]; error=null; state='planned'"}
+    ]
+  },
+
+  "lifecycle_state_to_supervisor_state_mapping": {
+    "note": "Read-only projection of core._lifecycle_state's existing 5-value classifier onto the B07 supervisor_state vocabulary. Never written back to the task card. This IS the concrete mechanism B07's leg-4 response_schema referred to as 'derived read-only from taskctl_status via the SAME classifier core._lifecycle_state already implements ... mapped onto the supervisor vocabulary'.",
+    "mapping": {
+      "pending": "planned",
+      "processing": "dispatched_dryrun",
+      "review": "worker_review_ready",
+      "finished": "codex_reviewed",
+      "blocked": "blocked"
+    }
+  },
+
+  "smoke_cases": [
+    {
+      "case_id": "clean_task",
+      "scenario": "A real, currently-queued task card with no collision/mismatch/staleness/missing-artifact condition.",
+      "method": "live_readonly_call",
+      "call": "core.show_task(<a real task_id from the live queue>)",
+      "expected": "state=planned, error=null, supervisor_state == lifecycle_state_to_supervisor_state_mapping[core._lifecycle_state(card)]"
+    },
+    {
+      "case_id": "collision",
+      "scenario": "Two synthetic in-memory cards declare overlapping allowed_writes paths.",
+      "method": "fixture_pure_function_call",
+      "call": "scripts.build_tasking_parallel_group_collision_guard_v1.scan_collisions([synthetic_card_a, synthetic_card_b]) -- fixture cards only, never written to the live queue/taskdb",
+      "expected": "collision_free=false; conflicting task_id appears in file_collisions; derivation step 4 yields error.code=collision, supervisor_state=blocked"
+    },
+    {
+      "case_id": "stale_task",
+      "scenario": "A caller-supplied previous_snapshot disagrees with a re-read current snapshot (worker_status flips unclaimed -> claimed).",
+      "method": "fixture_pure_function_call",
+      "call": "derivation step 5 comparison logic against two synthetic snapshot dicts (no live queue read required for this case)",
+      "expected": "error.code=stale_task, reason matches 'stale_task:worker_status_changed:<task_id>:<before>-><after>', supervisor_state=blocked"
+    },
+    {
+      "case_id": "runner_topic_mismatch",
+      "scenario": "Same 4 cross-validated examples as B07 (test [6/10]), reused verbatim against the UNMODIFIED live core.check_runner_topic_allowlist.",
+      "method": "live_readonly_call",
+      "call": "core.check_runner_topic_allowlist(runner, topic, action)",
+      "expected": "matches B07's 4 expected_reason values exactly (unknown_runner_topic_pair, per_wave_prefix_allowlisted [i.e. allowed, no mismatch], per_wave_action_not_allowed:start, codex_action_not_allowed:auto-pickup)"
+    },
+    {
+      "case_id": "missing_artifact",
+      "scenario": "A synthetic card's read_first list includes a path that does not exist on disk.",
+      "method": "fixture_pure_function_call",
+      "call": "Path(repo_root / '<nonexistent_fixture_path>').exists() -- pure filesystem check, no file content read",
+      "expected": "exists()==False; derivation step 3 yields error.code=missing_artifact, supervisor_state=blocked"
+    },
+    {
+      "case_id": "failed_validation",
+      "scenario": "Caller reports reported_validation_verdict='failed' for a task_id (out-of-band leg-3 signal); the tool never runs validation itself.",
+      "method": "fixture_pure_function_call",
+      "call": "derivation step 6 relay logic against reported_validation_verdict='failed'",
+      "expected": "error.code=failed_validation, reason matches 'failed_validation:reported_by_caller:<task_id>', supervisor_state=blocked; contract documents this as schema-reserved / never independently derived in dryrun-only mode, same as B07 leg-3's reality_in_this_contract"
+    }
+  ],
+
+  "safety_boundaries": {
+    "no_credential_read": {
+      "enforced": true,
+      "detail": "This contract adds no code that reads credential/secret env values or files. Reuses core.py's existing _sanitize_env_for_audit() pattern conceptually: only env var NAMES + set/unset booleans may ever be logged, never values."
+    },
+    "no_daemon_start": {
+      "enforced": true,
+      "detail": "No new long-running process, listener, or background loop. The MCP server remains the existing stdio request/response FastMCP process; this contract adds no additional daemon and no new server entrypoint."
+    },
+    "no_real_process_launch": {
+      "enforced": true,
+      "detail": "geoai_supervisor_loop_status is a pure read/derive tool: it calls only core.show_task, core.check_runner_topic_allowlist, core.collision_guard (all pre-existing, all read-only taskctl subcommands: show/collision-guard), and a filesystem existence check. It never calls run_taskctl with allow_write=True and never appends an audit entry."
+    },
+    "no_writes_unless_explicit_future_gate": {
+      "enforced": true,
+      "detail": "Every task-status-mutating action stays behind the EXISTING GEOAI_TASK_MCP_ALLOW_WRITES gate plus the B119 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check. This contract adds zero new write paths and does not touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST."
+    }
+  },
+
+  "forbidden_operations_confirmed_not_taken": {
+    "source_patch": false,
+    "daemon_start": false,
+    "real_agent_launch": false,
+    "credential_read": false,
+    "credential_write": false,
+    "write_gate_enable": false,
+    "task_status_mutation": false,
+    "network_operation": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+
+  "future_source_patch_paths": {
+    "note": "Exact paths and additions a FUTURE coder task would make to implement this contract for real. NOT applied by this task -- acceptance criterion 'must specify exact future source patch paths but must not patch source in this task'.",
+    "patches": [
+      {
+        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "change": "Add a new pure function `supervisor_loop_status(task_id: str, runner: str | None = None, topic: str | None = None, previous_snapshot: dict | None = None, reported_validation_verdict: str | None = None) -> dict[str, Any]` implementing exactly the ordered_steps in derivation_algorithm above, composed only from show_task, check_runner_topic_allowlist, collision_guard, and a new module-level LIFECYCLE_TO_SUPERVISOR_STATE dict matching lifecycle_state_to_supervisor_state_mapping. Adds zero new subprocess/exec/network calls beyond the existing run_taskctl call sites it reuses."
+      },
+      {
+        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "change": "Register `@mcp.tool() def geoai_supervisor_loop_status(task_id: str, runner: str | None = None, topic: str | None = None, previous_snapshot: dict | None = None, reported_validation_verdict: str | None = None) -> dict[str, Any]` calling `core.supervisor_loop_status(...)`, docstring FROZEN READ-ONLY CONTRACT in the same style as geoai_task_codex_handoff (B116), no write-gate toggle, no mutation parameters."
+      }
+    ],
+    "owner": "future coder task (e.g. CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1), not created or applied by this worker",
+    "requires_source_patch": true
+  },
+
+  "neural_bridge_note": {
+    "doctrine": "Per GeoAI neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This contract adds NO cue router: derivation_algorithm is a static, human-authored safety/interface boundary (a deterministic classifier composed entirely of pre-existing pure functions), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
+    "migration_task_id_unaffected": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "curriculum_path_unaffected": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "not_a_bare_promise": true
+  },
+
+  "no_launch_code_marker": "This artifact defines JSON schema only. No subprocess/exec/fork/shell/network code is introduced by this task. Real wiring remains gated behind the future coder task listed in future_source_patch_paths.owner and every launch_precondition already listed in phase2_orchestration_contract_b104_v1.",
+
+  "acceptance": {
+    "read_only_tool_schema_task_id_to_supervisor_state_and_error": "pass",
+    "smoke_cases_for_6_scenarios_defined": "pass",
+    "exact_future_source_patch_paths_specified_no_patch_applied": "pass",
+    "safety_boundaries_preserved": "pass",
+    "no_source_code_patched": "pass"
+  },
+
+  "rollback": {
+    "action": "Delete the 4 new artifact files introduced by this task (this contract, its eval, its next_wave proposal, its test). Nothing outside tools/geoai-task-mcp/{contracts,eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
+    "trigger_conditions": [
+      "any smoke_case gains an undocumented task_status_mutation",
+      "any error_taxonomy code diverges from the 5 already frozen in task_mcp_supervisor_loop_contract_b07_v1",
+      "a future implementation patches core.py/server.py without a dedicated gated coder task"
+    ]
+  },
+
+  "verdict": "PASS"
+}

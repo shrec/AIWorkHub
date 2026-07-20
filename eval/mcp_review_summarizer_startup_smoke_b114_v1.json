@@ -1,0 +1,72 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_startup_smoke_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1",
+  "timestamp": "2026-07-04T23:15:00+00:00",
+  "verdict": "PASS",
+  "runner": "deepseek_task_mcp_review_summarizer_startup_b114",
+  "topic": "task_mcp",
+  "mode": "mcp_review_summarizer_startup_smoke_readonly",
+  "objective": "Smoke test that the MCP server module surface exposes geoai_task_review_summarize with readonly flags, write gate default-off, and no queue mutation on tool listing.",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_startup_smoke_b114_v1.sh",
+  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+  "acceptance_results": {
+    "tool_registered": "PASS — geoai_task_review_summarize found in mcp._tool_manager._tools (16 tools total)",
+    "tool_callable": "PASS — tool.fn is callable, name matches",
+    "tool_description_readonly": "PASS — description contains read-only, never mutates, never calls taskctl, never launches",
+    "fn_docstring_readonly": "PASS — fn docstring contains read-only",
+    "readonly_flag": "PASS — readonly=True",
+    "process_launch_flag": "PASS — process_launch=False",
+    "agent_launch_flag": "PASS — agent_launch=False",
+    "shell_invocation_flag": "PASS — shell_invocation=False",
+    "queue_write_flag": "PASS — queue_write=False",
+    "audit_write_flag": "PASS — audit_write=False",
+    "subprocess_launch_tripwire": "PASS — SUBPROCESS_LAUNCH_TRIPWIRE=0",
+    "write_gate_default_off": "PASS — writes_allowed()=False with ALLOW_WRITES=0",
+    "write_gate_enabled_flag": "PASS — write_gate_enabled=True (gate active = writes blocked, correct default-off state)",
+    "queue_unchanged": "PASS — queue file sha256 identical before/after module import + tool listing",
+    "audit_unchanged": "PASS — audit log sha256 identical",
+    "no_multiprocessing": "PASS — review_summarizer does not import multiprocessing",
+    "launch_implemented_false": "PASS — LAUNCH_IMPLEMENTED=False",
+    "bash_test_exit": "PASS — bash test exits 0",
+    "eval_json_valid": "PASS — JSON valid"
+  },
+  "acceptance_criteria": [
+    "geoai_task_review_summarize is registered in mcp._tool_manager._tools",
+    "tool description contains read-only / never-mutates / never-launches invariants",
+    "review_summarizer._authority_flags() returns readonly=True, process_launch=False, agent_launch=False",
+    "write gate default-off: core.writes_allowed() returns False when GEOAI_TASK_MCP_ALLOW_WRITES=0",
+    "write_gate_enabled flag is True in authority_flags (gate active = blocking writes = correct default-off)",
+    "queue sha256 unchanged before/after importing server module and listing tools",
+    "audit log sha256 unchanged before/after tool listing",
+    "SUBPROCESS_LAUNCH_TRIPWIRE == 0",
+    "LAUNCH_IMPLEMENTED == False",
+    "no multiprocessing import in review_summarizer",
+    "bash test exits 0",
+    "python3 AITools/taskctl.py verify exits 0"
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER": true,
+    "AUDIT_UNCHANGED_BEFORE_AFTER": true
+  },
+  "forbidden_operations_verified": [
+    "live_queue_mutation",
+    "agent_launch",
+    "model_launch",
+    "write_gate_enable_by_default",
+    "network_call",
+    "secret_logging",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
+}

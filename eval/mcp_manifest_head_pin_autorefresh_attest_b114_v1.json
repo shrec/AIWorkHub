@@ -1,0 +1,95 @@
+{
+  "selftest_id": "mcp_manifest_head_pin_autorefresh_attest_b114_v1",
+  "task_id": "CLAUDE_TASK_MCP_MANIFEST_HEAD_PIN_AUTOREFRESH_ATTEST_B114_V1",
+  "mode": "mcp_manifest_head_pin_autorefresh_attest_readonly",
+  "ok": true,
+  "objective": "Read-only cross-eval attestation: ALL committed MCP manifest head-pin eval artifacts (B112 + B113 + B114) must share ONE committed_sha256 equal to the live nested-repo HEAD blob of the B110 manifest, so that when the manifest HEAD blob legitimately advances a single canonical refresh path updates the whole eval set atomically and no committed eval can lag the others. Divergence across the eval set is rejected non-zero.",
+  "committed_source": "git_head",
+  "byte_identical": true,
+  "manifest_fingerprint_matches": true,
+  "committed_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "committed_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "live_head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "eval_tracks_head": true,
+  "drift_count": 0,
+  "attested_eval_set": [
+    "eval/mcp_manifest_git_head_pin_b112_v1.json",
+    "eval/mcp_manifest_head_pin_ci_stale_commit_guard_b113_v1.json",
+    "eval/mcp_manifest_head_pin_autorefresh_attest_b114_v1.json"
+  ],
+  "per_eval_committed_sha256": {
+    "eval/mcp_manifest_git_head_pin_b112_v1.json": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+    "eval/mcp_manifest_head_pin_ci_stale_commit_guard_b113_v1.json": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+    "eval/mcp_manifest_head_pin_autorefresh_attest_b114_v1.json": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708"
+  },
+  "eval_set_unanimous": true,
+  "eval_set_matches_head": true,
+  "attestation_signature_algo": "sha256(join('\\n', sorted('<rel>:<committed_sha256>')))",
+  "attestation_signature": "380595b8b5748370fd713e5efc65d271bddac276ad74c006729a19b3b8934f41",
+  "authority_flags": {
+    "contract_frozen": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "source_provenance": {
+    "pin_repo": "tools/geoai-task-mcp",
+    "pin_ref": "HEAD",
+    "committed_manifest_rel": "eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
+    "committed_source": "git_head",
+    "head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+    "measured_via": "git show HEAD:<manifest_rel> (working-tree-immune, not a git-clean check)",
+    "resolution_order": [
+      "nested_repo_head",
+      "parent_repo_head",
+      "working_tree_snapshot_fallback"
+    ],
+    "subsystem_committed": true
+  },
+  "regression_asserts": {
+    "all_head_pin_evals_share_one_committed_sha256": true,
+    "eval_set_committed_sha256_equals_live_head_blob": true,
+    "lagging_single_eval_rejected_nonzero": true,
+    "attestation_signature_recomputes": true,
+    "divergent_eval_set_rejected_nonzero": true,
+    "additively_patched_dirty_working_tree_still_passes": true,
+    "git_clean_false_fail_trap_avoided": true,
+    "idempotent_rerun_stable_attestation": true
+  },
+  "teeth": {
+    "lagging_eval": "A controlled temp-copy of the eval set in which exactly ONE eval's committed_sha256 is frozen to an old value (simulating a manifest recommit whose autorefresh missed that eval) is REJECTED non-zero, because the set is no longer unanimous and no longer equals the live HEAD blob.",
+    "attestation_signature": "The attestation signature is sha256 over the sorted '<eval_rel>:<committed_sha256>' lines of the whole eval set; the test recomputes it from the on-disk evals and asserts identity, so any silent per-eval drift changes the signature and fails the round-trip.",
+    "git_clean_false_fail_trap": "The manifest HEAD blob is measured via `git show HEAD:<rel>`; an additively-patched (dirty) manifest working tree does not change the measured blob sha, so the attestation is patch-state-independent and a naive git-clean check would false-FAIL."
+  },
+  "readonly_proof": {
+    "mutates_tracked_files": false,
+    "launches_agent_or_model": false,
+    "enables_write_gate": false,
+    "network_call": false,
+    "queue_mutation": false,
+    "scratch_isolation": "all scratch in a private mktemp dir cleaned in a trap; per-test temp git repos; no shared fixed-path writes"
+  },
+  "idempotence": {
+    "reran_twice": true,
+    "attestation_signature_stable": true,
+    "note": "Re-running the attestation over the unmodified committed eval set yields the identical attestation_signature and verdict; the check reads-only and derives its result solely from committed evidence + the live HEAD blob, so it is deterministic and re-runnable."
+  },
+  "test": "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "composes": [
+    "CLAUDE_TASK_MCP_MANIFEST_HEAD_PIN_CI_STALE_COMMIT_GUARD_B113_V1",
+    "CLAUDE_TASK_MCP_MANIFEST_GIT_HEAD_PIN_B112_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1"
+  ],
+  "neural_bridge_priority": {
+    "role": "deterministic_manifest_head_pin_autorefresh_cross_eval_attestation",
+    "not_runtime_authority": true,
+    "learned_target": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "note": "ABCR/validator drift-protection tooth over the executor surface: it attests that the committed head-pin eval SET stays consistent with the live HEAD manifest blob. No regex/keyword/table cue router is introduced as launch or route authority; adapter/runner/topic launch SELECTION remains the learned-router target."
+  }
+}

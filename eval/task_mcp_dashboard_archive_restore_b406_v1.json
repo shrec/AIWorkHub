@@ -1,0 +1,79 @@
+{
+  "eval_id": "task_mcp_dashboard_archive_restore_b406_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_DASHBOARD_ARCHIVE_RESTORE_B406_V1",
+  "date": "2026-07-15",
+  "mode": "dashboard_active_hygiene_owner_archive_restore_selective_rebase",
+  "runner": "deepseek_v4_pro",
+  "topic": "tasking_system",
+  "attempt": "selective_rebase_retained_candidate",
+  "verdict": "ACCEPTED_AFTER_COORDINATOR_REPAIR",
+  "summary": "Rebased the retained B406 archive/restore candidate onto the current parent files, preserving all existing DeepSeek credential/readiness integration, callback bridge health API, B404 terminal-review lifecycle, and runner allowlists. Fixed Active to exclude blocked/finished/archived rows. Added coordinator-only archive/restore with immutable audit events, idempotent semantics, and refusal for processing/review/claimed-pending rows. Added health identity endpoint and dashboard UI controls with token prompt.",
+  "review_feedback_applied": "Prior candidate was rejected solely because core.py was not in allowed_writes and its isolated core baseline omitted current uncommitted DeepSeek/callback integration. This rebase includes core.py in allowed_writes and preserves all current lines above and below the archive/restore additions with byte-level precision.",
+  "gates": {
+    "active_only_pending_processing_review": true,
+    "blocked_outside_active": true,
+    "finished_outside_active": true,
+    "archived_outside_active": true,
+    "archive_refuses_processing": true,
+    "archive_refuses_review": true,
+    "archive_refuses_claimed_pending": true,
+    "archive_allows_finished": true,
+    "archive_allows_unclaimed_pending": true,
+    "archive_allows_blocked": true,
+    "restore_clears_archived_at_only": true,
+    "restore_preserves_original_status": true,
+    "restore_noop_idempotent": true,
+    "archive_idempotent": true,
+    "every_action_appends_event": true,
+    "events_immutable_newest_first": true,
+    "reason_truncated_200_chars": true,
+    "b404_claim_epoch_preserved": true,
+    "b404_no_pending_transition": true,
+    "b404_review_outcome_preserved": true,
+    "b404_no_callback_creation": true,
+    "db_identity_no_secrets": true,
+    "db_identity_fingerprint_stable": true,
+    "token_never_in_events": true,
+    "deletion_never_occurs": true,
+    "deepseek_readiness_surface_preserved": true,
+    "callback_bridge_health_api_preserved": true,
+    "all_python_compiles": true
+  },
+  "tests": {
+    "command": "PYTHONPATH=tools/geoai-task-mcp/src:AITools /home/shrek/GeoAI/.venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_dashboard.py AITools/test_taskctl_dashboard_archive_restore_b406_v1.py AITools/test_taskctl_terminal_review_only_b404_v1.py",
+    "interpreter": "/home/shrek/GeoAI/.venv/bin/python",
+    "result": "80 passed"
+  },
+  "coordinator_review": {
+    "accepted": true,
+    "worker_stopped_reason": "sandbox lacked pytest and worker entered an environment-repair loop after implementation",
+    "repairs": [
+      "preserved legacy 405 behavior for non-allowlisted POST routes",
+      "updated Active test truth to pending+processing+review only",
+      "enforced coordinator capability in taskctl archive/restore",
+      "made archive state idempotent while preserving an audit event per action",
+      "made first archive/restore state mutation and audit event atomic",
+      "added missing/wrong/correct dashboard and CLI capability tests",
+      "bounded migration plan to blocked/superseded/future_backlog only"
+    ],
+    "migration_plan_rows": 97,
+    "migration_archive_candidates": 77,
+    "migration_claimed_terminal_requires_review": 20,
+    "live_queue_mutated": false
+  },
+  "changed_paths": [
+    "AITools/taskdb.py",
+    "AITools/taskctl.py",
+    "AITools/test_taskctl_dashboard_archive_restore_b406_v1.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/index.html",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.js",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.css"
+  ],
+  "new_artifacts": [
+    "AITools/test_taskctl_dashboard_archive_restore_b406_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_dashboard_archive_restore_b406_v1.json",
+    "tools/geoai-task-mcp/eval/task_mcp_dashboard_archive_restore_b406_migration_plan.jsonl"
+  ]
+}

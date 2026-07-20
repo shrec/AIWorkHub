@@ -1,0 +1,127 @@
+{
+  "authority_flags": {
+    "contract_frozen": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "composes": {
+    "input_schema_freeze": {
+      "eval": "tools/geoai-task-mcp/eval/mcp_client_smoke_contract_freeze_b108_v1.json",
+      "eval_id": "mcp_client_smoke_contract_freeze_b108_v1",
+      "harness": "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
+      "source_field": "detail.frozen_schema_fingerprints",
+      "task_id": "CLAUDE_TASK_MCP_CLIENT_SMOKE_CONTRACT_FREEZE_B108_V1"
+    },
+    "output_contract_freeze": {
+      "eval": "tools/geoai-task-mcp/eval/mcp_readonly_tool_result_schema_freeze_b109_v1.json",
+      "eval_id": "mcp_readonly_tool_result_schema_freeze_b109_v1",
+      "harness": "tools/geoai-task-mcp/tests/mcp_readonly_result_schema_freeze.py",
+      "source_fields": [
+        "detail.frozen_output_schema_fingerprints",
+        "detail.frozen_result_skeleton_fingerprints"
+      ],
+      "task_id": "CLAUDE_TASK_MCP_READONLY_TOOL_RESULT_SCHEMA_FREEZE_B109_V1"
+    }
+  },
+  "fingerprint_algo": "sha256",
+  "frozen_unified_contract_v1": true,
+  "manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "manifest_fingerprint_spec": "sha256(json.dumps({readonly_tools,write_gated_tools,per_readonly_tool,write_gated_input_schema_fp}, sort_keys=True, separators=(',',':')))",
+  "manifest_id": "mcp_unified_contract_freeze_manifest_b110_v1",
+  "mode": "mcp_unified_contract_freeze_no_launch",
+  "neural_bridge": {
+    "learned_target": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "not_runtime_authority": true,
+    "note": "This gate is an ABCR/validator tooth over a deterministic executor surface; it is NOT a runtime cognitive router. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this freeze is only the drift-protection evidence extractor for that surface.",
+    "role": "deterministic_contract_freeze_validator"
+  },
+  "per_readonly_tool": {
+    "geoai_cli_adapter_audit_summary_readonly": {
+      "input_schema_fp": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+      "output_schema_fp": "5fc4ac244ce411f881fb112af8fce5c896d55e4bf19a253c4b2f363a095a67b1",
+      "result_skeleton_fp": "38556ccf570e39d958d93d3859b90928dfa39367e991a63ace1441567d7d40a5"
+    },
+    "geoai_cli_adapter_plan_readonly": {
+      "input_schema_fp": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+      "output_schema_fp": "0e26f78662f85cf082a1b9a02a8ab8f20465fddde3cc0c64afa98b53483993eb",
+      "result_skeleton_fp": "f15bce6176e5ee3a51b18bcdbf4fc7b7f633ecddda984446b98fd6e35342e2c5"
+    },
+    "geoai_cli_adapter_report_readonly": {
+      "input_schema_fp": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+      "output_schema_fp": "9db21818742f39cddd1089f8373dab352f3489fd555866ae7866772659cd70ca",
+      "result_skeleton_fp": "c1c81f65e4d04bdd81ef1b84fd810d41f23eabbda763a65936b83dfaa3141e05"
+    },
+    "geoai_task_audit_log_read": {
+      "input_schema_fp": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+      "output_schema_fp": "fdd2305a613bfd24f01c484b593ef0d36accb5df3f49a30c696b4b2d37f1bf54",
+      "result_skeleton_fp": "a3ed606211c4752400a8719f8f711d160e9f51a8a8d4b0c1f112cf1e52670b4e"
+    },
+    "geoai_task_collision_guard": {
+      "input_schema_fp": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+      "output_schema_fp": "fcb8ae84a30dc9801d116a3d294f67a613436a9ff8de4969b0097bef429d66f4",
+      "result_skeleton_fp": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f"
+    },
+    "geoai_task_health": {
+      "input_schema_fp": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+      "output_schema_fp": "9c2b1d290ffa8d3e2cb8555afaf7117cf45e613d588cbb5e787b191f9251f1dc",
+      "result_skeleton_fp": "e61b8cb033c374b08000c2585607d8cccdb1a91da4055af0e033441cf1201c14"
+    },
+    "geoai_task_list": {
+      "input_schema_fp": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+      "output_schema_fp": "6bc17623c20a41768e84146af7271946f2d89119181c35882f3a63c2330f3361",
+      "result_skeleton_fp": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f"
+    },
+    "geoai_task_pending_for_runner": {
+      "input_schema_fp": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+      "output_schema_fp": "9574847f6b6c2d8eaef5271fe4486ba39c46210bdfaef31a87b0ec303c12f474",
+      "result_skeleton_fp": "87a32b68a9a85471f84885c1b59da774b3b5ad5f16d2864d922d8570de65766d"
+    },
+    "geoai_task_review_queue": {
+      "input_schema_fp": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+      "output_schema_fp": "90a02a5eab8f75261a4d9c191a7e1f939d44052dbf46a5a8ffd0bfba2e12ec86",
+      "result_skeleton_fp": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f"
+    },
+    "geoai_task_show": {
+      "input_schema_fp": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+      "output_schema_fp": "49abd9371460804368fc330a3c9eb5ad061dcc81d62794b08c4b163ef4ac31b5",
+      "result_skeleton_fp": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f"
+    },
+    "geoai_task_usage_report": {
+      "input_schema_fp": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+      "output_schema_fp": "e9583569f8f66b1ebf56609cee43b4c3ffbb9b5ee70322a7a8d40032150f3563",
+      "result_skeleton_fp": "2c83150c951e941ac4354831d3a09f4c1398816f94f259fbd8c173958033719f"
+    }
+  },
+  "purpose": "One machine-readable binding of the B108 inputSchema freeze and the B109 output-schema + result-skeleton freeze per read-only tool, plus write-gated input schemas, so a single gate fails on ANY input-or-output drift and the two freezes cannot silently diverge.",
+  "readonly_tool_count": 11,
+  "readonly_tools": [
+    "geoai_cli_adapter_audit_summary_readonly",
+    "geoai_cli_adapter_plan_readonly",
+    "geoai_cli_adapter_report_readonly",
+    "geoai_task_audit_log_read",
+    "geoai_task_collision_guard",
+    "geoai_task_health",
+    "geoai_task_list",
+    "geoai_task_pending_for_runner",
+    "geoai_task_review_queue",
+    "geoai_task_show",
+    "geoai_task_usage_report"
+  ],
+  "schema_id": "geoai.mcp_unified_contract_freeze_manifest.v1",
+  "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1",
+  "write_gated_input_schema_fp": {
+    "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+    "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+    "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+    "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344"
+  },
+  "write_gated_tool_count": 4,
+  "write_gated_tools": [
+    "geoai_task_auto_pickup",
+    "geoai_task_export_jsonl",
+    "geoai_task_mark_done",
+    "geoai_task_mark_review"
+  ]
+}

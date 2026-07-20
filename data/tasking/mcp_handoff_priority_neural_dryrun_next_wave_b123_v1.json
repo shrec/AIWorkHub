@@ -1,0 +1,31 @@
+{
+  "schema_id": "geoai.mcp_handoff_priority_neural_dryrun_next_wave.v1",
+  "parent_task_id": "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_NEURAL_DRYRUN_B123_V1",
+  "runner": "claude_task_mcp_handoff_neural_b123",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B123 trained a small numpy MLP over the B122 curriculum (1997 train / 494 heldout rows). Primary model heldout accuracy=1.0000 vs majority baseline=0.4899 and risk_level-mapped baseline=0.3664. Antishortcut ablation (rule-defining booleans removed) heldout accuracy=0.9494, still beating both baselines from continuous signals alone. No runtime wiring, no queue mutation.",
+  "invariants_verified": {
+    "OFFLINE_DRYRUN_ONLY": true,
+    "NO_QUEUE_MUTATION": true,
+    "NO_PROCESS_LAUNCH": true,
+    "NO_PRODUCTION_TRAINING_LAUNCH": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "BEATS_BOTH_DETERMINISTIC_BASELINES": true,
+    "ANTISHORTCUT_ABLATION_ALSO_BEATS_BASELINES": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_NEURAL_MIGRATION_PLAN_B124_V1",
+      "objective": "If this probe stays gate-passed, design (not wire) an explicit *_NEURAL_*_MIGRATION_* plan for how a learned handoff-priority signal could eventually assist (never replace) Codex's own review-priority judgment, keeping the deterministic label rule as validator/evidence-extractor only. Include a feature-availability audit for streaming/real-time inference (stale_hours and review_wait_hours are only ~95% populated) and a rollback plan.",
+      "topic": "task_mcp",
+      "depends_on": [
+        "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_NEURAL_DRYRUN_B123_V1"
+      ],
+      "ready": false,
+      "note": "Not queued/claimed here -- documentation only, no queue mutation performed."
+    }
+  ],
+  "blockers": []
+}

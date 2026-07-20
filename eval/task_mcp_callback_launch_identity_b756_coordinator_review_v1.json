@@ -1,0 +1,24 @@
+{
+  "schema_id": "geoai.task_mcp.callback_launch_identity_b756.coordinator_review.v1",
+  "task_id": "CLAUDE_TASK_MCP_CALLBACK_LAUNCH_IDENTITY_FAIL_CLOSED_B756_V1",
+  "reviewed_by": "codex",
+  "disposition": "RECOVER_AND_SELECTIVELY_APPLY_RETAINED_CANDIDATE",
+  "original_terminal_outcome": "validation_failed",
+  "original_failure_cause": "/usr/bin/python3: No module named pytest in the pre-B755 worker environment",
+  "accepted_changes": [
+    "request_id is validated and bound atomically with claim-start",
+    "malformed request_id rejects the whole claim",
+    "ProcessManager passes the exact request_id before child spawn",
+    "callback dedup includes request_id and preserves same-request exactly-once behavior",
+    "legacy delivered rows survive the idempotent migration",
+    "upsert_card is the single callback enqueue site"
+  ],
+  "parent_verification": {
+    "py_compile": "PASS",
+    "b384_callback_regression": "37 passed",
+    "process_launcher_and_workspace_regression": "52 passed",
+    "legacy_migration_and_delivered_row_preservation": "PASS",
+    "malformed_request_id_fail_closed": "PASS"
+  },
+  "activation_requirement": "Reload the Task MCP server process before relying on this behavior for new worker launches."
+}

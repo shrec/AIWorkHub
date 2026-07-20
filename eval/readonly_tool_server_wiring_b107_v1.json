@@ -1,0 +1,43 @@
+{
+  "eval_id": "readonly_tool_server_wiring_b107_v1",
+  "task_id": "CLAUDE_TASK_MCP_READONLY_TOOL_SERVER_WIRING_B107_V1",
+  "date": "2026-07-04",
+  "mode": "mcp_readonly_cli_plan_tool_server_wiring",
+  "builds_on": "cli_adapter_readonly_tool_b106_v1",
+  "verdict": "PASS",
+  "summary": "Wired cli_adapter_readonly_tool.register(mcp) into server.py so the three B106 read-only CLI adapter tools (plan/audit_summary/report) are live @mcp.tool()s on the FastMCP instance, additive to the 12 pre-existing queue tools. No other server.py logic changed; no process launch, subprocess, exec, fork, or shell code added. register(mcp) internals untouched (owned by cli_adapter_readonly_tool.py, edited by a parallel task).",
+  "tools_registered": [
+    "geoai_cli_adapter_plan_readonly",
+    "geoai_cli_adapter_audit_summary_readonly",
+    "geoai_cli_adapter_report_readonly"
+  ],
+  "schema_valid": true,
+  "writes_with_allow_unset": 0,
+  "writes_with_allow_set": 0,
+  "launch_code_present": false,
+  "test_result": "PASS",
+  "verify_result": "PASS",
+  "gates": {
+    "exactly_three_readonly_tools_registered": true,
+    "additive_not_replacing_existing_tools": true,
+    "schemas_valid_json_schema": true,
+    "no_writes_allow_unset": true,
+    "no_writes_allow_set": true,
+    "no_process_launch_code_in_server": true,
+    "write_gate_off_by_default": true,
+    "server_py_untouched_apart_from_wiring": true,
+    "parent_queue_unmutated": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/tests/test_readonly_tool_server_wiring_b107_v1.sh",
+    "tools/geoai-task-mcp/eval/readonly_tool_server_wiring_b107_v1.json"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_readonly_tool_server_wiring_b107_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ],
+  "next_wave": "CLAUDE_TASK_MCP_READONLY_COLLISION_PREFLIGHT_B107_V1 (owned by a different parallel task, cli_adapter_readonly_tool.py)"
+}

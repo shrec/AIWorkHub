@@ -1,0 +1,287 @@
+{
+  "eval_id": "mcp_runner_topic_allowlist_design_b118_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_DESIGN_B118_V1",
+  "date": "2026-07-05",
+  "mode": "allowlist_design_no_core_mutation",
+  "builds_on": [
+    "launch_disabled_queue_contract_b117_v1",
+    "task_mcp_finishline_status_audit_b116_v1",
+    "deepseek_agent_catalog_survey_b116_v1"
+  ],
+  "verdict": "PASS",
+  "summary": "Designed runner/topic allow-list policy for MCP write-gated actions. Defines an allow/deny matrix for all 12 known runner×topic pairs, 8 malformed/attack fixture cases, and a deterministic enforcement matrix for the next implementation patch (B119). The allowlist reuses static safety boundaries from launch_queue_contract.py and the B104 phase2 orchestration contract. No core.py or server.py mutation. Safety gates stay deterministic; neural routing remains a separate concern (see B108/B109).",
+  "allowlist_authority": {
+    "source": "static_human_configured_safety_boundary",
+    "not_neural": true,
+    "rationale": "Runner/topic allowlists are deterministic safety gates, not cognitive decisions. The neural controller learns routing/adapter selection (B108/B109); this allowlist is a hard boundary that prevents unauthorized runner/topic strings from mutating the queue, regardless of what any neural router decides.",
+    "derived_from": [
+      "launch_queue_contract.py static safety boundaries (LAUNCHABLE_BINARIES, MANUAL_ONLY, KNOWN_ADAPTERS)",
+      "phase2_orchestration_contract_b104_v1 adapter matrix",
+      "taskctl.py auto-pickup --runner/--topic convention",
+      "CLAUDE.md worker topic-bound continuous loop runners"
+    ]
+  },
+  "allowlist_matrix": {
+    "schema_version": "geoai.runner_topic_allowlist.v1",
+    "description": "Each entry maps (runner, topic, write_action) -> allow|deny with rationale. Write actions are: auto-pickup, done, review, export-jsonl, start, usage. Read-only tools are always allowed for any authenticated caller and are not in this matrix.",
+    "entries": [
+      {
+        "runner": "claude_coding",
+        "topic": "coding",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Primary Claude worker for implementation tasks. Needs auto-pickup + review (not done — Codex finalizes).",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Workers never run 'done' (Codex-only). 'export-jsonl' is admin-only."
+      },
+      {
+        "runner": "claude_stem",
+        "topic": "stem",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude STEM worker for definition/DFK tasks.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_general_reasoning",
+        "topic": "general_reasoning",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude general reasoning worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_capability_eval",
+        "topic": "capability_eval",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude capability evaluation worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_context_graph",
+        "topic": "context_graph",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude context graph worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_translate",
+        "topic": "translation",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude translation worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_c_native",
+        "topic": "c_native",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude C/CUDA native worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "claude_open_generation",
+        "topic": "open_generation",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "Claude open generation worker.",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "deepseek_finance",
+        "topic": "finance",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "DeepSeek finance worker (assigned topic space per user memory).",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "deepseek_routing",
+        "topic": "routing_safety",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "DeepSeek routing/safety worker (assigned topic space per user memory).",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "deepseek_tasking",
+        "topic": "tasking_system",
+        "write_actions": ["auto-pickup", "review", "start", "usage"],
+        "allow": true,
+        "rationale": "DeepSeek tasking system worker (assigned topic space per user memory).",
+        "denied_actions": ["done", "export-jsonl"],
+        "deny_rationale": "Codex-only finalization; admin-only export."
+      },
+      {
+        "runner": "codex",
+        "topic": "*",
+        "write_actions": ["done", "export-jsonl", "review", "usage"],
+        "allow": true,
+        "rationale": "Codex is the coordinator. Can finalize (done), export, and review. Does NOT auto-pickup tasks (Codex does not claim worker tasks).",
+        "denied_actions": ["auto-pickup", "start"],
+        "deny_rationale": "Codex is the coordinator, not a worker. It reviews and finalizes; workers claim and start."
+      }
+    ]
+  },
+  "malformed_fixtures": {
+    "description": "Runner/topic strings that MUST be denied regardless of write-gate state. These test the robustness of the allowlist enforcement.",
+    "cases": [
+      {
+        "runner": "",
+        "topic": "coding",
+        "expected": "deny",
+        "reason": "empty runner string"
+      },
+      {
+        "runner": "claude_coding",
+        "topic": "",
+        "expected": "deny",
+        "reason": "empty topic string"
+      },
+      {
+        "runner": "",
+        "topic": "",
+        "expected": "deny",
+        "reason": "both empty"
+      },
+      {
+        "runner": "../../etc/passwd",
+        "topic": "coding",
+        "expected": "deny",
+        "reason": "path traversal in runner"
+      },
+      {
+        "runner": "claude_coding",
+        "topic": "; rm -rf /",
+        "expected": "deny",
+        "reason": "shell injection in topic"
+      },
+      {
+        "runner": "claude_coding_NULL_hidden",
+        "runner_contains_null_byte": true,
+        "topic": "coding",
+        "expected": "deny",
+        "reason": "null byte in runner"
+      },
+      {
+        "runner": "CLAUDE_CODING",
+        "topic": "coding",
+        "expected": "deny",
+        "reason": "case mismatch — allowlist is exact-match only"
+      },
+      {
+        "runner": "unknown_runner_abc123",
+        "topic": "coding",
+        "expected": "deny",
+        "reason": "runner not in allowlist"
+      }
+    ]
+  },
+  "enforcement_matrix": {
+    "description": "Which write-gate layer enforces which check. Ordered by priority — first match wins.",
+    "layers": [
+      {
+        "layer": "write_gate_env",
+        "check": "GEOAI_TASK_MCP_ALLOW_WRITES != '1'",
+        "action": "block all write commands with returncode=126",
+        "priority": 1,
+        "implemented": true,
+        "location": "core.py:run_taskctl()"
+      },
+      {
+        "layer": "action_allowlist",
+        "check": "args[0] not in WRITE_COMMANDS",
+        "action": "pass through as read-only (no block needed)",
+        "priority": 2,
+        "implemented": true,
+        "location": "core.py:_is_write_command()"
+      },
+      {
+        "layer": "runner_topic_allowlist",
+        "check": "(runner, topic, action) not in allowlist",
+        "action": "block with returncode=126, audit log entry: 'blocked_runner_topic_not_in_allowlist'",
+        "priority": 3,
+        "implemented": false,
+        "location": "core.py:run_taskctl() — NEXT PATCH B119",
+        "note": "This is the layer this design task defines. Implementation deferred to B119."
+      },
+      {
+        "layer": "malformed_input_reject",
+        "check": "runner/topic fail sanity (empty, null byte, path traversal, shell meta, case mismatch)",
+        "action": "block with returncode=126, audit log entry: 'blocked_malformed_runner_or_topic'",
+        "priority": 4,
+        "implemented": false,
+        "location": "core.py:run_taskctl() — NEXT PATCH B119",
+        "note": "Sanity checks run before allowlist lookup; malformed input is rejected immediately."
+      }
+    ]
+  },
+  "next_enforcement_patch": {
+    "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+    "goal": "Implement runner/topic allowlist enforcement in core.py write path, with malformed-input rejection and audit logging, without changing any other core.py behavior.",
+    "runner": "claude_coding",
+    "topic": "coding",
+    "mode": "implementation_gated_core_patch",
+    "allowed_writes": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+      "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
+      "tools/geoai-task-mcp/tests/runner_topic_allowlist_enforcement_smoke.py"
+    ],
+    "forbidden": [
+      "server_py_mutation",
+      "launch_queue_contract_mutation",
+      "write_gate_disable",
+      "git_add_A",
+      "mixed_task_commit"
+    ],
+    "acceptance": [
+      "all allowlist entries pass (allow=deny matches matrix)",
+      "all 8 malformed fixture cases are rejected",
+      "unknown runner/topic pairs are rejected",
+      "read-only tools are unaffected",
+      "audit log records every allowlist denial",
+      "CODE_ONLY — no runtime switch, no launch",
+      "bash tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes"
+    ]
+  },
+  "gates": {
+    "allow_deny_matrix_complete": true,
+    "malformed_fixtures_defined": true,
+    "next_enforcement_patch_defined": true,
+    "no_core_py_edited": true,
+    "no_server_py_edited": true,
+    "safety_boundaries_preserved": true,
+    "neural_routing_separate_concern": true,
+    "allowlist_is_deterministic_safety_gate": true,
+    "codex_finalizer_role_preserved": true
+  },
+  "safety_invariants": {
+    "write_gate_default_off": true,
+    "deterministic_gates_remain": true,
+    "neural_is_routing_only_not_safety_authority": true,
+    "no_regex_keyword_launch_authority": true,
+    "no_process_launch_code": true,
+    "codex_done_monopoly": true,
+    "worker_cannot_finalize_own_task": true,
+    "runner_topic_exact_match_only": true
+  },
+  "neural_bridge_note": "This allowlist is a DETERMINISTIC SAFETY BOUNDARY, not a neural learning target. The neural controller learns adapter/runner/topic routing (B108/B109) and may select among ALLOWED entries; the allowlist is the hard boundary that prevents any neural choice from mutating the queue under an unauthorized identity. This is controller/verifier layer separation per GeoAI doctrine.",
+  "files_written": [
+    "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_design_b118_v1.json",
+    "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_design_rows_b118_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/mcp_runner_topic_allowlist_design_next_wave_b118_v1.json",
+    "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_design_b118_v1.sh"
+  ]
+}

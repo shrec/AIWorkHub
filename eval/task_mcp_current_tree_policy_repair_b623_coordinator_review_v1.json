@@ -1,0 +1,35 @@
+{
+  "schema_id": "geoai.task_mcp.coordinator_review.v1",
+  "task_id": "CODEX_GPT55_TASK_MCP_CURRENT_TREE_POLICY_REPAIR_B623_V1",
+  "coordinator": "codex",
+  "verdict": "ACCEPT_SELECTIVE_REBASE",
+  "worker_terminal_state": "validation_failed",
+  "worker_terminal_state_disposition": "The candidate feature code was independently reviewed. Worker validation failed because its sandbox lacked pytest/project_context hydration and treated a shell-style environment prefix as an executable; no worker file was promoted automatically.",
+  "accepted_features": [
+    "Exact live-card scoped authority for claim-start, review and usage only after the unchanged static runner/topic allowlist denies the identity.",
+    "Optional exact allow_unchanged_required_outputs policy with baseline equality, regular-file, nonempty, no-promotion and all-unchanged no-effect guards."
+  ],
+  "preservation": {
+    "whole_file_copy_used": false,
+    "current_parent_baseline_preserved": true,
+    "b622_v4_runner_entry_preserved": true,
+    "callback_dashboard_project_context_deepseek_gc_liveness_archive_restore_changed": false
+  },
+  "coordinator_validation": {
+    "runner_topic_allowlist_smoke": "PASS",
+    "focused_allow_unchanged_pytest": "4 passed",
+    "combined_worker_workspace_launcher_security_pytest": "43 passed",
+    "launcher_contract_smoke": "PASS",
+    "py_compile": "PASS",
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "PASS collision_free=true"
+  },
+  "authority": {
+    "coordinator_done_authority_changed": false,
+    "archive_restore_authority_changed": false,
+    "auto_pickup_authority_changed": false,
+    "export_authority_changed": false,
+    "static_allowlist_weakened": false
+  },
+  "remaining_blocker": null
+}

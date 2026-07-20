@@ -1,0 +1,24 @@
+{
+  "schema_id": "geoai.task_mcp.validation_exec_scratch_b753.coordinator_review.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VALIDATION_EXEC_SCRATCH_B753_V1",
+  "reviewed_by": "codex",
+  "disposition": "ACCEPT_FIX_VALIDATION_TERMINAL_WAS_ENV_FALSE_NEGATIVE",
+  "worker_terminal_state": "validation_failed",
+  "worker_validation_error": "/usr/bin/python3: No module named pytest",
+  "accepted_changes": [
+    "request-private exec-probed validation scratch",
+    "Landlock and bubblewrap scratch binding",
+    "TMPDIR/TMP/TEMP validation-only override",
+    "fail-closed noexec detection",
+    "cleanup on success, failure, timeout and cancellation",
+    "credential isolation preserved"
+  ],
+  "parent_verification": {
+    "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py tools/geoai-task-mcp/tests/test_worker_workspace.py tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "result": "67 passed in 2.69s",
+    "new_focused_tests": "15 passed"
+  },
+  "remaining_infrastructure_gap": "The sanitized isolated HOME cannot import the operator user-site pytest package unless its exact approved site-packages path is bound read-only and added to validation PYTHONPATH.",
+  "activation_requirement": "Reload the Task MCP server process so future launches import the accepted worker_workspace.py implementation.",
+  "next_task": "CLAUDE_SONNET5_TASK_MCP_VALIDATION_PYTEST_RUNTIME_B755_V1"
+}

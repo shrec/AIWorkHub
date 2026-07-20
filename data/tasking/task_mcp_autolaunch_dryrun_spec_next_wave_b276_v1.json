@@ -1,0 +1,84 @@
+{
+  "schema_id": "geoai.task_mcp_autolaunch_dryrun_spec_next_wave.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1",
+  "runner": "deepseek_task_mcp_autolaunch_dryrun_b276",
+  "topic": "task_mcp",
+  "created_at": "2026-07-08",
+  "status": "dryrun_spec_complete",
+  "next_wave_cards": [
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_AUTOLAUNCH_IMPLEMENT_GATES_B277_V1",
+      "runner": "claude_task_mcp_autolaunch_impl_b277",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_autolaunch_implement_gates_no_launch_yet",
+      "objective": "Implement the G1-G2-G3 safety gates from the B276 dryrun spec as real code in launch_queue_contract.py (or a new autolaunch_gate.py module): env dual-gate check, taskctl guard integration, allowed_writes pre-flight validation. G4 (LAUNCH_IMPLEMENTED) stays false. Still no process launch.",
+      "acceptance": [
+        "G1 env-gate function returns correct bool for all 4 env-var combinations",
+        "G2 guard check calls taskctl.py guard and parses PASS/FAIL",
+        "G3 allowed_writes validator checks paths against forbidden set",
+        "All gates are import-safe, side-effect-free Python functions",
+        "Shell test passes for all gate combinations",
+        "LAUNCH_IMPLEMENTED remains false"
+      ],
+      "depends_on": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (this spec)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/autolaunch_gate.py",
+        "tools/geoai-task-mcp/eval/mcp_autolaunch_implement_gates_b277_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_autolaunch_implement_gates_b277_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_AUTOLAUNCH_LOG_ACCOUNTING_B278_V1",
+      "runner": "claude_task_mcp_autolaunch_log_b278",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_autolaunch_log_accounting_append_only",
+      "objective": "Implement the 15-field append-only JSONL launch log from the B276 spec. Wire log entries on gate-check and (future) process-completion events. No process launch.",
+      "acceptance": [
+        "JSONL append-only log at tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
+        "All 15 fields populated for gate-check entries",
+        "Log reader function returns entries filtered by task_id/adapter/date",
+        "Shell test validates log schema, append behavior, and reader"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_AUTOLAUNCH_IMPLEMENT_GATES_B277_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/autolaunch_gate.py"
+      ]
+    },
+    {
+      "proposed_task_id": "CODEX_TASK_MCP_AUTOLAUNCH_WIRE_PROCESS_B279_V1",
+      "runner": "codex_task_mcp_autolaunch_wire_b279",
+      "topic": "task_mcp",
+      "priority": "critical",
+      "mode": "mcp_autolaunch_wire_process_spawn_gated",
+      "objective": "Wire real process-spawn for claude_cli and codex_cli adapters using the B276 command templates, behind ALL four gates including G4 LAUNCH_IMPLEMENTED=true. This is the FIRST task that sets LAUNCH_IMPLEMENTED=True and actually spawns model processes.",
+      "acceptance": [
+        "LAUNCH_IMPLEMENTED set to True",
+        "claude_cli and codex_cli adapters spawn real processes via subprocess.Popen",
+        "All 4 gates checked before spawn; any gate failure blocks",
+        "Completion polling via taskctl.py show + completion_inbox",
+        "Stale detection with configurable timeout",
+        "Dry-run mode (--dryrun flag) prints command without executing",
+        "Shell test with forged gate-failure fixtures"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_AUTOLAUNCH_LOG_ACCOUNTING_B278_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
+        "AITools/taskctl.py"
+      ]
+    }
+  ],
+  "blockers": [],
+  "notes": {
+    "neural_routing_parallel_track": "mcp_neural_launch_routing_migration_b254_v1 provides neural curriculum for learned adapter selection. The B276 spec keeps static adapter mapping as safety floor; the neural router should eventually replace static dispatch.",
+    "deepseek_manual_adapter": "DeepSeek runs as a separate chat session initiated by the owner. The MCP can prepare the command block but cannot spawn a DeepSeek process locally. This is by design, not a gap.",
+    "completion_inbox_integration": "B275 completion_inbox wiring already provides review_queue, stale_processing, and runner_mismatch_warnings. The autolaunch completion path (section 4 of B276 spec) builds directly on these existing read-only tools."
+  }
+}

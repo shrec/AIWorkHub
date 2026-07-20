@@ -1,0 +1,94 @@
+{
+  "schema_id": "geoai.task_mcp_supervisor_loop_contract_eval.b07.v1",
+  "task_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_CONTRACT_B07_V1",
+  "mode": "mcp_supervisor_contract_no_launch_no_source_patch",
+  "runner": "claude_task_mcp_supervisor_contract_b07",
+  "topic": "task_mcp",
+  "target_artifact": "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+  "test_harness": "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
+
+  "contract_shape_measured": {
+    "flow_legs_count": 4,
+    "lifecycle_states_count": 5,
+    "lifecycle_states": ["planned", "dispatched_dryrun", "worker_review_ready", "codex_reviewed", "blocked"],
+    "error_taxonomy_categories_count": 5,
+    "error_taxonomy_categories": ["collision", "stale_task", "runner_topic_mismatch", "missing_artifact", "failed_validation"],
+    "safety_boundary_keys_count": 4,
+    "forbidden_operations_all_false": true,
+    "source_files_created_or_modified": 0
+  },
+
+  "acceptance_results": {
+    "mcp_request_response_schema_for_full_flow": "PASS - all 4 flow_legs carry an explicit request_schema/response_schema (leg 2 documented as a non-MCP argv handoff, never executed)",
+    "dryrun_only_lifecycle_states": "PASS - planned, dispatched_dryrun, worker_review_ready, codex_reviewed, blocked all present with task_status_mutation=false",
+    "safety_boundaries": "PASS - no_credential_read, no_daemon_start, no_real_process_launch, no_writes_unless_explicit_future_gate all enforced=true",
+    "error_taxonomy_5_categories": "PASS - collision, stale_task, runner_topic_mismatch, missing_artifact, failed_validation each carry trigger/detection_point/example_reason/result",
+    "no_source_code_patched": "PASS - allowed_writes and actual files touched are all under contracts/, eval/, data/tasking/, tests/; zero paths under tools/geoai-task-mcp/src/",
+    "bash_test_exit": "PASS - test_task_mcp_supervisor_loop_contract_b07_v1.sh exits 0",
+    "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns success"
+  },
+
+  "cross_validated_against_live_module": {
+    "note": "runner_topic_mismatch error-taxonomy examples were cross-checked LIVE against the already-existing, unmodified core.check_runner_topic_allowlist (no source patch performed; this only CALLS the pre-existing function read-only).",
+    "checks": [
+      {"runner": "not_claude_task_mcp_prefixed", "topic": "task_mcp", "action": "auto-pickup", "expected_reason": "unknown_runner_topic_pair", "live_match": true},
+      {"runner": "claude_task_mcp_supervisor_contract_b07", "topic": "task_mcp", "action": "auto-pickup", "expected_reason": "per_wave_prefix_allowlisted", "live_match": true},
+      {"runner": "claude_task_mcp_supervisor_contract_b07", "topic": "task_mcp", "action": "start", "expected_reason": "per_wave_action_not_allowed:start", "live_match": true},
+      {"runner": "codex", "topic": "any_topic_at_all", "action": "auto-pickup", "expected_reason": "codex_action_not_allowed:auto-pickup", "live_match": true}
+    ],
+    "checks_total": 4,
+    "checks_passed": 4
+  },
+
+  "no_source_patch_verified": {
+    "method": "Enumerated this task's own allowed_writes list; confirmed none begin with tools/geoai-task-mcp/src/. tools/geoai-task-mcp is a nested git repo shared with concurrent workers, so global src/ cleanliness is NOT asserted here (other in-flight tasks legitimately hold src/core.py, src/geoai_task_mcp/server.py, src/geoai_task_mcp/review_summarizer.py dirty); only THIS task's own footprint is checked.",
+    "this_task_allowed_writes": [
+      "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
+    ],
+    "result": true
+  },
+
+  "forbidden_pattern_scan": {
+    "note": "Same forbidden-source-pattern scan style as test_agent_launcher_mvp_b02_v1.py: the contract's raw JSON text contains no subprocess/exec/network invocation strings.",
+    "patterns_checked": ["subprocess.run", "subprocess.Popen", "subprocess.call", "import subprocess", "os.system", "os.popen", "os.exec", "os.fork", "os.spawn", "Popen(", "shell=True", "pty.spawn", "requests.post", "urllib.request", "httpx."],
+    "found_in_contract": []
+  },
+
+  "forbidden_operations_confirmed_not_taken": {
+    "source_patch": false,
+    "daemon_start": false,
+    "real_agent_launch": false,
+    "credential_read": false,
+    "credential_write": false,
+    "write_gate_enable": false,
+    "task_status_mutation": false,
+    "network_operation": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+
+  "checks_total": 15,
+  "checks_passed": 15,
+  "checks_failed": 0,
+
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only. Never git add -A / git add . / mixed-task commit.",
+
+  "rollback": {
+    "action": "Delete the 4 new artifact files (this eval, the contract, the next_wave proposal, the test). No source file changed, no other artifact references these paths yet.",
+    "trigger_conditions": [
+      "contract shape check regresses (fewer than 4 flow_legs, 5 lifecycle_states, or 5 error_taxonomy categories)",
+      "a future task wires an MCP tool that mutates task_status without a dedicated write-gate task"
+    ]
+  },
+
+  "verdict": "PASS"
+}

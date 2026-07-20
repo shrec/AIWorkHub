@@ -1,0 +1,54 @@
+{
+  "next_wave_id": "review_artifact_strictness_guard_next_wave_b120_v1",
+  "parent_task": "CLAUDE_TASK_MCP_REVIEW_ARTIFACT_STRICTNESS_GUARD_B120_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). The B120 guard (audit_review_artifact_strictness_b120_v1.py) is a deterministic, read-only, static-file strictness screen over a fixed 3-wave manifest (KNOWN_WAVES). It correctly flags the rejected mcp_full_wave_dryrun_harness_b119_v1 wave and passes the two real B119 waves, but it does not yet (a) discover waves generically from a task_id/runner without a hardcoded manifest, (b) wire into review_summarizer.py's B116/B119 handoff report so Codex sees a strictness_guard field per queued task automatically, or (c) build a neural training-target curriculum from the invalid/valid wave labels (per the neural-bridge-priority doctrine: this deterministic scanner should also emit distillation rows so a learned classifier can eventually replace/complement the regex/heuristic reason codes).",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_STRICTNESS_HANDOFF_WIRE_V1",
+      "goal": "Wire audit_review_artifact_strictness_b120_v1.build_report()/audit_wave() into review_summarizer.py's build_codex_handoff_report() so every queued-for-review task's handoff entry additionally carries a strictness_guard field (invalid/invalid_reasons/reviewer_action) derived from that task's own allowed_writes files, without adding any new taskctl write call.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+        "tools/geoai-task-mcp/tests/test_review_strictness_handoff_wire_v1.sh",
+        "tools/geoai-task-mcp/eval/review_strictness_handoff_wire_v1.json"
+      ],
+      "acceptance": [
+        "handoff report entries gain a strictness_guard field derived generically from each card's own allowed_writes (not the hardcoded B120 3-wave manifest)",
+        "read-only, no new taskctl write command, B116/B119 fields unchanged (additive only)",
+        "regression: existing B116/B119 handoff tests stay green"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_REVIEW_STRICTNESS_GENERIC_DISCOVERY_V1",
+      "goal": "Replace the fixed KNOWN_WAVES manifest with generic discovery: given a task_id or a card's allowed_writes list, locate its eval JSON / rows JSONL / test script / builder script by path convention and audit them, so the guard works on any future wave without a code edit per wave.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/geoai-task-mcp/tests/test_review_strictness_generic_discovery_v1.sh",
+        "tools/geoai-task-mcp/eval/review_strictness_generic_discovery_v1.json"
+      ],
+      "acceptance": [
+        "guard accepts a task_id/allowed_writes list and audits it without a manifest edit",
+        "all 3 existing known waves still classify identically (regression)",
+        "still read-only, no queue mutation"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_REVIEW_STRICTNESS_CURRICULUM_MIGRATION_V1",
+      "goal": "Per neural-bridge-priority doctrine: this B120 guard is a deterministic heuristic (size/regex/marker) evidence extractor. Emit a labeled curriculum (wave file-content features -> invalid/valid + reason-code targets) so a learned classifier can eventually score submission strictness instead of only regex/size heuristics; deterministic guard remains the validator/baseline, never the learned authority.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/review_artifact_strictness_targets_v1.jsonl",
+        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/geoai-task-mcp/tests/test_review_strictness_curriculum_v1.sh"
+      ],
+      "acceptance": [
+        "curriculum rows carry file-derived features + invalid/valid label + reason codes for each known wave",
+        "deterministic guard stays the baseline/validator; no runtime regex/cue router promoted to production authority",
+        "explicit migration task framing per Neural-Control-First doctrine"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "next_wave_id": "mcp_neural_launch_routing_migration_next_wave_b254_v1",
+  "parent_task": "CLAUDE_TASK_MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_B254_V1",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued -- this worker does not create task cards. Curriculum is broadened; the next steps mirror B108's own next-wave shape (isolated neural dryrun measurement, then a gated launch executor), scaled to this larger, outcome-diverse row set. CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1 remains the explicit owner-sign-off gate for any real launcher; nothing here changes that.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_NEURAL_ROUTING_DRYRUN_B254_V1",
+      "goal": "Run an isolated neural dryrun over mcp_neural_launch_routing_migration_b254_v1.jsonl to measure whether a model learns adapter/runner/topic routing + abstain (including the new real_active_claim_collision and synthetic_wrong_runner_topic classes) better than the B108 baseline. Report per-class accuracy, abstain precision/recall split by abstain_reason, and whether historical_review_outcome improves calibration.",
+      "mode": "isolated_neural_dryrun_no_runtime",
+      "runner": "claude_capability_eval",
+      "topic": "capability_eval",
+      "acceptance": [
+        "per-class routing accuracy reported against B108 baseline",
+        "abstain precision/recall reported per abstain_reason",
+        "no regex/keyword authority introduced",
+        "dryrun uses ONLY read-only plan/collision tools as evidence extractors"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B254_V1",
+      "goal": "Unchanged from B108's proposal: wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH AND GEOAI_TASK_MCP_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1). Default stays fully disabled.",
+      "mode": "implementation_gated_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "launch unreachable without explicit gate AND neural router selection AND owner sign-off",
+        "default disabled; deterministic safety gates remain",
+        "argv-list only, no shell, cwd pinned, env scrubbed"
+      ]
+    }
+  ],
+  "blockers": []
+}

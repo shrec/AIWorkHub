@@ -1,0 +1,80 @@
+{
+  "eval_id": "task_mcp_kb_fts_literal_query_repair_b663_v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_KB_FTS_LITERAL_QUERY_REPAIR_B663_V1",
+  "date": "2026-07-19",
+  "verdict": "PASS",
+  "summary": "AITools/kb.py cmd_search and cmd_context were passing raw natural-language project-context text straight into an FTS5 MATCH expression. FTS5 treats '-', ':', '(', ')', '\"' and '*' as query grammar (column filters, NOT, grouping, phrase, prefix), so ordinary text like 'fixed-width' raised sqlite3.OperationalError: no such column: width. Added _fts_safe_query(): every Unicode word token (incl. Georgian) is emitted as its own double-quoted literal phrase before the MATCH call, so punctuation can never be parsed as FTS5 grammar. Also added a KB_DB_PATH env override for DB_PATH so tests never open/mutate the production AITools/kb.db.",
+  "bug": {
+    "symptom": "sqlite3.OperationalError: no such column: width",
+    "trigger_query": "Signal Atlas fixed-width candidate record loader pair input",
+    "root_cause": "entries_fts MATCH ? received the raw query string; FTS5's query parser interprets bareword-hyphen sequences as column-filter/NOT grammar rather than literal text",
+    "affected_functions": ["cmd_search", "cmd_context"]
+  },
+  "fix": {
+    "approach": "literal-token-quoting",
+    "new_helper": "AITools/kb.py::_fts_safe_query(raw: str) -> str | None",
+    "behavior": "extracts \\w+ Unicode tokens (letters incl. Georgian, digits, underscore) and joins them as individually double-quoted FTS5 phrases; returns None for input with no searchable token",
+    "callers_updated": ["cmd_search", "cmd_context (FTS fallback path)"],
+    "test_isolation_addon": "DB_PATH now honors KB_DB_PATH env var, defaulting to AITools/kb.db when unset"
+  },
+  "gates": {
+    "exact_repro_query_no_longer_raises": true,
+    "literal_token_search_default": true,
+    "no_raw_fts5_grammar_exposed": true,
+    "no_raw_sql_concatenation": true,
+    "category_filter_preserved": true,
+    "tag_filter_preserved": true,
+    "limit_filter_preserved": true,
+    "unicode_georgian_search_preserved": true,
+    "deterministic_ordering_preserved": true,
+    "output_format_unchanged": true,
+    "schema_unchanged": true,
+    "production_kb_db_not_mutated": true,
+    "hyphen_case_covered": true,
+    "colon_case_covered": true,
+    "quotes_case_covered": true,
+    "parens_case_covered": true,
+    "leading_minus_case_covered": true,
+    "wildcard_case_covered": true,
+    "georgian_case_covered": true,
+    "empty_whitespace_case_covered": true,
+    "py_compile_clean": true
+  },
+  "validation": {
+    "commands": [
+      "python3 -m pytest -q AITools/test_kb_fts_literal_query_repair_b663_v1.py",
+      "python3 -m py_compile AITools/kb.py",
+      "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
+    ],
+    "pytest_result": "24 passed",
+    "py_compile_result": "clean"
+  },
+  "evidence": {
+    "before_fix": {
+      "command": "python3 -c \"import sqlite3; con=sqlite3.connect(':memory:'); con.execute('CREATE VIRTUAL TABLE t USING fts5(body)'); con.execute('SELECT * FROM t WHERE t MATCH ?', ('fixed-width candidate record loader',))\"",
+      "result": "sqlite3.OperationalError: no such column: width"
+    },
+    "after_fix": {
+      "command": "KB_DB_PATH=<tmp>/kb.db python3 AITools/kb.py search 'Signal Atlas fixed-width candidate record loader pair input'",
+      "result": "[kb] 1 result(s) for 'Signal Atlas fixed-width candidate record loader pair input': ... arch.signal_atlas_loader"
+    }
+  },
+  "files_changed": [
+    "AITools/kb.py",
+    "AITools/test_kb_fts_literal_query_repair_b663_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
+  ],
+  "forbidden_actions_avoided": {
+    "production_kb_mutation": false,
+    "schema_change": false,
+    "raw_sql_concatenation": false,
+    "raw_fts_grammar_default": false,
+    "task_mcp_lifecycle_change": false,
+    "dashboard_change": false,
+    "git_commit": false,
+    "git_push": false,
+    "taskctl_done_by_worker": false
+  },
+  "commit_contract": "NO_COMMIT",
+  "next": "stop_at_taskctl_review"
+}

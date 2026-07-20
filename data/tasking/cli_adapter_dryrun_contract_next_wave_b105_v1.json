@@ -1,0 +1,84 @@
+{
+  "next_wave_id": "cli_adapter_dryrun_contract_next_wave_b105_v1",
+  "parent_task": "CLAUDE_TASK_MCP_CLI_ADAPTER_DRYRUN_CONTRACT_B105_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps launch DISABLED by default and adds NO process-spawn code until the FINAL gated task, and only behind ALL launch_preconditions from phase2_orchestration_contract_b104_v1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_PLAN_TOOL_B106_V1",
+      "goal": "Expose cli_adapter_dryrun.plan_dryrun as a read-only MCP tool geoai_agent_launch_plan that returns the would-run argv + validation + collision preflight; starts no process; appends action=launch_planned audit entry.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/tests/test_dryrun_plan_tool_b106_v1.sh",
+        "tools/geoai-task-mcp/eval/dryrun_plan_tool_b106_v1.json"
+      ],
+      "acceptance": [
+        "tool starts no process with ALLOW_LAUNCH unset (and even when set)",
+        "returns plan dict + collision preflight result",
+        "audit entry action=launch_planned appended; no secret value recorded"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_B106_V1",
+      "goal": "Add a static runner/topic allowlist validator layered on validate_command; any unknown or off-topic runner/topic pair is blocked and audited. Still no launch.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_runner_topic_allowlist_b106_v1.sh",
+        "tools/geoai-task-mcp/eval/runner_topic_allowlist_b106_v1.json"
+      ],
+      "acceptance": [
+        "unknown runner/topic pair blocked and audited",
+        "static allowlist is a safety boundary, not a cue router",
+        "no process launch; write gate stays off"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_TOKEN_BUDGET_B106_V1",
+      "goal": "Attach per-task/per-adapter token_budget_max ceiling to the dry-run plan; an over-budget plan is marked blocked_over_budget and audited (never silently continued). Maps to taskctl usage fields.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_dryrun_token_budget_b106_v1.sh",
+        "tools/geoai-task-mcp/eval/dryrun_token_budget_b106_v1.json"
+      ],
+      "acceptance": [
+        "over-budget plan reported blocked_over_budget, never continued",
+        "token_cost_reporting_fields populated per task and per adapter",
+        "no secret env value recorded"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+      "goal": "Produce trainable curriculum rows for a LEARNED adapter/runner/topic launch-routing + abstain policy that replaces the static allowlist selection with a neural router. No cue/regex router introduced.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+      ],
+      "acceptance": [
+        "curriculum rows define task->adapter/runner/topic routing + abstain labels",
+        "no regex/keyword cue router introduced",
+        "learned-selection migration path documented"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B107_V1",
+      "goal": "FINAL: add the real launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH mirroring the ALLOW_WRITES gate; a real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass, using argv-list only, no shell, cwd pinned, env scrubbed. Default stays fully disabled; rollback = unset the flag; executor never reviews its own task.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_gated_launch_executor_b107_v1.sh",
+        "tools/geoai-task-mcp/eval/gated_launch_executor_b107_v1.json"
+      ],
+      "acceptance": [
+        "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",
+        "argv-list only, no shell, cwd pinned, env scrubbed, bounded timeout",
+        "default stays disabled; blocked attempts audited; rollback = unset ALLOW_LAUNCH; executor never reviews/finalizes its own task"
+      ]
+    }
+  ]
+}

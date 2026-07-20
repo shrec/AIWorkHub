@@ -1,0 +1,253 @@
+{
+  "eval_id": "task_mcp_autolaunch_queue_dryrun_b281_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1",
+  "runner": "deepseek_task_mcp_autolaunch_b281",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "task_mcp_autolaunch_queue_dryrun_no_cli_launch",
+  "verdict": "PASS",
+  "no_external_paid_model_launched": true,
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "queue_write_apply": false,
+    "audit_write_apply": false,
+    "agent_or_process_launch_apply": false,
+    "notification_push_authority": false,
+    "cursor_persistence_write_apply": false,
+    "owner_delivery_channel_apply": false,
+    "training_launch": false,
+    "process_launch_authority": false,
+    "subprocess_spawn_authority": false
+  },
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local synthesis: combines B276 autolaunch dryrun spec, B277 owner notification loop spec, and B275 completion_inbox.py into a unified queue-request -> launch -> completion-inbox -> stale-recovery -> usage-accounting flow. No external API/SDK question open."
+  },
+  "builds_on": [
+    "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (command templates, 4-gate safety model, 15-field launch log, completion return path)",
+    "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (5-kind event taxonomy, delta cursor, automatic loop definition)",
+    "CLAUDE_TASK_MCP_COMPLETION_INBOX_SMOKE_B276_V1 (completion_inbox.py review_queue, stale_processing, runner_mismatch_warnings)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py (build_completion_inbox with 5 facets: review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, read_errors)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (collision_guard, usage_report, auto_pickup, run_taskctl write gate)"
+  ],
+  "summary": "Synthesizes B276 (autolaunch) and B277 (notification loop) into a unified queue-request -> completion-inbox flow. Defines exactly how Codex creates a launch request (queue_request JSON envelope), how the MCP would process it through the 4-gate safety model, how completion_inbox reports results, how stale tasks are detected and recovered, and how usage accounting events flow back to the cost ledger. Every process-launch and notification-delivery capability remains at the design stage; no CLI/model process is launched by this artifact. All authority_flags are false. The queue_request schema is a pure JSON design that feeds into the existing auto_pickup + completion_inbox pipeline without introducing new subprocess paths.",
+  "protocol_sections": {
+    "section_1_queue_request_schema": {
+      "title": "Queue Request Creation (Codex -> MCP)",
+      "description": "Codex creates a queue_request JSON object and deposits it via a proposed geoai_task_queue_request MCP tool (not implemented here). The schema is a self-describing envelope that the MCP autolauncher would consume to spawn workers through the B276 command templates behind the 4-gate safety model.",
+      "queue_request_envelope": {
+        "request_id": "string, deterministic sha1(task_id + runner + requested_at)[:16] — idempotent, same task+runner+timestamp = same request_id",
+        "task_id": "string, the task card id to launch a worker for",
+        "runner": "string, the runner name (e.g., claude_coding, deepseek_task_mcp_autolaunch_b281)",
+        "topic": "string, the task topic (e.g., coding, task_mcp)",
+        "adapter": "string enum: claude_cli | codex_cli | deepseek_manual — which B276 command template to use",
+        "model": "string, model identifier (e.g., claude-sonnet-4-5, gpt-5.5, deepseek-v4-pro)",
+        "owner_prompt": "string, the owner's instruction text to pass to the worker (may be empty for auto_pickup tasks)",
+        "requested_at": "string, ISO-8601 UTC timestamp when Codex created this request",
+        "priority": "string enum: critical | high | medium | low — mirrors task card priority",
+        "max_turns": "integer, max conversation turns for the worker (default 200)",
+        "stale_timeout_seconds": "integer, how long before the worker is considered stale (default 7200 for claude/codex, 86400 for deepseek_manual)",
+        "env_overrides": "object, optional env vars to set for the worker process (must not include secrets; audit-log sanitized per B276 G1)",
+        "authority_flags": "object, embedded per-request — always all-false in dryrun mode; mirrored from task card authority_flags for launch-time checks"
+      },
+      "queue_request_lifecycle": {
+        "states": ["created", "gated", "launched", "running", "completed", "stale", "failed", "blocked"],
+        "transitions": {
+          "created -> gated": "request received by MCP, G1-G4 checks begin",
+          "gated -> launched": "all 4 gates pass, process spawned via B276 adapter template",
+          "gated -> blocked": "any gate fails, request recorded as blocked with failed_gate_ids",
+          "launched -> running": "process PID confirmed alive",
+          "running -> completed": "worker exits, completion_inbox detects review_queue entry",
+          "running -> stale": "stale_timeout_seconds exceeded without completion",
+          "running -> failed": "worker process exits with non-zero code or unrecoverable error"
+        }
+      },
+      "idempotency_rule": "Same request_id submitted twice is a no-op if the previous request is still in created/gated/launched/running state. If the previous request reached completed/stale/failed, a new request with the same task_id is allowed (re-queue). This prevents double-launch of the same worker."
+    },
+    "section_2_completion_inbox_integration": {
+      "title": "Completion Inbox Integration (MCP -> Codex)",
+      "description": "After a worker finishes (or fails, or goes stale), the MCP autolauncher updates the task card lifecycle_state (via taskctl.py review for completion, or taskctl.py start for stale recovery). Codex's orchestration loop then detects the change through the EXISTING build_completion_inbox() facets — no new tool needed for the read path.",
+      "completion_flow": {
+        "step_1_worker_finishes": {
+          "action": "Worker writes outputs to allowed_writes, runs taskctl.py review <task_id>",
+          "detection": "build_completion_inbox()['review_queue'] now includes this task_id"
+        },
+        "step_2_codex_detects": {
+          "action": "Codex orchestration loop calls geoai_completion_inbox() (existing tool) or proposed geoai_completion_inbox_delta() (B277 section_2b)",
+          "detection": "review_queue entry has validation_status, runner_task_batch_mismatch, and allowed_writes list"
+        },
+        "step_3_codex_reviews": {
+          "action": "Codex runs taskctl.py guard-staged, inspects allowed_writes artifacts, checks validation_status",
+          "outcome": "PASS -> taskctl.py stage + git commit; FAIL -> create repair task"
+        },
+        "step_4_usage_accounting": {
+          "action": "Codex records usage via geoai_task_usage_report (existing tool) or reads from the 15-field launch log (B276 section_3)",
+          "detection": "usage_report() returns input/output tokens and cost_usd per task_id/runner"
+        }
+      },
+      "stale_recovery_flow": {
+        "trigger": "build_completion_inbox()['stale_processing'] returns entries older than stale_processing_hours (default 24h)",
+        "recovery_steps": [
+          "1. Codex detects stale entry via completion_inbox or proposed delta tool",
+          "2. Codex checks if a newer card already supersedes this task (git log --grep check)",
+          "3. If superseded: mark the stale task as finished/done via taskctl.py done",
+          "4. If genuinely abandoned: create a requeue_request with a new runner assignment, resetting lifecycle_state to pending",
+          "5. If the worker process is still alive (zombie): kill it (SIGTERM, then SIGKILL after 30s) before requeuing"
+        ],
+        "stale_detection_fields": ["task_id", "runner", "stale_hours", "last_activity_at", "last_activity_field"],
+        "zombie_kill_policy": "The MCP autolauncher records the worker PID at launch time. On stale detection, it checks /proc/<pid> before killing. If the PID no longer exists, the task is marked stale-completed (process died silently)."
+      },
+      "collision_and_duplicate_runner_handling": {
+        "trigger": "build_completion_inbox()['runner_mismatch_warnings'] returns entries OR core.collision_guard() reports 2+ runners claiming the same task_id",
+        "handling": [
+          "1. Codex detects collision via geoai_task_collision_guard (existing tool) or completion_inbox runner_mismatch_warnings",
+          "2. For batch-token mismatch: the newer claim is authoritative if it passes taskctl guard; the older claim is marked stale",
+          "3. For same-task_id double-claim: the runner whose task card has the more recent claimed_at wins; the other claim is rejected with a collision_block entry",
+          "4. Codex creates a collision_report event (kind=duplicate_runner per B277 section_1) and pauses auto_pickup for that task_id"
+        ],
+        "collision_prevention": "Before creating a queue_request, Codex MUST run taskctl.py guard <task_id> --dryrun to verify the task is not already claimed. The queue_request idempotency rule (section_1) provides a second layer: same request_id re-submitted is a no-op."
+      }
+    },
+    "section_3_usage_accounting_events": {
+      "title": "Usage Accounting Flow",
+      "description": "Every worker launch attempt records a 15-field launch log entry (B276 section_3). Additionally, Codex records per-task usage via geoai_task_usage_report (existing tool). This section defines how these two accounting sources reconcile into a unified cost ledger.",
+      "dual_source_accounting": {
+        "source_1_launch_log": {
+          "path": "tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
+          "fields": ["launch_id", "task_id", "runner", "topic", "adapter", "model", "launch_requested_at", "launch_completed_at", "exit_code", "gates_passed", "gates_failed", "usage_input_tokens", "usage_output_tokens", "cost_usd", "error_message", "stale_detected_at"],
+          "written_by": "MCP autolauncher (future), append-only JSONL"
+        },
+        "source_2_taskctl_usage": {
+          "tool": "geoai_task_usage_report (core.usage_report())",
+          "fields": ["task_id", "runner", "topic", "model", "usage_input_tokens", "usage_output_tokens", "cost_usd"],
+          "written_by": "Codex or worker via taskctl.py usage"
+        }
+      },
+      "reconciliation_rules": {
+        "prefer_launch_log_for_gate_events": "G1-G4 gate check entries (gates_failed non-empty) are recorded ONLY in the launch log, not in taskctl usage (no process was spawned, no tokens consumed)",
+        "prefer_taskctl_usage_for_token_counts": "When a worker actually runs, taskctl.py usage records the final token counts; the launch log may have a preliminary estimate. Final cost_usd always comes from taskctl usage if available.",
+        "cost_ledger_aggregation": "A proposed geoai_task_cost_ledger MCP tool (not implemented here) would UNION both sources, deduplicate by (task_id, runner, model), and produce per-topic/per-runner/per-day aggregates. Until implemented, Codex aggregates manually from the two read-only sources."
+      },
+      "usage_event_envelope": {
+        "event_kind": "usage",
+        "derived_from": "B277 section_1 event taxonomy, kind=usage",
+        "payload_fields": ["task_id", "runner", "topic", "model", "usage_input_tokens", "usage_output_tokens", "cost_usd", "source", "recorded_at"],
+        "note": "Matches B277 event_kind=usage payload exactly; source field distinguishes launch_log vs taskctl_usage"
+      }
+    },
+    "section_4_queue_flow_state_machine": {
+      "title": "End-to-End Queue Flow State Machine",
+      "description": "Combines the queue_request lifecycle (section_1), completion_inbox detection (section_2), stale recovery (section_2), and usage accounting (section_3) into a single state machine with exactly 9 states and 12 transitions.",
+      "states": {
+        "PENDING": "Task exists in task_queue_v1.sqlite, not yet claimed by any runner",
+        "CLAIMED": "Task claimed by a runner via auto_pickup; lifecycle_state=processing",
+        "LAUNCH_REQUESTED": "Codex created a queue_request for this task; MCP has not yet processed it",
+        "GATE_CHECK": "MCP is running G1-G4 safety gates; if any fail -> BLOCKED",
+        "LAUNCHED": "Worker process spawned via B276 adapter template; PID recorded",
+        "RUNNING": "Worker process confirmed alive; completion_inbox would show no review_queue entry yet",
+        "COMPLETED": "Worker ran taskctl.py review; completion_inbox review_queue now contains this task; awaiting Codex finalization",
+        "STALE": "Worker process exceeded stale_timeout_seconds without completing; stale_processing facet detects this",
+        "BLOCKED": "A gate failed or a collision was detected; task cannot proceed without manual intervention"
+      },
+      "transitions": [
+        {"from": "PENDING", "to": "CLAIMED", "trigger": "auto_pickup by runner"},
+        {"from": "CLAIMED", "to": "LAUNCH_REQUESTED", "trigger": "Codex creates queue_request"},
+        {"from": "LAUNCH_REQUESTED", "to": "GATE_CHECK", "trigger": "MCP picks up request"},
+        {"from": "GATE_CHECK", "to": "LAUNCHED", "trigger": "G1-G4 all PASS"},
+        {"from": "GATE_CHECK", "to": "BLOCKED", "trigger": "Any gate FAILS"},
+        {"from": "LAUNCHED", "to": "RUNNING", "trigger": "Process PID confirmed alive"},
+        {"from": "RUNNING", "to": "COMPLETED", "trigger": "Worker runs taskctl.py review"},
+        {"from": "RUNNING", "to": "STALE", "trigger": "stale_timeout_seconds exceeded"},
+        {"from": "STALE", "to": "PENDING", "trigger": "Requeue with new runner assignment"},
+        {"from": "STALE", "to": "BLOCKED", "trigger": "Zombie process unkillable or task superseded"},
+        {"from": "COMPLETED", "to": "PENDING", "trigger": "Codex review FAIL -> repair task created, original marked done"},
+        {"from": "BLOCKED", "to": "PENDING", "trigger": "Manual owner unblock or gate fix"}
+      ],
+      "invariants": [
+        "A task_id can be in at most one of {LAUNCHED, RUNNING} at any time (single-worker invariant)",
+        "A task_id in COMPLETED must have a review_queue entry with validation_status",
+        "A task_id in STALE must have stale_hours >= stale_processing_hours threshold",
+        "A task_id in BLOCKED must have at least one failed_gate_id or collision_report entry",
+        "The MCP autolauncher never spawns a process when LAUNCH_IMPLEMENTED=false (G4 gate is always FAIL in dryrun)"
+      ]
+    },
+    "section_5_authority_flags": {
+      "title": "Authority Flags (ALL FALSE)",
+      "description": "Every authority flag is explicitly false. This spec grants zero runtime, default, support, model, score, launch, or notification authority. It is a pure design/synthesis artifact.",
+      "flags": {
+        "runtime_authority": false,
+        "default_authority": false,
+        "support_authority": false,
+        "model_weight_write": false,
+        "score_apply": false,
+        "canonical_lexicon_mutation": false,
+        "atlas_bank_mutation": false,
+        "queue_write_apply": false,
+        "audit_write_apply": false,
+        "agent_or_process_launch_apply": false,
+        "notification_push_authority": false,
+        "cursor_persistence_write_apply": false,
+        "owner_delivery_channel_apply": false,
+        "training_launch": false,
+        "process_launch_authority": false,
+        "subprocess_spawn_authority": false
+      }
+    }
+  },
+  "gates": {
+    "dryrun_only_no_cli_launch_code": true,
+    "queue_request_schema_defined_no_implementation": true,
+    "completion_inbox_integration_specified_no_new_tool": true,
+    "stale_recovery_flow_defined": true,
+    "usage_accounting_reconciliation_rules_defined": true,
+    "collision_and_duplicate_runner_handling_defined": true,
+    "state_machine_9_states_12_transitions": true,
+    "all_authority_flags_false": true,
+    "launch_implemented_remains_false": true,
+    "artifact_under_25mb": true,
+    "no_external_process_spawn": true,
+    "no_subprocess_import": true,
+    "no_server_py_modification": true,
+    "no_new_mcp_tool_registered": true
+  },
+  "invariants": {
+    "dryrun_only": true,
+    "launch_implemented": false,
+    "queue_write": false,
+    "audit_write": false,
+    "workflow_switch": false,
+    "parent_queue_mutation": false,
+    "production_mcp_server_api_altered": false,
+    "single_worker_per_task_id": true,
+    "request_idempotency": true,
+    "collision_prevention_before_launch": true
+  },
+  "remaining_gaps_not_solved_by_this_spec": [
+    "NO_PROCESS_SPAWN_IMPLEMENTED: The MCP autolauncher's actual process-spawn code is deferred to CODEX_TASK_MCP_AUTOLAUNCH_WIRE_PROCESS_B279_V1 (B276 next_wave, G4 LAUNCH_IMPLEMENTED=true required)",
+    "NO_QUEUE_REQUEST_TOOL_REGISTERED: The geoai_task_queue_request MCP tool that Codex would call to deposit queue_request JSON is not implemented; this spec defines the schema only",
+    "NO_COST_LEDGER_TOOL: The geoai_task_cost_ledger tool for unified cost aggregation across launch log + taskctl usage is not implemented",
+    "NO_OWNER_DELIVERY_CHANNEL: Per B277 blocker 1, no email/Slack/desktop-notify target exists for stale/failure notifications",
+    "NO_TRUE_PUSH: Per B277 section_3 honest framing, all detection is pull-based (agent loop calls completion_inbox); no inotify/DB-trigger/daemon exists",
+    "NO_ARTIFACT_BODY_READ: Per B277 blocker 2, this spec operates on task-card metadata only, never artifact file contents"
+  ],
+  "neural_bridge_note": "This spec introduces no learned decision authority and no regex/keyword cue router. The queue_flow state machine is a deterministic support-boundary mapping: each transition is triggered by an already-defined event (auto_pickup, taskctl review, stale timeout, gate check, collision_guard output). The 9 states and 12 transitions are a formalization of the existing taskctl lifecycle + B276/B277 protocols. If a future task teaches a controller to PRIORITIZE which task to launch next or SELECT which adapter to use, that becomes a neural curriculum target per neural_bridge_priority (see mcp_neural_launch_routing_migration_b254_v1); this task only defines the deterministic state machine it would operate within.",
+  "files_written": [
+    "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh"
+  ],
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "do_not_mark_done": true
+}

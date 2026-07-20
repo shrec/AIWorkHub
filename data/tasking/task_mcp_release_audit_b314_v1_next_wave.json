@@ -1,0 +1,113 @@
+{
+  "audit_version": 2,
+  "generated_at": "2026-07-10T00:00:00Z",
+  "generated_by": "deepseek_task_mcp_release_audit_b314",
+  "next_wave_tasks": [
+    {
+      "allowed_writes": [
+        "tools/geoai-task-mcp/data/review/task_mcp_residual_risk_register_b318_v1.json"
+      ],
+      "blocks_release": false,
+      "objective": "Document and track 8 residual_risk findings (F005, F006, F010, F012-F017): create a risk register with acceptance rationale, monitoring triggers, and conditions that would escalate each risk.",
+      "parent_finding_ids": [
+        "B314_F005",
+        "B314_F006",
+        "B314_F010",
+        "B314_F012",
+        "B314_F013",
+        "B314_F014",
+        "B314_F015",
+        "B314_F016",
+        "B314_F017"
+      ],
+      "priority": "normal",
+      "proposed_task_id": "DEEPSEEK_TASK_MCP_RESIDUAL_RISK_REGISTER_B318_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b314_v1.json",
+        "tools/geoai-task-mcp/data/review/task_mcp_release_audit_b314_v1_rows.jsonl"
+      ],
+      "runner_prefix": "deepseek_task_mcp_",
+      "topic": "task_mcp"
+    },
+    {
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      ],
+      "blocks_release": false,
+      "objective": "Address B314_F010: replace daemon=True monitor threads with non-daemon threads + shutdown event, or add atexit handler to signal live processes before exit.",
+      "parent_finding_ids": [
+        "B314_F010"
+      ],
+      "priority": "low",
+      "proposed_task_id": "DEEPSEEK_TASK_MCP_DAEMON_THREAD_HARDEN_B319_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      ],
+      "runner_prefix": "deepseek_task_mcp_",
+      "topic": "task_mcp"
+    },
+    {
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      ],
+      "blocks_release": false,
+      "objective": "Address B314_F014: buffer usage records for replay when write gate reopens, preventing silent loss of token accounting data.",
+      "parent_finding_ids": [
+        "B314_F014"
+      ],
+      "priority": "low",
+      "proposed_task_id": "DEEPSEEK_TASK_MCP_USAGE_BUFFER_REPLAY_B320_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      ],
+      "runner_prefix": "deepseek_task_mcp_",
+      "topic": "task_mcp"
+    },
+    {
+      "allowed_writes": [
+        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b321_v1.json",
+        "tools/geoai-task-mcp/data/review/task_mcp_release_audit_b321_v1_rows.jsonl"
+      ],
+      "blocks_release": false,
+      "objective": "Re-audit after B318 register created; confirm all residual risks are documented and monitored. Verify no new findings introduced by residual risk remediation.",
+      "parent_finding_ids": [],
+      "priority": "normal",
+      "proposed_task_id": "DEEPSEEK_TASK_MCP_REAUDIT_POST_RESIDUAL_B321_V1",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b314_v1.json",
+        "tools/geoai-task-mcp/data/review/task_mcp_residual_risk_register_b318_v1.json"
+      ],
+      "runner_prefix": "deepseek_task_mcp_",
+      "topic": "task_mcp"
+    }
+  ],
+  "parent_audit_verdict": "CONDITIONAL_PASS",
+  "prior_rejection_notes": {
+    "fix_applied": "Replaced with pre/post sha256 hashes of ONLY auditor allowed_writes files. No attribution of other workers' dirty files.",
+    "prior_next_wave_tasks_removed": [
+      "DEEPSEEK_TASK_MCP_SECRET_INHERITANCE_FIX_B315_V1 (F001/F003 already fixed in HEAD)",
+      "DEEPSEEK_TASK_MCP_COORDINATOR_TOKEN_LATE_BIND_B316_V1 (F002 already fixed in HEAD)",
+      "DEEPSEEK_TASK_MCP_REPAIR_BATCH_1_B317_V1 (F004/F007/F008/F009 already fixed; F005/F006/F010 accepted as residual; F011 improved)",
+      "DEEPSEEK_TASK_MCP_REAUDIT_POST_FIX_B319_V1 (no fixes needed, this v2 audit replaces)"
+    ],
+    "rejected_test": "Test 7 (global git diff attribution)"
+  },
+  "reason_for_change": "All 3 release_blocking findings (F001, F002, F003) resolved in HEAD commit 8b56f1f88. Zero active repair_required findings remain.",
+  "release_gate_status": {
+    "active_blockers": [],
+    "blockers_resolved": [
+      "B314_F001",
+      "B314_F002",
+      "B314_F003"
+    ],
+    "current": "CONDITIONAL_PASS",
+    "estimated_tasks_to_full_green": 0,
+    "minimum_path_remaining": [],
+    "note": "All release_blocking findings resolved. 8 residual_risk findings accepted. Release gate is CONDITIONAL_PASS — proceed at coordinator discretion.",
+    "prior": "BLOCKED",
+    "residual_risks_accepted": 8
+  },
+  "schema_id": "geoai.task_mcp.next_wave.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_RELEASE_AUDIT_B314_V1",
+  "verdict_changed_from": "BLOCKED"
+}

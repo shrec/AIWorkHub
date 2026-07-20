@@ -1,0 +1,150 @@
+{
+  "schema_id": "geoai.task_mcp_callback_bridge_finish.v1",
+  "eval_id": "task_mcp_callback_bridge_finish_b384_v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_BRIDGE_FINISH_B384_V1",
+  "date": "2026-07-15",
+  "verdict": "CANDIDATE_READY_FOR_CODEX_TRUSTED_HOST_REVIEW",
+  "summary": "Retry after OAuth refresh. Reconciled this worktree's pre-existing origin-thread/outbox groundwork in AITools/taskdb.py + AITools/taskctl.py against the two retained sibling worktrees (17fbfa4e0396... second B376 candidate, and 2a9878e97b90... an earlier fuller B343 DeepSeek/live-output candidate). Discovered and fixed a broken import chain (dashboard.py/process_launcher.py imported a nonexistent geoai_task_mcp.deepseek_credentials module in THIS worktree, and runtime_adapters.py lacked the DeepSeek constants/app-server command builder both callers already referenced) that would have failed collection on every listed test file. Implemented the missing callback_bridge.py App Server client from scratch against the real installed Codex 0.144.1 wire protocol (verified byte-for-byte via the coordinator-supplied SHA256 hashes of ClientRequest.json/ServerNotification.json found at /tmp/geoai-codex-app-server-schema/): no top-level jsonrpc member, initialize.params.clientInfo required, thread/resume.params.threadId required, turn/start.params.{threadId,input[]} required with optional cwd/clientUserMessageId, turn/completed arrives as an un-ided notification correlated by threadId. Added a real fake-executable App Server subprocess test harness and a proper assert-based pytest suite (the two retained candidates' test_callback_bridge.py used a print/counter PASS-FAIL pattern that pytest would silently report all-green regardless of internal failures -- replaced with real asserts). Implemented the two 'Focused review repair' items: episode-scoped outbox dedup (UNIQUE now includes episode_id, sourced from a new card claim_epoch counter bumped on every successful claim-start) with a fail-closed idempotent table-rebuild migration for pre-existing 3-column-UNIQUE databases, and an atomic pre-delivery supersede check in claim_pending_callback (a pending/inflight entry whose task is no longer in the matching review/blocked terminal state is marked superseded and never handed to the bridge). Fixed the legacy/default recover-stale path to route to blocked+terminal_outcome+outbox wake instead of silently requeuing to pending, and extended reject-review to also reclaim a blocked task (not only review), since blocked tasks had no other path back to pending. Updated the two now-stale exact-claim tests whose assertions predated the coordinator-review-first release-launch semantics.",
+  "read_first_reconciliation": {
+    "retained_b376_candidate": "/tmp/geoai-task-mcp-worktrees/17fbfa4e039640959385d427c378c72e/worktree -- has callback_bridge.py + test_callback_bridge.py but (a) used raw JSON-RPC 2.0 framing with a top-level jsonrpc member and no cwd on turn/start (violates the exact wire spec given in this task's coordinator context), (b) its test file's PASS/FAIL is a print/global-counter pattern pytest cannot see -- collected as all-green even when internally failed, (c) missing _fake_app_server.py entirely, (d) also has the broken deepseek_credentials import (not this task's root cause, pre-existing upstream).",
+    "earlier_b343_candidate_2a9878e9": "/tmp/geoai-task-mcp-worktrees/2a9878e97b904d5aa8102b03465c6337/worktree -- has a working deepseek_credentials.py + the matching runtime_adapters.py DeepSeek constants/argv branch (DEEPSEEK_COPILOT_ADAPTER, resolve_deepseek_model, DEEPSEEK_SECRET_ENV_VAR) that THIS worktree's process_launcher.py already imports but runtime_adapters.py never defined. Ported byte-compatible: copied deepseek_credentials.py verbatim, merged the DeepSeek constants/argv branch into this worktree's runtime_adapters.py alongside its own (this worktree's) build_codex_app_server_command/validate_app_server_command additions -- neither candidate had both pieces at once.",
+    "outcome": "No blind overwrite: every reconciled file was diffed against both siblings first; only the specific missing/incompatible symbols were merged, never a whole-file replace."
+  },
+  "protocol_verification": {
+    "schema_source": "/tmp/geoai-codex-app-server-schema/{ClientRequest.json,ServerNotification.json,JSONRPCRequest.json,JSONRPCNotification.json,JSONRPCResponse.json,JSONRPCError.json,ClientNotification.json}",
+    "sha256_verified": {
+      "ClientRequest.json": "5bae99085b24b4865694f23047f9ef6f36d414d72391b0a7c36e93ffff714cc2 -- MATCHES coordinator-supplied hash",
+      "ServerNotification.json": "899cbd9cabc67a675babb78c3eac113080ea38fc4f6cce3bc2ddad4dbd8040c1 -- MATCHES coordinator-supplied hash"
+    },
+    "findings_applied": [
+      "JSONRPCRequest/JSONRPCNotification/JSONRPCResponse/JSONRPCError each require only id/method/params or id/result or id/error -- NO 'jsonrpc' field in the schema at all; callback_bridge.py never sends one.",
+      "InitializeParams requires only clientInfo (name+version); capabilities optional -- no protocolVersion field in the schema, so it is omitted from the built request.",
+      "ThreadResumeParams requires threadId; cwd is optional.",
+      "TurnStartParams requires threadId+input (input is an ARRAY of UserInput, e.g. [{type:'text', text:...}], not a bare object); cwd and clientUserMessageId are optional.",
+      "ClientNotification 'initialized' requires only 'method' -- no params key at all for that variant; callback_bridge.py sends {\"method\": \"initialized\"} with no params.",
+      "turn/completed is a ServerNotification (method+params{threadId,turn}, no request id) -- correlated by threadId, not by the original turn/start request id."
+    ]
+  },
+  "changed_paths": {
+    "core_new": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+      "tools/geoai-task-mcp/tests/_fake_app_server.py",
+      "tools/geoai-task-mcp/tests/test_callback_bridge.py"
+    ],
+    "reconciled_from_sibling_worktrees": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/deepseek_credentials.py (copied from the 2a9878e9 sibling verbatim; self-contained, compatible with this worktree's runtime_adapters.py after the merge below)"
+    ],
+    "modified": [
+      "AITools/taskdb.py",
+      "AITools/taskctl.py",
+      "AITools/test_taskctl_exact_claim_start_mcp.py",
+      "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+      "tools/geoai-task-mcp/pyproject.toml"
+    ],
+    "untouched_task_cards": [
+      "AITools/test_taskctl_origin_thread_callback_b366_v1.py (already correct, ran as-is, 12/12 pass)"
+    ]
+  },
+  "fix_detail": {
+    "callback_bridge_py": [
+      "AppServerClient: initialize/send_initialized/thread_resume/turn_start, no jsonrpc member, cwd on turn_start defaults to /home/shrek/GeoAI, deterministic_client_user_message_id() (sha256-derived, stable per task+transition+thread+episode -- a bridge restart mid-delivery reissues the identical id).",
+      "BusyThreadError subclass of AppServerError raised on a 'busy' thread/resume error -- deferral path never starts a parallel turn.",
+      "CallbackBridge wraps AITools/taskdb.py's outbox primitives directly (claim_pending_callback/mark_callback_delivered/mark_callback_dead_letter/requeue_callback/callback_outbox_stats) so the bridge and taskctl never disagree about outbox state; run_once/daemon/status/dry_run CLI commands.",
+      "build_app_server_command/AppServerClient executable accepts either a single binary string or an argv-prefix list ([sys.executable, path]) so tests can spawn the fake server without relying on the executable bit (chmod is denied in this sandbox)."
+    ],
+    "fake_app_server_py": [
+      "Real subprocess (spawned via Popen, never a mocked subprocess.run returncode). Enforces initialize->initialized->thread/resume->turn/start sequence; rejects out-of-order/missing steps with a JSON-RPC-shaped error. --busy and --crash-after flags for the deferral/crash-recovery tests."
+    ],
+    "taskdb_py_episode_and_supersede": [
+      "callback_outbox gains episode_id column; UNIQUE constraint is now (task_id, transition, origin_thread_id, episode_id) instead of a task-lifetime-scoped 3-column key.",
+      "_migrate_callback_outbox_add_episode_column(): idempotent, fail-closed (BEGIN IMMEDIATE + rollback-on-exception) table rebuild for a pre-existing 3-column-UNIQUE table; preserves all rows at episode_id='0'.",
+      "current_claim_episode(conn, task_id) reads card.claim_epoch (new in taskctl.py, see below); enqueue_callback/maybe_enqueue_callback resolve and store it.",
+      "claim_pending_callback() now loops: reclaims expired leases, then for each candidate pending row checks _task_still_in_matching_terminal_state() (transition=='blocked' requires current canonical_status=='blocked'; every other eligible transition requires 'review', matching cmd_release_launch's own target_status mapping) -- a stale row is atomically marked 'superseded' (new 5th outbox state) and the loop continues to the next row, so a superseded entry is never handed to the bridge and never launches Codex."
+    ],
+    "taskctl_py": [
+      "_atomic_claim_task(): every successful claim increments card.claim_epoch (starts unset/0, becomes 1 on first claim) -- this is the episode boundary the outbox dedup keys off.",
+      "cmd_reject_review(): now accepts status in {review, blocked} (previously review-only) and clears terminal_outcome on reclaim, so a blocked task (e.g. the B383 promotion_conflict case) is not stranded forever -- pending remains reachable ONLY through this explicit Codex decision.",
+      "cmd_recover_stale() legacy/default path (no --owner-confirm): now routes to status=blocked with terminal_outcome=blocked and an outbox wake (via maybe_enqueue_callback) instead of silently requeuing straight to pending -- coordinator-review-first, matching cmd_release_launch's own pattern. The --owner-confirm TTL-gated path is unchanged (out of this task's explicit scope: 'the legacy/default recover-stale path')."
+    ],
+    "broken_import_chain_fixed": [
+      "dashboard.py imported geoai_task_mcp.deepseek_credentials, which did not exist anywhere in this worktree (confirmed also missing in the retained 17fbfa4e sibling -- a pre-existing cross-candidate bug, not something either B376 attempt introduced). process_launcher.py imports the same module for CredentialError/load_credential. Both are now satisfied by the ported deepseek_credentials.py.",
+      "runtime_adapters.py lacked DEEPSEEK_COPILOT_ADAPTER/DEEPSEEK_SUPPORTED_MODELS/DEEPSEEK_DEFAULT_MODEL/DEEPSEEK_SECRET_ENV_VAR/resolve_deepseek_model/the deepseek_copilot_cli argv branch that process_launcher.py's _resolve_provider_env already referenced -- merged in from the 2a9878e9 sibling, alongside build_codex_app_server_command/validate_app_server_command (which that sibling never had, since it predates the callback-bridge work).",
+      "core.py lacked callback_outbox_status() (dashboard.py already called it) -- added, mirroring the existing collision_guard()/usage_report() run_taskctl() pattern.",
+      "pyproject.toml [project.scripts] was missing geoai-task-callback-bridge and geoai-task-deepseek-credential entry points documented in README.md -- added."
+    ]
+  },
+  "tests": {
+    "new_files": [
+      "tools/geoai-task-mcp/tests/_fake_app_server.py (harness, not itself a test file)",
+      "tools/geoai-task-mcp/tests/test_callback_bridge.py -- 28 real assert-based pytest cases (wire sequence, no-jsonrpc-member, busy/crash/missing-step rejection, prompt injection resistance, deterministic clientUserMessageId, dry-run canary safety, end-to-end run_once against the fake server, zero-launch idle/backlog-supersede proof, redaction)"
+    ],
+    "new_cases_in_b384_regression_file": [
+      "test_claim_pending_callback_supersedes_stale_entry_when_task_no_longer_matches",
+      "test_claim_pending_callback_delivers_when_task_still_matches",
+      "test_reject_review_reclaim_then_same_transition_enqueues_new_wake",
+      "test_reject_review_reclaims_a_blocked_task_not_only_review",
+      "test_recover_stale_routes_to_blocked_not_pending",
+      "test_migration_upgrades_pre_episode_outbox_table_idempotently"
+    ],
+    "updated_stale_tests": [
+      "AITools/test_taskctl_exact_claim_start_mcp.py::test_release_launch_is_exact_and_idempotent -- now asserts status=='blocked' (not 'pending') for an unmapped release reason, and reclaims via reject-review before the final claim-start (pending is no longer directly reachable from release-launch).",
+      "AITools/test_taskctl_exact_claim_start_mcp.py::test_coordinator_transition_races_are_serialized -- release-launch race case now asserts status=='blocked' and the 'blocked' (not 'unclaimed') task_event name."
+    ],
+    "validation_command": "/home/shrek/GeoAI/.venv/bin/python -m pytest -q AITools/test_taskctl_exact_claim_start_mcp.py AITools/test_taskctl_origin_thread_callback_b366_v1.py AITools/test_taskctl_origin_thread_callback_b384_v1.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_runtime_adapters.py tools/geoai-task-mcp/tests/test_dashboard.py tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_process_launcher_security.py tools/geoai-task-mcp/tests/test_server_runtime_wiring.py",
+    "result": "121 passed, 30 failed, 5 errors",
+    "failure_classification": "ALL 35 failed/error cases are the documented outer-sandbox limitation: PermissionError on os.chmod/os.fchmod of a freshly-created 0600 token/log file, or 'git init' failing with 'chmod on .git/config.lock failed: Operation not permitted'. Verified by grepping the full failure log: 0 of the 35 failure blocks lack a PermissionError/chmod/'Operation not permitted' string. These are host-only security tests genuinely blocked by this worker sandbox's seccomp denial of chmod/fchmod/git-init (matches AGENTS.md/this task's own acceptance note); none are logic regressions from this change. Per-file breakdown: test_taskctl_exact_claim_start_mcp.py 11/13 blocked (chmod on coordinator.token in _make_env, present before this task and unrelated to this diff), test_runtime_adapters.py 6/? blocked (chmod on a synthetic 'claude'/'codex' fixture executable), test_process_launcher.py 9 blocked (os.fchmod on a process log file, process_launcher.py:429), test_process_launcher_security.py 5 blocked at fixture setup ('git init -q' inside the sandbox), test_server_runtime_wiring.py 2 blocked (chmod on coordinator.token).",
+    "fully_green_files": [
+      "AITools/test_taskctl_origin_thread_callback_b366_v1.py: 12/12 passed",
+      "AITools/test_taskctl_origin_thread_callback_b384_v1.py: 26/26 passed (20 pre-existing + 6 new)",
+      "tools/geoai-task-mcp/tests/test_callback_bridge.py: 28/28 passed",
+      "tools/geoai-task-mcp/tests/test_dashboard.py: fully passed (no chmod dependency in this file)"
+    ],
+    "stdio_smoke": {
+      "command": "bash tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "result": "PASS -- no direct launch/exec/shell primitive, real stdio transport, no shell=True"
+    },
+    "taskctl_verify": {
+      "command": "python3 AITools/taskctl.py verify",
+      "result": "VERIFY: PASS"
+    },
+    "collision_guard": {
+      "command": "python3 AITools/taskctl.py collision-guard",
+      "result": "collision_free=true -- no overlapping allowed_writes (99 active cards)"
+    },
+    "dashboard_end_to_end_smoke": {
+      "description": "Direct in-process dashboard.build_snapshot() call against this worktree's own isolated queue DB (no HTTP server started).",
+      "result": "0 provider errors; callback_bridge_health and adapter_readiness both populated (callback_bridge_health: 20 threads_bound, 3 pending outbox entries auto-enqueued by this session's own verify/collision-guard/callback-outbox-status runs against already-review/blocked bound cards; adapter_readiness.ok=true)."
+    }
+  },
+  "canary": {
+    "description": "Disposable, safe-anywhere dry-run against the real fake executable App Server -- never starts a real codex process, never sends a real turn. Matches the exact command already published in MVP_ROADMAP.md's 'Callback bridge canary plan' section.",
+    "command_run": "python3 -c \"import sys; sys.path.insert(0,'tools/geoai-task-mcp/src'); from geoai_task_mcp.callback_bridge import CallbackBridge; b=CallbackBridge(repo='.', executable=[sys.executable,'tools/geoai-task-mcp/tests/_fake_app_server.py']); print(b.dry_run('SOME_TASK_ID','review_ready'))\"",
+    "result": "{'ok': True, 'command': [...,'app-server','--listen','stdio://'], 'prompt': 'Task MCP callback: task_id=SOME_TASK_ID state=review_ready ...', 'rejected_flags_absent': True}",
+    "real_owner_thread_callback_sent": false,
+    "live_enable_command_for_codex_after_review": "geoai-task-callback-bridge --executable codex daemon"
+  },
+  "forbidden_checks": {
+    "codex_thread_status_cli": "never called or emulated anywhere in callback_bridge.py/_fake_app_server.py/test_callback_bridge.py",
+    "codex_exec_rejected_thread_flags": "build_app_server_command/build_codex_app_server_command never include --thread-id/--client-id/--no-remote; validate_app_server_command explicitly rejects them; test_production_command_contains_app_server_and_no_rejected_flags asserts this",
+    "worker_output_in_callback_prompt": "build_callback_prompt's signature is exactly (task_id, state, event_id, request_id) -- structurally cannot accept worker output/logs/errors; test_callback_prompt_never_interpolates_worker_output asserts the signature directly",
+    "full_thread_id_in_worker_contract_dashboard_log_or_artifact": "redacted_thread_suffix() used everywhere a thread id is surfaced (health(), dry_run(), run_once() result); test_health_never_exposes_full_thread_id and test_outbox_stats_never_exposes_full_thread_id assert this",
+    "secret_in_argv_log_card_dashboard_or_artifact": "no change to the existing DeepSeek credential env-only delivery path (ported unmodified from the 2a9878e9 sibling)",
+    "shell_true": "no subprocess call anywhere in this diff passes shell=True (AppServerClient.start() uses subprocess.Popen with a list argv, shell=False explicit)",
+    "real_owner_thread_callback_during_worker_execution": "never invoked -- only the fake-server dry-run canary above was run",
+    "taskctl_done_by_worker": "not called",
+    "git_commit_add_A_add_dot": "none performed"
+  },
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "callback_live_authority": false
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "worker_status_recommendation": "review -- request taskctl review; Codex owns trusted-host full-suite replay (chmod/git-init-dependent cases will pass there), live canary, and daemon enablement."
+}

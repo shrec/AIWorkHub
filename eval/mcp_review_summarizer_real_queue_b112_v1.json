@@ -1,0 +1,76 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_real_queue_integration_eval.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1",
+  "timestamp": "2026-07-04T22:15:00+00:00",
+  "verdict": "PASS",
+  "runner": "deepseek_task_mcp_review_summarizer_b112",
+  "topic": "task_mcp",
+  "mode": "mcp_review_summarizer_real_queue_integration_readonly",
+  "objective": "Run a real non-stubbed MCP integration test for geoai_task_review_summarize against taskctl review queue behavior, preserving read-only/no-launch/no-queue-mutation invariants.",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_real_queue_b112_v1.sh",
+  "test_source": "tools/geoai-task-mcp/tests/mcp_review_summarizer_real_queue_integration.py",
+  "test_result": "ALL TESTS PASSED (1 warning)",
+  "test_exit_code": 0,
+  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "server_module": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+  "acceptance_results": {
+    "real_mcp_tool_path": "PASS — summarizer called without _run_taskctl/_show_task stub injection; uses real core.run_taskctl / core.show_task; server tool geoai_task_review_summarize also exercised",
+    "queue_unchanged": "PASS — live taskctl review-queue output byte-identical (SHA256 match) before/after summarizer call",
+    "empty_queue_supported": "PASS — empty review queue returns task_count=0, empty grouped_tasks, empty checklist (stub-injected case)",
+    "fixture_queue_supported": "PASS — non-empty stubbed fixture (2 tasks) returns correct grouped tasks by topic/runner and full checklist with all required fields",
+    "write_gate_default_off": "PASS — GEOAI_TASK_MCP_ALLOW_WRITES=0 throughout; all 8 authority flags confirmed correct (readonly=True, process_launch=False, agent_launch=False, shell_invocation=False, queue_write=False, audit_write=False, subprocess_launch_tripwire_zero=True, write_gate_enabled=True)",
+    "process_launch_authority_false": "PASS — process_launch and agent_launch flags both false",
+    "test_passes": "PASS — bash test exits 0, 11 test sections all green",
+    "verify_passes": "PASS — python3 AITools/taskctl.py verify exits 0"
+  },
+  "findings": [
+    {
+      "severity": "warning",
+      "id": "B112_REGEX_DESCRIPTION_SUFFIX",
+      "summary": "review_summarizer._REVIEW_LINE_RE uses `$` anchor which rejects real-queue lines that have ' — description' suffix after task_id. Real-queue parsing returns task_count=0 even when queue is non-empty.",
+      "fix": "Remove `$` from _REVIEW_LINE_RE or make suffix-tolerant (e.g., allow optional ' — .*' after task_id).",
+      "blocked_by": "review_summarizer.py not in B112 allowed_writes"
+    },
+    {
+      "severity": "warning",
+      "id": "B112_EMPTY_FETCH_ERRORS_ABSENT",
+      "summary": "Empty-queue early-return path in summarize_review_queue() omits `fetch_errors` field. Schema contract (B111) lists fetch_errors as required output field.",
+      "fix": "Add `'fetch_errors': []` to the empty-queue early-return dict.",
+      "blocked_by": "review_summarizer.py not in B112 allowed_writes"
+    }
+  ],
+  "authority_flags": {
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false,
+    "write_gate_default_off": true
+  },
+  "forbidden_operations_verified": [
+    "live_queue_mutation — confirmed: queue byte-identical before/after",
+    "agent_launch — confirmed: process_launch flag false",
+    "model_launch — confirmed: no model process spawned",
+    "write_gate_enable — confirmed: GEOAI_TASK_MCP_ALLOW_WRITES=0"
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER": true,
+    "REAL_TASKCTL_NO_STUBS": true,
+    "SUBPROCESS_LAUNCH_TRIPWIRE_ZERO": true
+  },
+  "test_cases_executed": 11,
+  "test_cases_passed": 11,
+  "warnings": 1,
+  "failures": 0,
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1",
+  "recommended_followup": "B112_FIX task to fix regex `$` anchor and empty-queue fetch_errors omission in review_summarizer.py"
+}

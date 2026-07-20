@@ -1,0 +1,44 @@
+{
+  "schema_id": "geoai.codex_coordinator_review.task_mcp_zero_row_required_output.b536.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_ZERO_ROW_REQUIRED_OUTPUT_B536_V1",
+  "reviewed_at": "2026-07-17T14:16:00Z",
+  "reviewer": "codex_coordinator",
+  "verdict": "ACCEPT_WITH_ONE_FAIL_CLOSED_COORDINATOR_CORRECTION",
+  "terminal_validation_failure": {
+    "worker_exit_code": 0,
+    "implementation_completed": true,
+    "launcher_error": "validation_failed:.venv/bin/python3 ... No such file or directory",
+    "interpretation": "The isolated worktree intentionally has no repository .venv. The five retained in-scope paths were hash-guard promoted and validated from the parent environment; no model rerun was performed."
+  },
+  "accepted_contract": {
+    "card_field": "allow_empty_required_outputs",
+    "default_zero_byte_rejection_unchanged": true,
+    "exact_repo_relative_path_only": true,
+    "required_outputs_and_allowed_writes_subset_required": true,
+    "snapshotted_into_request_metadata": true,
+    "mutable_card_not_reread_at_finalize": true,
+    "missing_symlink_nonfile_undeclared_zero_unchanged_rejected": true,
+    "permitted_zero_in_audit_records": true,
+    "promotion_scope_and_hash_guards_unchanged": true
+  },
+  "coordinator_correction": {
+    "issue": "The worker initially allowed allow_empty_required_outputs to be present when required_outputs was absent.",
+    "fix": "Launch now fails closed with allow_empty_required_outputs_requires_required_outputs.",
+    "test_added": "test_allow_empty_without_required_outputs_rejected"
+  },
+  "verification": {
+    "focused_tests": "27/27 PASS",
+    "existing_project_context_and_required_output_tests": "8/8 PASS",
+    "python_compile": "PASS",
+    "json_validation": "PASS",
+    "diff_check": "PASS"
+  },
+  "scope": {
+    "callback_routing_changed": false,
+    "queue_state_changed": false,
+    "dashboard_changed": false,
+    "adapter_or_credentials_changed": false,
+    "domain_manifest_parsing_added": false
+  },
+  "operational_result": "Future tasks may explicitly declare an honest-zero required JSONL without receiving required_output_zero_bytes; undeclared empty outputs still fail closed."
+}

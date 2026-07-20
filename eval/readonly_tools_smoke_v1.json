@@ -1,0 +1,71 @@
+{
+  "schema_id": "geoai.readonly_tools_smoke.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_READONLY_TOOL_SMOKE_V1",
+  "timestamp": "2026-07-04T09:00:00+00:00",
+  "verdict": "PENDING_TEST",
+  "runner": "deepseek_task_mcp_readonly_smoke_v1",
+  "topic": "task_mcp",
+  "test_harness": "tools/geoai-task-mcp/tests/test_readonly_tools_smoke_v1.sh",
+  "test_source": "tools/geoai-task-mcp/tests/readonly_tools_smoke.py",
+  "test_targets": {
+    "health": {
+      "description": "health endpoint with ALLOW_WRITES=0",
+      "expected": "ok=True, writes_allowed=False, verify.returncode==0"
+    },
+    "review_queue": {
+      "description": "review_queue read-only access",
+      "expected": "returncode==0, stdout present"
+    },
+    "list_tasks": {
+      "description": "list by status pending/all",
+      "expected": "returncode==0 for both variants"
+    },
+    "show_task": {
+      "description": "show single task card",
+      "expected": "returncode==0, task_id in stdout"
+    },
+    "pending_for_runner": {
+      "description": "export pending for runner",
+      "expected": "returncode==0, jsonl_rows key present"
+    },
+    "collision_guard": {
+      "description": "collision guard with --print",
+      "expected": "returncode==0, collision info in stdout"
+    },
+    "usage_report": {
+      "description": "usage report with and without filter",
+      "expected": "returncode==0 for both variants"
+    },
+    "auto_pickup_blocked": {
+      "description": "write-gated auto_pickup blocked",
+      "expected": "returncode==126, stderr has 'write command blocked'"
+    },
+    "mark_review_blocked": {
+      "description": "write-gated mark_review blocked",
+      "expected": "returncode==126"
+    },
+    "mark_done_blocked": {
+      "description": "write-gated mark_done blocked",
+      "expected": "returncode==126"
+    },
+    "export_jsonl_blocked": {
+      "description": "write-gated export_jsonl blocked",
+      "expected": "returncode==126"
+    },
+    "parent_queue_intact": {
+      "description": "taskctl verify still passes after all read-only calls",
+      "expected": "returncode==0, no parent queue mutations"
+    }
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "forbidden_operations": [
+    "parent_task_system_migration",
+    "runtime_switch_to_mcp",
+    "write_gate_disable",
+    "agent_launch_enable_default"
+  ]
+}

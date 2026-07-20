@@ -1,0 +1,125 @@
+{
+  "eval_id": "task_mcp_owner_notification_smoke_pytest_b279_v1",
+  "task_id": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_PYTEST_B279_V1",
+  "runner": "claude_task_mcp_notify_pytest_b279",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "owner_notification_smoke_pytest_no_launch",
+  "verdict": "PASS",
+  "no_external_paid_model_launched": true,
+  "no_subprocess_model_launch": true,
+  "no_live_sqlite_writes": true,
+  "completion_inbox_py_modified": false,
+  "core_py_modified": false,
+  "context7_usage": {
+    "context7_used": false,
+    "context7_unavailable": false,
+    "reason": "Pure repo-local task: converting an already-frozen local JSON spec (B278) into pytest test functions against two already-read local modules (completion_inbox.py, core.py). pytest itself is a well-known stdlib-adjacent test runner already vendored in this environment (verified `python3 -c 'import pytest'` -> 9.0.3); no new external library/API/CLI/service question was open."
+  },
+  "builds_on": [
+    "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_SPEC_B278_V1 (task_mcp_owner_notification_smoke_spec_b278_v1.json -- 6 scenarios + 2 edge cases, spec-only, no code changes)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py (READ-ONLY: build_completion_inbox, _runner_task_batch_mismatch, _authority_flags -- unmodified)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (READ-ONLY: list_tasks, show_task, usage_report, WRITE_COMMANDS, run_taskctl -- unmodified)",
+    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh (precedent for _list_tasks/_show_task fixture-injection pattern, reused here as real pytest functions instead of a heredoc script)"
+  ],
+  "summary": "Turns the B278 spec's 6 scenarios + 2 edge cases into 12 executable pytest test functions (11 pass, 1 strict-xfail) in tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py. Every scenario calls the REAL completion_inbox.build_completion_inbox / completion_inbox._runner_task_batch_mismatch / core.usage_report / core.list_tasks against fixture-injected _list_tasks/_show_task callables or a pytest-monkeypatched core.subprocess.run -- no real taskctl subprocess is ever launched, no live task_queue_v1.sqlite read/write occurs, no model/agent CLI is spawned anywhere in this file. Neither completion_inbox.py nor core.py was edited.",
+  "known_indexer_gap_used": {
+    "gap": "bug.tools_geoai_task_mcp_not_indexed (AI Memory KB, ACTIVE since 2026-07-05)",
+    "workaround": "Direct Read tool used on completion_inbox.py and core.py (both explicit read_first paths) after confirming source_graph.py/cgraph.py/source_graph_universal.py all return 0 hits for tools/geoai-task-mcp/ even post build -i -- same documented workaround as prior task_mcp workers, not a new grep-ban violation."
+  },
+  "test_functions": {
+    "count": 12,
+    "pass": 11,
+    "xfail": 1,
+    "fail": 0,
+    "file": "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+    "names": [
+      "test_scenario_completion",
+      "test_scenario_blocked",
+      "test_scenario_duplicate_runner",
+      "test_edge_case_duplicate_runner_cross_reference",
+      "test_scenario_stale",
+      "test_scenario_usage",
+      "test_scenario_tool_error_current_raises_uncaught",
+      "test_scenario_tool_error_list_failure_silently_swallowed",
+      "test_scenario_tool_error_show_failure_is_recorded",
+      "test_scenario_tool_error_graceful_degrade_desired_future_contract [XFAIL strict=True]",
+      "test_edge_case_no_pending_task",
+      "test_completion_inbox_authority_flags_never_grant_write_or_launch"
+    ]
+  },
+  "tool_error_evidence": {
+    "rule_applied": "worker_low_token_protocol_v1.json proof_artifact_required_rule + this task's acceptance 'honestly record tool_error current behavior as pass/xfail/fail evidence'",
+    "finding_1_subprocess_raises_uncaught": {
+      "verdict": "PASS (documents current gap)",
+      "mechanism": "core.subprocess.run monkeypatched to raise OSError; core.list_tasks propagates it uncaught (run_taskctl has no try/except around subprocess.run)",
+      "test": "test_scenario_tool_error_current_raises_uncaught"
+    },
+    "finding_2_list_failure_silently_swallowed": {
+      "verdict": "PASS (documents a STRICTER gap than 'uncaught exception')",
+      "mechanism": "when the LIST-call taskctl subprocess returns (does not raise) with returncode=1 and empty stdout, _fetch_full_cards never checks the LIST result's returncode -- empty stdout parses to zero rows, fetch_errors stays 0. A read-source outage is indistinguishable from a genuinely empty queue.",
+      "test": "test_scenario_tool_error_list_failure_silently_swallowed"
+    },
+    "finding_3_show_failure_is_recorded": {
+      "verdict": "PASS (documents partial existing handling)",
+      "mechanism": "a SHOW-call failure (non-zero returncode) for a specific task_id IS already appended to fetch_errors -- this is the one piece of tool_error handling that exists today.",
+      "test": "test_scenario_tool_error_show_failure_is_recorded"
+    },
+    "finding_4_desired_future_contract": {
+      "verdict": "XFAIL strict=True (tracks the gap; flips to XPASS->hard-fail if someone silently 'fixes' this without updating the test, forcing the test to be revisited)",
+      "mechanism": "core.list_tasks should catch a subprocess-level failure and return a bounded {ok: False, ...} result instead of raising -- not implemented today.",
+      "test": "test_scenario_tool_error_graceful_degrade_desired_future_contract"
+    }
+  },
+  "field_shape_mismatches_documented": [
+    "scenario_completion: real code emits runner_task_batch_mismatch=None (JSON null) where B278 spec's literal fixture says false (JSON bool)",
+    "scenario_blocked: real code's latest_validation_facts entry uses key last_activity_at (sourced only from updated_at, no started_at/claimed_at fallback) and adds an extra lifecycle_state key; B278 envelope calls the timestamp field last_recorded_at and has no lifecycle_state key",
+    "scenario_stale: real code's stale_processing entry key is stale_hours; B278 envelope calls it hours_since_activity (values match, key names do not)",
+    "scenario_duplicate_runner: B278's abstract fixture (conflicting_runner_a/b, task_id_batch_token as bare ints) does not match how _runner_task_batch_mismatch actually works (batch tokens must be embedded IN the runner/task_id strings as _bNNN / _BNNN_ substrings, not passed as separate numeric fields); this task's test constructs a code-compatible fixture (FIXTURE_TASK_DUP_03_B278 / fixture_runner_c1_b277) instead of silently reinterpreting the spec's literal fixture",
+    "scenario_usage: core.usage_report() returns cmd_usage_report's human-readable TEXT report (verified: json.loads() raises JSONDecodeError on it), not the structured JSON payload (usage_input_tokens/usage_output_tokens/cost_usd) the B278 envelope expects for a usage event"
+  ],
+  "gates": {
+    "completion_inbox_py_not_modified": true,
+    "core_py_not_modified": true,
+    "no_subprocess_model_launch_anywhere": true,
+    "no_live_sqlite_write_anywhere": true,
+    "taskctl_subprocess_calls_monkeypatched_where_touched": true,
+    "six_scenarios_plus_two_edge_cases_covered_by_real_pytest_functions": true,
+    "tool_error_current_behavior_recorded_as_pass_xfail_fail": true,
+    "authority_flags_all_false": true,
+    "artifact_under_25mb": true,
+    "next_wave_blockers_explicit_no_overclaim": true,
+    "pytest_run_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "queue_write_apply": false,
+    "audit_write_apply": false,
+    "agent_or_process_launch_apply": false,
+    "notification_push_authority": false,
+    "cursor_persistence_write_apply": false,
+    "owner_delivery_channel_apply": false,
+    "training_launch": false
+  },
+  "neural_bridge_note": "No learned decision authority and no regex/keyword cue router introduced. All 12 test functions assert against ALREADY-DEFINED deterministic classifiers (completion_inbox.build_completion_inbox / _runner_task_batch_mismatch, core.usage_report / list_tasks) -- this is test/evidence code exercising an existing support-boundary/evidence-extraction layer, not a routing or intelligence decision. No new deterministic logic was added to production code (completion_inbox.py/core.py untouched); this task only adds test coverage.",
+  "files_changed": [
+    "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_pytest_b279_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_owner_notification_smoke_pytest_next_wave_b279_v1.json"
+  ],
+  "production_mcp_server_api_altered": false,
+  "tests_run": [
+    "python3 -m pytest tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py -> 11 passed, 1 xfailed, exit 0",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "do_not_mark_done": true
+}

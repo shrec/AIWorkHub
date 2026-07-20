@@ -1,0 +1,22 @@
+{
+  "canonical_bytes": 1729,
+  "canonical_sha256": "0d9362cdc58f6d4e1a07d68bdffdf29d10df961552b11c16c2290f5f5b6cda6d",
+  "projections": {
+    ".github/copilot-instructions.md": {
+      "bytes": 1859,
+      "canonical_sha256": "0d9362cdc58f6d4e1a07d68bdffdf29d10df961552b11c16c2290f5f5b6cda6d",
+      "sha256": "bf6c483936b6e6b455776216087fe0b8ef6c622b22e1b2b791d6cdeeaf384898"
+    },
+    "AGENTS.md": {
+      "bytes": 1837,
+      "canonical_sha256": "0d9362cdc58f6d4e1a07d68bdffdf29d10df961552b11c16c2290f5f5b6cda6d",
+      "sha256": "b1ed67a1aa89ee7ae8808654540400681f3eb9500c415b5d95c454b6d9632d33"
+    },
+    "CLAUDE.md": {
+      "bytes": 1837,
+      "canonical_sha256": "0d9362cdc58f6d4e1a07d68bdffdf29d10df961552b11c16c2290f5f5b6cda6d",
+      "sha256": "873d460eaaed42814c90cde8bc58958354837b667bd687f85fbb97ce849f5970"
+    }
+  },
+  "schema_id": "geoai.task_mcp.agent_tool_instruction_generator_b816_v2.eval.v1"
+}

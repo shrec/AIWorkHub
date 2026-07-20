@@ -1,0 +1,73 @@
+{
+  "next_wave_id": "mcp_readonly_tool_result_schema_freeze_next_wave_b109_v1",
+  "parent_task": "CLAUDE_TASK_MCP_READONLY_TOOL_RESULT_SCHEMA_FREEZE_B109_V1",
+  "date": "2026-07-04",
+  "status": "proposed_not_queued",
+  "enqueued": false,
+  "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B109 froze the OUTPUT contract of the 11 read-only geoai-task-mcp tools, complementing B108 (input-schema freeze). Over a REAL MCP ClientSession (initialize/tools_list/tools_call) with core.run_taskctl replaced by an in-process stub and a subprocess tripwire (launch_attempts=0), it snapshots a value->type SKELETON of every read-only tool's structuredContent result and byte-freezes its sha256; all leaf values (absolute/tmp paths, pids, timestamps, argv/command strings, env-dependent bools, ordering) are normalized to type tokens so the freeze is deterministic across runs AND across two independent client sessions. No queue/audit write with GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1 (byte-identical empty audit state dir). frozen_output_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. No process launch is enabled and none is proposed until the FINAL gated executor, behind ALL launch_preconditions plus ALLOW_LAUNCH=1 AND ALLOW_WRITES=1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_READONLY_ERROR_RESULT_SKELETON_FREEZE_B110_V1",
+      "status": "proposed_not_queued",
+      "goal": "Freeze the ERROR-path output contract of the read-only tools: drive each read-only tool with invalid/missing required args and with a backend stub that returns a nonzero taskctl returncode, then snapshot + byte-freeze the value->type skeleton of the error structuredContent (isError True path) exactly as B109 did for the success path. Ensures an accidental change to how failures are reported is also caught. Pure in-process, no launch, no write.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/mcp_readonly_error_result_skeleton_freeze.py",
+        "tools/geoai-task-mcp/tests/test_mcp_readonly_error_result_skeleton_freeze_b110_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_readonly_error_result_skeleton_freeze_b110_v1.json"
+      ],
+      "acceptance": [
+        "error structuredContent key/type skeleton frozen by fingerprint for every read-only tool",
+        "deterministic across runs; volatile values normalized to type tokens",
+        "read-only; mutates nothing; launches nothing (run_taskctl stubbed, launch tripwire = 0)"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1",
+      "status": "proposed_not_queued",
+      "goal": "Compose B108 (inputSchema) + B109 (structuredContent result skeleton) into ONE machine-readable contract-freeze manifest and a single shell gate that fails on ANY input-or-output drift for the read-only surface, so the two freezes cannot silently diverge. No new schema logic; a manifest + aggregator over the existing two evals. Read-only; no launch; no write.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/mcp_unified_contract_freeze_gate.py",
+        "tools/geoai-task-mcp/tests/test_mcp_unified_contract_freeze_gate_b110_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_unified_contract_freeze_manifest_b110_v1.json"
+      ],
+      "acceptance": [
+        "single manifest binds B108 input fingerprints + B109 result-skeleton fingerprints per tool",
+        "one gate fails on any input OR output contract drift",
+        "read-only; mutates nothing; launches nothing"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_READONLY_CONTENT_BLOCK_FREEZE_B110_V1",
+      "status": "proposed_not_queued",
+      "goal": "Freeze the non-structured content-block contract (CallToolResult.content: the text/JSON blocks a client without structuredContent support parses) for the read-only tools: snapshot the block type sequence + payload key/type skeleton and byte-freeze it, so clients relying on content (not structuredContent) are also drift-protected. Pure in-process, no launch, no write.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/mcp_readonly_content_block_freeze.py",
+        "tools/geoai-task-mcp/tests/test_mcp_readonly_content_block_freeze_b110_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_readonly_content_block_freeze_b110_v1.json"
+      ],
+      "acceptance": [
+        "content-block type sequence + payload skeleton frozen by fingerprint per read-only tool",
+        "deterministic across runs; volatile values normalized",
+        "read-only; mutates nothing; launches nothing"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+      "status": "proposed_not_queued",
+      "goal": "Produce trainable curriculum rows for a LEARNED adapter/runner/topic launch-routing + abstain policy that replaces the static allowlist SELECTION (not the safety boundary) with a neural router. The read-only client smoke + plan tool and the B108/B109 freezes become the evidence extractor / dry-run harness for the learned router. No cue/regex router introduced as launch authority.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+      ],
+      "acceptance": [
+        "curriculum rows define task->adapter/runner/topic routing + abstain labels",
+        "no regex/keyword cue router introduced as launch authority",
+        "read-only client smoke / plan tool + contract freezes cited as the dry-run evidence extractor"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_e2e_eval.v1",
+  "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1",
+  "timestamp": "2026-07-05T12:20:00+00:00",
+  "verdict": "PASS",
+  "runner": "claude_task_mcp_codex_handoff_b116",
+  "topic": "task_mcp",
+  "mode": "mcp_review_handoff_e2e_no_workflow_switch",
+  "objective": "Harden the MCP review-queue summarizer into a Codex-ready HANDOFF report tool: per review task summarize task_id, allowed_writes, validation commands, risks, and commit-hygiene status, strictly READ-ONLY over the parent task queue; register one MCP tool without switching runtime, disabling the write gate, or enabling process launch.",
+  "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh",
+  "test_runner": "tools/geoai-task-mcp/tests/mcp_codex_handoff_e2e.py",
+  "modules_under_test": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py (build_codex_handoff_report)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_task_codex_handoff tool)"
+  ],
+  "checks_total": 70,
+  "checks_passed": 70,
+  "checks_failed": 0,
+  "acceptance_results": {
+    "empty_queue_report": "PASS - empty fixture queue yields ok=True, task_count=0, handoff_reports=[]",
+    "fixture_queue_report": "PASS - 3-card fixture yields 3 handoff reports",
+    "field_task_id": "PASS - present per report",
+    "field_allowed_writes": "PASS - present per report (+ allowed_writes_count, scoped_paths == allowed_writes)",
+    "field_validation_commands": "PASS - present per report (+ validation_present bool)",
+    "field_risks": "PASS - deterministic risk checklist per report (code/severity/detail)",
+    "field_commit_hygiene": "PASS - status ok|warn + no_git_add_all/mixed_task_commit_forbidden/scoped_stage_only",
+    "field_recommended_stage_list": "PASS - scoped stage/guard-staged/diff/done commands per task_id",
+    "risk_clean_task": "PASS - clean task risk_level=low, hygiene=ok",
+    "risk_missing_validation": "PASS - risky task risk_level=high, flags missing_validation",
+    "risk_shared_file_write": "PASS - risky task flags shared_file_write (server.py + manifest)",
+    "risk_declared_human_brief": "PASS - medium task surfaces declared_risk from human_brief.risk",
+    "commit_hygiene_warn": "PASS - empty commit_contract + no forbidden guards -> status=warn",
+    "task_ids_filter": "PASS - task_ids narrows report to 1, filtered_by_task_ids=True",
+    "batch_label_passthrough": "PASS - batch_label echoed",
+    "zero_mutation_fixture_hash": "PASS - fixture dir sha256 identical before/after",
+    "zero_mutation_no_write_cmd": "PASS - only review-queue/show issued; no done/review/start/auto-pickup/export-jsonl/usage",
+    "zero_mutation_live_queue": "PASS - live review-queue stdout identical before/after server-tool call",
+    "server_tool_registered": "PASS - server exposes geoai_task_codex_handoff, callable, server_tool label set",
+    "server_tool_contract_label": "PASS - contract=B116_v1_codex_handoff_e2e_readonly",
+    "authority_readonly": "PASS - True",
+    "authority_process_launch": "PASS - False",
+    "authority_agent_launch": "PASS - False",
+    "authority_queue_write": "PASS - False",
+    "authority_audit_write": "PASS - False",
+    "authority_write_gate_enabled": "PASS - True (GEOAI_TASK_MCP_ALLOW_WRITES=0)",
+    "authority_subprocess_tripwire_zero": "PASS - True",
+    "bash_test_exit": "PASS - test_mcp_codex_handoff_e2e_b116_v1.sh exits 0",
+    "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns PASS",
+    "existing_summarizer_regression": "PASS - b110/b111/b112/b113/b115 summarizer tests still green (behavior-preserving refactor of summarize_review_queue via shared read-only _collect_review_cards)"
+  },
+  "acceptance_criteria": [
+    "must produce a Codex-ready report for an empty queue and a fixture queue",
+    "must include task_id, runner, topic, allowed_writes, validation, risks, and recommended scoped stage list",
+    "must not call taskctl done/review/start/auto-pickup or mutate parent queue",
+    "must keep GEOAI_TASK_MCP_ALLOW_WRITES default off",
+    "bash tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh passes",
+    "python3 AITools/taskctl.py verify passes"
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_FIXTURE": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_LIVE": true,
+    "NO_WRITE_TASKCTL_COMMAND_ISSUED": true,
+    "SINGLE_TOOL_ADDED_ONLY": true,
+    "NO_RUNTIME_SWITCH_TO_MCP": true
+  },
+  "forbidden_operations_verified": [
+    "runtime_switch_to_mcp",
+    "write_gate_disable",
+    "parent_task_queue_mutation",
+    "process_launch_enable",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "tool_inventory_note": {
+    "server_tools_before": 16,
+    "server_tools_after": 17,
+    "added_tool": "geoai_task_codex_handoff",
+    "note": "B116 intentionally registers one new read-only MCP tool, so the FastMCP tool count moves 16->17 by design."
+  },
+  "preexisting_failures_not_caused_by_b116": {
+    "attribution_method": "reverted only the B116 server.py tool block to a clean 16-tool state and re-ran the four failing suite tests; all four still FAILED at baseline.",
+    "tests": {
+      "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh": "stale frozen tool-count assertion fails at baseline (AssertionError: 16 with expected != 16); B116 only shifts printed actual 16->17",
+      "test_mcp_stdio_concurrent_client_smoke_b110_v1.sh": "same stale frozen tool-count assertion (run1, 16 at baseline)",
+      "test_mvp_contract_audit_v1.sh": "stale 'audit' tool-name list missing 5 tools (cli_adapter x3 + review_summarize + codex_handoff) at baseline; predates b106",
+      "test_mcp_neural_launch_routing_dryrun_b109_v1.sh": "collision-guard row drift (expected 3 collision rows, got 6); unrelated to B116 files (no server/summarizer dependency)"
+    },
+    "owner_action": "the frozen tool-count / audit-list assertions in b109/b110 stdio smoke and mvp_contract_audit are outside B116 allowed_writes; their owners/Codex should bump the frozen inventory to 17 including geoai_task_codex_handoff."
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
+  "next_wave_task": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B117_V1"
+}

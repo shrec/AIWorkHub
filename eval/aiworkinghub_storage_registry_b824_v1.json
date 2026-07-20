@@ -1,0 +1,88 @@
+{
+  "artifact_schema_id": "geoai.task_mcp.eval.aiworkinghub_storage_registry_b824_v1",
+  "created_at": "2026-07-20T00:00:00Z",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_STORAGE_REGISTRY_B824_V1",
+  "scope": {
+    "mode": "repository_local_storage_registry",
+    "live_cutover": false,
+    "legacy_delete": false,
+    "allowed_write_paths_only": true
+  },
+  "canonical_inventory": {
+    "task_queue": {
+      "canonical_durable_path": "tasking/task_queue.sqlite",
+      "legacy_source": "bitnnv2/data/tasking/task_queue_v1.sqlite",
+      "rollback_source_sha256": "23ecc369f601c3339a802a383d6f15e147df129771e016c05419b2fcb95fb2dd"
+    },
+    "source_graph": {
+      "canonical_durable_path": "source_graph/source_graph.sqlite",
+      "legacy_source": "AITools/source_graph.db",
+      "rollback_source_sha256": "6d645a92301727613473eb670982fe56b3a2664a5e43881083eae84b03ac0417"
+    },
+    "universal": {
+      "canonical_durable_path": "source_graph/universal.sqlite",
+      "legacy_source": "AITools/source_graph_universal.db",
+      "rollback_source_sha256": "d1bea7d3e8be1f9e59516c4f7ad0b193cc18f33e7a9af14fe3f4880a42597e3e"
+    },
+    "session": {
+      "canonical_durable_path": "sessions/sessions.sqlite",
+      "legacy_source": "AITools/session.db",
+      "rollback_source_sha256": "34a702b54f17b30b36c16b3e602241c18d35cbc232b11dd99f50e18b7c07b66b"
+    },
+    "transcript": {
+      "canonical_durable_path": "sessions/transcript_graph.sqlite",
+      "legacy_source": "AITools/transcript_graph.db",
+      "rollback_source_sha256": "773eab9a8cf5a075edaf2962a1250937a68e71bd8bb305ecbb3f7b8d54789196"
+    },
+    "memory": {
+      "canonical_durable_path": "memory/memory.sqlite",
+      "legacy_source": "AITools/ai_memory/ai_memory.db",
+      "rollback_source_sha256": "8fe74da44c6c0dae5cc54a6e062959c531edd9b9a9a591f96fbc6cffb6c17883"
+    },
+    "kb": {
+      "canonical_durable_path": "kb/knowledge.sqlite",
+      "legacy_source": "AITools/kb.db",
+      "rollback_source_sha256": "5188b5e8ea9d7afe53bf2e3a2440619c00d3463943b9ca10aa5ffeabacf19886"
+    }
+  },
+  "evidence": {
+    "registry_schema": "aiworkinghub.storage_registry.v1",
+    "portable_repo_relative_paths_only": true,
+    "credentials_sockets_locks_wal_shm_worktrees_runtime_only": true,
+    "sparse_worktree_missing_is_not_absence": true,
+    "authority_state": "shadow",
+    "canonical_active": false,
+    "legacy_active": false,
+    "live_cutover": false,
+    "migration_generation": 0,
+    "resolution_guards": [
+      "manifest_repo_id_bound",
+      "reject_traversal",
+      "reject_symlink_components",
+      "reject_host_absolute_paths",
+      "reject_cross_repository_reuse"
+    ]
+  },
+  "validation": [
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src /home/shrek/GeoAI/.venv/bin/python3 -m pytest -p no:cacheprovider -q tools/geoai-task-mcp/tests/test_aiworkinghub_storage_registry_b824_v1.py",
+      "status": "pass",
+      "summary": "4 passed in 0.06s"
+    },
+    {
+      "command": "python3 -m json.tool .aiworkinghub/config/storage.json",
+      "status": "pass",
+      "summary": "valid JSON"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "status": "pass",
+      "summary": "VERIFY: PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard",
+      "status": "fail_unrelated_active_card_collisions",
+      "summary": "11 active-card collisions reported outside this task's allowed write paths; no registry-path collision was reported."
+    }
+  ]
+}

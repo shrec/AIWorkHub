@@ -1,0 +1,84 @@
+{
+  "schema_id": "geoai.task_mcp.callback_bridge_b384.coordinator_review.v3",
+  "reviewer": "codex_coordinator",
+  "review_date": "2026-07-14",
+  "verdict": "ACCEPTED_CANONICAL_CALLBACK_BRIDGE_AND_LIVE_DAEMON",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_BRIDGE_FINISH_B384_V1",
+  "worker_candidate": {
+    "request_id": "a98c26e3f7d4415a9a2cd63f30b92022",
+    "launcher_outcome": "validation_failed",
+    "worker_suite_result": "121 passed, 30 failed, 5 errors under chmod/fchmod/git-init sandbox denials",
+    "trusted_host_initial_result": "155 passed, 1 failed",
+    "trusted_host_initial_failure": "stale worktree-deletion expectation contradicted the coordinator-review-first retained-worktree contract"
+  },
+  "coordinator_repairs": [
+    "atomic BEGIN IMMEDIATE outbox claim with a conditional single-winner update",
+    "exact current claim episode and normalized terminal-transition matching before delivery",
+    "idempotent fail-closed migration to the four-column episode unique key",
+    "bounded select-based App Server reads with real timeout behavior",
+    "strict initialize, thread/resume, turn/start response-id and thread/turn-id correlation",
+    "bounded busy retry and dead-letter handling",
+    "schema-shaped fake App Server responses and mismatch/busy/silent regression cases",
+    "retained-worktree lifecycle expectation"
+  ],
+  "promoted_paths": [
+    "AITools/taskdb.py",
+    "AITools/taskctl.py",
+    "AITools/test_taskctl_exact_claim_start_mcp.py",
+    "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_bridge_finish_b384_v1.json",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/_fake_app_server.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_process_launcher_security.py"
+  ],
+  "rejected_stale_merges": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/deepseek_credentials.py"
+  ],
+  "rejection_reason": "Those candidate copies predated current Lexicon runner allowlists and weakened the accepted DeepSeek credential and configurable Codex inner-sandbox behavior; canonical versions were preserved.",
+  "protocol_authority": {
+    "codex_cli_version": "0.144.1",
+    "client_request_schema_sha256": "5bae99085b24b4865694f23047f9ef6f36d414d72391b0a7c36e93ffff714cc2",
+    "server_notification_schema_sha256": "899cbd9cabc67a675babb78c3eac113080ea38fc4f6cce3bc2ddad4dbd8040c1"
+  },
+  "canonical_hashes": {
+    "AITools/taskdb.py": "f09b612cb0410e2c88e54d28d573f6a5608e3d4c9c2d077f63342ba7c6714506",
+    "AITools/taskctl.py": "0be44b81b992099977b3d740145618632fa49ef4b5d96df6fe3ed207c412c38a",
+    "callback_bridge.py": "5780faa21962ad24eb8d267fa5005334dd252a24aa9e914f0f4a1cd3e32759a6",
+    "_fake_app_server.py": "d99809907b14168d91f7b3883f8e64cf99777adc13cb8ff062d6e8dc5a7ffbaa",
+    "test_callback_bridge.py": "44889c0fae8e1806806930bca635fa71262e0096d8937fb70e4320e766e49624"
+  },
+  "trusted_host_validation": {
+    "full_registered_suite": "161 passed in 9.80s",
+    "mcp_stdio_subprocess_smoke": "PASS",
+    "taskctl_verify": "PASS",
+    "collision_guard": "PASS; 99 active cards; zero overlapping allowed_writes",
+    "live_database_episode_unique_columns": [
+      "task_id",
+      "transition",
+      "origin_thread_id",
+      "episode_id"
+    ],
+    "real_owner_thread_callback_sent_during_review": false
+  },
+  "authority": {
+    "canonical_code_accepted": true,
+    "callback_live_authority": true,
+    "process_launch_authority": false,
+    "worker_can_finalize_tasks": false,
+    "codex_remains_coordinator": true
+  },
+  "live_activation": {
+    "service": "geoai-task-callback-bridge.service",
+    "enabled": true,
+    "active": true,
+    "stale_outbox_superseded": 24,
+    "pending_at_enable": 0,
+    "inflight_at_enable": 0,
+    "dead_letter_at_enable": 0,
+    "real_owner_thread_callback_sent_during_activation": false
+  },
+  "remaining_action": "Observe the first genuine post-enable worker terminal event; the daemon now owns durable polling and exact originating-thread wake delivery."
+}

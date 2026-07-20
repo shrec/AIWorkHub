@@ -1,0 +1,47 @@
+{
+  "schema_id": "geoai.task_mcp.callback_idle_atomic_no_resume.b684.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_IDLE_ATOMIC_NO_RESUME_B684_V1",
+  "defect": "B683: sideband callback delivery resumed the origin thread (thread/resume) before deciding turn/start vs turn/steer; against the actual production owner thread (very large history) that thread/resume round trip repeatedly exhausted the mux's bounded 45-second sideband deadline. Batch de917c12b5b849308db7ae562fa59a17 reached attempts>=8, hard_failure_count=1, last_failure_kind=busy/not_ready while the durable event stayed parked forever, never delivered.",
+  "repair": "SidebandCallbackClient delivery (deliver_callback/deliver_callback_batch -> _deliver_turn) no longer sends thread/resume or turn/steer at all. It issues exactly one turn/start directly against the uniquely resolved live mux owner for the exact origin_thread_id, using the existing deterministic clientUserMessageId and callback prompt. A successful synchronous TurnStartResponse.turn.id is the only delivery acknowledgement -- the App Server's own turn/start response is the atomic concurrency authority. An active/busy/activeTurnNotSteerable/already-in-progress rejection (classified by _is_sideband_turn_start_busy_rejection against both the free-text message and the CodexErrorInfo.activeTurnNotSteerable structured shape) raises SidebandThreadBusyError, a BusyThreadError subclass that durably parks via defer_batch_busy without consuming the bounded hard-failure budget. A malformed/denied/protocol-shaped rejection (missing result.turn.id, an unrelated error, an unauthorized/rejected sideband envelope) still raises the base AppServerError and retains the existing bounded fail_batch_transient retry/dead-letter path. thread_resume/turn_steer remain available as standalone SidebandCallbackClient primitives (used directly by owner-resolution/auth diagnostics and tests) but are never invoked by the delivery path. The subprocess transport (AppServerClient, select_steer_target, resume-decides-steer-or-start) is entirely unchanged.",
+  "no_local_idle_guess": true,
+  "no_second_app_server_spawn": true,
+  "no_fallback_app_server": true,
+  "no_direct_database_injection": true,
+  "no_vscode_reload_required_for_repair_itself": true,
+  "missing_or_ambiguous_owner_stays_fail_closed_parked": true,
+  "permanent_failure_policy_unchanged": true,
+  "historical_dead_letters_rewritten": false,
+  "b683_batch_marked_delivered_synthetically": false,
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py"
+  ],
+  "worker_validation": {
+    "commands": [
+      {
+        "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+        "passed": 15,
+        "failed": 0
+      },
+      {
+        "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
+        "passed": 162,
+        "failed": 3,
+        "failed_tests_pre_existing_and_unrelated": [
+          "test_app_server_mux.py::test_installer_check_reports_readiness_without_mutation",
+          "test_app_server_mux.py::test_installer_print_config_default_shows_apply_and_rollback",
+          "test_app_server_mux.py::test_installer_never_touches_vscode_settings_or_sideband_dir"
+        ],
+        "failure_reason": "This isolated task worktree is missing the untracked, pre-existing fixture tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py (confirmed untracked in the main GeoAI checkout too, and outside this task's allowed_writes and this worktree's writable scripts/ permissions). Unrelated to the B684 sideband delivery-path change: no test exercising callback_bridge.py or app_server_mux.py sideband/mux behavior fails."
+      }
+    ]
+  },
+  "coordinator_validation": {
+    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
+    "passed": 180,
+    "failed": 0,
+    "note": "Codex reran validation in the full canonical checkout, including the installer fixture missing from the isolated worker worktree. Service reload and the preserved B683 event are the live canary."
+  },
+  "verdict": "PASS_COORDINATOR_ACCEPTED_READY_FOR_LIVE_CALLBACK_CANARY"
+}

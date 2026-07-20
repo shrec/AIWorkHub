@@ -1,0 +1,116 @@
+{
+  "schema_id": "geoai.task_mcp_runner_topic_allowlist_dryrun.b05.v1",
+  "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_DRYRUN_B05_V1",
+  "mode": "runner_topic_allowlist_dryrun_no_launch",
+  "date": "2026-07-05",
+  "builds_on": [
+    "agent_launcher_dryrun_protocol_b04_v1",
+    "task_mcp_agent_launcher_safety_contract_b03_v1",
+    "mcp_runner_topic_allowlist_enforcement_b119_v1"
+  ],
+  "purpose": "Resolve (as a dry-run policy design, not a code patch) the B04 finding that per-wave task_mcp runners (e.g. this task's own runner claude_task_mcp_allowlist_dryrun_b05) are rejected by core.RUNNER_TOPIC_ALLOWLIST with reason=unknown_runner_topic_pair. This artifact re-measures the gap against the live module via read-only introspection (import + call, no file text read, no subprocess), enumerates blocked examples, and records a safe next-wave source-patch proposal. It adds zero execution code and edits no .py file.",
+  "measurement_method": {
+    "how": "python3 -c 'import geoai_task_mcp.core as core; core.check_runner_topic_allowlist(runner, topic, action)' -- direct in-process introspection of the already-shipped pure function. No file was Read/grepped for source text (source_graph.py/cgraph.py do not index tools/geoai-task-mcp/src -- confirmed gap, out of scope for this task's allowed_writes). No subprocess, no daemon, no network call.",
+    "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py: check_runner_topic_allowlist(runner, topic, action)",
+    "companion_module_checked": "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py: launch_enabled(), LAUNCH_IMPLEMENTED, writes_allowed()"
+  },
+  "forbidden_operations_confirmed_not_taken": {
+    "source_code_patch": false,
+    "daemon_start": false,
+    "real_agent_launch": false,
+    "credential_write": false,
+    "network_operation": false,
+    "task_status_mutation": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+  "current_allowlist_snapshot_measured": {
+    "note": "Exact contents of core.RUNNER_TOPIC_ALLOWLIST at measurement time, read via attribute access (not file text).",
+    "static_pairs": [
+      {"runner": "claude_coding", "topic": "coding", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_stem", "topic": "stem", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_general_reasoning", "topic": "general_reasoning", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_capability_eval", "topic": "capability_eval", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_context_graph", "topic": "context_graph", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_translate", "topic": "translation", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_c_native", "topic": "c_native", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "claude_open_generation", "topic": "open_generation", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "deepseek_finance", "topic": "finance", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "deepseek_routing", "topic": "routing_safety", "actions": ["auto-pickup", "review", "start", "usage"]},
+      {"runner": "deepseek_tasking", "topic": "tasking_system", "actions": ["auto-pickup", "review", "start", "usage"]}
+    ],
+    "codex_wildcard": {"runner": "codex", "topic": "any (not checked)", "actions": ["done", "export-jsonl", "usage", "review"]},
+    "observation": "The dict has no entry for topic=='task_mcp', and no pattern/prefix mechanism exists for per-wave runner names at all (only exact-tuple lookup + one hardcoded codex wildcard). Any runner not in this fixed list of 11 pairs is rejected for its OWN (runner, topic), regardless of how well-formed the name is."
+  },
+  "blocked_examples_measured": [
+    {
+      "runner": "claude_task_mcp_allowlist_dryrun_b05",
+      "topic": "task_mcp",
+      "action": "review",
+      "result": {"allowed": false, "reason": "unknown_runner_topic_pair"},
+      "note": "THIS task's own runner/topic -- the exact live finding being resolved by this artifact."
+    },
+    {
+      "runner": "claude_task_mcp_launcher_dryrun_b04",
+      "topic": "task_mcp",
+      "action": "review",
+      "result": {"allowed": false, "reason": "unknown_runner_topic_pair"},
+      "note": "B04's runner; identical B03 finding re-confirmed live against current code."
+    },
+    {
+      "runner": "claude_shared_axis",
+      "topic": "shared_axis",
+      "action": "auto-pickup",
+      "result": {"allowed": false, "reason": "unknown_runner_topic_pair"},
+      "note": "Informational only (out of scope for this task's proposal): another topic-continuous worker name seen in project memory that is also absent from the static dict. Not addressed by the B05 proposal, which is scoped to topic=='task_mcp' only."
+    },
+    {
+      "runner": "codex",
+      "topic": "task_mcp",
+      "action": "export-jsonl",
+      "result": {"allowed": true, "reason": "codex_wildcard_topic_allowed"},
+      "note": "Codex itself is never blocked for any topic (wildcard by runner name only) -- only per-wave CLAUDE_* runners are blocked."
+    },
+    {
+      "runner": "claude_coding",
+      "topic": "coding",
+      "action": "done",
+      "result": {"allowed": false, "reason": "action_not_allowed_for_runner_topic:done"},
+      "note": "Control example: even an allowlisted pair is rejected for an out-of-scope action (workers never call done)."
+    },
+    {
+      "runner": "claude coding",
+      "topic": "coding",
+      "action": "auto-pickup",
+      "result": {"allowed": false, "reason": "malformed_runner:invalid_characters"},
+      "note": "Control example: malformed-token sanity check runs before any allowlist/prefix lookup and is unaffected by this proposal."
+    }
+  ],
+  "write_gate_status_measured": {
+    "core.writes_allowed()": false,
+    "cli_adapter_dryrun.writes_allowed()": false,
+    "GEOAI_TASK_MCP_ALLOW_WRITES_env": null,
+    "note": "Default-off write gate confirmed unchanged and untouched by this artifact."
+  },
+  "launch_status_measured": {
+    "cli_adapter_dryrun.launch_enabled()": false,
+    "cli_adapter_dryrun.LAUNCH_IMPLEMENTED": false,
+    "note": "process_launch stays false; this artifact does not flip, wrap, or bypass either flag."
+  },
+  "finding_confirmed": "The B04 gap is real and current: any per-wave task_mcp runner (naming pattern 'claude_task_mcp_<slug>_b<NN>') is rejected by check_runner_topic_allowlist with unknown_runner_topic_pair because RUNNER_TOPIC_ALLOWLIST only contains exact tuples for stable topic-continuous workers. This blocks a hypothetical FUTURE real MCP-mediated call (auto-pickup/review/usage) made under this exact runner/topic; it does NOT block taskctl.py direct CLI usage (taskctl.py has no allowlist dependency), which is how this very task was executed.",
+  "proposal_pointer": {
+    "path": "tools/geoai-task-mcp/data/tasking/runner_topic_allowlist_dryrun_next_wave_b05_v1.json",
+    "status": "proposed_not_applied",
+    "summary": "Additive PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix rule for topic=='task_mcp' only, restricted to a conservative action subset, with all existing static pairs left byte-identical. Described only; no code was changed by this task."
+  },
+  "neural_bridge_note": {
+    "doctrine": "neural-control-first: this allowlist is a deterministic safety/support-boundary gate per CLAUDE.md's explicit carve-out ('Controller/verifier layers are valid when they are moral, safety, support-boundary, rollback, or correctness checks'), not a learned routing/intent decision. The function's own docstring already states it is 'explicitly NOT a neural learning target'.",
+    "this_artifact_is": "a read-only re-measurement + a described (not applied) additive prefix-rule proposal for the static gate; it adds no new execution code and proposes no regex/table cognition path for task selection -- only a widened safety boundary for an already-deterministic gate.",
+    "not_a_bare_promise": true
+  },
+  "rollback": {
+    "code_to_roll_back": false,
+    "rollback_action": "git revert this eval JSON + next_wave JSON + test script; no runtime/registry/subprocess/source code exists to unwind because none was changed"
+  },
+  "verdict": "PASS"
+}

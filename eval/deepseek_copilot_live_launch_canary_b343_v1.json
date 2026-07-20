@@ -1,0 +1,113 @@
+{
+  "schema_id": "geoai.task_mcp_deepseek_live_launch_canary.v1",
+  "eval_id": "deepseek_copilot_live_launch_canary_b343_v1",
+  "task_id": "CLAUDE_TASK_MCP_FULL_ORCHESTRATION_COMPLETION_B343_V1",
+  "runner": "claude_task_mcp_full_orchestration_completion_b343",
+  "topic": "task_mcp",
+  "date": "2026-07-13",
+  "mode": "task_mcp_deepseek_copilot_byok_live_canary",
+  "canary_verdict": "BLOCKED_CREDENTIAL",
+  "summary": "The local deepseek_copilot_cli adapter (official GitHub Copilot CLI in BYOK mode against DeepSeek's OpenAI-compatible API) is implemented, wired, and tested. The one bounded no-product-mutation LIVE canary through the real MCP launcher requires a real DeepSeek API key on the coordinator host; none is provisioned (measured: credential_present=false, blocker_reason=credential_file_absent), so the live canary is reported as BLOCKED_CREDENTIAL with an exact replay plan rather than faked to PASS. Every independent implementation, security, and regression gate passes now.",
+  "measured_host_readiness": {
+    "adapter_id": "deepseek_copilot_cli",
+    "installed": true,
+    "copilot_cli_path": "/home/shrek/.nvm/versions/node/v24.15.0/bin/copilot",
+    "credential_present": false,
+    "launchable": false,
+    "blocker_reason": "credential_file_absent",
+    "endpoint": "https://api.deepseek.com/v1",
+    "provider_type": "openai",
+    "supported_models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+    "default_model": "deepseek-v4-pro"
+  },
+  "copilot_byok_contract_verified_from_cli_docs": {
+    "source": "copilot --help and copilot help providers (installed CLI, offline)",
+    "activation": "COPILOT_PROVIDER_BASE_URL activates BYOK; GitHub auth not required",
+    "provider_env": {
+      "COPILOT_PROVIDER_TYPE": "openai",
+      "COPILOT_PROVIDER_BASE_URL": "https://api.deepseek.com/v1",
+      "COPILOT_MODEL": "deepseek-v4-pro|deepseek-v4-flash",
+      "COPILOT_PROVIDER_API_KEY": "<secret; child env only>"
+    },
+    "noninteractive_argv_flags": [
+      "-p (single prompt token)",
+      "--output-format json (JSONL)",
+      "--allow-all-tools (required for non-interactive)",
+      "--no-ask-user (autonomous, no questions)",
+      "--no-remote --no-remote-export (disabled remote control/export)",
+      "--disable-builtin-mcps (github-mcp-server off)",
+      "--no-color --no-auto-update",
+      "--secret-env-vars COPILOT_PROVIDER_API_KEY (declared redaction)",
+      "-C <cwd> --model <deepseek model>"
+    ],
+    "not_passed": ["--allow-all-paths", "--allow-all-urls", "--yolo", "--allow-all"],
+    "not_passed_reason": "Copilot permissions stay subordinate to the outer Landlock/bubblewrap filesystem sandbox."
+  },
+  "independent_gates_passed": {
+    "adapter_identity_and_argv": true,
+    "one_prompt_token_no_shell_injection": true,
+    "model_routing_guard_rejects_github_hosted_models": true,
+    "deepseek_default_model_is_pro": true,
+    "deepseek_manual_stays_manual_only_fallback": true,
+    "credential_0600_outside_repo": true,
+    "credential_rejects_symlink_group_world_wrong_owner_empty_non_deepseek_endpoint_inside_repo": true,
+    "getpass_bootstrap_never_argv": true,
+    "api_key_repr_and_status_secret_free": true,
+    "sanitized_env_injects_key_only_when_provided_never_from_os_environ": true,
+    "missing_credential_fails_before_claim_start_task_stays_unclaimed": true,
+    "bad_model_fails_before_claim_start": true,
+    "direct_launch_key_reaches_only_child_env_then_cancel": true,
+    "isolated_landlock_launch_claims_and_passes_key_through_sandbox": true,
+    "copilot_jsonl_deepseek_usage_parsed_without_inventing_tokens": true,
+    "cost_ledger_labels_provider_deepseek_copilot": true,
+    "adapter_readiness_in_completion_inbox_and_dashboard_no_secret": true,
+    "claude_codex_paths_regression_green": true,
+    "frozen_v1_tool_contract_still_33_tools": true
+  },
+  "validation": {
+    "pytest_tools_geoai_task_mcp_tests": "PASS (150 passed, 1 xfailed)",
+    "test_deepseek_copilot_adapter_b343_v1": "PASS (39 passed)",
+    "test_mcp_stdio_subprocess_client_smoke_b109_v1_sh": "PASS (frozen_contract_v1=true, 33 tools)",
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "PASS (collision_free=true, 63 active cards)"
+  },
+  "secret_non_leakage_invariants": [
+    "api_key never in argv (only COPILOT_PROVIDER_API_KEY as --secret-env-vars value)",
+    "api_key never in task cards, process_events.jsonl, audit log, dashboard payload, or readiness output",
+    "api_key never read from os.environ into the sanitized env (passed explicitly by the launcher)",
+    "DeepSeekCredential.api_key is repr=False (no traceback/repr leak)",
+    "credential file is 0600, non-symlink, owner-only, outside the repo (never Git-tracked)"
+  ],
+  "blocked_credential_live_replay_plan": [
+    "geoai-task-deepseek-credential set   # host, outside repo, 0600, getpass",
+    "Confirm geoai_completion_inbox.adapter_readiness shows deepseek_copilot_cli.launchable=true",
+    "Start MCP server with GEOAI_TASK_MCP_ALLOW_LAUNCH=1 and GEOAI_TASK_MCP_ALLOW_WRITES=1",
+    "geoai_agent_launch_task(task_id=<pending deepseek canary card>, runner=deepseek_*, topic=task_mcp, adapter_id=deepseek_copilot_cli, model=deepseek-v4-pro)",
+    "geoai_agent_collect_result(request_id) until review_ready; return the task to Codex review",
+    "Assert: no product source mutated, only allowed_writes touched, shell=false, exact claim->review lifecycle"
+  ],
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "secret_export": false,
+    "runtime_default_change": false,
+    "product_source_mutation": false
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "files_written": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/deepseek_credentials.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+    "tools/geoai-task-mcp/pyproject.toml",
+    "tools/geoai-task-mcp/tests/test_deepseek_copilot_adapter_b343_v1.py",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/MVP_ROADMAP.md",
+    "tools/geoai-task-mcp/eval/deepseek_copilot_live_launch_canary_b343_v1.json"
+  ]
+}

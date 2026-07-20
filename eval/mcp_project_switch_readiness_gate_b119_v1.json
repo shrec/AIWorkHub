@@ -1,0 +1,158 @@
+{
+  "eval_id": "mcp_project_switch_readiness_gate_b119_v1",
+  "task_id": "CLAUDE_TASK_MCP_PROJECT_SWITCH_READINESS_GATE_B119_V1",
+  "contract": "B119_v1",
+  "generated": "2026-07-05T18:53:02.994829+00:00",
+  "mode": "project_switch_readiness_scorecard_no_switch",
+  "builds_on": [
+    "task_mcp_finishline_status_audit_b116_v1",
+    "mcp_live_client_smoke_b118_v1",
+    "mcp_autopickup_dryrun_b118_v1",
+    "mcp_runner_topic_allowlist_design_b118_v1",
+    "launch_disabled_queue_contract_b117_v1"
+  ],
+  "authority_flags": {
+    "workflow_switch": false,
+    "queue_mutation": false,
+    "write_gate_disable": false,
+    "process_launch": false,
+    "default_change": false,
+    "gate_readonly": true
+  },
+  "git_state": {
+    "dirty_count": 0,
+    "untracked_count": 1,
+    "total_changed": 1,
+    "parent_repo_clean": true
+  },
+  "queue_status_snapshot": {
+    "captured_at": "2026-07-05T18:45:00+00:00",
+    "captured_via": "python3 AITools/taskctl.py list --topic task_mcp (read-only)",
+    "statuses": {
+      "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1": "processing",
+      "DEEPSEEK_TASK_MCP_BATCH_COLLISION_GUARD_B119_V1": "review",
+      "DEEPSEEK_TASK_MCP_FULL_WAVE_DRYRUN_HARNESS_B119_V1": "review"
+    }
+  },
+  "gates": {
+    "live_client": {
+      "pass": true,
+      "evidence": "eval/mcp_live_client_smoke_b118_v1.json",
+      "task_id": "DEEPSEEK_TASK_MCP_LIVE_CLIENT_SMOKE_B118_V1"
+    },
+    "dryrun": {
+      "pass": true,
+      "evidence": "eval/mcp_autopickup_dryrun_b118_v1.json",
+      "task_id": "CLAUDE_TASK_MCP_AUTOPICKUP_DRYRUN_B118_V1"
+    },
+    "allowlist": {
+      "pass": false,
+      "designed": true,
+      "enforced": false,
+      "evidence": "eval/mcp_runner_topic_allowlist_design_b118_v1.json",
+      "enforcement_task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+      "enforcement_status": "processing"
+    },
+    "batch_guard": {
+      "pass": false,
+      "task_id": "DEEPSEEK_TASK_MCP_BATCH_COLLISION_GUARD_B119_V1",
+      "status": "review"
+    },
+    "full_wave_dryrun": {
+      "pass": false,
+      "task_id": "DEEPSEEK_TASK_MCP_FULL_WAVE_DRYRUN_HARNESS_B119_V1",
+      "status": "review",
+      "note": "dry-run harness only; not a live write-gated wave execution"
+    },
+    "_launch_disabled_contract_ok": true
+  },
+  "named_gate_keys": [
+    "live_client",
+    "dryrun",
+    "allowlist",
+    "batch_guard",
+    "full_wave_dryrun"
+  ],
+  "readiness_classes": {
+    "read_only_ready": true,
+    "write_gated_ready": false,
+    "launch_disabled_ready": true,
+    "launch_enabled_not_ready": true
+  },
+  "workflow_switch_ready": false,
+  "summary": {
+    "total_checkboxes": 23,
+    "done": 12,
+    "gap": 8,
+    "not_started": 3,
+    "blocked": 0
+  },
+  "by_phase": {
+    "phase_0": {
+      "done": 6,
+      "gap": 0,
+      "not_started": 0,
+      "blocked": 0,
+      "total": 6
+    },
+    "phase_1": {
+      "done": 3,
+      "gap": 2,
+      "not_started": 0,
+      "blocked": 0,
+      "total": 5
+    },
+    "phase_2": {
+      "done": 3,
+      "gap": 4,
+      "not_started": 0,
+      "blocked": 0,
+      "total": 7
+    },
+    "phase_3": {
+      "done": 0,
+      "gap": 2,
+      "not_started": 3,
+      "blocked": 0,
+      "total": 5
+    }
+  },
+  "blockers": [
+    {
+      "id": "allowlist_enforcement_pending",
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+      "status": "processing",
+      "detail": "Allow-list DESIGN is frozen/PASS but core.py write-path ENFORCEMENT is not finished."
+    },
+    {
+      "id": "batch_collision_guard_pending_finalize",
+      "task_id": "DEEPSEEK_TASK_MCP_BATCH_COLLISION_GUARD_B119_V1",
+      "status": "review",
+      "detail": "Batch collision guard built + tests passing but task not yet Codex-finalized (done)."
+    },
+    {
+      "id": "full_wave_dryrun_pending_finalize",
+      "task_id": "DEEPSEEK_TASK_MCP_FULL_WAVE_DRYRUN_HARNESS_B119_V1",
+      "status": "review",
+      "detail": "Full-wave dry-run harness pending Codex finalize; note it is a DRY-RUN, not a live write-gated wave."
+    },
+    {
+      "id": "p3_no_parent_corruption_not_started",
+      "task_id": null,
+      "status": "NOT_STARTED",
+      "detail": "No dedicated post-real-wave taskctl verify + queue-integrity-diff evidence found."
+    },
+    {
+      "id": "phase_2_gaps_open",
+      "task_id": null,
+      "status": "4/7 open",
+      "detail": "CLI adapter concrete implementations (claude/codex/deepseek) + candidate eval remain GAP per B116 audit; not in scope of the 5 named switch gates but part of full roadmap completion."
+    }
+  ],
+  "acceptance": {
+    "phases_0_3_scored_with_evidence": true,
+    "workflow_switch_ready_false_unless_all_gates_pass": true,
+    "readiness_classes_distinguished": true,
+    "no_mutation": true
+  }
+}

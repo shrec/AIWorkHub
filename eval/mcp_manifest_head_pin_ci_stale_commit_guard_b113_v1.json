@@ -1,0 +1,74 @@
+{
+  "selftest_id": "mcp_manifest_head_pin_ci_stale_commit_guard_b113_v1",
+  "task_id": "CLAUDE_TASK_MCP_MANIFEST_HEAD_PIN_CI_STALE_COMMIT_GUARD_B113_V1",
+  "mode": "mcp_manifest_head_pin_stale_guard_readonly",
+  "ok": true,
+  "objective": "Read-only regression guard: the committed B112/B113 head-pin eval evidence must stay consistent with the live nested-repo HEAD manifest blob, so stale head-pin evidence cannot pass silently after the B110 manifest is re-committed.",
+  "committed_source": "git_head",
+  "byte_identical": true,
+  "manifest_fingerprint_matches": true,
+  "committed_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "committed_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "live_head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "b112_eval_committed_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "eval_tracks_head": true,
+  "drift_count": 0,
+  "authority_flags": {
+    "contract_frozen": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "source_provenance": {
+    "pin_repo": "tools/geoai-task-mcp",
+    "pin_ref": "HEAD",
+    "committed_manifest_rel": "eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
+    "committed_source": "git_head",
+    "head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+    "measured_via": "git show HEAD:<rel> (working-tree-immune, not a git-clean check)",
+    "resolution_order": [
+      "nested_repo_head",
+      "parent_repo_head",
+      "working_tree_snapshot_fallback"
+    ],
+    "subsystem_committed": true
+  },
+  "regression_asserts": {
+    "b112_eval_committed_sha256_equals_live_head_blob": true,
+    "b113_eval_committed_sha256_equals_live_head_blob": true,
+    "divergent_stale_eval_rejected_nonzero": true,
+    "additively_patched_dirty_working_tree_still_passes": true,
+    "git_clean_false_fail_trap_avoided": true,
+    "byte_identical_regeneration_preserved": true,
+    "manifest_fingerprint_recomputes": true
+  },
+  "teeth": {
+    "divergence": "A controlled temp-copy of the B112 eval whose committed_sha256 is frozen (simulating a manifest recommit that did not refresh the evidence) is REJECTED non-zero by the stale-guard, so stale head-pin evidence cannot pass silently.",
+    "git_clean_false_fail_trap": "In a private mktemp git repo, the manifest working copy is ADDITIVELY patched (dirty) but the guard reads `git show HEAD:<rel>`; the HEAD blob sha (== recorded eval evidence) is unchanged, so the guard PASSES -- a naive git-clean/working-tree comparison would have FALSE-FAILED. The guard is patch-state-independent (semantic HEAD-blob compare), not a raw git-diff check."
+  },
+  "readonly_proof": {
+    "mutates_tracked_files": false,
+    "launches_agent_or_model": false,
+    "enables_write_gate": false,
+    "network_call": false,
+    "queue_mutation": false,
+    "scratch_isolation": "all scratch in a private mktemp dir cleaned in a trap; per-test temp git repos; no shared fixed-path writes"
+  },
+  "test": "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ],
+  "composes": [
+    "CLAUDE_TASK_MCP_MANIFEST_GIT_HEAD_PIN_B112_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1"
+  ],
+  "neural_bridge_priority": {
+    "role": "deterministic_manifest_head_pin_stale_commit_regression_guard",
+    "not_runtime_authority": true,
+    "learned_target": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "note": "ABCR/validator drift-protection tooth over the executor surface. No regex/keyword/table cue router is introduced as launch or route authority; adapter/runner/topic launch SELECTION remains the learned-router target."
+  }
+}

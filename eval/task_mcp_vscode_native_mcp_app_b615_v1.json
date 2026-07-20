@@ -1,0 +1,160 @@
+{
+  "schema_id": "geoai.task_mcp_vscode_native_mcp_app.v1",
+  "eval_id": "task_mcp_vscode_native_mcp_app_b615_v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VSCODE_NATIVE_APP_B615_V1",
+  "date": "2026-07-18",
+  "verdict": "IMPLEMENTED_NATIVE_WEBVIEW_REPLACES_IFRAME_STATIC_CHECKS_PASS_PYTEST_UNVERIFIABLE_IN_WORKER_SANDBOX",
+  "summary": "Replaced the B445/B455 iframe-embedded HTTP dashboard extension with a native VS Code Webview application. extension.js now owns exactly one bounded repo-local `python3 -m geoai_task_mcp.server` stdio child and a hand-rolled JSON-RPC 2.0 ClientSession (initialize -> notifications/initialized -> tools/call), with exact monotonically-increasing request ids, a bounded pending-request map (MCP_MAX_PENDING_REQUESTS=16) with a per-request timeout (MCP_REQUEST_TIMEOUT_MS=20s), a response-size cap on unterminated stdout (MCP_MAX_LINE_BYTES=8MiB), sanitized/redacted stderr logging, and exactly one bounded restart attempt (MCP_MAX_RESTART_ATTEMPTS=1) on unexpected child exit. Added tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py: three narrow read-only MCP tools (geoai_dashboard_snapshot, geoai_dashboard_task_detail, geoai_dashboard_health) that call ONLY dashboard.build_snapshot()/build_task_detail()/core.health() -- the same canonical builders the pre-existing HTTP dashboard's /api/snapshot and /api/task routes already use -- with a defensive transport-size bound (never a data-model change) and dashboard._TASK_ID_RE task_id validation reused as-is (no second regex). Wired via dashboard_mcp_app.register(mcp) in server.py, mirroring the existing cli_adapter_readonly_tool.register(mcp) pattern. The Webview (media/app.js + media/app.css) is a from-scratch native rewrite of the old dashboard.js/dashboard.css: no fetch/XHR, no iframe, no window.prompt/confirm, no archive/restore (read-only only); it sends only a fixed message enum (ready/refresh/retry/selectTask/setAutoRefresh/setRefreshInterval) validated against an allowlist plus a bounded task_id regex, and receives only snapshot/taskDetail/offline/error messages back from the extension host -- it never receives a coordinator token, env value, filesystem path, MCP capability, child-process handle, or arbitrary tool-call primitive. CSP is a strict per-render nonce (`script-src 'nonce-<random>'`, `frame-src 'none'`, no unsafe-inline/unsafe-eval, only webview.cspSource for style/img/font). All dynamic content is textContent/DOM construction (createElement/replaceChildren); innerHTML is never assigned. The one retained full-editor WebviewPanel is created once and reused via panel.reveal(); both it and the Activity Bar WebviewView get a host-owned ViewState whose setInterval poll timer is cleared by onDidChangeVisibility/onDidChangeViewState the instant a view is hidden and only rescheduled while visible -- polling-stop is a host-side fact, not a hope that a backgrounded script pauses itself. Remote-SSH needs no owner-managed forwarding: extensionKind stays [\"workspace\"] so the MCP child is colocated with the extension host already; there is no HTTP listener, no vscode.env.asExternalUri call, and no tunnel anywhere in the new code path. package.json dropped dashboardUrl/autoStart in favor of one refreshIntervalMs setting (10000/30000/60000, default 30000); the three commands (openDashboard/refreshDashboard/restartDashboard, the last retitled 'Restart Task MCP Connection') and the Activity Bar container/WebviewView id are preserved unchanged. install_remote.sh needed no functional change (it already copies media/ recursively); only a stale 'autoStart' comment was corrected. This first native MCP App stays strictly read-only end to end: the write gate (GEOAI_TASK_MCP_ALLOW_WRITES) and launch gate (GEOAI_TASK_MCP_ALLOW_LAUNCH) are explicitly deleted from the spawned child's environment regardless of the ambient extension-host environment, and no archive/restore/done/reject/launch affordance exists anywhere in the Webview or extension host; the pre-existing Task MCP workers/callback bridge/HTTP dashboard server are unchanged and continue operating independently.",
+  "architecture_change": {
+    "before": "extension.js ran a bounded /healthz + autostart loop against a loopback HTTP dashboard process, then framed the dashboard's own served HTML in a sandboxed <iframe> resolved through vscode.env.asExternalUri against an explicit /embed/vscode CSP-relaxed route.",
+    "after": "extension.js spawns and owns exactly one `python3 -m geoai_task_mcp.server` stdio child, drives it with a hand-rolled JSON-RPC 2.0 client (no npm dependency), and renders a fully native Webview (media/app.js + media/app.css) built from the MCP tool responses -- no HTTP server, no iframe, no asExternalUri, no LAN IP, no manual port forwarding anywhere in the path.",
+    "iframe_removed": true,
+    "http_dashboard_dependency_removed": true,
+    "asexternaluri_removed": true,
+    "openexternal_or_simplebrowser_present": false
+  },
+  "mcp_stdio_client": {
+    "child_spawn_sites": 1,
+    "spawned_command": "<python3> -m geoai_task_mcp.server",
+    "handshake": ["initialize", "notifications/initialized"],
+    "tool_call_method": "tools/call",
+    "request_id_scheme": "monotonic integer, exact per-request, never reused",
+    "pending_request_map_bound": 16,
+    "request_timeout_ms": 20000,
+    "response_size_cap_bytes": 8388608,
+    "stderr_handling": "bounded length + redaction of 24+ char opaque token-shaped substrings before logging",
+    "restart_policy": "exactly one bounded restart attempt on unexpected child exit, then native offline/retry state",
+    "write_gate_env": "GEOAI_TASK_MCP_ALLOW_WRITES deleted from child env before spawn",
+    "launch_gate_env": "GEOAI_TASK_MCP_ALLOW_LAUNCH deleted from child env before spawn"
+  },
+  "dashboard_mcp_tools": {
+    "module": "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py",
+    "tools": ["geoai_dashboard_snapshot", "geoai_dashboard_task_detail", "geoai_dashboard_health"],
+    "sole_data_builders": ["dashboard.build_snapshot", "dashboard.build_task_detail", "core.health"],
+    "second_data_model_introduced": false,
+    "task_id_validation": "reuses dashboard._TASK_ID_RE (same compiled pattern object) -- no second regex",
+    "transport_bounds": {
+      "snapshot_max_bytes": 4194304,
+      "task_detail_max_bytes": 1048576,
+      "truncation_reported_never_silent": true
+    },
+    "server_wiring": "dashboard_mcp_app.register(mcp) called from server.py, same pattern as cli_adapter_readonly_tool.register(mcp)",
+    "extension_call_sites": {
+      "geoai_dashboard_snapshot": "pushSnapshot() -- called on ready/refresh/retry and by each view's poll timer",
+      "geoai_dashboard_task_detail": "pushTaskDetail() -- called on selectTask with a regex-validated task_id",
+      "geoai_dashboard_health": "restartMcpConnectionCommand() -- confirms the freshly (re)started session actually answers, distinct from the full snapshot pull"
+    }
+  },
+  "webview_message_contract": {
+    "inbound_from_webview": ["ready", "refresh", "retry", "selectTask", "setAutoRefresh", "setRefreshInterval"],
+    "outbound_to_webview": ["snapshot", "taskDetail", "offline", "error"],
+    "task_id_pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$",
+    "allowed_refresh_intervals_ms": [10000, 30000, 60000],
+    "webview_receives_coordinator_token": false,
+    "webview_receives_env_or_filesystem_path": false,
+    "webview_receives_raw_mcp_capability": false,
+    "webview_can_call_arbitrary_tool": false
+  },
+  "csp": {
+    "mode": "strict per-render nonce",
+    "script_src": "'nonce-<random 16-byte hex, generated per getHtmlForWebview call>'",
+    "style_src": "webview.cspSource",
+    "img_src": "webview.cspSource + data:",
+    "font_src": "webview.cspSource",
+    "frame_src": "'none'",
+    "connect_src": "'none'",
+    "object_src": "'none'",
+    "unsafe_inline_present": false,
+    "unsafe_eval_present": false,
+    "remote_origin_present": false
+  },
+  "rendering": {
+    "dynamic_content_method": "textContent + DOM construction (createElement/replaceChildren) only",
+    "innerHTML_with_dynamic_data": false,
+    "innerHTML_present_at_all": false,
+    "panel_reuse": "single createWebviewPanel call, reveal() on subsequent opens, retainContextWhenHidden true",
+    "webview_state_persistence": "vscode.getState()/setState() for selectedTaskId/status filter/sort order",
+    "hidden_view_polling_stop": "host-owned ViewState.timer cleared on onDidChangeVisibility/onDidChangeViewState when !visible"
+  },
+  "remote_ssh": {
+    "extension_kind": ["workspace"],
+    "owner_managed_forwarding_required": false,
+    "repo_resolution": "vscode.workspace.workspaceFolders[0].uri.fsPath",
+    "python_discovery": [
+      "<repo>/tools/geoai-task-mcp/.venv/bin/python3",
+      "<repo>/.venv/bin/python3",
+      "python3 on PATH"
+    ],
+    "offline_diagnostic": "native offline/retry banner posted to the Webview on no_workspace_folder / spawn failure / handshake timeout / restart exhaustion -- never a browser"
+  },
+  "read_only_scope": {
+    "archive_restore_done_reject_launch_in_webview": false,
+    "arbitrary_mcp_call_in_webview": false,
+    "existing_http_dashboard_server_changed": false,
+    "existing_task_mcp_workers_changed": false,
+    "existing_callback_bridge_changed": false
+  },
+  "changed_paths": [
+    "tools/vscode-geoai-task-operations/package.json",
+    "tools/vscode-geoai-task-operations/extension.js",
+    "tools/vscode-geoai-task-operations/media/app.js",
+    "tools/vscode-geoai-task-operations/media/app.css",
+    "tools/vscode-geoai-task-operations/media/geoai-tasks.svg",
+    "tools/vscode-geoai-task-operations/README.md",
+    "tools/vscode-geoai-task-operations/install_remote.sh",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/eval/task_mcp_vscode_native_mcp_app_b615_v1.json",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_vscode_native_mcp_app_b615_v1_next_wave.json"
+  ],
+  "no_writes_outside_allowed": true,
+  "core_py_untouched": true,
+  "dashboard_py_untouched": true,
+  "taskdb_py_untouched": true,
+  "credentials_untouched": true,
+  "callback_lifecycle_untouched": true,
+  "second_task_database": false,
+  "queue_mutation": false,
+  "coordinator_token_in_extension": false,
+  "lan_ip_in_extension": false,
+  "file_hashes_sha256": {
+    "tools/vscode-geoai-task-operations/package.json": "12779684c956a226484bb59dd4b5dcd4d44393b43b8d5d09a4018ede92380417",
+    "tools/vscode-geoai-task-operations/extension.js": "c7ba82b4efe615dec966e28d34f593a372a4cd3c33023a1fdc4dbde7b934893d",
+    "tools/vscode-geoai-task-operations/media/app.js": "708e533b5b1ca2d6b6f7e5003288475a9fce4d81c22eca41acbbc8a392e48edd",
+    "tools/vscode-geoai-task-operations/media/app.css": "67364b70ffa7efd332448d51057254d253cb1cfef84f27c0012220eeaa885959",
+    "tools/vscode-geoai-task-operations/media/geoai-tasks.svg": "9aea41f5c3e7673ce955c4259107c04240d13f67e2d50b247b4ea76504bb3361",
+    "tools/vscode-geoai-task-operations/README.md": "58cc4f3cb134c7ab673497b6f5ec010fd78c9f2167fcf54fd30ca8fd5351f778",
+    "tools/vscode-geoai-task-operations/install_remote.sh": "116198f71164fe2c762646e349bde9db7704ce0ddb49e278235921f9e74d6c88",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "2049c002745d12af5e6011e1b51930b50c4cc2e88377ec0557cdb82a6189b59e",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py": "44651099a40f5405a24ddd232ab889e66dd3190e161183042ebaa09274c73482",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py": "b1b23a71e7178b5b32fbc04168ee4dcf38cb0d10bc8ca6fba53feaa700acfbbf",
+    "tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py": "48cce6039af88d2e76564affe537c27c2b3dd61a1114d3d9d746287619b749ab"
+  },
+  "tests": {
+    "node_check_extension_js": "PASS",
+    "node_check_app_js": "PASS",
+    "test_extension_smoke_sh": {
+      "result": "PASS",
+      "assertions_passed": 24,
+      "assertions_failed": 0
+    },
+    "python_pytest_test_dashboard_mcp_app": {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py",
+      "result": "UNVERIFIABLE_IN_THIS_WORKER_SANDBOX",
+      "reason": "This isolated worker sandbox has neither `pytest` nor the `mcp` package installed, and pip/venv installs fail here with EPERM on chmod/utimensat for any newly created or existing file (confirmed: `python3 -m venv`, `pip install --target`, and even `touch` on an existing path all fail with 'Operation not permitted' on metadata operations) -- a sandbox-level filesystem restriction, not a repo issue. Verified instead via `python3 -m py_compile` on dashboard_mcp_app.py, server.py, and test_dashboard_mcp_app.py (all compile cleanly) and by manual trace of every test against the implementation. The coordinator is expected to re-run this exact pytest command in an environment with `pytest`/`mcp` installed as part of its independent validation rerun."
+    },
+    "json_tool_eval_file": "PASS (this file)",
+    "taskctl_verify": {
+      "result": "FAIL (10 pre-existing errors, none touching this task's allowed_writes)",
+      "note": "All 10 failures are RUNNER_TASK_BATCH_MISMATCH / active-duplicate-runner errors on unrelated B475/B480 lexicon shard cards and a B548/B549 parse_place_spatial card -- none reference CLAUDE_SONNET5_TASK_MCP_VSCODE_NATIVE_APP_B615_V1, tools/vscode-geoai-task-operations, or tools/geoai-task-mcp. Pre-existing shared-queue state, not caused by this task."
+    },
+    "taskctl_collision_guard": {
+      "result": "10 pre-existing file collisions reported among 156 active cards, none in this task's allowed_writes",
+      "note": "Collisions are on bitnnv2/data/review/lexicon_b480_authority/**, bitnnv2/data/contracts/parse_place_spatial_s0_abi_contract_v1.json, and tools/geoai-task-mcp/README.md (a file this task does not write) between other in-flight cards. No collision involves tools/vscode-geoai-task-operations/**, dashboard_mcp_app.py, test_dashboard_mcp_app.py, or this task's eval/next-wave JSON files."
+    }
+  },
+  "worker_stops_here": true,
+  "codex_review_requested": true
+}

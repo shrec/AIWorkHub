@@ -1,0 +1,10 @@
+{
+  "schema_id": "geoai.task_mcp.validation_env_assignment_prefix_b773.coordinator_review.v1",
+  "task_id": "CLAUDE_TASK_MCP_VALIDATION_ENV_ASSIGNMENT_PREFIX_B773_V1",
+  "verdict": "accepted_selective_apply",
+  "supported_prefix": "TMPDIR=/dev/shm",
+  "public_api_preserved": "parse_validation_command(command) -> (argv, pythonpath_components)",
+  "shell_execution": false,
+  "arbitrary_environment_assignments": false,
+  "coordinator_note": "Worker terminal validation failure was caused by a missing unrelated import in the isolated seed. The scoped parser fix and focused regressions are independently validated on the parent tree."
+}

@@ -1,0 +1,66 @@
+{
+  "schema_id": "geoai.task_mcp.worker_result.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_MULTI_INSTANCE_SIDEBAND_ROUTING_B471_V2",
+  "date": "2026-07-16",
+  "objective": "B472: eliminate callback loss when several VS Code extension-host App Server mux processes run concurrently and overwrite one fixed sideband.sock/cap path.",
+  "root_cause": {
+    "measured_topology": "mux PIDs 703036, 896247, 924074 simultaneously alive during the B471 live canary, all bound the single fixed ~/.geoai/app_server_mux/sideband.sock + sideband.cap path",
+    "beyond_b471_selector": "B471 fixed the wrong-turn selector (unique-newest inProgress by startedAt); the still-open defect was topological -- every mux instance's start()/_bind_socket()/write_capability_token() unconditionally unlinked and rebound the SAME shared socket/cap path, so the newest process silently shadowed the origin thread owner's endpoint and every sideband call (regardless of which thread it targeted) reached only the newest mux's child App Server."
+  },
+  "fix": {
+    "per_instance_endpoint": "AppServerMux now generates a random per-instance id (secrets.token_hex(4), same length as the legacy 'sideband' stem so AF_UNIX 108-byte deployments are unaffected) and binds sideband_dir/<id>.sock + <id>.cap. _bind_socket() never unlinks a pre-existing path -- on collision it regenerates a fresh id and retries (bounded, SIDEBAND_SOCKET_BIND_MAX_ATTEMPTS) so a live sibling instance's endpoint is never clobbered.",
+    "atomic_registry": "Each instance publishes sideband_dir/instances/<id>.json: instance_id, pid, pid_start_time (/proc/<pid>/stat field 22), socket_path, capability_path, owned_thread_ids. Written via the same hardened owner-only atomic-write helper as the capability token (0600, owner/uid checked, bounded size). Liveness resolution (_pid_is_live) requires BOTH pid alive AND matching start-time, so a later process that recycles a dead instance's pid is never mistaken for the original owner.",
+    "owner_only_thread_tracking": "AppServerMux._observe_extension_message records a thread id into owned_thread_ids ONLY when it observes the EXTENSION's own thread/resume, turn/start, or turn/steer request on the extension->child pump. dispatch_sideband() (the path every callback-bridge probe uses) writes straight to the child via _write_to_child and never passes through that observer, so a sideband thread/resume can never claim or steal ownership -- verified directly by driving the raw socket out-of-band.",
+    "client_side_resolution": "SidebandCallbackClient resolves find_owning_sideband_instances(sideband_dir, thread_id) before every call. Zero matches -> SidebandOwnerNotFoundError; more than one -> SidebandOwnerAmbiguousError. Both subclass BusyThreadError, so CallbackBridge._process_batch durably parks the whole batch via the existing non-blocking capped-backoff path and never touches the dead-letter hard-failure budget. Exactly one match -> the client addresses only that instance's socket/capability pair -- never a fan-out, never the newest.",
+    "b471_preserved": "select_steer_target, the unique-newest-inProgress-by-startedAt selector, and the mux's thread/resume projection (id/status/startedAt only) are unchanged."
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_app_server_mux.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/MVP_ROADMAP.md",
+    "tools/geoai-task-mcp/scripts/geoai-task-callback-bridge.service"
+  ],
+  "new_tests": {
+    "test_app_server_mux.py": [
+      "test_two_mux_instances_never_collide_or_clobber_each_other",
+      "test_bind_socket_regenerates_id_on_collision_without_unlinking_existing_file",
+      "test_ownership_recorded_only_from_extension_thread_resume",
+      "test_sideband_issued_resume_never_recorded_as_ownership",
+      "test_sideband_registry_file_mode_is_owner_only"
+    ],
+    "test_callback_bridge.py": [
+      "test_two_mux_instances_coexist_with_distinct_endpoints",
+      "test_two_instances_each_thread_resolves_to_its_correct_owner_never_wrong_server",
+      "test_sideband_probe_never_registers_ownership_and_cannot_steal_thread",
+      "test_stale_registry_row_from_dead_process_is_ignored",
+      "test_ambiguous_owner_across_two_live_instances_durably_parks",
+      "test_sideband_exception_hierarchy_bounded_vs_durable_park",
+      "test_sideband_client_missing_owner_raises_durable_park_not_hard_failure",
+      "test_sideband_client_owner_resolved_but_not_ready_raises_unavailable_error"
+    ]
+  },
+  "verification": {
+    "app_server_mux_pytest": "45 passed",
+    "callback_bridge_pytest": "81 passed, 22 pre-existing failures unrelated to this task (see blocked_by_environment)",
+    "taskctl_verify": "PASS",
+    "collision_guard": "reports 8-file collision between this task_id (CLAUDE_SONNET5_TASK_MCP_MULTI_INSTANCE_SIDEBAND_ROUTING_B471_V2) and its own already-archived predecessor card CLAUDE_SONNET5_TASK_MCP_MULTI_INSTANCE_SIDEBAND_ROUTING_B472_V1 (archived_at set) sharing the identical allowed_writes set -- a task-graph administrative artifact, not a code defect; not resolvable by a worker (taskctl lifecycle is Codex-owned)"
+  },
+  "blocked_by_environment": {
+    "isolated_worktree_missing_dependencies": [
+      "tools/geoai-task-mcp/tests/_fake_app_server.py and tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py exist untracked in the live /home/shrek/GeoAI checkout but were absent from this isolated git worktree (untracked files do not propagate to `git worktree add`); copied verbatim into this worktree, unmodified, solely to make the required pytest command executable -- not part of this task's diff",
+      "AITools/taskdb.py in the live repo carries a large uncommitted addition (claim_pending_callback_batch, enqueue_callback, callback_outbox_stats, callback_batches table) that this isolated worktree's checkout predates; 22 test_callback_bridge.py cases that exercise CallbackBridge.run_once() through the real outbox therefore fail here with AttributeError on taskdb, NOT on anything touched by this task -- every failure trace bottoms out at taskdb, never at app_server_mux.py/callback_bridge.py/select_steer_target/SidebandCallbackClient. Not copied into this worktree (out of scope, too large to vet as a side effect of this task); expected to pass once run against the live repo's actual taskdb.py."
+    ],
+    "sandbox_fchmod_denied": "This sandbox denies the fchmod(2) syscall outright (EPERM) even on a file this process just created with an explicit 0600 os.open() mode -- write_capability_token's original hard fchmod() call made every sideband test fail before any of this task's logic ran. Fixed by wrapping fchmod in contextlib.suppress(OSError) (matching the pattern already used for ensure_private_dir's chmod) and keeping the trailing stat-based 0600 verification as the real, unconditional gate -- verified the umask in this sandbox (0o002) still yields exactly 0600 from the os.open() mode argument alone."
+  },
+  "authority": {
+    "no_commit": true,
+    "worker_did_not_run_taskctl_lifecycle": true,
+    "worker_did_not_restart_vscode_or_kill_live_mux": true,
+    "worker_did_not_mutate_callback_rows": true,
+    "worker_did_not_run_live_owner_thread_canary": true,
+    "requesting_codex_review": true
+  }
+}

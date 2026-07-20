@@ -1,0 +1,195 @@
+{
+ "contract_id": "phase2_orchestration_contract_b104_v1",
+ "task_id": "CLAUDE_TASK_MCP_PHASE2_ORCHESTRATION_CONTRACT_B104_V1",
+ "mode": "orchestration_contract_no_launch_code",
+ "builds_on": "agent_launcher_design_v1",
+ "roadmap_phase": "Phase 2 - Agent Launcher MVP",
+ "purpose": "Define the Phase-2 MCP orchestration contract for launching local CLI workers LATER: command allowlist, sandbox/logging, token/cost reporting, adapter boundaries, and Codex review handoff. This is a design/contract artifact only; it adds NO launch/process code and keeps every launch action disabled by default.",
+ "launch_enabled_by_default": false,
+ "command_allowlist": [
+  "claude",
+  "codex",
+  "python3 AITools/taskctl.py auto-pickup",
+  "python3 AITools/taskctl.py contract",
+  "python3 AITools/taskctl.py show",
+  "python3 AITools/taskctl.py review",
+  "python3 AITools/taskctl.py collision-guard",
+  "python3 AITools/taskctl.py verify",
+  "python3 AITools/taskctl.py usage"
+ ],
+ "command_allowlist_policy": {
+  "rule": "Only launchable binaries on this static allowlist ('claude', 'codex') may ever be prepared for launch; the manual DeepSeek adapter is never a local command. The taskctl subcommands are the ONLY parent-repo commands a launched worker is expected to run. Anything not on the list is blocked and audited.",
+  "launchable_binaries": ["claude", "codex"],
+  "manual_only": ["deepseek_manual"],
+  "no_arbitrary_command": true
+ },
+ "sandbox": {
+  "cwd_pin": "GEOAI_REPO",
+  "argv_list_only": true,
+  "no_shell": true,
+  "env_scrub": "Pass only PYTHONPATH, GEOAI_REPO, PATH, and allowlisted GEOAI_TASK_MCP_* flags; drop all secret-bearing variables. Values are never copied into logs.",
+  "bounded_timeout_seconds_default": 3600,
+  "concurrency_cap_default": 1,
+  "network_policy": "Orchestrator opens no new listeners; a launched worker inherits host network only.",
+  "filesystem_scope": "A launched worker is confined to the GEOAI_REPO working tree; allowed_writes are enforced by taskctl, not by the orchestrator.",
+  "rollback": "Unsetting GEOAI_TASK_MCP_ALLOW_LAUNCH restores the fully-disabled default."
+ },
+ "logging": {
+  "audit_log_path_default": "tools/geoai-task-mcp/logs/audit.jsonl",
+  "audit_log_path_override_env": "GEOAI_TASK_MCP_AUDIT_LOG_PATH",
+  "append_only": true,
+  "never_logs_secret_values": true,
+  "reuse": "core.write_audit_entry",
+  "logged_actions": [
+   "launch_planned",
+   "launch_blocked_disabled",
+   "launch_would_run",
+   "review_handoff_prepared"
+  ],
+  "per_launch_fields": [
+   "timestamp",
+   "task_id",
+   "runner",
+   "topic",
+   "adapter_id",
+   "cwd",
+   "decision",
+   "blocked_reason"
+  ]
+ },
+ "token_cost_reporting_fields": [
+  "task_id",
+  "runner",
+  "adapter_id",
+  "model",
+  "input_tokens",
+  "output_tokens",
+  "total_tokens",
+  "cost_usd",
+  "wall_time_seconds",
+  "token_budget_max",
+  "token_budget_remaining",
+  "reported_via"
+ ],
+ "token_cost_reporting_policy": {
+  "per_task": true,
+  "reported_via": "python3 AITools/taskctl.py usage <task_id> --runner <runner> --model <model> --input-tokens N --output-tokens N [--cost-usd X]",
+  "budget_enforcement": "token_budget_max is a per-task ceiling; a launched worker over budget is reported and blocked from further launches, never silently continued.",
+  "note": "Token/cost reporting is per task and per adapter so orchestration cost is observable and attributable; secret env values are never recorded."
+ },
+ "adapters": {
+  "claude_cli": {
+   "kind": "local_cli",
+   "separate_model": true,
+   "disabled_by_default": true,
+   "human_in_the_loop": false,
+   "detect": "read-only PATH presence probe (shutil.which style); absence => adapter unavailable, never launched",
+   "invocation_template_not_wired": "argv-list template ['claude','-p','<prompt>','--cwd','<GEOAI_REPO>'] prepared only; NOT executed by this contract",
+   "review_role": "worker",
+   "boundary": "A launched Claude CLI instance is a heavy implementation/integration WORKER only: it runs exactly one claimed task inside allowed_writes, runs validation, calls taskctl review, and never finalizes done."
+  },
+  "codex_cli": {
+   "kind": "local_cli",
+   "separate_model": true,
+   "disabled_by_default": true,
+   "human_in_the_loop": false,
+   "detect": "read-only PATH presence probe (shutil.which style); absence => adapter unavailable, never launched",
+   "invocation_template_not_wired": "argv-list template ['codex','exec','<prompt>','--cwd','<GEOAI_REPO>'] prepared only; NOT executed by this contract",
+   "review_role": "reviewer_finalizer",
+   "boundary": "Codex is the orchestrator/reviewer/finalizer. A launched Codex WORKER instance must NOT self-review or finalize a task it executed; separation-of-duties keeps executor and reviewer distinct."
+  },
+  "deepseek_manual": {
+   "kind": "manual_external",
+   "separate_model": true,
+   "disabled_by_default": true,
+   "human_in_the_loop": true,
+   "detect": "n/a - external hosted model; presence is human-confirmed, never machine-probed",
+   "invocation_template_not_wired": "No local process: orchestrator renders a handoff packet (prompt + task card + cwd + runner/topic) for a human to paste into the Copilot-hosted DeepSeek session",
+   "review_role": "worker",
+   "boundary": "No local process and no API key is held by the orchestrator; the human is the executor and the gate. Returns to Codex review like any worker."
+  }
+ },
+ "codex_review_handoff": {
+  "trigger": "a launched/executed worker task reaches taskctl review state",
+  "command": "python3 AITools/taskctl.py review <task_id> --runner <runner>",
+  "finalizer": "codex",
+  "separation_of_duties": "The adapter that executed a task is never the adapter that reviews or finalizes it; a launched Codex worker cannot review its own executed task.",
+  "packet_fields": [
+   "task_id",
+   "runner",
+   "topic",
+   "adapter_id",
+   "changed_paths",
+   "tests_run",
+   "verdict",
+   "token_cost_report",
+   "audit_log_ref"
+  ],
+  "worker_must_not": [
+   "run taskctl done",
+   "create follow-up task cards",
+   "self-review own executed task"
+  ]
+ },
+ "launch_preconditions": [
+  {
+   "id": "allow_launch_flag",
+   "requirement": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 (default '0'); without it every request terminates blocked_launch_disabled."
+  },
+  {
+   "id": "allow_writes_flag",
+   "requirement": "GEOAI_TASK_MCP_ALLOW_WRITES=1 (default '0'); write-gate parity is required in addition to the launch flag."
+  },
+  {
+   "id": "runner_topic_allowlist",
+   "requirement": "The runner/topic pair is on an explicit static allowlist; any unknown or off-topic pair is blocked and audited."
+  },
+  {
+   "id": "command_allowlist_match",
+   "requirement": "The launchable binary is on command_allowlist ('claude' or 'codex'); no arbitrary command is ever prepared or run."
+  },
+  {
+   "id": "collision_guard_preflight",
+   "requirement": "taskctl collision-guard passes immediately before launch; any stale or conflicting claim blocks it."
+  },
+  {
+   "id": "dry_run_default",
+   "requirement": "Plan-only (dry-run) is the default action; a real launch needs an explicit opt-in argument beyond the gate flags, never the default code path."
+  },
+  {
+   "id": "cwd_env_sandbox_pin",
+   "requirement": "cwd pinned to GEOAI_REPO, scrubbed env, argv-list-only with no shell invocation, and a bounded timeout."
+  },
+  {
+   "id": "concurrency_cap",
+   "requirement": "The concurrency cap (default 1) is not exceeded; over-cap requests are blocked to protect the workstation and the shared task queue."
+  },
+  {
+   "id": "audit_log_entry",
+   "requirement": "An append-only audit entry is written for the launch decision (planned / blocked / would_run); secret env values are never logged."
+  },
+  {
+   "id": "adapter_available",
+   "requirement": "The adapter is available: a read-only presence probe for local_cli adapters, human-confirmed presence for the manual_external adapter."
+  }
+ ],
+ "invariant": {
+  "launch_enabled_by_default": false,
+  "launch_actions_enabled": false,
+  "launch_code_added": false,
+  "write_gate_disabled": false,
+  "proposed_enable_flag": "GEOAI_TASK_MCP_ALLOW_LAUNCH",
+  "requires_also": "GEOAI_TASK_MCP_ALLOW_WRITES=1",
+  "default": "0"
+ },
+ "neural_bridge_note": "Per GeoAI neural-control-first doctrine, the FUTURE selection of adapter/runner/topic (which agent to launch for which task) must be a LEARNED routing decision, not a regex/keyword cue router. This contract adds NO cue router and NO runtime keyword branch: the command allowlist and runner/topic allowlist are static human-configured safety boundaries, and adapter availability is a read-only presence probe. The intelligence layer (learned launch/route/abstain policy) is deferred to trainable targets tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, so no hidden regex/table cognition becomes launch authority.",
+ "acceptance": {
+  "launch_preconditions_defined_no_launch_code": "pass",
+  "three_adapter_boundaries": "pass",
+  "token_cost_reporting_fields": "pass",
+  "disabled_by_default_preserved": "pass",
+  "codex_review_handoff_defined": "pass"
+ },
+ "no_launch_code_marker": "This artifact and its siblings contain NO process-launch code (no child-process spawn, no os-level exec or fork, no shell invocation). Launch/process code arrives only in the gated Phase-2 follow-up tasks, and only behind all launch_preconditions.",
+ "verdict": "PASS"
+}

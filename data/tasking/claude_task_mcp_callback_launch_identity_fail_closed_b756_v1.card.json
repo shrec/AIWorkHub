@@ -1,0 +1,73 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_TASK_MCP_CALLBACK_LAUNCH_IDENTITY_FAIL_CLOSED_B756_V1",
+  "runner": "claude_task_mcp_callback_launch_identity_fail_closed_b756_v1",
+  "topic": "task_mcp",
+  "logical_topic": "task_mcp_callback_reliability",
+  "title": "Make distinct-launch callback identity authorized and fail closed",
+  "objective": "Implement the accepted B674 root-cause repair without its allowlist bypass or fail-open launch. A worker child may start only after its exact request identity is durably bound under the exact runner/topic authority; same-request terminal retries deduplicate and a distinct launch gets one new durable wake.",
+  "priority": "critical",
+  "queue_order": 756001,
+  "recommended_model": "claude-sonnet-5",
+  "read_first": [
+    "AGENTS.md",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_episode_b674_coordinator_review_v1.json",
+    "AITools/taskdb.py",
+    "AITools/taskctl.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "AITools/test_taskctl_origin_thread_callback_b384_v1.py"
+  ],
+  "allowed_writes": [
+    "AITools/taskdb.py",
+    "AITools/taskctl.py",
+    "AITools/test_taskctl_callback_launch_identity_b756_v1.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+  ],
+  "required_outputs": [
+    "AITools/test_taskctl_callback_launch_identity_b756_v1.py",
+    "tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+  ],
+  "acceptance": [
+    "Preserve B674's useful request_id-widened outbox migration only if every existing row is preserved, historical delivered rows are not replayed, and repeated initialization is idempotent.",
+    "Create an exact authorized launch-identity write path. Extend the runner/topic action allowlist explicitly; core.run_taskctl must receive runner and topic. Omitting identities to bypass the allowlist is forbidden.",
+    "Binding must succeed durably before the model child is spawned. A binding failure or exception rejects the launch and starts no child; perform a safe claim release/recovery if claim-start already mutated state, or make claim-and-bind atomic.",
+    "The terminal callback row must carry the exact durable request identity. Reconciliation/retry for the same request enqueues at most once, while a fresh request for the same task/transition/claim context enqueues one additional wake.",
+    "Preserve origin-thread validation, terminal-review-only routing, busy parking, batching, dead-letter recovery, process liveness and coordinator authority.",
+    "Regression tests must explicitly reject both B674 flaws: fail-open binding and identity-free core.run_taskctl. Include a no-child-spawn assertion on bind failure and isolated migration/callback lifecycle tests."
+  ],
+  "validation": [
+    "python3 AITools/test_taskctl_callback_launch_identity_b756_v1.py",
+    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
+    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+  ],
+  "forbidden": [
+    "runner_topic_allowlist_bypass",
+    "best_effort_launch_identity",
+    "child_spawn_after_bind_failure",
+    "historical_callback_replay",
+    "origin_thread_bypass",
+    "nonterminal_wake",
+    "dashboard_change",
+    "model_data_change",
+    "roadmap_edit",
+    "git_commit",
+    "git_push",
+    "taskctl_done_by_worker"
+  ],
+  "commit_contract": "NO_COMMIT. Worker implements and tests only the fail-closed launch identity/callback contract; Codex owns promotion and reload.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {"required": true, "mode": "focus", "budget": 150, "query": "callback outbox request identity exact allowlist claim bind child spawn fail closed", "targets": ["AITools/taskdb.py", "AITools/taskctl.py", "tools/geoai-task-mcp/src/geoai_task_mcp/core.py", "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"]},
+    "session": {"topic": "Task MCP callback launch identity B756", "limit": 20},
+    "ai_memory": {"query": "B674 callback lost distinct request allowlist bypass", "limit": 10},
+    "kb": {"query": "Task MCP durable callback exact launch identity", "limit": 8}
+  }
+}

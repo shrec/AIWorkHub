@@ -1,0 +1,33 @@
+{
+  "authority_flags": {
+    "contract_frozen": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "byte_identical": true,
+  "committed_binding_recomputed_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "committed_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "committed_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "drift": [],
+  "drift_count": 0,
+  "failing_check": null,
+  "manifest_fingerprint_matches": true,
+  "mode": "mcp_manifest_regeneration_selftest_no_launch",
+  "ok": true,
+  "readonly_tool_count": 11,
+  "regenerated_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "regenerated_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "selftest_id": "mcp_unified_contract_manifest_selftest_b111_v1",
+  "source_provenance": {
+    "b108_eval_id": "mcp_client_smoke_contract_freeze_b108_v1",
+    "b108_eval_id_expected": true,
+    "b109_eval_id": "mcp_readonly_tool_result_schema_freeze_b109_v1",
+    "b109_eval_id_expected": true,
+    "committed_source": "git_head",
+    "committed_source_note": "compared against the git-HEAD-pinned committed manifest."
+  },
+  "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
+  "write_gated_tool_count": 4
+}

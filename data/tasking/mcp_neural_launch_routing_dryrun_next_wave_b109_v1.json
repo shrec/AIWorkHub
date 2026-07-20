@@ -1,0 +1,21 @@
+{
+  "next_wave_id": "mcp_neural_launch_routing_dryrun_next_wave_b109_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_NEURAL_ROUTING_DRYRUN_B109_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "notes": "Neural dryrun completed. If gates pass (adapter > majority, abstain precision > 0.8, collision abstain >= table), the next step is the GATED LAUNCH EXECUTOR that wires the learned router behind deterministic safety gates. Neural routing selects among adapters listed in the static allowlist; safety gates (write gate, launch precondition) remain deterministic boundaries. Default stays fully disabled; launch requires explicit ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all preconditions pass AND neural router selects adapter.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B108_V1",
+      "goal": "Wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH; real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass AND the neural router (once trained) selects the adapter. Default stays fully disabled.",
+      "mode": "implementation_gated_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "launch unreachable without explicit gate AND neural router selection",
+        "default disabled; deterministic safety gates remain",
+        "argv-list only, no shell, cwd pinned, env scrubbed"
+      ]
+    }
+  ]
+}

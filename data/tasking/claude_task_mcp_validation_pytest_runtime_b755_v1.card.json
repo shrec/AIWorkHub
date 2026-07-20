@@ -1,0 +1,61 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_TASK_MCP_VALIDATION_PYTEST_RUNTIME_B755_V1",
+  "runner": "claude_task_mcp_validation_pytest_runtime_b755_v1",
+  "topic": "task_mcp",
+  "logical_topic": "task_mcp_validation_runtime",
+  "title": "Expose only the approved pytest runtime to sanitized worker validation",
+  "objective": "Close the exact B753/B674 false-negative path: isolated validation preserves credential-free HOME but cannot import the operator-installed pytest package. Add a bounded read-only validation-only Python runtime binding without exposing arbitrary user-site content, credentials, or writable package state.",
+  "priority": "high",
+  "queue_order": 755001,
+  "recommended_model": "claude-sonnet-5",
+  "read_first": [
+    "AGENTS.md",
+    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_coordinator_review_v1.json",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/geoai-task-mcp/tests/test_worker_workspace.py"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+  ],
+  "acceptance": [
+    "Reproduce python3 -m pytest import failure under the current sanitized validation HOME while parent-host pytest is installed.",
+    "For pytest validation only, resolve one canonical trusted Python package root, reject symlinks/untrusted ownership/world-writable paths, bind it read-only in the validation sandbox and prepend only that exact path to PYTHONPATH while preserving the card's relative project PYTHONPATH.",
+    "Do not copy packages, expose the real HOME, inherit credentials, add arbitrary host paths or make package roots writable. Non-pytest validation commands must keep byte-equivalent environment/path behavior.",
+    "Fail closed with an explicit infrastructure error when no approved pytest runtime exists. Request-private executable scratch and cleanup from B753 must remain intact.",
+    "Use a standalone unittest-compatible regression command so this task's own validation does not depend on the bug it repairs; cover pytest success, untrusted/symlink rejection, non-pytest unchanged behavior, credential isolation and cleanup."
+  ],
+  "validation": [
+    "python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+  ],
+  "forbidden": [
+    "real_home_passthrough",
+    "credential_passthrough",
+    "writable_user_site",
+    "arbitrary_pythonpath",
+    "package_copy",
+    "task_queue_change",
+    "callback_change",
+    "roadmap_edit",
+    "git_commit",
+    "git_push",
+    "taskctl_done_by_worker"
+  ],
+  "commit_contract": "NO_COMMIT. Worker repairs only the isolated validation pytest runtime boundary and stops at Codex review.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {"required": true, "mode": "focus", "budget": 90, "query": "worker validation sanitized HOME PYTHONPATH readonly pytest runtime", "targets": ["tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py"]},
+    "session": {"topic": "Task MCP pytest validation runtime B755", "limit": 12},
+    "ai_memory": {"query": "B753 B674 pytest missing sanitized HOME", "limit": 6},
+    "kb": {"query": "Task MCP validation sandbox Python runtime", "limit": 6}
+  }
+}

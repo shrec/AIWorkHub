@@ -1,0 +1,69 @@
+{
+  "next_wave_id": "cli_adapter_readonly_tool_next_wave_b106_v1",
+  "parent_task": "CLAUDE_TASK_MCP_CLI_ADAPTER_READONLY_TOOL_B106_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps launch DISABLED by default and adds NO process-spawn code until the FINAL gated task, and only behind ALL launch_preconditions from phase2_orchestration_contract_b104_v1. This B106 module stays strictly read-only; the ONLY write path (append action=launch_planned audit) and process launch arrive in later gated tasks. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_READONLY_TOOL_SERVER_WIRING_B107_V1",
+      "goal": "Wire cli_adapter_readonly_tool.register(mcp) into server.py so geoai_cli_adapter_plan_readonly / _audit_summary_readonly / _report_readonly are live @mcp.tool()s. Adjust tool signatures to JSON-schema-friendly params (no Any) as FastMCP requires. Still strictly read-only; no process launch; no queue/audit write.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/tests/test_readonly_tool_server_wiring_b107_v1.sh",
+        "tools/geoai-task-mcp/eval/readonly_tool_server_wiring_b107_v1.json"
+      ],
+      "acceptance": [
+        "three read-only tools registered and callable via the MCP server",
+        "tools write nothing (no audit append, no queue mutation) with ALLOW_WRITES unset AND set",
+        "no process launch; signatures serialize to a valid MCP JSON schema"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_READONLY_COLLISION_PREFLIGHT_B107_V1",
+      "goal": "Add a read-only collision preflight to the plan output: report whether the plan's runner/topic/task would collide with an active claim, reusing core.collision_guard READ-ONLY (no mutation). Plan carries a would_collide flag; no launch, no write.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py",
+        "tools/geoai-task-mcp/tests/test_readonly_collision_preflight_b107_v1.sh",
+        "tools/geoai-task-mcp/eval/readonly_collision_preflight_b107_v1.json"
+      ],
+      "acceptance": [
+        "plan reports would_collide against active claims, read-only",
+        "collision preflight mutates nothing and launches nothing",
+        "write gate stays off; secrets redacted"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+      "goal": "Produce trainable curriculum rows for a LEARNED adapter/runner/topic launch-routing + abstain policy that replaces the static allowlist SELECTION (not the safety boundary) with a neural router. The read-only plan tool becomes the evidence extractor / dry-run harness for the learned router. No cue/regex router introduced.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+      ],
+      "acceptance": [
+        "curriculum rows define task->adapter/runner/topic routing + abstain labels",
+        "no regex/keyword cue router introduced as launch authority",
+        "read-only plan tool cited as the dry-run evidence extractor"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B108_V1",
+      "goal": "FINAL: add the real launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH mirroring the ALLOW_WRITES gate; a real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass, using argv-list only, no shell, cwd pinned, env scrubbed. The read-only tool remains the default preview path. Default stays fully disabled; rollback = unset the flag; executor never reviews its own task.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_gated_launch_executor_b108_v1.sh",
+        "tools/geoai-task-mcp/eval/gated_launch_executor_b108_v1.json"
+      ],
+      "acceptance": [
+        "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",
+        "argv-list only, no shell, cwd pinned, env scrubbed, bounded timeout",
+        "default stays disabled; blocked attempts audited; rollback = unset ALLOW_LAUNCH; executor never reviews/finalizes its own task"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "eval_id": "audit_log_read_tool_b104_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_B104_V1",
+  "date": "2026-07-04",
+  "verdict": "PASS",
+  "summary": "Added read-only MCP tool geoai_task_audit_log_read that returns write-gate audit log summaries (counts by tool/action, last N entries). No writes, no workflow switch, no process launch. All authority flags preserved false.",
+  "gates": {
+    "read_only_tool_added": true,
+    "empty_log_handled": true,
+    "populated_log_summary_correct": true,
+    "counts_by_tool_correct": true,
+    "counts_by_action_correct": true,
+    "last_entries_capped": true,
+    "authority_flags_all_false": true,
+    "no_secrets_leaked": true,
+    "default_write_off": true,
+    "parent_queue_unmutated": true,
+    "smoke_test_passes": true,
+    "no_subprocess_launch": true,
+    "no_file_write": true
+  },
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/tests/audit_log_read_smoke.py",
+    "tools/geoai-task-mcp/tests/test_audit_log_read_tool_b104_v1.sh",
+    "tools/geoai-task-mcp/eval/audit_log_read_tool_b104_v1.json",
+    "tools/geoai-task-mcp/data/tasking/audit_log_read_tool_next_wave_b104_v1.json"
+  ],
+  "tool_signature": {
+    "name": "geoai_task_audit_log_read",
+    "parameters": "max_entries: int = 100",
+    "returns": {
+      "ok": "bool",
+      "audit_log_path": "string",
+      "audit_log_exists": "bool",
+      "total_entries": "int",
+      "entries_by_tool": "dict[str, int]",
+      "entries_by_action": "dict[str, int]",
+      "last_entries": "list[dict]",
+      "file_size_bytes": "int",
+      "writes_allowed": "bool",
+      "authority_flags": {
+        "write_gate_enabled": "bool",
+        "workflow_switch": "false",
+        "process_launch": "false",
+        "agent_launch": "false"
+      }
+    }
+  },
+  "no_write_gate_disable": true,
+  "no_workflow_switch": true,
+  "no_process_launch": true,
+  "no_agent_launch_enable": true
+}

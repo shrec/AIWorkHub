@@ -1,0 +1,69 @@
+{
+  "next_wave_id": "mcp_autolaunch_protocol_spec_next_wave_b275_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_PROTOCOL_SPEC_B275_V1",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued. This protocol spec defines the abstract contract; the next wave translates it into concrete, testable artifacts. CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1 remains the explicit owner-sign-off gate for any real launcher; nothing here changes that.",
+  "follow_up_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1",
+      "goal": "Translate the B275 protocol spec into concrete per-adapter command templates, exact CLI invocations, and a dryrun-safe implementation skeleton. Define the exact binary paths, env-var contracts, and completion polling intervals for each adapter. All authority_flags remain false; no real process spawn.",
+      "mode": "mcp_autolaunch_dryrun_spec_no_execution",
+      "runner": "deepseek_task_mcp_autolaunch_dryrun_b276",
+      "topic": "task_mcp",
+      "acceptance": [
+        "Concrete command templates for all 3 adapters (claude_cli, codex_cli, deepseek_manual)",
+        "Exact binary path resolution logic",
+        "Per-adapter completion polling intervals and stale timeouts",
+        "Dryrun-only: LAUNCH_IMPLEMENTED remains false",
+        "All authority_flags explicitly false",
+        "Builds on B275 state machine and safety gate contract"
+      ],
+      "builds_on": [
+        "mcp_autolaunch_protocol_spec_b275_v1"
+      ]
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_SAFETY_GATE_IMPL_B277_V1",
+      "goal": "Implement the 4-layer safety gate evaluation engine as defined in B275 protocol spec. Build the gate evaluator that checks G1 (env dual-gate), G2 (taskctl guard), G3 (allowed_writes scope), and G4 (LAUNCH_IMPLEMENTED flag) in order with short-circuit. Write a gated guard function that returns (passed: bool, failed_gate: str, reason: str). Still dryrun: LAUNCH_IMPLEMENTED is False so G4 always fails by design. Include deterministic tests for each gate's pass and fail conditions.",
+      "mode": "implementation_safety_gate_no_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "All 4 gates implemented as Python functions returning (passed, failed_gate, reason)",
+        "Sequential evaluation with short-circuit on first failure",
+        "G4 always returns False with reason=launch_not_implemented",
+        "Deterministic tests for each gate: pass and fail cases",
+        "No process launch code; no subprocess/Popen/exec",
+        "Integration test: gate evaluator rejects all current task cards (G4 blocks)"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_AUTOLAUNCH_POLLING_LOOP_B278_V1",
+      "goal": "Implement the POLL state polling loop from B275 protocol spec. Poll taskctl.py runner-status at adapter-specific intervals; detect when worker_status transitions to review OR when stale_timeout is exceeded. Emit structured poll events to the audit log. No process spawn; poll loop is testable with mock task state transitions.",
+      "mode": "implementation_polling_loop_no_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "Polling loop reads taskctl.py state at configured intervals",
+        "Detects review state transition and emits COMPLETE event",
+        "Detects stale timeout and triggers recover-stale",
+        "Per-adapter poll intervals (claude: 60s, codex: 60s, deepseek: 3600s)",
+        "Audit log entries for each poll event",
+        "No process spawn; testable with mock task cards"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B254_V1",
+      "goal": "Unchanged from B254's proposal: wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH AND GEOAI_TASK_MCP_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off. Requires B275 protocol spec, B276 dryrun spec, B277 safety gate impl, and B278 polling loop to be complete first.",
+      "mode": "implementation_gated_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "Launch unreachable without explicit gate AND neural router selection AND owner sign-off",
+        "Default disabled; deterministic safety gates remain",
+        "Argv-list only, no shell, cwd pinned, env scrubbed"
+      ]
+    }
+  ],
+  "blockers": []
+}

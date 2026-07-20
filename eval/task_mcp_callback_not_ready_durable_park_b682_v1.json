@@ -1,0 +1,14 @@
+{
+  "schema_id": "geoai.task_mcp.callback_not_ready_durable_park.b682.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_NOT_READY_DURABLE_PARK_B682_V1",
+  "defect": "sideband not_ready was classified as bounded transport failure and dead-lettered valid terminal callbacks",
+  "repair": "classify only the resolved owner's not_ready envelope as BusyThreadError so the existing durable waiting_for_thread_idle path is used",
+  "permanent_failure_policy_unchanged": true,
+  "historical_dead_letters_rewritten": false,
+  "coordinator_validation": {
+    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_not_ready_durable_park_b682_v1.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
+    "passed": 121,
+    "failed": 0
+  },
+  "verdict": "PASS_READY_FOR_SERVICE_RELOAD_AND_LIVE_CALLBACK_CANARY"
+}

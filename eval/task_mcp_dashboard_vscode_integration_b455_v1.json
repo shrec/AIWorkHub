@@ -1,0 +1,120 @@
+{
+  "schema_id": "geoai.task_mcp_dashboard_vscode_integration.v1",
+  "eval_id": "task_mcp_dashboard_vscode_integration_b455_v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_DASHBOARD_VSCODE_INTEGRATION_B455_V1",
+  "date": "2026-07-16",
+  "verdict": "IMPLEMENTED_EXACT_COUNTS_AND_SCOPED_VSCODE_EMBED_TESTS_PASS",
+  "summary": "Fixed the dashboard's 500-saturated status counters and finished the B445 VS Code embed integration blocked on dashboard.py. (1) Added dashboard.exact_status_counts(): one narrow read-only SQLite aggregate over tasks.(archived_at, status, worker_status) only -- never card_json, never a rendered row list -- reusing AITools.taskdb.canonical_status precedence exactly. DashboardProvider.get_exact_status_counts() exposes it; build_snapshot() now sources status_counts (pending/processing/review/blocked/finished/archived/active/stale) from this exact path when available, falling back to the historical bounded-row-length behavior only for test doubles that don't implement it (FakeProvider tests unchanged). Added snapshot['row_counts'] with {returned, exact, truncated} per status for bounded-vs-exact transparency; dashboard.js/index.html untouched (out of allowed_writes) and unaffected -- it only reads status_counts[metric], which stayed the same shape. (2) Added dashboard.py's one explicit VS Code embed document at exact path GET /embed/vscode (no query params): same index.html/dashboard.js body as '/', but the only response that omits X-Frame-Options and widens CSP frame-ancestors to 'vscode-webview: https://*.vscode-cdn.net' (desktop Electron + web/Remote-SSH-tunneled VS Code) -- every other CSP directive and every other route (including /api/* and mutation endpoints) is untouched and keeps X-Frame-Options: DENY / frame-ancestors 'none'. (3) extension.js now resolves vscode.env.asExternalUri against the dashboard URL with '/embed/vscode' appended (embedUrlString()), never the plain root, still no LAN IP/token/second data model -- README.md's former 'Known limitation' section is replaced with a description of the resolved embed mechanism. Reproduced the bug with a real taskdb fixture of 501 finished cards (test_exact_status_counts_reports_totals_past_default_task_limit): exact_status_counts() and build_snapshot()['status_counts']['finished'] both report 501 (> DEFAULT_TASK_LIMIT=500), row_counts['finished'] == {returned:0, exact:501, truncated:true}, and the queue row count is unchanged after the read (502 before and after). Four new header tests prove ordinary pages/API/mutation endpoints keep DENY/frame-ancestors 'none', the embed route's CSP is narrowly scoped and every other directive is unchanged, query params and unrelated paths never pick up the relaxed policy, and arbitrary Host/Origin values are still rejected on the embed route exactly as elsewhere.",
+  "reproduction": {
+    "bug": "status_counts['blocked'/'finished'/'archived'] were computed as len(data_provider.list_tasks(status, limit=DEFAULT_TASK_LIMIT)), i.e. capped at 500 regardless of the true queue size.",
+    "fixture": "501 finished + 1 pending card inserted directly into a real temporary taskdb SQLite file (no second database -- same schema/open_db/init_db/canonical_status as production).",
+    "before_semantics_reproduced": "with the old len(list_tasks('finished', limit=500)) path, a bounded read-only list of finished rows would be truncated to 500 regardless of the underlying 501 total (DashboardProvider.list_tasks/core.list_tasks caps via taskctl --limit).",
+    "after": "dashboard.exact_status_counts(db_path)['finished'] == 501 and build_snapshot(...)['status_counts']['finished'] == 501 (> DEFAULT_TASK_LIMIT), proven in test_exact_status_counts_reports_totals_past_default_task_limit."
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+    "tools/geoai-task-mcp/tests/test_dashboard.py",
+    "tools/vscode-geoai-task-operations/extension.js",
+    "tools/vscode-geoai-task-operations/README.md",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
+    "tools/geoai-task-mcp/eval/task_mcp_dashboard_vscode_integration_b455_v1.json"
+  ],
+  "no_writes_outside_allowed": true,
+  "core_py_untouched": true,
+  "taskdb_py_untouched": true,
+  "credentials_untouched": true,
+  "callback_lifecycle_untouched": true,
+  "file_hashes_sha256": {
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py": "276802841871633b10f79d471c8a93df675bcf125e8d3c4a54db1768b2b9ddf1",
+    "tools/geoai-task-mcp/tests/test_dashboard.py": "ff7a99056ed47d65353488f5bc5b54e512928be804290b6400bc90c553813886",
+    "tools/vscode-geoai-task-operations/extension.js": "49e48bbb80ace6f9a84e588e038c51206763c3327c2bf9cc746f21a45ec7a2e1",
+    "tools/vscode-geoai-task-operations/README.md": "6640c33ce0d849d50e6b82d5af3c6ead01b9fe5276332dcbe58e75532b10d1a4",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "c6d11a169fb4d9c4317c332c3c7bde1c78af2ae523055f4256b711874e85ee00"
+  },
+  "exact_counts": {
+    "sample_fixture": {"finished": 501, "pending": 1, "total": 502},
+    "returned_row_counts_after_fix": {
+      "pending": "bounded by DEFAULT_TASK_LIMIT (unchanged)",
+      "processing": "bounded by DEFAULT_TASK_LIMIT (unchanged)",
+      "review": "bounded by DEFAULT_TASK_LIMIT (unchanged)",
+      "blocked": 0,
+      "finished": 0,
+      "archived": 0
+    },
+    "note": "row_counts[status] = {returned, exact, truncated} exposed alongside status_counts; blocked/finished/archived never return per-row payloads (returned=0 always), only exact totals -- unchanged from before for row payloads, fixed only for counts.",
+    "snapshot_read_mutates_queue": false
+  },
+  "security_headers": {
+    "ordinary_routes": {
+      "x_frame_options": "DENY",
+      "csp_frame_ancestors": "'none'",
+      "routes_checked": ["/", "/dashboard.js", "/dashboard.css", "/healthz", "/api/snapshot", "/api/task", "/api/archive", "/api/health-identity"]
+    },
+    "vscode_embed_route": {
+      "path": "/embed/vscode",
+      "x_frame_options": "omitted (only this route)",
+      "csp_frame_ancestors": "vscode-webview: https://*.vscode-cdn.net",
+      "other_csp_directives_unchanged": ["default-src 'none'", "connect-src 'self'", "img-src 'self' data:", "style-src 'self'", "script-src 'self'", "object-src 'none'", "base-uri 'none'", "form-action 'none'"],
+      "query_params_rejected": true,
+      "host_origin_checks_unchanged": true,
+      "post_method_still_405": true
+    }
+  },
+  "tests": {
+    "python_pytest": {
+      "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_dashboard.py",
+      "result": "44 passed, 2 failed",
+      "new_tests": [
+        "test_exact_status_counts_reports_totals_past_default_task_limit",
+        "test_ordinary_pages_and_api_routes_retain_strict_anti_framing_headers",
+        "test_vscode_embed_route_relaxes_frame_ancestors_only",
+        "test_vscode_embed_route_rejects_query_and_never_leaks_to_other_paths",
+        "test_vscode_embed_route_still_enforces_host_and_origin_checks",
+        "test_api_and_mutation_endpoints_keep_auth_unchanged_by_embed_route"
+      ],
+      "new_tests_result": "all 6 PASS",
+      "pre_existing_unrelated_failures": [
+        {
+          "test": "test_callback_bridge_health_batch_stats_never_expose_full_thread_id",
+          "reason": "geoai_task_mcp.core has no attribute 'callback_outbox_status' in this isolated worktree -- function absent from core.py entirely (confirmed via AST scan), same class of pre-existing worktree gap as the deepseek_credentials stub this test file already bridges. Not caused by this task; core.py is untouched and forbidden (core_py_change)."
+        },
+        {
+          "test": "test_agent_processes_expose_derived_liveness_never_the_raw_status_path",
+          "reason": "geoai_task_mcp.process_launcher has no attribute 'read_supervisor_status' in this isolated worktree -- function absent from process_launcher.py entirely (confirmed via AST scan). Not caused by this task; process_launcher.py is untouched and out of allowed_writes."
+        }
+      ]
+    },
+    "node_check_extension_js": "PASS",
+    "test_extension_smoke_sh": {
+      "result": "FAIL (3 pre-existing, out-of-scope failures; 14 PASS)",
+      "assertions_passed": 14,
+      "assertions_failed": 3,
+      "new_assertion_added": "asExternalUri resolves the explicit embed/vscode path (5b) -- PASS",
+      "pre_existing_unrelated_failures": [
+        {
+          "assertion": "install_remote.sh missing required behavior",
+          "reason": "tools/vscode-geoai-task-operations/install_remote.sh does not exist anywhere in this isolated worktree or its git history (git log --all -- <path> is empty; the whole tools/vscode-geoai-task-operations/ directory is untracked). Pre-existing B445 worktree gap -- install_remote.sh is not in this task's allowed_writes, so it cannot be created here."
+        },
+        {
+          "assertion": "missing required file: media/geoai-tasks.svg",
+          "reason": "Same pre-existing gap as above; media/ is not in allowed_writes."
+        },
+        {
+          "assertion": "missing required file: install_remote.sh",
+          "reason": "Same pre-existing gap as above."
+        }
+      ]
+    },
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "PASS (collision_free=true, 125 active cards)"
+  },
+  "not_reused_from_rejected_b451": true,
+  "callback_lifecycle_change": false,
+  "queue_mutation": false,
+  "second_task_database": false,
+  "wildcard_frame_ancestor": false,
+  "coordinator_token_in_extension": false,
+  "lan_ip_in_extension": false,
+  "codex_review_requested": true,
+  "worker_stops_here": true
+}

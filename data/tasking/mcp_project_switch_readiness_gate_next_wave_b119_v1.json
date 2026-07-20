@@ -1,0 +1,41 @@
+{
+  "next_wave_id": "mcp_project_switch_readiness_gate_next_wave_b119_v1",
+  "version": 1,
+  "generated": "2026-07-05T18:53:02.995318+00:00",
+  "workflow_switch_ready": false,
+  "remaining_steps": [
+    {
+      "step": 1,
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+      "action": "Finish + Codex-finalize (done) allow-list enforcement in core.py write path."
+    },
+    {
+      "step": 2,
+      "task_id": "DEEPSEEK_TASK_MCP_BATCH_COLLISION_GUARD_B119_V1",
+      "action": "Codex-finalize (done) batch collision guard."
+    },
+    {
+      "step": 3,
+      "task_id": "DEEPSEEK_TASK_MCP_FULL_WAVE_DRYRUN_HARNESS_B119_V1",
+      "action": "Codex-finalize (done) full-wave dry-run harness; then design a SEPARATE, explicitly-approved task to run one literal live wave with GEOAI_TASK_MCP_ALLOW_WRITES=1 (p3_full_task_wave real execution)."
+    },
+    {
+      "step": 4,
+      "task_id": null,
+      "action": "Build p3_no_parent_corruption evidence: taskctl verify + before/after queue diff around the real wave from step 3."
+    },
+    {
+      "step": 5,
+      "task_id": null,
+      "action": "Re-run build_mcp_project_switch_readiness_gate_b119_v1.py; only flip workflow_switch when all 5 named gates report pass=true."
+    }
+  ],
+  "authority_flags": {
+    "workflow_switch": false,
+    "queue_mutation": false,
+    "write_gate_disable": false,
+    "process_launch": false,
+    "default_change": false,
+    "gate_readonly": true
+  }
+}

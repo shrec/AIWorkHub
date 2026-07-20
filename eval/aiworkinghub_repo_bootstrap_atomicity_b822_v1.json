@@ -1,0 +1,20 @@
+{
+  "schema_id": "geoai.eval.bootstrap_atomicity_b822.v1",
+  "task_id": "DEEPSEEK_AIWORKINGHUB_REPO_BOOTSTRAP_ATOMICITY_B822_V1",
+  "verdict": "PASS",
+  "summary": "bootstrap_repository now writes manifest as the final atomic seal after all directory and .gitignore artifacts are ready. Crash before seal leaves no manifest; next attach retries cleanly.",
+  "changes": [
+    {
+      "file": "tools/geoai-task-mcp/src/geoai_task_mcp/repository_state.py",
+      "change": "Reorder bootstrap_repository: dirs + .gitignore created first (idempotent phase 1), then manifest written as atomic seal (phase 2). Removed redundant manifest-write branch duplication."
+    }
+  ],
+  "atomicity_contract": {
+    "phase_1_idempotent": ["hub_dir", "durable_dirs", "runtime_dir", "runtime_gitignore"],
+    "phase_2_atomic_seal": ["project_manifest_json"],
+    "crash_before_seal": "no_valid_manifest",
+    "crash_after_seal": "complete_bootstrap"
+  },
+  "test_file": "tools/geoai-task-mcp/tests/test_aiworkinghub_repo_bootstrap_atomicity_b822_v1.py",
+  "test_count": 5
+}

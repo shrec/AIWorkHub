@@ -1,0 +1,78 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_markdown_render_eval.v1",
+  "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1",
+  "timestamp": "2026-07-05T18:45:00+00:00",
+  "verdict": "PASS",
+  "runner": "claude_task_mcp_handoff_render_b119",
+  "topic": "task_mcp",
+  "mode": "readonly_handoff_markdown_tool_no_queue_mutation",
+  "objective": "Add a compact read-only Codex handoff markdown renderer over the existing B116 codex-handoff report so Codex can review completed worker tasks without manual parsing.",
+  "parent_task": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1",
+  "next_wave_candidate": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B117_V1",
+  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
+  "modules_under_test": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py (render_codex_handoff_markdown, build_codex_handoff_markdown_report)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_task_codex_handoff_markdown tool)"
+  ],
+  "checks_total": 41,
+  "checks_passed": 41,
+  "checks_failed": 0,
+  "acceptance_results": {
+    "pure_render_function": "PASS - render_codex_handoff_markdown(report) is a single-argument pure function, no taskctl/core I/O, deterministic (byte-identical output for identical input, called twice)",
+    "renderer_over_b116_output": "PASS - input is exactly the build_codex_handoff_report dict shape (contract/task_count/summary/handoff_reports), no reshaping required",
+    "markdown_fields_present": "PASS - top-level header, batch_label, summary rollup (risk_levels/commit_hygiene_ok/commit_hygiene_warn/missing_validation), per-task sections (runner/topic, risk_level, commit_hygiene, allowed_writes, validation, risks, recommended next command)",
+    "wrapper_preserves_b116_shape": "PASS - build_codex_handoff_markdown_report is additive-only: every original B116 field (contract, task_count, handoff_reports, authority_flags, recommended_stage_commands, ...) unchanged, plus new markdown + markdown_contract fields",
+    "fixture_queue_zero_mutation": "PASS - fixture dir sha256 identical before/after; only review-queue/show issued; no done/review/start/auto-pickup/export-jsonl/usage",
+    "empty_queue_case": "PASS - empty fixture queue yields task_count=0, markdown reports 'tasks: 0'",
+    "single_tool_registered": "PASS - server tool count 18 -> 19, exactly one new tool geoai_task_codex_handoff_markdown added",
+    "server_tool_wiring_live_readonly": "PASS - tool is callable, returns ok=True + markdown string + markdown_contract label; live review-queue stdout identical before/after tool call",
+    "write_gate_default_off": "PASS - GEOAI_TASK_MCP_ALLOW_WRITES=0 verified in test + authority_flags.write_gate_enabled=True",
+    "b116_regression": "PASS - tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh still 70/70 PASS (build_codex_handoff_report untouched, only additive functions appended)",
+    "bash_test_exit": "PASS - test_mcp_codex_handoff_markdown_render_b119_v1.sh exits 0",
+    "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns PASS",
+    "live_review_queue_unchanged_full_session": "PASS - python3 AITools/taskctl.py review-queue output byte-identical before vs after the full work unit (diff empty)"
+  },
+  "acceptance_criteria": [
+    "must add a deterministic read-only renderer for build_codex_handoff_report output",
+    "must register exactly one read-only MCP tool or justify if server already exposes equivalent",
+    "must prove live/fixture review queue unchanged before/after",
+    "must not mutate task status, stage files, commit, launch process, or enable write gates",
+    "bash tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh passes",
+    "python3 AITools/taskctl.py verify passes"
+  ],
+  "invariants_verified": {
+    "READONLY": true,
+    "PURE_FUNCTION_RENDERER": true,
+    "DETERMINISTIC_OUTPUT": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_FIXTURE": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_LIVE": true,
+    "NO_WRITE_TASKCTL_COMMAND_ISSUED": true,
+    "SINGLE_TOOL_ADDED_ONLY": true,
+    "B116_FIELDS_PRESERVED_ADDITIVE_ONLY": true,
+    "B116_REGRESSION_GREEN": true
+  },
+  "forbidden_operations_verified": [
+    "queue_mutation",
+    "write_gate_disable",
+    "process_launch",
+    "status_mutation",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "tool_inventory_note": {
+    "server_tools_before": 18,
+    "server_tools_after": 19,
+    "added_tool": "geoai_task_codex_handoff_markdown",
+    "note": "B119 intentionally registers one new read-only MCP tool; existing tool-count-sensitive tests (b109/b110 stdio smoke, mvp_contract_audit) were already stale/pre-existing failures noted in the B116 eval and are out of scope for this task."
+  },
+  "environment": {
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "PYTHONPATH": "tools/geoai-task-mcp/src"
+  },
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
+  "next_wave_tasks_ref": "tools/geoai-task-mcp/data/tasking/mcp_codex_handoff_markdown_render_next_wave_b119_v1.json"
+}

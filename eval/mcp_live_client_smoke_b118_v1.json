@@ -1,0 +1,43 @@
+{
+  "authority_flags": {
+    "agent_launch_authority": false,
+    "contract_frozen": true,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "checks": {
+    "allow_writes_zero": true,
+    "blocked_client": false,
+    "health_readonly_tools_exercised": true,
+    "parent_queue_unchanged": true,
+    "server_no_launch_code": true,
+    "stdio_transport_live": true,
+    "taskctl_verify_pass": true
+  },
+  "environment": {
+    "GEOAI_REPO": "/home/shrek/GeoAI",
+    "GEOAI_TASK_MCP_ALLOW_WRITES": "0"
+  },
+  "eval_id": "mcp_live_client_smoke_b118_v1",
+  "extends": "mcp_stdio_subprocess_client_smoke_b109_v1",
+  "live_client_usable": true,
+  "mode": "mcp_live_client_smoke_no_workflow_switch",
+  "queue_integrity": {
+    "after_pass": true,
+    "before_pass": true,
+    "unchanged": true
+  },
+  "smoke": {
+    "failing_check": null,
+    "frozen_contract_v1": true,
+    "readonly_tool_count": 11,
+    "tools_visible_total": 18,
+    "transport": "mcp.client.stdio.stdio_client + mcp.ClientSession over real OS stdio pipes (out-of-process subprocess)",
+    "write_gated_tool_count": 4
+  },
+  "task_id": "DEEPSEEK_TASK_MCP_LIVE_CLIENT_SMOKE_B118_V1",
+  "timestamp_utc": "2026-07-05T13:08:03.346047+00:00",
+  "verdict": "LIVE_CLIENT_USABLE"
+}

@@ -1,0 +1,8 @@
+{"task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_PARTIAL_REVIEW_B04_V1", "kind": "finding", "type": "PARTIAL_ARTIFACTS_REVIEW", "classification": "safe_recover_stale", "reason": "B119 test files predate task; B119 eval/data outputs missing; all 3 smoke tests fail on stale tool-count assertions", "recommendation": "recover-stale without --force"}
+{"task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1", "kind": "target_task", "status": "stale_processing", "age_hours": 64.5, "present_artifacts": 3, "missing_artifacts": 2, "all_tests_fail": true, "predates_task": true}
+{"kind": "smoke_test", "test": "b109_stdio_subprocess_client_smoke", "exit_code": 1, "verdict": "FAIL", "live_total_tools": 20, "expected_total_tools": 15}
+{"kind": "smoke_test", "test": "b110_stdio_concurrent_client_smoke", "exit_code": 1, "verdict": "FAIL", "live_total_tools": 20, "expected_total_tools": 15}
+{"kind": "smoke_test", "test": "mvp_contract_audit", "exit_code": 1, "verdict": "FAIL", "live_tool_count": 20, "audited_tool_count": 11}
+{"kind": "provenance", "file": "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh", "mtime": "2026-07-04T14:46:31+00:00", "b119_claimed_at": "2026-07-05T18:30:46+00:00", "predates_claim": true}
+{"kind": "provenance", "file": "test_mcp_stdio_concurrent_client_smoke_b110_v1.sh", "mtime": "2026-07-04T21:29:03+00:00", "b119_claimed_at": "2026-07-05T18:30:46+00:00", "predates_claim": true}
+{"kind": "provenance", "file": "test_mvp_contract_audit_v1.sh", "mtime": "2026-07-04T09:06:18+00:00", "b119_claimed_at": "2026-07-05T18:30:46+00:00", "predates_claim": true}

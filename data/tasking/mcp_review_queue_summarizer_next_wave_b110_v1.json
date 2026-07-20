@@ -1,0 +1,26 @@
+{
+  "schema_id": "geoai.mcp_review_queue_summarizer_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1",
+  "runner": "deepseek_task_mcp_review_summarizer_b110",
+  "topic": "task_mcp",
+  "status": "pending_followup",
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
+      "objective": "Wire review_summarizer as a geoai_task_review_summarize MCP tool in server.py",
+      "runner": "deepseek_task_mcp_review_summarizer_b111",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1"],
+      "priority": "task_mcp_b111_server_wiring"
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_INTEGRATION_B112_V1",
+      "objective": "Integration test with real taskctl review queue (non-stubbed)",
+      "runner": "deepseek_task_mcp_review_summarizer_b112",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1"],
+      "priority": "task_mcp_b112_integration"
+    }
+  ],
+  "notes": "B110 delivers the read-only core module + stubbed smoke test. B111 wires it as an MCP tool. B112 tests against real queue. All maintain read-only invariant."
+}

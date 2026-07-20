@@ -1,0 +1,35 @@
+{
+  "next_wave_id": "deepseek_agent_catalog_survey_next_wave_b116_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_AGENT_CATALOG_SURVEY_B116_V1",
+  "date": "2026-07-05",
+  "timestamp": "2026-07-05T12:37:36.089888+00:00",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued. Every follow-up keeps launch DISABLED by default.",
+  "survey_summary": {
+    "total_candidates_surveyed": 23,
+    "top_terminal_worker": "deepseek_tui",
+    "s_tier_count": 1,
+    "a_tier_count": 1,
+    "b_tier_count": 5
+  },
+  "follow_up_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_DEEPSEEK_TUI_ADAPTER_DRYRUN_B117_V1",
+      "goal": "Register deepseek_tui as DISABLED-BY-DEFAULT local CLI adapter. Read-only shutil.which presence probe. NO process spawn, NO install, NO launch.",
+      "mode": "NO_COMMIT",
+      "disabled_by_default": true,
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "tools/geoai-task-mcp/tests/test_deepseek_tui_adapter_dryrun_b117_v1.sh",
+        "tools/geoai-task-mcp/eval/deepseek_tui_adapter_dryrun_b117_v1.json"
+      ],
+      "acceptance": [
+        "adapter registered disabled_by_default=true",
+        "detect() read-only probe, never spawns",
+        "no launch code added",
+        "launch_enabled() returns False",
+        "ALLOW_LAUNCH has no effect"
+      ]
+    }
+  ]
+}

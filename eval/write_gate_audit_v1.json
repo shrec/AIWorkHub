@@ -1,0 +1,42 @@
+{
+  "eval_id": "write_gate_audit_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1",
+  "date": "2026-07-04",
+  "verdict": "PASS",
+  "summary": "Minimal append-only audit log for write-gated MCP actions. Blocked write attempts are logged to tools/geoai-task-mcp/logs/audit.jsonl by default, path configurable via GEOAI_TASK_MCP_AUDIT_LOG_PATH. No secrets or env values are logged. GEOAI_TASK_MCP_ALLOW_WRITES default remains 0 (off). Smoke test confirms blocked attempt is logged without mutating parent queue.",
+  "gates": {
+    "audit_log_created": true,
+    "blocked_write_logged": true,
+    "no_secrets_leaked": true,
+    "default_write_off": true,
+    "parent_queue_unmutated": true,
+    "smoke_test_passes": true,
+    "configurable_path": true,
+    "jsonl_format": true,
+    "append_only": true
+  },
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/tests/write_gate_audit_smoke.py",
+    "tools/geoai-task-mcp/tests/test_write_gate_audit_v1.sh"
+  ],
+  "audit_log_default_path": "tools/geoai-task-mcp/logs/audit.jsonl",
+  "audit_log_env_var": "GEOAI_TASK_MCP_AUDIT_LOG_PATH",
+  "audit_log_format": "JSONL (one JSON object per line)",
+  "audit_entry_schema": {
+    "timestamp": "ISO 8601 UTC",
+    "tool_name": "string (e.g. auto-pickup, done, review)",
+    "action": "blocked_write",
+    "blocked_reason": "string",
+    "caller_info": {
+      "pid": "int",
+      "env_vars_checked": {
+        "GEOAI_TASK_MCP_ALLOW_WRITES": "<set>|<unset>",
+        "GEOAI_TASK_MCP_AUDIT_LOG_PATH": "<set>|<unset>"
+      }
+    }
+  },
+  "no_write_gate_disable": true,
+  "no_agent_launch_enable": true
+}

@@ -1,0 +1,18 @@
+{
+  "schema_id": "geoai.coordinator_review.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_LAUNCH_EPISODE_B674_V1",
+  "disposition": "REJECT_RUNTIME_CANDIDATE_PRESERVE_ROOT_CAUSE_AND_DB_TEST_EVIDENCE",
+  "worker_terminal_note": "The reported validation failure was caused by pytest being unavailable under sanitized HOME; the standalone taskdb/taskctl suite passes 15/15 on the parent host.",
+  "accepted_findings": [
+    "The callback outbox currently deduplicates terminal wakes by task, transition, origin thread and claim episode.",
+    "A genuinely distinct launch identity must participate in callback idempotence so same-launch retries deduplicate while a new launch can wake again.",
+    "The proposed request_id-widened database migration is a useful candidate and requires a fully authorized launch-path binding."
+  ],
+  "rejection_reasons": [
+    "ProcessManager treats launch-request binding as best-effort and continues launching after binding fails, so the original callback-loss bug remains possible.",
+    "The candidate deliberately omits runner/topic when calling core.run_taskctl, bypassing RUNNER_TOPIC_ALLOWLIST instead of extending the exact authority contract.",
+    "Its MCP tests assert both fail-open behavior and the allowlist bypass, so passing those tests does not satisfy the production safety contract."
+  ],
+  "canonical_runtime_promoted": false,
+  "next_dependency": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_LAUNCH_IDENTITY_FAIL_CLOSED_B756_V1"
+}

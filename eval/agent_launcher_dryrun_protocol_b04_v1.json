@@ -1,0 +1,149 @@
+{
+  "schema_id": "geoai.task_mcp_agent_launcher_dryrun_protocol.b04.v1",
+  "task_id": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1",
+  "mode": "mcp_agent_launcher_dryrun_protocol_no_execution",
+  "date": "2026-07-05",
+  "builds_on": [
+    "task_mcp_agent_launcher_safety_contract_b03_v1",
+    "cli_adapter_dryrun_contract_b105_v1",
+    "agent_launcher_mvp_b02_v1",
+    "mcp_runner_topic_allowlist_enforcement_b119_v1"
+  ],
+  "purpose": "Convert the B03 safety contract into a testable dry-run protocol: a request/response schema for Codex -> MCP -> local CLI worker prompt+command composition, reusing EXISTING dry-run code (cli_adapter_dryrun.build_argv_template/validate_command, core.check_runner_topic_allowlist) as the composition/validation engine. No new process-launch or subprocess code is added by this task; allowed_writes contains no src/ path.",
+  "forbidden_operations_confirmed_not_taken": {
+    "daemon_start": false,
+    "real_agent_launch": false,
+    "credential_write": false,
+    "network_operation": false,
+    "task_status_mutation": false,
+    "runtime_change": false,
+    "git_add_A": false,
+    "mixed_task_commit": false
+  },
+  "reused_implementation": {
+    "module": "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+    "functions_reused": [
+      "build_argv_template(adapter_id, prompt, repo)",
+      "validate_command(argv)",
+      "launch_enabled()",
+      "LAUNCH_IMPLEMENTED (const False)"
+    ],
+    "core_functions_reused": [
+      "geoai_task_mcp.core.check_runner_topic_allowlist(runner, topic, action)"
+    ],
+    "note": "This protocol adds zero new execution code; it is a schema+test artifact layered on already-existing, already-tested dry-run primitives."
+  },
+  "dry_run_request_schema": {
+    "task_id": {"type": "string", "required": true, "description": "must be a task known to taskctl; checked read-only via `taskctl.py show <task_id>`"},
+    "runner": {"type": "string", "required": true},
+    "topic": {"type": "string", "required": true},
+    "adapter_id": {"type": "string", "enum": ["claude_cli", "codex_cli", "deepseek_manual"], "required": true},
+    "action": {"type": "string", "enum": ["auto-pickup", "review", "start", "usage"], "required": true, "description": "taskctl action this composed request is for; consumed by core.check_runner_topic_allowlist"},
+    "mode": {"type": "string", "enum": ["dryrun"], "required": false, "default": "dryrun", "note": "a 'live' value is rejected with decision=launch_blocked_disabled; never silently promoted"},
+    "prompt_char_budget": {"type": "integer", "required": false, "default": 20000}
+  },
+  "dry_run_response_schema": {
+    "decision": {"type": "string", "enum": ["launch_planned", "manual_handoff_planned", "launch_blocked_invalid_command", "launch_blocked_disabled", "launch_blocked_precondition_failed"]},
+    "would_run_argv": {"type": "array", "items": "string", "description": "from build_argv_template; [] for deepseek_manual (no local process)"},
+    "command_allowlist_check": {"type": "object", "fields": ["ok", "decision", "blocked_reason", "is_manual_only"], "description": "from validate_command(would_run_argv); skipped/not_applicable_manual_handoff for deepseek_manual since no local argv exists"},
+    "runner_topic_check": {"type": "object", "fields": ["allowed", "reason"], "description": "from core.check_runner_topic_allowlist(runner, topic, action); reason='unknown_runner_topic_pair' when the pair is not statically allowlisted"},
+    "task_id_binding_check": {"type": "object", "fields": ["ok", "found"], "description": "read-only `taskctl.py show <task_id>` lookup; found=false for an unknown task_id; never mutates task status"},
+    "allowed_writes_check": {"type": "object", "fields": ["ok", "task_allowed_writes"], "description": "cross-reference against the claimed card's allowed_writes (from `taskctl.py contract <task_id>`); real enforcement remains taskctl.py cmd_stage/cmd_guard_staged, this field only documents that binding for the composed prompt"},
+    "composed_prompt_char_count": {"type": "integer"},
+    "prompt_truncated": {"type": "boolean"},
+    "prompt_char_budget": {"type": "integer"},
+    "launch_enabled": {"type": "boolean", "const": false},
+    "launch_implemented": {"type": "boolean", "const": false},
+    "audit_ref": {"type": "string", "description": "tools/geoai-task-mcp/logs/audit.jsonl append-only entry path"},
+    "review_return_envelope": {
+      "type": "object",
+      "fields": ["task_id", "runner", "topic", "adapter_id", "changed_paths", "tests_run", "verdict", "token_cost_report", "audit_log_ref"],
+      "description": "identical shape to B03 review_packet_fields; produced when the worker calls `taskctl.py review <task_id> --runner <runner>` (never `done`)"
+    }
+  },
+  "prompt_composition_policy": {
+    "prompt_source": "taskctl_contract_plus_read_first_paths",
+    "formula": "composed_prompt = `taskctl.py contract <task_id>` stdout (compact JSON) + \"\\n---read_first---\\n\" + newline-joined read_first path STRINGS (paths only, not file content -- the worker reads read_first itself; matches B03 section 7.2)",
+    "prompt_char_budget_default": 20000,
+    "over_budget_policy": "truncate_and_flag: composed_prompt[:budget-len(marker)] + marker, prompt_truncated=true; decision is NOT blocked by truncation alone (no silent loss -- prompt_truncated is always surfaced in the response)",
+    "truncation_marker": "...[PROMPT_TRUNCATED_AT_BUDGET]",
+    "stricter_reject_mode_deferred_to": "CLAUDE_TASK_MCP_DRYRUN_TOKEN_BUDGET_B106_V1 (blocked_over_budget policy, not yet implemented)",
+    "measured_example_this_task": {
+      "contract_json_chars": 6210,
+      "read_first_paths_joined_chars": 211,
+      "composed_prompt_chars": 6421,
+      "default_budget_20000_truncated": false,
+      "demo_small_budget_4000_truncated": true,
+      "demo_small_budget_out_len": 4000,
+      "measured_via": "python3 AITools/taskctl.py contract CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1 (real command, no execution of any launch)"
+    }
+  },
+  "dry_run_examples": {
+    "note": "All three would_run_argv / command_allowlist_check / runner_topic_check values below are REAL measured output of cli_adapter_dryrun.build_argv_template/validate_command and core.check_runner_topic_allowlist -- not hand-written prose. No process was started to produce them.",
+    "example_claude_cli_allowed": {
+      "request": {"task_id": "T1", "runner": "claude_coding", "topic": "coding", "adapter_id": "claude_cli", "action": "auto-pickup", "mode": "dryrun"},
+      "response": {
+        "decision": "launch_planned",
+        "would_run_argv": ["claude", "-p", "CONTRACT_JSON_PLACEHOLDER", "--cwd", "<GEOAI_REPO>"],
+        "command_allowlist_check": {"ok": true, "binary": "claude", "decision": "allow_dryrun", "blocked_reason": "", "is_manual_only": false},
+        "runner_topic_check": {"allowed": true, "reason": "allowlisted"},
+        "launch_enabled": false,
+        "launch_implemented": false
+      }
+    },
+    "example_codex_cli_blocked_precondition": {
+      "request": {"task_id": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1", "runner": "claude_task_mcp_launcher_dryrun_b04", "topic": "task_mcp", "adapter_id": "codex_cli", "action": "review", "mode": "dryrun"},
+      "response": {
+        "decision": "launch_blocked_precondition_failed",
+        "would_run_argv": ["codex", "exec", "CONTRACT_JSON_PLACEHOLDER", "--cwd", "<GEOAI_REPO>"],
+        "command_allowlist_check": {"ok": true, "binary": "codex", "decision": "allow_dryrun", "blocked_reason": "", "is_manual_only": false},
+        "runner_topic_check": {"allowed": false, "reason": "unknown_runner_topic_pair"},
+        "launch_enabled": false,
+        "launch_implemented": false
+      },
+      "finding": "REAL gap discovered while building this protocol: core.RUNNER_TOPIC_ALLOWLIST has no 'task_mcp' topic entry and no pattern for per-wave runner names like 'claude_task_mcp_launcher_dryrun_b04' (it only lists stable topic-continuous runners: claude_coding/coding, claude_stem/stem, deepseek_finance/finance, etc, plus a codex wildcard). A composed request using THIS task's own (runner, topic) would be blocked at the runner_topic_check precondition if it ever went through core.run_taskctl(). This is command-allowlist-valid but precondition-blocked -- proposed as follow-up (see next_wave)."
+    },
+    "example_deepseek_manual_handoff": {
+      "request": {"task_id": "T3", "runner": "deepseek_finance", "topic": "finance", "adapter_id": "deepseek_manual", "action": "auto-pickup", "mode": "dryrun"},
+      "response": {
+        "decision": "manual_handoff_planned",
+        "would_run_argv": [],
+        "command_allowlist_check": {"ok": true, "decision": "not_applicable_manual_handoff", "blocked_reason": "", "is_manual_only": true},
+        "runner_topic_check": {"allowed": true, "reason": "allowlisted"},
+        "launch_enabled": false,
+        "launch_implemented": false,
+        "handoff_note": "no local process is ever composed for deepseek_manual; orchestrator renders (prompt + task card + cwd + runner/topic) for a human to paste into the externally hosted session, per B03 section 7.3"
+      }
+    }
+  },
+  "review_return_envelope_example": {
+    "task_id": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1",
+    "runner": "claude_task_mcp_launcher_dryrun_b04",
+    "topic": "task_mcp",
+    "adapter_id": "claude_cli",
+    "changed_paths": [
+      "tools/geoai-task-mcp/eval/agent_launcher_dryrun_protocol_b04_v1.json",
+      "tools/geoai-task-mcp/data/tasking/agent_launcher_dryrun_protocol_next_wave_b04_v1.json",
+      "tools/geoai-task-mcp/tests/test_agent_launcher_dryrun_protocol_b04_v1.sh"
+    ],
+    "tests_run": [
+      "bash tools/geoai-task-mcp/tests/test_agent_launcher_dryrun_protocol_b04_v1.sh -> PASS",
+      "python3 AITools/taskctl.py verify -> PASS"
+    ],
+    "verdict": "PASS",
+    "token_cost_report": null,
+    "audit_log_ref": "tools/geoai-task-mcp/logs/audit.jsonl"
+  },
+  "neural_bridge_note": {
+    "doctrine": "neural-control-first: adapter/runner/topic SELECTION for a real launch must be a learned routing + abstain decision, never a regex/keyword cue router",
+    "this_protocol_is": "a static human-authored request/response schema + reuse of an already-static safety allowlist (core.check_runner_topic_allowlist); it composes and validates, it does not route/select intelligently",
+    "migration_task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "curriculum_path": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "not_a_bare_promise": true
+  },
+  "rollback": {
+    "code_to_roll_back": false,
+    "rollback_action": "git revert this eval JSON + next_wave JSON + test script; no runtime/registry/subprocess code exists to unwind"
+  },
+  "verdict": "PASS"
+}

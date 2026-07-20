@@ -1,0 +1,115 @@
+{
+  "schema_id": "geoai.task_mcp_inventory_taxonomy_sync_plan.b252.v1",
+  "task_id": "CLAUDE_TASK_MCP_INVENTORY_TAXONOMY_SYNC_PLAN_B252_V1",
+  "timestamp": "2026-07-07T21:26:34+00:00",
+  "runner": "claude_task_mcp_inventory_taxonomy_sync_b252",
+  "topic": "task_mcp",
+  "mode": "inventory_sync_plan_no_source_patch",
+  "objective": "Prepare a coordinated patch plan for MCP inventory drift after B11/B251: README exposed tools, frozen contract counts, stdio smoke counts, neural launch collision rows, and B250 taxonomy update. Planning only -- no README/tests/source files touched by this task.",
+  "source_evidence": [
+    "tools/geoai-task-mcp/eval/task_mcp_live_tool_inventory_reverify_b251_v1.json",
+    "tools/geoai-task-mcp/eval/task_mcp_live_tool_inventory_reverify_rows_b251_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/task_mcp_live_tool_inventory_reverify_next_wave_b251_v1.json"
+  ],
+  "live_inventory_baseline": {
+    "total_live_tools": 20,
+    "tier1_read_only": 16,
+    "tier2_write_gated": 4,
+    "source": "B251 same-day reverify (CLAUDE_TASK_MCP_LIVE_TOOL_INVENTORY_REVERIFY_B251_V1), timestamp 2026-07-07T21:00:00+00:00, cross-checked directly against rows JSONL tier fields by this task"
+  },
+  "correction_to_b251": {
+    "field": "stale_assertions_found[STALE_3_STDIO_SUBPROCESS_SMOKE_COUNT].actual",
+    "b251_claimed": "readonly=14 (11 frozen + 5 new read-only tools)",
+    "arithmetic_error": "11 + 5 = 16, not 14 -- B251's own missing_from_tuples list has exactly 5 entries, so the correct live readonly count is 16",
+    "corrected_value": 16,
+    "independently_verified_by": "counting TIER_1_READ_ONLY* rows in task_mcp_live_tool_inventory_reverify_rows_b251_v1.jsonl (16) vs TIER_2_WRITE_GATED rows (4); 16+4=20 matches total_live_tools",
+    "note": "This plan uses the corrected value (16) for all downstream patch targets so the coordinated patch does not re-propagate B251's arithmetic slip into new test assertions."
+  },
+  "patch_plan": [
+    {
+      "proposal_id": "TASK_MCP_README_EXPOSED_TOOLS_SYNC_NEXT",
+      "target_files": ["tools/geoai-task-mcp/README.md"],
+      "lines": "53-71",
+      "stale_assertion_ids": ["STALE_1_README_EXPOSED_TOOLS"],
+      "current_value": "'Exposed Tools' section lists 8 read-only + 4 write-gated = 12 total tools",
+      "corrected_value": "20 total live tools (16 read-only + 4 write-gated)",
+      "missing_tools": [
+        "geoai_task_auto_pickup_dryrun", "geoai_task_review_summarize", "geoai_task_codex_handoff",
+        "geoai_task_codex_handoff_markdown", "geoai_supervisor_loop_status",
+        "geoai_cli_adapter_plan_readonly", "geoai_cli_adapter_audit_summary_readonly", "geoai_cli_adapter_report_readonly"
+      ],
+      "action": "Rewrite 'Exposed Tools' section to enumerate all 20 live tools; prefer generating the list from server.py @mcp.tool() registry + cli_adapter_readonly_tool.READONLY_TOOL_NAMES (see companion fixture below) to prevent recurrence.",
+      "priority": "medium"
+    },
+    {
+      "proposal_id": "TASK_MCP_FROZEN_CONTRACT_V2_OR_SEPARATE_INVENTORY_TEST",
+      "target_files": ["tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py"],
+      "lines": "65-84",
+      "stale_assertion_ids": ["STALE_2_FROZEN_B108_TOOL_LISTS"],
+      "current_value": "READONLY_TOOLS (11) + WRITE_GATED_TOOLS (4) = 15, consumed by downstream tests as if it were the current full inventory",
+      "corrected_value": "Keep this file's tuples exactly as-is (B108 fingerprint baseline is intentional and historically correct) but (a) rename the exported names to signal frozen-subset scope (e.g. READONLY_TOOLS_B108_BASELINE / WRITE_GATED_TOOLS_B108_BASELINE), and (b) add a companion live-inventory fixture (20 tools: 16 read-only + 4 write-gated) that downstream tests import instead of the frozen tuples.",
+      "missing_tools": [
+        "geoai_task_auto_pickup_dryrun", "geoai_task_review_summarize", "geoai_task_codex_handoff",
+        "geoai_task_codex_handoff_markdown", "geoai_supervisor_loop_status"
+      ],
+      "action": "Do not delete or mutate the frozen fingerprint tuples (they are a deliberate historical contract). Add new companion fixture; recommend option (b) since (a) alone does not fix STALE_3/STALE_4 dependents.",
+      "priority": "medium",
+      "note": "Design-intentional freeze per B251 -- patch is additive (new fixture / rename export), not a rewrite of the B108 baseline values."
+    },
+    {
+      "proposal_id": "TASK_MCP_STDIO_SMOKE_COUNT_REBASE",
+      "target_files": [
+        "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+        "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh"
+      ],
+      "lines": "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh:88-89, test_mcp_stdio_concurrent_client_smoke_b110_v1.sh:108-109",
+      "stale_assertion_ids": ["STALE_3_STDIO_SUBPROCESS_SMOKE_COUNT", "STALE_4_STDIO_CONCURRENT_SMOKE_COUNT"],
+      "current_value": "assert d[\"readonly_tool_count\"] == 11; assert d[\"write_gated_tool_count\"] == 4 (both asserted against the frozen B108 tuples)",
+      "corrected_value": "readonly_tool_count == 16, write_gated_tool_count == 4 (unchanged) -- see correction_to_b251 above for why 16 not 14",
+      "action": "Rebase both assertions onto the live 20-tool inventory (or import counts from the companion live-inventory fixture proposed above) once TASK_MCP_FROZEN_CONTRACT_V2 lands. Both files share the identical assertion pattern and must be patched together.",
+      "priority": "medium",
+      "already_tracked_as_known_failure_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2]"
+    },
+    {
+      "proposal_id": "TASK_MCP_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_REBASE",
+      "target_files": ["tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh"],
+      "lines": "192",
+      "stale_assertion_ids": ["STALE_5_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_COUNT"],
+      "current_value": "assert len(collision_rows) == 3",
+      "corrected_value": "Unknown at planning time -- bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl shows modified in git status as of this plan's timestamp (same file B250 already flagged as drifted 3-vs-6). The coordinated patch MUST re-count live rows immediately before patching, not copy a number from this plan or from B250's memory.",
+      "action": "Re-derive len(collision_rows) from the live curriculum JSONL at patch time; update the assertion to that live count with a comment noting it is a data-driven curriculum size, not a fixed contract value.",
+      "priority": "low",
+      "note": "Unrelated to MCP tool count but shares the same 'frozen assertion drifted from live data' failure cluster; scope of this proposal is the test assertion only, not the curriculum JSONL itself.",
+      "already_tracked_as_known_failure_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2]"
+    },
+    {
+      "proposal_id": "TASK_MCP_B250_TAXONOMY_PATCH",
+      "target_files": [
+        "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
+        "tools/geoai-task-mcp/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh"
+      ],
+      "lines": "eval JSON tool_authority_tiers.tiers[0].member_tools (TIER_1_READ_ONLY_NAVIGATION) approx lines 39-55; paired test total_tools assertion approx line 115",
+      "stale_assertion_ids": ["STALE_6_B250_TIER_TAXONOMY_MISSING_TOOL"],
+      "current_value": "TIER_1 lists 15 member_tools; geoai_task_codex_handoff_markdown absent from all tiers; geoai_supervisor_loop_status.implemented == 'schema_only_pending_wiring'",
+      "corrected_value": "TIER_1 lists 16 member_tools (add geoai_task_codex_handoff_markdown, implemented:true); geoai_supervisor_loop_status.implemented -> true (wired live by B11); total_tools recomputed as 20 implemented (TIER_1 16 + TIER_2 4) plus any reserved TIER_3/TIER_4 placeholders retained as-is",
+      "action": "Patch the eval JSON taxonomy and its paired test assertion in the SAME change -- the test enforces the eval JSON's tier counts, so patching one without the other reintroduces drift immediately.",
+      "priority": "medium",
+      "note": "Freshest artifact in the repo (same day as B251); most actionable single patch target per B251's own next_wave note."
+    }
+  ],
+  "coordinated_task_recommendation_ref": "tools/geoai-task-mcp/data/tasking/task_mcp_inventory_taxonomy_sync_next_wave_b252_v1.json",
+  "coordination_rationale": "All 5 proposals are deterministic doc/test-fixture rebases of the SAME underlying fact (live tool count/tier split moved 15->20 across B107-B11) -- patching them as 5 separate fragmented tasks risks re-landing mutually inconsistent counts (as already happened once: B251's own STALE_3 arithmetic slip of 14 vs the correct 16). One coordinated source_patch task with a single source-of-truth live count (16 read-only + 4 write-gated = 20) applied atomically across README, frozen-contract companion fixture, both stdio smoke tests, the neural-launch collision-row test, and the B250 taxonomy pair removes the drift class in one commit instead of five staggered ones.",
+  "neural_bridge_note": "All 5 proposals are deterministic doc/test-fixture rebases (evidence/validator role), not a cognitive routing decision -- consistent with B251's own next_wave neural_bridge_note. No neural migration target is implied by this inventory-sync plan or its recommended coordinated patch. MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 (tracked separately) remains the neural target for adapter/runner/topic SELECTION, which none of these count-assertion fixes touch.",
+  "acceptance_results": {
+    "rows_cover_all_five_b251_inventory_proposals_with_exact_target_files_and_stale_assertion_details": "PASS - patch_plan has 5 entries, one per B251 proposal_id, each with target_files + lines + stale_assertion_ids + current_value + corrected_value; see rows JSONL for the flattened per-target rows",
+    "recommends_one_coordinated_source_patch_task_not_fragmented_drift_patches": "PASS - see coordinated_task_recommendation_ref (single recommended_task object, not a list)",
+    "no_readme_tests_source_files_patched_by_this_planning_task": "PASS - this task wrote only eval/JSONL/data-tasking/tests-for-this-plan artifacts under its own allowed_writes; README.md and all target test/source files listed above were read-only inputs (values taken from B251 read_first evidence), never opened for write",
+    "test_script_validates_plan_completeness": "PASS - see tests/test_task_mcp_inventory_taxonomy_sync_plan_b252_v1.sh"
+  },
+  "forbidden_operations_verified_not_taken": [
+    "source_patch", "daemon_start", "credential_access", "task_status_mutation", "git_add_A", "mixed_task_commit"
+  ],
+  "commit_contract": "NO_COMMIT per task contract; artifacts left uncommitted for Codex to stage/finalize.",
+  "rows_ref": "tools/geoai-task-mcp/eval/task_mcp_inventory_taxonomy_sync_plan_rows_b252_v1.jsonl",
+  "next_wave_ref": "tools/geoai-task-mcp/data/tasking/task_mcp_inventory_taxonomy_sync_next_wave_b252_v1.json"
+}

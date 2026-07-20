@@ -1,0 +1,98 @@
+{
+  "schema_id": "geoai.task_mcp.eval.worker_project_context_b434.v1",
+  "task_id": "CODEX_GPT55_TASK_MCP_WORKER_AI_INFRA_INTEGRATION_B434_V1",
+  "timestamp_utc": "2026-07-16T00:00:00Z",
+  "before": {
+    "project_context": "task cards had no bounded structured project_context preflight or common trusted bundle injection",
+    "context_databases": "isolated worktrees could omit live source_graph/session indexes; no per-worker DB copy was allowed by contract",
+    "codex_sandbox": "Codex command planning defaulted to workspace-write unless a raw env override selected danger-full-access",
+    "required_outputs": "successful isolated worker exit could reach review_ready based on validation/promotion without a card-level required-output contract"
+  },
+  "after": {
+    "project_context": "project_context.py validates required/source_graph/session/kb contracts and collects bounded source_graph focus/slice/bundle plus transcript current-state with fixed argv and shell=false",
+    "common_prompt": "build_worker_prompt injects one PROJECT_CONTEXT_BUNDLE string shared by Claude, Codex and DeepSeek adapter prompts",
+    "redaction": "launcher events and request metadata store only project_context schema, hashes, byte counts, truncation flags and degraded reasons",
+    "context_databases": "worker_workspace seeding remains limited to declared read_first/allowed_writes plus isolated task queue DB; source_graph.db/session.db are not copied per worker",
+    "codex_sandbox": "runtime command planning selects Codex danger-full-access only when an outer landlock/bubblewrap sandbox backend is explicitly passed; standalone default remains workspace-write",
+    "required_outputs": "worker_workspace.validate_required_outputs fails closed on missing/no-match/symlink/non-file/zero-byte required artifacts before promotion/review"
+  },
+  "commands": [
+    {
+      "cmd": ".venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "result": "not_run_environment_blocked",
+      "returncode": 127,
+      "stdout": "",
+      "stderr": "/usr/bin/bash: line 1: .venv/bin/python: No such file or directory"
+    },
+    {
+      "cmd": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "result": "not_run_environment_blocked",
+      "returncode": 1,
+      "stdout": "",
+      "stderr": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "cmd": "python3 -m py_compile tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "result": "pass",
+      "returncode": 0
+    },
+    {
+      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src python3 -c \"from geoai_task_mcp import process_launcher, project_context, runtime_adapters, worker_workspace; print('import ok')\"",
+      "result": "pass",
+      "returncode": 0,
+      "stdout": "import ok"
+    },
+    {
+      "cmd": "python3 AITools/taskctl.py verify",
+      "result": "pass",
+      "returncode": 0,
+      "stdout": "VERIFY: PASS"
+    },
+    {
+      "cmd": "python3 AITools/taskctl.py collision-guard",
+      "result": "pass",
+      "returncode": 0,
+      "stdout": "collision_free=true - no overlapping allowed_writes (118 active cards)"
+    },
+    {
+      "cmd": ".venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_process_launcher_security.py tools/geoai-task-mcp/tests/test_runtime_adapters.py tools/geoai-task-mcp/tests/test_worker_workspace.py",
+      "result": "not_run_environment_blocked",
+      "returncode": 127,
+      "stdout": "",
+      "stderr": "/usr/bin/bash: line 1: .venv/bin/python: No such file or directory"
+    },
+    {
+      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src /home/shrek/GeoAI/.venv/bin/python -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "result": "coordinator_pass",
+      "returncode": 0,
+      "stdout": "8 passed"
+    },
+    {
+      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src /home/shrek/GeoAI/.venv/bin/python -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_process_launcher_security.py tools/geoai-task-mcp/tests/test_runtime_adapters.py tools/geoai-task-mcp/tests/test_worker_workspace.py",
+      "result": "coordinator_pass",
+      "returncode": 0,
+      "stdout": "45 passed"
+    },
+    {
+      "cmd": "real parent Source Graph focus/slice/bundle + bounded session + KB canary",
+      "result": "coordinator_pass",
+      "returncode": 0,
+      "stdout": "focus=10798B; slice=31471B with valid bounded JSON preview; bundle=12434B; no degraded section"
+    },
+    {
+      "cmd": "production Task MCP regression: project-context + launcher + security + adapters + workspace + liveness + DeepSeek BYOK",
+      "result": "coordinator_pass",
+      "returncode": 0,
+      "stdout": "117 passed"
+    }
+  ],
+  "worker_pytest_blocker": "the isolated worktree had no local .venv; Codex coordinator reran the exact focused suites with the parent repository venv and accepted the corrected 8/8 plus 45/45 results",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_worker_project_context_b434_v1.json"
+  ]
+}

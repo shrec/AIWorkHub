@@ -1,0 +1,322 @@
+{
+  "aggregate_stats": {
+    "age_hours": {
+      "max": 375.1,
+      "min": 45.9,
+      "p50": 351.1,
+      "p90": 375.1
+    },
+    "allowed_writes": {
+      "max": 18,
+      "mean": 5.35,
+      "min": 1,
+      "p50": 5,
+      "p90": 7,
+      "p95": 7
+    },
+    "review_wait_hours": {
+      "max": 186.3,
+      "min": 0.0,
+      "p50": 0.1,
+      "p90": 0.5
+    }
+  },
+  "builder_contract": "B160_v1_review_signal_inventory_no_runtime",
+  "declared_risk_counts": {
+    "high": 410,
+    "low": 185,
+    "low-medium": 6,
+    "low_medium": 10,
+    "medium": 889,
+    "medium_high": 13,
+    "very_high": 1
+  },
+  "examples_by_status_family": {
+    "blocked": [
+      "CODER_BACKGROUND_CONSOLIDATION_DAEMON_STATE_STORE_V1",
+      "CODER_BACKGROUND_DISTILLED_TARGET_COMPILER_BATCH01_V1",
+      "CODER_BACKGROUND_SHADOW_TRAINING_CYCLE_BATCH01_V1",
+      "DEEPSEEK_GEORGIAN_GRAMMAR_SOURCE_POS_NEGATIVE_GATE_STRICT_REPAIR_P2W2_V1",
+      "DEEPSEEK_GEORGIAN_GRAMMAR_MARKDOWN_VERB_EXAMPLE_EXTRACT_P2X2_V1"
+    ],
+    "finished": [
+      "CODER_AGENT_LOOP_REAL_EXECUTION_VERIFIER_COVERAGE_V1",
+      "CODER_AGENT_LOOP_TOOLISA_CONSUMER_DEFAULT_APPLY_GATE_V2",
+      "CODER_AGENT_LOOP_TOOLISA_CONSUMER_WIRE_AND_DEFAULT_GATE_V1",
+      "CODER_CHAT_AGENT_LOOP_ENTRY_POINT_V1",
+      "CODER_CODE_GENERATION_LANGUAGE_CURRICULUM_C_LUAJIT_PY_BATCH01_V1"
+    ],
+    "pending": [
+      "CLAUDE_GENERALIZATION_PARAPHRASE_CURRICULUM_DISTILL_B161_V1",
+      "CLAUDE_GENERALIZATION_PARAPHRASE_ROUTE_INVARIANCE_PROBE_B161_V1",
+      "CLAUDE_LEXICON_ATLAS_BITMASK_OVERLAY_PREFLIGHT_B161_V1",
+      "DEEPSEEK_GENERALIZATION_GEORGIAN_NATIVE_PARAPHRASE_B161_V1",
+      "DEEPSEEK_LEXICON_AOBA_PATTERN_SOURCE_HARVEST_B161_V1"
+    ],
+    "processing": [
+      "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_B10_V1",
+      "DEEPSEEK_LEXICON_PREVERB_ROOT_MISSING_5_SOURCE_CHASE_B143_V1",
+      "DEEPSEEK_LEXICON_SAFLAVS_SURFACE_EXACT_SEARCH_B155_V1",
+      "DEEPSEEK_NEURAL_CONNECTIVITY_NONCOLLISION_RANGE_SPEC_BACKFILL_B17_V1",
+      "DEEPSEEK_SIGNAL_ATLAS_B56_NONLEAKY_FEATURE_MINE_B170_V1"
+    ],
+    "review_ready": [
+      "CLAUDE_INFERENCE_DEPENDENCY_SCORECARD_B160_V1",
+      "CLAUDE_INFERENCE_FALSE_SUPPORT_ROW_EXPANSION_B160_V1",
+      "CLAUDE_NEURAL_CONNECTIVITY_SELECTOR_CURRICULUM_B160_V1",
+      "DEEPSEEK_GENERALIZATION_NEGATIVE_ABSTAIN_HELDOUT_B160_V1",
+      "DEEPSEEK_GENERALIZATION_NOISY_INPUT_HELDOUT_B160_V1"
+    ],
+    "review_worker_finished": []
+  },
+  "generated_at": "2026-07-06T15:03:51.661582+00:00",
+  "mcp_exposure_gaps": [
+    {
+      "category": "risk",
+      "exposed_via": [
+        "geoai_task_show",
+        "geoai_task_review_summarize"
+      ],
+      "gap": "No aggregated risk score across queue; human_brief.risk is optional text, not enumerated."
+    },
+    {
+      "category": "change_size",
+      "exposed_via": [
+        "geoai_task_show",
+        "geoai_task_review_summarize"
+      ],
+      "gap": "No file-type breakdown or scope-warning flag in MCP tool response; counts are implicit."
+    },
+    {
+      "category": "validation",
+      "exposed_via": [
+        "geoai_task_show",
+        "geoai_task_health (verify)"
+      ],
+      "gap": "No per-task test-pass/fail state stored; verify is queue-wide, not per-task."
+    },
+    {
+      "category": "cost",
+      "exposed_via": [
+        "geoai_task_usage_report"
+      ],
+      "gap": "Cost not joined into task card view; requires separate call. No cumulative cost per topic."
+    },
+    {
+      "category": "collision",
+      "exposed_via": [
+        "geoai_task_collision_guard"
+      ],
+      "gap": "Per-card collision state not surfaced in show/list; requires full guard scan."
+    },
+    {
+      "category": "staleness",
+      "exposed_via": [
+        "geoai_task_list (status filter)",
+        "geoai_task_show (timestamps)"
+      ],
+      "gap": "No computed staleness score or age-hours in tool response; raw timestamps only."
+    }
+  ],
+  "recommended_neural_priority_targets": [
+    {
+      "field": "risk_level",
+      "priority": "P0",
+      "rationale": "Single compact risk tier for quick filtering before deep review.",
+      "source": "Combined from authority_flags, forbidden scope, declared_risk, mode",
+      "type": "enum{low,medium,high}"
+    },
+    {
+      "field": "change_scope",
+      "priority": "P0",
+      "rationale": "Codex reviewer needs to know review effort before opening card.",
+      "source": "allowed_writes count + file-type diversity",
+      "type": "enum{tiny(0-2),small(3-6),medium(7-15),large(16+)}"
+    },
+    {
+      "field": "validation_gate",
+      "priority": "P1",
+      "rationale": "A task with unknown validation is riskier than one with green tests.",
+      "source": "Per-task test result (currently not stored per-task; needs infra)",
+      "type": "enum{pass,fail,unknown}"
+    },
+    {
+      "field": "staleness_hours",
+      "priority": "P1",
+      "rationale": "Stale review items decay in relevance; oldest-first or risk-weighted.",
+      "source": "Elapsed hours since started_at (if processing) or review_at (if review)",
+      "type": "float"
+    },
+    {
+      "field": "collision_risk",
+      "priority": "P0",
+      "rationale": "Colliding tasks must be sequenced; flag before claiming.",
+      "source": "Whether this task's allowed_writes overlap any other active task",
+      "type": "bool"
+    },
+    {
+      "field": "has_human_brief",
+      "priority": "P2",
+      "rationale": "Cards with explicit reviewer guidance are faster to triage.",
+      "source": "Presence of human_brief with reviewer_focus",
+      "type": "bool"
+    },
+    {
+      "field": "commit_hygiene_ok",
+      "priority": "P1",
+      "rationale": "Poor commit hygiene correlates with review-back pressure.",
+      "source": "commit_contract contains no-commit + git-add-all prohibition + mixed-task prohibition",
+      "type": "bool"
+    }
+  ],
+  "runner_counts": {
+    "NONE_already_done": 12,
+    "claude_c_native": 33,
+    "claude_capability_eval": 150,
+    "claude_coder": 47,
+    "claude_coding": 134,
+    "claude_context_graph": 81,
+    "claude_general_reasoning": 89,
+    "claude_lexicon_trainer": 48,
+    "claude_open_generation": 88,
+    "claude_shared_axis": 40,
+    "claude_stem": 99,
+    "claude_translate": 10,
+    "codex": 15,
+    "copilot_claude": 23,
+    "deepseek_agent_loop": 47,
+    "deepseek_authority_audit": 6,
+    "deepseek_coding": 22,
+    "deepseek_coding_verifier": 6,
+    "deepseek_flash": 36,
+    "deepseek_measurement_hygiene": 6,
+    "deepseek_neural": 62,
+    "deepseek_neural_score": 19,
+    "deepseek_pro": 7,
+    "deepseek_tasking": 6,
+    "deepseek_translate": 29,
+    "deepseek_translate_case": 27,
+    "deepseek_translate_sources": 27,
+    "deepseek_v4_pro": 19,
+    "deepseek_valency": 7,
+    "opus": 6
+  },
+  "schema_id": "geoai.review_signal_inventory.v1",
+  "signal_categories": {
+    "change_size": "Change-size signals — allowed_writes count, file types, validation count",
+    "collision": "Collision signals — overlapping allowed_writes, runner/topic conflicts",
+    "cost": "Cost signals — token in/out, cost_usd, records count from usage report",
+    "risk": "Risk signals — authority flags, forbidden scope, declared risk, mode riskiness",
+    "staleness": "Staleness signals — age, elapsed hours, review-wait, completed_at presence",
+    "validation": "Validation signals — test commands, acceptance criteria, verify result"
+  },
+  "signal_inventory_field_list": {
+    "change_size": [
+      "allowed_writes_count",
+      "allowed_writes_file_types",
+      "validation_commands_count",
+      "acceptance_criteria_count",
+      "read_first_count",
+      "allowed_writes_has_server_py",
+      "allowed_writes_has_registry",
+      "allowed_writes_has_default"
+    ],
+    "collision": [
+      "has_collision",
+      "collision_files"
+    ],
+    "cost": [
+      "usage_report_available",
+      "input_tokens",
+      "output_tokens",
+      "cost_usd",
+      "usage_records"
+    ],
+    "focus": [
+      "reviewer_focus",
+      "intent",
+      "expected_win",
+      "human_brief_present"
+    ],
+    "risk": [
+      "declared_risk",
+      "authority_runtime",
+      "authority_default",
+      "authority_training_launch",
+      "forbidden_count",
+      "forbidden_items",
+      "mode",
+      "mode_is_readonly",
+      "mode_has_runtime",
+      "has_forbidden_git_add_a",
+      "has_forbidden_mixed_task",
+      "commit_contract_no_commit",
+      "commit_contract_explicit"
+    ],
+    "staleness": [
+      "status_family",
+      "status",
+      "worker_status",
+      "created_at",
+      "started_at",
+      "completed_at",
+      "review_at",
+      "age_hours",
+      "started_elapsed_hours",
+      "review_wait_hours",
+      "completed_hours_ago",
+      "is_stale"
+    ],
+    "validation": [
+      "validation_commands",
+      "has_bash_test",
+      "has_pytest",
+      "has_python_script",
+      "has_taskctl_verify",
+      "has_any_validation",
+      "acceptance_criteria"
+    ]
+  },
+  "source_registry": "/home/shrek/GeoAI/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+  "status_family_counts": {
+    "blocked": 25,
+    "finished": 2647,
+    "pending": 6,
+    "processing": 18,
+    "review_ready": 7
+  },
+  "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SIGNAL_INVENTORY_B160_V1",
+  "topic_counts": {
+    "agent_loop": 18,
+    "artifact_hygiene": 12,
+    "attention_research": 57,
+    "authority_migration": 12,
+    "c_native": 32,
+    "capability_eval": 143,
+    "coding": 203,
+    "context_graph": 84,
+    "finance": 19,
+    "general_reasoning": 88,
+    "generalization": 15,
+    "geometry_research": 300,
+    "lexicon": 113,
+    "lexicon_trainer": 43,
+    "navigator": 13,
+    "navigator_research": 20,
+    "neural_authority": 130,
+    "neural_connectivity": 45,
+    "open_generation": 108,
+    "opengen": 20,
+    "representation": 282,
+    "shared_axis": 56,
+    "signal_atlas": 374,
+    "stem": 103,
+    "task_mcp": 60,
+    "tasking_system": 14,
+    "training": 10,
+    "translation": 18,
+    "translation_bridge": 97,
+    "translator": 23
+  },
+  "total_cards": 2703
+}

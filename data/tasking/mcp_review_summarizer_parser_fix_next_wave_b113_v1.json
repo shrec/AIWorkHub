@@ -1,0 +1,38 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_parser_fix_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1",
+  "runner": "deepseek_task_mcp_review_parser_fix_b113",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B113 parser fix complete. Both B112 warnings resolved: regex now suffix-tolerant (real queue lines with em-dash descriptions parse correctly), fetch_errors=[] added to empty-queue path. All read-only/no-launch invariants preserved.",
+  "resolved_warnings": [
+    "B112_REGEX_DESCRIPTION_SUFFIX",
+    "B112_EMPTY_FETCH_ERRORS_ABSENT"
+  ],
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1",
+      "objective": "Smoke test that the MCP server starts with the new tool registered and list-tools includes geoai_task_review_summarize",
+      "runner": "deepseek_task_mcp_review_summarizer_b113",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1"],
+      "priority": "task_mcp_b113_startup_smoke",
+      "ready": true
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+      "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization",
+      "runner": "deepseek_task_mcp_review_summarizer_b114",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1"],
+      "priority": "task_mcp_b114_neural_bridge",
+      "ready": true
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py done DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1 after review",
+    "Codex to create/update B113 startup smoke task card if needed"
+  ]
+}

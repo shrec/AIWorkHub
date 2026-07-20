@@ -1,0 +1,33 @@
+{
+  "schema_id": "geoai.task_mcp.untracked_recursive_input_seed_b660_v1.coordinator_review.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_UNTRACKED_RECURSIVE_INPUT_SEED_B660_V1",
+  "worker_terminal_state": "cancelled_by_coordinator_after_bounded_patch",
+  "decision": "ACCEPT_COORDINATOR_REPAIR",
+  "root_cause": "pathlib.Path.glob on a terminal tree/** declaration returns directory matches rather than the complete nested regular-file population, so _expand_declared discarded the directories and seeded none of the untracked B647 files.",
+  "repair": {
+    "scope": "_expand_declared terminal /** input expansion only",
+    "mechanism": "deterministic os.walk over the live parent filesystem with followlinks disabled",
+    "untracked_and_gitignored_files_included": true,
+    "symlink_files_and_directories_rejected": true,
+    "max_seed_files_preserved": true,
+    "allowed_write_promotion_lifecycle_changed": false
+  },
+  "coordinator_verification": {
+    "focused_regression": "4/4 PASS",
+    "existing_worker_workspace_suite": "35/35 PASS",
+    "python_compile": "PASS",
+    "live_b658_safp6461_seeded": 20,
+    "live_b656b_safp6461_seeded": 56,
+    "live_b658_total_files_seeded": 80,
+    "live_b656b_total_files_seeded": 224,
+    "live_seed_hash_mismatches": 0,
+    "live_canary": "PASS"
+  },
+  "authority_boundary": {
+    "atlas_store_mutation": false,
+    "task_lifecycle_change": false,
+    "promotion_change": false,
+    "scope_relaxation": false
+  },
+  "next_dependency": "Launch CODEX_GPT55_SIGNAL_ATLAS_GENUINE_COLLECTION_CATALOG_B659_V3 from a clean workspace and require direct queries over the 20 plus 56 hydrated immutable stores."
+}

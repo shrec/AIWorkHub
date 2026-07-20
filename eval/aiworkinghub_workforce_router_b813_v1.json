@@ -1,0 +1,51 @@
+{
+  "schema_id": "geoai.task_mcp.eval.aiworkinghub_workforce_router_b813_v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_WORKFORCE_ROUTER_B813_V1",
+  "mode": "capability_cost_outcome_task_allocation",
+  "policy_scope": {
+    "pure_policy_only": true,
+    "queue_mutation": false,
+    "worker_launch": false,
+    "git_commit": false,
+    "repo_id_isolation": true
+  },
+  "requirements_covered": [
+    "bounded_task_requirements",
+    "worker_capabilities_for_gpt55_deepseek_v4_pro_glm52_claude",
+    "no_hardcoded_claude_default",
+    "rank_available_compatible_workers_only",
+    "observed_outcome_latency_token_cost_inputs",
+    "conservative_labeled_priors_for_missing_evidence",
+    "cheapest_capable_selection",
+    "disjoint_parallel_shards_only",
+    "duplicate_accepted_work_prohibited",
+    "failed_residuals_escalate_only",
+    "authoritative_owner_coordinator_model_pins",
+    "no_provider_constraints",
+    "unavailable_or_credential_missing_model_never_selected",
+    "explainable_decision_record_with_fallback_chain"
+  ],
+  "deterministic_tests": [
+    "test_selects_cheapest_capable_model_without_claude_default",
+    "test_missing_evidence_uses_labeled_conservative_priors_and_can_fail_floor",
+    "test_authoritative_owner_pin_and_no_provider_constraints_are_enforced",
+    "test_unavailable_credentials_or_quota_are_never_selected",
+    "test_capability_context_tool_risk_and_quality_filters_are_explainable",
+    "test_parallel_shards_require_disjoint_inputs_and_do_not_launch_or_mutate",
+    "test_decision_record_declares_pure_policy_and_residual_escalation"
+  ],
+  "conservative_priors": {
+    "accepted_rate": 0.5,
+    "review_ready_rate": 0.5,
+    "validation_failure_rate": 0.25,
+    "p50_latency_seconds": 3600.0,
+    "p95_latency_seconds": 14400.0,
+    "cost_usd_per_1k_tokens": 99.0,
+    "estimated_tokens": 100000.0
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/workforce_router.py",
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_workforce_router_b813_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkinghub_workforce_router_b813_v1.json"
+  ]
+}

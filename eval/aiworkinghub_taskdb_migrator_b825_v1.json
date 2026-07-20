@@ -1,0 +1,28 @@
+{
+  "acceptance_evidence": {
+    "atomic_cutover": "cutover_shadow requires allow_cutover=true, verifies shadow parity before os.replace, backs up an existing canonical DB with sqlite_online_backup, and leaves the legacy source DB in place.",
+    "default_action": "create_shadow performs online backup to .aiworkinghub/tasking/.task_queue.sqlite.shadow and parity verification only.",
+    "online_backup": "sqlite_online_backup uses sqlite3.Connection.backup into a private temp DB and atomically publishes the destination only after backup completion.",
+    "parity": "compare_parity covers schema fingerprint, counts for tasks/events/artifacts/callback_outbox/callback_batches, lifecycle-bearing task identities, and pending/inflight callback delivery identities.",
+    "path_resolution": "resolve_task_store_paths uses the AIWorkingHub repository manifest durable tasking directory; AITools.taskdb keeps BITNN_TASK_QUEUE_DB as the explicit compatibility override."
+  },
+  "default_action": "shadow_only",
+  "forbidden_guard": {
+    "automatic_cutover": false,
+    "callback_loss": false,
+    "cross_repo_queue": false,
+    "legacy_delete": false,
+    "raw_live_db_copy": false,
+    "status_reset": false
+  },
+  "schema_id": "geoai.task_mcp.eval.aiworkinghub_taskdb_migrator_b825_v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_TASKDB_MIGRATOR_B825_V1",
+  "tests": [
+    "test_shadow_uses_sqlite_backup_api_with_active_wal_and_preserves_parity",
+    "test_interrupted_backup_does_not_publish_partial_shadow",
+    "test_mismatch_rejection_when_source_changes_after_shadow",
+    "test_explicit_cutover_is_atomic_and_keeps_legacy_as_rollback_source",
+    "test_two_repositories_with_identical_task_ids_do_not_cross_queues",
+    "test_taskdb_env_override_beats_manifest_default"
+  ]
+}

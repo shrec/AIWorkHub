@@ -1,0 +1,57 @@
+{
+  "next_wave_id": "mcp_completion_inbox_wiring_next_wave_b275_v1",
+  "parent_task": "CLAUDE_TASK_MCP_COMPLETION_INBOX_WIRING_B275_V1",
+  "date": "2026-07-08",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps the completion-inbox tool strictly read-only and adds NO new process-spawn code.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_RESULT_SCHEMA_FREEZE_V1",
+      "goal": "Freeze the geoai_completion_inbox result schema (mirroring test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh) so a future change to completion_inbox.py or server.py cannot silently drop a field Codex depends on (review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, authority_flags, mutation).",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/mcp_completion_inbox_result_schema_freeze.py",
+        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_result_schema_freeze_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_completion_inbox_result_schema_freeze_v1.json"
+      ],
+      "acceptance": [
+        "frozen key set asserted present in geoai_completion_inbox output",
+        "test fails loudly if a depended-on key is removed or renamed",
+        "no process launch, no queue/audit mutation"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_ADD_INDEXER_COVERAGE_V1",
+      "goal": "Fix the documented indexer gap (kb bug.tools_geoai_task_mcp_not_indexed): add tools/geoai-task-mcp to source_graph.py's source_dirs (AITools/source_graph.toml) and source_graph_universal.py's project roots so server.py/core.py/completion_inbox.py/review_summarizer.py become queryable via the mandated indexer path instead of requiring a direct Read workaround on every future task touching this package.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "AITools/source_graph.toml"
+      ],
+      "acceptance": [
+        "source_graph.py context/body/find return real results for tools/geoai-task-mcp/**/*.py after build -i",
+        "no existing source_dir entry removed or altered",
+        "kb bug.tools_geoai_task_mcp_not_indexed updated/superseded to reflect the fix"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_STALE_ARTIFACT_SIGNAL_V1",
+      "goal": "Strengthen stale_processing beyond the updated_at/started_at/claimed_at timestamp proxy: cross-check whether any file in the card's allowed_writes has a filesystem mtime newer than the card's last DB timestamp (real artifact activity signal), read-only (os.stat only, no content read of code files).",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_stale_artifact_signal_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_completion_inbox_stale_artifact_signal_v1.json"
+      ],
+      "acceptance": [
+        "stale_processing entries report an artifact_activity_since_last_db_update bool",
+        "read-only: os.stat only, no writes, no code-content reads",
+        "no regression on existing 4-facet shape"
+      ]
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py review CLAUDE_TASK_MCP_COMPLETION_INBOX_WIRING_B275_V1 and finalize (NO_COMMIT from worker).",
+    "This task did not modify AITools/source_graph.toml (outside its allowed_writes) even though the indexer gap was confirmed live during this task -- see CLAUDE_TASK_MCP_COMPLETION_INBOX_ADD_INDEXER_COVERAGE_V1 above."
+  ]
+}

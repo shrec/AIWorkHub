@@ -1,0 +1,40 @@
+{
+  "next_wave_id": "mcp_manifest_head_pin_ci_stale_commit_guard_next_wave_b113_v1",
+  "parent_task": "CLAUDE_TASK_MCP_MANIFEST_HEAD_PIN_CI_STALE_COMMIT_GUARD_B113_V1",
+  "date": "2026-07-04",
+  "status": "proposed_not_queued",
+  "enqueued": false,
+  "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B113 hardens the B112 git-HEAD pin with a STALE-COMMIT guard: the committed head-pin eval evidence (mcp_manifest_git_head_pin_b112_v1.json and this B113 eval) must keep committed_sha256 == the live nested-repo HEAD blob sha of the B110 manifest (git show HEAD:eval/mcp_unified_contract_freeze_manifest_b110_v1.json). If the manifest is re-committed but the evidence is not refreshed, committed_sha256 goes STALE and the guard fails LOUDLY. Added to test_mcp_manifest_git_head_pin_b112_v1.sh as section 8 (four checks): 8a asserts both committed evals track the live HEAD blob; 8b DIVERGENCE TEETH -- a controlled temp-copy of the eval with committed_sha256 frozen to 0*64 is REJECTED non-zero; 8c GIT-CLEAN FALSE-FAIL TRAP -- in a private mktemp git repo the manifest working copy is ADDITIVELY patched (dirty) yet the guard reads `git show HEAD:<rel>`, so the HEAD blob sha (== eval evidence) is unchanged and the guard PASSES, while a naive git-clean/working-tree check would have false-FAILed (patch-state-independent semantic compare, not raw git diff); 8d read-only re-assert. Verified: live HEAD blob sha256=e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708 == committed_sha256, manifest_fingerprint=ac7a5bad... recomputes, byte-identical regeneration preserved, zero drift. READ-ONLY: mutates no tracked file (before/after sha256 of manifest + B112/B113 eval unchanged), launches no agent/model/server, makes no network call, does not enable any write gate; authority_flags all FALSE at worker scope; parent taskctl queue intact (verify PASS). Adapter/runner/topic launch SELECTION remains a LEARNED-router target (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this is an ABCR/validator drift-protection tooth over the executor surface, never a runtime cognitive router.",
+  "produced_artifacts": [
+    "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "tools/geoai-task-mcp/eval/mcp_manifest_head_pin_ci_stale_commit_guard_b113_v1.json",
+    "tools/geoai-task-mcp/data/tasking/mcp_manifest_head_pin_ci_stale_commit_guard_next_wave_b113_v1.json"
+  ],
+  "composes": [
+    "CLAUDE_TASK_MCP_MANIFEST_GIT_HEAD_PIN_B112_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
+    "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1"
+  ],
+  "neural_bridge_priority": {
+    "role": "deterministic_manifest_head_pin_stale_commit_regression_guard",
+    "not_runtime_authority": true,
+    "learned_target": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "note": "Evidence extractor / drift guard, not intelligence. The trainable target (learned adapter/runner/topic launch routing + abstain) is MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1; no regex/keyword cue router is introduced as launch or route authority."
+  },
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_MANIFEST_HEAD_PIN_EVAL_AUTOREFRESH_ATTEST_B114_V1",
+      "status": "proposed_not_queued",
+      "goal": "Add a read-only attestation that when the B110 manifest HEAD blob legitimately advances, a single canonical refresh path updates ALL committed head-pin eval evidence (B112 + B113) in one atomic step, so no committed eval can lag the others; prove divergence across the eval set is rejected non-zero.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh"
+      ],
+      "acceptance": [
+        "all committed head-pin evals share one committed_sha256 == live HEAD blob",
+        "fails non-zero if any single eval lags after a manifest recommit",
+        "read-only; mutates nothing tracked; launches nothing"
+      ]
+    }
+  ]
+}

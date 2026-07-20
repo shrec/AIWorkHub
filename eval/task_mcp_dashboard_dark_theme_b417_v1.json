@@ -1,0 +1,30 @@
+{
+  "schema_id": "geoai.task_mcp.dashboard_dark_theme.coordinator_review.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_DASHBOARD_DARK_THEME_B417_V1",
+  "coordinator_verdict": "ACCEPT",
+  "worker_terminal_outcome": "validation_failed",
+  "worker_failure_scope": "Worker attempted taskctl review inside the isolated read-only worktree and could not acquire .task_queue_v1.lock; the UI implementation itself completed successfully.",
+  "accepted_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.css",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/index.html",
+    "tools/geoai-task-mcp/tests/test_dashboard_dark_theme_b417_v1.py"
+  ],
+  "preserved_behavior": [
+    "dashboard layout",
+    "dashboard JavaScript",
+    "dashboard API",
+    "task lifecycle",
+    "archive and restore controls"
+  ],
+  "verification": {
+    "focused_dark_theme": "7 passed",
+    "dashboard_regression": "39 passed",
+    "live_endpoint": "http://127.0.0.1:18765 serves dark HTML and CSS; LAN proxy remains 192.168.1.35:8765"
+  },
+  "theme": {
+    "color_scheme": "dark",
+    "canvas": "#18181b",
+    "surface": "#1e1e22",
+    "ink": "#e4e4e7"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "next_wave_id": "review_artifact_strictness_robust_repair_next_wave_b121_v1",
+  "parent_task": "CLAUDE_TASK_MCP_REVIEW_STRICTNESS_ROBUST_REPAIR_B121_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). B121 repaired the B120 guard: (1) audit_json_artifact() no longer accepts bare checks_total/checks_passed ints as sufficient acceptance evidence on their own -- a real submission must carry at least one populated named container (gates/acceptance_results/invariants_verified/tests_run); this closed the exact live gap where mcp_full_wave_dryrun_harness_b119_v1.json had drifted from an original 0-byte/echo-only dummy shape to a populated-but-fully-fabricated eval JSON (hardcoded checks_total=checks_passed=4, sha_before reused verbatim as sha_after) that the B120 guard no longer caught. (2) Added _has_unbound_positional_args_bash/_python: detects a test/harness that reads bare top-level $1/$2/.../sys.argv[N] positional CLI args this repo's zero-arg test-invocation convention can never bind, WITHOUT false-positiving on the ubiquitous, legitimate bash idiom of a helper function binding $1/$2 as its own call-time params (validated against all 42 existing tools/geoai-task-mcp/tests/*.sh scripts, 0 false positives). (3) A parallel red-team subagent then found and this task fixed three further bypasses of the EXISTING (pre-B121) echo-only/dummy-harness heuristics: padding an echo-only test with `true`/`:`/`return 0` no-op lines escaped is_echo_exit_only (fixed: _NOOP_LINE_RE recognizes these as trivial, and _ECHO_LINE_RE's character class was too narrow to even recognize `echo \"Running checks...\"` as an echo line -- broadened to allow common punctuation); a substance/real-io marker word (assert/open() etc.) mentioned only inside a `#` comment counted as real code (fixed: has_substance and has_real_io now scan only non-comment lines). Self-test now carries 5 isolation-safe synthetic fixtures (positive/echo-only/positional-arg-broken/noop-padded/comment-marker, mktemp-based) instead of relying solely on the live, concurrently-mutated B119 wave files, and no longer hardcodes which exact invalid_reason string a hollow submission must produce.",
+  "remaining_gaps_carried_over_from_b120": [
+    "CLAUDE_TASK_MCP_REVIEW_STRICTNESS_HANDOFF_WIRE_V1 (still open): wire build_report()/audit_wave() into review_summarizer.py's handoff report so every queued task gets a strictness_guard field, not just the 3 hardcoded KNOWN_WAVES",
+    "CLAUDE_TASK_MCP_REVIEW_STRICTNESS_GENERIC_DISCOVERY_V1 (still open): replace the fixed KNOWN_WAVES manifest with generic path-convention discovery from a task_id/allowed_writes list",
+    "MCP_NEURAL_REVIEW_STRICTNESS_CURRICULUM_MIGRATION_V1 (still open): emit a labeled curriculum from wave features -> invalid/valid + reason-code targets per neural-bridge-priority doctrine; this guard remains a deterministic baseline/validator, never a promoted cue-router authority"
+  ],
+  "acknowledged_unfixed_red_team_findings": [
+    "Dead-code substance leakage: a bash test can define a helper function containing real assert/comparison logic and !=/exit markers, NEVER call that function anywhere, and just echo a fixed PASS string at top level -- has_substance currently scans the whole non-comment body including unreachable function definitions, so this is not caught. Needs a lightweight call-check (does the function name appear as an invoked command elsewhere in the file, outside its own definition line?) before crediting its body's substance markers to the executed path.",
+    "Fabricated-but-well-shaped named container: an eval JSON with a real non-empty gates/acceptance_results dict where every value is a hardcoded constant (e.g. all True) still passes has_metric_container -- this is an acknowledged inherent limit of a static content-shape screen (it cannot execute or independently verify the underlying computation); the red-team subagent itself judged this not really fixable without running the actual check. Out of scope for a shape-only guard; would need either provenance/signing of eval JSONs at production time, or the neural curriculum/learned-classifier route already tracked as a next-wave item."
+  ],
+  "follow_up_tasks": [
+    {
+      "task_id": "MCP_REVIEW_STRICTNESS_DEAD_CODE_SUBSTANCE_LEAK_V1",
+      "goal": "Fix the dead-code substance leakage red-team finding: has_substance in audit_test_script must not credit assert/comparison markers found only inside a bash function definition that is never invoked elsewhere in the file. Add a lightweight check: for each _FUNC_OPEN_RE-detected function name, confirm it appears as a bare invoked command (not just its own def line) before crediting its body's substance markers.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/geoai-task-mcp/tests/test_review_strictness_dead_code_substance_v1.sh",
+        "tools/geoai-task-mcp/eval/review_strictness_dead_code_substance_v1.json"
+      ],
+      "acceptance": [
+        "a test with a real-looking but never-called helper function + unconditional top-level echo PASS is flagged hollow",
+        "regression: all existing known waves + all B121 synthetic fixtures (5) classify identically; 0 false positives across all real tools/geoai-task-mcp/tests/*.sh scripts",
+        "still read-only, no queue mutation, no new taskctl write command"
+      ]
+    },
+    {
+      "task_id": "MCP_REVIEW_STRICTNESS_TAUTOLOGICAL_METRIC_DETECT_V1",
+      "goal": "The concrete B119 dryrun artifact this task repaired against also exhibits a second, deeper hollow pattern the current guard still cannot see: parent_queue_sha_before and parent_queue_sha_after are both populated from the SAME single hash computation (get_hash called once, assigned to both fields), so a genuinely broken before/after invariant check can never fail -- same class as kb bug.b31_verifier_gate_self_contradiction. Design a static-source check for a harness script that assigns two differently-named 'before'/'after' (or similar paired) output fields from the identical source expression/variable with no intervening state-changing call between them.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/geoai-task-mcp/tests/test_review_strictness_tautological_metric_v1.sh",
+        "tools/geoai-task-mcp/eval/review_strictness_tautological_metric_v1.json"
+      ],
+      "acceptance": [
+        "new check flags a harness whose before/after (or equivalently-paired) output fields derive from the identical unmutated expression",
+        "regression: all 3 existing known waves + the 3 B121 synthetic fixtures classify identically",
+        "still read-only, no queue mutation, no new taskctl write command"
+      ]
+    }
+  ]
+}

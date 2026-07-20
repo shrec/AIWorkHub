@@ -1,0 +1,49 @@
+{
+  "schema_id": "geoai.eval.aiworkinghub_callback_stale_turn_recovery_b823_v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_CALLBACK_STALE_TURN_RECOVERY_B823_V1",
+  "mode": "durable_callback_stale_active_turn_recovery",
+  "result": "implemented",
+  "scope": {
+    "taskdb_authority": "AITools/taskdb.py remains sole callback schema/claim/defer/delivery/stats authority",
+    "bridge_changes": [
+      "sideband status reads callback_batches defensively for redacted parked-batch diagnostics only",
+      "busy/not_ready owner failures continue through BusyThreadError durable park path",
+      "no taskdb compatibility shim or import-time monkey patching"
+    ],
+    "mux_changes": [
+      "per-instance descriptors include generation_id, heartbeat_at, owner_lease_seconds and ready",
+      "owner resolution ignores live descriptors whose heartbeat exceeds the bounded owner lease",
+      "fresh active owners remain valid routing targets and are not interrupted or double-delivered"
+    ]
+  },
+  "acceptance_evidence": [
+    {
+      "requirement": "stale owner disappears or is replaced while durable callback remains pending",
+      "test": "test_stale_generation_is_ignored_and_reconnect_generation_receives_exactly_once"
+    },
+    {
+      "requirement": "genuine active heartbeating turn remains parked",
+      "test": "test_genuine_fresh_active_owner_remains_parked_and_is_not_double_delivered"
+    },
+    {
+      "requirement": "expired ownership lease invalidates only stale active-turn observation",
+      "test": "test_only_stale_owner_parks_durable_callback_without_hard_failure"
+    },
+    {
+      "requirement": "status exposes parked reason, age and owner/generation freshness",
+      "test": "test_status_exposes_redacted_parked_age_and_owner_generation_freshness"
+    },
+    {
+      "requirement": "no second taskdb implementation",
+      "test": "test_callback_bridge_does_not_reimplement_or_monkeypatch_taskdb"
+    }
+  ],
+  "forbidden_regressions": {
+    "interrupt_genuine_active_turn": "fresh owner busy response remains SidebandThreadBusyError durable park",
+    "drop_callback": "stale owner resolution raises durable SidebandOwnerNotFoundError, not hard failure",
+    "duplicate_delivery": "reconnect generation test asserts exactly one turn/start to the fresh owner",
+    "busy_retry_dead_letter": "busy/not_ready subclasses BusyThreadError and existing B682/B684 suites cover non-dead-letter parking",
+    "second_app_server_spawn": "sideband owner recovery uses registry descriptors only and never falls back to AppServerClient",
+    "taskdb_split_authority": "callback_bridge contains no callback schema DDL or taskdb monkey patch"
+  }
+}

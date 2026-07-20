@@ -1,0 +1,79 @@
+{
+  "task_id": "DEEPSEEK_AIWORKINGHUB_VSCODE_MULTIREPO_WORKSPACE_B816_V1",
+  "verdict": "PASS",
+  "runner": "deepseek_aiworkinghub_vscode_multirepo_workspace_b816_v1",
+  "topic": "task_mcp",
+  "mode": "vscode_active_repository_native_dashboard_binding",
+  "completed_at": "2026-07-20T12:04:00Z",
+  "summary": "Converted VS Code Task Operations extension into AIWorkingHub active-repository dashboard. Every window binds one MCP session to the selected workspace repository; multiple windows/repositories remain isolated.",
+  "acceptance_checks": {
+    "rename_display_to_aiworkinghub": {
+      "status": "PASS",
+      "details": "displayName=AIWorkingHub, Activity Bar title=AIWorkingHub, view name=Dashboard, command titles prefixed AIWorkingHub:. Extension ID geoai-task-operations preserved. Legacy command IDs (geoaiTaskOperations.*) registered alongside new aiWorkingHub.* commands."
+    },
+    "single_folder_auto_bind": {
+      "status": "PASS",
+      "details": "getActiveRepositoryRoot detects folders.length===1 and auto-binds, persisting to workspaceState."
+    },
+    "multi_root_explicit_selection": {
+      "status": "PASS",
+      "details": "Multi-root requires explicit repository selection via QuickPick. Selection is persisted in workspaceState under aiWorkingHub.repositoryUri. Never silently uses folders[0]."
+    },
+    "one_mcp_child_per_window_and_repo": {
+      "status": "PASS",
+      "details": "Exactly one childProcess.spawn call site. getMcpClient compares repositoryRoot and tears down stale client on repo mismatch before creating new one."
+    },
+    "aiworkinghub_repo_env_var": {
+      "status": "PASS",
+      "details": "Both AIWORKINGHUB_REPO and legacy GEOAI_REPO env vars passed to the MCP child process."
+    },
+    "same_name_repo_isolation": {
+      "status": "PASS",
+      "details": "repositoryLabel disambiguates same-name folders by appending parent directory segment. Repository binding uses full URI string, not folder name."
+    },
+    "repo_switch_teardown": {
+      "status": "PASS",
+      "details": "selectRepositoryCommand stops old client, clears mcpClient, persists new URI, starts new client, pushes repositoryInfo to all views."
+    },
+    "webview_readonly_strict_csp": {
+      "status": "PASS",
+      "details": "All existing protections preserved: nonce CSP, no iframe, no eval, no unsafe-inline, frame-src none, tool allowlist, sanitizeWebviewPayload, hidden-view polling pause, no write/launch gate env, no innerHTML."
+    },
+    "repo_label_without_host_path": {
+      "status": "PASS",
+      "details": "repositoryLabel uses folder.name only. The Webview receives a repositoryInfo message with just the label string. Host-absolute paths stay in the extension host."
+    }
+  },
+  "test_results": {
+    "smoke_test": {
+      "passed": 29,
+      "failed": 0,
+      "verdict": "PASS",
+      "command": "bash tools/vscode-geoai-task-operations/test_extension_smoke.sh"
+    },
+    "syntax_checks": {
+      "extension_js": "PASS",
+      "app_js": "PASS"
+    }
+  },
+  "changed_paths": [
+    "tools/vscode-geoai-task-operations/extension.js",
+    "tools/vscode-geoai-task-operations/package.json",
+    "tools/vscode-geoai-task-operations/media/app.js",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh"
+  ],
+  "forbidden_violations": {
+    "folders_zero_silent_fallback": false,
+    "central_multi_repo_database": false,
+    "multiple_mcp_children_per_window": false,
+    "browser_iframe_http_dependency": false,
+    "webview_write_authority": false,
+    "absolute_host_path_in_webview": false,
+    "secret_exposure": false,
+    "git_commit": false,
+    "git_push": false,
+    "taskctl_done_by_worker": false
+  },
+  "contract": "NO_COMMIT",
+  "coordinator_note": "Worker completed all acceptance criteria. Codex owns install/reload, integration validation, and final commit."
+}

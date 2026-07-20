@@ -1,0 +1,92 @@
+{
+  "schema_id": "geoai.task_mcp_vscode_dashboard_extension.v1",
+  "eval_id": "task_mcp_vscode_dashboard_extension_b445_v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_VSCODE_DASHBOARD_EXTENSION_B445_V1",
+  "date": "2026-07-16",
+  "verdict": "BUILT_TESTS_PASS_BLOCKED_ON_DASHBOARD_ANTI_FRAMING_HEADERS",
+  "summary": "Built a self-contained VS Code Remote workspace extension (tools/vscode-geoai-task-operations) that surfaces the existing Task MCP dashboard as an Activity Bar launcher/status view plus one retained full-editor WebviewPanel, sourcing data exclusively from the dashboard's own /api/* endpoints. Health check runs on the remote/workspace extension host against the raw configured loopback URL; on failure with autoStart=true it starts exactly one repo-local `python3 -m geoai_task_mcp.dashboard` process (never a duplicate, only its own process ever killed) and polls /healthz with a bounded 20x500ms retry. The client-facing iframe address is resolved separately via vscode.env.asExternalUri so Remote-SSH needs no manual port forwarding. All 16 static smoke assertions pass, `taskctl verify` and `collision-guard` both pass. One real, structural blocker was found and is NOT hidden: tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py::DashboardRequestHandler._send_bytes unconditionally sends X-Frame-Options: DENY and CSP frame-ancestors 'none' on every response (static + /api/*), which a browser enforces regardless of the embedding webview's own CSP -- so the iframe will show a browser-level refusal until a separate follow-up task (outside this task's allowed_writes) relaxes those headers for the VS Code webview origin. Everything else in the contract (config, commands, panel reuse, autostart bounds/ownership, CSP restriction, no secrets/LAN IP/Simple Browser) is implemented and verified.",
+  "changed_paths": [
+    "tools/vscode-geoai-task-operations/package.json",
+    "tools/vscode-geoai-task-operations/extension.js",
+    "tools/vscode-geoai-task-operations/media/geoai-tasks.svg",
+    "tools/vscode-geoai-task-operations/README.md",
+    "tools/vscode-geoai-task-operations/install_remote.sh",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
+    "tools/geoai-task-mcp/eval/task_mcp_vscode_dashboard_extension_b445_v1.json"
+  ],
+  "no_writes_outside_allowed": true,
+  "existing_dashboard_and_other_extension_untouched": true,
+  "file_hashes_sha256": {
+    "tools/vscode-geoai-task-operations/package.json": "033391525f7794b508d9bc58d1935dedac62bcc04c6204f54eae4abbed4038c0",
+    "tools/vscode-geoai-task-operations/extension.js": "a93061f7bdd1d73a5164bbbf67613c66810102cace7b1bc6bc898a9c65703467",
+    "tools/vscode-geoai-task-operations/media/geoai-tasks.svg": "8b193b05a4e7207deb2b48c455c59d5ef6ce72fed14dd75f3e809181088ebb7a",
+    "tools/vscode-geoai-task-operations/README.md": "b7987b013468a20059570b0813cf6e5fcaf95e1c35f451942276bcc1cebc1f30",
+    "tools/vscode-geoai-task-operations/install_remote.sh": "b504ecadc3f0d383fefa7f20b3e4df2c7a0719f0eda58cca67bb0392c358aa09",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "a1fd89ce3c7251322a7e75c216990df326751a98a7ce3fbcdebbf9489088043e"
+  },
+  "tests": {
+    "node_check_extension_js": "PASS",
+    "test_extension_smoke_sh": {
+      "result": "PASS",
+      "assertions_passed": 16,
+      "assertions_failed": 0,
+      "covers": [
+        "package.json contribution IDs (views, commands, activationEvents)",
+        "extensionKind == [\"workspace\"]",
+        "extension.js syntax (node --check)",
+        "no hardcoded LAN IP / 0.0.0.0 / coordinator token / secret literal",
+        "no openExternal / Simple Browser / external browser tab usage",
+        "vscode.env.asExternalUri used before embedding",
+        "single createWebviewPanel call + guarded reuse + retainContextWhenHidden (panel is created/revealed, never duplicated)",
+        "bounded autostart loop (AUTOSTART_MAX_ATTEMPTS) + single-owner process tracking (dashboardProcOwned)",
+        "CSP frame-src restricted to the resolved origin, never a wildcard",
+        "top-level webview never sets enableScripts: true",
+        "install_remote.sh replaces older versions, never mutates settings.json or starts a background service, prints the exact Reload Window / open-command handoff, copies every required asset",
+        "all 6 required output files present on disk"
+      ]
+    },
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "PASS (collision_free=true, 124 active cards)"
+  },
+  "data_path_proof": {
+    "chain": "Task MCP /api/snapshot, /api/task, /api/archive, /api/restore (dashboard.py, unmodified) -> served HTML/JS/CSS from dashboard_static/ (unmodified) -> vscode.env.asExternalUri resolves the client-reachable tunnel/loopback address -> sandboxed iframe (sandbox=\"allow-scripts allow-same-origin allow-forms\") inside the extension's WebviewPanel renders that resolved URL",
+    "no_second_data_model": true,
+    "no_direct_task_db_reads_from_extension": true,
+    "no_dashboard_frontend_copied": true
+  },
+  "remote_ssh_behavior": {
+    "extension_kind": "workspace",
+    "health_check_runs_on": "remote/workspace extension host, against the raw loopback dashboardUrl (never the client-resolved address)",
+    "client_facing_address": "vscode.env.asExternalUri(dashboardUrl) -- resolves VS Code's own tunnel; no owner-managed port forwarding required",
+    "autostart_process": "spawned on the remote/workspace host via workspace .venv (tools/geoai-task-mcp/.venv/bin/python3 preferred, falls back to .venv/bin/python3 then bare python3) with PYTHONPATH=tools/geoai-task-mcp/src, loopback host, configured port",
+    "duplicate_prevention": "module-level dashboardProc handle checked before every spawn attempt",
+    "process_ownership_on_stop": "only a process this extension itself started (dashboardProcOwned) is ever killed, on Restart Task Dashboard or deactivate"
+  },
+  "security_boundaries": {
+    "no_secret_in_url_html_or_postmessage": true,
+    "no_coordinator_token_read_or_logged_by_extension": true,
+    "no_lan_ip_hardcoded": true,
+    "no_simple_browser_or_openExternal": true,
+    "csp_frame_src_scoped_to_resolved_origin_only": true,
+    "top_level_webview_enableScripts": false,
+    "top_level_webview_enableCommandUris": "restricted to this extension's own 3 command IDs",
+    "dashboard_same_origin_archive_restore_flow": "untouched -- entirely inside the framed document, extension never intercepts or forwards it"
+  },
+  "blocker": {
+    "id": "dashboard_frame_ancestors_none",
+    "severity": "blocks_end_to_end_iframe_render",
+    "location": "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py:DashboardRequestHandler._send_bytes",
+    "description": "Every dashboard HTTP response (static assets and /api/*) unconditionally sends X-Frame-Options: DENY and Content-Security-Policy: ...; frame-ancestors 'none'. Browsers enforce frame-ancestors at the framed document, independent of the parent webview's own CSP, so the dashboard currently refuses to render inside this (or any) iframe.",
+    "why_not_fixed_here": "dashboard.py is outside this task's allowed_writes (tools/vscode-geoai-task-operations/** and this eval JSON only); modifying it is explicitly out of scope for a worker-scoped write boundary.",
+    "unblocks_when": "a separate, explicitly-scoped follow-up task relaxes dashboard.py's anti-framing headers for the VS Code webview origin (e.g. an allowlisted frame-ancestors value derived from the resolved asExternalUri origin, or a dedicated embed-mode flag), then a live reload/install verifies the iframe actually renders end-to-end.",
+    "current_behavior_without_fix": "The Activity Bar launcher's Online/Offline status still reflects a real /healthz check and is accurate; the full editor panel's iframe will show a browser-level connection refusal in place of the dashboard until the header is relaxed."
+  },
+  "manual_handoff": {
+    "install": "bash tools/vscode-geoai-task-operations/install_remote.sh",
+    "after_install": "Run 'Developer: Reload Window' (or restart the extension host)",
+    "open": "Run command: GeoAI Tasks: Open Operations Dashboard (or click the GeoAI Tasks Activity Bar icon)",
+    "worker_did_not_install_or_reload": true
+  },
+  "codex_review_requested": true,
+  "worker_stops_here": true
+}

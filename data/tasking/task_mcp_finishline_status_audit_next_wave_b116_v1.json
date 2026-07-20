@@ -1,0 +1,79 @@
+{
+  "audit_id": "task_mcp_finishline_status_audit_b116_v1",
+  "contract": "B116_v1",
+  "total_gaps": 13,
+  "total_done": 10,
+  "total_checkboxes": 23,
+  "shortest_safe_sequence": [
+    {
+      "step": 1,
+      "checkbox": "p0_mcp_client_smoke",
+      "label": "Run live MCP client smoke from VS Code/Codex/Claude",
+      "rationale": "Prerequisite: cannot validate any MCP-mediated workflow without a real client exercising the server over stdio.",
+      "current_task": "mcp_client_smoke_contract_freeze_b108_v1",
+      "estimated_effort": "1 session",
+      "depends_on": []
+    },
+    {
+      "step": 2,
+      "checkbox": "p1_dryrun_auto_pickup",
+      "label": "Add --dry-run flag to geoai_task_auto_pickup",
+      "rationale": "Workers need to preview what auto_pickup would claim before committing. Safety prerequisite for wave execution.",
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "p0_mcp_client_smoke"
+      ]
+    },
+    {
+      "step": 3,
+      "checkbox": "p1_allow_list",
+      "label": "Enforce runner/topic allow-list in core.py write path",
+      "rationale": "Reuse static allowlists from launch_queue_contract.py. Prevent unauthorized runner/topic strings from mutating queue.",
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "p0_mcp_client_smoke"
+      ]
+    },
+    {
+      "step": 4,
+      "checkbox": "p3_collision_guard_batch",
+      "label": "Add batch pre/post collision guard validation",
+      "rationale": "Extend B107 single-task preflight to batch: validate no collisions before wave start and after wave end.",
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "p1_allow_list"
+      ]
+    },
+    {
+      "step": 5,
+      "checkbox": "p3_full_task_wave",
+      "label": "Execute one full MCP-mediated task wave (claim→work→review→done)",
+      "rationale": "The goal: prove MCP can mediate the entire task lifecycle without manual copy/paste.",
+      "estimated_effort": "1-2 sessions",
+      "depends_on": [
+        "p1_dryrun_auto_pickup",
+        "p1_allow_list",
+        "p3_collision_guard_batch"
+      ]
+    },
+    {
+      "step": 6,
+      "checkbox": "p3_no_parent_corruption",
+      "label": "Validate no parent-repo task state corruption after wave",
+      "rationale": "Post-wave: run taskctl verify, compare pre/post queue integrity, JSONL consistency.",
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "p3_full_task_wave"
+      ]
+    }
+  ],
+  "sequence_steps": 6,
+  "authority_flags": {
+    "workflow_switch": false,
+    "launch_enabled": false,
+    "write_gate_default_off": true,
+    "parent_queue_mutation": false,
+    "audit_readonly": true
+  },
+  "generated": "2026-07-05T12:37:36.099148+00:00"
+}

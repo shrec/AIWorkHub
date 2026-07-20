@@ -1,0 +1,35 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_server_wiring_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
+  "runner": "deepseek_task_mcp_review_summarizer_b111",
+  "topic": "task_mcp",
+  "status": "pending_followup",
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_INTEGRATION_B112_V1",
+      "objective": "Integration test with real taskctl review queue (non-stubbed), verify the wired MCP tool works end-to-end",
+      "runner": "deepseek_task_mcp_review_summarizer_b112",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1"],
+      "priority": "task_mcp_b112_integration"
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1",
+      "objective": "Smoke test that the MCP server starts with the new tool registered and list-tools includes geoai_task_review_summarize",
+      "runner": "deepseek_task_mcp_review_summarizer_b113",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1"],
+      "priority": "task_mcp_b113_startup_smoke"
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+      "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization",
+      "runner": "deepseek_task_mcp_review_summarizer_b114",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1"],
+      "priority": "task_mcp_b114_neural_bridge",
+      "notes": "Neural-control-first: summarizer is a deterministic executor after learned dispatch. This task builds the curriculum to teach the neural controller how to prioritize, group, and route review tasks."
+    }
+  ],
+  "notes": "B111 delivers the MCP tool server wiring. B112 tests against real queue. B113 smoke-tests MCP server startup with the tool. B114 extracts neural curriculum from output patterns."
+}

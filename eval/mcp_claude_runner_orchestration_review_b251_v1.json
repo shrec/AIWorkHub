@@ -1,0 +1,128 @@
+{
+  "schema_id": "geoai.mcp_claude_runner_orchestration_review_eval.b251.v1",
+  "task_id": "CLAUDE_TASK_MCP_CLAUDE_RUNNER_ORCHESTRATION_REVIEW_B251_V1",
+  "runner": "claude_task_mcp_claude_runner_orchestration_review_b251",
+  "topic": "task_mcp",
+  "mode": "mcp_orchestration_review_no_process_launch",
+  "timestamp_utc": "2026-07-08T13:34:20.000000+00:00",
+  "verdict": "PASS",
+  "objective": "Review the task-mcp path for Claude-runner orchestration: what Codex needs to dispatch Claude work through MCP safely, how runner/topic identity guard should be enforced, and what remains before process launch can ever be enabled. Design/review only; no process launch, no server behavior change.",
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Reviewed repo-owned geoai_task_mcp source (server.py, core.py-adjacent contract modules) and existing frozen smoke/audit tests under tools/geoai-task-mcp/tests. No external MCP-SDK/API question was open; the review is entirely about this repo's own orchestration contract layering."
+  },
+  "current_capability_inventory": {
+    "source": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (direct read, tools/geoai-task-mcp not yet covered by any source_graph/cgraph indexer bucket per kb bug.tools_geoai_task_mcp_not_indexed)",
+    "total_live_tools": 20,
+    "read_only_tools": 16,
+    "write_gated_tools": 4,
+    "write_gated_tool_names": [
+      "geoai_task_auto_pickup",
+      "geoai_task_mark_review",
+      "geoai_task_mark_done",
+      "geoai_task_export_jsonl"
+    ],
+    "read_only_tool_names": [
+      "geoai_task_health",
+      "geoai_task_review_queue",
+      "geoai_task_list",
+      "geoai_task_show",
+      "geoai_task_pending_for_runner",
+      "geoai_task_auto_pickup_dryrun",
+      "geoai_task_collision_guard",
+      "geoai_task_usage_report",
+      "geoai_task_audit_log_read",
+      "geoai_task_review_summarize",
+      "geoai_task_codex_handoff",
+      "geoai_task_codex_handoff_markdown",
+      "geoai_supervisor_loop_status",
+      "geoai_cli_adapter_plan_readonly",
+      "geoai_cli_adapter_audit_summary_readonly",
+      "geoai_cli_adapter_report_readonly"
+    ],
+    "write_gate_mechanism": "GEOAI_TASK_MCP_ALLOW_WRITES env var, default '0'; blocked calls return returncode 126 with stderr marker 'write command blocked' (verified live by test_mvp_contract_audit_v1.sh)."
+  },
+  "existing_dispatch_design_chain": {
+    "note": "A layered, all-disabled-by-default 'future launch' design already exists in code, unwired to any @mcp.tool(). This review documents the chain so Codex/owner can decide the next gated step deliberately.",
+    "layers": [
+      {
+        "layer": "B104",
+        "artifact": "phase2_orchestration_contract (static safety allowlist origin, referenced in later modules' docstrings)",
+        "role": "Defines the static human-configured LAUNCHABLE_BINARIES / adapter allowlist that every later layer mirrors.",
+        "wired_to_mcp": false
+      },
+      {
+        "layer": "B105",
+        "artifact": "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
+        "role": "Validates a would-be dispatch command against the static allowlist (LAUNCHABLE_BINARIES=(claude,codex); deepseek_manual stays manual-only) and writes an append-only audit entry ONLY. LAUNCH_IMPLEMENTED=False constant; no subprocess/exec/fork/shell import anywhere.",
+        "wired_to_mcp": false
+      },
+      {
+        "layer": "B106",
+        "artifact": "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py",
+        "role": "Wraps B105 as a strictly READ-ONLY view: plan_command_readonly (validated plan, no audit write even though the underlying dryrun planner could emit one -- calls plan_dryrun(audit=False)), audit_summary_readonly, readonly_tool_report (combines both). Adds a read-only collision preflight (would_collide) against the same task-card JSONL the tasking collision guard scans.",
+        "wired_to_mcp": true,
+        "registered_tool_names": [
+          "geoai_cli_adapter_plan_readonly",
+          "geoai_cli_adapter_audit_summary_readonly",
+          "geoai_cli_adapter_report_readonly"
+        ]
+      },
+      {
+        "layer": "B119",
+        "artifact": "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py + launch_queue_persist.py",
+        "role": "Pure schema (LaunchRequest/LaunchDecision/ProcessLogEntry dataclasses, ProcessState enum) plus append-only JSONL audit persistence for a FUTURE gated launch queue. attempt_start() always raises LaunchDisabledError. Requires BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1 (both default '0') before evaluate_launch() could ever return anything but blocked_launch_disabled -- and no launcher exists yet even if both were set.",
+        "wired_to_mcp": false,
+        "gap": "Neither module is imported by server.py. Codex has NO MCP-visible view of the disabled launch-queue state today; it is only reachable via direct Python import in tests."
+      },
+      {
+        "layer": "future / not yet a task card",
+        "artifact": "gated launcher (referenced in code comments as CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_*; no such task_id exists yet in the manifest as of this review)",
+        "role": "Would be the FIRST module in this chain permitted to actually spawn a process, and only behind both env gates.",
+        "wired_to_mcp": false,
+        "exists_in_code": false
+      }
+    ]
+  },
+  "safe_dispatch_contract_recommendation": {
+    "runner_topic_identity_guard": "Every dispatch-adjacent tool already takes explicit runner/topic/task_id parameters (geoai_task_auto_pickup, geoai_task_pending_for_runner, geoai_cli_adapter_plan_readonly). A future launch tool MUST (a) accept explicit task_id+runner+topic, (b) echo them back verbatim in its result alongside the task's own WORKER_CONTRACT_JSON.task_id/runner/topic, and (c) the dispatched worker must self-verify the match before reading beyond read_first or writing anything -- this is the same task_identity_guard already mandated for every worker contract, just enforced one layer earlier at dispatch time instead of only at worker-start time.",
+    "allowed_writes_guard": "git staging/commit (taskctl.py stage / guard-staged) must stay CLI-only and is NOT exposed as an MCP tool today, and should not become one: broadening a worker's write surface must remain the dispatched worker's own responsibility under its task card's allowed_writes, never something Codex-via-MCP can expand from outside.",
+    "review_queue_handoff": "Already sufficient today with zero process-launch capability: geoai_task_review_queue / geoai_task_review_summarize / geoai_task_codex_handoff / geoai_task_codex_handoff_markdown give Codex a full read-only view of tasks awaiting review (grouped by topic/runner, validation commands, allowed_writes, derived risk), and geoai_task_mark_review / geoai_task_mark_done (write-gated) let Codex finalize without any worker process ever being launched via MCP.",
+    "no_process_launch_by_default": "Verified: LAUNCH_IMPLEMENTED / launch_enabled() are hardcoded False (not env-toggle-dependent) in cli_adapter_dryrun.py, launch_queue_contract.py, and cli_adapter_readonly_tool.py; attempt_start() always raises LaunchDisabledError; server.py contains no subprocess/os.system/os.popen/os.exec/os.fork/os.spawn/Popen(/shell=True/pty.spawn pattern (same forbidden-pattern check already enforced by test_mcp_stdio_subprocess_client_smoke_b109_v1.sh and reused here)."
+  },
+  "sufficiency_assessment": {
+    "sufficient_today_for": [
+      "Task discovery/listing/inspection (list/show/pending_for_runner)",
+      "Non-mutating preview of which task an auto-pickup WOULD claim (auto_pickup_dryrun)",
+      "Actual task claim/start (auto_pickup, write-gated, requires GEOAI_TASK_MCP_ALLOW_WRITES=1)",
+      "Codex review-queue triage and handoff (review_queue, review_summarize, codex_handoff, codex_handoff_markdown)",
+      "Codex finalization (mark_review, mark_done, both write-gated)",
+      "Collision/usage/export/audit-log observability (collision_guard, usage_report, export_jsonl, audit_log_read)",
+      "Supervisor-loop state derivation for a task_id (supervisor_loop_status)",
+      "Read-only PREVIEW of a validated future dispatch command with no execution (cli_adapter_plan_readonly / audit_summary_readonly / report_readonly)"
+    ],
+    "missing_before_any_process_launch_can_be_enabled": [
+      "MCP-visible read-only wiring for the disabled launch_queue_contract/launch_queue_persist state (currently invisible to Codex over MCP; only reachable via direct Python import in tests) -- low-risk, additive, mirrors the existing B106 pattern.",
+      "An actual launcher implementation: none exists anywhere in the codebase today (LAUNCH_IMPLEMENTED=False in every layer). Before one can exist it must: require BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1; reuse the SAME static LAUNCHABLE_BINARIES=(claude,codex) allowlist (deepseek_manual stays manual-only permanently); write to the SAME append-only launch_queue_persist audit log; enforce the runner/topic/task_id identity-guard echo above; never itself perform git stage/guard-staged/commit (that stays the dispatched worker's own CLI-only step); and land as its own explicitly reviewed gated-enablement task with a refusal-by-default regression test plus an isolated-sandbox positive-path test.",
+      "A learned adapter/runner/topic selection policy: today's task->runner assignment is the static taskctl auto-pickup claim logic. Per this project's neural-control-first doctrine, the eventual choice of which adapter/runner/topic to dispatch must become a LEARNED routing+abstain policy (already named in code comments as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, not yet a task card in the manifest) rather than the current static allowlist/FIFO, which is an acceptable bootstrap only while that migration ticket stays open and tracked."
+    ]
+  },
+  "authority_flags": {
+    "process_launch_authority": false,
+    "write_gate_enabled": false,
+    "workflow_switch": false,
+    "runtime_authority": false
+  },
+  "verified_invariants": {
+    "server_py_no_launch_code": true,
+    "launch_queue_contract_launch_implemented_false": true,
+    "launch_queue_contract_not_imported_by_server": true,
+    "cli_adapter_dryrun_launch_implemented_false": true,
+    "cli_adapter_readonly_tool_readonly_true": true
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "next_wave_pointer": "tools/geoai-task-mcp/data/tasking/mcp_claude_runner_orchestration_review_next_wave_b251_v1.json",
+  "summary": "B251 orchestration review: 20 live MCP tools (16 read-only, 4 write-gated) already give Codex full discover/preview/review/finalize capability with zero process-launch surface. A layered disabled-by-default dispatch design (B104 static allowlist -> B105 dryrun validator -> B106 read-only MCP view, live -> B119 launch-queue schema+audit, NOT yet MCP-wired) already anticipates a future gated launcher, but no launcher exists anywhere in the codebase (LAUNCH_IMPLEMENTED=False everywhere) and none should until a dedicated gated-enablement task adds dual env-gate requirement, identity-guard echo, and reuse of the existing append-only audit trail. Adapter/runner/topic selection remains a tracked-but-unbuilt neural migration, not a runtime cue router."
+}

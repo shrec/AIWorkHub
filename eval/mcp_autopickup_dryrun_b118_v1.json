@@ -1,0 +1,64 @@
+{
+  "eval_id": "mcp_autopickup_dryrun_b118_v1",
+  "task_id": "CLAUDE_TASK_MCP_AUTOPICKUP_DRYRUN_B118_V1",
+  "date": "2026-07-05",
+  "mode": "write_gate_safe_dryrun_no_workflow_switch",
+  "builds_on": "task_mcp_finishline_status_audit_b116_v1",
+  "roadmap_checkbox": "p1_dryrun_auto_pickup",
+  "verdict": "PASS",
+  "summary": "Added a READ-ONLY auto-pickup dry-run preview. core.auto_pickup_dryrun(runner, topic) reports the task auto_pickup WOULD claim WITHOUT mutating the parent queue and WITHOUT touching the write gate. It never invokes the write-gated `auto-pickup` command; it reuses only the read-only `export` command (pending_for_runner) and replicates the exact candidate-selection predicate of taskctl.cmd_auto_pickup (unclaimed + pending + runner-matched + topic-matched, first). Exposed as MCP tool geoai_task_auto_pickup_dryrun. Additive only: real claim semantics in core.py/server.py are unchanged and auto_pickup stays behind GEOAI_TASK_MCP_ALLOW_WRITES.",
+  "gates": {
+    "dryrun_reports_would_claim_task": true,
+    "no_parent_queue_mutation_byte_identical": true,
+    "no_parent_queue_mutation_logical_identical": true,
+    "before_after_snapshot_proven": true,
+    "runner_filter_shown_in_report": true,
+    "topic_filter_shown_in_report": true,
+    "topic_change_changes_candidate": true,
+    "dryrun_uses_only_readonly_export_command": true,
+    "dryrun_never_invokes_auto_pickup_write_command": true,
+    "real_auto_pickup_stays_write_gated": true,
+    "dryrun_does_not_bypass_write_gate": true,
+    "blocked_auto_pickup_leaves_queue_unmutated": true,
+    "additive_change_only_real_semantics_preserved": true,
+    "no_workflow_switch": true,
+    "no_process_launch": true,
+    "test_isolation_safe_parallel_friendly": true,
+    "smoke_test_passes": true,
+    "shell_test_passes": true,
+    "taskctl_verify_passes": true
+  },
+  "invariant": {
+    "dryrun_write_command_invoked": false,
+    "dryrun_queue_mutated": false,
+    "dryrun_write_gate_bypassed": false,
+    "real_auto_pickup_in_write_commands": true,
+    "write_gate_default": "GEOAI_TASK_MCP_ALLOW_WRITES=0 (off)",
+    "selection_predicate_source": "AITools/taskctl.py:953-1018 (cmd_auto_pickup)",
+    "lifecycle_classifier_source": "AITools/taskdb.py:115-134 (canonical_status)",
+    "readonly_command_used": "export --runner <runner> [--topic <topic>]",
+    "queue_db_override_env": "BITNN_TASK_QUEUE_DB",
+    "cards_path_override_env": "BITNN_TASK_CARDS_PATH",
+    "manifest_override_env": "BITNN_TASK_CARDS_MANIFEST"
+  },
+  "public_api": {
+    "core.auto_pickup_dryrun(runner, topic=None)": "read-only preview dict {ok, dry_run, would_claim_task_id, candidate, filtering{runner_filter,topic_filter,pending_for_runner_topic,eligible_unclaimed,excluded_already_claimed}, mutation{queue_mutated,write_gate_bypassed,write_command_invoked,real_auto_pickup_write_gated,writes_allowed_env}, source_command, export_returncode}",
+    "core.eligible_dryrun_candidates(rows, runner, topic=None)": "pure -> ordered eligible cards mirroring cmd_auto_pickup (unclaimed+pending+runner+topic)",
+    "server.geoai_task_auto_pickup_dryrun(runner, topic=None)": "read-only MCP tool wrapping core.auto_pickup_dryrun"
+  },
+  "neural_bridge_note": "The dry-run selection is a DETERMINISTIC MIRROR of taskctl.cmd_auto_pickup's own candidate predicate (a preview/validator over the queue substrate, Layer 1), NOT a runtime cue router owning cognition. It decides no capability the model must learn; it only reports what the existing deterministic queue command would do. A future LEARNED task-routing/abstain policy (which runner/topic a worker session should pursue) remains tracked separately and is out of scope for this read-only preview.",
+  "no_launch_no_switch_marker": "This change adds NO process-launch code and NO workflow switch: no subprocess beyond the pre-existing read-only `export` call, no runtime switch to MCP, no write-gate disable. The only subprocess in the dry-run path is `taskctl export` (not a WRITE_COMMAND).",
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/tests/mcp_autopickup_dryrun_smoke.py",
+    "tools/geoai-task-mcp/tests/test_mcp_autopickup_dryrun_b118_v1.sh",
+    "tools/geoai-task-mcp/eval/mcp_autopickup_dryrun_b118_v1.json",
+    "tools/geoai-task-mcp/data/tasking/mcp_autopickup_dryrun_next_wave_b118_v1.json"
+  ],
+  "tests_run": [
+    "python3 tools/geoai-task-mcp/tests/mcp_autopickup_dryrun_smoke.py -> PASS",
+    "bash tools/geoai-task-mcp/tests/test_mcp_autopickup_dryrun_b118_v1.sh -> PASS",
+    "python3 AITools/taskctl.py verify -> PASS"
+  ]
+}

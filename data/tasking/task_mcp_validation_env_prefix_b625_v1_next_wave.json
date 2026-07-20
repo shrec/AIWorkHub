@@ -1,0 +1,13 @@
+{
+  "schema_id": "geoai.task_mcp.validation_env_prefix_repair.next_wave.v1",
+  "parent_task": "CLAUDE_SONNET5_TASK_MCP_VALIDATION_ENV_PREFIX_B625_V1",
+  "status": "PASS",
+  "new_code_task_required": false,
+  "live_queue_audit": {
+    "commands": 16,
+    "tasks": 8,
+    "parse_failures": 0
+  },
+  "next_operation": "reload_long_lived_task_mcp_server_then_run_one_card_scoped_review_transition_canary",
+  "reason": "B624 proved that the still-running old server process retained the stale runner allowlist even after current-tree B623 was accepted. A reload is required before judging current-tree runner authority or B625 parsing from the extension connection."
+}

@@ -1,0 +1,167 @@
+{
+  "contract_id": "agent_launcher_mvp_b02_v1",
+  "task_id": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_MVP_B02_V1",
+  "mode": "mcp_launcher_mvp_design_and_dryrun_no_agent_spawn",
+  "builds_on": ["phase2_orchestration_contract_b104_v1", "cli_adapter_dryrun_contract_b105_v1"],
+  "roadmap_phase": "Phase 2 - Agent Launcher MVP",
+  "purpose": "Define request/response schemas for four future MCP tools (launch_task, task_status, collect_result, cancel_task) that let Codex request task pickup and spawn model CLI commands LATER, and receive completion summaries. This artifact is a schema/contract ONLY: it adds no server wiring, no subprocess/exec/fork/shell code, and no live agent spawn. All four tools are LAUNCH_IMPLEMENTED=false in this MVP.",
+  "invariant": {
+    "launch_implemented": false,
+    "launch_enabled_by_default": false,
+    "shell_execution_used": false,
+    "network_launch_used": false,
+    "real_agent_spawn_used": false,
+    "source_of_truth": "AITools/taskctl.py JSONL/SQLite (bitnnv2/data/tasking/task_queue_v1.sqlite); this contract adds no parallel store",
+    "rollback": "no code path to roll back; contract defines schema only"
+  },
+  "safety_model": {
+    "local_only": true,
+    "no_shell_execution": true,
+    "no_network_launch": true,
+    "no_secret_logging": true,
+    "write_gate_independent_flag": "GEOAI_TASK_MCP_ALLOW_LAUNCH (proposed, mirrors GEOAI_TASK_MCP_ALLOW_WRITES); both default '0'",
+    "even_if_flag_set": "no launcher code exists yet in the allowed_writes of this task, so no flag value can trigger a spawn",
+    "preconditions_reused_from": "phase2_orchestration_contract_b104_v1.launch_preconditions (allow_launch_flag, allow_writes_flag, runner_topic_allowlist, command_allowlist_match, collision_guard_preflight, dry_run_default, cwd_env_sandbox_pin, concurrency_cap, audit_log_entry, adapter_available)"
+  },
+  "common_types": {
+    "adapter_id": {"enum": ["claude_cli", "codex_cli", "deepseek_manual"]},
+    "decision_launch": {"enum": ["launch_planned", "launch_blocked_disabled", "launch_blocked_invalid_command", "launch_blocked_precondition_failed"]},
+    "decision_cancel": {"enum": ["cancel_not_applicable_no_process", "cancelled_plan_only"]},
+    "state_status": {"enum": ["planned", "blocked", "not_found"]},
+    "verdict_result": {"enum": ["pending", "not_applicable_mvp"]}
+  },
+  "tools": {
+    "geoai_agent_launch_task": {
+      "summary": "Plan (never execute) a worker launch for a claimed task_id via one of the three adapters. MVP always runs in dryrun mode regardless of the mode field.",
+      "request_schema": {
+        "task_id": {"type": "string", "required": true},
+        "runner": {"type": "string", "required": true},
+        "topic": {"type": "string", "required": true},
+        "adapter_id": {"type": "adapter_id", "required": true},
+        "mode": {"type": "string", "enum": ["dryrun"], "required": false, "default": "dryrun", "note": "MVP accepts only dryrun; a 'live' value is rejected with launch_blocked_disabled, never silently promoted"},
+        "prompt_override": {"type": "string", "required": false}
+      },
+      "response_schema": {
+        "request_id": {"type": "string", "description": "opaque id, generated locally, not persisted to any new store"},
+        "task_id": {"type": "string"},
+        "adapter_id": {"type": "adapter_id"},
+        "decision": {"type": "decision_launch"},
+        "would_run_argv": {"type": "array", "items": "string", "description": "argv-list template only, e.g. ['claude','-p','<prompt>','--cwd','<repo>']; empty for deepseek_manual"},
+        "launch_enabled": {"type": "boolean", "const": false},
+        "launch_implemented": {"type": "boolean", "const": false},
+        "shell_invocation": {"type": "boolean", "const": false},
+        "audit_ref": {"type": "string", "description": "path/tag of the append-only audit log entry recorded for this decision"},
+        "blocked_reason": {"type": ["string", "null"]}
+      }
+    },
+    "geoai_agent_task_status": {
+      "summary": "Read-only status lookup that layers on taskctl show; no separate process/job store is created.",
+      "request_schema": {
+        "task_id": {"type": "string", "required": true},
+        "request_id": {"type": "string", "required": false, "description": "optional correlation id returned by a prior launch_task call"}
+      },
+      "response_schema": {
+        "request_id": {"type": ["string", "null"]},
+        "task_id": {"type": "string"},
+        "state": {"type": "state_status"},
+        "taskctl_status": {"type": "object", "description": "verbatim result of core.show_task(task_id) / taskctl show <task_id>; taskctl JSONL/SQLite remains sole source of truth"},
+        "process_state": {"type": "string", "const": "no_process_local_only_mvp"},
+        "last_updated": {"type": "string", "description": "ISO-8601 UTC timestamp of this status read"}
+      }
+    },
+    "geoai_agent_collect_result": {
+      "summary": "Read-only completion-summary collector. In this MVP there is never a real launched process, so a genuine result is never available; verdict is always not_applicable_mvp or pending.",
+      "request_schema": {
+        "task_id": {"type": "string", "required": true},
+        "request_id": {"type": "string", "required": false}
+      },
+      "response_schema": {
+        "request_id": {"type": ["string", "null"]},
+        "task_id": {"type": "string"},
+        "verdict": {"type": "verdict_result"},
+        "summary": {"type": "string"},
+        "tests_run": {"type": "array", "items": "string"},
+        "changed_paths": {"type": "array", "items": "string"},
+        "token_cost_report": {"type": ["object", "null"], "description": "reuses phase2_orchestration_contract_b104_v1.token_cost_reporting_fields shape when known"},
+        "review_ready": {"type": "boolean", "const": false, "description": "MVP never marks a task review-ready via this tool; only taskctl review does"}
+      }
+    },
+    "geoai_agent_cancel_task": {
+      "summary": "Cancel a planned (never a running) launch. Because no process is ever started in this MVP, cancellation only ever clears a local plan record, never a real process.",
+      "request_schema": {
+        "task_id": {"type": "string", "required": true},
+        "request_id": {"type": "string", "required": false},
+        "reason": {"type": "string", "required": false}
+      },
+      "response_schema": {
+        "request_id": {"type": ["string", "null"]},
+        "task_id": {"type": "string"},
+        "decision": {"type": "decision_cancel"},
+        "note": {"type": "string"}
+      }
+    }
+  },
+  "dry_run_examples": {
+    "launch_task_ok": {
+      "request": {"task_id": "T1", "runner": "claude_worker", "topic": "task_mcp", "adapter_id": "claude_cli", "mode": "dryrun"},
+      "response": {
+        "request_id": "req-example-0001",
+        "task_id": "T1",
+        "adapter_id": "claude_cli",
+        "decision": "launch_planned",
+        "would_run_argv": ["claude", "-p", "<prompt>", "--cwd", "<repo>"],
+        "launch_enabled": false,
+        "launch_implemented": false,
+        "shell_invocation": false,
+        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "blocked_reason": null
+      }
+    },
+    "launch_task_live_rejected": {
+      "request": {"task_id": "T1", "runner": "claude_worker", "topic": "task_mcp", "adapter_id": "claude_cli", "mode": "live"},
+      "response": {
+        "request_id": "req-example-0002",
+        "task_id": "T1",
+        "adapter_id": "claude_cli",
+        "decision": "launch_blocked_disabled",
+        "would_run_argv": [],
+        "launch_enabled": false,
+        "launch_implemented": false,
+        "shell_invocation": false,
+        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "blocked_reason": "mode 'live' not supported by MVP; launch never implemented"
+      }
+    },
+    "collect_result_not_applicable": {
+      "request": {"task_id": "T1"},
+      "response": {
+        "request_id": null,
+        "task_id": "T1",
+        "verdict": "not_applicable_mvp",
+        "summary": "No process was ever launched for this task in this MVP; nothing to collect.",
+        "tests_run": [],
+        "changed_paths": [],
+        "token_cost_report": null,
+        "review_ready": false
+      }
+    },
+    "cancel_task_no_process": {
+      "request": {"task_id": "T1", "reason": "owner changed priority"},
+      "response": {
+        "request_id": null,
+        "task_id": "T1",
+        "decision": "cancel_not_applicable_no_process",
+        "note": "No process exists to cancel in this MVP; only a dry-run plan (if any) is cleared."
+      }
+    }
+  },
+  "neural_bridge_note": "Adapter/runner/topic selection for a real future launch must be a LEARNED routing + abstain decision (tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, see bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl), never a regex/keyword cue router. This schema itself is a static, human-authored safety/interface boundary (request/response shape), not a cognitive routing decision, so it does not violate the neural-control-first doctrine.",
+  "no_launch_code_marker": "This artifact defines JSON schema only. No subprocess/exec/fork/shell/network code is introduced by this task. Real launch code remains gated behind CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B107_V1 and all launch_preconditions.",
+  "acceptance": {
+    "four_tool_schemas_defined": "pass",
+    "local_only_no_shell_safety_model": "pass",
+    "dry_run_examples_never_call_remote_cli": "pass",
+    "taskctl_jsonl_sqlite_preserved_as_source_of_truth": "pass"
+  },
+  "verdict": "PASS"
+}

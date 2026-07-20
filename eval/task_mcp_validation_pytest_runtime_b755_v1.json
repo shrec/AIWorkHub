@@ -1,0 +1,71 @@
+{
+  "schema_id": "geoai.task_mcp.validation_pytest_runtime_b755.worker_evidence.v1",
+  "task_id": "CLAUDE_TASK_MCP_VALIDATION_PYTEST_RUNTIME_B755_V1",
+  "objective": "Close the B753/B674 false-negative path: an isolated validation run's sanitized, credential-free HOME cannot import the operator-installed pytest package, so pytest-based validation commands fail with ModuleNotFoundError instead of exercising the product under test.",
+  "bug_reproduction": {
+    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "observed_stderr": "/usr/bin/python3: No module named pytest",
+    "cause": "site.getusersitepackages() under the sanitized validation HOME has no .local/lib/pythonX/site-packages of its own; the operator's real pytest install lives only under the parent host's real HOME.",
+    "reproduced_in_unittest": "TestReproducesSanitizedHomePytestImportFailure.test_pytest_module_invocation_fails_under_a_fresh_sanitized_home"
+  },
+  "fix_summary": {
+    "changed_file": "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "new_functions": [
+      "_is_pytest_validation_command(argv) -> bool",
+      "resolve_trusted_pytest_runtime_root() -> Path"
+    ],
+    "wiring": "run_validations() now checks _is_pytest_validation_command(tokens) after parse_validation_command(); when true it calls resolve_trusted_pytest_runtime_root() and prepends that exact path to the existing pythonpath_components tuple before computing validation_readonly_dirs and the child PYTHONPATH -- preserving any relative project PYTHONPATH the card already declared. Non-pytest commands take the unchanged prior code path (effective_components is exactly pythonpath_components), so their env/argv stay byte-equivalent.",
+    "trust_root_source": "site.getusersitepackages() -- the same single canonical absolute path resolve_validation_pythonpath/_validation_pythonpath_readonly_dirs already accept as the sole approved absolute PYTHONPATH component; no new discovery mechanism, no host-path guessing.",
+    "trust_checks": [
+      "reject if the raw or resolved path is a symlink (validation_pytest_runtime_symlink_forbidden)",
+      "reject if the path does not exist / is not a directory (validation_pytest_runtime_unavailable)",
+      "reject if not owned by this process's uid (validation_pytest_runtime_untrusted_owner)",
+      "reject if world-writable, i.e. mode & 0o002 (validation_pytest_runtime_world_writable)",
+      "reject if it does not contain an importable pytest/__init__.py (validation_pytest_runtime_missing_pytest)"
+    ],
+    "binding": "Read-only: bubblewrap --ro-bind under /validation-pythonpath/<n> via the pre-existing validation_readonly_dirs mechanism; Landlock never restricts reads (only mutation rights), so the path is inherently non-writable to the sandboxed child there too. No package files are copied; no other real-HOME content is exposed; no credentials pass through this path.",
+    "fail_closed": "resolve_trusted_pytest_runtime_root() raises WorkspaceError before any pytest validation command's subprocess is spawned when no approved root exists; run_validations' existing scratch-dir provisioning, TMPDIR override, and finally-block cleanup (B753) are untouched."
+  },
+  "acceptance_mapping": [
+    {
+      "acceptance": "Reproduce python3 -m pytest import failure under the current sanitized validation HOME while parent-host pytest is installed.",
+      "status": "done",
+      "evidence": "TestReproducesSanitizedHomePytestImportFailure; also directly reproduced live in this session: `python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py` -> `/usr/bin/python3: No module named pytest`."
+    },
+    {
+      "acceptance": "For pytest validation only, resolve one canonical trusted Python package root, reject symlinks/untrusted ownership/world-writable paths, bind it read-only and prepend only that exact path to PYTHONPATH while preserving the card's relative project PYTHONPATH.",
+      "status": "done",
+      "evidence": "resolve_trusted_pytest_runtime_root(); TestResolveTrustedPytestRuntimeRoot (symlink/owner/missing/missing-pytest cases; world-writable case environment-skipped, see note); test_pytest_command_succeeds_with_trusted_root_prepended_and_project_pythonpath_preserved (components == [trusted_root, '.'])."
+    },
+    {
+      "acceptance": "Do not copy packages, expose the real HOME, inherit credentials, add arbitrary host paths or make package roots writable. Non-pytest validation commands must keep byte-equivalent environment/path behavior.",
+      "status": "done",
+      "evidence": "test_pytest_command_does_not_leak_adapter_credentials; test_non_pytest_command_env_and_argv_are_unchanged (forces resolve_trusted_pytest_runtime_root to raise AssertionError if ever called for a non-pytest command)."
+    },
+    {
+      "acceptance": "Fail closed with an explicit infrastructure error when no approved pytest runtime exists. Request-private executable scratch and cleanup from B753 must remain intact.",
+      "status": "done",
+      "evidence": "test_pytest_command_fails_closed_when_no_approved_pytest_runtime_exists; test_exec_scratch_still_provisioned_and_cleaned_up_around_a_pytest_command."
+    },
+    {
+      "acceptance": "Use a standalone unittest-compatible regression command so this task's own validation does not depend on the bug it repairs.",
+      "status": "done",
+      "evidence": "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py is stdlib unittest only (no pytest import) and is run directly via `python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py`."
+    }
+  ],
+  "test_results": {
+    "command": "python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py -v",
+    "result": "Ran 14 tests: 13 passed, 1 skipped",
+    "skipped_test": {
+      "name": "TestResolveTrustedPytestRuntimeRoot.test_world_writable_root_is_rejected",
+      "reason": "This authoring session is itself a nested Task MCP worker sandbox (Landlock + seccomp) that denies the chmod/fchmod syscalls needed to force a directory to mode 0o777 after creation, and umask strips the world-write bit at mkdir time (0o777 -> 0o775). The world-writable rejection branch (mode & 0o002) is exercised by direct code inspection and is structurally identical to the already-covered owner/symlink/missing branches; it is expected to pass in an unsandboxed coordinator process where chmod succeeds normally."
+    }
+  },
+  "sandbox_context": {
+    "select_sandbox_backend": "landlock",
+    "landlock_abi_version": 4,
+    "bubblewrap_usable": false
+  },
+  "commit_contract": "NO_COMMIT",
+  "next": "Stops at taskctl review; Codex finalizes."
+}

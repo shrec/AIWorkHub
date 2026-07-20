@@ -1,0 +1,89 @@
+{
+  "schema_id": "geoai.task_mcp.eval.context_cache_b817_v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_CONTEXT_CACHE_B817_V1",
+  "runner": "codex_gpt55_aiworkinghub_context_cache_b817_v1",
+  "status": "implemented",
+  "scope": "isolated_repository_scoped_content_addressed_context_cache",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/context_cache.py",
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_context_cache_b817_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkinghub_context_cache_b817_v1.json"
+  ],
+  "acceptance_evidence": {
+    "cache_key_material": [
+      "repo_id",
+      "source_revision",
+      "normalized_context_policy",
+      "tool_schema_id",
+      "tool_version",
+      "immutable_input_shard_sha256"
+    ],
+    "content_addressing": {
+      "key_sha256": "canonical JSON over repository-scoped key material",
+      "payload_sha256": "verified on every hit",
+      "hash_substitution_outcome": "corrupt",
+      "corrupt_handling": "fail_closed_remove_regular_entry"
+    },
+    "bounds": {
+      "max_entry_bytes": "enforced before write",
+      "max_total_bytes": "LRU prune",
+      "max_age_seconds": "stale outcome and removal"
+    },
+    "path_safety": {
+      "cache_root_required": true,
+      "repo_id_required": true,
+      "repo_id_path_separators_rejected": true,
+      "cache_root_symlink_rejected": true,
+      "bucket_symlink_rejected": true,
+      "entry_symlink_outcome": "corrupt"
+    },
+    "non_cached_material": [
+      "credentials",
+      "coordinator tokens",
+      "secret/token/API-key/password fields",
+      "worker output",
+      "mutable task lifecycle state",
+      "absolute external-source contents beyond authorized bundle evidence"
+    ],
+    "reuse_metadata": {
+      "local_recomputation_avoided": true,
+      "future_exact_bundle_reuse_candidate": true,
+      "provider_prompt_cache_billing_savings_claimed": false
+    },
+    "integration_status": "not integrated with project_context or process_launcher"
+  },
+  "validation": [
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkinghub_context_cache_b817_v1.py",
+      "status": "blocked",
+      "reason": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m py_compile tools/geoai-task-mcp/src/geoai_task_mcp/context_cache.py tools/geoai-task-mcp/tests/test_aiworkinghub_context_cache_b817_v1.py",
+      "status": "passed_before_final_guard_tightening"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 python3 compile() over context_cache.py and test_aiworkinghub_context_cache_b817_v1.py",
+      "status": "passed"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 direct in-memory pytest-stub harness over all test_aiworkinghub_context_cache_b817_v1.py test_* functions",
+      "status": "passed",
+      "passed_tests": 8
+    },
+    {
+      "command": "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkinghub_context_cache_b817_v1.json",
+      "status": "passed"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "status": "failed_unrelated_queue_state",
+      "reason": "10 pre-existing task queue errors: B480 runner/task batch mismatches and duplicate active runners"
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard",
+      "status": "failed_unrelated_queue_state",
+      "reason": "10 pre-existing active-card file collisions outside this task's allowed_writes"
+    }
+  ]
+}

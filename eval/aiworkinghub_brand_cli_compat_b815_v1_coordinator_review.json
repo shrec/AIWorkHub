@@ -1,0 +1,9 @@
+{
+  "schema_id": "aiworkinghub.coordinator_review.v1",
+  "task_id": "DEEPSEEK_AIWORKINGHUB_BRAND_CLI_COMPAT_B815_V1",
+  "verdict": "REJECT_REWORK_REQUIRED",
+  "promoted_paths": [],
+  "focused_test": {"passed": 13, "failed": 2},
+  "failures": ["geoai_task_mcp.server import could not resolve dashboard_mcp_app in isolated baseline", "aiworkinghub.server alias was not implemented"],
+  "next_scope": "Repair only the two exact import/alias failures against current canonical tree."
+}

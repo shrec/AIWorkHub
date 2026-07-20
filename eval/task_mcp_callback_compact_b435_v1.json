@@ -1,0 +1,52 @@
+{
+  "eval_id": "task_mcp_callback_compact_b435_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_CALLBACK_COMPACT_B435_V1",
+  "timestamp_utc": "2026-07-16T08:18:05Z",
+  "summary": "Compact callback rendering: single-task and batch templates reduced to one concise line each. Validation gates, outbox, retry/dead-letter, thread routing, and dashboard/log payloads unchanged.",
+  "before": {
+    "single_task_template": "Task MCP callback: task_id={task_id} state={state} event_id={event_id} request_id={request_id}\\n\\nThe GeoAI Task MCP worker for this task has reached a terminal state. ...",
+    "batch_template": "Task MCP callback: {count} task(s) reached a terminal state in one batch for this thread.\\n\\n{member_lines}\\n\\nThe GeoAI Task MCP worker(s) ...",
+    "single_task_length_bytes_min": 257,
+    "batch_length_bytes_min": 404
+  },
+  "after": {
+    "single_task_template": "Task MCP: {task_id} → {state}",
+    "batch_template": "Task MCP: {count} tasks terminal → inspect review queue",
+    "single_member_batch": "renders the exact single-task template with task_id and state",
+    "single_task_length_example": 34,
+    "batch_length_example": 47,
+    "reduction_single": "~87%",
+    "reduction_batch": "~88%"
+  },
+  "durable_delivery_preserved": {
+    "validation_gate": true,
+    "outbox_schema": "unchanged",
+    "dead_letter_recovery": "unchanged",
+    "thread_routing": "unchanged",
+    "claim_ack": "unchanged",
+    "retry_backoff": "unchanged",
+    "dashboard_log_payloads": "unchanged",
+    "redaction": "unchanged"
+  },
+  "test_results": {
+    "test_files": [
+      "tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
+      "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+      "AITools/test_taskctl_origin_thread_callback_b366_v1.py",
+      "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
+      "AITools/test_taskctl_terminal_review_only_b404_v1.py"
+    ],
+    "test_count": 168,
+    "pass": 168,
+    "fail": 0,
+    "error": 0
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_compact_b435_v1.json"
+  ],
+  "worker_validation_note": "The worker finalizer reported validation_failed only because isolated /usr/bin/python3 lacked pytest; coordinator validation used the repository virtualenv.",
+  "verdict": "COORDINATOR_ACCEPTED_PASS_168_0"
+}

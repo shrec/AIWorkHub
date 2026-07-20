@@ -1,0 +1,71 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_e2e_next_wave.v1",
+  "parent_task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1",
+  "runner": "claude_task_mcp_codex_handoff_b116",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B116 Codex-ready HANDOFF report tool complete. review_summarizer.build_codex_handoff_report summarizes per review task: task_id, runner, topic, allowed_writes, validation commands, a deterministic risk checklist (missing_validation, shared_file_write, wide_write_scope, missing_forbidden_guards, declared_risk, commit_hygiene_warn), commit-hygiene status (no_git_add_all / mixed_task_commit_forbidden / scoped_stage_only), and a scoped stage/guard-staged/diff/done command list. Registered as one new read-only MCP tool geoai_task_codex_handoff in server.py (FastMCP tool count 16->17). Strictly READ-ONLY: fixture-dir sha256 and live review-queue stdout both identical before/after; only review-queue/show taskctl commands issued; write gate default-off; no process/agent launch; no runtime switch. summarize_review_queue refactored behavior-preserving onto shared _collect_review_cards helper; b110/b111/b112/b113/b115 summarizer tests remain green. 70/70 e2e checks pass; taskctl verify PASS.",
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_FIXTURE": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER_LIVE": true,
+    "NO_WRITE_TASKCTL_COMMAND_ISSUED": true,
+    "SINGLE_TOOL_ADDED_ONLY": true,
+    "NO_RUNTIME_SWITCH_TO_MCP": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_NEURAL_PRIORITY_DISTILL_B117_V1",
+      "objective": "Neural-bridge: distill the handoff report fields (risk checklist, commit-hygiene status, allowed_writes shape) into curriculum/feature-axis targets so a learned controller can PRIORITIZE the Codex review queue (which task to review first) instead of the deterministic risk validator. Deterministic risk derivation stays as the evidence extractor / baseline; emit trainable rows + a measured neural dry-run.",
+      "runner": "claude_task_mcp_codex_handoff_b117",
+      "topic": "task_mcp",
+      "depends_on": ["CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"],
+      "priority": "task_mcp_b117_handoff_neural_priority",
+      "read_first": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+        "tools/geoai-task-mcp/eval/mcp_codex_handoff_e2e_b116_v1.json"
+      ],
+      "ready": true
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B117_V1",
+      "objective": "Add a read-only renderer that turns build_codex_handoff_report output into a compact Codex review packet (deterministic text/markdown), still no queue mutation and no new write authority; register as a read-only MCP tool.",
+      "runner": "claude_task_mcp_codex_handoff_b117",
+      "topic": "task_mcp",
+      "depends_on": ["CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"],
+      "priority": "task_mcp_b117_handoff_markdown_render",
+      "ready": true
+    }
+  ],
+  "blockers": [],
+  "preexisting_failures_for_owner": [
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "issue": "frozen tool-count assertion is stale (fails at clean 16-tool baseline too, expected != 16); bump frozen inventory to 17 including geoai_task_codex_handoff",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "issue": "same stale frozen tool-count assertion (fails at baseline); bump to 17",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+      "issue": "stale audit tool-name list missing cli_adapter x3 + review_summarize + codex_handoff (fails at baseline; predates b106)",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"
+    },
+    {
+      "test": "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+      "issue": "collision-guard row drift (expected 3, got 6); unrelated to B116 files",
+      "out_of_scope_for": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1"
+    }
+  ],
+  "follow_up_actions": [
+    "Codex to run taskctl.py review CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1 finalize (worker returns to review, does not mark done)",
+    "Owners of b109/b110 stdio smoke + mvp_contract_audit to refresh their frozen tool inventory to 17 (add geoai_task_codex_handoff)"
+  ]
+}

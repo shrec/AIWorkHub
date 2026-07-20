@@ -1,0 +1,69 @@
+{
+  "next_wave_id": "mcp_autopickup_dryrun_next_wave_b118_v1",
+  "parent_task": "CLAUDE_TASK_MCP_AUTOPICKUP_DRYRUN_B118_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). The B118 dry-run is READ-ONLY: it previews what auto_pickup would claim using only the read-only `export` command and never mutates the parent queue or touches the write gate. Follow-ups keep the write gate default-off and add NO workflow switch / process launch. Any adapter/runner/topic SELECTION that a worker session should pursue must become a LEARNED router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_BATCH_COLLISION_PREFLIGHT_B119_V1",
+      "goal": "Add a batch dry-run: preview the next claimable task for a set of (runner, topic) pairs and run collision-guard preflight over the previewed candidate set, WITHOUT claiming any task. Reuse core.auto_pickup_dryrun + read-only collision_guard.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/tests/test_mcp_dryrun_batch_collision_preflight_b119_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_dryrun_batch_collision_preflight_b119_v1.json"
+      ],
+      "acceptance": [
+        "previews N runner/topic candidates with zero queue mutation (snapshot before/after identical)",
+        "collision-guard preflight runs over the previewed set; no task claimed",
+        "write gate stays off; no process launch; no workflow switch"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_DRYRUN_STALE_CLAIM_DIAGNOSTIC_B119_V1",
+      "goal": "Extend the dry-run report with a read-only stale/in-progress diagnostic: for a runner/topic, report tasks already in-progress (would block a fresh pickup) and any stale claims, mirroring taskctl's in_progress branch. Read-only; no unstick, no mutation.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_mcp_dryrun_stale_claim_diagnostic_b119_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_dryrun_stale_claim_diagnostic_b119_v1.json"
+      ],
+      "acceptance": [
+        "reports in-progress + stale claims for runner/topic without mutating any card",
+        "diagnostic is read-only; never calls unstick-pending/auto-pickup/review/done",
+        "queue byte-identical before/after"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCE_B119_V1",
+      "goal": "Enforce a static runner/topic allow-list on the real (write-gated) auto_pickup claim path so an unknown/off-topic runner/topic string is refused before any mutation. Dry-run already reports the pair; this adds the write-path guard. Static allowlist is a SAFETY boundary, not a cue router.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforce_b119_v1.sh",
+        "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_enforce_b119_v1.json"
+      ],
+      "acceptance": [
+        "unknown/off-topic runner/topic refused on the write path and audited",
+        "static allowlist is a safety boundary, not a runtime cue router",
+        "write gate stays default-off; dry-run path unchanged"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_TASK_ROUTING_MIGRATION_V1",
+      "goal": "Produce trainable curriculum rows for a LEARNED runner/topic task-routing + abstain policy (which pending task a worker session should pursue) that would eventually replace static selection with a neural router. No cue/regex router introduced; deterministic dry-run/allowlist remain validators only.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/mcp_task_routing_targets_v1.jsonl",
+        "tools/geoai-task-mcp/eval/mcp_task_routing_targets_v1.json"
+      ],
+      "acceptance": [
+        "curriculum rows define task->runner/topic routing + abstain labels",
+        "no regex/keyword cue router introduced",
+        "learned-selection migration path documented; deterministic preview stays a validator"
+      ]
+    }
+  ]
+}

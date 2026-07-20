@@ -1,0 +1,66 @@
+{
+  "next_wave_id": "task_mcp_vscode_native_mcp_app_b615_v1_next_wave",
+  "parent_task": "CLAUDE_SONNET5_TASK_MCP_VSCODE_NATIVE_APP_B615_V1",
+  "date": "2026-07-18",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). B615 shipped a strictly read-only native VS Code MCP App: one bounded stdio child, a hand-rolled JSON-RPC client, three narrow dashboard MCP tools, and a fixed inbound message enum. Every follow-up below stays read-only or capability-gated by design; none may add an archive/restore/done/reject/launch affordance to the Webview without an explicit security review.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_VSCODE_MUTATION_UI_SECURITY_REVIEW_B616_V1",
+      "goal": "Independent security review of a capability-gated archive/restore mutation UI design for the native Webview BEFORE any mutation code is written: coordinator-token handling (never in the Webview), a narrow confirm-and-reason flow driven entirely by extension-host-validated messages, and an explicit allowlist of the exact 1-2 write-gated MCP tools the Webview may ever trigger.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "docs/security/vscode_task_operations_mutation_ui_review_b616_v1.md",
+        "tools/geoai-task-mcp/eval/vscode_mutation_ui_security_review_b616_v1.json"
+      ],
+      "acceptance": [
+        "no code changes to extension.js/media/*.js/server.py in this task",
+        "review states the exact write-gated tool allowlist, token-handling boundary, and confirm/reason UX before implementation begins",
+        "explicitly blocks promotion until a follow-up implementation task passes its own gated review"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_VSCODE_EXTENSION_TEST_HARNESS_B617_V1",
+      "goal": "Add a real @vscode/test-electron (or equivalent) integration harness that actually activates the extension, opens the panel, and exercises the ready/refresh/selectTask message round trip against a real spawned geoai_task_mcp.server child in a scratch task-queue fixture -- current coverage is static analysis (node --check + pattern assertions) only, with no live activation test.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/vscode-geoai-task-operations/test/**",
+        "tools/vscode-geoai-task-operations/package.json"
+      ],
+      "acceptance": [
+        "a real VS Code extension-host test activates the extension and opens the panel",
+        "the test drives ready -> snapshot and selectTask -> taskDetail through the real MCP stdio child (no mock)",
+        "hidden-view polling-stop is asserted against a real onDidChangeViewState transition, not just source-pattern matching"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_VSCODE_STDIO_PROTOCOL_HARDENING_B618_V1",
+      "goal": "Compare the hand-rolled McpStdioClient in extension.js against the official @modelcontextprotocol/sdk TypeScript client behavior (protocol version negotiation edge cases, notification ordering, error-object shape variance) and either bundle the official SDK (if an offline-installable vendored copy is acceptable for this project) or harden the hand-rolled client's edge-case handling with regression tests for each divergence found.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/vscode-geoai-task-operations/extension.js",
+        "tools/vscode-geoai-task-operations/test/**",
+        "tools/geoai-task-mcp/eval/vscode_stdio_protocol_hardening_b618_v1.json"
+      ],
+      "acceptance": [
+        "documented comparison of hand-rolled client vs. official SDK client behavior",
+        "any found protocol-edge-case divergence gets a regression test",
+        "still exactly one bounded child/session; still no bundled network dependency unless explicitly approved"
+      ]
+    },
+    {
+      "task_id": "MCP_NEURAL_DASHBOARD_TELEMETRY_SIGNAL_MIGRATION_V1",
+      "goal": "Per the project's neural-control-first doctrine, the liveness/model/context telemetry this Webview renders (liveness_state, heartbeat age, ai_infra_context hit counts) should also become a labeled feature axis for the neural controller's abstain/health-signal learning, not just a human-facing status badge. Produce curriculum rows pairing (task_id, liveness snapshot) with the eventual worker outcome so the controller can learn to weight a 'stale'/'degraded' signal.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "bitnnv2/data/curriculum/mcp_dashboard_telemetry_signal_targets_v1.jsonl",
+        "tools/geoai-task-mcp/eval/mcp_dashboard_telemetry_signal_targets_v1.json"
+      ],
+      "acceptance": [
+        "curriculum rows pair a liveness/telemetry snapshot with the eventual task outcome",
+        "no regex/keyword cue router introduced as a health-signal authority",
+        "dashboard_mcp_app.py cited as the read-only evidence source, not modified for this task"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "schema_id": "geoai.task_mcp_mvp_patch_plan_next_wave.v1",
+  "task_id": "CLAUDE_TASK_MCP_DRYRUN_TO_MVP_PATCH_PLAN_B282_V1",
+  "runner": "claude_task_mcp_mvp_plan_b282",
+  "topic": "task_mcp",
+  "created_at": "2026-07-08",
+  "status": "mvp_patch_plan_complete",
+  "supersedes": {
+    "proposed_task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1",
+    "from_file": "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
+    "reason": "That card proposed a brand-new queue_request.py module and a brand-new mcp_queue_requests_b282_v1.jsonl log. Direct inspection of launch_queue_contract.py + launch_queue_persist.py (B119) shows equivalent dataclasses/persistence already exist and are already wired into server.py as 3 read-only tools. The corrected card below (CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1) extends the existing modules additively instead of duplicating them. Renumbered to B286 to avoid a batch-token collision with this planning task's own B282 id."
+  },
+  "next_wave_cards": [
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1",
+      "runner": "claude_task_mcp_queue_request_b286",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_queue_request_tool_extend_existing_launch_queue_contract",
+      "objective": "Additively extend launch_queue_contract.py (LaunchRequest: +model, +owner_prompt, +requested_at, +stale_timeout_seconds; +deterministic_request_id helper) and launch_queue_persist.py (+find_open_requests, extended _PROCESS_LOG_KEYS), then register ONE new write-gated MCP tool geoai_task_queue_request in server.py per task_mcp_mvp_patch_plan_b282_v1.json's api_surface_new_tool schema. Reuses the existing append-only log at tools/geoai-task-mcp/logs/launch_queue_audit.jsonl -- no new log file. No process launch; LAUNCH_IMPLEMENTED stays False.",
+      "acceptance": [
+        "LaunchRequest gains exactly 4 new optional fields with safe defaults; no existing field renamed/removed/reordered in a way that breaks as_dict() callers",
+        "deterministic_request_id(task_id, runner, requested_at) matches B281 section_1: sha1(f'{task_id}:{runner}:{requested_at}').hexdigest()[:16]",
+        "New tool geoai_task_queue_request registered additively in server.py; existing 24 tools unchanged (list_tools count check: 24 -> 25)",
+        "Write-gate-off (default): persisted_entry is null, zero bytes appended to the log",
+        "Write-gate-on: exactly one JSONL line appended per non-duplicate, non-idempotent request",
+        "Idempotency: same request_id submitted twice while the first is non-terminal returns idempotent_noop=true and appends nothing",
+        "Duplicate-runner block: a second runner submitting for the same task_id while an open entry exists for a different runner returns duplicate_runner_blocked=true and appends nothing",
+        "LAUNCH_IMPLEMENTED remains False in every code path; no subprocess/os.exec/os.spawn/os.system/os.popen import added anywhere in the diff",
+        "Shell test validates schema, write-gate-off/on, idempotency, and duplicate-runner behavior"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_DRYRUN_TO_MVP_PATCH_PLAN_B282_V1 (this plan)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/eval/mcp_queue_request_tool_b286_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_queue_request_tool_b286_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B287_V1",
+      "runner": "claude_task_mcp_stale_recovery_b287",
+      "topic": "task_mcp",
+      "priority": "high",
+      "mode": "mcp_stale_recovery_orchestrator_readonly_detect",
+      "objective": "Implement stale_recovery.py: consumes completion_inbox.build_completion_inbox()['stale_processing'] and launch_queue_persist.read_persisted_log() and produces a ranked recovery_actions list (requeue|mark_done|kill_zombie|escalate). No automatic execution -- recommendations only, per task_mcp_mvp_patch_plan_b282_v1.json G_STALE_RECOVERY gate.",
+      "acceptance": [
+        "Module produces recovery_actions list: each entry has task_id, action_type, confidence, reason",
+        "kill_zombie confidence stays 'low' until a pid field exists on ProcessLogEntry (documented gap from B282 plan blockers) -- no /proc/<pid> check invented without real pid data",
+        "Ranking: kill_zombie > requeue > mark_done > escalate",
+        "Zero taskctl write commands issued by the module (list/show only, matching completion_inbox.py's read-only invariant)",
+        "Shell test with fixture stale_processing + audit-log rows covering all 4 action types"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1 (shares the extended log schema for evidence)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/stale_recovery.py",
+        "tools/geoai-task-mcp/eval/mcp_stale_recovery_orchestrator_b287_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B288_V1",
+      "runner": "claude_task_mcp_cost_ledger_b288",
+      "topic": "task_mcp",
+      "priority": "medium",
+      "mode": "mcp_cost_ledger_aggregator_readonly_union",
+      "objective": "Implement cost_ledger.py: UNIONs launch_queue_persist.read_persisted_log() entries with core.usage_report() into a per-topic/per-runner/per-day cost view, per task_mcp_mvp_patch_plan_b282_v1.json G_USAGE_EXISTING gate. Read-only; no new write path. Note: launch-log side is empty of cost data until token/cost fields are added to ProcessLogEntry (documented gap in B282 plan blockers) -- usage_report() remains the authoritative side until then.",
+      "acceptance": [
+        "New tool geoai_task_cost_ledger registered additively in server.py",
+        "UNION of launch_queue_persist entries + core.usage_report() rows, dedup by (task_id, runner, model)",
+        "Aggregates: total_cost_usd by topic, by runner, by day; per-task detail on request",
+        "No write to any file; pure read-only aggregation",
+        "Shell test with fixture launch log + usage data"
+      ],
+      "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1 (needs the extended log to have entries)",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/cost_ledger.py",
+        "tools/geoai-task-mcp/eval/mcp_cost_ledger_aggregator_b288_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_cost_ledger_aggregator_b288_v1.sh"
+      ]
+    },
+    {
+      "proposed_task_id": "CODEX_TASK_MCP_QUEUE_ORCHESTRATION_LOOP_WIRING_B289_V1",
+      "runner": "codex_task_mcp_queue_loop_b289",
+      "topic": "task_mcp",
+      "priority": "critical",
+      "mode": "codex_orchestration_loop_queue_integration",
+      "objective": "Wire the full queue flow into Codex's orchestration loop: auto_pickup -> geoai_task_queue_request (if CLAIMED and needs launch) -> completion_inbox polling -> review -> cost ledger recording, using the B286/B287/B288 tools. First task that connects the MCP queue tools into Codex's real cadence; DeepSeek manual adapter unchanged (owner still copies the command block).",
+      "acceptance": [
+        "Codex loop: auto_pickup -> detect CLAIMED -> geoai_task_queue_request -> poll completion_inbox -> review -> commit",
+        "Stale detection integrated via stale_recovery.py recommendations each loop iteration",
+        "Cost ledger consulted before queueing a request",
+        "Dry-run mode prints what WOULD be queued without calling the write-gated tool"
+      ],
+      "depends_on": [
+        "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1",
+        "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B287_V1",
+        "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B288_V1"
+      ],
+      "read_first": [
+        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "AITools/taskctl.py"
+      ]
+    }
+  ],
+  "blockers": [
+    "LAUNCH_IMPLEMENTED_STILL_FALSE: unchanged -- no card in this wave flips it.",
+    "OWNER_DELIVERY_CHANNEL_UNDECIDED: unchanged from B277/B281.",
+    "PID_AND_COST_FIELDS_NOT_YET_ON_PROCESSLOGENTRY: B287's kill_zombie confidence and B288's launch-log UNION side both stay degraded until B286 lands the schema extension."
+  ],
+  "notes": {
+    "why_renumbered": "This planning task owns batch token B282; the B281-proposed queue-tool implementation card also claimed B282, which would collide with this task's own task_id batch token under taskctl's runner/task batch guard. Renumbering the corrected card to B286 (and its dependents to B287-B289) avoids that collision while preserving the original dependency order (queue tool first, then stale-recovery + cost-ledger in parallel, then Codex loop wiring last).",
+    "implementation_order": "B286 (extend launch_queue_contract/persist + 1 new tool) -> B287 (stale recovery) + B288 (cost ledger) can run in parallel after B286 -> B289 (Codex loop wiring) last."
+  }
+}

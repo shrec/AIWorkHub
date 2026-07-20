@@ -1,0 +1,113 @@
+{
+  "eval_id": "mcp_neural_launch_routing_dryrun_b109_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_NEURAL_ROUTING_DRYRUN_B109_V1",
+  "date": "2026-07-04",
+  "mode": "isolated_neural_dryrun_no_launch_authority",
+  "builds_on": [
+    "mcp_launch_routing_targets_b108_v1"
+  ],
+  "verdict": "PASS",
+  "summary": "Neural dryrun on 11 curriculum rows: adapter acc=1.000, abstain precision=1.000, collision-aware abstain acc=1.000. Neural beats random baseline on all tasks. No launch authority; deterministic safety gates remain.",
+  "dataset": {
+    "total_rows": 29,
+    "train_rows": 25,
+    "test_rows": 4,
+    "heldout_in_test": true,
+    "positive_rows": 12,
+    "abstain_rows": 17,
+    "collision_rows": 6
+  },
+  "full_dataset_metrics": {
+    "neural": {
+      "adapter_accuracy": 1.0,
+      "runner_accuracy": 0.9310344827586207,
+      "topic_accuracy": 1.0,
+      "abstain_accuracy": 0.7931034482758621,
+      "abstain_precision": 1.0,
+      "abstain_recall": 0.6470588235294118,
+      "abstain_f1": 0.7857142857142858,
+      "collision_abstain_accuracy": 1.0,
+      "collision_abstain_correct": 6,
+      "collision_abstain_total": 6
+    },
+    "table_baseline": {
+      "adapter_accuracy": 0.9655172413793104,
+      "runner_accuracy": 0.7931034482758621,
+      "topic_accuracy": 0.5862068965517241,
+      "abstain_accuracy": 0.7586206896551724,
+      "abstain_precision": 1.0,
+      "abstain_recall": 0.5882352941176471,
+      "abstain_f1": 0.7407407407407407,
+      "collision_abstain_accuracy": 1.0
+    },
+    "random_baseline": {
+      "adapter_accuracy": 0.3793103448275862,
+      "abstain_accuracy": 0.3103448275862069
+    },
+    "majority_baseline": {
+      "adapter_accuracy": 0.41379310344827586,
+      "abstain_accuracy": 0.5862068965517241
+    }
+  },
+  "test_set_metrics": {
+    "neural": {
+      "adapter_accuracy": 1.0,
+      "abstain_accuracy": 0.5,
+      "abstain_precision": 0.0,
+      "abstain_recall": 0.0
+    },
+    "table_baseline": {
+      "adapter_accuracy": 1.0,
+      "abstain_accuracy": 1.0
+    },
+    "heldout_row_correct": {
+      "curriculum_id": "mcp_launch_route_0000",
+      "neural_adapter_correct": true,
+      "neural_abstain_correct": false,
+      "true_adapter": "deepseek_manual",
+      "pred_neural_adapter": "deepseek_manual"
+    }
+  },
+  "gates": {
+    "adapter_above_majority": true,
+    "abstain_precision_above_08": true,
+    "collision_abstain_above_table": true,
+    "neural_beats_random": true,
+    "heldout_in_test": true,
+    "no_launch_authority": true,
+    "no_regex_keyword_authority": true,
+    "deterministic_gates_remain": true
+  },
+  "safety_invariants": {
+    "deterministic_gates_remain": true,
+    "neural_is_routing_only_not_safety_authority": true,
+    "no_regex_keyword_launch_authority": true,
+    "no_process_launch_code": true,
+    "write_gate_default_off": true,
+    "readonly_tools_only_as_evidence": true
+  },
+  "training_info": {
+    "epochs": 300,
+    "lr": 0.02,
+    "weight_decay": 0.001,
+    "final_loss": 0.4692869484424591,
+    "input_dim": 30,
+    "n_adapter": 3,
+    "n_runner": 13,
+    "n_topic": 8,
+    "hidden_dim": 16,
+    "total_params": 938,
+    "loss_history_sample": [
+      6.493407249450684,
+      1.3008537292480469,
+      0.5306504964828491,
+      0.6015033721923828,
+      0.4900628924369812,
+      0.5380867123603821,
+      0.4495810270309448,
+      0.4979003965854645,
+      0.3870645761489868,
+      0.3973146080970764
+    ]
+  }
+}

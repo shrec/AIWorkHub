@@ -1,0 +1,33 @@
+{
+  "next_wave_id": "write_gate_audit_next_wave_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "follow_up_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_V1",
+      "runner": "deepseek_task_mcp_audit_read_v1",
+      "topic": "task_mcp",
+      "summary": "Add a read-only MCP tool geoai_task_audit_log that returns the last N audit entries, useful for dashboard/health checks.",
+      "priority": "low",
+      "depends_on": ["DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1"]
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_ROTATION_V1",
+      "runner": "deepseek_task_mcp_audit_rotate_v1",
+      "topic": "task_mcp",
+      "summary": "Add audit log rotation (max size / max age) so the log doesn't grow unbounded on long-running servers.",
+      "priority": "low",
+      "depends_on": ["DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1"]
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_ALERT_V1",
+      "runner": "deepseek_task_mcp_audit_alert_v1",
+      "topic": "task_mcp",
+      "summary": "Add optional alert threshold: if blocked attempts exceed N/hour, surface via health tool or stderr. Keeps MCP agent aware of misconfiguration.",
+      "priority": "medium",
+      "depends_on": ["DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1"]
+    }
+  ],
+  "notes": "All follow-ups are read-only or passive additions. None enable writes or agent launch by default. The audit log itself is append-only and defensive — it cannot be used to bypass the write gate."
+}

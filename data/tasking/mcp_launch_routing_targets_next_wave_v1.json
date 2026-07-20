@@ -1,0 +1,34 @@
+{
+  "next_wave_id": "mcp_launch_routing_targets_next_wave_b108_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_NEURAL_LAUNCH_ROUTING_TARGETS_B108_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued. Curriculum rows are produced; the next step is an ISOLATED NEURAL DRYRUN that measures whether the model can learn adapter/runner/topic routing + abstain from these rows. After the dryrun passes gates, the GATED LAUNCH EXECUTOR (B108) task wires the learned router behind the deterministic safety gates. Deterministic safety gates remain; neural routing selects among allowed adapters, never bypasses safety.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_NEURAL_ROUTING_DRYRUN_B108_V1",
+      "goal": "Run isolated neural dryrun on mcp_launch_routing_targets_v1.jsonl to measure whether the model learns adapter/runner/topic routing + abstain. Report per-class accuracy, abstain precision/recall, and collision-aware abstain accuracy.",
+      "mode": "isolated_neural_dryrun_no_runtime",
+      "runner": "claude_capability_eval",
+      "topic": "capability_eval",
+      "acceptance": [
+        "per-class routing accuracy above baseline",
+        "abstain precision > 0.8 on collision scenarios",
+        "no regex/keyword authority introduced",
+        "dryrun uses ONLY read-only plan/collision tools as evidence extractors"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B108_V1",
+      "goal": "Wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH; real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass AND the neural router (once trained) selects the adapter. Default stays fully disabled.",
+      "mode": "implementation_gated_launch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "launch unreachable without explicit gate AND neural router selection",
+        "default disabled; deterministic safety gates remain",
+        "argv-list only, no shell, cwd pinned, env scrubbed"
+      ]
+    }
+  ]
+}

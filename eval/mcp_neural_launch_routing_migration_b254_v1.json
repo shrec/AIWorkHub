@@ -1,0 +1,102 @@
+{
+  "eval_id": "mcp_neural_launch_routing_migration_b254_v1",
+  "task_id": "CLAUDE_TASK_MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_B254_V1",
+  "runner": "claude_task_mcp_neural_launch_routing_migration_b254",
+  "topic": "task_mcp",
+  "mode": "mcp_neural_launch_routing_migration_curriculum_no_launch",
+  "builds_on": [
+    "mcp_launch_routing_targets_b108_v1",
+    "mcp_claude_runner_orchestration_review_b251_v1"
+  ],
+  "verdict": "PASS",
+  "summary": "Migrated the B108 single-snapshot MCP launch-routing curriculum (29 rows) to a 251-row curriculum sampled from the FULL live historical auto-pickup/review-queue outcome distribution (3105 task cards read from machine_task_cards_v1.jsonl at build time, status_counts={'pending': 12, 'processing': 2, 'review': 19, 'blocked_data': 10, 'blocked_review_failed': 13, 'future_backlog': 2, 'blocked': 2, 'finished': 2988, 'completed': 44, 'stale_already_done': 13}). Adds a historical_review_outcome feature axis (in_progress/in_review/completed_ok/review_outcome_failed_historical/blocked_*_historical) that B108 did not have, plus real-active-claim collision rows and synthetic wrong-runner/topic mismatch rows as new abstain classes. B108's 29 rows are carried forward unmodified (labels/safety) with feature_axes attached for regression continuity. Static allowlists remain the deterministic safety floor and are not replaced by any of this -- every row's safety section sets static_allowlist_is_safety_floor_not_replaced=True.",
+  "data_source": {
+    "path": "bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+    "read_method": "plain open()/json.loads per line, malformed lines skipped",
+    "concurrency_note": "This file is live and mutated by other topic-bound workers during this build; row COUNTS are a function of live queue state and will differ between build runs. Structural/schema gates below do not depend on exact counts.",
+    "cards_loaded": 3105,
+    "status_counts": {
+      "pending": 12,
+      "processing": 2,
+      "review": 19,
+      "blocked_data": 10,
+      "blocked_review_failed": 13,
+      "future_backlog": 2,
+      "blocked": 2,
+      "finished": 2988,
+      "completed": 44,
+      "stale_already_done": 13
+    }
+  },
+  "counts": {
+    "total_rows": 251,
+    "real_positive": 134,
+    "real_active_claim_collision_abstain": 4,
+    "synthetic_wrong_runner_topic_abstain": 84,
+    "carried_forward_b108": 29,
+    "positive": 146,
+    "abstain": 105,
+    "heldout": 29
+  },
+  "abstain_reasons": {
+    "collision_detected": 4,
+    "collision_detected_same_task": 4,
+    "wrong_runner_topic_mismatch": 84,
+    "collision_detected_both": 2,
+    "mode_not_trainable": 3,
+    "topic_ambiguous": 3,
+    "safety_boundary_unclear": 4,
+    "deepseek_manual_only": 1
+  },
+  "adapter_distribution": {
+    "deepseek_manual": 105,
+    "claude_cli": 130,
+    "codex_cli": 10,
+    "unknown": 6
+  },
+  "historical_review_outcome_note": "blocked_review_failed / blocked_data / blocked cards are emitted as is_positive=True (abstain=False) rows: their adapter/runner/topic assignment was a real, structurally-valid routing decision -- what later failed was the task's SUBSTANTIVE outcome (review content rejected, data missing), not the routing choice itself. That distinction is recorded on feature_axes.historical_review_outcome, not on the abstain label, to avoid teaching the router to abstain on topics/runners merely because some past task on that pairing failed review for unrelated content reasons.",
+  "safety_invariants": {
+    "deterministic_gates_remain": true,
+    "neural_is_routing_only_not_safety_authority": true,
+    "no_regex_keyword_launch_authority": true,
+    "no_process_launch_code": true,
+    "write_gate_default_off": true,
+    "static_allowlist_is_safety_floor_not_replaced": true
+  },
+  "gates": {
+    "all_rows_have_safety_section": true,
+    "no_regex_keyword_authority_in_any_row": true,
+    "all_abstain_rows_have_reason": true,
+    "collision_abstain_rows_have_collision_context": true,
+    "positive_rows_not_abstain": true,
+    "heldout_set_exists": true,
+    "collision_aware_abstain_rows_present": true,
+    "wrong_runner_topic_rows_present": true,
+    "curriculum_jsonl_valid": true,
+    "eval_jsonl_valid": true,
+    "static_allowlist_explicitly_marked_safety_floor": true
+  },
+  "neural_bridge_note": "These curriculum rows are TRAINING TARGETS for a learned neural router that selects adapter/runner/topic from task context and abstains when evidence is insufficient (collision, wrong pairing, ambiguous topic, non-trainable mode). adapter_of() and the historical-status/outcome bucketing in this build script are curriculum LABEL GENERATORS only -- NOT runtime launch authority. Production routing must be the neural model's learned dispatch over rows like these, never a regex/keyword cue router promoted to active_default. Deterministic safety gates (COMMAND_ALLOWLIST, LAUNCHABLE_BINARIES, the dual GEOAI_TASK_MCP_ALLOW_LAUNCH/ALLOW_WRITES env-gate contract) remain the safety floor after the neural router selects; this task neither touches nor weakens them.",
+  "authority_flags": {
+    "process_launch_authority": false,
+    "write_gate_enabled": false,
+    "workflow_switch": false,
+    "runtime_authority": false,
+    "regex_launch_authority": false,
+    "keyword_router_authority": false
+  },
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local curriculum/data-curation build over this repo's own task-card store and prior curriculum artifact; no external library/API/SDK question was open."
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "next_wave_pointer": "tools/geoai-task-mcp/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json",
+  "files_written": [
+    "bitnnv2/data/curriculum/mcp_neural_launch_routing_migration_b254_v1.jsonl",
+    "tools/geoai-task-mcp/eval/mcp_neural_launch_routing_migration_b254_v1.json",
+    "tools/geoai-task-mcp/eval/mcp_neural_launch_routing_migration_rows_b254_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json"
+  ]
+}

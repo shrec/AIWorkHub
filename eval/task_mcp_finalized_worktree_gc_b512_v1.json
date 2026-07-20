@@ -1,0 +1,112 @@
+{
+  "schema_id": "geoai.task_mcp_finalized_worktree_gc.v1",
+  "eval_id": "task_mcp_finalized_worktree_gc_b512_v1",
+  "task_id": "CLAUDE_TASK_MCP_FINALIZED_WORKTREE_GC_B512_V1",
+  "date": "2026-07-17",
+  "verdict": "GC_IMPLEMENTED_TESTS_PASS_REVIEW_REQUIRED",
+  "summary": "Reproduced and repaired the retained-worktree disk leak: ProcessManager._finalize_isolated_request intentionally sets cleanup=False for every non-success terminal state (validation_failed/cancelled/scope_rejected/worker_failed/timed_out/promotion_conflict/finalize_failed) so a human/Codex reviewer can inspect the isolated git worktree + HOME before it is deleted, but nothing ever revisited those retained directories once the coordinator finished reviewing and ran taskctl done/archive -- the workspace stayed on disk forever. Added a fail-closed GC pass (ProcessManager._gc_finalized_workspace(s)) wired into the existing ProcessManager.reconcile() entry point (the same call task_reconciler.py's scan loop already runs on every interval), plus a shared, reusable path-shape validator (worker_workspace.assert_gc_safe_workspace_shape) that re-derives the one legal <configured_root>/<request_id>/{worktree,home} location from request_id alone and never trusts persisted metadata blindly. 26/26 new tests pass; the pre-existing durable-reconciler suite (test_task_liveness_reconciler.py) stays green except two pre-existing, unrelated environment failures (a supervisor heartbeat timing test and a missing scripts/ file, both untouched by this diff -- see known_environment_gaps).",
+  "root_cause": {
+    "description": "cleanup=False on every failure terminal path in _finalize_isolated_request is a deliberate, documented design decision (retain evidence for coordinator review), not a bug. The gap is that no code path EVER revisits a retained workspace after the coordinator's own accept/reject decision (taskctl done -> status=finished, or taskctl archive -> archived_at set). ProcessManager only re-scans persisted requests when a NEW instance is constructed or an explicit status/list_processes/reconcile call happens (same structural class of gap as the B411/B412 launcher-loss regression this repo already fixed for exited-but-unfinalized workers), and even then the re-scan only finalizes; it never garbage-collects an already-finalized, already-retained workspace.",
+    "additional_finding": "core._lifecycle_state (tools/geoai-task-mcp/src/geoai_task_mcp/core.py:480-503) never checks card['archived_at'] -- it can only return finished/blocked/review/processing/pending, never 'archived' (AITools/taskdb.py's canonical_status treats a non-empty archived_at as taking priority over every other field). A GC keyed off core._lifecycle_state alone would never become eligible for an archived task; process_launcher._canonical_task_status fixes this locally for the GC path without touching core.py's existing, load-bearing behavior."
+  },
+  "fix": {
+    "files_changed": [
+      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+    ],
+    "worker_workspace_py": [
+      "Added configured_worktree_root(): factored the WORKTREE_ROOT_ENV/tempdir default computation out of create_workspace() into one shared function so a GC path can re-derive the exact same root create_workspace() itself used, instead of duplicating/drifting the logic.",
+      "Added assert_gc_safe_workspace_shape(request_id, path, home): fail-closed shape validator. Re-derives the ONLY legal <configured_worktree_root()>/<request_id>/{worktree,home} pair from request_id alone (after re-validating request_id against _REQUEST_ID_RE) and raises WorkspaceError on any mismatch -- catches a request_id outside the strict grammar, a path/home pair outside the configured root, or a home/worktree swap. Never trusts a request's own persisted metadata path/home strings as proof of safety; GC calls this BEFORE calling the existing cleanup_workspace()."
+    ],
+    "process_launcher_py": [
+      "Added GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES - {'blocked'} and GC_ELIGIBLE_CANONICAL_STATUSES = {'finished','archived'}.",
+      "Added _canonical_task_status(card): checks card['archived_at'] first (returns 'archived'), else delegates to core._lifecycle_state -- the local fix for core.py's incomplete classifier, scoped to the GC path only.",
+      "Added _process_proven_dead(pid, ticks): the fail-closed, opposite-biased counterpart to the existing _pid_matches (which is written to favor 'still the same process' for cancel/liveness). GC needs 'not proven dead' to mean 'do nothing' -- an alive PID with unknown/unrecorded start ticks is NOT proof of death.",
+      "Added ProcessManager._gc_finalized_workspace(request_id, event): the single-request, fail-closed GC evaluator. Requires, in order: event.state in GC_CANDIDATE_PROCESS_STATES, event.workspace_retained is true, request_id not in _active_request_ids() (belt-and-suspenders against the in-memory live registry), a readable+parseable *.request.json whose workspace.request_id/repo match exactly, a successful task_id lookup whose canonical status (via _canonical_task_status) is finished or archived, _process_proven_dead(pid, ticks) true, and assert_gc_safe_workspace_shape() passing. Only then calls the EXISTING cleanup_workspace() (already idempotent by construction: existence-guarded git-worktree-remove, ignore_errors=True rmtree) and appends one auditable event that copies the request's own current terminal state unchanged (never altering the task's terminal outcome or any earlier review/release callback transition) plus bounded, non-secret GC evidence fields (workspace_gc, workspace_gc_at, workspace_gc_reason, workspace_retained=false). Every failure mode returns a bounded {'gc': false, 'reason': ...} instead of deleting anything.",
+      "Added ProcessManager._gc_finalized_workspaces(): the per-scan sweep over _latest_by_request(), calling _gc_finalized_workspace per candidate (each under its own _registry_lock() critical section, mirroring _reconcile_persisted_requests's existing per-request locking style rather than one lock held across the whole scan).",
+      "ProcessManager.reconcile() now also calls _gc_finalized_workspaces() and merges gc_scanned/gc_cleaned/gc_skipped into its return dict -- the ONE required integration point: task_reconciler.py's existing scan loop (daemon or run-once) already calls reconcile() on GEOAI_TASK_MCP_RECONCILER_SCAN_INTERVAL_SECONDS, so a finalized workspace is swept within one normal reconciliation interval with no new daemon, no cron, and no broad rm -rf."
+    ],
+    "invariants_preserved": [
+      "never_weakens_retention: cleanup=False in _finalize_isolated_request is completely untouched; a workspace is retained for review exactly as before. GC only ever acts strictly AFTER the coordinator has independently finished/archived the task.",
+      "no_new_task_queue: GC reads the canonical task status through the existing self._show_task (== taskctl show) exactly like every other lifecycle check in this module; it never touches AITools/taskdb.py directly and never adds a second source of truth.",
+      "callback_semantics_unchanged: GC never calls core.mark_review or core.release_launch (verified by a dedicated test with monkeypatched spies) and never mutates the task card; only the process-event log and the two on-disk directories are touched.",
+      "idempotent_and_fail_closed: a directory that is already gone is a successful no-op (not an error); every ambiguity (missing metadata, unparseable JSON, a failed task lookup, an unproven-dead PID, an unsafe path shape) returns a skip with a reason and deletes nothing.",
+      "no_manual_cron: the only entry point is ProcessManager.reconcile(), already driven by task_reconciler.py's existing scan loop; no new script, systemd unit, or cron job was added."
+    ]
+  },
+  "tests": {
+    "new_test_file": "tools/geoai-task-mcp/tests/test_finalized_workspace_gc_b512_v1.py",
+    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_finalized_workspace_gc_b512_v1.py",
+    "result": "26 passed",
+    "cases": [
+      "test_finalized_task_with_dead_process_is_gc_cleaned",
+      "test_archived_task_with_dead_process_is_gc_cleaned",
+      "test_every_retained_terminal_state_is_gc_eligible_once_finished[worker_failed]",
+      "test_every_retained_terminal_state_is_gc_eligible_once_finished[scope_rejected]",
+      "test_every_retained_terminal_state_is_gc_eligible_once_finished[promotion_conflict]",
+      "test_every_retained_terminal_state_is_gc_eligible_once_finished[finalize_failed]",
+      "test_every_retained_terminal_state_is_gc_eligible_once_finished[timed_out]",
+      "test_non_finalized_task_status_preserves_the_workspace[review-review_ready]",
+      "test_non_finalized_task_status_preserves_the_workspace[processing-in_progress]",
+      "test_non_finalized_task_status_preserves_the_workspace[pending-unclaimed]",
+      "test_non_finalized_task_status_preserves_the_workspace[blocked-blocked]",
+      "test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished",
+      "test_finalization_pending_states_are_never_gc_candidates[review_pending]",
+      "test_finalization_pending_states_are_never_gc_candidates[release_pending]",
+      "test_finalization_pending_states_are_never_gc_candidates[reconcile_pending]",
+      "test_request_still_tracked_live_in_memory_is_preserved",
+      "test_live_process_with_matching_start_ticks_is_preserved",
+      "test_live_process_with_unknown_start_ticks_is_not_proven_dead",
+      "test_pid_reused_with_mismatched_start_ticks_is_proven_dead_and_gc_cleaned",
+      "test_workspace_outside_configured_root_is_rejected_and_untouched",
+      "test_assert_gc_safe_workspace_shape_rejects_a_home_worktree_swap",
+      "test_missing_workspace_directories_are_idempotent_gc_success",
+      "test_missing_metadata_file_fails_closed",
+      "test_task_lookup_failure_fails_closed_and_preserves_workspace",
+      "test_gc_never_invokes_review_or_release_callbacks_and_leaves_task_card_untouched",
+      "test_reconcile_wires_gc_into_the_existing_reconciliation_entry_point"
+    ],
+    "regression_check_command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_task_liveness_reconciler.py",
+    "regression_check_result": "21 passed, 2 failed (both pre-existing, unrelated -- see known_environment_gaps)",
+    "note_on_test_environment": "This isolated worktree lacks geoai_task_mcp/project_context.py -- an uncommitted sibling file in the parent repo not declared in this task's read_first/allowed_writes, so worktree seeding never copied it in. process_launcher.py imports it unconditionally at module scope, so test_task_liveness_reconciler.py (pre-existing, unmodified by this task) fails to collect here too. This test file installs a minimal local stub (mirroring the existing deepseek_credentials stub pattern already used by test_task_liveness_reconciler.py and test_process_launcher_security.py) so the GC logic can be exercised end-to-end in this sandbox; the coordinator's real environment has the real module and needs no stub."
+  },
+  "known_environment_gaps": {
+    "description": "Two pre-existing failures observed while regression-checking test_task_liveness_reconciler.py (a file this task did not modify) are environment/sandbox limitations, not caused by this diff:",
+    "items": [
+      {
+        "test": "test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity",
+        "reason": "A worker_supervisor.py subprocess/threading timing test (0.1s heartbeat interval, 6s deadline) that observed zero heartbeats in this sandbox's scheduling; worker_supervisor.py was not touched by this diff.",
+        "reproduces_without_this_diffs_changes": true
+      },
+      {
+        "test": "test_service_can_write_lifecycle_and_see_isolated_worktrees",
+        "reason": "Reads tools/geoai-task-mcp/scripts/geoai-task-reconciler.service, which is missing from this isolated worktree for the same seeding-scope reason as project_context.py (not in read_first/allowed_writes, not yet git-committed).",
+        "reproduces_without_this_diffs_changes": true
+      }
+    ],
+    "additional_sandbox_limitation": "test_worker_workspace.py, test_process_launcher.py, and test_process_launcher_security.py (none in this task's allowed_writes, none edited) fail in this exact sandbox on unrelated OS-level restrictions -- os.fchmod raising PermissionError and `git init` failing to chmod .git/config.lock. Both are pre-existing sandbox restrictions this exact execution environment imposes (confirmed by the _bridge_chmod_sandbox_restriction fixture already present in the newer test files specifically to probe-and-neutralize this); they are unrelated to the two files this task changed and are expected to pass in the coordinator's real validation environment."
+  },
+  "acceptance_status": {
+    "reproduce_lifecycle_gap": "MET -- root_cause above documents the exact code path (cleanup=False, never revisited) and the archived_at classifier gap found alongside it.",
+    "gc_eligibility_rules": "MET -- see fix.process_launcher_py; enforced by GC_CANDIDATE_PROCESS_STATES, GC_ELIGIBLE_CANONICAL_STATUSES, _process_proven_dead, _active_request_ids() check, and assert_gc_safe_workspace_shape, each covered by a dedicated test.",
+    "never_delete_uncertain_or_protected_states": "MET -- pending/processing/review/blocked/review_pending/release_pending/reconcile_pending, missing/ambiguous metadata, a live-looking PID, and an unsafe workspace shape are each covered by a dedicated preservation test.",
+    "reuse_cleanup_workspace_idempotent_auditable": "MET -- GC calls the existing worker_workspace.cleanup_workspace() unchanged, adds no parallel deletion code path, is verified idempotent on both an already-cleaned request and an already-absent directory pair, and appends one auditable event per action with the terminal state preserved.",
+    "integrate_into_existing_reconciler": "MET -- wired into ProcessManager.reconcile(), the exact call task_reconciler.py's daemon/run-once loop already drives on its scan interval; no new daemon/cron/script was added.",
+    "targeted_test_coverage": "MET -- finalized cleanup, review/blocked/active preservation, PID reuse/start ticks, unsafe path rejection, missing-directory idempotence, and unchanged callback/review lifecycle are each covered by a named test in the list above.",
+    "no_real_worktree_touched_no_task_card_rewrite_no_roadmap_edit": "MET -- every test uses tmp_path-scoped repos/process dirs/env-overridden WORKTREE_ROOT_ENV; no roadmap, dashboard, or task-card file was edited."
+  },
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "training_launch": false
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "worker_status_recommendation": "review -- fail-closed GC implemented, wired into the existing reconciler, and covered by 26 new targeted tests; Codex should independently verify no other call site expects a retained workspace to survive past task finalization before promoting."
+}

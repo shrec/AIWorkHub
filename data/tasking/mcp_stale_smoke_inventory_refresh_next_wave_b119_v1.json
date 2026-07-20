@@ -1,0 +1,56 @@
+{
+  "schema_id": "geoai.mcp_stale_smoke_inventory_refresh_next_wave.b119.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1",
+  "runner": "deepseek_task_mcp_stale_smoke_b119",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B119 refreshed test-shell constants only (total_tools_visible 15->20 in b109/b110; mvp_contract_audit equality->subset). No behavior change. The stale FROZEN tuples in smoke-client Python code and the stale audit JSON/rows artifacts remain — these need a coordinated patch by a task with broader allowed_writes.",
+  "next_wave_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_FROZEN_TUPLE_REFRESH_B120_V1",
+      "objective": "Update the frozen READONLY_TOOLS, WRITE_GATED_TOOLS, and FROZEN_SCHEMA_FINGERPRINTS tuples in mcp_stdio_client_smoke.py, mcp_stdio_concurrent_client_smoke.py, and mcp_client_smoke_contract_freeze.py to include the 5 new tools (auto_pickup_dryrun, review_summarize, codex_handoff, codex_handoff_markdown, supervisor_loop_status) with live-derived SHA256 fingerprints. Update readonly_tool_count and write_gated_tool_count assertions in b109/b110 shell scripts to match.",
+      "runner": "claude_task_mcp_frozen_tuple_b120",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
+      "priority": "task_mcp_b120_frozen_tuple_refresh",
+      "read_first": [
+        "tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py",
+        "tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py",
+        "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py"
+      ],
+      "ready": true
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_MVP_AUDIT_ARTIFACT_REFRESH_B121_V1",
+      "objective": "Update mvp_contract_audit_v1.json and mvp_contract_audit_rows_v1.jsonl to cover all 20 live tools. Regenerate tool rows for the 9 new tools (auto_pickup_dryrun, review_summarize, codex_handoff, codex_handoff_markdown, supervisor_loop_status, cli_adapter_plan_readonly, cli_adapter_audit_summary_readonly, cli_adapter_report_readonly). Then revert test_mvp_contract_audit_v1.sh from subset-check back to equality check.",
+      "runner": "claude_task_mcp_mvp_audit_b121",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
+      "priority": "task_mcp_b121_mvp_audit_refresh",
+      "read_first": [
+        "tools/geoai-task-mcp/eval/mvp_contract_audit_v1.json",
+        "tools/geoai-task-mcp/eval/mvp_contract_audit_rows_v1.jsonl",
+        "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh"
+      ],
+      "ready": true
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_README_TOOL_LIST_REFRESH_B122_V1",
+      "objective": "Update README.md 'Exposed Tools' section from 12 listed tools (8 read + 4 write) to the current 20-tool inventory. Listed by B251 reverify as stale (STALE_1_README_EXPOSED_TOOLS).",
+      "runner": "claude_task_mcp_readme_b122",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
+      "priority": "task_mcp_b122_readme_refresh",
+      "read_first": [
+        "tools/geoai-task-mcp/README.md"
+      ],
+      "ready": true
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py review DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1 and finalize (NO_COMMIT from worker; Codex handles staged commit of allowed_writes only).",
+    "Codex to queue B120/B121/B122 as coordinated next-wave for full inventory refresh."
+  ]
+}

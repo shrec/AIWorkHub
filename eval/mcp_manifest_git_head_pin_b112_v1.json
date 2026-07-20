@@ -1,0 +1,49 @@
+{
+  "authority_flags": {
+    "contract_frozen": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "write_gate_enabled": false
+  },
+  "byte_identical": true,
+  "committed_binding_recomputed_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "committed_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "committed_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "committed_source": "git_head",
+  "drift_count": 0,
+  "head_pin_immunity_proven": true,
+  "manifest_fingerprint_matches": true,
+  "mode": "mcp_manifest_head_pin_assertion_readonly",
+  "ok": true,
+  "readonly_tool_count": 11,
+  "regenerated_manifest_fingerprint": "ac7a5baddd5034e48ae30ff0fcd2d6eae7042b6d2efd746170f823714151892d",
+  "regenerated_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+  "selftest_id": "mcp_manifest_git_head_pin_b112_v1",
+  "source_provenance": {
+    "committed_manifest_rel": "eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
+    "committed_source": "git_head",
+    "committed_source_note": "tools/geoai-task-mcp is now a committed nested git repo; the B110 manifest is pinned to that repo's HEAD blob (immune to a concurrently-dirty working tree), upgraded from the B111 working_tree_snapshot fallback.",
+    "head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
+    "pin_repo": "tools/geoai-task-mcp",
+    "pin_ref": "HEAD",
+    "resolution_order": [
+      "nested_repo_head",
+      "parent_repo_head",
+      "working_tree_snapshot_fallback"
+    ],
+    "subsystem_committed": true
+  },
+  "regression_asserts": {
+    "b111_selftest_asserts_git_head_when_committed": true,
+    "committed_source_equals_git_head": true,
+    "head_pin_immune_to_dirty_working_tree": true,
+    "working_tree_snapshot_downgrade_rejected": true
+  },
+  "task_id": "CLAUDE_TASK_MCP_MANIFEST_GIT_HEAD_PIN_B112_V1",
+  "teeth": {
+    "immunity": "In a private mktemp git repo, dirtying the manifest working copy leaves `git show HEAD:<rel>` byte-clean == committed while the on-disk copy is tampered, proving the pin measures HEAD not the working tree.",
+    "regression": "The git_head assertion rejects (non-zero) a simulated resolver that returns working_tree_snapshot while the manifest is committed in HEAD."
+  },
+  "write_gated_tool_count": 4
+}

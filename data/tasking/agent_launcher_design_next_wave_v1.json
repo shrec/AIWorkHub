@@ -1,0 +1,85 @@
+{
+ "date": "2026-07-04",
+ "follow_up_tasks": [
+  {
+   "acceptance": [
+    "adapters.py exposes no subprocess/os.exec* for agent processes",
+    "detect() is read-only shutil.which probe",
+    "test asserts no launch/spawn tool registered"
+   ],
+   "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/adapters.py",
+    "tools/geoai-task-mcp/tests/test_adapter_abstraction_v1.sh",
+    "tools/geoai-task-mcp/eval/adapter_abstraction_v1.json"
+   ],
+   "goal": "Implement the adapter interface (LocalCliAdapter, ManualExternalAdapter) with read-only detect() only; no spawn, launch still disabled.",
+   "mode": "NO_COMMIT",
+   "task_id": "CLAUDE_TASK_MCP_ADAPTER_ABSTRACTION_SPEC_V1"
+  },
+  {
+   "acceptance": [
+    "plan tool spawns no process with ALLOW_LAUNCH unset",
+    "audit entry action=launch_planned appended",
+    "no real launch enabled"
+   ],
+   "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/tests/test_launch_plan_v1.sh",
+    "tools/geoai-task-mcp/eval/launch_plan_v1.json"
+   ],
+   "goal": "Add read-only geoai_agent_launch_plan tool returning the argv it WOULD run + collision preflight; executes nothing.",
+   "mode": "NO_COMMIT",
+   "task_id": "CLAUDE_TASK_MCP_DRYRUN_PLAN_TOOL_V1"
+  },
+  {
+   "acceptance": [
+    "state model round-trips",
+    "no os.fork/subprocess for agent proc",
+    "blocked transitions audited"
+   ],
+   "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_state.py",
+    "tools/geoai-task-mcp/tests/test_launch_state_v1.sh",
+    "tools/geoai-task-mcp/eval/launch_state_v1.json"
+   ],
+   "goal": "Add launch-queue + process-state data model and per-action audit; every request terminates blocked_launch_disabled while gate off.",
+   "mode": "NO_COMMIT",
+   "task_id": "CLAUDE_TASK_MCP_LAUNCH_AUDIT_STATE_V1"
+  },
+  {
+   "acceptance": [
+    "curriculum rows define task->adapter/runner/topic routing + abstain labels",
+    "no regex/keyword cue router introduced",
+    "learned-selection migration path documented"
+   ],
+   "allowed_writes": [
+    "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+   ],
+   "goal": "Produce trainable targets (curriculum rows) for a LEARNED adapter/runner/topic launch-routing + abstain policy; replaces any static allowlist with a neural router. No cue/regex router.",
+   "mode": "NO_COMMIT",
+   "task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1"
+  },
+  {
+   "acceptance": [
+    "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all gates pass",
+    "default stays disabled; rollback = unset flag",
+    "blocked attempts audited"
+   ],
+   "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/tests/test_launch_gated_enablement_v1.sh",
+    "tools/geoai-task-mcp/eval/launch_gated_enablement_v1.json"
+   ],
+   "goal": "FINAL: wire GEOAI_TASK_MCP_ALLOW_LAUNCH gate; permit a real launch only when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all safety gates pass. Default disabled.",
+   "mode": "NO_COMMIT",
+   "task_id": "CLAUDE_TASK_MCP_LAUNCH_GATED_ENABLEMENT_V1"
+  }
+ ],
+ "next_wave_id": "agent_launcher_design_next_wave_v1",
+ "notes": "PROPOSAL only, not enqueued. Every follow-up keeps launch disabled by default; only the final gated task can wire ALLOW_LAUNCH, and only behind all safety gates.",
+ "parent_task": "CLAUDE_TASK_MCP_AGENT_LAUNCHER_DESIGN_V1",
+ "status": "proposal"
+}

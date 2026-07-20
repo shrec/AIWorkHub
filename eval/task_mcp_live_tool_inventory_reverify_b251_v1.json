@@ -1,0 +1,123 @@
+{
+  "schema_id": "geoai.task_mcp_live_tool_inventory_reverify_eval.b251.v1",
+  "task_id": "CLAUDE_TASK_MCP_LIVE_TOOL_INVENTORY_REVERIFY_B251_V1",
+  "timestamp": "2026-07-07T21:00:00+00:00",
+  "verdict": "PASS",
+  "runner": "claude_task_mcp_live_tool_inventory_b251",
+  "topic": "task_mcp",
+  "mode": "mcp_inventory_reverify_no_source_patch",
+  "objective": "After B11 added geoai_supervisor_loop_status, reverify live MCP tool inventory and identify stale tool-count assertions/docs that need a later coordinated patch. Static inventory only; no daemon/MCP client launch; no source patch.",
+  "method": "static_read_of_committed_and_dirty_working_tree",
+  "read_evidence": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (full read, 258 lines, working tree)",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py (full read, register(mcp) + READONLY_TOOL_NAMES)",
+    "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_b11_v1.json",
+    "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
+    "tools/geoai-task-mcp/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh",
+    "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
+    "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+    "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+    "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+    "tools/geoai-task-mcp/eval/mcp_review_summarizer_startup_smoke_b114_v1.json",
+    "tools/geoai-task-mcp/README.md"
+  ],
+  "live_tool_inventory": {
+    "total_live_tools": 20,
+    "direct_mcp_tool_decorators_in_server_py": 17,
+    "registered_via_cli_adapter_readonly_tool_register": 3,
+    "note": "B11 (task_mcp_supervisor_loop_status_wiring_b11_v1, verdict PASS, commit_made=false, NO_COMMIT) landed geoai_supervisor_loop_status on top of the already-dirty working tree. This reverify's own direct read of server.py confirms 17 @mcp.tool() decorators (matches B11's own '17 @mcp.tool() decorators total after this addition' claim), plus the 3 tools bound by cli_adapter_readonly_tool.register(mcp) (B107) = 20 total live tools. Tree is still uncommitted (git status: server.py/core.py modified, not staged) at reverify time.",
+    "tool_names": [
+      "geoai_task_health", "geoai_task_review_queue", "geoai_task_list", "geoai_task_show",
+      "geoai_task_pending_for_runner", "geoai_task_auto_pickup", "geoai_task_auto_pickup_dryrun",
+      "geoai_task_mark_review", "geoai_task_mark_done", "geoai_task_collision_guard",
+      "geoai_task_usage_report", "geoai_task_export_jsonl", "geoai_task_audit_log_read",
+      "geoai_task_review_summarize", "geoai_task_codex_handoff", "geoai_task_codex_handoff_markdown",
+      "geoai_supervisor_loop_status",
+      "geoai_cli_adapter_plan_readonly", "geoai_cli_adapter_audit_summary_readonly", "geoai_cli_adapter_report_readonly"
+    ]
+  },
+  "stale_assertions_found": [
+    {
+      "id": "STALE_1_README_EXPOSED_TOOLS",
+      "file": "tools/geoai-task-mcp/README.md",
+      "lines": "53-71",
+      "claim": "'Exposed Tools' section lists 8 read-only + 4 write-gated = 12 total.",
+      "actual": "20 total live tools (17 direct + 3 registered).",
+      "missing_from_doc": [
+        "geoai_task_auto_pickup_dryrun", "geoai_task_review_summarize", "geoai_task_codex_handoff",
+        "geoai_task_codex_handoff_markdown", "geoai_supervisor_loop_status",
+        "geoai_cli_adapter_plan_readonly", "geoai_cli_adapter_audit_summary_readonly", "geoai_cli_adapter_report_readonly"
+      ],
+      "already_flagged_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[0] (said 12 stale as of 16->17 move; this reverify confirms still stale at 20 and re-derives the exact 8 missing names above)",
+      "severity": "docs_only_high_visibility"
+    },
+    {
+      "id": "STALE_2_FROZEN_B108_TOOL_LISTS",
+      "file": "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
+      "lines": "65-84",
+      "claim": "READONLY_TOOLS tuple (11 entries, lines 65-77) + WRITE_GATED_TOOLS tuple (4 entries, lines 79-84) = 15 tools, deliberately frozen at the B108 schema-fingerprint baseline.",
+      "actual": "20 total live tools; 5 tools added since B108 are absent from these tuples.",
+      "missing_from_tuples": [
+        "geoai_task_auto_pickup_dryrun", "geoai_task_review_summarize", "geoai_task_codex_handoff",
+        "geoai_task_codex_handoff_markdown", "geoai_supervisor_loop_status"
+      ],
+      "note": "This freeze is BY DESIGN scoped to the B108 fingerprint contract (FROZEN_SCHEMA_FINGERPRINTS, lines 88-104) and is not itself wrong as a historical fixture. It becomes stale-as-fact only where OTHER tests import these tuples and assert them as the CURRENT full inventory (see STALE_3/STALE_4).",
+      "severity": "design_intentional_freeze_but_downstream_misuse"
+    },
+    {
+      "id": "STALE_3_STDIO_SUBPROCESS_SMOKE_COUNT",
+      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "lines": "88-89",
+      "claim": "assert d[\"readonly_tool_count\"] == 11, ...; assert d[\"write_gated_tool_count\"] == 4, ...",
+      "actual": "Values derive from the STALE_2 frozen tuples; live counts are readonly=14 (11 frozen + geoai_task_auto_pickup_dryrun + geoai_task_review_summarize + geoai_task_codex_handoff + geoai_task_codex_handoff_markdown + geoai_supervisor_loop_status, all read-only-flagged tools) and write_gated=4 (unchanged) if re-derived from server.py live decorators.",
+      "already_flagged_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2] as a known pre-existing failure not caused by any single later task",
+      "severity": "pre_existing_known_test_failure"
+    },
+    {
+      "id": "STALE_4_STDIO_CONCURRENT_SMOKE_COUNT",
+      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "lines": "108-109",
+      "claim": "Same assert d[\"readonly_tool_count\"] == 11 / d[\"write_gated_tool_count\"] == 4 pattern per concurrent-client tag.",
+      "actual": "Same STALE_3 drift.",
+      "already_flagged_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2]",
+      "severity": "pre_existing_known_test_failure"
+    },
+    {
+      "id": "STALE_5_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_COUNT",
+      "file": "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+      "lines": "192",
+      "claim": "assert len(collision_rows) == 3, f'expected 3 collision rows, got {len(collision_rows)}'",
+      "actual": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl (the curriculum this test reads) shows modified in git status at reverify time; row count has drifted from the frozen 3 (already flagged by B250 as a 3-vs-6 drift).",
+      "already_flagged_by": "eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json stale_facts_flagged_not_trusted[2] ('collision-guard row-count drift 3 vs 6')",
+      "severity": "pre_existing_known_test_failure_not_tool_count_but_same_cluster"
+    },
+    {
+      "id": "STALE_6_B250_TIER_TAXONOMY_MISSING_TOOL",
+      "file": "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
+      "lines": "39-55 (tool_authority_tiers.tiers[0].member_tools, TIER_1_READ_ONLY_NAVIGATION)",
+      "claim": "TIER_1 lists 15 member_tools; total_tools assertion (test file line 115, live-corrected to 24 during this same working session) = 24 across all 4 tiers.",
+      "actual": "geoai_task_codex_handoff_markdown (live in server.py since before B11, confirmed present at line 186-209) does not appear anywhere in tool_authority_tiers -- 0 matches for the string in either the eval JSON or its test script. It is the 21st tier-taxonomy slot missing; live total is 20 implemented (TIER_1 15 + geoai_task_codex_handoff_markdown + TIER_2 4) vs the 19 implemented the taxonomy currently accounts for (TIER_1 15, all now implemented since B11 landed geoai_supervisor_loop_status, + TIER_2 4).",
+      "additional_gap": "TIER_1 member geoai_supervisor_loop_status is still recorded as implemented:'schema_only_pending_wiring' (line 54) even though B11 (same day, eval/task_mcp_supervisor_loop_status_wiring_b11_v1.json, verdict PASS) already wired core.supervisor_loop_status + the @mcp.tool() registration in the working tree this reverify read directly.",
+      "note": "B250's own artifact explicitly says 'do not assume this landed, re-check live tool listing' -- this reverify is exactly that re-check, performed same-day.",
+      "severity": "same_day_freshest_artifact_already_behind_live_tree_no_fault_of_b250_worker"
+    }
+  ],
+  "not_stale_confirmed": [
+    {
+      "artifact": "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json / tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh total_tools==24 assertion",
+      "note": "A grep snapshot taken earlier in this same reverify session showed the test asserting ==23 (mismatched with the eval JSON's own '24 tools total' prose); a later direct Read of the same file (mtime 2026-07-07T20:27:10Z, after the grep) showed ==24, consistent with the eval JSON. This was a concurrent-worker in-flight edit (both files are untracked/uncommitted, owned by the still-active B250 task), not a genuine stale-assertion finding -- recorded here so a later worker does not re-flag a transient snapshot."
+    }
+  ],
+  "acceptance_results": {
+    "reports_current_tool_count_and_expected_names": "PASS - live_tool_inventory.total_live_tools=20, tool_names lists all 20",
+    "finds_stale_assertions_with_exact_files_lines": "PASS - 6 findings above, each with file + line range, no source_patch performed",
+    "no_daemon_or_mcp_client_launch_required": "PASS - static file reads only; no subprocess/exec/daemon/network call made by this task",
+    "test_script_validates_inventory_consistency": "PASS - see tests/test_task_mcp_live_tool_inventory_reverify_b251_v1.sh"
+  },
+  "forbidden_operations_verified_not_taken": [
+    "daemon_start", "source_patch", "credential_access", "task_status_mutation", "git_add_A", "mixed_task_commit"
+  ],
+  "commit_contract": "NO_COMMIT per task contract; artifacts left uncommitted for Codex to stage/finalize.",
+  "rows_ref": "tools/geoai-task-mcp/eval/task_mcp_live_tool_inventory_reverify_rows_b251_v1.jsonl",
+  "next_wave_ref": "tools/geoai-task-mcp/data/tasking/task_mcp_live_tool_inventory_reverify_next_wave_b251_v1.json"
+}

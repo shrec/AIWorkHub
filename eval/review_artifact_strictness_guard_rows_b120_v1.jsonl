@@ -1,0 +1,3 @@
+{"schema_id": "geoai.review_artifact_strictness_guard_row.v1", "wave": "mcp_full_wave_dryrun_harness_b119_v1", "invalid": false, "invalid_reasons": [], "reviewer_action": "accept_for_codex_review"}
+{"schema_id": "geoai.review_artifact_strictness_guard_row.v1", "wave": "mcp_codex_handoff_markdown_render_b119_v1", "invalid": false, "invalid_reasons": [], "reviewer_action": "accept_for_codex_review"}
+{"schema_id": "geoai.review_artifact_strictness_guard_row.v1", "wave": "launch_queue_persist_audit_b119_v1", "invalid": false, "invalid_reasons": [], "reviewer_action": "accept_for_codex_review"}

@@ -1,0 +1,18 @@
+{"case": "validate_claude", "argv": ["claude", "-p", "do task"], "expected_ok": true, "decision": "allow_dryrun", "note": "launchable binary on allowlist"}
+{"case": "validate_codex", "argv": ["codex", "exec", "review"], "expected_ok": true, "decision": "allow_dryrun", "note": "launchable binary on allowlist"}
+{"case": "validate_taskctl_worker_cmd", "argv": ["python3", "AITools/taskctl.py", "auto-pickup", "--runner", "r"], "expected_ok": true, "decision": "allow_dryrun", "note": "allowlisted worker subcommand"}
+{"case": "block_arbitrary_binary", "argv": ["rm", "-rf", "/"], "expected_ok": false, "decision": "blocked", "note": "not on allowlist; audited"}
+{"case": "block_empty_argv", "argv": [], "expected_ok": false, "decision": "blocked", "note": "empty argv"}
+{"case": "block_taskctl_done", "argv": ["python3", "AITools/taskctl.py", "done", "X"], "expected_ok": false, "decision": "blocked", "note": "done not on worker allowlist"}
+{"case": "block_manual_only_deepseek", "argv": ["deepseek_manual"], "expected_ok": false, "decision": "blocked", "is_manual_only": true, "note": "manual external adapter never a local command"}
+{"case": "redact_secret_api_key", "env_name": "OPENAI_API_KEY", "input_value": "sk-SECRET-VALUE-123", "output": "<redacted-secret>", "note": "value never emitted"}
+{"case": "redact_secret_token", "env_name": "GEOAI_TASK_MCP_TOKEN", "input_value": "tok-DEADBEEF", "output": "<redacted-secret>", "note": "value never emitted"}
+{"case": "redact_nonsecret_set", "env_name": "PYTHONPATH", "input_value": "/opt/x", "output": "<set>", "note": "non-secret reports set/unset only, never value"}
+{"case": "redact_nonsecret_unset", "env_name": "EMPTYVAR", "input_value": "", "output": "<unset>", "note": "empty -> unset"}
+{"case": "plan_dryrun_valid", "argv": ["claude", "-p", "hi"], "would_run_argv": ["claude", "-p", "hi"], "decision": "launch_planned", "launch_enabled": false, "launch_implemented": false, "note": "plan only; executes nothing; audit appended"}
+{"case": "plan_dryrun_invalid", "argv": ["curl", "http://x"], "would_run_argv": [], "decision": "launch_blocked_invalid_command", "note": "no argv would run; audited"}
+{"case": "launch_impossible_with_flag", "env": {"GEOAI_TASK_MCP_ALLOW_LAUNCH": "1", "GEOAI_TASK_MCP_ALLOW_WRITES": "1"}, "launch_enabled": false, "launch_implemented": false, "note": "no launcher exists; flags cannot enable launch"}
+{"case": "no_launch_code_source_scan", "forbidden_patterns_absent": ["import subprocess", "subprocess.run", "subprocess.Popen", "os.system", "os.exec", "os.fork", "shell=True", "Popen("], "note": "adapter source contains none"}
+{"case": "write_gate_off_default", "GEOAI_TASK_MCP_ALLOW_WRITES": "0", "writes_allowed": false, "note": "write gate off unless explicitly enabled"}
+{"case": "audit_no_secret_leak", "audit_env_status_tokens": ["<set>", "<unset>", "<redacted-secret>"], "note": "audit records env NAMES/status only, never values"}
+{"case": "parent_queue_unmutated", "cmd": "taskctl verify", "returncode": 0, "note": "no task-queue mutation"}

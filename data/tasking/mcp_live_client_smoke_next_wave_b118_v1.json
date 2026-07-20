@@ -1,0 +1,30 @@
+{
+  "schema_id": "geoai.task_mcp_live_client_smoke_next_wave.b118.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_LIVE_CLIENT_SMOKE_B118_V1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_LIVE_CLIENT_SMOKE_B118_V1",
+  "status": "completed_smoke",
+  "runner": "deepseek_task_mcp_live_client_smoke_b118",
+  "topic": "task_mcp",
+  "priority": "task_mcp_b118_live_client_smoke",
+  "phase": "phase_0_wrapper_mvp",
+  "next_wave_items": [
+    {
+      "item": "mcp_client_smoke_complete",
+      "status": "done",
+      "note": "Live MCP client smoke over stdio passed; server is usable from local dev environment."
+    },
+    {
+      "item": "phase_1_safe_local_automation",
+      "status": "pending",
+      "note": "Next phase: tool-level audit log, dry-run auto_pickup, batch status snapshot."
+    }
+  ],
+  "mvp_roadmap_check": {
+    "phase_0_mcp_client_smoke": "done",
+    "phase_1_safe_local_automation": "pending",
+    "phase_2_agent_launcher_mvp": "pending",
+    "phase_3_project_switch_readiness": "pending"
+  },
+  "live_client_smoke_verdict": "LIVE_CLIENT_USABLE",
+  "timestamp_utc": "2026-07-05T12:47:30Z"
+}

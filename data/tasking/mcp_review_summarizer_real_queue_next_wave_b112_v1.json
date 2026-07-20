@@ -1,0 +1,35 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_real_queue_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1",
+  "runner": "deepseek_task_mcp_review_summarizer_b112",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B112 integration test against real taskctl review queue passed. Summarizer works correctly with real taskctl.py (no stubs), queue unchanged before/after, empty and non-empty fixture cases both pass, all authority flags confirmed read-only. Ready for B113 MCP startup smoke test and B114 neural bridge distillation.",
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1",
+      "objective": "Smoke test that the MCP server starts with the new tool registered and list-tools includes geoai_task_review_summarize",
+      "runner": "deepseek_task_mcp_review_summarizer_b113",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1"],
+      "priority": "task_mcp_b113_startup_smoke",
+      "ready": true
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+      "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization",
+      "runner": "deepseek_task_mcp_review_summarizer_b114",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1"],
+      "priority": "task_mcp_b114_neural_bridge",
+      "ready": true,
+      "notes": "Neural-control-first: summarizer is a deterministic executor after learned dispatch. This task builds the curriculum to teach the neural controller how to prioritize, group, and route review tasks."
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py done DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1 after review",
+    "Codex to create B113 and B114 task cards"
+  ]
+}

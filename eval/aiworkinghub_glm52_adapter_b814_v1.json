@@ -1,0 +1,63 @@
+{
+  "schema_id": "geoai.task_mcp.eval.aiworkinghub_glm52_adapter_b814_v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_GLM52_ADAPTER_B814_V1",
+  "adapter_id": "glm_copilot_cli",
+  "runner_identity": "glm_*",
+  "model": {
+    "default": "glm-5.2",
+    "supported": [
+      "glm-5.2"
+    ]
+  },
+  "provider": {
+    "kind": "copilot_byok_openai_compatible",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "allowed_hosts": [
+      "open.bigmodel.cn"
+    ],
+    "provider_type": "openai",
+    "secret_env_var": "COPILOT_PROVIDER_API_KEY",
+    "non_secret_env_vars": [
+      "COPILOT_PROVIDER_TYPE",
+      "COPILOT_PROVIDER_BASE_URL",
+      "COPILOT_MODEL"
+    ]
+  },
+  "credential_contract": {
+    "default_path": "~/.config/aiworkinghub/glm_copilot_credential.json",
+    "path_env_override": "GEOAI_TASK_MCP_GLM_CREDENTIAL",
+    "repo_storage_allowed": false,
+    "required_file_mode": "0600",
+    "required_parent_mode": "0700",
+    "owner_only": true,
+    "symlink_allowed": false,
+    "max_bytes": 65536,
+    "allowed_fields": [
+      "provider",
+      "provider_type",
+      "base_url",
+      "api_key"
+    ],
+    "setup_command": "python3 -m geoai_task_mcp.glm_credentials setup",
+    "status_command": "python3 -m geoai_task_mcp.glm_credentials status"
+  },
+  "security_evidence": {
+    "argv_lists_only": true,
+    "shell": false,
+    "secret_in_argv": false,
+    "secret_in_metadata": false,
+    "secret_in_logs": false,
+    "secret_in_status": false,
+    "credential_loaded_before_claim_start": true,
+    "readiness_report_secret_free": true,
+    "live_paid_call_performed": false
+  },
+  "tests": [
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_glm52_adapter_b814_v1.py",
+    "tools/geoai-task-mcp/tests/test_runtime_adapters.py",
+    "tools/geoai-task-mcp/tests/test_process_launcher_security.py"
+  ],
+  "source": {
+    "official_glm_docs": "https://docs.bigmodel.cn/cn/guide/start/quick-start"
+  }
+}

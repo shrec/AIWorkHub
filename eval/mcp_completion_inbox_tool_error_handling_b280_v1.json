@@ -1,0 +1,110 @@
+{
+  "eval_id": "mcp_completion_inbox_tool_error_handling_b280_v1",
+  "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_TOOL_ERROR_HANDLING_B280_V1",
+  "runner": "claude_task_mcp_tool_error_b280",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "completion_inbox_tool_error_handling_implementation",
+  "verdict": "PASS",
+  "builds_on": [
+    "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_PYTEST_B279_V1 (tests/test_completion_inbox_smoke_fixtures_b279_v1.py -- documented finding_1_subprocess_raises_uncaught, finding_2_list_failure_silently_swallowed, finding_3_show_failure_is_recorded)",
+    "data/tasking/task_mcp_owner_notification_smoke_pytest_next_wave_b279_v1.json blocker id=list_call_failure_silently_swallowed (severity high) and id=no_tool_error_event_kind_exists (severity high)"
+  ],
+  "summary": "Implements bounded read-error reporting inside completion_inbox.py (no core.py/server.py change): every taskctl `list`/`show` call in _fetch_full_cards is now try/except-guarded so a raised exception degrades to a recorded error instead of crossing build_completion_inbox() uncaught, and the LIST call's returncode is now checked (previously only the SHOW call's returncode was checked) so a nonzero-returncode LIST failure with empty stdout is no longer indistinguishable from a genuinely empty queue. Both failure modes are surfaced via a new additive `read_errors` facet (scope: list|show, error_kind: nonzero_returncode|exception, bounded/truncated error_message) plus a `counts.read_errors` integer. The pre-existing `fetch_errors` facet (task_id + error, SHOW-scoped) keeps its exact original shape/contents for backward compatibility -- this closes blocker list_call_failure_silently_swallowed and blocker no_tool_error_event_kind_exists from the B279 next-wave file, scoped to the completion_inbox read layer only (no new geoai_completion_inbox_delta tool, no server.py change -- out of this task's allowed_writes).",
+  "context7_usage": {
+    "context7_used": false,
+    "context7_unavailable": false,
+    "reason": "Pure repo-local implementation task inside an already-read local module (completion_inbox.py); no new external library/framework/API/CLI/service surface was touched. Python's builtin try/except and existing core.list_tasks/core.show_task dict contract (already documented in-repo, verified by direct Read of core.py:261-366) fully define the change."
+  },
+  "known_indexer_gap_used": {
+    "gap": "bug.tools_geoai_task_mcp_not_indexed (AI Memory KB, ACTIVE since 2026-07-05)",
+    "workaround": "cgraph.py find / source_graph.py find both returned zero hits for 'def list_tasks' (re-verified this task), confirming the gap is still open; direct Read used on completion_inbox.py (read_first) and core.py:255-380 (needed to confirm list_tasks/show_task both return run_taskctl(...).as_dict() and that subprocess.run has no surrounding try/except -- the exact mechanism finding_1 in B279 documented) -- same documented workaround as prior task_mcp workers."
+  },
+  "implementation": {
+    "file": "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+    "changes": [
+      "New helper _result_fields(result) -- extracts (returncode, stdout, stderr) from a dict or attribute-bearing object without raising; used for both LIST and SHOW results (previously only SHOW had this dict-or-object handling inline).",
+      "_fetch_full_cards: LIST call now wrapped in try/except Exception -> read_errors entry {scope:list, status, topic, error_kind:exception, error_message} instead of propagating.",
+      "_fetch_full_cards: LIST result's returncode is now checked via _result_fields; nonzero -> read_errors entry {scope:list, status, topic, error_kind:nonzero_returncode, error_message} and rows=[] (bounded degrade, not a raw empty-queue read).",
+      "_fetch_full_cards: SHOW call now wrapped in try/except Exception -> fetch_errors entry (backward-compatible shape) AND read_errors entry {scope:show, task_id, error_kind:exception, error_message}.",
+      "_fetch_full_cards: SHOW nonzero returncode path (pre-existing) now ALSO appends a read_errors entry {scope:show, task_id, error_kind:nonzero_returncode, error_message} in addition to the unchanged fetch_errors entry.",
+      "_fetch_full_cards return signature widened from (cards, fetch_errors) to (cards, fetch_errors, read_errors) -- internal helper, single caller (build_completion_inbox) updated in the same file.",
+      "build_completion_inbox: collects read_errors across all three canonical statuses (pending/processing/review) and adds it as a new top-level additive facet plus counts.read_errors; every pre-existing top-level key (review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, fetch_errors, counts.*, authority_flags, mutation) is unchanged in shape and content on the clean path.",
+      "Module + function docstrings updated to document the B280 bounded read-error contract; no change to READONLY/LAUNCH_IMPLEMENTED/SUBPROCESS_LAUNCH_TRIPWIRE module constants or _authority_flags()."
+    ],
+    "read_only_preserved": true,
+    "no_write_tool_introduced": true,
+    "no_model_cli_launch_introduced": true,
+    "facet_shape_compatibility": "additive-only: existing fetch_errors/review_queue/stale_processing/runner_mismatch_warnings/latest_validation_facts/counts keys and value shapes are byte-identical to pre-B280 behavior on the clean (no read-tool-failure) path; read_errors and counts.read_errors are the only new keys."
+  },
+  "tests_run": [
+    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh -> 29/29 checks PASS, exit 0",
+    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh -> 21/21 checks PASS, exit 0 (regression: no facet-shape/behavior break)",
+    "python3 -m pytest tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py -> 11 passed, 1 xfailed, exit 0 (regression, incl. the pre-existing tool_error documentation tests)",
+    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> ALL CHECKS PASSED (regression: live MCP tool call + server.py wiring + queue DB byte-identical before/after)",
+    "python3 AITools/taskctl.py verify -> VERIFY: PASS"
+  ],
+  "new_test_coverage": {
+    "file": "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh",
+    "checks": 29,
+    "sections": [
+      "s1: nonzero LIST-call returncode (empty stdout) -> read_errors scope=list, error_kind=nonzero_returncode -- tested separately from SHOW failure",
+      "s2: LIST call raises an exception -> caught, read_errors scope=list, error_kind=exception, no exception escapes build_completion_inbox",
+      "s3: nonzero SHOW-call returncode for one task -> read_errors scope=show, error_kind=nonzero_returncode, AND fetch_errors keeps its original shape",
+      "s4: SHOW call raises an exception -> caught, read_errors scope=show, error_kind=exception, no exception escapes",
+      "s5: authority_flags/mutation all-False across every failure scenario (s1-s4)",
+      "s6: clean-path regression -- read_errors==[] and all pre-existing facet keys/shapes unaffected when no read-tool failure occurs"
+    ],
+    "nonzero_list_failure_and_show_task_failure_tested_separately": true
+  },
+  "gates": {
+    "read_only_behavior_no_write_tool_no_model_cli_launch": true,
+    "existing_facet_shapes_preserved_read_errors_additive_only": true,
+    "nonzero_list_failure_and_show_failure_tested_separately": true,
+    "authority_flags_all_model_runtime_support_apply_training_false": true,
+    "artifact_under_25mb": true,
+    "no_overclaim_next_wave_blockers_explicit": true,
+    "bash_test_passes": true,
+    "taskctl_verify_passes": true,
+    "regression_suite_passes": true
+  },
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "queue_write_apply": false,
+    "audit_write_apply": false,
+    "agent_or_process_launch_apply": false,
+    "notification_push_authority": false,
+    "cursor_persistence_write_apply": false,
+    "owner_delivery_channel_apply": false,
+    "training_launch": false
+  },
+  "neural_bridge_note": "No learned decision authority and no regex/keyword cue router introduced. The changed code (_fetch_full_cards try/except + returncode checks) is pure deterministic error-boundary/evidence-bounding logic on an existing read-only tool-shelling layer -- it decides nothing about task content, routing, or intelligence; it only prevents an already-existing read-source failure mode from silently mispresenting as an empty result or crashing the calling process. Not applicable to neural_bridge_priority's applies_to list (translation/routing/toolisa/coding/stem/context_graph/shared_axis/open_generation) -- this is task_mcp infrastructure reliability, not a learnable capability.",
+  "next_wave_blockers": [
+    {
+      "id": "no_tool_error_event_kind_in_mcp_tool_schema",
+      "severity": "medium",
+      "description": "read_errors is now populated inside build_completion_inbox()'s Python return value, but the geoai_completion_inbox MCP tool's advertised input/output JSON schema (server.py, out of this task's allowed_writes) has not been updated to document the new read_errors field for MCP clients that validate against a strict schema.",
+      "proposed_fix": "A follow-up task with server.py in allowed_writes should add read_errors to geoai_completion_inbox's documented output schema (additive property, non-breaking)."
+    },
+    {
+      "id": "geoai_completion_inbox_delta_still_not_implemented",
+      "severity": "low",
+      "description": "This task deliberately stayed inside the existing geoai_completion_inbox facet set (completion_inbox.py only, per allowed_writes) and did not build the separate geoai_completion_inbox_delta tool discussed in B277/B278/B279 (structured usage facet, owner-notification envelope field renames). Those B279 next-wave blockers (usage_report_not_structured, duplicate_runner_envelope_shape_mismatch, envelope_field_name_drift) remain open and unrelated to this task's scope.",
+      "proposed_fix": "Unchanged from B279 next-wave file -- separate task cards, not addressed here."
+    }
+  ],
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "do_not_mark_done": true,
+  "files_changed": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+    "tools/geoai-task-mcp/eval/mcp_completion_inbox_tool_error_handling_b280_v1.json",
+    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh"
+  ]
+}

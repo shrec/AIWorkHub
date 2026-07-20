@@ -1,0 +1,60 @@
+{
+  "next_wave_id": "mcp_runner_topic_allowlist_design_next_wave_b118_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_DESIGN_B118_V1",
+  "date": "2026-07-05",
+  "status": "proposal",
+  "notes": "PROPOSAL only, not enqueued. The runner/topic allowlist design is complete. The next step is an IMPLEMENTATION patch that adds the allowlist enforcement to core.py:run_taskctl() without changing any other behavior. After enforcement is implemented, a follow-up neural dryrun (B120) measures whether the model can learn to route within allowed boundaries.",
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
+      "goal": "Implement runner/topic allowlist enforcement in core.py write path: add ALLOWED_RUNNER_TOPIC_ACTIONS constant, add _validate_runner_topic() function, wire it into run_taskctl() before allow_write check, add malformed-input rejection (empty, null byte, path traversal, shell meta, case mismatch), and add audit log entries for every denial. Do NOT change server.py, launch_queue_contract.py, or any other file.",
+      "mode": "implementation_gated_core_patch",
+      "runner": "claude_coding",
+      "topic": "coding",
+      "acceptance": [
+        "ALLOWED_RUNNER_TOPIC_ACTIONS constant matches B118 design matrix exactly",
+        "_validate_runner_topic() rejects all 8 malformed fixture cases",
+        "unknown runner/topic pairs are rejected with audit log entry",
+        "Codex 'done' action allowed for codex runner only",
+        "read-only tools are unaffected (no runner/topic check on non-write commands)",
+        "bash tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes",
+        "existing smoke tests still pass (no regression)",
+        "python3 AITools/taskctl.py verify passes"
+      ],
+      "allowed_writes": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
+        "tools/geoai-task-mcp/tests/runner_topic_allowlist_enforcement_smoke.py"
+      ],
+      "forbidden": [
+        "server_py_mutation",
+        "launch_queue_contract_mutation",
+        "write_gate_disable",
+        "git_add_A",
+        "mixed_task_commit"
+      ],
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "DEEPSEEK_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_DESIGN_B118_V1"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_NEURAL_DRYRUN_B120_V1",
+      "goal": "Run isolated neural dryrun: measure whether the model can learn to select allowed runner/topic pairs from task context and abstain when evidence is insufficient. The allowlist is a deterministic safety boundary; the neural controller learns to route within it.",
+      "mode": "isolated_neural_dryrun_no_runtime",
+      "runner": "claude_capability_eval",
+      "topic": "capability_eval",
+      "acceptance": [
+        "per-class routing accuracy above baseline on 12 allowed pairs",
+        "abstain when task context is ambiguous (no forced guess)",
+        "model never selects denied action for a runner (e.g., never emits 'done' for non-codex)",
+        "no regex/keyword authority introduced",
+        "dryrun uses read-only tools as evidence extractors only"
+      ],
+      "estimated_effort": "1 session",
+      "depends_on": [
+        "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1"
+      ]
+    }
+  ]
+}

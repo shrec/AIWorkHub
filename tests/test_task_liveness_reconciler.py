@@ -1,0 +1,792 @@
+"""B412: token-free supervisor heartbeat, honest liveness derivation, and the
+durable reconciler that finalizes an isolated worker even after the
+launching MCP/VS Code/launcher process has disappeared.
+
+Regression anchor: request ``d6b6e8ee4080420fb555692e741452bf`` exited
+successfully at 2026-07-15T14:21:41Z but stayed ``processing`` until a
+coordinator manually invoked reconciliation an hour later (15:21Z). The
+structural gap: ``ProcessManager`` only re-scans persisted requests when a
+NEW instance happens to be constructed -- nothing re-scans on its own. This
+file exercises the fix: ``worker_supervisor.py``'s heartbeat, the derived
+alive/quiet/unresponsive/lost states, and ``task_reconciler.py`` repeatedly
+driving the EXISTING finalize path.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+
+def _ensure_deepseek_credentials_stub() -> None:
+    """See test_process_launcher_security.py's identical helper: some
+    isolated Task MCP worktrees are missing ``deepseek_credentials.py``
+    entirely (an uncommitted file on the trusted host). Only installs a
+    stub when the real module is genuinely unimportable."""
+    import importlib
+    import types
+
+    try:
+        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        return
+    except ImportError:
+        pass
+
+    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+
+    class CredentialError(Exception):
+        def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
+            super().__init__(reason)
+            self.reason = reason
+
+    def load_credential(repo=None):  # noqa: ANN001, ARG001
+        raise CredentialError("deepseek_credential_stub_environment")
+
+    def adapter_readiness(repo=None):  # noqa: ANN001, ARG001
+        return {"ok": True, "readonly": True, "adapters": []}
+
+    stub.CredentialError = CredentialError
+    stub.load_credential = load_credential
+    stub.adapter_readiness = adapter_readiness
+    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+
+
+_ensure_deepseek_credentials_stub()
+
+from geoai_task_mcp import process_launcher, task_reconciler, worker_supervisor  # noqa: E402
+from geoai_task_mcp import worker_workspace  # noqa: E402
+
+
+def _chmod_blocked_by_sandbox() -> bool:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as name:
+        try:
+            os.chmod(name, 0o700)
+        except PermissionError:
+            return True
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _bridge_chmod_sandbox_restriction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """See test_process_launcher_security.py's identical fixture docstring:
+    neutralizes ``os.chmod``/``os.fchmod`` ONLY when this exact sandbox
+    genuinely rejects the bare syscall (probed once); a no-op elsewhere."""
+    if _chmod_blocked_by_sandbox():
+        monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
+        monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
+
+
+def _spawn_sleeper(seconds: float = 30.0) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
+    """Reap ``proc`` (a direct child of THIS test process) so a zombie entry
+    can never be mistaken for "still alive" -- unlike production, where a
+    terminated grandchild is reparented to init and reaped there, a test
+    fixture's direct child stays a zombie (and ``os.kill(pid, 0)`` keeps
+    succeeding) until its own parent calls ``wait()``."""
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _kill_if_alive(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+
+# --- worker_supervisor.py heartbeat -----------------------------------------
+
+
+def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_path, monkeypatch):
+    """A monotonic heartbeat lands every ``heartbeat_interval_seconds`` while
+    the child is silent, and ``last_output_change_epoch`` only advances once
+    the child actually produces output -- output growth is activity
+    evidence, never inferred progress.
+
+    Runs the real ``supervise()`` on a background thread so this test can
+    poll ``status_path`` concurrently. ``signal.signal`` only works on a
+    process's main thread, so it is neutralized here -- this test exercises
+    heartbeat/output-tracking, not SIGTERM/cancel handling (which the
+    existing supervisor tests and ``ProcessManager``'s own cancel path
+    already cover on the real main-thread entry point)."""
+    monkeypatch.setattr(worker_supervisor.signal, "signal", lambda *a, **k: None)
+    status_path = tmp_path / "status.json"
+    cancel_path = tmp_path / "cancel.json"
+    stdout_path = tmp_path / "out.log"
+    stderr_path = tmp_path / "err.log"
+    marker = tmp_path / "go"
+
+    script = (
+        "import time, sys, os\n"
+        f"while not os.path.exists({str(marker)!r}):\n"
+        "    time.sleep(0.02)\n"
+        "sys.stdout.write('x' * 40)\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.6)\n"
+    )
+    spec = {
+        "argv": [sys.executable, "-c", script],
+        "cwd": "/",
+        "timeout_seconds": 10,
+        "status_path": str(status_path),
+        "cancel_path": str(cancel_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "heartbeat_interval_seconds": 0.1,
+    }
+
+    import threading
+
+    thread = threading.Thread(target=worker_supervisor.supervise, args=(spec,), daemon=True)
+    thread.start()
+    try:
+        silent_snapshots = []
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and len(silent_snapshots) < 3:
+            if status_path.is_file():
+                try:
+                    payload = json.loads(status_path.read_text())
+                except json.JSONDecodeError:
+                    payload = {}
+                if payload.get("state") == "running" and payload.get("heartbeat_seq"):
+                    silent_snapshots.append(payload)
+            time.sleep(0.08)
+
+        assert len(silent_snapshots) >= 2, "expected multiple heartbeats while child was silent"
+        seqs = [s["heartbeat_seq"] for s in silent_snapshots]
+        assert seqs == sorted(seqs) and seqs[0] < seqs[-1], "heartbeat_seq must be monotonic"
+        assert len({s["last_output_change_epoch"] for s in silent_snapshots}) == 1, (
+            "no output changed yet -- last_output_change_epoch must stay fixed"
+        )
+        assert all(s.get("stdout_bytes", 0) == 0 for s in silent_snapshots)
+
+        marker.write_text("go")
+        deadline = time.monotonic() + 6.0
+        activity_seen = False
+        while time.monotonic() < deadline:
+            payload = json.loads(status_path.read_text())
+            if payload.get("stdout_bytes", 0) > 0:
+                activity_seen = True
+                assert payload["last_output_change_epoch"] > silent_snapshots[0]["last_output_change_epoch"]
+                break
+            time.sleep(0.05)
+        assert activity_seen, "expected stdout activity to be observed after the marker was written"
+
+        thread.join(timeout=10)
+        final = json.loads(status_path.read_text())
+        assert final["state"] == "exited"
+        assert final["exit_code"] == 0
+        assert final["supervisor_pid_start_ticks"] is not None
+    finally:
+        marker.write_text("go")
+        thread.join(timeout=5)
+
+
+def test_supervisor_status_read_secure_modes_and_symlink_rejection(tmp_path):
+    """``read_supervisor_status`` fails closed (returns ``{}``) on a
+    symlink, an insecure permission mode, and malformed JSON -- and accepts
+    a genuinely owner-only 0600 regular file."""
+    real = tmp_path / "status.json"
+    payload = {"state": "running", "heartbeat_seq": 3}
+    fd = os.open(real, os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(payload, fh)
+    assert process_launcher.read_supervisor_status(real) == payload
+
+    symlink = tmp_path / "status_symlink.json"
+    symlink.symlink_to(real)
+    assert process_launcher.read_supervisor_status(symlink) == {}
+
+    insecure = tmp_path / "status_insecure.json"
+    fd = os.open(insecure, os.O_CREAT | os.O_WRONLY, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(payload, fh)
+    assert process_launcher.read_supervisor_status(insecure) == {}
+
+    malformed = tmp_path / "status_malformed.json"
+    fd = os.open(malformed, os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write("{not json")
+    assert process_launcher.read_supervisor_status(malformed) == {}
+
+    missing = tmp_path / "does_not_exist.json"
+    assert process_launcher.read_supervisor_status(missing) == {}
+
+
+def test_supervisor_status_read_rejects_foreign_owner(tmp_path, monkeypatch):
+    real = tmp_path / "status.json"
+    fd = os.open(real, os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"state": "running"}, fh)
+    real_getuid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_getuid + 1)
+    assert process_launcher.read_supervisor_status(real) == {}
+
+
+# --- derive_liveness_state ---------------------------------------------------
+
+
+def test_derive_liveness_state_alive_fresh_heartbeat_and_recent_activity():
+    now = 1_000_000.0
+    result = process_launcher.derive_liveness_state(
+        now_epoch=now,
+        supervisor_alive=True,
+        heartbeat_at_epoch=now - 1.0,
+        last_output_change_epoch=now - 2.0,
+    )
+    assert result["liveness_state"] == "alive"
+
+
+def test_derive_liveness_state_quiet_is_not_a_failure():
+    now = 1_000_000.0
+    result = process_launcher.derive_liveness_state(
+        now_epoch=now,
+        supervisor_alive=True,
+        heartbeat_at_epoch=now - 1.0,
+        last_output_change_epoch=now - 5000.0,
+        warning_seconds=1800.0,
+        lease_seconds=60.0,
+        grace_seconds=120.0,
+    )
+    assert result["liveness_state"] == "quiet"
+    assert result["heartbeat_age_seconds"] == pytest.approx(1.0)
+
+
+def test_derive_liveness_state_stale_heartbeat_becomes_unresponsive_then_lost():
+    now = 1_000_000.0
+    lease, grace = 60.0, 120.0
+    unresponsive = process_launcher.derive_liveness_state(
+        now_epoch=now,
+        supervisor_alive=True,
+        heartbeat_at_epoch=now - (lease + 10),
+        last_output_change_epoch=now - (lease + 10),
+        lease_seconds=lease,
+        grace_seconds=grace,
+    )
+    assert unresponsive["liveness_state"] == "unresponsive"
+
+    lost = process_launcher.derive_liveness_state(
+        now_epoch=now,
+        supervisor_alive=True,
+        heartbeat_at_epoch=now - (lease + grace + 10),
+        last_output_change_epoch=now - (lease + grace + 10),
+        lease_seconds=lease,
+        grace_seconds=grace,
+    )
+    assert lost["liveness_state"] == "lost"
+
+
+def test_derive_liveness_state_exact_dead_pid_is_always_lost():
+    result = process_launcher.derive_liveness_state(
+        now_epoch=1_000_000.0,
+        supervisor_alive=False,
+        heartbeat_at_epoch=1_000_000.0 - 1.0,
+        last_output_change_epoch=1_000_000.0 - 1.0,
+    )
+    assert result["liveness_state"] == "lost"
+
+
+def test_derive_liveness_state_never_returns_a_percentage_or_correctness_claim():
+    for supervisor_alive in (True, False):
+        result = process_launcher.derive_liveness_state(
+            now_epoch=1.0,
+            supervisor_alive=supervisor_alive,
+            heartbeat_at_epoch=None,
+            last_output_change_epoch=None,
+        )
+        assert result["liveness_state"] in process_launcher.LIVENESS_STATES
+        assert "percent" not in result and "progress" not in result and "correct" not in result
+
+
+# --- PID-reuse refusal --------------------------------------------------------
+
+
+def test_pid_matches_refuses_a_mismatched_start_tick_even_for_a_live_pid():
+    own_pid = os.getpid()
+    real_ticks = process_launcher._pid_start_ticks(own_pid)
+    assert real_ticks is not None
+    assert process_launcher._pid_matches(own_pid, real_ticks) is True
+    # A live PID whose recorded start ticks do not match must never be
+    # treated as the same process -- this is exactly PID-reuse refusal.
+    assert process_launcher._pid_matches(own_pid, real_ticks + 1) is False
+
+
+# --- ProcessManager._finalize_isolated_request liveness escalation ----------
+
+
+def _card(task_id: str = "TASK_B412", runner: str = "claude_worker_b412") -> dict:
+    return {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "coding",
+        "status": "processing",
+        "worker_status": "in_progress",
+        "claimed_by": runner,
+        "review_requested_by": "",
+        "allowed_writes": ["out/result.txt"],
+    }
+
+
+def _show(card: dict):
+    def show(task_id: str) -> dict:
+        return {"returncode": 0, "stdout": json.dumps(card), "stderr": ""}
+
+    return show
+
+
+def _collision(**_kwargs) -> dict:
+    return {"returncode": 0, "stdout": '{"collision_free":true}', "stderr": ""}
+
+
+def _write_status(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(payload, fh)
+
+
+def _build_manager(tmp_path: Path, card: dict) -> process_launcher.ProcessManager:
+    return process_launcher.ProcessManager(
+        repo=tmp_path / "repo",
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(card),
+        collision_guard=_collision,
+        adapter_builder=lambda **_k: SimpleNamespace(argv=[], cwd=str(tmp_path), launchable=True, reason=""),
+        isolation_enabled=True,
+    )
+
+
+def _seed_request(
+    manager: process_launcher.ProcessManager,
+    tmp_path: Path,
+    card: dict,
+    *,
+    request_id: str,
+    supervisor_pid: int,
+    supervisor_ticks,
+    supervisor_status: dict,
+) -> None:
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir(parents=True, exist_ok=True)
+    status_path = process_dir / f"{request_id}.supervisor.json"
+    metadata_path = process_dir / f"{request_id}.request.json"
+    stdout_path = process_dir / f"{request_id}.stdout.log"
+    stderr_path = process_dir / f"{request_id}.stderr.log"
+    cancel_path = process_dir / f"{request_id}.cancel.json"
+    for p in (stdout_path, stderr_path):
+        os.close(os.open(p, os.O_CREAT | os.O_WRONLY, 0o600))
+    _write_status(status_path, supervisor_status)
+
+    workspace_metadata = {
+        "request_id": request_id,
+        "repo": str(tmp_path / "repo"),
+        "path": str(tmp_path / "workspace" / request_id),
+        "home": str(tmp_path / "home" / request_id),
+        "allowed_writes": list(card["allowed_writes"]),
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    worker_workspace.write_json_0600(metadata_path, {
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+        "adapter_id": "claude_cli",
+        "model": None,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(cancel_path),
+        "metadata_path": str(metadata_path),
+        "validation": [],
+        "sandbox_backend": "landlock",
+        "workspace": workspace_metadata,
+    })
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+        "adapter_id": "claude_cli",
+        "state": "running",
+        "pid": supervisor_pid,
+        "pid_start_ticks": supervisor_ticks,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+    })
+
+
+def test_supervisor_unresponsive_beyond_grace_is_finalized_as_lost_and_kills_exact_process_group(
+    tmp_path, monkeypatch,
+):
+    """A supervisor whose exact PID+start-tick identity still exists but
+    whose heartbeat lease AND recovery grace have both elapsed is escalated
+    to "lost", its exact process group (and its child's) is terminated, and
+    the task is routed to review/blocked -- never left pending."""
+    card = _card()
+    fake_supervisor = _spawn_sleeper()
+    fake_child = _spawn_sleeper()
+    try:
+        manager = _build_manager(tmp_path, card)
+        release_calls = []
+        monkeypatch.setattr(
+            process_launcher.core, "release_launch",
+            lambda task_id, runner, reason: release_calls.append((task_id, runner, reason)) or {"ok": True},
+        )
+        now = time.time()
+        stale_heartbeat = now - (
+            process_launcher.heartbeat_lease_seconds()
+            + process_launcher.lost_recovery_grace_seconds()
+            + 5.0
+        )
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-unresponsive-lost",
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=process_launcher._pid_start_ticks(fake_supervisor.pid),
+            supervisor_status={
+                "state": "running",
+                "child_pid": fake_child.pid,
+                "child_pid_start_ticks": process_launcher._pid_start_ticks(fake_child.pid),
+                "heartbeat_at_epoch": stale_heartbeat,
+                "last_output_change_epoch": stale_heartbeat,
+                "started_at_epoch": stale_heartbeat,
+            },
+        )
+
+        result = manager._finalize_isolated_request("req-unresponsive-lost")
+
+        assert result is not None
+        assert result["state"] == "worker_failed"
+        assert result["liveness_lost"] is True
+        assert "liveness_lost" in result["error"]
+        assert release_calls == [(card["task_id"], card["runner"], "worker_failed")]
+        assert _wait_dead(fake_supervisor), "hung supervisor process group must be terminated"
+        assert _wait_dead(fake_child), "orphaned child process group must be terminated too"
+    finally:
+        _kill_if_alive(fake_supervisor)
+        _kill_if_alive(fake_child)
+
+
+def test_live_supervisor_before_first_status_write_is_not_failed(tmp_path, monkeypatch):
+    """A reconciler racing the supervisor's first status write must leave the
+    exact live process and its processing task untouched."""
+    card = _card()
+    fake_supervisor = _spawn_sleeper()
+    try:
+        manager = _build_manager(tmp_path, card)
+        release_calls = []
+        monkeypatch.setattr(
+            process_launcher.core,
+            "release_launch",
+            lambda *args, **kwargs: release_calls.append((args, kwargs)) or {"ok": True},
+        )
+        request_id = "req-live-before-status"
+        _seed_request(
+            manager, tmp_path, card,
+            request_id=request_id,
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=process_launcher._pid_start_ticks(fake_supervisor.pid),
+            supervisor_status={"state": "starting"},
+        )
+        (tmp_path / "processes" / f"{request_id}.supervisor.json").unlink()
+
+        result = manager._finalize_isolated_request(request_id)
+
+        assert result is None
+        assert release_calls == []
+        assert fake_supervisor.poll() is None
+        assert card["status"] == "processing"
+    finally:
+        _kill_if_alive(fake_supervisor)
+
+
+def test_supervisor_crash_with_surviving_child_is_terminated_and_never_left_pending(tmp_path, monkeypatch):
+    """The supervisor process is already gone (exact PID+ticks no longer
+    match) while its child is still running -- the orphaned child's exact
+    process group is terminated and the task is routed to review, never
+    silently left in pending."""
+    card = _card()
+    fake_child = _spawn_sleeper()
+    try:
+        manager = _build_manager(tmp_path, card)
+        release_calls = []
+        monkeypatch.setattr(
+            process_launcher.core, "release_launch",
+            lambda task_id, runner, reason: release_calls.append((task_id, runner, reason)) or {"ok": True},
+        )
+        dead_pid = 2_147_483_000  # far beyond any realistic live PID in this sandbox
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-crash-surviving-child",
+            supervisor_pid=dead_pid,
+            supervisor_ticks=999_999_999,
+            supervisor_status={
+                "state": "running",
+                "child_pid": fake_child.pid,
+                "child_pid_start_ticks": process_launcher._pid_start_ticks(fake_child.pid),
+                "heartbeat_at_epoch": time.time(),
+                "last_output_change_epoch": time.time(),
+                "started_at_epoch": time.time(),
+            },
+        )
+
+        result = manager._finalize_isolated_request("req-crash-surviving-child")
+
+        assert result is not None
+        assert result["state"] == "worker_failed"
+        assert _wait_dead(fake_child), "orphaned surviving child must be terminated"
+        assert release_calls, "a crashed supervisor must still route to review, never silently drop"
+        assert all(reason != "pending" for _, _, reason in release_calls)
+    finally:
+        _kill_if_alive(fake_child)
+
+
+# --- durable reconciliation: the B411 regression itself ---------------------
+
+
+def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_exactly_once(
+    tmp_path, monkeypatch,
+):
+    """The exact B411 regression: the supervisor already wrote a clean
+    ``exited``/``exit_code=0`` status, but nothing re-scanned it because the
+    launching process is gone. ``task_reconciler.run_scan`` (== the
+    reconciler daemon's one iteration) must finalize it through scope
+    validation -> validation commands -> promotion -> ``taskctl review``,
+    each exactly once."""
+    card = _card()
+    card.update({"status": "processing", "worker_status": "in_progress"})
+    manager = _build_manager(tmp_path, card)
+
+    calls = {"enforce_scope": 0, "run_validations": 0, "promote": 0, "mark_review": 0}
+
+    def fake_enforce_scope(workspace):
+        calls["enforce_scope"] += 1
+        return ["out/result.txt"]
+
+    def fake_run_validations(workspace, commands, **_kwargs):
+        calls["run_validations"] += 1
+        return [{"command": c, "returncode": 0} for c in commands]
+
+    def fake_promote(workspace, changed):
+        calls["promote"] += 1
+        return list(changed)
+
+    def fake_mark_review(task_id, runner=None, topic=None):
+        calls["mark_review"] += 1
+        card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher, "enforce_scope", fake_enforce_scope)
+    monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
+    monkeypatch.setattr(process_launcher, "promote", fake_promote)
+    monkeypatch.setattr(process_launcher.core, "mark_review", fake_mark_review)
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
+
+    dead_pid = 2_147_483_001
+    _seed_request(
+        manager, tmp_path, card,
+        request_id="req-exited-orphaned",
+        supervisor_pid=dead_pid,
+        supervisor_ticks=999_999_998,
+        supervisor_status={
+            "state": "exited",
+            "exit_code": 0,
+            "child_pid": dead_pid,
+            "child_pid_start_ticks": 999_999_998,
+            "started_at_epoch": time.time() - 120,
+            "finished_at_epoch": time.time() - 60,
+            "heartbeat_seq": 4,
+            "heartbeat_at_epoch": time.time() - 60,
+        },
+    )
+
+    result = task_reconciler.run_scan(manager)
+    assert result["ok"] is True
+
+    events = manager._request_events("req-exited-orphaned")
+    latest = events[-1]
+    assert latest["state"] == "review_ready"
+    assert card["status"] == "review"
+    # enforce_scope runs twice by design (re-checked after validations, in
+    # case a validation command itself changed files) -- run_validations,
+    # promote, and the taskctl review transition each run exactly once.
+    assert calls == {"enforce_scope": 2, "run_validations": 1, "promote": 1, "mark_review": 1}
+
+    # --- idempotent double scan: a second scan must be a total no-op ---
+    result2 = task_reconciler.run_scan(manager)
+    assert result2["ok"] is True
+    assert calls == {"enforce_scope": 2, "run_validations": 1, "promote": 1, "mark_review": 1}
+    events_after = manager._request_events("req-exited-orphaned")
+    assert len(events_after) == len(events)
+
+
+@pytest.mark.parametrize(
+    "supervisor_state,expected_terminal",
+    [
+        ("timed_out", "timed_out"),
+        ("cancelled", "cancelled"),
+        ("spawn_failed", "worker_failed"),
+    ],
+)
+def test_non_exited_terminal_states_route_to_review_never_pending_and_enqueue_one_release(
+    tmp_path, monkeypatch, supervisor_state, expected_terminal,
+):
+    card = _card()
+    manager = _build_manager(tmp_path, card)
+    release_calls = []
+
+    def fake_release(task_id, runner, reason):
+        release_calls.append((task_id, runner, reason))
+        card.update({"status": "review", "worker_status": "review_ready", "claimed_by": ""})
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.core, "release_launch", fake_release)
+    dead_pid = 2_147_483_010
+    _seed_request(
+        manager, tmp_path, card,
+        request_id=f"req-{supervisor_state}",
+        supervisor_pid=dead_pid,
+        supervisor_ticks=999_999_997,
+        supervisor_status={
+            "state": supervisor_state,
+            "exit_code": 1 if supervisor_state != "cancelled" else None,
+            "started_at_epoch": time.time() - 30,
+            "finished_at_epoch": time.time() - 5,
+        },
+    )
+
+    result = manager._finalize_isolated_request(f"req-{supervisor_state}")
+
+    assert result["state"] == expected_terminal
+    assert len(release_calls) == 1
+    assert release_calls[0][2] != "pending"
+    assert card["status"] != "pending"
+    assert card["worker_status"] != "unclaimed"
+
+    # A duplicate scan must be a pure no-op: already terminal, nothing re-runs.
+    again = manager._finalize_isolated_request(f"req-{supervisor_state}")
+    assert again["state"] == expected_terminal
+    assert len(release_calls) == 1
+
+
+@pytest.mark.parametrize("status,worker_status", [("review", "review_ready"), ("finished", "done")])
+def test_release_exact_is_idempotent_when_canonical_task_is_already_terminal(
+    tmp_path, monkeypatch, status, worker_status,
+):
+    card = _card()
+    card.update({"status": status, "worker_status": worker_status})
+    manager = _build_manager(tmp_path, card)
+    release_calls = []
+    monkeypatch.setattr(
+        process_launcher.core,
+        "release_launch",
+        lambda *args, **kwargs: release_calls.append((args, kwargs)),
+    )
+
+    result = manager._release_exact(
+        {"task_id": card["task_id"], "runner": card["runner"]},
+        "worker_failed",
+    )
+
+    assert result == {
+        "ok": True,
+        "idempotent_noop": True,
+        "canonical_lifecycle": "review" if status == "review" else "finished",
+    }
+    assert release_calls == []
+
+
+# --- task_reconciler.py CLI/daemon plumbing ---------------------------------
+
+
+def test_single_instance_lock_rejects_a_concurrent_holder(tmp_path):
+    lock_path = tmp_path / "reconciler.lock"
+    with task_reconciler.single_instance_lock(lock_path):
+        with pytest.raises(task_reconciler.ReconcilerLockHeld):
+            with task_reconciler.single_instance_lock(lock_path):
+                pass
+    # Lock is released afterwards -- a fresh acquire must succeed.
+    with task_reconciler.single_instance_lock(lock_path):
+        pass
+
+
+def test_run_once_cli_is_bounded_json_and_idempotent_on_an_empty_repo(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    (repo / "tools/geoai-task-mcp/logs").mkdir(parents=True)
+    rc = task_reconciler.main(["run-once", "--repo", str(repo)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert "scanned_at" in payload
+
+    rc2 = task_reconciler.main(["run-once", "--repo", str(repo)])
+    assert rc2 == 0
+    payload2 = json.loads(capsys.readouterr().out)
+    assert payload2["ok"] is True
+
+
+def test_status_cli_reports_lock_presence_read_only(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    rc = task_reconciler.main(["status", "--repo", str(repo)])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["lock_present"] is False
+
+
+def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "tools/geoai-task-mcp/logs").mkdir(parents=True)
+    scans = []
+    rc = task_reconciler.run_daemon(
+        repo=repo,
+        scan_interval_seconds=5,
+        max_iterations=3,
+        on_scan=lambda result: scans.append(result),
+    )
+    assert rc == 0
+    assert len(scans) == 3
+    assert all(scan["ok"] for scan in scans)
+
+
+def test_service_can_write_lifecycle_and_see_isolated_worktrees():
+    unit = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "geoai-task-reconciler.service"
+    ).read_text(encoding="utf-8")
+    assert "Environment=GEOAI_TASK_MCP_ALLOW_WRITES=1" in unit
+    assert "PrivateTmp=false" in unit

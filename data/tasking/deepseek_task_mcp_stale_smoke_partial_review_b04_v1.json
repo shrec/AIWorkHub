@@ -1,0 +1,52 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_PARTIAL_REVIEW_B04_V1",
+  "runner": "deepseek_task_mcp_stale_smoke_partial_review_b04",
+  "topic": "task_mcp",
+  "mode": "partial_processing_artifact_review_no_status_mutation",
+  "priority": "medium",
+  "queue_order": 26624,
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "handoff_note": "გაუშვი პარალელური სუბაგენტები და რომ დასრულდება დაუბრუნე კოდექსს რევიუსთვის",
+  "objective": "Review the single remaining partial processing MCP task DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1. Determine whether its present test files predate the task, are complete task outputs, or require manual recovery/requeue. Do not mutate task status.",
+  "read_first": [
+    "bitnnv2/eval/task_mcp_stale_recovery_review_b03_v1.json",
+    "bitnnv2/eval/task_mcp_stale_recovery_review_rows_b03_v1.jsonl",
+    "bitnnv2/data/tasking/task_mcp_stale_recovery_review_next_wave_b03_v1.json",
+    "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+    "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+    "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/scripts/review_mcp_stale_smoke_partial_b04_v1.py",
+    "tools/geoai-task-mcp/eval/mcp_stale_smoke_partial_review_b04_v1.json",
+    "tools/geoai-task-mcp/eval/mcp_stale_smoke_partial_review_rows_b04_v1.jsonl",
+    "tools/geoai-task-mcp/data/tasking/mcp_stale_smoke_partial_review_next_wave_b04_v1.json",
+    "tools/geoai-task-mcp/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh"
+  ],
+  "acceptance": [
+    "Do not mutate task status; output Codex-only recommendation: recover, force-recover, mark done after validation, or leave processing.",
+    "Run or inspect the three B119 smoke tests and report exact pass/fail/blocker.",
+    "Report file mtimes/git provenance for the three present test files.",
+    "No server behavior changes, no write-gate changes, no process launch authority changes."
+  ],
+  "forbidden": [
+    "task_status_mutation",
+    "server_behavior_change",
+    "write_gate_disable",
+    "process_launch",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "authority_flags": {
+    "queue_mutation": false,
+    "runtime_authority": false,
+    "workflow_switch": false,
+    "write_gate_enabled": false
+  },
+  "validation": [
+    "bash tools/geoai-task-mcp/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh",
+    "python3 AITools/taskctl.py verify"
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "schema_id": "geoai.task_mcp.eval.required_ignored_output_promotion_b561.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_REQUIRED_IGNORED_OUTPUT_PROMOTION_B561_V1",
+  "evaluated_at": "2026-07-18T09:15:00Z",
+  "bug_class": "B557-class promotion defect: gitignored required outputs silently omitted from promoted_paths",
+  "root_cause": {
+    "defect": "changed_paths() derives the promotion candidate set from `git diff --name-only HEAD` and `git ls-files --others --exclude-standard`. Git-ignored files are excluded by --exclude-standard even when they match allowed_writes and are validated by validate_required_outputs.",
+    "missing_link": "validate_required_outputs correctly found and validated the ignored required output (existence, non-empty, changed-from-baseline, allowed_writes), but its validated exact path records were never unioned into the promotion candidate set before promote().",
+    "impact": "A task with a gitignored required output (e.g., a .bin fixture) reached review_ready with the file present on disk but unpromoted to the parent repo."
+  },
+  "repair": {
+    "location": "process_launcher.py:_finalize_isolated_request",
+    "change": "After enforce_scope and validate_required_outputs, extract exact paths from required_output_records and union into changed before calling promote(). Only already-expanded validated record paths are used, never raw glob patterns.",
+    "guard_preservation": "All fail-closed guards remain intact: promote() independently re-checks allowed_writes, parent-baseline hash, symlink rejection, and regular-file requirement."
+  },
+  "tests": {
+    "test_worker_workspace.py": [
+      "test_validate_required_outputs_finds_gitignored_file_missed_by_changed_paths",
+      "test_promotion_includes_validated_required_output_not_in_changed_paths",
+      "test_required_output_symlink_rejected",
+      "test_required_output_unchanged_rejected",
+      "test_required_output_parent_changed_during_promotion",
+      "test_required_output_out_of_scope_rejected"
+    ],
+    "test_process_launcher_security.py": [
+      "test_required_ignored_output_promoted_in_full_finalize_flow"
+    ]
+  }
+}

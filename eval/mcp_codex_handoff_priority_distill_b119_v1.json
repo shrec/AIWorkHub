@@ -1,0 +1,106 @@
+{
+  "schema_id": "geoai.mcp_codex_handoff_priority_distill_eval.v1",
+  "task_id": "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_DISTILL_REAL_B122_V1",
+  "timestamp": "2026-07-09T15:23:46.156278+00:00",
+  "verdict": "PASS",
+  "mode": "handoff_priority_distill_real_rows_no_runtime",
+  "topic": "task_mcp",
+  "objective": "Replace the rejected placeholder B121 handoff-priority distillation with real trainable rows for Codex handoff-priority classification, sourced from real review_summarizer.py computed outputs and the real task-card registry.",
+  "builder_contract": "B122_v1_handoff_priority_distill_real_rows_no_runtime",
+  "source_registry": "bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+  "total_cards_in_registry": 3445,
+  "handoff_reached_cards": 3394,
+  "row_count": 3394,
+  "label_rule": {
+    "label_rule_id": "handoff_priority_label_rule_v1_b122",
+    "description": "high: blocked_review_failed OR blocker_other OR stale_flag OR review_wait_flag (direct evidence of an already-failed/stuck review or an outlier-slow handoff), OR >=3 of the 5 weak signals (commit_hygiene_warn, missing_validation, shared_file_write, wide_write_scope, missing_forbidden_guards). needs_codex_judgment: 1-2 weak signals present with no strong evidence -- genuinely ambiguous, deferred rather than forced into high/low. low: zero evidence signals present.",
+    "stale_hours_threshold_p": 0.9,
+    "stale_hours_threshold_value": 0.7652299630555556,
+    "review_wait_hours_threshold_p": 0.9,
+    "review_wait_hours_threshold_value": 0.5329975775,
+    "not_used_as_authority": "risk_level is NOT the label; see deterministic_baseline for its accuracy as a naive proxy only."
+  },
+  "class_balance": {
+    "counts": {
+      "high": 439,
+      "needs_codex_judgment": 1462,
+      "low": 1493
+    },
+    "fractions": {
+      "high": 0.12934590453741898,
+      "needs_codex_judgment": 0.4307601649970536,
+      "low": 0.4398939304655274
+    },
+    "by_split": {
+      "train": {
+        "counts": {
+          "high": 356,
+          "needs_codex_judgment": 1173,
+          "low": 1193
+        },
+        "fractions": {
+          "high": 0.1307861866274798,
+          "needs_codex_judgment": 0.4309331373989713,
+          "low": 0.43828067597354886
+        }
+      },
+      "heldout": {
+        "counts": {
+          "high": 83,
+          "needs_codex_judgment": 289,
+          "low": 300
+        },
+        "fractions": {
+          "high": 0.12351190476190477,
+          "needs_codex_judgment": 0.43005952380952384,
+          "low": 0.44642857142857145
+        }
+      }
+    }
+  },
+  "split_counts": {
+    "train": 2722,
+    "heldout": 672
+  },
+  "feature_coverage": {
+    "stale_hours_present": 0.9628756629345905,
+    "review_wait_hours_present": 0.9549204478491455,
+    "risks_nonempty": 0.8774307601649971,
+    "validation_present": 0.795226870948733,
+    "allowed_writes_present": 1.0
+  },
+  "leakage_checks": {
+    "one_row_per_task_id": true,
+    "split_assignment_independent_of_label": true,
+    "split_assignment_basis": "sha256(task_id) hash bucket, unrelated to any risk/timestamp field",
+    "global_threshold_is_scalar_constant_not_row_label": true,
+    "global_threshold_note": "stale/review-wait thresholds are single scalar percentiles computed over the full population's elapsed-time values (not labels); the same constant is applied uniformly to every row, so no row's target label leaks into another row's features.",
+    "no_taskctl_subprocess_calls": true,
+    "no_live_queue_mutation": true
+  },
+  "deterministic_baseline": {
+    "risk_level_mapped_baseline_accuracy": 0.33912787271655864,
+    "risk_level_mapped_baseline_note": "Naively mapping the packaged risk_level (low/medium/high) straight to the priority label gets this accuracy on the documented multi-signal label. It is reported strictly as a lower-bound comparison baseline, not as ground truth -- the label itself is derived from independent blocker/staleness/review-wait evidence, not from risk_level.",
+    "majority_class_baseline_accuracy": 0.4398939304655274,
+    "majority_class": "low"
+  },
+  "authority_flags": {
+    "runtime_authority": false,
+    "default_authority": false,
+    "process_launch_authority": false,
+    "write_gate_enabled": false,
+    "training_launch": false,
+    "workflow_switch": false
+  },
+  "forbidden_operations_verified": [
+    "queue_mutation",
+    "write_gate_disable",
+    "process_launch",
+    "training_launch",
+    "deterministic_risk_as_authority",
+    "git_add_A",
+    "mixed_task_commit"
+  ],
+  "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
+  "next_wave_task_ref": "tools/geoai-task-mcp/data/tasking/mcp_handoff_priority_distill_real_next_wave_b122_v1.json"
+}

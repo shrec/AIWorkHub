@@ -1,0 +1,435 @@
+{
+  "eval_id": "mcp_autolaunch_protocol_spec_b275_v1",
+  "task_id": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_PROTOCOL_SPEC_B275_V1",
+  "runner": "deepseek_task_mcp_autolaunch_spec_b275",
+  "topic": "task_mcp",
+  "date": "2026-07-08",
+  "mode": "mcp_autolaunch_protocol_spec_no_execution",
+  "verdict": "PASS",
+  "schema_id": "geoai.mcp_autolaunch_protocol_spec.v1",
+  "summary": "Specified the local MCP autolaunch protocol contract for Codex-driven agent worker lifecycle: a 6-state finite state machine (IDLE->PICKUP->GUARD->LAUNCH->POLL->COMPLETE), per-model runner isolation with file-lock-mediated claim serialization, 4 mandatory safety gates with default-disabled env dual-gate, a 18-field structured audit log schema, stale detection with timeout-per-adapter + force-recovery path, usage accounting integrated with taskctl.py usage records, and a completion return path through taskctl review -> completion_inbox -> Codex finalize. Zero implementation code; all authority_flags are false.",
+  "builds_on": [
+    "taskctl.py (auto-pickup, guard, start, review, done, usage)",
+    "mcp_completion_inbox_wiring_b275_v1 (review_queue, stale_processing, runner_mismatch_warnings)",
+    "mcp_neural_launch_routing_migration_b254_v1 (neural routing targets, abstain classes, adapter_of labels)",
+    "mcp_launch_queue_contract_b104_v1 (LAUNCHABLE_BINARIES, env-gate contract)"
+  ],
+  "authority_flags": {
+    "process_launch_authority": false,
+    "runtime_authority": false,
+    "default_authority": false,
+    "support_authority": false,
+    "model_weight_write": false,
+    "score_apply": false,
+    "canonical_lexicon_mutation": false,
+    "atlas_bank_mutation": false,
+    "training_launch": false
+  },
+  "metrics": {
+    "aggregate": {
+      "protocol_sections_defined": 7,
+      "fsm_states": 6,
+      "fsm_transitions": 10,
+      "safety_gates": 4,
+      "audit_log_fields": 18,
+      "invariants": 7,
+      "gates_checked": 18,
+      "gates_passed": 18,
+      "stale_timeout_adapters": 3,
+      "completion_steps": 6
+    }
+  },
+  "protocol": {
+    "state_machine": {
+      "title": "Autolaunch Lifecycle Finite State Machine",
+      "description": "The autolaunch protocol defines a 6-state FSM governing each task's journey from queue to completion. States are tracked via taskctl.py lifecycle (pending/processing/review/finished) plus worker_status substate. All transitions are gated. Stale detection introduces a recovery transition from any non-terminal state back to IDLE.",
+      "states": {
+        "IDLE": {
+          "description": "Task is pending in queue, unclaimed (worker_status=unclaimed, status=pending).",
+          "entry_condition": "task card exists with status=pending, worker_status=unclaimed",
+          "allowed_transitions": [
+            "PICKUP"
+          ]
+        },
+        "PICKUP": {
+          "description": "Autolaunch orchestrator selects task for runner/topic. Claim is atomic (file-lock serialized).",
+          "entry_condition": "auto-pickup selects first unclaimed pending task matching runner/topic; batch_mismatch guard passes",
+          "exit_condition": "task card worker_status=claimed, claimed_by set, claimed_at timestamped",
+          "allowed_transitions": [
+            "GUARD",
+            "IDLE"
+          ]
+        },
+        "GUARD": {
+          "description": "All 4 safety gates evaluated in order. Failure at any gate blocks launch.",
+          "entry_condition": "task claimed by this runner",
+          "exit_condition": "G1 AND G2 AND G3 AND G4 all return PASS",
+          "allowed_transitions": [
+            "LAUNCH",
+            "IDLE"
+          ]
+        },
+        "LAUNCH": {
+          "description": "Worker process spawned via per-adapter CLI template. MCP server returns immediately.",
+          "entry_condition": "all 4 gates PASS; adapter binary resolvable; env vars set",
+          "exit_condition": "worker process spawned; launch audit record written",
+          "allowed_transitions": [
+            "POLL",
+            "IDLE"
+          ]
+        },
+        "POLL": {
+          "description": "Completion polling loop: check taskctl.py for review state or staleness.",
+          "entry_condition": "worker process running (or deepseek_manual task in-progress)",
+          "exit_condition": "lifecycle_state=review OR stale_timeout exceeded",
+          "allowed_transitions": [
+            "COMPLETE",
+            "IDLE"
+          ]
+        },
+        "COMPLETE": {
+          "description": "Worker finished. taskctl.py review called. Awaiting Codex finalization.",
+          "entry_condition": "lifecycle_state=review; worker_status=review",
+          "exit_condition": "Codex runs taskctl.py done",
+          "allowed_transitions": [],
+          "is_terminal": true
+        }
+      },
+      "transitions": [
+        {
+          "from": "IDLE",
+          "to": "PICKUP",
+          "trigger": "auto-pickup matching runner/topic",
+          "guard": "task_queue_lock + runner_topic_authority + batch_mismatch_check"
+        },
+        {
+          "from": "PICKUP",
+          "to": "GUARD",
+          "trigger": "claim successful",
+          "guard": "worker_status==claimed"
+        },
+        {
+          "from": "PICKUP",
+          "to": "IDLE",
+          "trigger": "any gate failure or guard rejection",
+          "guard": "none (fallback)"
+        },
+        {
+          "from": "GUARD",
+          "to": "LAUNCH",
+          "trigger": "all 4 gates PASS",
+          "guard": "G1 AND G2 AND G3 AND G4"
+        },
+        {
+          "from": "GUARD",
+          "to": "IDLE",
+          "trigger": "any gate FAIL",
+          "guard": "NOT (G1 AND G2 AND G3 AND G4)"
+        },
+        {
+          "from": "LAUNCH",
+          "to": "POLL",
+          "trigger": "process spawned successfully",
+          "guard": "pid > 0"
+        },
+        {
+          "from": "LAUNCH",
+          "to": "IDLE",
+          "trigger": "spawn failure",
+          "guard": "none"
+        },
+        {
+          "from": "POLL",
+          "to": "COMPLETE",
+          "trigger": "worker_status=review",
+          "guard": "lifecycle_state==review"
+        },
+        {
+          "from": "POLL",
+          "to": "IDLE",
+          "trigger": "stale timeout exceeded",
+          "guard": "elapsed > adapter.stale_timeout_seconds"
+        },
+        {
+          "from": "*",
+          "to": "IDLE",
+          "trigger": "force-recover on stale detection",
+          "guard": "taskctl.py recover-stale --force"
+        }
+      ]
+    },
+    "runner_isolation": {
+      "title": "Per-Model Runner Isolation Contract",
+      "invariants": [
+        "One task -> exactly one owning runner/topic pair",
+        "One runner -> at most one in-progress task at a time",
+        "Claim atomicity via file-lock serialized read-choose-update",
+        "Runner batch token must match task batch token when both present",
+        "Runner cannot claim task outside its assigned topic",
+        "No cross-runner writes; each worker receives only its allowed_writes"
+      ],
+      "collision_handling": {
+        "detection": "taskctl.py collision-guard scans active cards for overlapping allowed_writes",
+        "resolution": "collision -> abstain (do not launch); neural router learns collision-abstain from b254 curriculum rows",
+        "same_task_guard": "second claim on already-claimed task is rejected (worker_status != unclaimed check)"
+      }
+    },
+    "safety_gates": {
+      "title": "4-Layer Mandatory Safety Gate Contract",
+      "description": "Every autolaunch MUST pass all four gates in order before spawning a worker process. Gates evaluated sequentially; short-circuit on first failure.",
+      "gates": [
+        {
+          "gate_id": "G1_ENV_DUAL_GATE",
+          "name": "Environment Dual-Gate",
+          "priority": 1,
+          "type": "owner_intent",
+          "contract": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1",
+          "default": "both unset (treated as disabled)",
+          "rationale": "Owner must explicitly opt in to automated launches. Outermost safety ring."
+        },
+        {
+          "gate_id": "G2_TASKCTL_GUARD",
+          "name": "Taskctl Identity and State Guard",
+          "priority": 2,
+          "type": "queue_integrity",
+          "contract": "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic> returns guard=PASS",
+          "checks": [
+            "runner matches",
+            "topic matches",
+            "claimed_by matches",
+            "status is processing",
+            "batch mismatch empty"
+          ],
+          "rationale": "Prevents misconfigured autolaunch from claiming wrong/stale/already-owned task."
+        },
+        {
+          "gate_id": "G3_ALLOWED_WRITES_SCOPE",
+          "name": "Allowed Writes Scope Enforcement",
+          "priority": 3,
+          "type": "write_boundary",
+          "contract": "allowed_writes non-empty, all paths within repo, no forbidden path intersections, no active-task overlap",
+          "checks": [
+            "non-empty allowed_writes",
+            "paths resolve within REPO",
+            "no runtime/registry/default paths",
+            "no collision with other active tasks"
+          ],
+          "rationale": "Defense against task card with accidental write access to runtime authority or other workers."
+        },
+        {
+          "gate_id": "G4_LAUNCH_IMPLEMENTED",
+          "name": "Launch Implementation Feature Flag",
+          "priority": 4,
+          "type": "feature_flag",
+          "contract": "LAUNCH_IMPLEMENTED constant must be True before real process spawn",
+          "current_value": false,
+          "rationale": "This is a DESIGN spec. No launch code exists. G4 blocks all launches until explicitly flipped by implementation task."
+        }
+      ]
+    },
+    "audit_log_schema": {
+      "title": "Structured Autolaunch Audit Log (18 fields)",
+      "schema_id": "geoai.mcp_autolaunch_audit_record.v1",
+      "fields": [
+        {
+          "name": "launch_id",
+          "type": "string",
+          "format": "UUID v4"
+        },
+        {
+          "name": "task_id",
+          "type": "string"
+        },
+        {
+          "name": "runner",
+          "type": "string"
+        },
+        {
+          "name": "topic",
+          "type": "string"
+        },
+        {
+          "name": "adapter",
+          "type": "string",
+          "enum": [
+            "claude_cli",
+            "codex_cli",
+            "deepseek_manual"
+          ]
+        },
+        {
+          "name": "model",
+          "type": "string"
+        },
+        {
+          "name": "lifecycle_state",
+          "type": "string",
+          "enum": [
+            "IDLE",
+            "PICKUP",
+            "GUARD",
+            "LAUNCH",
+            "POLL",
+            "COMPLETE"
+          ]
+        },
+        {
+          "name": "launch_requested_at",
+          "type": "string",
+          "format": "ISO-8601 UTC"
+        },
+        {
+          "name": "launch_completed_at",
+          "type": "string",
+          "format": "ISO-8601 UTC"
+        },
+        {
+          "name": "process_pid",
+          "type": "integer"
+        },
+        {
+          "name": "exit_code",
+          "type": "integer"
+        },
+        {
+          "name": "gates_passed",
+          "type": "array<string>"
+        },
+        {
+          "name": "gates_failed",
+          "type": "array<string>"
+        },
+        {
+          "name": "usage_input_tokens",
+          "type": "integer"
+        },
+        {
+          "name": "usage_output_tokens",
+          "type": "integer"
+        },
+        {
+          "name": "cost_usd",
+          "type": "number"
+        },
+        {
+          "name": "error_message",
+          "type": "string"
+        },
+        {
+          "name": "stale_detected_at",
+          "type": "string",
+          "format": "ISO-8601 UTC"
+        }
+      ]
+    },
+    "stale_recovery": {
+      "title": "Stale Detection and Recovery Protocol",
+      "detection_method": "completion_inbox polls taskctl.py runner-status; compares elapsed time against adapter.stale_timeout_seconds",
+      "adapters": {
+        "claude_cli": {
+          "stale_timeout_seconds": 7200
+        },
+        "codex_cli": {
+          "stale_timeout_seconds": 7200
+        },
+        "deepseek_manual": {
+          "stale_timeout_seconds": 86400
+        }
+      },
+      "recovery_action": "taskctl.py recover-stale <task_id> --force resets worker_status to unclaimed, returns task to IDLE",
+      "audit_trail": "stale_detected_at recorded in audit log; completion_inbox emits stale_warning"
+    },
+    "usage_accounting": {
+      "title": "Cost and Usage Accounting Integration",
+      "worker_path": "python3 AITools/taskctl.py usage <task_id> --runner <runner> --model <model> --input-tokens N --output-tokens N [--cost-usd X]",
+      "reporting": "taskctl.py usage-report aggregates by runner, model, provider, topic"
+    },
+    "completion_return_path": {
+      "title": "Completion to Codex Review Return Path",
+      "steps": [
+        {
+          "step": 1,
+          "actor": "worker",
+          "action": "Write outputs to allowed_writes; run tests"
+        },
+        {
+          "step": 2,
+          "actor": "worker",
+          "action": "taskctl.py review <task_id> --runner <runner>",
+          "state_change": "processing->review"
+        },
+        {
+          "step": 3,
+          "actor": "completion_inbox",
+          "action": "Detect review_queue entry; report to Codex"
+        },
+        {
+          "step": 4,
+          "actor": "Codex",
+          "action": "Review artifacts; run guard-staged"
+        },
+        {
+          "step": "5a",
+          "actor": "Codex",
+          "action": "PASS: stage + guard-staged + commit + done",
+          "state_change": "review->finished"
+        },
+        {
+          "step": "5b",
+          "actor": "Codex",
+          "action": "FAIL: create repair task",
+          "state_change": "review->blocked"
+        }
+      ],
+      "invariants": [
+        "Worker NEVER runs taskctl.py done",
+        "Worker prefers NO_COMMIT; Codex finalizes",
+        "No git add -A / git add .",
+        "One commit per task; no unrelated dirty file sweep"
+      ]
+    }
+  },
+  "invariants": {
+    "no_execution_code": "Zero process-launch code. All CLI templates are DESCRIPTIVE only.",
+    "taskctl_is_source_of_truth": "All lifecycle state in taskctl SQLite/JSONL. Autolaunch reads from taskctl, never maintains parallel state.",
+    "neural_routing_only": "Neural router (b254) selects adapter/runner/topic. It does NOT authorize launches. Neural = routing; Gates = safety.",
+    "no_regex_keyword_launch_authority": "No regex/keyword/table logic may authorize a launch.",
+    "static_allowlist_safety_floor": "LAUNCHABLE_BINARIES allowlist is the deterministic safety floor; no binary outside it may be spawned.",
+    "per_model_isolation": "Each adapter operates in strict isolation: separate namespaces, claim pools, cost tracking, timeouts.",
+    "audit_log_append_only": "Audit log is append-only JSONL; never modified or deleted."
+  },
+  "gates": {
+    "eval_json_valid": true,
+    "next_wave_json_valid": true,
+    "test_script_exists": true,
+    "test_script_passes": true,
+    "state_machine_6_states_defined": true,
+    "all_transitions_gated": true,
+    "runner_isolation_invariants_6_defined": true,
+    "safety_gates_4_layer_defined": true,
+    "safety_gates_sequential_short_circuit": true,
+    "audit_log_16_fields_defined": true,
+    "stale_recovery_protocol_defined": true,
+    "usage_accounting_integrated_with_taskctl": true,
+    "completion_return_path_defined": true,
+    "no_execution_code_anywhere": true,
+    "all_authority_flags_explicitly_false": true,
+    "neural_bridge_acknowledged": true,
+    "static_allowlist_explicitly_safety_floor": true,
+    "builds_on_references_existing_infrastructure": true
+  },
+  "neural_bridge_note": "This protocol spec defines the DETERMINISTIC CONTRACT that a learned neural autolaunch controller must satisfy. The neural controller (trained on b254 curriculum rows) selects adapter/runner/topic and decides launch/abstain. This spec defines what 'launch' MEANS: the state machine, gates, audit trail, completion path. The neural controller learns to navigate this protocol; the protocol is the deterministic substrate. Future dryrun tasks measure whether models correctly predict state transitions, gate outcomes, and abstain decisions under this protocol.",
+  "context7_usage": {
+    "context7_used": false,
+    "local_docs_sufficient": true,
+    "reason": "Pure repo-local protocol spec over existing taskctl + completion_inbox infrastructure. No external library/API/SDK question open."
+  },
+  "commit_contract": "NO_COMMIT",
+  "codex_review_required": true,
+  "next_wave_pointer": "tools/geoai-task-mcp/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
+  "files_written": [
+    "tools/geoai-task-mcp/eval/mcp_autolaunch_protocol_spec_b275_v1.json",
+    "tools/geoai-task-mcp/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
+    "tools/geoai-task-mcp/tests/test_mcp_autolaunch_protocol_spec_b275_v1.sh"
+  ]
+}

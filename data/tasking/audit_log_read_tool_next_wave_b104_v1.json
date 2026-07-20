@@ -1,0 +1,25 @@
+{
+  "next_wave_id": "audit_log_read_tool_next_wave_b104_v1",
+  "parent_task": "DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_B104_V1",
+  "date": "2026-07-04",
+  "status": "proposal",
+  "follow_up_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_FILTER_TOOL_V1",
+      "runner": "deepseek_task_mcp_audit_filter_v1",
+      "topic": "task_mcp",
+      "summary": "Add optional filtering by tool_name, action, or time range to geoai_task_audit_log_read.",
+      "priority": "low",
+      "depends_on": ["DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_B104_V1"]
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_HEALTH_INTEGRATION_V1",
+      "runner": "deepseek_task_mcp_audit_health_v1",
+      "topic": "task_mcp",
+      "summary": "Include audit log summary (total blocked, rate) in geoai_task_health output for dashboard use.",
+      "priority": "low",
+      "depends_on": ["DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_B104_V1"]
+    }
+  ],
+  "notes": "All follow-ups are read-only additions. None enable writes, workflow switch, process launch, or agent launch by default."
+}

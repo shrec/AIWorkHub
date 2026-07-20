@@ -1,0 +1,55 @@
+{
+  "next_wave_id": "mcp_unified_contract_freeze_gate_next_wave_b110_v1",
+  "parent_task": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1",
+  "date": "2026-07-04",
+  "status": "proposed_not_queued",
+  "enqueued": false,
+  "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B110 composes the B108 inputSchema freeze and the B109 output-schema + result-skeleton freeze into ONE machine-readable manifest (mcp_unified_contract_freeze_manifest_b110_v1.json) that binds, per read-only tool, {input_schema_fp, output_schema_fp, result_skeleton_fp}, plus the 4 write-gated tools' input_schema_fp, and a manifest self-fingerprint (sha256 over the canonical binding) for tamper detection. A single pure aggregator gate (mcp_unified_contract_freeze_gate.py) runs BOTH freeze harnesses FRESH, re-derives the live fingerprints and fails on ANY input-or-output drift, so the two freezes cannot silently diverge. Verified with a positive pass (11 read-only tools, zero drift) AND five negative drift injections (read-only input, write-gated input, output-schema, result-skeleton, manifest tamper) each forcing a non-zero exit. Read-only: mutates nothing, launches no agent/model/server; GEOAI_TASK_MCP_ALLOW_WRITES stays default-off and irrelevant to the gate. authority_flags (contract_frozen/process_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope; Codex review finalizes any authority. Adapter/runner/topic SELECTION must become a LEARNED router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this deterministic gate is only an ABCR/validator drift-protection tooth over the executor surface, never a runtime cognitive router.",
+  "produced_artifacts": [
+    "tools/geoai-task-mcp/eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
+    "tools/geoai-task-mcp/tests/mcp_unified_contract_freeze_gate.py",
+    "tools/geoai-task-mcp/tests/test_mcp_unified_contract_freeze_gate_b110_v1.sh"
+  ],
+  "composes": [
+    "CLAUDE_TASK_MCP_CLIENT_SMOKE_CONTRACT_FREEZE_B108_V1",
+    "CLAUDE_TASK_MCP_READONLY_TOOL_RESULT_SCHEMA_FREEZE_B109_V1"
+  ],
+  "neural_bridge_priority": {
+    "role": "deterministic_contract_freeze_validator",
+    "not_runtime_authority": true,
+    "learned_target": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "note": "This gate is an evidence extractor / drift guard, not intelligence. The trainable target (learned adapter/runner/topic launch routing + abstain) is already proposed as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1; no regex/keyword cue router is introduced as launch or route authority."
+  },
+  "follow_up_tasks": [
+    {
+      "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
+      "status": "proposed_not_queued",
+      "goal": "Add a manifest-regeneration self-test: regenerate the unified manifest from the two fresh freeze harness outputs in a mktemp dir and assert it is byte-identical to the committed manifest (and that its manifest_fingerprint recomputes), so an out-of-band manifest edit or a stale manifest is caught in addition to fingerprint drift. Pure in-process, no launch, no write to tracked paths.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/tests/mcp_unified_contract_manifest_selftest.py",
+        "tools/geoai-task-mcp/tests/test_mcp_unified_contract_manifest_selftest_b111_v1.sh"
+      ],
+      "acceptance": [
+        "regenerated manifest byte-identical to committed manifest",
+        "manifest_fingerprint recomputes from binding",
+        "read-only; mutates nothing tracked; launches nothing"
+      ]
+    },
+    {
+      "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_INCLUDE_ERROR_AND_CONTENT_BLOCK_B111_V1",
+      "status": "proposed_not_queued",
+      "goal": "Once the B110-proposed error-path freeze (CLAUDE_TASK_MCP_READONLY_ERROR_RESULT_SKELETON_FREEZE_B110_V1) and content-block freeze (CLAUDE_TASK_MCP_READONLY_CONTENT_BLOCK_FREEZE_B110_V1) land, extend the unified manifest + gate to also bind error_result_skeleton_fp and content_block_fp per read-only tool, so success-output, error-output and non-structured content-block contracts are all covered by the single drift gate.",
+      "mode": "NO_COMMIT",
+      "allowed_writes": [
+        "tools/geoai-task-mcp/eval/mcp_unified_contract_freeze_manifest_b111_v1.json",
+        "tools/geoai-task-mcp/tests/test_mcp_unified_contract_freeze_gate_b111_v1.sh"
+      ],
+      "acceptance": [
+        "manifest binds success + error + content-block fingerprints per read-only tool",
+        "one gate fails on any of the four contract families drifting",
+        "read-only; mutates nothing; launches nothing"
+      ]
+    }
+  ]
+}

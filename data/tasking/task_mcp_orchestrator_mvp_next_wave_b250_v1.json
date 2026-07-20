@@ -1,0 +1,48 @@
+{
+  "proposal_id": "task_mcp_orchestrator_mvp_next_wave_b250_v1",
+  "status": "design_only_not_applied_this_task",
+  "source_task": "CLAUDE_TASK_MCP_ORCHESTRATOR_MVP_EXECUTION_PROTOCOL_B250_V1",
+  "this_task_scope": {
+    "source_code_changed": false,
+    "daemon_started": false,
+    "cli_runner_executed": false,
+    "credential_accessed": false,
+    "task_status_mutated": false
+  },
+  "note": "These are genuine follow-up gaps surfaced during grounding (review_signal_inventory_b160_v1 mcp_exposure_gaps, mvp_contract_audit_v1 findings, B08 unwired tool, this task's own timeout/error-taxonomy proposal) -- not busywork. None are created as taskctl cards by this task; Codex/owner decides which to schedule.",
+  "proposed_next_wave_tasks": [
+    {
+      "candidate_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_NEXT",
+      "goal": "Wire geoai_supervisor_loop_status per task_mcp_supervisor_loop_status_tool_b08_v1.future_source_patch_paths (add core.supervisor_loop_status() pure function + one @mcp.tool() registration in server.py). Real source patch, gated by a fresh collision check against whatever the in-flight B11 workflow leaves in core.py/server.py.",
+      "why_genuine": "B08's contract, derivation_algorithm, and 6 smoke_cases are already fully specified and PASS-gated; only the wiring step is outstanding. Leaving a fully-specified, gate-passed tool unwired is exactly the 'validated but not wired' anti-pattern the project's empirical-governance rule forbids.",
+      "blocked_on": "B11 in-flight core.py/server.py patch must land or be reconciled first to avoid a two-writer collision on the same files."
+    },
+    {
+      "candidate_id": "CLAUDE_TASK_MCP_LIVE_TOOL_INVENTORY_REVERIFY_NEXT",
+      "goal": "Once B11 lands, re-run a live MCP tool listing (geoai_task_health or an MCP client introspection call) and bump every frozen tool-count assertion (test_mcp_stdio_subprocess_client_smoke_b109_v1.sh, test_mcp_stdio_concurrent_client_smoke_b110_v1.sh, test_mvp_contract_audit_v1.sh, README.md 'Exposed Tools') to the new real count in one coordinated patch.",
+      "why_genuine": "This protocol's own tool_authority_tiers deliberately did NOT hardcode a single 'current total N' because the live tree is mid-patch; the four listed pre-existing test failures are already documented as stale-assertion drift, not fixed. A dedicated task can close that drift once the tree is stable, instead of each new tool-adding task silently widening the gap."
+    },
+    {
+      "candidate_id": "CLAUDE_TASK_MCP_EXECUTION_TIMEOUT_TAXONOMY_EXTENSION_NEXT",
+      "goal": "Owner-reviewed decision on whether to promote this protocol's PROPOSED execution_timeout error code into the frozen error_taxonomy alongside collision/stale_task/runner_topic_mismatch/missing_artifact/failed_validation, with the corresponding update to task_mcp_supervisor_loop_contract_b07_v1's common_types_extended.error_taxonomy_code enum.",
+      "why_genuine": "The repo's only timeout constant (bounded_timeout_seconds_default=3600) currently has no defined failure-taxonomy outcome once TIER_4 launch execution is eventually implemented; deciding this BEFORE the gated executor is built avoids inventing the code under implementation pressure."
+    },
+    {
+      "candidate_id": "CLAUDE_TASK_MCP_EXPOSURE_GAP_CLOSURE_NEXT",
+      "goal": "Close the 5 mcp_exposure_gaps already catalogued in review_signal_inventory_b160_v1.json: aggregated risk score, per-task validation-state storage, cost-per-topic join, per-card collision surfacing in show/list, and a computed staleness/age-hours field.",
+      "why_genuine": "These are concrete, already-identified read-only enhancements to TIER_1 tools (no gate/authority change needed); each closes a real observability gap Codex currently has to work around with extra tool calls."
+    },
+    {
+      "candidate_id": "CLAUDE_TASK_MCP_DEFAULT_REPO_SUBMODULE_NEUTRALITY_NEXT",
+      "goal": "Remove core.py:13's hardcoded '/home/shrek/GeoAI' DEFAULT_REPO fallback (mvp_contract_audit_v1 finding F2) so per_project_isolation's cwd-pin is genuinely parameterized, not owner-path-specific, ahead of the MVP_ROADMAP Phase 3 submodule conversion.",
+      "why_genuine": "Directly blocks this protocol's own per_project_isolation claim of 'parameterized repo root, not literal multi-tenant' from being fully true; currently only true when GEOAI_REPO is explicitly set."
+    }
+  ],
+  "not_created_as_taskctl_cards": true,
+  "rollback": "Delete this file; it proposes no code change and is referenced by nothing outside tools/geoai-task-mcp/data/tasking/.",
+  "neural_bridge_note": {
+    "migration_task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
+    "curriculum_path": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
+    "doctrine_note": "None of the 5 proposals above are cue-router/regex-routing work; they are deterministic tool-surface, taxonomy, and hygiene follow-ups. The neural routing migration remains a separate, already-tracked concern."
+  }
+}

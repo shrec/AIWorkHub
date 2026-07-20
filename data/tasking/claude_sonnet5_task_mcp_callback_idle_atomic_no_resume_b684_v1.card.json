@@ -1,0 +1,81 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_TASK_MCP_CALLBACK_IDLE_ATOMIC_NO_RESUME_B684_V1",
+  "title": "Callback sideband atomic idle delivery without long-thread resume",
+  "runner": "claude_sonnet5_task_mcp_callback_idle_atomic_no_resume_b684_v1",
+  "topic": "task_mcp",
+  "logical_topic": "task_mcp_callback_reliability",
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "priority": "critical",
+  "queue_order": 684001,
+  "recommended_model": "claude-sonnet-5",
+  "mode": "bounded_sideband_delivery_path_repair",
+  "origin_thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+  "objective": "Fix the measured B683 callback stall: sideband thread/resume on the very large owner thread repeatedly reaches the mux's 45-second response timeout, so the durable event survives but never delivers. For sideband callbacks only, use an atomic idle-only turn/start acknowledgement against the already extension-owned thread, park active/busy rejections durably, and remove the expensive thread/resume dependency without weakening exact-thread, dedup or fail-closed guarantees.",
+  "read_first": [
+    "AGENTS.md",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
+    "AITools/taskdb.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_app_server_mux.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+  ],
+  "acceptance": [
+    "Reproduce the production evidence exactly: B683 batch de917c12b5b849308db7ae562fa59a17 reached attempts>=8, hard_failure_count=1, last_failure_kind=busy/not_ready while every sideband thread/resume waited for the 45-second mux deadline; the event remained durable but undelivered.",
+    "Sideband callback delivery sends no thread/resume and no turn/steer. It issues one turn/start directly to the uniquely resolved live mux owner for the exact origin_thread_id, using the existing deterministic clientUserMessageId and callback prompt.",
+    "A successful synchronous TurnStartResponse with a valid turn id is the only delivery acknowledgement. Active/busy/activeTurnNotSteerable/already-in-progress rejections durably park without consuming the hard-failure budget; malformed, denied, wrong-owner and protocol failures retain the bounded hard-failure path.",
+    "The App Server remains the atomic concurrency authority: no local stale idle guess, no second hidden turn, no fallback App Server, no direct database injection, no VS Code reload requirement. Missing or ambiguous mux ownership stays fail-closed parked.",
+    "The subprocess transport and its resume/start-or-steer behavior remain unchanged. Existing callback, compact callback and mux suites plus focused idle-success, active-park, exact-once/restart and zero-thread-resume regression tests pass.",
+    "Document service-reload and live-canary procedure. Do not rewrite historical dead letters or mark B683 delivered synthetically."
+  ],
+  "validation": [
+    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+  ],
+  "forbidden": [
+    "sideband_thread_resume",
+    "sideband_turn_steer",
+    "local_idle_guess",
+    "second_app_server_spawn",
+    "callback_drop",
+    "duplicate_delivery",
+    "historical_audit_rewrite",
+    "dashboard_unrelated_change",
+    "git_commit",
+    "git_push",
+    "taskctl_done_by_worker"
+  ],
+  "commit_contract": "NO_COMMIT. Bounded callback delivery-path repair only; Codex owns canonical acceptance, bridge service reload and B683 live canary.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "focus",
+      "budget": 160,
+      "query": "callback sideband thread resume timeout direct turn start atomic idle busy durable park exact once",
+      "targets": [
+        "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
+        "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
+        "AITools/taskdb.py",
+        "tools/geoai-task-mcp/tests"
+      ]
+    },
+    "session": {"topic": "B683 callback long-thread resume stall", "limit": 18},
+    "ai_memory": {"query": "callback bridge sideband timeout B409 B416 B682", "limit": 8},
+    "kb": {"query": "App Server turn start active busy semantics", "limit": 8}
+  }
+}

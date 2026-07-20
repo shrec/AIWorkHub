@@ -1,0 +1,35 @@
+{
+  "schema_id": "geoai.task_mcp.eval.allow_empty_required_outputs.b536.v1",
+  "task_id": "DEEPSEEK_V4PRO_TASK_MCP_ZERO_ROW_REQUIRED_OUTPUT_B536_V1",
+  "evaluated_at": "2026-07-17T14:05:00Z",
+  "runner": "deepseek_v4pro_task_mcp_zero_row_output_b536",
+  "verdict": "PASS",
+  "summary": "Added allow_empty_required_outputs card field with exact-path-only semantics, snapshotted metadata propagation, and narrow zero-byte bypass in validate_required_outputs. All fail-closed invariants preserved.",
+  "contract_coverage": {
+    "default_zero_rejection_unchanged": "PASS",
+    "exact_path_zero_acceptance": "PASS",
+    "mixed_required_outputs": "PASS",
+    "malformed_glob_traversal_absolute_declarations_rejected": "PASS",
+    "non_subset_declaration_rejected": "PASS",
+    "symlink_missing_unchanged_rejection": "PASS",
+    "metadata_round_trip": "PASS",
+    "mutable_card_after_launch_isolation": "PASS"
+  },
+    "test_count": 27,
+    "test_pass": 27,
+  "test_fail": 0,
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_worker_required_empty_output_b536_v1.py"
+  ],
+  "regression_safety": {
+    "required_output_project_context_tests": "PASS",
+    "promotion_scope_hash_guards_unchanged": true,
+    "callback_queue_dashboard_untouched": true,
+    "domain_manifest_not_parsed": true,
+    "fail_closed_for_all_undeclared_zeros": true
+  },
+  "blocker": null,
+  "next_task": "task_mcp_zero_row_required_output_b536_v1_next_wave"
+}

@@ -1,0 +1,42 @@
+{
+  "schema_id": "geoai.mcp_review_summarizer_startup_smoke_next_wave.v1",
+  "parent_task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1",
+  "runner": "deepseek_task_mcp_review_summarizer_startup_b114",
+  "topic": "task_mcp",
+  "status": "completed",
+  "verdict": "PASS",
+  "notes": "B114 startup smoke complete. geoai_task_review_summarize registered, readonly flags verified, write gate default-off, no queue/audit mutation on tool listing. All no-launch invariants preserved.",
+  "invariants_verified": {
+    "READONLY": true,
+    "NO_LAUNCH": true,
+    "NO_MUTATION": true,
+    "WRITE_GATE_DEFAULT_OFF": true,
+    "QUEUE_UNCHANGED_BEFORE_AFTER": true,
+    "AUDIT_UNCHANGED_BEFORE_AFTER": true
+  },
+  "next_wave_tasks": [
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1",
+      "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization",
+      "runner": "deepseek_task_mcp_review_summarizer_b114",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1"],
+      "priority": "task_mcp_b114_neural_bridge",
+      "ready": true
+    },
+    {
+      "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
+      "objective": "End-to-end smoke test via MCP stdio transport: start server, call geoai_task_review_summarize via JSON-RPC, verify response shape",
+      "runner": "deepseek_task_mcp_review_summarizer_b115",
+      "topic": "task_mcp",
+      "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1"],
+      "priority": "task_mcp_b115_stdio_smoke",
+      "ready": true
+    }
+  ],
+  "blockers": [],
+  "follow_up_actions": [
+    "Codex to run taskctl.py done DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1 after review",
+    "Codex to create/update neural bridge distill task card if needed"
+  ]
+}
