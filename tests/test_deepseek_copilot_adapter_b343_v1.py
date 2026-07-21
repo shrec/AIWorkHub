@@ -545,6 +545,10 @@ def test_direct_launch_injects_key_into_child_env_and_cancels(monkeypatch, tmp_p
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
 )
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot complete nested Landlock execution",
+)
 def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_path, repo):
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
