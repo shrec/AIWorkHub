@@ -221,6 +221,10 @@ def _wait_terminal(manager: process_launcher.ProcessManager, request_id: str) ->
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
 )
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock workers",
+)
 def test_production_launch_owns_exact_claim_promotion_and_review(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -262,6 +266,10 @@ def test_production_launch_owns_exact_claim_promotion_and_review(
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock workers",
 )
 def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     monkeypatch: pytest.MonkeyPatch,
