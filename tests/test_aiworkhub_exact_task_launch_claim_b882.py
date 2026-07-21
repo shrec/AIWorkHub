@@ -334,11 +334,10 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
         process_log_path=tmp_path / "events.jsonl",
         process_dir=tmp_path / "processes",
         collision_guard=_collision,
-        # In GitHub Actions ``sys.executable`` lives inside the parent
-        # checkout's .venv-ci.  The isolated Landlock worker must not gain
-        # read access to that parent checkout merely to run this fixture.
-        # Use the base interpreter, matching a real external adapter binary.
-        adapter_builder=_plan([getattr(sys, "_base_executable", sys.executable), "-c", script]),
+        # GitHub's hosted-toolcache Python receives SIGSEGV under the
+        # Landlock fixture on some runner images.  The system interpreter is
+        # the stable external binary this launcher smoke actually needs.
+        adapter_builder=_plan(["/usr/bin/python3", "-c", script]),
     )
     launched = manager.launch(
         task_id="TASK_B882J",
