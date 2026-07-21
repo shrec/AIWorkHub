@@ -334,7 +334,11 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
         process_log_path=tmp_path / "events.jsonl",
         process_dir=tmp_path / "processes",
         collision_guard=_collision,
-        adapter_builder=_plan([sys.executable, "-c", script]),
+        # In GitHub Actions ``sys.executable`` lives inside the parent
+        # checkout's .venv-ci.  The isolated Landlock worker must not gain
+        # read access to that parent checkout merely to run this fixture.
+        # Use the base interpreter, matching a real external adapter binary.
+        adapter_builder=_plan([getattr(sys, "_base_executable", sys.executable), "-c", script]),
     )
     launched = manager.launch(
         task_id="TASK_B882J",
@@ -357,7 +361,7 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
             break
         time.sleep(0.02)
     assert deadline_result is not None and deadline_result.get("terminal")
-    assert deadline_result["state"] == "review_ready"
+    assert deadline_result["state"] == "review_ready", deadline_result
     assert (git_task_repo / "out" / "result.txt").read_text(encoding="utf-8") == "worker-result\n"
     final_row = _row(git_task_repo, "TASK_B882J")
     assert final_row["worker_status"] == "review"
