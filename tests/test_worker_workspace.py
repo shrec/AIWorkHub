@@ -659,7 +659,9 @@ def test_validation_pythonpath_preserves_shell_metacharacter_rejection(command: 
         worker_workspace.parse_validation_command(command)
 
 
-def test_validation_pythonpath_resolution_is_beneath_worktree(tmp_path: Path) -> None:
+def test_validation_pythonpath_resolution_is_beneath_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     worktree = tmp_path / "worktree"
     (worktree / "read").mkdir(parents=True)
     workspace = worker_workspace.WorkerWorkspace(
@@ -677,7 +679,12 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(tmp_path: Path) ->
     assert worker_workspace.resolve_validation_pythonpath(
         workspace, "bubblewrap", ("read",)
     ) == f"{worker_workspace.SANDBOX_WORKSPACE}/read"
-    approved_site = Path(worker_workspace.site.getusersitepackages()).resolve()
+    approved_site = tmp_path / "approved-site-packages"
+    approved_site.mkdir()
+    monkeypatch.setattr(
+        worker_workspace.site, "getusersitepackages", lambda: str(approved_site)
+    )
+    approved_site = approved_site.resolve()
     components = worker_workspace.parse_validation_command(
         f"PYTHONPATH={approved_site}:.:read python3 -m pytest -q x.py"
     )[1]
