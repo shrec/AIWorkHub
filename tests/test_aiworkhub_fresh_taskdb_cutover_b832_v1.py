@@ -18,6 +18,11 @@ from aiworkhub import fresh_task_store
 REPO = Path(__file__).resolve().parents[3]
 TASK_ID = fresh_task_store.TASK_ID
 
+pytestmark = pytest.mark.skipif(
+    not ((REPO / "AITools" / "taskdb.py").is_file() and (REPO / "AITools" / "taskctl.py").is_file()),
+    reason="legacy GeoAI taskdb/taskctl integration is unavailable in the standalone AIWorkHub checkout",
+)
+
 
 def _storage(repo_id: str) -> dict:
     return {

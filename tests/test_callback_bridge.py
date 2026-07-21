@@ -25,7 +25,6 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "AITools"))
 
 from aiworkhub import app_server_mux, callback_bridge  # noqa: E402
 from aiworkhub.app_server_mux import AppServerMux  # noqa: E402
@@ -55,7 +54,7 @@ from aiworkhub.callback_bridge import (  # noqa: E402
 from aiworkhub.route_identity import CoordinatorRouteKey  # noqa: E402
 from aiworkhub.callback_bridge import _batch_from_claim_result  # noqa: E402
 
-import taskdb  # noqa: E402
+import _taskdb_compat as taskdb  # noqa: E402
 
 FAKE_SERVER = Path(__file__).resolve().parent / "_fake_app_server.py"
 

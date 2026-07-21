@@ -38,7 +38,6 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "AITools"))
 
 from aiworkhub import app_server_mux  # noqa: E402
 from aiworkhub.callback_bridge import (  # noqa: E402
@@ -51,7 +50,7 @@ from aiworkhub.callback_bridge import (  # noqa: E402
     _is_sideband_turn_start_busy_rejection,
 )
 
-import taskdb  # noqa: E402
+import _taskdb_compat as taskdb  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
