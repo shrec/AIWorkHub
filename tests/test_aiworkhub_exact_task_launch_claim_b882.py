@@ -322,22 +322,21 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
     ``show_task`` fake -- must claim successfully through the real
     task_engine.claim_start_exact instead of
     claim_start_failed:identity_mismatch. Popen only ever runs a bounded
-    Python -c script; no Claude/Codex CLI adapter or paid model call happens
+    POSIX-shell command; no Claude/Codex CLI adapter or paid model call happens
     on this path."""
     _insert_task(
         git_task_repo, "TASK_B882J", CARD_RUNNER, CARD_TOPIC, topic_column="",
         card_extra={"allowed_writes": ["out/result.txt"], "priority": "high"},
     )
-    script = "from pathlib import Path; Path('out/result.txt').write_text('worker-result\\n')"
     manager = process_launcher.ProcessManager(
         repo=git_task_repo,
         process_log_path=tmp_path / "events.jsonl",
         process_dir=tmp_path / "processes",
         collision_guard=_collision,
-        # GitHub's hosted-toolcache Python receives SIGSEGV under the
-        # Landlock fixture on some runner images.  The system interpreter is
-        # the stable external binary this launcher smoke actually needs.
-        adapter_builder=_plan(["/usr/bin/python3", "-c", script]),
+        # This smoke validates the isolated launch/claim/promotion contract,
+        # not a Python interpreter.  GitHub runner Python binaries can receive
+        # SIGSEGV under nested Landlock, so use the minimal stable POSIX writer.
+        adapter_builder=_plan(["/bin/sh", "-c", "printf 'worker-result\\n' > out/result.txt"]),
     )
     launched = manager.launch(
         task_id="TASK_B882J",
