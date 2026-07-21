@@ -1,0 +1,75 @@
+{
+  "schema_id": "aiworkhub.task_mcp.aiworkhub_finalizer_canonical_authority_b863_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_FINALIZER_CANONICAL_AUTHORITY_B863_V1",
+  "runner": "claude_sonnet5_aiworkhub_finalizer_canonical_authority_b863_v1",
+  "topic": "task_mcp",
+  "mode": "canonical_authority_repair",
+  "reproduced_failure": {
+    "id": "claim_ownership_lost_false_positive_deletes_valid_worktree",
+    "reference_incidents": ["B860", "B861"],
+    "mechanism": "ProcessManager._exact_claim_state / _gc_finalized_workspace read canonical task state through self._show_task, which defaulted to core.show_task. core.show_task resolves its own repository ambiently via core.repo_root() (the AIWORKHUB_REPO env var, or a DEFAULT_REPO fallback) -- independently of ProcessManager.repo, the exact repository the worker's isolated workspace was actually launched against. Confirmed concretely in task_reconciler.py: run_scan/run_daemon/main all accept an explicit --repo and construct ProcessManager(repo=repo), but the pre-fix _show_task default ignored that binding entirely. When the ambient resolution disagreed with the bound repo (multiple repositories handled by one process, an explicit --repo, or a nested independent repository misresolved into its outer checkout via repository_state's unbounded manifest walk-up), the launcher (bound to the correct repo) and the finalizer (core.show_task, reading a different repo's task_queue.sqlite) disagreed about the exact canonical claim -- producing a false claim_ownership_lost for a worker that still legitimately owned its claim.",
+    "second_order_bug": "_finalize_isolated_request treated claim_ownership_lost as unconditional proof of legitimate reassignment: `ownership_lost = error.startswith(\"claim_ownership_lost\"); cleanup = ownership_lost`. Every claim_ownership_lost read -- real or a false positive from the disagreement above -- deleted the isolated git worktree and HOME immediately, destroying the only evidence of a successful run before any human/Codex reviewer ever saw it."
+  },
+  "fixes": [
+    {
+      "id": "canonical_repo_bound_claim_authority",
+      "file": "tools/geoai-task-mcp/src/aiworkhub/task_engine.py",
+      "description": "New module: task_engine.show_task(repo, task_id) reads the canonical card via task_store.get_task(repo, task_id) directly, bound to an explicit repo argument -- never an ambiently re-resolved one. Same TaskCtlResult.as_dict()-shaped wire contract as core.show_task, so it is a drop-in replacement for every internal caller of ProcessManager._show_task.",
+      "also_touches": "process_launcher.py: ProcessManager.__init__ now defaults self._show_task to self._default_show_task (bound to self.repo via task_engine.show_task) instead of core.show_task. Every internal caller -- _preflight_card, _exact_claim_state, _gc_finalized_workspace, status(), _monitor_direct_for_tests -- is fixed uniformly by this one binding change; no per-call-site edits were needed. Explicit show_task= constructor injection (used throughout the existing test suite) is unaffected and still takes precedence."
+    },
+    {
+      "id": "nested_independent_repository_boundary",
+      "file": "tools/geoai-task-mcp/src/aiworkhub/repository_state.py",
+      "description": "_find_upward (and resolve_repository_root) previously walked upward through every ancestor directory looking for .aiworkhub/project.json with no boundary, so resolving from inside a nested independent git repository (its own .git, e.g. tools/geoai-task-mcp itself) could climb past that repo's own git root and bind to an outer repository's manifest instead -- treating the nested repo as untracked content of the outer one. _find_upward now accepts a boundary path; resolve_repository_root computes the nearest git root first and bounds the manifest search to it (falling back to that same git root, not any further ancestor, when no manifest exists yet). The non-nested case is behaviorally unchanged."
+    },
+    {
+      "id": "retain_workspace_on_every_finalize_failure",
+      "file": "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+      "description": "_finalize_isolated_request's WorkspaceError branch set cleanup = ownership_lost, deleting the workspace unconditionally on any claim_ownership_lost error. Changed to cleanup = False unconditionally: every genuine terminal failure (scope_rejected, validation_failed, promotion_conflict, finalize_failed, and now claim_ownership_lost) retains the isolated worktree/HOME and records the exact error/recovery path in the appended event (workspace_retained=True). Deletion is deferred entirely to the existing canonical-status-gated sweep in _gc_finalized_workspace, which independently re-reads self.repo's task_queue.sqlite (now via the fix above) and requires canonical_status in {finished, archived} plus a proven-dead process and a safe workspace shape before ever touching disk. release_launch is still skipped for ownership_lost (unchanged from before), since this worker can no longer prove it owns the claim episode to mutate."
+    }
+  ],
+  "acceptance_mapping": [
+    {"criterion": "A successful worker that still owns the exact canonical claim always reaches review; no legacy JSONL/card_json claim field can override the canonical row.", "evidence": "task_engine.show_task's only data source is task_store.get_task, whose canonical SQLite row always wins over any stale card_json copy (task_store.py::get_task, unchanged, verified by test_task_store_row_overrides_stale_card_json_claim_field); test_default_show_task_reads_the_bound_repo_not_an_ambient_one proves the claim read is bound to the correct repo even when the ambient AIWORKHUB_REPO env disagrees."},
+    {"criterion": "A failed ownership, promotion, review or validation transition retains the isolated workspace and reports its exact recovery path; GC runs only after confirmed canonical terminal handoff.", "evidence": "test_finalize_retains_workspace_on_claim_ownership_lost_instead_of_deleting_it + test_gc_still_waits_for_confirmed_canonical_terminal_status_after_retain"},
+    {"criterion": "Nested independent repositories are isolated from their outer repository and worker changes are collected from the repository that owns the task scope.", "evidence": "test_nested_independent_repository_binds_to_its_own_root_not_outer + test_non_nested_repository_resolution_is_unchanged"},
+    {"criterion": "Regression reproduces the B860/B861 claim_ownership_lost case and proves no valid output is deleted.", "evidence": "test_finalize_retains_workspace_on_claim_ownership_lost_instead_of_deleting_it asserts path.exists() and (path / 'evidence.txt').exists() after finalize sees claim_ownership_lost"},
+    {"criterion": "Existing process launcher, finalized workspace GC, task liveness, task engine verification and collision tests pass.", "evidence": "see validation_results below"}
+  ],
+  "test_file": "tools/geoai-task-mcp/tests/test_aiworkhub_finalizer_canonical_authority_b863.py",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/task_engine.py",
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_state.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_finalizer_canonical_authority_b863.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_finalizer_canonical_authority_b863_v1.json"
+  ],
+  "not_modified": [
+    "tools/geoai-task-mcp/src/aiworkhub/core.py (out of allowed_writes scope; core.show_task/core.repo_root are unchanged and still used by other callers outside this task's authority-critical paths)",
+    "tools/geoai-task-mcp/src/aiworkhub/worker_supervisor.py (pure subprocess supervisor -- no repo-resolution or claim-authority logic; read in full, left untouched)",
+    "tools/geoai-task-mcp/src/aiworkhub/task_store.py (get_task's canonical-row-over-card_json merge was already correct; covered by a new guard-rail regression test, no functional change needed)"
+  ],
+  "validation_results": {
+    "targeted_suite": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_process_launcher.py tests/test_finalized_workspace_gc_b512_v1.py tests/test_task_liveness_reconciler.py tests/test_aiworkhub_finalizer_canonical_authority_b863.py",
+    "result": "71 passed, 1 pre-existing failure",
+    "pre_existing_failure": {
+      "test": "tests/test_task_liveness_reconciler.py::test_service_can_write_lifecycle_and_see_isolated_worktrees",
+      "reason": "FileNotFoundError: scripts/aiworkhub-task-reconciler.service does not exist and has never existed in this repository's git history (confirmed via git log --all -- that path, zero hits). Unrelated to this task's claim/finalization-authority scope and outside allowed_writes (scripts/*.service is not listed); not modified."
+    },
+    "new_tests_added": 6,
+    "new_tests_result": "6 passed"
+  },
+  "out_of_scope_test_conflict": {
+    "test": "tools/geoai-task-mcp/tests/test_process_launcher_security.py::test_success_status_does_not_promote_after_exact_claim_ownership_is_lost",
+    "status": "now fails; file is not in this task's allowed_writes, so it was intentionally not edited",
+    "detail": "This pre-existing test asserted the exact bug this task is required to fix: `assert not workspace.path.exists()` after a claim_ownership_lost finalize outcome. Every other assertion in that test (state == finalize_failed, claim_ownership_lost in the event error, release_launch never called) still passes unchanged -- only its two trailing disk-deletion assertions (`not workspace.path.exists()` and re-reading the promoted file) now fail, because cleanup is correctly False for this case per the card's own acceptance criteria and forbidden list (finalize_failed_workspace_gc). Its sibling test in the same file, test_missing_supervisor_status_releases_on_restart_and_retries_failed_release, already asserted retention (workspace.path.exists()) for the non-ownership-lost worker_failed case, confirming this was the one inconsistent special case, not a broad regression. Follow-up: a task with tests/test_process_launcher_security.py in its allowed_writes should update this test's final two assertions to expect retention (workspace.path.exists() True) and add a companion assertion that the retained workspace only clears once _gc_finalized_workspace confirms a canonical finished/archived status, matching this task's new B863 regression tests.",
+    "verified_not_a_broader_regression": "PYTHONPATH=src python3 -m pytest -q tests/test_process_launcher_security.py -> 19 passed, 1 failed (only the test above); tests/test_aiworkhub_repository_state_b810_v1.py, tests/test_repository_state.py, tests/test_aiworkhub_storage_registry_b824_v1.py (21 passed), tests/test_aiworkhub_canonical_task_engine_b852.py (all passed) all green"
+  },
+  "forbidden_checks": {
+    "legacy_lifecycle_authority": "not reintroduced -- task_engine.show_task's only source is the canonical task_store SQLite row",
+    "finalize_failed_workspace_gc": "fixed -- _finalize_isolated_request no longer deletes on any failure path, including claim_ownership_lost",
+    "outer_repo_nested_repo_confusion": "fixed -- repository_state manifest search bounded at the nearest git root",
+    "silent_pending_requeue": "not touched -- terminal_state routing (review_pending/finalize_failed/validation_failed/etc.) is unchanged, only the cleanup boolean and the claim-read binding changed",
+    "git_commit": "none made",
+    "git_push": "none made"
+  }
+}

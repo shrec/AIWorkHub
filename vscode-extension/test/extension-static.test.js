@@ -75,7 +75,10 @@ assert.ok(ext.includes("AIWORKHUB_WINDOW_ID"));
 assert.ok(ext.includes("AIWORKHUB_CLAIM_EPISODE"));
 assert.ok(ext.includes('snapshot: "aiworkhub_dashboard_snapshot"'));
 assert.ok(ext.includes("mcpClient.repositoryRoot !== root"));
-assert.ok(ext.includes("mcpClient.stop({ restart: false })"));
+// B865: switching repositories must stop the OLD repo's lifecycle-owned
+// dispatcher (never orphaning a nested app-server subprocess) before the
+// old MCP child is killed -- a bare mcpClient.stop() would skip that.
+assert.ok(ext.includes("mcpClient.stopDispatcherThenTerminate({ restart: false })"));
 
 // B844: `import aiworkhub` must resolve to this extension's own bundled
 // runtime/ directory -- never a repository checkout, an editable install, or
@@ -104,6 +107,20 @@ assert.ok(ext.includes("no_repository_selected"));
 assert.ok(ext.includes("showQuickPick"));
 assert.ok(ext.includes("workspaceState.get(WSP_STATE_KEY_REPO_URI"));
 assert.ok(ext.includes("workspaceState.update(WSP_STATE_KEY_REPO_URI"));
+
+// B865: repository binding + child/dispatcher lifecycle closure -- reload
+// restore never leaves a stale controller running, deactivate/reload/repo-
+// switch always stop the dispatcher before killing the child, and the
+// legacy .aiworkinghub directory is never read/created.
+assert.ok(ext.includes("async stopDispatcherThenTerminate("));
+assert.ok(ext.includes("DISPATCHER_TOOLS.ensureStarted"));
+assert.ok(ext.includes("DISPATCHER_TOOLS.stop"));
+assert.ok(ext.includes("panel.__aiworkhubViewState.dispose()"));
+assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must never be referenced");
+
+const deactivateMarker = "async function deactivate()";
+const deactivateBody = ext.slice(ext.indexOf(deactivateMarker), ext.indexOf(deactivateMarker) + 500);
+assert.ok(deactivateBody.includes("stopDispatcherThenTerminate"));
 
 assert.ok(ext.includes("defaultCoordinatorTargets"));
 assert.ok(ext.includes("selected_provider"));

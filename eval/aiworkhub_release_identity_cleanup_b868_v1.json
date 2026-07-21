@@ -1,0 +1,30 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_RELEASE_IDENTITY_CLEANUP_B868_V1",
+  "runner": "claude_sonnet5_aiworkhub_release_identity_cleanup_b868_v1",
+  "goal": "Replace stale shrec/AIWorkingHub repository URLs with canonical shrec/AIWorkHub identity in public metadata; preserve historical explanatory context; no runtime changes.",
+  "changed_files": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/CHANGELOG.md",
+    "tools/geoai-task-mcp/vscode-extension/package.json"
+  ],
+  "replacements": [
+    {"file": "tools/geoai-task-mcp/README.md", "line": 559, "before": "https://github.com/shrec/AIWorkingHub/issues", "after": "https://github.com/shrec/AIWorkHub/issues"},
+    {"file": "tools/geoai-task-mcp/README.md", "line": 560, "before": "https://github.com/shrec/AIWorkingHub/pulls", "after": "https://github.com/shrec/AIWorkHub/pulls"},
+    {"file": "tools/geoai-task-mcp/vscode-extension/package.json", "field": "repository.url", "before": "https://github.com/shrec/AIWorkingHub.git", "after": "https://github.com/shrec/AIWorkHub.git"},
+    {"file": "tools/geoai-task-mcp/vscode-extension/package.json", "field": "bugs.url", "before": "https://github.com/shrec/AIWorkingHub/issues", "after": "https://github.com/shrec/AIWorkHub/issues"},
+    {"file": "tools/geoai-task-mcp/vscode-extension/package.json", "field": "homepage", "before": "https://github.com/shrec/AIWorkingHub", "after": "https://github.com/shrec/AIWorkHub"},
+    {"file": "tools/geoai-task-mcp/CHANGELOG.md", "line": 26, "note": "corrected-remote parenthetical, not a historical migration note; updated to canonical repo", "before": "shrec/AIWorkingHub", "after": "shrec/AIWorkHub"},
+    {"file": "tools/geoai-task-mcp/CHANGELOG.md", "line": 39, "before": "https://github.com/shrec/AIWorkingHub/compare/v0.5.0...HEAD", "after": "https://github.com/shrec/AIWorkHub/compare/v0.5.0...HEAD"}
+  ],
+  "preserved_historical": [
+    "tools/geoai-task-mcp/CHANGELOG.md Notes section (lines 33-37): 'canonical aiworkhub naming cutover' phase reference left intact as genuine historical record."
+  ],
+  "not_touched_out_of_scope": [
+    "SECURITY.md, CONTRIBUTING.md, MVP_ROADMAP.md not in allowed_writes; not scanned/modified.",
+    "vscode-extension/package-lock.json does not exist in this repo; no action taken.",
+    "docs/PUBLISHING.md and vscode-extension/README.md scanned: no stale AIWorkingHub references found."
+  ],
+  "runtime_or_consumer_data_changed": false,
+  "aiworkhub_worker_source_graph_query_tool": "unavailable_in_this_environment",
+  "aiworkhub_worker_session_current_state_tool": "unavailable_in_this_environment"
+}

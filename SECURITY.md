@@ -10,7 +10,7 @@ Pre-release (`-alpha`, `-beta`, `-rc`) versions are not supported.
 If you find a security-sensitive bug, **do not open a public issue**.
 
 Submit a private vulnerability report through
-https://github.com/shrec/AIWorkingHub/security/advisories/new with a clear
+https://github.com/shrec/AIWorkHub/security/advisories/new with a clear
 description and, if possible, a minimal reproduction. Do not include secrets
 or credentials that are not required to reproduce the issue.
 

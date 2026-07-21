@@ -23,10 +23,8 @@ of a tag.
 - `.gitignore` extended to exclude `node_modules/`, `*.vsix`, `*.sqlite`,
   `*.sqlite3`, `*.db`, and repository-local `.aiworkhub/` state.
 - `SECURITY.md` and `vscode-extension/package.json` GitHub URLs corrected to
-  this repository's actual current remote (`shrec/AIWorkingHub`); the
-  product/package/CLI identity itself stays canonical `AIWorkHub`/`aiworkhub`
-  (see the release audit for the pending GitHub repository rename, which
-  this worker does not perform).
+  this repository's actual current remote (`shrec/AIWorkHub`); the
+  product/package/CLI identity itself stays canonical `AIWorkHub`/`aiworkhub`.
 
 ### Notes
 
@@ -36,4 +34,4 @@ Code-owned App Server mux/sideband transport, and the canonical
 `aiworkhub` naming cutover) are tracked in detail in `MVP_ROADMAP.md`
 rather than duplicated here.
 
-[0.6.0]: https://github.com/shrec/AIWorkingHub/compare/v0.5.0...HEAD
+[0.6.0]: https://github.com/shrec/AIWorkHub/compare/v0.5.0...HEAD

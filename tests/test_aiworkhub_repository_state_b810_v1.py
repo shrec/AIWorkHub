@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import repository_state as rs
+from aiworkhub.storage_registry import load_storage_registry
 
 
 def _git_init(path: Path) -> None:
@@ -129,7 +130,12 @@ def test_path_traversal_and_symlink_escapes_are_rejected(tmp_path: Path) -> None
         rs.inspect_repository(other)
 
 
-def test_legacy_discovery_is_read_only_candidate_only(tmp_path: Path) -> None:
+def test_bootstrap_does_not_discover_or_adopt_a_planted_legacy_path(tmp_path: Path) -> None:
+    """B878: this repository state carries no legacy-discovery feature at
+    all -- a planted ``bitnnv2/data/tasking`` legacy path must be left
+    completely untouched and unreferenced by bootstrap, not surfaced as a
+    read-only "candidate" (that mechanism was removed; ``RepositoryState``
+    has no such field)."""
     repo = tmp_path / "repo"
     _git_init(repo)
     legacy = repo / "bitnnv2" / "data" / "tasking"
@@ -138,11 +144,13 @@ def test_legacy_discovery_is_read_only_candidate_only(tmp_path: Path) -> None:
     before = sorted(p.relative_to(repo).as_posix() for p in repo.rglob("*"))
 
     state = rs.bootstrap_repository(repo, repo_id="repo_legacy_readonly")
-    candidates = state.legacy_candidates
     after = sorted(p.relative_to(repo).as_posix() for p in repo.rglob("*"))
 
-    assert any(c["relative_path"] == "bitnnv2/data/tasking" for c in candidates)
-    assert all(c["read_only"] == "true" for c in candidates)
-    assert all(c["migration_action"] == "candidate_only" for c in candidates)
+    assert not hasattr(state, "legacy_candidates")
+    assert state.manifest.to_json()["security"]["automatic_legacy_discovery"] is False
+    registry = load_storage_registry(repo)
+    assert "bitnnv2" not in json.dumps(registry.payload)
+    # The legacy directory is neither deleted nor rewritten: bootstrap only
+    # ever ADDS its own canonical .aiworkhub tree.
     assert "bitnnv2/data/tasking/machine_task_cards_v1.jsonl" in after
     assert set(before).issubset(after)

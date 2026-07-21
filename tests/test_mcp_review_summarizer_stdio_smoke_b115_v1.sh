@@ -19,7 +19,7 @@ export AIWORKHUB_REPO="$ROOT"
 export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 QUEUE_PATH="$ROOT/bitnnv2/data/tasking/task_queue_v1.sqlite"
-AUDIT_PATH="$ROOT/tools/geoai-task-mcp/logs/audit.jsonl"
+AUDIT_PATH="$ROOT/.aiworkhub/runtime/process_logs/audit.jsonl"
 
 echo "=== B115 MCP Review Summarizer Stdio Smoke Test ==="
 echo "ROOT=$ROOT"

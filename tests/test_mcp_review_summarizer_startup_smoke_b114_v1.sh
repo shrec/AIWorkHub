@@ -205,7 +205,7 @@ assert before_sha == after_sha, \
 print('  PASS queue_unchanged: sha256 identical before/after list-tools')
 
 # Also verify no audit log mutation
-AUDIT_PATH = os.path.join('$ROOT', 'tools/geoai-task-mcp/logs/audit.jsonl')
+AUDIT_PATH = os.path.join('$ROOT', '.aiworkhub/runtime/process_logs/audit.jsonl')
 if os.path.exists(AUDIT_PATH):
     with open(AUDIT_PATH, 'rb') as f:
         audit_before = hashlib.sha256(f.read()).hexdigest()

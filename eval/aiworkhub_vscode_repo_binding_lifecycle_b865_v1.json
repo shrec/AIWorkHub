@@ -1,0 +1,61 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_VSCODE_REPO_BINDING_LIFECYCLE_B865_V1",
+  "schema_id": "aiworkhub.eval.b865.v1",
+  "verdict": "review",
+  "summary": "Continued this exact claimed task from an interrupted prior session. The extension.js repo-binding + child/dispatcher lifecycle work (McpStdioClient.stopDispatcherThenTerminate, getMcpClient()'s stale-client teardown on repo change, reviveDashboardPanel()'s stale-controller disposal on reload/tab-deserialize, deactivate()/selectRepositoryCommand() calling stopDispatcherThenTerminate, _handshake() calling DISPATCHER_TOOLS.ensureStarted) and the Python backend (core.dispatcher_ensure_started/health/stop, callback_bridge.CallbackDispatcher/ensure_dispatcher/get_dispatcher/stop_dispatcher, dashboard_mcp_app.health_view/is_not_initialized_reason/initialize_view) were already fully implemented on disk from the prior session and needed no further edits -- preserved as-is. This pass closed the two remaining gaps: (1) two stale tests in test_dashboard_mcp_app.py and one stale static assertion in extension-static.test.js that predated the B850/B855 health_view rewrite and the B865 stopDispatcherThenTerminate rename, all fixed to match the current (already-correct) implementation; (2) the required new test file and this eval, adding B865-specific static+functional coverage for reload-restore disposal ordering, dispatcher-stop-before-child-kill ordering, repo-switch isolation, the .aiworkinghub legacy-path guard, and the Init Repo visibility gate.",
+  "checks": [
+    {
+      "id": "mcp_health_reports_exact_identity_after_activation_reload",
+      "status": "pass",
+      "evidence": "dashboard_mcp_app.health_view() reads AIWORKHUB_REPO_ROOT directly, reports repo (exact root), storage.repo_id (real repo_<hex> identity via task_store.storage_readiness), storage.ready, and server_version=='0.6.0' -- test_health_view_reports_full_identity_after_repo_bind (new) asserts all four plus result.get('error') != 'repo_root_not_selected' once a repository is actually bound; test_health_view_reports_repo_root_not_selected_before_any_bind (new) confirms the pre-bind case still reports that reason honestly rather than fabricating readiness."
+    },
+    {
+      "id": "editor_tab_deserialize_reconnects_and_starts_dispatcher",
+      "status": "pass",
+      "evidence": "extension.js's registerWebviewPanelSerializer.deserializeWebviewPanel calls reviveDashboardPanel(), which calls getMcpClient(context) -> ensureStarted() -> _start() -> _handshake(), and _handshake() always calls DISPATCHER_TOOLS.ensureStarted (test_extension_handshake_calls_dispatcher_ensure_started, new). Functionally, core.dispatcher_ensure_started() called twice in a row (activation then simulated tab-deserialize/reload) converges on the same running dispatcher without a second thread (test_dispatcher_ensure_started_converges_then_stop_unregisters, new)."
+    },
+    {
+      "id": "deactivate_reload_repo_switch_stop_old_dispatcher_terminate_exact_child_no_orphan",
+      "status": "pass",
+      "evidence": "deactivate() calls oldClient.stopDispatcherThenTerminate({restart:false}) before dropping the reference (test_extension_deactivate_stops_dispatcher_before_terminating_child, new). stopDispatcherThenTerminate() sends DISPATCHER_TOOLS.stop BEFORE calling this.stop() (child kill) -- test_extension_stop_dispatcher_then_terminate_orders_dispatcher_stop_before_kill (new) asserts the tool-call text appears before the kill call in source order, matching the B865 comment's stated invariant (a bare SIGTERM to the outer child never reaches CallbackDispatcher's nested AppServerClient subprocess). getMcpClient() and selectRepositoryCommand() both call stopDispatcherThenTerminate on the stale client before binding the new repository (test_extension_repo_switch_stops_old_client_dispatcher_before_rebinding, new). reviveDashboardPanel() disposes any stale panel's ViewState (poll timer) before adopting the new one (test_extension_reload_restore_disposes_stale_controller_before_adopting_new_panel, new). Python-side: CallbackDispatcher.stop() calls bridge.stop_daemon() (sets the stop event), joins the thread, and the daemon loop's own exit path calls self._client.stop() on its nested AppServerClient -- verified end to end by test_repository_switch_stops_old_dispatcher_never_shares_with_new (new): after stop_dispatcher(root_a), dispatcher_a.is_running() is False while dispatcher_b (a different repo) stays running, and get_dispatcher(root_a) is None."
+    },
+    {
+      "id": "only_aiworkhub_accepted_legacy_aiworkinghub_never_read_created_or_fallback",
+      "status": "pass",
+      "evidence": "readRepositoryManifestInfo() only ever reads path.join(root, '.aiworkhub', 'project.json'); source_graph_universal/AITools index-wide search for 'aiworkinghub' returns zero hits across the repo. test_extension_only_reads_aiworkhub_never_the_legacy_aiworkinghub_path and test_backend_never_references_the_legacy_aiworkinghub_path (both new) assert the literal string '.aiworkinghub' is absent from extension.js, dashboard_mcp_app.py, and callback_bridge.py; extension-static.test.js gained the same repo-wide assertion (ext.includes('.aiworkinghub') === false)."
+    },
+    {
+      "id": "init_repo_visible_only_for_genuinely_uninitialized_repository",
+      "status": "pass",
+      "evidence": "dashboard_mcp_app.is_not_initialized_reason() matches only the 'manifest_invalid:manifest_missing:...' prefix (repository_state.inspect_repository raising ManifestMissingError because no .aiworkhub/project.json has ever been written) and returns False for every other storage_readiness failure reason (repo_id mismatch, unresolvable root, registry mismatch, missing/corrupt canonical DB, failed quick_check) -- test_is_not_initialized_reason_true_only_for_never_initialized (new, 7 corrupt-reason cases). test_health_view_flags_not_initialized_only_for_a_genuinely_never_initialized_repo confirms a real never-initialized directory sets storage.not_initialized=true; test_health_view_never_flags_not_initialized_for_a_directory_that_does_not_exist confirms a nonexistent root (a different, real failure) sets it false rather than recommending 'just click Init Repo'. extension.js's #initialize-button lives inside the #uninitialized-alert <section>, which ships hidden -- test_extension_init_repo_button_stays_inside_the_hidden_uninitialized_alert (new)."
+    },
+    {
+      "id": "never_imports_another_repositorys_data",
+      "status": "pass",
+      "evidence": "initialize_view() only ever calls repository_bootstrap.initialize_repository_full(root, ...) -- creates/repairs THIS repository's own manifest/storage registry/canonical DB in place; test_initialize_view_bootstraps_in_place_never_a_legacy_or_cross_repo_import (new) asserts no import/migrate/copy-from-other-repo helper name appears in the function body. The dispatcher registry is keyed per repo_root (test_repository_switch_stops_old_dispatcher_never_shares_with_new, new, and the pre-existing test_two_repositories_never_share_a_dispatcher in the B857 suite), so no cross-repository read/delivery state can leak across a switch."
+    },
+    {
+      "id": "extension_static_and_focused_dashboard_callback_tests_pass",
+      "status": "pass",
+      "evidence": "Fixed two tests in test_dashboard_mcp_app.py that were stale against the already-shipped B850 health_view rewrite (it reads AIWORKHUB_REPO_ROOT + task_store.storage_readiness directly, never core.health()) and the B855 live-output/initialize tool additions to register() (5 tools, not 3). Fixed one stale extension-static.test.js assertion (mcpClient.stop -> mcpClient.stopDispatcherThenTerminate, the B865 rename) and added 5 new B865 static assertions. All listed validation commands pass -- see test_results below."
+    }
+  ],
+  "tests": [
+    "cd tools/geoai-task-mcp/vscode-extension && npm test --silent",
+    "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_vscode_release_b853.py tests/test_dashboard_mcp_app.py tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_vscode_repo_binding_lifecycle_b865_v1.json",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "test_results": {
+    "npm_test": "AIWorkHub VS Code extension static contract checks passed",
+    "pytest": "69 passed"
+  },
+  "scope_note": "NO_COMMIT per commit_contract. Continued the exact claimed task/runner (claude_sonnet5_aiworkhub_vscode_repo_binding_lifecycle_b865_v1) in the foreground; no subagent delegation. Only files inside allowed_writes were touched: tests/test_dashboard_mcp_app.py (2 stale-test fixes), vscode-extension/test/extension-static.test.js (1 stale-assertion fix + 5 new B865 assertions), tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py (new, required_output), eval/aiworkhub_vscode_repo_binding_lifecycle_b865_v1.json (new, required_output). extension.js, dashboard_mcp_app.py, and callback_bridge.py were read and verified but needed no edits -- the interrupted prior session's implementation there already satisfied every acceptance criterion.",
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/vscode-extension/test/extension-static.test.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_vscode_repo_binding_lifecycle_b865_v1.json"
+  ]
+}

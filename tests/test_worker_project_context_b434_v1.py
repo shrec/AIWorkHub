@@ -50,22 +50,77 @@ def _write_tool(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _stub_source_graph_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic in-process Source Graph stub (B849 canonical authority).
+
+    Since B849, ``collect_project_context`` calls
+    ``project_context._source_graph_direct`` in-process -- no subprocess,
+    no ``AITools/source_graph.py`` dependency. B866/B871 proved the
+    accepted fixture pattern: monkeypatch ``project_context._source_graph_direct``
+    directly rather than shelling out to a fake script, echoing back the
+    contract's mode/query/budget so mode-dependent assertions still hold.
+    """
+
+    def fake_direct(repo: Path, contract: dict) -> tuple[str, bool]:
+        source = contract["source_graph"]
+        mode = source["bundle_type"] if source["mode"] == "bundle" else source["mode"]
+        payload = {
+            "tool": "source_graph",
+            "mode": mode,
+            "query": source["query"],
+            "budget": source["budget"],
+        }
+        return json.dumps(payload, sort_keys=True), False
+
+    monkeypatch.setattr(project_context, "_source_graph_direct", fake_direct)
+
+
+def _stub_worker_tools_direct(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_hit: bool = True,
+    memory_hit: bool = False,
+    kb_hit: bool = False,
+) -> None:
+    """Deterministic in-process Session Manager / AI Memory / KB stub
+    (B879 canonical authority). Since B878/B879, ``collect_project_context``
+    calls ``worker_ai_tools_mcp.session_current_state`` / ``ai_memory_search``
+    / ``kb_search`` in-process against the repository's canonical
+    ``.aiworkhub`` SQLite authority -- no subprocess, no ``AITools/*.py``
+    dependency. Monkeypatching these call sites directly mirrors the
+    accepted ``_stub_source_graph_direct`` pattern for Source Graph.
+    """
+
+    def fake_session(ctx, *, limit: int = 12):
+        evidence = (
+            [{"source_id": "evt-1", "timestamp": "2026-01-01T00:00:00Z", "kind": "progress", "snippet": "bounded"}]
+            if session_hit else []
+        )
+        content = json.dumps(
+            {"topic": ctx.session_topic, "state": "current" if session_hit else "unknown",
+             "evidence_count": len(evidence), "evidence": evidence},
+            sort_keys=True,
+        )
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(evidence)}
+
+    def fake_memory(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "ctx", "value": "bounded", "tags": "task_mcp"}] if memory_hit else []
+        content = json.dumps({"results": results, "count": len(results)}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    def fake_kb(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "pipeline.stage_order", "title": "x", "category": "module", "tags": "task_mcp", "body": "y"}] if kb_hit else []
+        content = json.dumps({"results": results, "count": len(results)}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    monkeypatch.setattr(project_context._worker_tools, "session_current_state", fake_session)
+    monkeypatch.setattr(project_context._worker_tools, "ai_memory_search", fake_memory)
+    monkeypatch.setattr(project_context._worker_tools, "kb_search", fake_kb)
+
+
 def _context_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "AITools").mkdir(parents=True)
-    _write_tool(
-        repo / "AITools/source_graph.py",
-        """
-import json, sys
-cmd = sys.argv[1]
-if cmd == "bundle":
-    mode, query, budget = sys.argv[2], sys.argv[3], sys.argv[sys.argv.index("--max-lines") + 1]
-else:
-    mode, query, budget = cmd, sys.argv[2], sys.argv[3]
-print("[*] Language: python (python)")
-print(json.dumps({"tool":"source_graph","mode":mode,"query":query,"budget":budget}, sort_keys=True))
-""",
-    )
     _write_tool(
         repo / "AITools/transcript_graph.py",
         """
@@ -108,8 +163,12 @@ def _project_context_card(mode: str = "focus", *, required: bool = True) -> dict
     }
 
 
-def test_project_context_collects_source_modes_bounded_session_and_optional_kb(tmp_path: Path) -> None:
+def test_project_context_collects_source_modes_bounded_session_and_optional_kb(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = _context_repo(tmp_path)
+    _stub_source_graph_direct(monkeypatch)
+    _stub_worker_tools_direct(monkeypatch)
     seen = {}
     for mode in ("focus", "slice", "bundle"):
         result = project_context.collect_project_context(repo, _project_context_card(mode))
@@ -129,7 +188,7 @@ def test_project_context_collects_source_modes_bounded_session_and_optional_kb(t
             section for section in payload["sections"]
             if section["name"] == "session_current_state"
         )
-        assert json.loads(session_section["content"])["cmd"] == "current-state"
+        assert json.loads(session_section["content"])["state"] == "current"
         assert "--no-refresh" not in result.prompt_bundle
         assert result.metadata["section_count"] == 3
         assert "missing B434 context" not in json.dumps(result.metadata)
@@ -140,7 +199,9 @@ def test_project_context_collects_source_modes_bounded_session_and_optional_kb(t
     assert '"mode": "bundle"' in seen["bundle"]
 
 
-def test_project_context_validates_types_and_rejects_shellish_or_overbudget_values(tmp_path: Path) -> None:
+def test_project_context_validates_types_and_rejects_shellish_or_overbudget_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = _context_repo(tmp_path)
     card = _project_context_card()
     card["project_context"]["source_graph"]["mode"] = "find"
@@ -152,6 +213,8 @@ def test_project_context_validates_types_and_rejects_shellish_or_overbudget_valu
     with pytest.raises(project_context.ProjectContextError, match="budget_out_of_range"):
         project_context.collect_project_context(repo, card)
 
+    _stub_source_graph_direct(monkeypatch)
+    _stub_worker_tools_direct(monkeypatch)
     card = _project_context_card()
     card["project_context"]["source_graph"]["query"] = "ProcessManager; rm -rf /"
     result = project_context.collect_project_context(repo, card)
@@ -159,13 +222,16 @@ def test_project_context_validates_types_and_rejects_shellish_or_overbudget_valu
     assert "rm -rf" in result.prompt_bundle
 
 
-def test_large_valid_json_is_canonicalized_into_bounded_valid_preview(tmp_path: Path) -> None:
+def test_large_valid_json_is_canonicalized_into_bounded_valid_preview(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = _context_repo(tmp_path)
-    _write_tool(
-        repo / "AITools/source_graph.py",
-        "import json\nprint('[*] Language: python (python)')\n"
-        "print(json.dumps({'rows':['x' * 1024] * 80}))\n",
-    )
+
+    def fake_direct(repo_: Path, contract: dict) -> tuple[str, bool]:
+        return json.dumps({"rows": ["x" * 1024] * 80}), False
+
+    monkeypatch.setattr(project_context, "_source_graph_direct", fake_direct)
+    _stub_worker_tools_direct(monkeypatch)
     result = project_context.collect_project_context(repo, _project_context_card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
@@ -178,11 +244,13 @@ def test_large_valid_json_is_canonicalized_into_bounded_valid_preview(tmp_path: 
     assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
 
 
-def test_required_context_rejects_before_claim_and_optional_degrades(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_required_context_rejects_before_claim_and_optional_degrades(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     repo = _context_repo(tmp_path)
-    (repo / "AITools/source_graph.py").unlink()
+    (repo / "AITools/transcript_graph.py").unlink()
     claims = []
     monkeypatch.setattr(process_launcher.core, "claim_start_exact", lambda *args: claims.append(args) or {"ok": True})
     manager = process_launcher.ProcessManager(
@@ -202,17 +270,25 @@ def test_required_context_rejects_before_claim_and_optional_degrades(monkeypatch
         timeout_seconds=30,
     )
     assert blocked["ok"] is False
-    assert "context_tool_missing" in blocked["blocked_reason"]
+    assert "source_graph_query_failed" in blocked["blocked_reason"]
     assert claims == []
 
+    def failing_direct(repo_: Path, contract: dict) -> tuple[str, bool]:
+        raise project_context.ProjectContextError("source_graph_query_failed:test_stub")
+
+    monkeypatch.setattr(project_context, "_source_graph_direct", failing_direct)
     optional = _project_context_card(required=False)
     degraded = project_context.collect_project_context(repo, optional)
     assert degraded is not None
     assert degraded.metadata["sections"][0]["degraded_reason"]
 
 
-def test_identical_bundle_reaches_all_adapter_prompts_and_metadata_is_redacted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_identical_bundle_reaches_all_adapter_prompts_and_metadata_is_redacted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     repo = _context_repo(tmp_path)
+    _stub_source_graph_direct(monkeypatch)
+    _stub_worker_tools_direct(monkeypatch)
     result = project_context.collect_project_context(repo, _project_context_card())
     assert result is not None
     prompts = [
@@ -239,13 +315,13 @@ def test_workspace_creation_does_not_copy_live_context_databases(monkeypatch: py
     subprocess.run(["git", "config", "user.name", "Task MCP Tests"], cwd=repo, check=True)
     (repo / "out").mkdir()
     (repo / "out/result.json").write_text("baseline", encoding="utf-8")
-    subprocess.run(["git", "add", "AITools/source_graph.py", "AITools/transcript_graph.py", "AITools/kb.py", "out/result.json"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "AITools/transcript_graph.py", "AITools/kb.py", "out/result.json"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     workspace = worker_workspace.create_workspace(
         repo,
         "no-db-copy",
-        {"allowed_writes": ["out/result.json"], "read_first": ["AITools/source_graph.py"]},
+        {"allowed_writes": ["out/result.json"], "read_first": ["AITools/transcript_graph.py"]},
         "claude_cli",
     )
     try:

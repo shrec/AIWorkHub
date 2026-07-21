@@ -34,15 +34,6 @@ DURABLE_LAYOUT: dict[str, str] = {
     "config": "config",
 }
 RUNTIME_DIRNAME = "runtime"
-LEGACY_CANDIDATE_RELS: tuple[str, ...] = (
-    "bitnnv2/data/tasking",
-    "tools/geoai-task-mcp/logs",
-    "tools/geoai-task-mcp/data/tasking",
-    "AITools/ai_memory",
-    "AITools/kb.py",
-    "AITools/source_graph.py",
-    "AITools/transcript_graph.py",
-)
 
 
 class RepositoryStateError(RuntimeError):
@@ -125,7 +116,7 @@ class RepositoryManifest:
             "security": {
                 "credentials_in_repository": False,
                 "host_runtime_state_in_durable_payload": False,
-                "legacy_locations_are_read_only_migration_candidates": True,
+                "automatic_legacy_discovery": False,
             },
         }
 
@@ -138,7 +129,6 @@ class RepositoryState:
     manifest: RepositoryManifest
     durable_paths: dict[str, Path]
     runtime_path: Path
-    legacy_candidates: tuple[dict[str, str], ...]
 
 
 def is_valid_repo_id(value: str) -> bool:
@@ -189,7 +179,17 @@ def _assert_relative_child(root: Path, relative: str | Path) -> Path:
     return resolved
 
 
-def _find_upward(start: Path, marker: Path) -> Path | None:
+def _find_upward(start: Path, marker: Path, *, boundary: Path | None = None) -> Path | None:
+    """Search ``start`` and its ancestors for ``marker``.
+
+    When ``boundary`` is given, the search never looks past it: ``boundary``
+    itself is still checked, but nothing above it is. This is what keeps a
+    nested independent git repository from being resolved as untracked
+    content of whatever outer repository happens to sit above it -- without
+    a boundary, a manifest search from inside the nested repo would keep
+    climbing past its own ``.git`` and silently bind to the outer repo's
+    ``.aiworkhub/project.json`` instead.
+    """
     current = _resolve_existing_dir(start)
     for directory in (current, *current.parents):
         candidate = directory / marker
@@ -197,6 +197,8 @@ def _find_upward(start: Path, marker: Path) -> Path | None:
             if _has_symlink_component(candidate):
                 raise PathEscapeError(f"marker_symlink_component:{candidate}")
             return directory
+        if boundary is not None and directory == boundary:
+            break
     return None
 
 
@@ -225,7 +227,12 @@ def resolve_repository_root(
     elif environ.get("AIWORKHUB_REPO_ROOT"):
         root = _resolve_existing_dir(Path(str(environ["AIWORKHUB_REPO_ROOT"])))
     else:
-        root = _find_upward(start, PROJECT_MANIFEST_REL) or _git_root_from(start)
+        # Bind to the nearest enclosing git repository, never past it: a
+        # nested independent repository (its own ``.git``) must resolve to
+        # its own manifest/root, not escape upward into whatever outer
+        # repository happens to contain it.
+        git_root = _git_root_from(start)
+        root = _find_upward(start, PROJECT_MANIFEST_REL, boundary=git_root) or git_root
         if root is None:
             raise RepositoryNotFoundError("repository_root_not_found")
 
@@ -246,26 +253,6 @@ def _read_manifest(path: Path) -> RepositoryManifest:
     if not isinstance(payload, dict):
         raise ManifestInvalidError("manifest_must_be_object")
     return RepositoryManifest.from_json(payload)
-
-
-def discover_legacy_candidates(root: str | Path) -> tuple[dict[str, str], ...]:
-    """Return legacy AIWorkHub locations as read-only migration candidates only."""
-
-    repo = _resolve_existing_dir(Path(root))
-    candidates: list[dict[str, str]] = []
-    for rel in LEGACY_CANDIDATE_RELS:
-        try:
-            path = _assert_relative_child(repo, rel)
-        except PathEscapeError:
-            continue
-        if path.exists():
-            candidates.append({
-                "relative_path": rel,
-                "path": str(path),
-                "read_only": "true",
-                "migration_action": "candidate_only",
-            })
-    return tuple(candidates)
 
 
 def inspect_repository(
@@ -302,7 +289,6 @@ def inspect_repository(
         manifest=manifest,
         durable_paths=durable_paths,
         runtime_path=runtime_path,
-        legacy_candidates=discover_legacy_candidates(repo),
     )
 
 
@@ -416,7 +402,6 @@ __all__ = [
     "RepositoryState",
     "RepositoryStateError",
     "bootstrap_repository",
-    "discover_legacy_candidates",
     "inspect_repository",
     "is_valid_repo_id",
     "new_repo_id",

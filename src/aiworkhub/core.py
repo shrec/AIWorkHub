@@ -20,13 +20,23 @@ from . import (
     coordinator_config,
     refresh_coordinator_config,
 )
+from . import repository_state
 from . import task_store
 
 
-DEFAULT_REPO = Path(__file__).resolve().parents[4]
 TASKCTL_REL = Path("AITools/taskctl.py")
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
-AUDIT_LOG_DEFAULT_REL = Path("tools/geoai-task-mcp/logs/audit.jsonl")
+# Repository-local runtime tree (never durable, never shared across repos):
+# .aiworkhub/runtime/process_logs/audit.jsonl -- see repository_state.py's
+# RepositoryManifest runtime layout ("process_logs" is one of its declared
+# contents). Never a fixed path relative to this package's own install
+# location or to a historical monorepo layout.
+AUDIT_LOG_DEFAULT_REL = (
+    Path(repository_state.HUB_DIRNAME)
+    / repository_state.RUNTIME_DIRNAME
+    / "process_logs"
+    / "audit.jsonl"
+)
 
 _SECRET_ENV_PATTERNS = (
     "SECRET", "TOKEN", "PASSWORD", "PASSWD", "KEY", "API_KEY",
@@ -216,7 +226,7 @@ def _canonical_write_gate(
 # B119: runner/topic allowlist enforcement for write-gated taskctl actions.
 #
 # Deterministic safety boundary, NOT a neural learning target. It starts from
-# tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_design_b118_v1.json and
+# the pinned runner/topic allowlist design evaluation and
 # adds the exact ``claim-start`` lifecycle action. The neural controller may
 # later choose among these identities for routing; this static allowlist is the
 # hard boundary that blocks any identity not on the list.
@@ -656,8 +666,8 @@ CODEX_ALLOWED_ACTIONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# B06: bounded per-wave task_mcp prefix allowlist (applies the B05 proposal,
-# tools/geoai-task-mcp/data/tasking/runner_topic_allowlist_dryrun_next_wave_b05_v1.json).
+# B06: bounded per-wave task_mcp prefix allowlist (applies the pinned B05
+# dry-run proposal).
 #
 # This adds one topic key, ``task_mcp``, matched by a runner name prefix instead
 # of an exact tuple. Task MCP runners are per-wave-numbered (e.g.
@@ -759,7 +769,10 @@ class TaskCtlResult:
 
 
 def repo_root() -> Path:
-    return Path(os.environ.get("AIWORKHUB_REPO", str(DEFAULT_REPO))).expanduser().resolve()
+    env_override = os.environ.get("AIWORKHUB_REPO", "")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    return repository_state.resolve_repository_root(require_manifest=False)
 
 
 def taskctl_path(repo: Path | None = None) -> Path:
@@ -1892,9 +1905,10 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
 
 def export_jsonl(runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
     """Write-gated bounded export of the canonical queue to a JSONL file
-    under this MCP tool's own ``data/tasking`` directory. ``runner``/``topic``
-    are optional B119 allowlist identity hints (default None preserves prior
-    behavior for callers that do not supply them)."""
+    under this repository's canonical ``.aiworkhub/tasking`` directory
+    (never a package-install or historical monorepo data path).
+    ``runner``/``topic`` are optional B119 allowlist identity hints (default
+    None preserves prior behavior for callers that do not supply them)."""
     command = ["export-jsonl"]
     blocked = _canonical_write_gate("export-jsonl", runner=runner, topic=topic)
     if blocked is not None:
@@ -1903,7 +1917,9 @@ def export_jsonl(runner: str | None = None, topic: str | None = None) -> dict[st
         rows = task_store.list_tasks(repo_root(), status=None, limit=5000)
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
-    out_dir = repo_root() / "tools" / "geoai-task-mcp" / "data" / "tasking"
+    out_dir = (
+        repo_root() / repository_state.HUB_DIRNAME / repository_state.DURABLE_LAYOUT["tasking"]
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "canonical_task_export.jsonl"
     lines = [json.dumps(r, ensure_ascii=False, default=str) for r in rows]
@@ -1996,8 +2012,8 @@ def _parse_jsonl(text: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # B11 (retry of stale-claimed B10): read-only supervisor-loop STATUS derivation.
 #
-# Implements the 7-step derivation_algorithm frozen by
-# tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json
+# Implements the 7-step derivation algorithm frozen by the supervisor-loop
+# status contract
 # verbatim. Pure composition of pre-existing read-only helpers already defined
 # above (show_task, check_runner_topic_allowlist, collision_guard,
 # _lifecycle_state) -- no NEW subprocess/exec/network/daemon-launch code is

@@ -96,7 +96,7 @@ Example MCP server entry:
         "aiworkhub.server"
       ],
       "env": {
-        "PYTHONPATH": "/path/to/checkout/tools/geoai-task-mcp/src",
+        "PYTHONPATH": "/path/to/checkout/src",
         "AIWORKHUB_REPO": "/path/to/checkout",
         "AIWORKHUB_ALLOW_WRITES": "0"
       }
@@ -420,8 +420,8 @@ only -- it never touches VS Code settings, the installed extension, systemd,
 or the live callback DB:
 
 ```bash
-python3 tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py --check
-python3 tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py
+python3 scripts/install_vscode_app_server_mux.py --check
+python3 scripts/install_vscode_app_server_mux.py
 ```
 
 Codex owns applying the printed `chatgpt.cliExecutable` value, reloading the
@@ -501,7 +501,8 @@ launch gate.
 
 Every blocked write attempt is recorded to an append-only JSONL audit log.
 
-**Default path:** `tools/geoai-task-mcp/logs/audit.jsonl` (relative to `AIWORKHUB_REPO` root).
+**Default path:** `.aiworkhub/runtime/process_logs/audit.jsonl` (relative to
+`AIWORKHUB_REPO` root).
 
 **Override path:** set `AIWORKHUB_AUDIT_LOG_PATH` to an absolute path.
 
@@ -556,5 +557,5 @@ bash tests/test_write_gate_audit_v1.sh
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security Policy](SECURITY.md)
 - [License](LICENSE) -- MIT
-- [GitHub Issues](https://github.com/shrec/AIWorkingHub/issues) /
-  [Pull Requests](https://github.com/shrec/AIWorkingHub/pulls)
+- [GitHub Issues](https://github.com/shrec/AIWorkHub/issues) /
+  [Pull Requests](https://github.com/shrec/AIWorkHub/pulls)

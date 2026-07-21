@@ -97,7 +97,12 @@ def test_glm_never_referenced_from_auto_refresh_timer() -> None:
 
 def test_glm_never_referenced_from_activation() -> None:
     activate_start = _EXT_SOURCE.index("function activate(context)")
-    activate_end = _EXT_SOURCE.index("\nfunction deactivate", activate_start)
+    # deactivate() is async (B865: orderly dispatcher shutdown before the
+    # child process dies) -- match either `function deactivate` or
+    # `async function deactivate` so this bound doesn't break on that.
+    deactivate_match = re.search(r"\n(?:async )?function deactivate", _EXT_SOURCE[activate_start:])
+    assert deactivate_match is not None, "deactivate() not found after activate()"
+    activate_end = activate_start + deactivate_match.start()
     activate_body = _EXT_SOURCE[activate_start:activate_end]
     assert "runGlmCanary" not in activate_body
     assert "refreshModelCapabilities" not in activate_body

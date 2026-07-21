@@ -362,14 +362,15 @@ def test_bundle_validates_bundle_type_and_stays_bounded(tmp_path):
 
 def test_migration_skips_cleanly_when_no_legacy_source_exists(tmp_path):
     repo = _new_repo(tmp_path, "repo")
-    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_rel="AITools/source_graph.db", dry_run=True)
+    absent_source = tmp_path / "external_migration_source" / "source_graph.db"
+    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_source=absent_source, dry_run=True)
     assert report.status == "no_legacy_source_skip"
     assert report.parity_ok is True
 
 
 def test_migration_dry_run_verifies_without_writing_canonical(tmp_path):
     repo = _new_repo(tmp_path, "repo")
-    legacy_path = repo / "AITools" / "source_graph.db"
+    legacy_path = tmp_path / "external_migration_source" / "source_graph.db"
     legacy_path.parent.mkdir(parents=True)
     conn = sqlite3.connect(str(legacy_path))
     conn.execute("CREATE TABLE files(path TEXT)")
@@ -378,7 +379,7 @@ def test_migration_dry_run_verifies_without_writing_canonical(tmp_path):
     conn.close()
     legacy_sha_before = sgm._sha256_file(legacy_path)
 
-    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_rel="AITools/source_graph.db", dry_run=True)
+    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_source=legacy_path, dry_run=True)
     assert report.status == "verified_dry_run"
     assert report.parity_ok is True
     assert report.legacy_integrity_check == "ok"
@@ -394,8 +395,14 @@ def test_migration_dry_run_verifies_without_writing_canonical(tmp_path):
 
 
 def test_migration_real_run_then_idempotent_cutover(tmp_path):
+    """B878: a freshly bootstrapped repository's registry entries are already
+    ``canonical_active`` from birth (canonical-only storage, no shadow
+    phase), so ``perform_cutover`` is a no-op ``already_cutover`` from the
+    very first call -- there is nothing left to cut over to. The verified,
+    read-only migration copy still runs and must still leave the canonical
+    database populated and the legacy source untouched."""
     repo = _new_repo(tmp_path, "repo")
-    legacy_path = repo / "AITools" / "source_graph.db"
+    legacy_path = tmp_path / "external_migration_source" / "source_graph.db"
     legacy_path.parent.mkdir(parents=True)
     conn = sqlite3.connect(str(legacy_path))
     conn.execute("CREATE TABLE files(path TEXT)")
@@ -403,13 +410,16 @@ def test_migration_real_run_then_idempotent_cutover(tmp_path):
     conn.commit()
     conn.close()
 
-    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_rel="AITools/source_graph.db", dry_run=False)
+    registry_before = load_storage_registry(repo)
+    assert registry_before.databases["source_graph"].canonical_active is True
+
+    report = sgm.migrate_legacy_db(repo, db_id="source_graph", legacy_source=legacy_path, dry_run=False)
     assert report.status == "migrated_and_verified"
     assert Path(report.canonical_path).exists()
     assert Path(report.canonical_path).is_relative_to(repo / HUB_DIRNAME / "source_graph")
 
     cutover_1 = sgm.perform_cutover(repo, "source_graph", parity_ok=report.parity_ok)
-    assert cutover_1["status"] == "cutover_applied"
+    assert cutover_1["status"] == "already_cutover"
     assert cutover_1["generation"] == 1
 
     cutover_2 = sgm.perform_cutover(repo, "source_graph", parity_ok=report.parity_ok)
@@ -422,6 +432,28 @@ def test_migration_real_run_then_idempotent_cutover(tmp_path):
     assert db.authority_state == "canonical_active"
 
 
+def test_cutover_applies_and_is_then_idempotent_for_a_not_yet_canonical_entry(tmp_path):
+    """A registry entry that is explicitly not yet canonical (the shape an
+    older, richer migration/cutover tool would still produce) still takes
+    the real ``cutover_applied`` -> ``already_cutover`` path."""
+    repo = _new_repo(tmp_path, "repo")
+    registry_path = repo / HUB_DIRNAME / "config" / "storage.json"
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    entry = next(item for item in payload["databases"] if item["id"] == "source_graph")
+    entry["authority"] = {
+        "state": "shadow", "canonical_active": False, "legacy_active": False, "live_cutover": False,
+    }
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cutover_1 = sgm.perform_cutover(repo, "source_graph", parity_ok=True)
+    assert cutover_1["status"] == "cutover_applied"
+    assert cutover_1["generation"] == 1
+
+    cutover_2 = sgm.perform_cutover(repo, "source_graph", parity_ok=True)
+    assert cutover_2["status"] == "already_cutover"
+    assert cutover_2["generation"] == 1
+
+
 def test_cutover_refuses_without_parity(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     with pytest.raises(sgm.MigrationError):
@@ -430,7 +462,7 @@ def test_cutover_refuses_without_parity(tmp_path):
 
 def test_migration_never_writes_legacy_path_even_on_real_run(tmp_path):
     repo = _new_repo(tmp_path, "repo")
-    legacy_path = repo / "AITools" / "source_graph_universal.db"
+    legacy_path = tmp_path / "external_migration_source" / "source_graph_universal.db"
     legacy_path.parent.mkdir(parents=True)
     conn = sqlite3.connect(str(legacy_path))
     conn.execute("CREATE TABLE t(x INTEGER)")
@@ -439,7 +471,7 @@ def test_migration_never_writes_legacy_path_even_on_real_run(tmp_path):
     conn.close()
     before = legacy_path.read_bytes()
 
-    sgm.migrate_legacy_db(repo, db_id="universal", legacy_rel="AITools/source_graph_universal.db", dry_run=False)
+    sgm.migrate_legacy_db(repo, db_id="universal", legacy_source=legacy_path, dry_run=False)
     assert legacy_path.read_bytes() == before
 
 
@@ -451,17 +483,17 @@ def test_project_context_calls_canonical_module_without_subprocess(tmp_path, mon
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "pkg" / "core.py", "def project_ctx_probe():\n    return 1\n")
     sg.build_index(repo, incremental=True)
-    _write(repo / "AITools" / "transcript_graph.py", "print('{}')\n")
 
     def _forbidden_subprocess_run(*args, **kwargs):
         raise AssertionError("project_context must not shell out for source_graph")
 
-    def _fake_run_fixed_argv(argv, cwd):
-        # Only the session_current_state call is still subprocess-based here;
-        # simulate it succeeding so the rest of the bundle assembles.
-        return "{}", False
-
-    monkeypatch.setattr(pc, "_run_fixed_argv", _fake_run_fixed_argv)
+    monkeypatch.setattr(
+        pc._worker_tools,
+        "session_current_state",
+        lambda ctx, limit=12: {
+            "ok": True, "content": "{}", "truncated": False, "hit_count": 0,
+        },
+    )
     monkeypatch.setattr(subprocess, "run", _forbidden_subprocess_run)
 
     card = {
@@ -480,14 +512,11 @@ def test_project_context_calls_canonical_module_without_subprocess(tmp_path, mon
     assert "project_ctx_probe" in result.prompt_bundle
 
 
-def test_project_context_no_operational_dependency_on_aitools_source_graph_py(tmp_path):
+def test_project_context_no_operational_dependency_on_repository_helper_scripts(tmp_path, monkeypatch):
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "pkg" / "core.py", "def only_probe():\n    return 1\n")
     sg.build_index(repo, incremental=True)
-    _write(repo / "AITools" / "transcript_graph.py", "print('{}')\n")
-    # AITools/source_graph.py is deliberately absent from this fixture repo --
-    # if project_context.py still depended on it operationally this would fail.
-    assert not (repo / "AITools" / "source_graph.py").exists()
+    assert not (repo / "AITools").exists()
 
     card = {
         "project_context": {
@@ -501,12 +530,14 @@ def test_project_context_no_operational_dependency_on_aitools_source_graph_py(tm
         }
     }
     import aiworkhub.project_context as pc_mod
-    orig = pc_mod._run_fixed_argv
-    pc_mod._run_fixed_argv = lambda argv, cwd: ("{}", False)
-    try:
-        result = pc_mod.collect_project_context(repo, card)
-    finally:
-        pc_mod._run_fixed_argv = orig
+    monkeypatch.setattr(
+        pc_mod._worker_tools,
+        "session_current_state",
+        lambda ctx, limit=12: {
+            "ok": True, "content": "{}", "truncated": False, "hit_count": 0,
+        },
+    )
+    result = pc_mod.collect_project_context(repo, card)
     assert result is not None
     assert "only_probe" in result.prompt_bundle
 

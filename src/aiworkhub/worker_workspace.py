@@ -60,6 +60,15 @@ SANDBOX_WORKSPACE = "/workspace"
 # code that embeds a host path string into adapter/MCP config would silently
 # reference a path the sandboxed process cannot see.
 SANDBOX_AUTHORITY_REPO = "/authority-repo"
+# B870 V2: a SEPARATE, dedicated read-only alias for the AIWorkHub Python
+# package's own import root (the directory that must be on PYTHONPATH for
+# ``import aiworkhub`` to resolve). This is never derived from -- or bound
+# alongside -- SANDBOX_AUTHORITY_REPO: the package import root may live in a
+# standalone ``<repo>/src/aiworkhub`` checkout, nested inside a monorepo
+# beneath authority_repo, or bundled/installed entirely OUTSIDE
+# authority_repo, so it needs its own independent host-path binding rather
+# than being expressed as an offset inside the authority_repo alias.
+SANDBOX_PACKAGE_IMPORT_ROOT = "/aiworkhub-package-root"
 MAX_SEED_FILES = 20_000
 MAX_VALIDATION_COMMANDS = 32
 MAX_VALIDATION_SECONDS = 1_800
@@ -570,7 +579,7 @@ def _placeholder_queue_card() -> dict[str, Any]:
         "objective": "Synthetic placeholder row so an isolated worktree's "
         "disposable task-queue DB copy is never empty (B328). Not a real "
         "task; never claimed, never routed.",
-        "allowed_writes": ["tools/geoai-task-mcp/eval/_b328_isolated_queue_placeholder_never_written.json"],
+        "allowed_writes": ["eval/_b328_isolated_queue_placeholder_never_written.json"],
         "forbidden": ["placeholder_task_never_claimable"],
     }
 
@@ -668,6 +677,16 @@ def provision_worker_mcp_runtime(
     ``resolve_validation_pythonpath`` for the same backend-aware pattern).
     Landlock confines writes only, never reads, so the real host paths are
     used directly there.
+
+    B870 V2: the AIWorkHub package's own import root is resolved separately
+    from ``repo``/``authority_repo`` via
+    ``worker_ai_tools_mcp.resolve_host_package_import_root()`` -- never as an
+    offset beneath either of them -- and, only under bubblewrap, rewritten to
+    the dedicated ``SANDBOX_PACKAGE_IMPORT_ROOT`` alias. ``sandbox_argv`` (see
+    below) binds that same real host directory read-only at that exact alias
+    in the SAME mount namespace this request's adapter process launches
+    under, so the two stay in lockstep without either function guessing the
+    other's repository-layout assumptions.
     """
 
     if backend not in ("landlock", "bubblewrap"):
@@ -683,6 +702,15 @@ def provision_worker_mcp_runtime(
 
     from . import worker_ai_tools_mcp
 
+    host_package_import_root = worker_ai_tools_mcp.resolve_host_package_import_root()
+    if not host_package_import_root.is_dir():
+        raise WorkspaceError(
+            f"package_import_root_not_directory:{host_package_import_root}"
+        )
+    package_import_root = (
+        Path(SANDBOX_PACKAGE_IMPORT_ROOT) if backend == "bubblewrap" else host_package_import_root
+    )
+
     try:
         return worker_ai_tools_mcp.generate_worker_mcp_runtime(
             home=workspace.home,
@@ -694,6 +722,7 @@ def provision_worker_mcp_runtime(
             authority_repo=authority_repo,
             source_graph_targets=source_graph_targets,
             session_topic=session_topic,
+            package_import_root=package_import_root,
         )
     except worker_ai_tools_mcp.WorkerToolError as exc:
         # Provisioning/config-injection failure must reject the launch, not
@@ -1305,6 +1334,7 @@ def sandbox_argv(
     backend: str | None = None,
     validation_readonly_dirs: tuple[Path, ...] = (),
     validation_exec_scratch: Path | None = None,
+    package_import_root: Path | None = None,
 ) -> list[str]:
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
@@ -1380,8 +1410,14 @@ def sandbox_argv(
         "--bind", str(workspace.path), SANDBOX_WORKSPACE,
         "--ro-bind", str(workspace.path / ".git"), f"{SANDBOX_WORKSPACE}/.git",
         "--ro-bind", str(workspace.repo), SANDBOX_AUTHORITY_REPO,
-        "--chdir", SANDBOX_WORKSPACE,
     ]
+    if package_import_root is not None:
+        # A dedicated bind, independent of the SANDBOX_AUTHORITY_REPO bind
+        # above: the package import root may live entirely outside
+        # workspace.repo (a bundled/installed package), so it cannot be
+        # expressed as a path beneath that alias.
+        argv.extend(("--ro-bind", str(package_import_root), SANDBOX_PACKAGE_IMPORT_ROOT))
+    argv.extend(("--chdir", SANDBOX_WORKSPACE))
     node_root = _node_install_root(adapter_argv[0])
     if node_root is not None:
         relative = node_root.relative_to(host_home)
@@ -1869,6 +1905,9 @@ def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
 
 
 __all__ = [
+    "SANDBOX_AUTHORITY_REPO",
+    "SANDBOX_PACKAGE_IMPORT_ROOT",
+    "SANDBOX_WORKSPACE",
     "TASK_QUEUE_ISOLATED_RELATIVE",
     "WorkerWorkspace",
     "WorkspaceError",

@@ -1,0 +1,40 @@
+{
+  "evidence_schema": "geoai.task_mcp.b867_regression_contract_cleanup_evidence.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_REGRESSION_CONTRACT_CLEANUP_B867_V1",
+  "runner": "claude_sonnet5_aiworkhub_regression_contract_cleanup_b867_v1",
+  "verdict": "STALE_TESTS_UPDATED_NO_PRODUCTION_BEHAVIOR_CHANGED",
+  "summary": "Three tests were stale relative to already-accepted B860/B863 production behavior and were updated to match current code; no production runtime file was modified.",
+  "fixes": [
+    {
+      "file": "tests/test_process_launcher_security.py",
+      "test": "test_success_status_does_not_promote_after_exact_claim_ownership_is_lost",
+      "before": "asserted `not workspace.path.exists()` after a claim_ownership_lost finalize",
+      "after": "asserts `workspace.path.exists()`",
+      "reason": "B860/B863 changed ProcessManager._finalize_isolated_request (process_launcher.py:2385-2715) to set cleanup=False on every WorkspaceError terminal path, including claim_ownership_lost, because a lost-claim read can be a false positive and deleting the workspace destroys evidence and forces needless reruns. The test still asserted the old delete-on-loss behavior."
+    },
+    {
+      "file": "tests/test_task_liveness_reconciler.py",
+      "test": "test_service_can_write_lifecycle_and_see_isolated_worktrees",
+      "before": "read_text() on scripts/aiworkhub-task-reconciler.service, a systemd unit file that does not exist anywhere in this worktree (verified: no *reconciler*.service file under tools/geoai-task-mcp/)",
+      "after": "replaced with test_daemon_writes_lifecycle_transitions_with_writes_enabled, which drives task_reconciler.run_scan() with AIWORKHUB_ALLOW_WRITES=1 and asserts the actual lifecycle write (review_ready) the old test's docstring claimed to cover",
+      "reason": "The product never ships that unit file at that path; the test asserted an artifact the product never ships, per acceptance criteria."
+    },
+    {
+      "file": "tests/test_dashboard.py",
+      "test": "test_production_provider_uses_only_existing_read_paths",
+      "before": "fake_list_tasks(repo_root, status=\"pending\", limit=80) called `status.upper()` unconditionally",
+      "after": "returns [] when status is None before touching .upper()",
+      "reason": "DashboardProvider.get_cost_ledger (dashboard.py:484) calls task_store.list_tasks(self.repo_root, status=None, limit=5000) to scan the full task store -- a currently-shipped optional status argument the fake did not support, crashing with AttributeError: 'NoneType' object has no attribute 'upper'. Fix supports status=None without relaxing the test's forbidden_legacy_provider / task_store-only call restrictions."
+    }
+  ],
+  "validation": {
+    "pytest": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_process_launcher_security.py tests/test_task_liveness_reconciler.py tests/test_dashboard.py",
+    "result": "40 passed"
+  },
+  "not_modified": [
+    "src/aiworkhub/process_launcher.py",
+    "src/aiworkhub/dashboard.py",
+    "src/aiworkhub/task_reconciler.py"
+  ],
+  "commit_contract": "NO_COMMIT"
+}

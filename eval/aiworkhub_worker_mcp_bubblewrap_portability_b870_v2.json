@@ -1,0 +1,40 @@
+{
+  "schema_id": "aiworkhub.task_mcp.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_WORKER_MCP_BUBBLEWRAP_PORTABILITY_B870_V2",
+  "verdict": "repaired",
+  "rejected_v1_defect": {
+    "location": "worker_ai_tools_mcp.py:generate_worker_mcp_runtime",
+    "problem": "PYTHONPATH derived via Path(__file__).parents[4] plus a hardcoded tools/geoai-task-mcp/src relative offset, rejoined onto authority_repo",
+    "why_forbidden": ["fixed_parent_depth", "monorepo_path_assumption"]
+  },
+  "v2_fix": {
+    "resolver": "worker_ai_tools_mcp.resolve_host_package_import_root() = Path(__file__).resolve().parent.parent, no repo-depth assumption",
+    "provisioning": "worker_workspace.provision_worker_mcp_runtime resolves the host package root and, only for backend=='bubblewrap', substitutes the dedicated SANDBOX_PACKAGE_IMPORT_ROOT alias ('/aiworkhub-package-root') instead of rejoining onto authority_repo",
+    "mount": "worker_workspace.sandbox_argv binds the real host package root read-only at SANDBOX_PACKAGE_IMPORT_ROOT, independent of the SANDBOX_AUTHORITY_REPO bind (package root may live entirely outside authority_repo)",
+    "generate_worker_mcp_runtime_signature": "package_import_root: Path is now a required explicit parameter; env[PYTHONPATH] = str(package_import_root) verbatim, no derivation inside the function",
+    "landlock_direct": "backend != 'bubblewrap' passes the real resolved host package root straight through, byte-identical to pre-B870 behavior",
+    "process_launcher_wiring": "process_launcher.py's sandbox_argv call now passes package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root()"
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py",
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_worker_mcp_module_launch_b869_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_worker_mcp_bubblewrap_portability_b870_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_worker_mcp_bubblewrap_portability_b870_v2.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_worker_mcp_bubblewrap_portability_b870_v2.json"
+  ],
+  "tests": {
+    "b869_v1_repaired": "generate_worker_mcp_runtime calls now pass explicit package_import_root=_SRC; symlink-into-fake-repo hack removed (no longer needed since PYTHONPATH is never rebased onto authority_repo)",
+    "b870_v1_repaired": "asserts PYTHONPATH == SANDBOX_PACKAGE_IMPORT_ROOT under bubblewrap (not an authority_repo subpath), real host path under landlock/direct, live bwrap handshake with package root bound OUTSIDE the fake authority repo",
+    "b870_v2_new": [
+      "resolve_host_package_import_root layout-independence proven via 3 real subprocess-spawned layouts: standalone <repo>/src/aiworkhub, differently-nested monorepo, bundled-outside-any-repo",
+      "generate_worker_mcp_runtime never rebases package_import_root onto an unrelated authority_repo (regression guard for the rejected V1 shape)",
+      "sandbox_argv binds package_import_root at the dedicated alias, independent of SANDBOX_AUTHORITY_REPO, and omits the bind when not provided",
+      "provision_worker_mcp_runtime's provisioned PYTHONPATH alias matches the alias sandbox_argv actually binds (cross-call-site consistency)",
+      "live bubblewrap handshake proving the current nested-monorepo layout (package root beneath the real repo root) still works, using a self-contained fake authority repo to avoid flakiness from the shared checkout's live/dirty state"
+    ]
+  },
+  "validation_command": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_worker_mcp_module_launch_b869_v1.py tests/test_aiworkhub_worker_mcp_bubblewrap_portability_b870_v1.py tests/test_aiworkhub_worker_mcp_bubblewrap_portability_b870_v2.py",
+  "validation_result": "12 passed, 2 skipped (bubblewrap unusable on this host; landlock fallback path unaffected)"
+}

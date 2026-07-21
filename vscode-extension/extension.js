@@ -638,6 +638,29 @@ class McpStdioClient {
       }
     }
   }
+
+  // B865: stop the ONE lifecycle-owned dispatcher for this repository
+  // BEFORE terminating this client's own MCP child process. The dispatcher's
+  // CallbackBridge can hold a nested AppServerClient subprocess
+  // (start_new_session=True -- its own process group), which a bare
+  // SIGTERM to this outer child would never reach, orphaning it. Routing
+  // through the aiworkhub_dispatcher_stop tool first lets the server join
+  // the dispatcher thread and call that nested client's own .stop()
+  // (see aiworkhub.callback_bridge.CallbackBridge.daemon/stop_daemon)
+  // before this outer child dies. Best-effort and bounded: only sent while
+  // the child is alive and handshaken; a transport failure here never
+  // blocks terminating the child -- deactivate/reload/repo-switch must
+  // never hang on a dead connection.
+  async stopDispatcherThenTerminate({ restart = false } = {}) {
+    if (this.running && this.initialized) {
+      try {
+        await this.request("tools/call", { name: DISPATCHER_TOOLS.stop, arguments: {} }, MCP_REQUEST_TIMEOUT_MS);
+      } catch (_err) {
+        // Best-effort -- proceed to terminate the child regardless.
+      }
+    }
+    this.stop({ restart });
+  }
 }
 
 let outputChannel = null;
@@ -667,7 +690,11 @@ function getMcpClient(context) {
   const identity = { ...repo, label: displayLabel };
   if (!mcpClient || mcpClient.repositoryRoot !== root || mcpClient.repositoryIdentity.repoId !== identity.repoId) {
     if (mcpClient) {
-      mcpClient.stop({ restart: false });
+      // Fire-and-forget: getMcpClient() is synchronous and must return the
+      // new client immediately; the stale client's dispatcher-stop-then-
+      // terminate cleanup (see stopDispatcherThenTerminate) runs in the
+      // background so it can never block binding to the new repository.
+      mcpClient.stopDispatcherThenTerminate({ restart: false }).catch(() => {});
     }
     activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
     activeRepoIdentity = identity;
@@ -1778,10 +1805,12 @@ async function selectRepositoryCommand() {
   // Persist the choice.
   ctx.workspaceState.update(WSP_STATE_KEY_REPO_URI, choice.uriStr);
 
-  // Stop the old MCP child and clear state.
+  // Stop the old dispatcher (never orphaning a nested app-server
+  // subprocess) and the old MCP child, then clear state.
   if (mcpClient) {
-    mcpClient.stop({ restart: false });
+    const oldClient = mcpClient;
     mcpClient = null;
+    await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
   activeRepoIdentity = null;
   activeRepoLabel = "Switching repository";
@@ -1859,10 +1888,15 @@ function activate(context) {
   );
 }
 
-function deactivate() {
+async function deactivate() {
   if (mcpClient) {
-    mcpClient.stop({ restart: false });
+    const oldClient = mcpClient;
     mcpClient = null;
+    // B865: stop the dispatcher before the child dies -- extension host
+    // teardown (deactivate on reload/uninstall/window close) is exactly the
+    // path that previously let a nested app-server subprocess survive as an
+    // orphan (see stopDispatcherThenTerminate).
+    await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
   extensionContext = null;
 }

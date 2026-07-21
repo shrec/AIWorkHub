@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -24,7 +25,9 @@ if str(_SRC) not in sys.path:
 
 from aiworkhub import agent_tool_instructions as instr  # noqa: E402
 from aiworkhub import process_launcher  # noqa: E402
+from aiworkhub import repository_state  # noqa: E402
 from aiworkhub import runtime_adapters  # noqa: E402
+from aiworkhub import source_graph as source_graph_mod  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub import worker_workspace  # noqa: E402
 
@@ -43,86 +46,175 @@ def _mute_chmod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
 
 
-def _write_tool(path: Path, body: str) -> None:
+# ---------------------------------------------------------------------------
+# Real, minimal canonical SQLite fixtures (B878): worker_ai_tools_mcp now
+# queries the KB / AI Memory / Session-Manager canonical databases directly
+# with in-process sqlite3 -- it no longer shells out to AITools/*.py, so
+# these tests must build real schema-matching databases at the registry's
+# canonical paths instead of fake non-sqlite placeholder bytes.
+# ---------------------------------------------------------------------------
+
+def _seed_kb_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-
-
-def _write_storage_registry(repo: Path) -> None:
-    """Minimal fake ``.aiworkhub/config/storage.json`` -- every component
-    declared ``legacy_source``, none cut over to canonical (matches the real
-    repo's current state), so ``_resolve_authority_db`` uses legacy_source."""
-    registry = {
-        "durable_root": ".aiworkhub",
-        "databases": [
-            {"component": "source_graph", "id": "source_graph", "legacy_source": "AITools/source_graph.db",
-             "canonical_durable_path": "source_graph/source_graph.sqlite",
-             "authority": {"canonical_active": False, "state": "shadow"}},
-            {"component": "sessions", "id": "session", "legacy_source": "AITools/session.db",
-             "canonical_durable_path": "sessions/sessions.sqlite",
-             "authority": {"canonical_active": False, "state": "shadow"}},
-            {"component": "sessions", "id": "transcript", "legacy_source": "AITools/transcript_graph.db",
-             "canonical_durable_path": "sessions/transcript_graph.sqlite",
-             "authority": {"canonical_active": False, "state": "shadow"}},
-            {"component": "memory", "id": "memory", "legacy_source": "AITools/ai_memory/ai_memory.db",
-             "canonical_durable_path": "memory/memory.sqlite",
-             "authority": {"canonical_active": False, "state": "shadow"}},
-            {"component": "kb", "id": "kb", "legacy_source": "AITools/kb.db",
-             "canonical_durable_path": "kb/knowledge.sqlite",
-             "authority": {"canonical_active": False, "state": "shadow"}},
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT 'note', tags TEXT NOT NULL DEFAULT '',
+            source_refs TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE VIRTUAL TABLE entries_fts USING fts5(
+            key, title, body, tags, content=entries, content_rowid=id,
+            tokenize='unicode61 remove_diacritics 0'
+        );
+        CREATE TRIGGER entries_ai AFTER INSERT ON entries BEGIN
+            INSERT INTO entries_fts(rowid, key, title, body, tags)
+            VALUES (new.id, new.key, new.title, new.body, new.tags);
+        END;
+        CREATE TABLE links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_key TEXT NOT NULL, to_key TEXT NOT NULL, relation TEXT NOT NULL DEFAULT 'related'
+        );
+        """
+    )
+    now = "2026-01-01T00:00:00Z"
+    con.executemany(
+        "INSERT INTO entries(key,title,body,category,tags,source_refs,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (
+                "pipeline.stage_order", "Task MCP worker tools",
+                "bounded Source Graph context for Task MCP worker tools",
+                "module", "task_mcp,worker", "", now, now,
+            ),
+            (
+                "arch.v_grow.multi_layer", "v_grow multi layer",
+                "spawn conditions, dilution risk", "arch", "task_mcp", "", now, now,
+            ),
         ],
-    }
-    path = repo / ".aiworkhub" / "config" / "storage.json"
+    )
+    con.execute(
+        "INSERT INTO links(from_key,to_key,relation) VALUES (?,?,?)",
+        ("arch.v_grow.multi_layer", "pipeline.stage_order", "related"),
+    )
+    con.commit()
+    con.close()
+
+
+def _seed_memory_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(registry), encoding="utf-8")
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL,
+            tags TEXT DEFAULT '', scope TEXT DEFAULT 'persistent', project TEXT DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            access_count INTEGER DEFAULT 0, last_accessed TEXT DEFAULT ''
+        );
+        CREATE VIRTUAL TABLE memories_fts USING fts5(key, value, tags, content=memories, content_rowid=id);
+        CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, key, value, tags)
+            VALUES (new.id, new.key, new.value, new.tags);
+        END;
+        """
+    )
+    now = "2026-01-01T00:00:00+00:00"
+    con.execute(
+        "INSERT INTO memories(key,value,tags,scope,project,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+        ("ctx", "bounded worker dynamic MCP context", "task_mcp", "persistent", "", now, now),
+    )
+    con.commit()
+    con.close()
 
 
-def _fake_repo(tmp_path: Path, *, sections: int = 1, name: str = "repo") -> Path:
-    """A fake AUTHORITY repository: real (non-empty) db files at every
-    declared legacy_source path plus a storage.json registry, so
-    ``_resolve_authority_db``'s existence/size gate passes."""
+def _seed_transcript_db(path: Path, *, topic: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE documents (
+            doc_id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_id TEXT NOT NULL,
+            session_id INTEGER, timestamp TEXT, kind TEXT, speaker TEXT, content TEXT NOT NULL, tags TEXT
+        );
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+            content, kind, tags, content='documents', content_rowid='doc_id'
+        );
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, content, kind, tags)
+            VALUES (new.doc_id, new.content, new.kind, new.tags);
+        END;
+        """
+    )
+    con.execute(
+        "INSERT INTO documents(source,source_id,session_id,timestamp,kind,speaker,content,tags) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("session", "evt-1", 1, "2026-01-01T00:00:00Z", "progress", "worker", f"{topic} bounded discovery", ""),
+    )
+    con.commit()
+    con.close()
+
+
+def _bootstrap_manifest_and_registry(repo: Path) -> None:
+    """Canonical AIWorkHub 0.6.0 repo-local authority: a real
+    ``.aiworkhub/project.json`` manifest plus the matching
+    ``.aiworkhub/config/storage.json`` registry -- the current explicit
+    binding every authority lookup (generic and Source Graph) resolves
+    against. Every declared component defaults to its ``legacy_source``
+    (matches the real repo's current, not-yet-cut-over state)."""
+    repository_state.bootstrap_repository(repo)
+
+
+def _stub_source_graph_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    relevant_files: tuple[str, ...] = ("AITools/x.py", "tools/geoai-task-mcp/src/aiworkhub/x.py"),
+) -> list[tuple[str, str, int]]:
+    """Stand in for aiworkhub.source_graph's real FTS query engine (its own
+    correctness is covered by that module's own test suite) so these
+    fixtures can assert query/caching/audit semantics against a
+    deterministic payload without building a real on-disk index. Returns
+    the list of (mode, query, budget) calls actually made."""
+    calls: list[tuple[str, str, int]] = []
+
+    def _payload(mode: str, query: str, budget: int) -> dict:
+        calls.append((mode, query, budget))
+        return {"target": query, "relevant_files": list(relevant_files)}
+
+    monkeypatch.setattr(source_graph_mod, "focus", lambda repo_root, query, budget=64: _payload("focus", query, budget))
+    monkeypatch.setattr(source_graph_mod, "slice_", lambda repo_root, query, budget=64: _payload("slice", query, budget))
+    monkeypatch.setattr(
+        source_graph_mod, "bundle",
+        lambda repo_root, bundle_type, query, max_lines=64: _payload("bundle", query, max_lines),
+    )
+    return calls
+
+
+def _fake_repo(tmp_path: Path, *, name: str = "repo") -> Path:
+    """A standalone authority repository with canonical SQLite stores only.
+
+    Deliberately does not create an ``AITools`` directory: every worker tool
+    must operate from the selected repository's ``.aiworkhub`` authority.
+    """
     repo = tmp_path / name
-    (repo / "AITools" / "ai_memory").mkdir(parents=True)
-    _write_storage_registry(repo)
-    for relative in (
-        "AITools/source_graph.db", "AITools/session.db", "AITools/transcript_graph.db",
-        "AITools/ai_memory/ai_memory.db", "AITools/kb.db",
-    ):
-        (repo / relative).write_bytes(b"SQLite format 3\x00fake-non-empty-authority-db")
-    _write_tool(
-        repo / "AITools/source_graph.py",
-        f"""
-import json, sys
-print('[*] Language: python (python)')
-print(json.dumps({{"target": sys.argv[2], "sections": [{{"items": [{{"file": "x.py"}}]}}] * {sections}}}))
-""",
+    repo.mkdir(parents=True)
+    _bootstrap_manifest_and_registry(repo)
+    assert not (repo / "AITools").exists()
+    source_graph_db = repo / ".aiworkhub" / "source_graph" / "source_graph.sqlite"
+    source_graph_db.parent.mkdir(parents=True, exist_ok=True)
+    source_graph_db.write_bytes(b"SQLite format 3\x00fake-non-empty-source-graph-db")
+    # session_current_state resolves this component's existence/size only --
+    # it is never opened -- so a non-empty placeholder is sufficient.
+    (repo / ".aiworkhub" / "sessions" / "sessions.sqlite").parent.mkdir(parents=True, exist_ok=True)
+    (repo / ".aiworkhub" / "sessions" / "sessions.sqlite").write_bytes(b"SQLite format 3\x00fake-non-empty-session-db")
+    _seed_transcript_db(
+        repo / ".aiworkhub" / "sessions" / "transcript_graph.sqlite",
+        topic="AIWorkHub dynamic worker MCP B833",
     )
-    _write_tool(
-        repo / "AITools/transcript_graph.py",
-        """
-import json, sys
-print(json.dumps({"state": "partial_state", "evidence": [{"id": 1}], "topic": sys.argv[2]}))
-""",
-    )
-    _write_tool(
-        repo / "AITools/ai_memory/ai_memory.py",
-        """
-import json
-print(json.dumps({"count": 1, "results": [{"key": "ctx", "value": "bounded"}]}))
-""",
-    )
-    _write_tool(
-        repo / "AITools/kb.py",
-        """
-import sys
-if sys.argv[1] == "search":
-    print("[module] task_mcp_context -- bounded Source Graph context")
-elif sys.argv[1] == "get":
-    print("pipeline.stage_order: bounded stage order")
-else:
-    print("[related] arch.v_grow.multi_layer")
-""",
-    )
+    _seed_memory_db(repo / ".aiworkhub" / "memory" / "memory.sqlite")
+    _seed_kb_db(repo / ".aiworkhub" / "kb" / "knowledge.sqlite")
     return repo
 
 
@@ -135,6 +227,7 @@ def _ctx(
         home=home, request_id=request_id, task_id="TASK_B833", runner="claude_b833",
         topic="task_mcp", repo=repo, authority_repo=authority_repo,
         source_graph_targets=list(targets), session_topic="AIWorkHub dynamic worker MCP B833",
+        package_import_root=w.resolve_host_package_import_root(),
     )
     return w.WorkerToolContext(
         task_id="TASK_B833", runner="claude_b833", topic="task_mcp", request_id=request_id,
@@ -204,6 +297,7 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
 def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
 
     first = w.source_graph_query(ctx, mode="focus", query="ignored", budget=32)
@@ -269,6 +363,7 @@ def test_ai_memory_search_rejects_overbudget_query(monkeypatch: pytest.MonkeyPat
 def test_verify_audit_ledger_drops_tampered_and_forged_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
     w.source_graph_query(ctx, mode="focus", query="ignored")
 
@@ -296,6 +391,7 @@ def test_verify_audit_ledger_drops_tampered_and_forged_entries(monkeypatch: pyte
 def test_verify_audit_ledger_ignores_calls_from_a_different_task(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
     w.source_graph_query(ctx, mode="focus", query="ignored")
 
@@ -319,6 +415,7 @@ def test_verify_audit_ledger_fails_closed_on_unreadable_key_or_ledger(tmp_path: 
 def test_audit_verification_never_exposes_paths_or_key_material(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
     w.source_graph_query(ctx, mode="focus", query="ignored")
     key_bytes = ctx.audit_hmac_key_path.read_bytes()
@@ -378,7 +475,9 @@ def test_worker_ai_tools_module_imports_no_task_mutation_or_shell_surface() -> N
     assert "from . import core" not in source
     assert "import process_launcher" not in source
     assert "from . import process_launcher" not in source
-    assert "import subprocess" in source  # only for the fixed-argv helper
+    # B878: KB / AI Memory / Session Manager are now queried in-process via
+    # sqlite3 -- this module never shells out to AITools/*.py at all.
+    assert "import subprocess" not in source
     assert "shell=True" not in source
 
 
@@ -388,6 +487,7 @@ def test_fake_worker_end_to_end_dynamic_tool_call(monkeypatch: pytest.MonkeyPatc
     authenticated audit ledger as a real, independently-verifiable call."""
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
     fake_mcp = _FakeMcp()
     w.register_tools(fake_mcp, ctx)
@@ -415,6 +515,7 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
         home=home, request_id="req42", task_id="TASK_B833", runner="claude_b833",
         topic="task_mcp", repo=repo, authority_repo=repo, source_graph_targets=["AITools/source_graph.py"],
         session_topic="AIWorkHub dynamic worker MCP B833",
+        package_import_root=w.resolve_host_package_import_root(),
     )
 
     # Sandbox visibility: every generated artifact lives under this request's
@@ -425,11 +526,18 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
     ):
         assert str(path).startswith(str(home))
 
+    module_file = Path(w.__file__).resolve()
+    expected_package_module = f"{module_file.parent.name}.{module_file.stem}"
+
     claude_cfg = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     server = claude_cfg["mcpServers"][w.SERVER_NAME]
     assert server["command"] == sys.executable
-    assert server["args"] == [str(Path(w.__file__).resolve())]
+    # B869: launched as a package module, never the bare relative-importing
+    # file -- `python <file.py>` runs it as `__main__` with no known parent
+    # package, so `from .repository_state import ...` raises ImportError.
+    assert server["args"] == ["-m", expected_package_module]
     assert server["env"][w.ENV_TASK_ID] == "TASK_B833"
+    assert server["env"][w.ENV_PYTHONPATH] == str(module_file.parents[1])
 
     copilot_cfg = json.loads(runtime.copilot_mcp_config_path.read_text(encoding="utf-8"))
     assert copilot_cfg == claude_cfg
@@ -437,7 +545,9 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
     codex_toml = runtime.codex_config_toml_path.read_text(encoding="utf-8")
     assert f"[mcp_servers.{w.SERVER_NAME}]" in codex_toml
     assert f"[mcp_servers.{w.SERVER_NAME}.env]" in codex_toml
+    assert f'args = ["-m", "{expected_package_module}"]' in codex_toml
     assert w.ENV_TASK_ID in codex_toml and "TASK_B833" in codex_toml
+    assert w.ENV_PYTHONPATH in codex_toml and str(module_file.parents[1]) in codex_toml
     assert runtime.codex_config_toml_path == home / ".codex" / "config.toml"
 
     # No credential leakage: the runtime env never carries a provider secret.
@@ -453,6 +563,7 @@ def test_generate_worker_mcp_runtime_is_idempotent_on_the_audit_key(monkeypatch:
     kwargs = dict(
         home=home, request_id="req1", task_id="T", runner="r", topic="t",
         repo=repo, authority_repo=repo, source_graph_targets=[], session_topic="t",
+        package_import_root=w.resolve_host_package_import_root(),
     )
     first = w.generate_worker_mcp_runtime(**kwargs)
     key_after_first = first.audit_hmac_key_path.read_bytes()
@@ -623,6 +734,7 @@ def test_live_call_gate_blocks_code_task_when_runtime_never_provisioned(tmp_path
 def test_live_call_gate_passes_code_task_with_one_verified_live_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",), request_id="req1")
     w.source_graph_query(ctx, mode="focus", query="ignored")
     gate = process_launcher._worker_mcp_live_call_gate(
@@ -650,6 +762,7 @@ def test_live_call_gate_is_a_noop_without_a_project_context_contract(tmp_path: P
 def test_live_call_gate_telemetry_never_leaks_ledger_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",), request_id="req1")
     w.source_graph_query(ctx, mode="focus", query="ignored")
     gate = process_launcher._worker_mcp_live_call_gate(

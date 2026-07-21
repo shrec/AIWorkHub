@@ -78,7 +78,7 @@ SELF_TASK_ID = "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_RETRY_B11_V1"
 STATE_FILES = [
     REPO_ROOT / "bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
     REPO_ROOT / "bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
-    REPO_ROOT / "tools/geoai-task-mcp/logs/audit.jsonl",
+    REPO_ROOT / ".aiworkhub/runtime/process_logs/audit.jsonl",
 ]
 
 

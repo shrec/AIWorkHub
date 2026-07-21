@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,10 +21,95 @@ from typing import Any, Mapping
 
 TASK_ID = "CODEX_GPT55_AIWORKHUB_FRESH_TASKDB_CUTOVER_B832_V1"
 HUB = ".aiworkhub"
-LEGACY_REL = Path("bitnnv2") / "data" / "tasking" / "task_queue_v1.sqlite"
 CANONICAL_REL = Path("tasking") / "task_queue.sqlite"
 ARCHIVE_REL = Path("tasking") / "archive" / "task_queue_v1_legacy_20260720.sqlite"
 EMPTY_TABLES = ("tasks", "task_events", "callback_outbox", "callback_batches")
+
+# Self-contained schema for a fresh, empty canonical queue -- matches the
+# fully-migrated shape of AITools/taskdb.py::SCHEMA plus its idempotent
+# tasks.origin_thread_id migration, inlined so this module never imports the
+# repo-root AITools package to initialize a queue.
+_FRESH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id TEXT PRIMARY KEY,
+  runner TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_status TEXT NOT NULL DEFAULT 'unclaimed',
+  priority TEXT NOT NULL DEFAULT '',
+  objective TEXT NOT NULL DEFAULT '',
+  card_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  claimed_by TEXT,
+  claimed_at TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  archived_at TEXT NOT NULL DEFAULT '',
+  origin_thread_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_origin_thread_id ON tasks(origin_thread_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_archived_at ON tasks(archived_at);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  runner TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+  artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT '',
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS callback_outbox (
+  outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  origin_thread_id TEXT NOT NULL,
+  transition TEXT NOT NULL,
+  episode_id TEXT NOT NULL DEFAULT '0',
+  event_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  lease_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT NOT NULL DEFAULT '',
+  batch_id TEXT NOT NULL DEFAULT '',
+  UNIQUE(task_id, transition, origin_thread_id, episode_id, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_callback_outbox_state ON callback_outbox(state);
+CREATE INDEX IF NOT EXISTS idx_callback_outbox_batch_id ON callback_outbox(batch_id);
+
+CREATE TABLE IF NOT EXISTS callback_batches (
+  batch_id TEXT PRIMARY KEY,
+  origin_thread_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  lease_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT NOT NULL DEFAULT '',
+  member_count INTEGER NOT NULL DEFAULT 0,
+  not_before_at TEXT NOT NULL DEFAULT '',
+  hard_failure_count INTEGER NOT NULL DEFAULT 0,
+  last_failure_kind TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_callback_batches_state ON callback_batches(state);
+"""
 
 
 class FreshTaskStoreError(RuntimeError):
@@ -69,7 +153,13 @@ def _safe_join(base: Path, rel_value: str, field: str) -> Path:
     return path
 
 
-def resolve_paths(repo_root: str | Path) -> FreshTaskStorePaths:
+def resolve_paths(repo_root: str | Path, *, legacy_db: str | Path | None = None) -> FreshTaskStorePaths:
+    """Resolve cutover paths.
+
+    ``legacy_db`` must be an explicit caller-supplied Path (or a repo-relative
+    string). This module never guesses or reads a legacy source location from
+    repository configuration.
+    """
     root = Path(repo_root).resolve(strict=False)
     manifest = _load_json(root / HUB / "project.json")
     registry = _load_json(root / HUB / "config" / "storage.json")
@@ -79,11 +169,16 @@ def resolve_paths(repo_root: str | Path) -> FreshTaskStorePaths:
     if registry.get("durable_root") != HUB:
         raise FreshTaskStoreError("durable_root_invalid")
     task_record = _task_queue_record(registry)
+    if legacy_db is None:
+        raise FreshTaskStoreError("legacy_db_not_supplied")
+    resolved_legacy = Path(legacy_db)
+    if not resolved_legacy.is_absolute():
+        resolved_legacy = _safe_join(root, resolved_legacy.as_posix(), "legacy_db")
     return FreshTaskStorePaths(
         repo_root=root,
         repo_id=repo_id,
         registry_path=root / HUB / "config" / "storage.json",
-        legacy_db=_safe_join(root, str(task_record.get("legacy_source") or LEGACY_REL.as_posix()), "legacy_source"),
+        legacy_db=resolved_legacy,
         archive_db=_safe_join(root / HUB, ARCHIVE_REL.as_posix(), "archive"),
         canonical_db=_safe_join(root / HUB, str(task_record.get("canonical_durable_path") or CANONICAL_REL.as_posix()), "canonical"),
     )
@@ -94,15 +189,6 @@ def _task_queue_record(registry: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("id") == "task_queue":
             return item
     raise FreshTaskStoreError("task_queue_record_missing")
-
-
-def _taskdb_module(repo_root: Path):
-    aitools = str(repo_root / "AITools")
-    if aitools not in sys.path:
-        sys.path.insert(0, aitools)
-    import taskdb  # type: ignore[import-not-found]
-
-    return taskdb
 
 
 def _connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
@@ -250,8 +336,8 @@ def _lease_is_live(expires_at: str) -> bool:
     return parsed > datetime.now(timezone.utc)
 
 
-def preflight(repo_root: str | Path) -> dict[str, Any]:
-    paths = resolve_paths(repo_root)
+def preflight(repo_root: str | Path, *, legacy_db: str | Path | None = None) -> dict[str, Any]:
+    paths = resolve_paths(repo_root, legacy_db=legacy_db)
     if not paths.legacy_db.is_file():
         raise FreshTaskStoreError(f"legacy_db_missing:{paths.legacy_db}")
     with _connect(paths.legacy_db, readonly=True) as conn:
@@ -278,34 +364,57 @@ def _paths_json(paths: FreshTaskStorePaths) -> dict[str, str]:
     }
 
 
-def _initialize_empty_db(repo_root: Path, destination: Path) -> dict[str, Any]:
-    taskdb = _taskdb_module(repo_root)
+def _create_fresh_empty_db(destination: Path) -> None:
+    """Write a schema-only, empty canonical queue to ``destination`` atomically.
+
+    Self-contained: builds the schema from ``_FRESH_SCHEMA`` inline, no
+    import of the repo-root AITools package.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{destination.name}.fresh.", suffix=".tmp", dir=str(destination.parent))
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        with taskdb.open_db(tmp) as conn:
-            taskdb.init_db(conn)
+        with _connect(tmp) as conn:
+            conn.executescript(_FRESH_SCHEMA)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.commit()
         qc = quick_check(tmp)
         counts = empty_counts(tmp)
         if qc != "ok" or any(counts.values()):
             raise FreshTaskStoreError(f"fresh_db_not_empty:quick_check={qc}:counts={counts}")
-        return {
-            "path": str(tmp),
-            "quick_check": qc,
-            "byte_size": tmp.stat().st_size,
-            "schema_fingerprint": schema_fingerprint(tmp),
-            "counts": counts,
-        }
-    except Exception:
+        os.replace(tmp, destination)
+    finally:
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
-        raise
+
+
+def _ensure_canonical_db(destination: Path) -> dict[str, Any]:
+    """Idempotent canonical-queue init: reuse an already-published queue
+    instead of clobbering it, otherwise publish a fresh empty schema."""
+    if destination.exists():
+        qc = quick_check(destination)
+        if qc != "ok":
+            raise FreshTaskStoreError(f"existing_canonical_corrupt:quick_check={qc}")
+        return {
+            "path": str(destination),
+            "quick_check": qc,
+            "byte_size": destination.stat().st_size,
+            "schema_fingerprint": schema_fingerprint(destination),
+            "counts": table_counts(destination),
+            "reused_existing": True,
+        }
+    _create_fresh_empty_db(destination)
+    return {
+        "path": str(destination),
+        "quick_check": quick_check(destination),
+        "byte_size": destination.stat().st_size,
+        "schema_fingerprint": schema_fingerprint(destination),
+        "counts": empty_counts(destination),
+        "reused_existing": False,
+    }
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -369,9 +478,9 @@ def _other_records_unchanged(before: Mapping[str, Any], after: Mapping[str, Any]
     return without_task_queue(before) == without_task_queue(after)
 
 
-def cutover(repo_root: str | Path, *, execute: bool = False) -> dict[str, Any]:
-    paths = resolve_paths(repo_root)
-    pf = preflight(paths.repo_root)
+def cutover(repo_root: str | Path, *, legacy_db: str | Path | None = None, execute: bool = False) -> dict[str, Any]:
+    paths = resolve_paths(repo_root, legacy_db=legacy_db)
+    pf = preflight(paths.repo_root, legacy_db=paths.legacy_db)
     if not pf["ok"]:
         raise CutoverRefusedError("preflight_refused")
     if not execute:
@@ -411,15 +520,7 @@ def cutover(repo_root: str | Path, *, execute: bool = False) -> dict[str, Any]:
     ):
         raise FreshTaskStoreError("archive_parity_failed")
 
-    fresh = _initialize_empty_db(paths.repo_root, paths.canonical_db)
-    fresh_tmp = Path(str(fresh["path"]))
-    try:
-        os.replace(fresh_tmp, paths.canonical_db)
-    finally:
-        try:
-            fresh_tmp.unlink()
-        except FileNotFoundError:
-            pass
+    fresh = _ensure_canonical_db(paths.canonical_db)
 
     registry = _rebase_registry(paths, str(archive["sha256"]), rollback=False)
     return {
@@ -430,13 +531,13 @@ def cutover(repo_root: str | Path, *, execute: bool = False) -> dict[str, Any]:
         "paths": _paths_json(paths),
         "archive": archive,
         "source": source,
-        "fresh": {**fresh, "path": str(paths.canonical_db)},
+        "fresh": fresh,
         "registry": registry,
     }
 
 
-def rollback(repo_root: str | Path, *, execute: bool = False) -> dict[str, Any]:
-    paths = resolve_paths(repo_root)
+def rollback(repo_root: str | Path, *, legacy_db: str | Path | None = None, execute: bool = False) -> dict[str, Any]:
+    paths = resolve_paths(repo_root, legacy_db=legacy_db)
     if not paths.archive_db.is_file():
         raise FreshTaskStoreError("archive_missing")
     archive_hash = sha256_file(paths.archive_db)
@@ -474,7 +575,6 @@ __all__ = [
     "CutoverRefusedError",
     "FreshTaskStoreError",
     "FreshTaskStorePaths",
-    "LEGACY_REL",
     "TASK_ID",
     "cutover",
     "preflight",

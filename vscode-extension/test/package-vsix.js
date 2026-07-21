@@ -10,8 +10,8 @@ const extensionDir = path.join(staging, "extension");
 const out = path.join(dist, `${pkg.name}-${pkg.version}.vsix`);
 
 // Canonical, single source of truth for the bundled Python MCP runtime: the
-// same tools/geoai-task-mcp/src/aiworkhub package this repo tests/ships
-// everywhere else. Copied wholesale (including dashboard_static/* assets)
+// same src/aiworkhub package this repo tests/ships everywhere else. Copied
+// wholesale (including dashboard_static/* assets)
 // into an extension-local runtime/ directory so the packaged extension never
 // needs a repository checkout, an editable install, user/site-packages, or a
 // network install to run `python -m aiworkhub.server` -- see extension.js's
@@ -28,7 +28,7 @@ function copyFile(rel) {
   const target = path.join(extensionDir, rel);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   // README.md is the one bundled asset that lives one directory up (this
-  // extension shares tools/geoai-task-mcp/README.md as its packaged
+  // extension shares this repo's top-level README.md as its packaged
   // description rather than duplicating a second copy inside
   // vscode-extension/) -- fall back to it only when no local override exists.
   const localPath = path.join(root, rel);

@@ -144,7 +144,7 @@ def resolve_db_path(repo_root: Path) -> Path:
     """Resolve the canonical Source Graph database for ``repo_root``.
 
     Always ``<repo_root>/.aiworkhub/source_graph/source_graph.sqlite`` via
-    the repository-bound storage registry -- never a fixed GeoAI-specific
+    the repository-bound storage registry -- never a fixed project-specific
     path and never influenced by process ``cwd``.
     """
 
@@ -173,7 +173,7 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# File discovery -- generic, repo-agnostic (no GeoAI-specific hardcoding)
+# File discovery -- generic, repo-agnostic (no project-specific hardcoding)
 # ---------------------------------------------------------------------------
 
 def iter_source_files(repo_root: Path) -> list[Path]:

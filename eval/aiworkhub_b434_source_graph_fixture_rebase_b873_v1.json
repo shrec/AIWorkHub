@@ -1,0 +1,28 @@
+{
+  "schema_id": "aiworkhub.task_mcp.worker_eval_report.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_B434_SOURCE_GRAPH_FIXTURE_REBASE_B873_V1",
+  "runner": "claude_sonnet5_aiworkhub_b434_source_graph_fixture_rebase_b873_v1",
+  "goal": "Rebase tests/test_worker_project_context_b434_v1.py off the removed AITools/source_graph.py subprocess stub onto the canonical in-process project_context._source_graph_direct monkeypatch fixture pattern (B866/B871).",
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py"
+  ],
+  "production_code_changed": false,
+  "fixture_changes": {
+    "removed": "AITools/source_graph.py subprocess stub script and its argv-based invocation",
+    "added": "_stub_source_graph_direct(monkeypatch) helper that monkeypatches project_context._source_graph_direct to echo back mode/query/budget from the validated contract",
+    "adjusted": [
+      "required-context-missing test now unlinks AITools/transcript_graph.py (the file production actually checks) instead of the removed AITools/source_graph.py",
+      "workspace no-db-copy test git-adds only transcript_graph.py and kb.py (source_graph.py fixture file no longer created)"
+    ]
+  },
+  "acceptance_checks": {
+    "no_test_relies_on_source_graph_py_or_subprocess_argv": true,
+    "source_modes_bounded_preview_required_optional_degradation_preserved": true,
+    "pre_claim_rejection_and_identical_bundle_delivery_preserved": true,
+    "no_production_code_changes": true
+  },
+  "validation": {
+    "pytest_test_worker_project_context_b434_v1": "8 passed",
+    "json_tool_self_check": "pending_runtime_stamp"
+  }
+}

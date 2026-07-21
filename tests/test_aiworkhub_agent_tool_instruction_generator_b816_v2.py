@@ -117,7 +117,7 @@ def test_diff_api_is_non_mutating() -> None:
 
 
 def test_eval_artifact_matches_rendered_policy() -> None:
-    path = Path("tools/geoai-task-mcp/eval/aiworkhub_agent_tool_instruction_generator_b816_v2.json")
+    path = Path(__file__).resolve().parents[1] / "eval" / "aiworkhub_agent_tool_instruction_generator_b816_v2.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_id"] == "aiworkhub.task_mcp.agent_tool_instruction_generator_b816_v2.eval.v1"
     assert payload["canonical_sha256"] == payload["projections"]["AGENTS.md"]["canonical_sha256"]

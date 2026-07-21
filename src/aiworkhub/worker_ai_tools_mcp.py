@@ -27,8 +27,11 @@ Hard invariants:
     writing text that looks like one, because it cannot forge the HMAC
     without the secret, and any tampered line is dropped by the verifier
     rather than trusted.
-  * Every subprocess call is fixed-argv (never shell), timeout-bounded, and
-    output-capped, mirroring the bounded-context pattern already used by
+  * No tool ever shells out to a script or spawns a subprocess: Source Graph,
+    Session Manager, AI Memory and KB are all queried in-process (direct
+    ``sqlite3`` reads against the canonical registry-resolved database, or a
+    direct call into ``aiworkhub.source_graph``), bounded and output-capped,
+    mirroring the bounded-context pattern already used by
     ``project_context.py`` for the coordinator's own precomputed bundle.
 
 Binding note (B834 authority repair): this module receives TWO separate,
@@ -42,27 +45,31 @@ immutable repository bindings, never one conflated path:
     checks; not used to source authoritative index data.
   * ``ENV_AUTHORITY_REPO`` / ``ctx.authority_repo`` -- the coordinator-owned
     host repository the worktree was created FROM. Every Source Graph,
-    Session Manager, AI Memory and KB call in this module invokes that
-    repository's OWN copy of the relevant ``AITools/*.py`` script (so each
-    script's ``__file__``-relative default database path resolves to the
-    real, populated, repository-owned database) and is bound read-only under
-    both sandbox backends -- see ``worker_workspace.sandbox_argv`` /
-    ``_apply_landlock`` for how each backend exposes it. B833's original
-    single-binding design pointed every lookup at the isolated worktree,
-    which silently produced empty/absent-database results that still looked
-    like a successful call; that is the defect this binding split repairs.
+    Session Manager, AI Memory and KB call in this module resolves its
+    database path from that repository's own ``.aiworkhub`` canonical
+    registry and reads it directly (in-process ``sqlite3``, read-only) --
+    never by shelling out to ``AITools/*.py``. B878 removed the last
+    subprocess-based lookups: ``AITools/ai_memory/ai_memory.py`` resolves its
+    database relative to its own ``__file__`` with no path-override flag, so
+    it could never be pointed at the canonical
+    ``.aiworkhub/memory/memory.sqlite`` location once a repository has no
+    adjacent ``AITools/ai_memory/ai_memory.db`` at all -- a canonical-only
+    repository could never satisfy that script's hardcoded path, so it had to
+    stop being invoked altogether, not just be pointed at a different file.
 
-Authority-state discipline: before invoking any of those scripts, this
-module resolves the target database path from the coordinator-owned
+Authority-state discipline: before running any query, this module resolves
+the target database path from the coordinator-owned
 ``.aiworkhub/config/storage.json`` registry (read from ``ctx.authority_repo``,
 never from ``ctx.repo``) and requires the resolved file to actually exist and
 be non-empty -- a missing or empty database is a hard, fail-closed violation,
 never silently substituted with a fresh/empty one and never counted as a
-successful live call. Until a component's registry entry marks
-``authority.canonical_active`` true, its declared ``legacy_source`` is used,
-and the resolved ``authority_source``/``authority_state`` is recorded on both
-the tool result and the audit entry so the ledger records real authority
-identity, not just a bare ok/fail bit.
+successful live call. Resolution is canonical-only: a component's registry
+entry must be marked ``authority.canonical_active`` true, or the lookup fails
+closed -- there is no ``legacy_source`` fallback and no automatic legacy
+discovery. The resolved ``authority_source`` (always ``"canonical"`` for a
+successful lookup) and ``authority_state`` are recorded on both the tool
+result and the audit entry so the ledger records real authority identity, not
+just a bare ok/fail bit.
 """
 
 from __future__ import annotations
@@ -71,8 +78,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
-import subprocess
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +106,10 @@ ENV_SOURCE_GRAPH_TARGETS = "AIWORKHUB_WORKER_MCP_SOURCE_GRAPH_TARGETS"
 ENV_SESSION_TOPIC = "AIWORKHUB_WORKER_MCP_SESSION_TOPIC"
 ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
+# The interpreter's own import-path variable (never an AIWORKHUB_* identity
+# binding) -- carries the portable ".../src" import root so `python -m
+# aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
+ENV_PYTHONPATH = "PYTHONPATH"
 
 BOUND_ENV_VARS: tuple[str, ...] = (
     ENV_TASK_ID, ENV_RUNNER, ENV_TOPIC, ENV_REQUEST_ID, ENV_REPO, ENV_AUTHORITY_REPO,
@@ -119,7 +131,8 @@ MIN_LIMIT = 1
 MAX_LIMIT = 20
 MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
-TOOL_TIMEOUT_SECONDS = 12
+SQLITE_QUERY_TIMEOUT_SECONDS = 5
+SESSION_SNIPPET_CHARS = 280
 
 
 class WorkerToolError(RuntimeError):
@@ -190,34 +203,37 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
 
 
 # ---------------------------------------------------------------------------
-# Bounded, fixed-argv subprocess execution (never shell; capped output)
+# Bounded, read-only, in-process SQLite queries (never a subprocess, never a
+# fixed AITools script path -- see module docstring, B878)
 # ---------------------------------------------------------------------------
 
-def _run_fixed_argv(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> tuple[str, bool]:
+_FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _fts_match_expr(raw: str) -> str | None:
+    """Convert free text into a literal, injection-safe FTS5 MATCH expression.
+
+    Each Unicode word token is emitted as its own double-quoted phrase so
+    punctuation (``-``, ``:``, ``(``, ``)``, ``"``, ``*``) already present in
+    a topic/query string can never be parsed as FTS5 query grammar. Returns
+    ``None`` when the input has no searchable token.
+    """
+    tokens = _FTS_TOKEN_RE.findall(raw)
+    if not tokens:
+        return None
+    return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
+def _open_readonly_db(path: Path, *, tool: str) -> sqlite3.Connection:
     try:
-        result = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=TOOL_TIMEOUT_SECONDS,
-            check=False,
-            shell=False,
+        con = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True,
+            timeout=SQLITE_QUERY_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise WorkerToolError(f"tool_failed:{Path(argv[1]).name}:{exc}") from exc
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")
-        raise WorkerToolError(f"tool_failed:{Path(argv[1]).name}:rc={result.returncode}:{stderr[-300:]}")
-    raw = result.stdout
-    if len(raw) > MAX_RAW_TOOL_OUTPUT_BYTES:
-        raise WorkerToolError(f"tool_raw_budget_overflow:{Path(argv[1]).name}")
-    text = raw.decode("utf-8", errors="replace")
-    if not text.strip():
-        raise WorkerToolError(f"tool_empty:{Path(argv[1]).name}")
-    return text, len(raw) > MAX_TOOL_OUTPUT_BYTES
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        raise WorkerToolError(f"tool_db_unopenable:{tool}:{exc}") from exc
+    return con
 
 
 def _bounded_text(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -321,15 +337,17 @@ def _storage_registry_entry(authority_repo: Path, component: str, db_id: str) ->
 
 
 def _resolve_authority_db(ctx: WorkerToolContext, *, component: str, db_id: str) -> AuthorityBinding:
-    """Resolve a component's authoritative, read-only database path.
+    """Resolve a component's authoritative, canonical-only database path.
 
     Reads ONLY ``ctx.authority_repo`` (never ``ctx.repo``, the isolated
-    worktree). Until a component's registry entry marks
-    ``authority.canonical_active`` true, its declared ``legacy_source`` is
-    used. Fails closed (raises ``WorkerToolError``) when the registry entry
-    is missing, its declared path is absent, or the resolved database file
-    does not exist or is empty -- this is what stops the isolated worktree's
-    (or any other) missing/empty database from ever being mistaken for a
+    worktree). Always resolves the registry's own ``canonical_durable_path``
+    rooted under ``<authority_repo>/.aiworkhub`` -- there is no
+    ``legacy_source`` fallback and no automatic legacy discovery. Fails
+    closed (raises ``WorkerToolError``) when the registry entry is missing,
+    is not marked ``authority.canonical_active``, or the resolved canonical
+    database file does not exist or is empty -- this is what stops the
+    isolated worktree's (or any other) missing/empty database, or a
+    not-yet-cutover registry entry, from ever being mistaken for a
     successful authoritative lookup.
     """
 
@@ -338,24 +356,20 @@ def _resolve_authority_db(ctx: WorkerToolContext, *, component: str, db_id: str)
         raise WorkerToolError(f"authority_registry_entry_missing:{component}.{db_id}")
     authority = entry.get("authority") or {}
     state = str(authority.get("state") or "unknown")
-    if authority.get("canonical_active"):
-        registry = _load_storage_registry(ctx.authority_repo)
-        durable_root = str(registry.get("durable_root") or ".aiworkhub")
-        rel = entry.get("canonical_durable_path")
-        source = "canonical"
-        base = ctx.authority_repo / durable_root
-    else:
-        rel = entry.get("legacy_source")
-        source = "legacy"
-        base = ctx.authority_repo
+    if not authority.get("canonical_active"):
+        raise WorkerToolError(f"authority_component_not_canonical_active:{component}.{db_id}:{state}")
+    registry = _load_storage_registry(ctx.authority_repo)
+    durable_root = str(registry.get("durable_root") or ".aiworkhub")
+    rel = entry.get("canonical_durable_path")
+    base = ctx.authority_repo / durable_root
     if not rel:
-        raise WorkerToolError(f"authority_db_path_undeclared:{component}.{db_id}:{source}")
+        raise WorkerToolError(f"authority_db_path_undeclared:{component}.{db_id}:canonical")
     db_path = (base / str(rel)).resolve()
     if not db_path.is_relative_to(ctx.authority_repo.resolve()):
         raise WorkerToolError(f"authority_db_path_escapes_repo:{component}.{db_id}")
     if not db_path.is_file() or db_path.stat().st_size <= 0:
-        raise WorkerToolError(f"authority_db_absent_or_empty:{component}.{db_id}:{source}:{state}")
-    return AuthorityBinding(db_path=db_path, authority_source=source, authority_state=state)
+        raise WorkerToolError(f"authority_db_absent_or_empty:{component}.{db_id}:canonical:{state}")
+    return AuthorityBinding(db_path=db_path, authority_source="canonical", authority_state=state)
 
 
 def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
@@ -730,7 +744,20 @@ def source_graph_query(
 
 
 def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[str, Any]:
-    """Bounded Session Manager current-state, scoped to this task's topic."""
+    """Bounded Session Manager current-state, scoped to this task's topic.
+
+    Self-contained (B878): reads the canonical transcript-graph database
+    directly (``documents`` / ``documents_fts``) in-process, bounded to
+    ``limit`` rows ordered most-recent-first. This is a deliberately
+    simplified reimplementation of ``AITools/transcript_graph.py``'s
+    ``current_state`` (no authority-class ranking, supersession, or conflict
+    detection) -- that engine is a large, standalone module this worker
+    surface must not depend on or shell out to; what it preserves is the
+    bounded, evidence-with-source-id contract the caller actually relies on.
+    The ``sessions`` component's own database is still resolved and required
+    to exist (matching the registry's authority contract for that
+    component) even though this simplified query does not read its rows.
+    """
 
     tool = "session_current_state"
     try:
@@ -742,22 +769,48 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
         graph_binding = _resolve_authority_db(ctx, component="sessions", db_id="transcript")
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    script = ctx.authority_repo / "AITools" / "transcript_graph.py"
-    if not script.is_file():
-        return _violation(ctx, tool, "session_tool_missing")
-    argv = [
-        sys.executable, str(script), "current-state", ctx.session_topic,
-        "--limit", str(limit), "--json", "--no-refresh",
-        "--session-db", str(session_binding.db_path),
-        "--graph-db", str(graph_binding.db_path),
-    ]
     try:
-        raw_text, truncated = _run_fixed_argv(argv, cwd=ctx.authority_repo)
-        text, json_truncated = _canonical_json_output(tool, raw_text, max_bytes=MAX_TOOL_OUTPUT_BYTES)
-        truncated = truncated or json_truncated
+        con = _open_readonly_db(graph_binding.db_path, tool=tool)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    hit_count = _json_hit_count(json.loads(text))
+    try:
+        rows: list[sqlite3.Row] = []
+        match_expr = _fts_match_expr(ctx.session_topic)
+        if match_expr is not None:
+            try:
+                rows = con.execute(
+                    "SELECT d.source_id AS source_id, d.timestamp AS timestamp, "
+                    "d.kind AS kind, d.content AS content FROM documents d "
+                    "JOIN documents_fts f ON d.doc_id = f.rowid "
+                    "WHERE documents_fts MATCH ? ORDER BY d.timestamp DESC LIMIT ?",
+                    (match_expr, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+        if not rows:
+            rows = con.execute(
+                "SELECT source_id, timestamp, kind, content FROM documents "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
+    finally:
+        con.close()
+
+    evidence = [
+        {
+            "source_id": row["source_id"], "timestamp": row["timestamp"], "kind": row["kind"],
+            "snippet": (row["content"] or "")[:SESSION_SNIPPET_CHARS],
+        }
+        for row in rows
+    ]
+    state = "unknown" if not evidence else ("current" if len(evidence) == 1 else "superseded")
+    payload = {"topic": ctx.session_topic, "state": state, "evidence_count": len(evidence), "evidence": evidence}
+    text, truncated = _bounded_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), MAX_TOOL_OUTPUT_BYTES,
+    )
+    hit_count = len(evidence)
     bytes_returned = len(text.encode("utf-8"))
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
@@ -772,7 +825,15 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
 
 
 def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> dict[str, Any]:
-    """Bounded AI Memory search."""
+    """Bounded AI Memory search.
+
+    Self-contained (B878): reads the canonical memory database's
+    ``memories`` / ``memories_fts`` tables directly, in-process, read-only.
+    ``AITools/ai_memory/ai_memory.py`` resolves its database relative to its
+    own ``__file__`` with no path-override flag -- a canonical-only
+    repository (no adjacent ``AITools/ai_memory/ai_memory.db``) could never
+    satisfy that hardcoded path, so this tool no longer shells out to it.
+    """
 
     tool = "ai_memory"
     bounded = _bounded_query(query)
@@ -786,23 +847,28 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         binding = _resolve_authority_db(ctx, component="memory", db_id="memory")
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    # ai_memory.py resolves its database relative to its OWN __file__, with no
-    # path-override flag/env var -- so the authority repo's copy of the
-    # script itself must be invoked (not the isolated worktree's copy) for
-    # DB_PATH to resolve to the real, authoritative database.
-    script = ctx.authority_repo / "AITools" / "ai_memory" / "ai_memory.py"
-    if not script.is_file():
-        return _violation(ctx, tool, "ai_memory_tool_missing")
-    if (script.parent / "ai_memory.db").resolve() != binding.db_path:
-        return _violation(ctx, tool, "ai_memory_authority_db_path_mismatch")
-    argv = [sys.executable, str(script), "search", bounded, "--limit", str(limit), "--json"]
     try:
-        raw_text, truncated = _run_fixed_argv(argv, cwd=ctx.authority_repo)
-        text, json_truncated = _canonical_json_output(tool, raw_text, max_bytes=8 * 1024)
-        truncated = truncated or json_truncated
+        con = _open_readonly_db(binding.db_path, tool=tool)
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
-    hit_count = _json_hit_count(json.loads(text))
+    try:
+        rows: list[sqlite3.Row] = []
+        match_expr = _fts_match_expr(bounded)
+        if match_expr is not None:
+            rows = con.execute(
+                "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
+                "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
+                "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match_expr, limit),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
+    finally:
+        con.close()
+
+    payload = {"results": [dict(row) for row in rows], "count": len(rows)}
+    text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
+    hit_count = len(rows)
     bytes_returned = len(text.encode("utf-8"))
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
@@ -817,6 +883,9 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
 
 
 def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_label: str) -> dict[str, Any]:
+    """Bounded, in-process KB lookup against the canonical ``entries``/
+    ``links`` tables (B878: no more shelling out to ``AITools/kb.py``)."""
+
     bounded = _bounded_query(argument, max_bytes=MAX_KEY_BYTES if subcommand != "search" else MAX_QUERY_BYTES)
     if bounded is None:
         return _violation(ctx, tool_label, f"invalid_{subcommand}_argument")
@@ -824,24 +893,19 @@ def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_l
         binding = _resolve_authority_db(ctx, component="kb", db_id="kb")
     except WorkerToolError as exc:
         return _violation(ctx, tool_label, str(exc)[:160])
-    script = ctx.authority_repo / "AITools" / "kb.py"
-    if not script.is_file():
-        return _violation(ctx, tool_label, "kb_tool_missing")
-    argv = [sys.executable, str(script), subcommand, bounded]
-    if subcommand == "search":
-        argv.extend(("--limit", "8"))
-    env = dict(os.environ)
-    env["KB_DB_PATH"] = str(binding.db_path)
     try:
-        raw_text, truncated = _run_fixed_argv(argv, cwd=ctx.authority_repo, env=env)
-        text, plain_truncated = _bounded_text(raw_text, 8 * 1024)
-        truncated = truncated or plain_truncated
+        con = _open_readonly_db(binding.db_path, tool=tool_label)
     except WorkerToolError as exc:
         return _violation(ctx, tool_label, str(exc)[:160])
-    lowered = text.lower()
-    hit_count = 0 if ("no results" in lowered or "not found" in lowered or "0 result" in lowered) else max(
-        1, sum(1 for line in text.splitlines() if line.strip().startswith("["))
-    )
+    try:
+        payload = _kb_query(con, subcommand=subcommand, argument=bounded)
+    except sqlite3.Error as exc:
+        return _violation(ctx, tool_label, f"tool_query_failed:{tool_label}:{exc}"[:160])
+    finally:
+        con.close()
+
+    text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
+    hit_count = int(payload.get("count") or 0)
     bytes_returned = len(text.encode("utf-8"))
     _append_audit(
         ctx, tool=tool_label, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
@@ -853,6 +917,58 @@ def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_l
         "content": text, "cache_hit": False,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
     }
+
+
+def _kb_query(con: sqlite3.Connection, *, subcommand: str, argument: str) -> dict[str, Any]:
+    if subcommand == "search":
+        match_expr = _fts_match_expr(argument)
+        rows: list[sqlite3.Row] = []
+        if match_expr is not None:
+            rows = con.execute(
+                "SELECT e.key AS key, e.title AS title, e.category AS category, "
+                "e.tags AS tags, e.body AS body FROM entries e "
+                "JOIN entries_fts f ON e.id = f.rowid WHERE entries_fts MATCH ? "
+                "ORDER BY rank LIMIT 8",
+                (match_expr,),
+            ).fetchall()
+        return {"results": [dict(row) for row in rows], "count": len(rows)}
+
+    if subcommand == "get":
+        row = con.execute(
+            "SELECT key, title, body, category, tags, source_refs FROM entries WHERE key=?",
+            (argument,),
+        ).fetchone()
+        return {"entry": dict(row) if row is not None else None, "count": 1 if row is not None else 0}
+
+    # subcommand == "related"
+    row = con.execute("SELECT key, tags FROM entries WHERE key=?", (argument,)).fetchone()
+    if row is None:
+        return {"related": [], "count": 0}
+    seen = {argument}
+    related: list[dict[str, Any]] = []
+    for tag in (t.strip() for t in (row["tags"] or "").split(",") if t.strip()):
+        for candidate in con.execute(
+            "SELECT key, title, category FROM entries WHERE key != ? "
+            "AND (',' || tags || ',') LIKE ? LIMIT 5",
+            (argument, f"%,{tag},%"),
+        ).fetchall():
+            if candidate["key"] not in seen:
+                seen.add(candidate["key"])
+                related.append({"via": tag, **dict(candidate)})
+    for link in con.execute(
+        "SELECT to_key AS k, relation FROM links WHERE from_key=? "
+        "UNION SELECT from_key AS k, relation FROM links WHERE to_key=?",
+        (argument, argument),
+    ).fetchall():
+        if link["k"] in seen:
+            continue
+        entry = con.execute(
+            "SELECT key, title, category FROM entries WHERE key=?", (link["k"],),
+        ).fetchone()
+        if entry is not None:
+            seen.add(link["k"])
+            related.append({"via": f"link:{link['relation']}", **dict(entry)})
+    return {"related": related, "count": len(related)}
 
 
 def kb_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> dict[str, Any]:
@@ -889,6 +1005,25 @@ class WorkerMcpRuntime:
     audit_ledger_path: Path
     audit_hmac_key_path: Path
     tool_names: tuple[str, ...]
+    package_import_root: Path
+
+
+def resolve_host_package_import_root() -> Path:
+    """Return this module's own package import root: the real directory that
+    must be on ``sys.path`` for ``import aiworkhub`` to resolve, derived from
+    the running module's actual, installed ``__file__`` location.
+
+    This is intentionally the ONLY thing this function computes -- the parent
+    of the ``aiworkhub`` package directory this file lives in. It never counts
+    a fixed number of additional parents to guess a repository root, and it
+    never assumes a monorepo-specific package subpath or a
+    standalone ``<repo>/src/aiworkhub`` layout: whichever of those (or a
+    bundled/installed location entirely outside any project repository) is
+    true on this host, ``Path(__file__).resolve().parent.parent`` is correct
+    by construction, because it is the direct parent of THIS package
+    directory, not an inferred ancestor of some other root.
+    """
+    return Path(__file__).resolve().parent.parent
 
 
 def _toml_str(value: str) -> str:
@@ -921,6 +1056,7 @@ def generate_worker_mcp_runtime(
     authority_repo: Path,
     source_graph_targets: list[str] | tuple[str, ...],
     session_topic: str,
+    package_import_root: Path,
     python_executable: str | None = None,
 ) -> WorkerMcpRuntime:
     """Provision this request's isolated MCP config, env and audit ledger.
@@ -938,6 +1074,31 @@ def generate_worker_mcp_runtime(
     that will become visible only once the sandboxed process actually starts,
     so this function cannot validate them as existing directories on the
     host. The caller validates the real host paths before rewriting them.
+
+    B869 launch repair: every generated config launches this server as the
+    package module ``python -m aiworkhub.worker_ai_tools_mcp`` -- never the
+    bare file path. Executing the file directly makes Python treat it as
+    ``__main__`` with no known parent package, so its own
+    ``from .repository_state import ...`` relative import raises
+    ``ImportError: attempted relative import with no known parent package``
+    before the server can even bind ``ctx``.
+
+    B870 V2 portability repair: ``env[PYTHONPATH]`` is set VERBATIM to the
+    caller-supplied ``package_import_root`` -- this function never derives it
+    itself, never counts ``Path(__file__)`` parents, and never assumes a
+    repository layout (no monorepo-specific subpath, no fixed parent
+    depth). The caller (``worker_workspace.provision_worker_mcp_runtime``)
+    resolves the real host package root via ``resolve_host_package_import_root()``
+    and, only for the bubblewrap backend, substitutes the dedicated
+    ``SANDBOX_PACKAGE_IMPORT_ROOT`` alias that ``sandbox_argv`` binds that same
+    real host directory to (read-only) in the SAME mount namespace the worker
+    adapter process (and the MCP server subprocess it spawns) runs under. For
+    landlock and direct/no-sandbox invocation the real host path is passed
+    through unchanged -- Landlock confines writes only, so no read-side alias
+    is ever needed there. This works identically whether the package lives in
+    a standalone ``<repo>/src/aiworkhub`` checkout, nested inside a monorepo,
+    or bundled/installed entirely outside ``authority_repo``, because the
+    value is never rebased onto ``authority_repo`` at all.
     """
 
     runtime_dir = (home / "task_mcp_worker_runtime").resolve()
@@ -967,11 +1128,15 @@ def generate_worker_mcp_runtime(
         ENV_AUDIT_HMAC_KEY_PATH: str(key_path),
     }
 
-    module_path = str(Path(__file__).resolve())
+    module_file = Path(__file__).resolve()
+    package_module = f"{module_file.parent.name}.{module_file.stem}"
+    env[ENV_PYTHONPATH] = str(package_import_root)
+
     py = python_executable or sys.executable
+    launch_args = ["-m", package_module]
     mcp_config = {
         "mcpServers": {
-            SERVER_NAME: {"command": py, "args": [module_path], "env": env}
+            SERVER_NAME: {"command": py, "args": launch_args, "env": env}
         }
     }
 
@@ -987,7 +1152,7 @@ def generate_worker_mcp_runtime(
     lines = [
         f"[mcp_servers.{SERVER_NAME}]",
         f"command = {_toml_str(py)}",
-        f"args = [{_toml_str(module_path)}]",
+        f"args = [{', '.join(_toml_str(a) for a in launch_args)}]",
         "",
         f"[mcp_servers.{SERVER_NAME}.env]",
     ]
@@ -1013,6 +1178,7 @@ def generate_worker_mcp_runtime(
         audit_ledger_path=ledger_path,
         audit_hmac_key_path=key_path,
         tool_names=MCP_TOOL_NAMES,
+        package_import_root=package_import_root,
     )
 
 
@@ -1102,6 +1268,7 @@ __all__ = [
     "ENV_AUDIT_LEDGER_PATH",
     "ENV_AUTHORITY_REPO",
     "ENV_REPO",
+    "ENV_PYTHONPATH",
     "ENV_REQUEST_ID",
     "ENV_RUNNER",
     "ENV_SESSION_TOPIC",
@@ -1125,6 +1292,7 @@ __all__ = [
     "kb_search",
     "load_context_from_env",
     "register_tools",
+    "resolve_host_package_import_root",
     "session_current_state",
     "source_graph_query",
     "verify_audit_ledger",

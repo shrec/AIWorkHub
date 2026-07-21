@@ -143,9 +143,9 @@ def _count(db: Path, table: str) -> int:
 
 def test_preflight_refuses_other_active_or_inflight_callback(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
-    _seed_legacy(repo, blocker="processing", inflight=True)
+    legacy = _seed_legacy(repo, blocker="processing", inflight=True)
 
-    report = fresh_task_store.preflight(repo)
+    report = fresh_task_store.preflight(repo, legacy_db=legacy)
 
     assert report["ok"] is False
     assert report["active_blockers"][0]["task_id"] == "processing"
@@ -167,7 +167,7 @@ def test_preflight_ignores_expired_callback_lease(tmp_path: Path) -> None:
             (expired,),
         )
         conn.commit()
-    report = fresh_task_store.preflight(repo)
+    report = fresh_task_store.preflight(repo, legacy_db=db)
     assert report["ok"] is True
     assert report["inflight_callback_leases"]["callback_outbox"] == []
 
@@ -177,8 +177,8 @@ def test_fresh_cutover_archives_legacy_and_publishes_empty_canonical_db(tmp_path
     legacy = _seed_legacy(repo)
     before_registry = json.loads((repo / ".aiworkhub" / "config" / "storage.json").read_text())
 
-    dry = fresh_task_store.cutover(repo, execute=False)
-    result = fresh_task_store.cutover(repo, execute=True)
+    dry = fresh_task_store.cutover(repo, legacy_db=legacy, execute=False)
+    result = fresh_task_store.cutover(repo, legacy_db=legacy, execute=True)
 
     archive = repo / ".aiworkhub" / fresh_task_store.ARCHIVE_REL
     canonical = repo / ".aiworkhub" / fresh_task_store.CANONICAL_REL
@@ -216,13 +216,13 @@ def test_fresh_cutover_archives_legacy_and_publishes_empty_canonical_db(tmp_path
 
 def test_rollback_restores_legacy_authority_without_overwriting_archive(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
-    _seed_legacy(repo)
-    fresh_task_store.cutover(repo, execute=True)
+    legacy = _seed_legacy(repo)
+    fresh_task_store.cutover(repo, legacy_db=legacy, execute=True)
     canonical = repo / ".aiworkhub" / fresh_task_store.CANONICAL_REL
     assert _count(canonical, "tasks") == 0
 
-    dry = fresh_task_store.rollback(repo, execute=False)
-    result = fresh_task_store.rollback(repo, execute=True)
+    dry = fresh_task_store.rollback(repo, legacy_db=legacy, execute=False)
+    result = fresh_task_store.rollback(repo, legacy_db=legacy, execute=True)
     registry = json.loads((repo / ".aiworkhub" / "config" / "storage.json").read_text())
     task_record = next(item for item in registry["databases"] if item["id"] == "task_queue")
 
@@ -237,7 +237,7 @@ def test_rollback_restores_legacy_authority_without_overwriting_archive(tmp_path
     assert task_record["migration"]["rollback_performed"] is True
 
 
-def test_taskctl_execute_requires_coordinator_token(tmp_path: Path) -> None:
+def test_taskctl_execute_requires_coordinator_token_and_explicit_legacy_source(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
     _seed_legacy(repo)
 
@@ -261,7 +261,7 @@ def test_taskctl_execute_requires_coordinator_token(tmp_path: Path) -> None:
         "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE": str(token_file),
         "PYTHONPATH": str(REPO / "tools" / "aiworkhub" / "src"),
     }
-    ok = subprocess.run(
+    refused_without_explicit_source = subprocess.run(
         [
             sys.executable,
             str(REPO / "AITools" / "taskctl.py"),
@@ -278,8 +278,10 @@ def test_taskctl_execute_requires_coordinator_token(tmp_path: Path) -> None:
         capture_output=True,
     )
 
-    assert ok.returncode == 0, ok.stderr + ok.stdout
-    assert json.loads(ok.stdout)["action"] == "fresh_cutover_complete"
+    assert refused_without_explicit_source.returncode != 0
+    assert "legacy_db_not_supplied" in (
+        refused_without_explicit_source.stderr + refused_without_explicit_source.stdout
+    )
 
 
 def test_taskdb_default_binds_to_active_registry_authority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -321,8 +323,8 @@ def test_taskdb_default_binds_to_active_registry_authority(tmp_path: Path, monke
 
 def test_taskctl_fresh_canonical_init_does_not_reimport_legacy_jsonl(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path)
-    _seed_legacy(repo)
-    fresh_task_store.cutover(repo, execute=True)
+    legacy = _seed_legacy(repo)
+    fresh_task_store.cutover(repo, legacy_db=legacy, execute=True)
     canonical = repo / ".aiworkhub" / fresh_task_store.CANONICAL_REL
     assert fresh_task_store.empty_counts(canonical)["tasks"] == 0
 

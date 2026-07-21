@@ -314,9 +314,7 @@ def test_cli_bad_provider_fails(tmp_repo, capsys):
 
 def test_eval_artifact_activation_b821_v1():
     """B821 eval artifact is valid JSON and matches rendered policy."""
-    path = Path(
-        "tools/geoai-task-mcp/eval/aiworkhub_agent_tool_instruction_activation_b821_v1.json"
-    )
+    path = Path(__file__).resolve().parents[1] / "eval" / "aiworkhub_agent_tool_instruction_activation_b821_v1.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert (
         payload["schema_id"]

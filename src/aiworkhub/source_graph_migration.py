@@ -1,9 +1,11 @@
-"""Verified, one-time migration of legacy AITools Source Graph databases into
-the canonical AIWorkHub location, plus an idempotent authority cutover.
+"""Verified, one-time migration of a caller-named legacy Source Graph database
+into the canonical AIWorkHub location, plus an idempotent authority cutover.
 
-Legacy databases (``AITools/source_graph.db``, ``AITools/source_graph_universal.db``)
-are treated as READ-ONLY migration inputs -- this module never writes them.
-Copying uses SQLite's Online Backup API (``sqlite3.Connection.backup``), the
+The legacy database location is always an explicit ``Path`` the caller
+supplies -- this module has no fixed, repo-relative ``AITools/...`` default
+and never discovers or guesses a source on its own. That source is treated
+as a READ-ONLY migration input -- this module never writes to it. Copying
+uses SQLite's Online Backup API (``sqlite3.Connection.backup``), the
 supported way to obtain a consistent snapshot of a live database file without
 requiring exclusive access. Every migration is verified with
 ``PRAGMA integrity_check`` plus a schema/table/row-count comparison and a
@@ -120,13 +122,20 @@ class MigrationReport:
 
 
 def migrate_legacy_db(
-    repo_root: Path, *, db_id: str, legacy_rel: str, dry_run: bool = True,
+    repo_root: Path, *, db_id: str, legacy_source: Path, dry_run: bool = True,
 ) -> MigrationReport:
-    """Copy ``legacy_rel`` into the canonical ``db_id`` location, verified.
+    """Copy the caller-supplied ``legacy_source`` into the canonical ``db_id``
+    location, verified.
 
-    ``legacy_rel`` is never written to. When it does not exist, this returns
-    a ``no_legacy_source_skip`` report -- a fresh repository with no prior
-    AITools database is a valid, expected state, not an error. When
+    ``legacy_source`` is an explicit, fully caller-resolved :class:`Path` --
+    absolute or already resolved relative to the caller's own working
+    directory -- naming exactly where this one migration should read from.
+    This module never derives, defaults, or guesses that location itself
+    (there is no fixed ``AITools/...``-shaped fallback baked in here); the
+    caller alone decides what, if anything, is being imported. ``legacy_source``
+    is never written to. When it does not exist, this returns a
+    ``no_legacy_source_skip`` report -- a fresh repository with no prior
+    database to import is a valid, expected state, not an error. When
     ``dry_run`` is true (the default) the verified copy is discarded after
     the parity check and only the rollback manifest is written; the
     canonical database file itself is only replaced when ``dry_run=False``
@@ -134,9 +143,7 @@ def migrate_legacy_db(
     """
 
     repo_root = repo_root.resolve()
-    legacy_path = (repo_root / legacy_rel).resolve()
-    if repo_root not in legacy_path.parents and legacy_path != repo_root:
-        raise MigrationError("legacy_path_escapes_repo")
+    legacy_path = Path(legacy_source).resolve()
 
     if not legacy_path.is_file():
         return MigrationReport(
@@ -249,9 +256,13 @@ def perform_cutover(repo_root: Path, db_id: str, *, parity_ok: bool) -> dict[str
     authority = target.setdefault("authority", {})
     migration = target.setdefault("migration", {})
     if authority.get("canonical_active") is True:
+        # A fresh, canonical-only entry (see storage_registry.default_registry_payload)
+        # carries no ``migration`` block at all -- it was never migrated, so
+        # there is nothing to report but the implicit generation-1 state
+        # storage_registry._parse_database already treats it as.
         return {
             "status": "already_cutover", "db_id": db_id,
-            "generation": int(migration.get("generation") or 0),
+            "generation": int(migration.get("generation") or 1),
         }
 
     generation = int(migration.get("generation") or 0) + 1

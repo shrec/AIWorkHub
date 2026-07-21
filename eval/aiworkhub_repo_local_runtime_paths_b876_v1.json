@@ -1,0 +1,97 @@
+{
+  "schema_id": "geoai.task_mcp_eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_REPO_LOCAL_RUNTIME_PATHS_B876_V1",
+  "runner": "claude_sonnet5_aiworkhub_repo_local_runtime_paths_b876_v1",
+  "generated_at": "2026-07-21T15:00:57Z",
+  "objective": "Cut runtime path resolution (audit log, launch-queue log, process events log/dir, reconciler lock, canonical task export) over to repository-local .aiworkhub storage; remove the parents[4] monorepo-relative DEFAULT_REPO fallback in core.py::repo_root().",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard.py",
+    "tools/geoai-task-mcp/src/aiworkhub/launch_queue_persist.py",
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/task_reconciler.py",
+    "tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh",
+    "tools/geoai-task-mcp/tests/test_task_liveness_reconciler.py",
+    "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_startup_smoke_b114_v1.sh",
+    "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh",
+    "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh"
+  ],
+  "fixes": [
+    {
+      "file": "src/aiworkhub/core.py",
+      "change": "repo_root() no longer falls back to DEFAULT_REPO=Path(__file__).resolve().parents[4] (a fixed path relative to this package's own install location); it now resolves via repository_state.resolve_repository_root(require_manifest=False) when AIWORKHUB_REPO is unset."
+    },
+    {
+      "file": "src/aiworkhub/core.py",
+      "change": "AUDIT_LOG_DEFAULT_REL moved from tools/geoai-task-mcp/logs/audit.jsonl to .aiworkhub/runtime/process_logs/audit.jsonl."
+    },
+    {
+      "file": "src/aiworkhub/core.py",
+      "change": "export_jsonl() canonical queue export dir moved from tools/geoai-task-mcp/data/tasking to .aiworkhub/tasking (DURABLE_LAYOUT['tasking'])."
+    },
+    {
+      "file": "src/aiworkhub/process_launcher.py",
+      "change": "Added PROCESS_LOG_DEFAULT_REL/PROCESS_DIR_DEFAULT_REL (.aiworkhub/runtime/process_logs/{process_events.jsonl,processes}); _process_log_path() and ProcessManager.__init__ now use them instead of tools/geoai-task-mcp/logs/*."
+    },
+    {
+      "file": "src/aiworkhub/dashboard.py",
+      "change": "read_process_runs() default process log path now reuses process_launcher.PROCESS_LOG_DEFAULT_REL instead of a duplicated tools/geoai-task-mcp/logs literal."
+    },
+    {
+      "file": "src/aiworkhub/launch_queue_persist.py",
+      "change": "LAUNCH_QUEUE_LOG_DEFAULT_REL moved from tools/geoai-task-mcp/logs/launch_queue_audit.jsonl to .aiworkhub/runtime/process_logs/launch_queue_audit.jsonl (literal, no new import, preserves this module's deliberate file-path-only isolation from package __init__)."
+    },
+    {
+      "file": "src/aiworkhub/task_reconciler.py",
+      "change": "LOCK_REL_PATH moved from tools/geoai-task-mcp/logs/task_reconciler.lock to .aiworkhub/runtime/locks/task_reconciler.lock."
+    },
+    {
+      "file": "tests/*",
+      "change": "Updated 5 tests that hardcoded the historical tools/geoai-task-mcp/logs default paths (audit log existence/no-mutation checks, reconciler fixture dirs, launch-queue default-path assertion) to the new .aiworkhub/runtime paths."
+    }
+  ],
+  "not_changed_and_why": [
+    {
+      "path": "src/aiworkhub/repository_state.py:LEGACY_CANDIDATE_RELS",
+      "reason": "discover_legacy_candidates() is an explicit read-only migration-candidate detector (documented invariant); referencing legacy paths there is the intended behavior, not a runtime storage dependency."
+    },
+    {
+      "path": "src/aiworkhub/storage_registry.py:legacy_source, src/aiworkhub/source_graph_migration.py",
+      "reason": "Both are outside allowed_writes for this task; both hits are labeled/read-only legacy-source references for the source_graph migration path (worker_ai_tools_mcp.py:_resolve_source_graph_db already resolves the canonical .aiworkhub/source_graph path exclusively and never falls back to them)."
+    },
+    {
+      "path": "src/aiworkhub/agent_tool_instructions.py:84, core.py comments, worker_ai_tools_mcp.py:373,907,977, worker_workspace.py:582",
+      "reason": "Prose docstrings/comments describing invariants (including two now documenting this fix) or a synthetic never-claimed placeholder task-card string; none construct a runtime path."
+    },
+    {
+      "path": "src/aiworkhub/core.py run_taskctl()/taskctl_path()/require_repo()/TASKCTL_REL",
+      "reason": "Out of scope: this is the pre-existing AITools/taskctl.py subprocess bridge, orthogonal to the canonical in-process task_store.py path this task's acceptance criteria target (task store/engine authority was already migrated under B852); it references AITools/taskctl.py, not tools/geoai-task-mcp, and is not flagged by the identity scan."
+    }
+  ],
+  "identity_scan": {
+    "command": "git grep -n -I -i 'geoai-task-mcp|AITools/source_graph.db' -- src/aiworkhub",
+    "remaining_hits": 17,
+    "remaining_hits_are_runtime_path_constructions": false,
+    "remaining_hits_classification": "comments/docstrings documenting the invariant, read-only legacy-candidate migration detection, and one synthetic placeholder task-card string"
+  },
+  "tests": {
+    "pytest": {
+      "command": "PYTHONPATH=src python3 -m pytest -q",
+      "result": "925 passed, 2 skipped",
+      "duration_seconds": 115.68
+    },
+    "focused": {
+      "command": "bash tests/test_launch_queue_persist_audit_b119_v1.sh",
+      "result": "pre-existing unrelated failure (assert set(scrubbed) == set(m._PROCESS_LOG_KEYS) at check.py:179) reproduced identically on git-stashed unmodified tree; not caused by this task's change"
+    }
+  },
+  "acceptance": {
+    "no_geoai_task_mcp_runtime_path_construction": true,
+    "logs_and_locks_under_repo_local_aiworkhub_runtime": true,
+    "canonical_task_store_remains_sole_authority": true,
+    "linux_windows_and_standalone_layout_covered_by_existing_pathlib_usage": true,
+    "full_python_suite_passes": true
+  },
+  "commit_contract": "NO_COMMIT",
+  "next": "taskctl review; Codex finalizes"
+}

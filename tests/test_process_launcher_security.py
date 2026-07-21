@@ -461,7 +461,12 @@ def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(
     assert result["state"] == "finalize_failed"
     assert "claim_ownership_lost" in result["latest_event"]["error"]
     assert release_calls == []
-    assert not workspace.path.exists()
+    # B860/B863: a claim_ownership_lost read is not reliable proof of a
+    # legitimate different owner -- it can be a false positive from a
+    # launcher/finalizer authority disagreement, so the isolated workspace
+    # is retained as evidence instead of being deleted here. Deletion is
+    # deferred to the canonical-status-gated GC sweep.
+    assert workspace.path.exists()
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 

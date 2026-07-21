@@ -1,0 +1,45 @@
+{
+  "schema_id": "aiworkhub.task_mcp.aiworkhub_canonical_only_storage_b878_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CANONICAL_ONLY_STORAGE_B878_V1",
+  "runner": "claude_sonnet5_aiworkhub_canonical_only_storage_b878_v1",
+  "topic": "task_mcp",
+  "verdict": "accepted_after_coordinator_review",
+  "scope_note": "This eval covers only the corrective slice worked in this pass: worker_ai_tools_mcp.py's Session/AI Memory/KB tools were the one concrete blocker to canonical-only operation identified by a prior full-suite run, plus two stale repository_state legacy-discovery tests. Full-suite/commit/push were explicitly out of scope for this pass.",
+  "blocker_found": {
+    "description": "worker_ai_tools_mcp.py resolved canonical Session/Memory/KB databases via the storage registry, but then still shelled out to fixed AITools/*.py scripts (AITools/transcript_graph.py, AITools/ai_memory/ai_memory.py, AITools/kb.py) to read them. AITools/ai_memory/ai_memory.py resolves its DB path relative to its own __file__ with no override flag, so it can only ever open an adjacent AITools/ai_memory/ai_memory.db -- it can never be pointed at the canonical .aiworkhub/memory/memory.sqlite path, so canonical-only operation (no adjacent legacy AITools db) could never work for that tool.",
+    "reproduced_by": "PYTHONPATH=src python3 -m pytest tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py::test_session_ai_memory_and_kb_tools_are_bounded_and_audited -- FAILED before this fix (session_current_state ok=False)."
+  },
+  "fix_applied": {
+    "module": "src/aiworkhub/worker_ai_tools_mcp.py",
+    "change": "session_current_state, ai_memory_search, kb_search/kb_get/kb_related now query the canonical registry-resolved SQLite databases directly, in-process (read-only sqlite3 URI connections), with no subprocess and no fixed AITools/*.py script path anywhere in the module.",
+    "session_current_state_note": "Deliberately simplified vs AITools/transcript_graph.py's current_state: bounded FTS-or-recency query over documents/documents_fts, no authority-class ranking/supersession/conflict engine. Documented in the function docstring as an intentional scope reduction, not a hidden gap.",
+    "removed": ["_run_fixed_argv", "import subprocess", "TOOL_TIMEOUT_SECONDS"],
+    "added": ["_fts_match_expr", "_open_readonly_db", "_kb_query", "SQLITE_QUERY_TIMEOUT_SECONDS", "SESSION_SNIPPET_CHARS"]
+  },
+  "tests_updated": {
+    "tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py": "Replaced fake-byte / fake-AITools-script fixtures with real minimal canonical SQLite fixtures (_seed_kb_db, _seed_memory_db, _seed_transcript_db) seeded at the registry's canonical paths (.aiworkhub/{kb,memory,sessions}/*.sqlite); updated the no-subprocess-surface assertion.",
+    "tests/test_repository_state.py": "Replaced stale test_legacy_discovery_is_read_only_candidate_only (referenced a removed RepositoryState.legacy_candidates field -> AttributeError) with test_bootstrap_does_not_discover_or_adopt_a_planted_legacy_path, asserting bootstrap neither discovers nor references a planted bitnnv2/data/tasking legacy path and leaves it untouched.",
+    "tests/test_aiworkhub_repository_state_b810_v1.py": "Same replacement (duplicate test)."
+  },
+  "validation": {
+    "focused_tests_run": [
+      "tests/test_repository_state.py",
+      "tests/test_aiworkhub_repository_state_b810_v1.py",
+      "tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+      "tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+      "tests/test_aiworkhub_worker_mcp_module_launch_b869_v1.py",
+      "tests/test_aiworkhub_storage_registry_b824_v1.py",
+      "tests/test_aiworkhub_finalizer_canonical_authority_b863.py"
+    ],
+    "focused_result": "89 passed",
+    "broader_worker_sweep": "pytest tests/ -k 'worker or repository_state or storage_registry or finalizer' -> 202 passed, 2 skipped",
+    "full_suite_run": true,
+    "coordinator_full_suite_result": "930 passed, 2 skipped",
+    "coordinator_extension_result": "npm test passed",
+    "commit_made": false,
+    "push_made": false
+  },
+  "not_done_in_this_pass": [
+    "No production files were changed beyond src/aiworkhub/worker_ai_tools_mcp.py and the listed test files; storage_registry.py, repository_state.py, source_graph.py, task_store.py, fresh_task_store.py, source_graph_migration.py were read but not modified in this pass -- prior full-B878 acceptance criteria on those files is unaffected/unchanged by this corrective slice."
+  ]
+}

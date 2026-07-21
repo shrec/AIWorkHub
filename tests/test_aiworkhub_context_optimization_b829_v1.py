@@ -20,12 +20,10 @@ from aiworkhub.project_context import (
 
 TASK_ID = "CODEX_GPT55_AIWORKHUB_CONTEXT_OPTIMIZATION_B829_V1"
 RUNNER = "codex_gpt55_aiworkhub_context_optimization_b829_v1"
-EVAL_JSON = Path("tools/geoai-task-mcp/eval/aiworkhub_context_optimization_b829_v1.json")
-EVAL_ROWS = Path("tools/geoai-task-mcp/eval/aiworkhub_context_optimization_rows_b829_v1.jsonl")
-PROCESS_DIRS = [
-    Path("/repo/AIWorkHub/tools/geoai-task-mcp/logs/processes"),
-    Path("tools/geoai-task-mcp/logs/processes"),
-]
+_REPO_TESTS_DIR = Path(__file__).resolve().parents[1]
+EVAL_JSON = _REPO_TESTS_DIR / "eval" / "aiworkhub_context_optimization_b829_v1.json"
+EVAL_ROWS = _REPO_TESTS_DIR / "eval" / "aiworkhub_context_optimization_rows_b829_v1.jsonl"
+PROCESS_DIRS = [_REPO_TESTS_DIR / "logs" / "processes"]
 
 
 def _base_card() -> dict:
@@ -56,34 +54,40 @@ def _base_card() -> dict:
 
 def _fake_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
-    for rel in [
-        "AITools/source_graph.py",
-        "AITools/transcript_graph.py",
-        "AITools/kb.py",
-        "AITools/ai_memory/ai_memory.py",
-    ]:
-        path = repo / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# stub\n", encoding="utf-8")
+    repo.mkdir(parents=True)
     return repo
 
 
 def test_project_context_caps_zero_hit_suppression_and_fail_closed(monkeypatch, tmp_path):
     repo = _fake_repo(tmp_path)
 
-    def fake_run(argv, **_kwargs):
-        tool = Path(argv[1]).name
-        if tool == "source_graph.py":
-            return json.dumps({"results": [{"path": "project_context.py", "score": 1.0}]}), False
-        if tool == "transcript_graph.py":
-            return json.dumps({"results": [{"source_id": "1", "snippet": "state"}]}), False
-        if tool == "ai_memory.py":
-            return json.dumps({"count": 0, "results": []}), False
-        if tool == "kb.py":
-            return "[kb] no results for 'context bundle relevance caching telemetry'\n", False
-        raise AssertionError(argv)
-
-    monkeypatch.setattr("aiworkhub.project_context._run_fixed_argv", fake_run)
+    monkeypatch.setattr(
+        "aiworkhub.project_context._worker_tools.session_current_state",
+        lambda ctx, limit=12: {
+            "ok": True,
+            "content": json.dumps({"results": [{"source_id": "1", "snippet": "state"}]}),
+            "truncated": False,
+            "hit_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        "aiworkhub.project_context._worker_tools.ai_memory_search",
+        lambda ctx, query, limit=8: {
+            "ok": True, "content": json.dumps({"count": 0, "results": []}),
+            "truncated": False, "hit_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "aiworkhub.project_context._worker_tools.kb_search",
+        lambda ctx, query, limit=8: {
+            "ok": True, "content": json.dumps({"count": 0, "results": []}),
+            "truncated": False, "hit_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "aiworkhub.project_context._source_graph_direct",
+        lambda repo, contract: (json.dumps({"results": [{"path": "project_context.py", "score": 1.0}]}), False),
+    )
     result = collect_project_context(repo, _base_card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("\n", 1)[1])
@@ -96,12 +100,10 @@ def test_project_context_caps_zero_hit_suppression_and_fail_closed(monkeypatch, 
     assert result.metadata["optimization"]["byte_labels_are_token_truth"] is False
     assert result.metadata["optimization"]["empty_ceremonial_calls_injected"] is False
 
-    def empty_source_graph(argv, **_kwargs):
-        if Path(argv[1]).name == "source_graph.py":
-            return "{}", False
-        return fake_run(argv, **_kwargs)
-
-    monkeypatch.setattr("aiworkhub.project_context._run_fixed_argv", empty_source_graph)
+    monkeypatch.setattr(
+        "aiworkhub.project_context._source_graph_direct",
+        lambda repo, contract: ("{}", False),
+    )
     with pytest.raises(ProjectContextError, match="source_graph_required_empty_result"):
         collect_project_context(repo, _base_card())
 

@@ -100,10 +100,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/shrec/AIWorkingHub.git"
+    "url": "https://github.com/shrec/AIWorkHub.git"
   },
   "bugs": {
-    "url": "https://github.com/shrec/AIWorkingHub/issues"
+    "url": "https://github.com/shrec/AIWorkHub/issues"
   },
-  "homepage": "https://github.com/shrec/AIWorkingHub"
+  "homepage": "https://github.com/shrec/AIWorkHub"
 }

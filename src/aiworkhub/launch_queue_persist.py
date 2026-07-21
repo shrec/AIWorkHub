@@ -80,7 +80,9 @@ lqc = _load_contract_module()
 # Log path resolution (explicit arg > env override > repo-root default)
 # ---------------------------------------------------------------------------
 LAUNCH_QUEUE_LOG_ENV: str = "AIWORKHUB_LAUNCH_QUEUE_LOG_PATH"
-LAUNCH_QUEUE_LOG_DEFAULT_REL = Path("tools/geoai-task-mcp/logs/launch_queue_audit.jsonl")
+# Repository-local, non-durable runtime tree (never the historical
+# any package-install/monorepo log path): .aiworkhub/runtime/process_logs/.
+LAUNCH_QUEUE_LOG_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/launch_queue_audit.jsonl")
 
 # Frozen ProcessLogEntry schema; any other top-level key is stripped before
 # writing (defense in depth -- see _scrub_entry).

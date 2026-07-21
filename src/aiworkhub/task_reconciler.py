@@ -46,7 +46,9 @@ DEFAULT_SCAN_INTERVAL_SECONDS = 30.0
 MIN_SCAN_INTERVAL_SECONDS = 5.0
 MAX_SCAN_INTERVAL_SECONDS = 3600.0
 SCAN_INTERVAL_ENV = "AIWORKHUB_RECONCILER_SCAN_INTERVAL_SECONDS"
-LOCK_REL_PATH = Path("tools/geoai-task-mcp/logs/task_reconciler.lock")
+# Repository-local, non-durable runtime tree (never the historical
+# any package-install/monorepo lock path): .aiworkhub/runtime/locks/.
+LOCK_REL_PATH = Path(".aiworkhub/runtime/locks/task_reconciler.lock")
 
 
 def _utcnow() -> str:

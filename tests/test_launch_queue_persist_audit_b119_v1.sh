@@ -248,7 +248,7 @@ finally:
 restore = _with_env(AIWORKHUB_LAUNCH_QUEUE_LOG_PATH=None)
 try:
     default_path = m.resolve_log_path()
-    assert str(default_path).endswith("tools/geoai-task-mcp/logs/launch_queue_audit.jsonl")
+    assert str(default_path).endswith(".aiworkhub/runtime/process_logs/launch_queue_audit.jsonl")
 finally:
     restore()
 

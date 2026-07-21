@@ -4,7 +4,7 @@ Self-contained SQLite task queue for the AIWorkHub dashboard. This module
 never imports or executes ``AITools/taskdb.py`` or ``AITools/taskctl.py``:
 every repository AIWorkHub attaches to gets its own canonical
 ``.aiworkhub/tasking/task_queue.sqlite``, independent of whether that
-repository happens to have GeoAI's own AITools installed. This is what makes
+repository happens to have a host project's own AI tools installed. This is what makes
 the dashboard safe to open against an arbitrary third-party repository
 instead of silently reading whatever legacy queue happens to be reachable
 from the bundled runtime's own install location.

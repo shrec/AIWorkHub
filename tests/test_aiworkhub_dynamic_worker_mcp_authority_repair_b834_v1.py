@@ -24,7 +24,9 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import process_launcher  # noqa: E402
+from aiworkhub import repository_state  # noqa: E402
 from aiworkhub import runtime_adapters  # noqa: E402
+from aiworkhub import source_graph as source_graph_mod  # noqa: E402
 from aiworkhub import worker_ai_tools_mcp as w  # noqa: E402
 from aiworkhub import worker_workspace  # noqa: E402
 
@@ -60,23 +62,44 @@ def _write_storage_registry(repo: Path, *, canonical_active: bool = False) -> No
     path.write_text(json.dumps(registry), encoding="utf-8")
 
 
-def _authority_repo(tmp_path: Path, *, name: str = "authority_repo", echo_argv: bool = False) -> Path:
+def _stub_source_graph_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    relevant_files: tuple[str, ...] = ("AITools/source_graph.py", "tools/geoai-task-mcp/src/aiworkhub/x.py"),
+) -> list[tuple[str, str, int]]:
+    """Stand in for aiworkhub.source_graph's real FTS query engine (its own
+    correctness is covered by that module's own test suite) so these
+    fixtures can assert query-vs-target/caching/audit semantics against a
+    deterministic payload without building a real on-disk index. Returns
+    the list of (mode, query, budget) calls actually made -- the direct,
+    in-process replacement for the old subprocess argv-echo trick."""
+    calls: list[tuple[str, str, int]] = []
+
+    def _payload(mode: str, query: str, budget: int) -> dict:
+        calls.append((mode, query, budget))
+        return {"target": query, "relevant_files": list(relevant_files)}
+
+    monkeypatch.setattr(source_graph_mod, "focus", lambda repo_root, query, budget=64: _payload("focus", query, budget))
+    monkeypatch.setattr(source_graph_mod, "slice_", lambda repo_root, query, budget=64: _payload("slice", query, budget))
+    monkeypatch.setattr(
+        source_graph_mod, "bundle",
+        lambda repo_root, bundle_type, query, max_lines=64: _payload("bundle", query, max_lines),
+    )
+    return calls
+
+
+def _authority_repo(tmp_path: Path, *, name: str = "authority_repo") -> Path:
     repo = tmp_path / name
     (repo / "AITools" / "ai_memory").mkdir(parents=True)
-    _write_storage_registry(repo)
     for relative in (
-        "AITools/source_graph.db", "AITools/session.db", "AITools/transcript_graph.db",
+        "AITools/session.db", "AITools/transcript_graph.db",
         "AITools/ai_memory/ai_memory.db", "AITools/kb.db",
     ):
         (repo / relative).write_bytes(b"SQLite format 3\x00fake-non-empty-authority-db")
-    source_graph_body = (
-        "import json, sys\n"
-        "print('[*] Language: python (python)')\n"
-        + ("print('ARGV:' + json.dumps(sys.argv))\n" if echo_argv else "")
-        + "print(json.dumps({'target': sys.argv[2] if len(sys.argv) > 2 else '',"
-        " 'relevant_files': ['AITools/source_graph.py', 'tools/geoai-task-mcp/src/aiworkhub/x.py']}))\n"
-    )
-    _write_tool(repo / "AITools/source_graph.py", source_graph_body)
+    repository_state.bootstrap_repository(repo)
+    source_graph_db = repo / ".aiworkhub" / "source_graph" / "source_graph.sqlite"
+    source_graph_db.parent.mkdir(parents=True, exist_ok=True)
+    source_graph_db.write_bytes(b"SQLite format 3\x00fake-non-empty-source-graph-db")
     _write_tool(
         repo / "AITools/transcript_graph.py",
         "import json, sys\n"
@@ -94,12 +117,13 @@ def _authority_repo(tmp_path: Path, *, name: str = "authority_repo", echo_argv: 
 
 
 def _worktree_repo(tmp_path: Path, *, name: str = "worktree") -> Path:
-    """A worktree-shaped repo with the AITools/*.py scripts present but NO
-    databases -- the exact shape of a fresh ``git worktree add --detach``
+    """A worktree-shaped repo: current AIWorkHub 0.6.0 manifest+registry
+    present (so authority resolution succeeds) but no Source Graph database
+    ever built -- the exact shape of a fresh ``git worktree add --detach``
     checkout, which is what makes it unsafe as an authority source."""
     repo = tmp_path / name
     (repo / "AITools" / "ai_memory").mkdir(parents=True)
-    _write_tool(repo / "AITools/source_graph.py", "print('should never run against the worktree')\n")
+    repository_state.bootstrap_repository(repo)
     return repo
 
 
@@ -117,6 +141,7 @@ def _ctx(
         home=home, request_id=request_id, task_id=task_id, runner="claude_b834",
         topic="task_mcp", repo=repo, authority_repo=authority_repo,
         source_graph_targets=list(targets), session_topic="AIWorkHub dynamic worker MCP B834 authority repair",
+        package_import_root=w.resolve_host_package_import_root(),
     )
     return w.WorkerToolContext(
         task_id=task_id, runner="claude_b834", topic="task_mcp", request_id=request_id,
@@ -194,17 +219,38 @@ def test_registered_tools_never_accept_an_authority_repo_override_param(
 # Authority resolution: legacy read-only, fail-closed absent/empty database
 # ---------------------------------------------------------------------------
 
-def test_resolve_authority_db_uses_legacy_source_and_reports_state(tmp_path: Path) -> None:
+def test_resolve_authority_db_uses_canonical_path_and_reports_state(tmp_path: Path) -> None:
+    """B878: canonical-only resolution -- a fresh registry's ``kb`` entry is
+    already ``canonical_active`` from birth, so the resolver reads the
+    canonical ``.aiworkhub/kb/knowledge.sqlite`` path, never a legacy path."""
     authority = _authority_repo(tmp_path)
+    kb_db = authority / ".aiworkhub" / "kb" / "knowledge.sqlite"
+    kb_db.parent.mkdir(parents=True, exist_ok=True)
+    kb_db.write_bytes(b"SQLite format 3\x00fake-non-empty-kb-db")
     ctx = w.WorkerToolContext(
         task_id="T", runner="r", topic="t", request_id="req1",
         repo=authority, authority_repo=authority, source_graph_targets=(),
         session_topic="t", audit_ledger_path=None, audit_hmac_key_path=None,
     )
     binding = w._resolve_authority_db(ctx, component="kb", db_id="kb")
-    assert binding.authority_source == "legacy"
-    assert binding.authority_state == "shadow"
-    assert binding.db_path == (authority / "AITools/kb.db").resolve()
+    assert binding.authority_source == "canonical"
+    assert binding.authority_state == "canonical_active"
+    assert binding.db_path == kb_db.resolve()
+
+
+def test_resolve_authority_db_fails_closed_when_component_not_canonical_active(tmp_path: Path) -> None:
+    """B878: there is no ``legacy_source`` fallback -- an entry that is not
+    yet ``authority.canonical_active`` fails closed instead of silently
+    reading a legacy path."""
+    worktree = _worktree_repo(tmp_path)
+    _write_storage_registry(worktree, canonical_active=False)
+    ctx = w.WorkerToolContext(
+        task_id="T", runner="r", topic="t", request_id="req1",
+        repo=worktree, authority_repo=worktree, source_graph_targets=(),
+        session_topic="t", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+    with pytest.raises(w.WorkerToolError, match="authority_component_not_canonical_active"):
+        w._resolve_authority_db(ctx, component="kb", db_id="kb")
 
 
 def test_resolve_authority_db_fails_closed_on_missing_registry_entry(tmp_path: Path) -> None:
@@ -219,10 +265,11 @@ def test_resolve_authority_db_fails_closed_on_missing_registry_entry(tmp_path: P
 
 
 def test_resolve_authority_db_fails_closed_on_absent_database(tmp_path: Path) -> None:
-    """The isolated-worktree shape: AITools/*.py present, no databases at
-    all. Never falls back to letting a script silently create an empty one."""
+    """The isolated-worktree shape: registry entry is canonical_active, but
+    the canonical database file was never built. Never falls back to a
+    legacy path and never lets a script silently create an empty one."""
     worktree = _worktree_repo(tmp_path)
-    _write_storage_registry(worktree)
+    _write_storage_registry(worktree, canonical_active=True)
     ctx = w.WorkerToolContext(
         task_id="T", runner="r", topic="t", request_id="req1",
         repo=worktree, authority_repo=worktree, source_graph_targets=(),
@@ -232,6 +279,7 @@ def test_resolve_authority_db_fails_closed_on_absent_database(tmp_path: Path) ->
         w._resolve_authority_db(ctx, component="source_graph", db_id="source_graph")
     # And no database file was created as a side effect of the failed lookup.
     assert not (worktree / "AITools/source_graph.db").exists()
+    assert not (worktree / ".aiworkhub/source_graph/source_graph.sqlite").exists()
 
 
 def test_resolve_authority_db_fails_closed_on_empty_database(tmp_path: Path) -> None:
@@ -254,7 +302,6 @@ def test_source_graph_query_against_isolated_worktree_authority_is_a_violation_n
     recorded, fail-closed violation instead."""
     _mute_chmod(monkeypatch)
     worktree = _worktree_repo(tmp_path)
-    _write_storage_registry(worktree)
     ctx = _ctx(repo=worktree, authority_repo=worktree, home=tmp_path / "home")
     result = w.source_graph_query(ctx, mode="focus", query="anything")
     assert result["ok"] is False
@@ -269,7 +316,8 @@ def test_omitting_target_never_replaces_query_with_declared_target(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     _mute_chmod(monkeypatch)
-    authority = _authority_repo(tmp_path, echo_argv=True)
+    authority = _authority_repo(tmp_path)
+    calls = _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(
         repo=authority, authority_repo=authority, home=tmp_path / "home",
         targets=("AITools/source_graph.py",),
@@ -277,6 +325,7 @@ def test_omitting_target_never_replaces_query_with_declared_target(
     result = w.source_graph_query(ctx, mode="focus", query="a very specific semantic query")
     assert result["ok"] is True
     assert result["target"] is None
+    assert calls == [("focus", "a very specific semantic query", 64)]
     payload = json.loads(result["content"])
     assert payload["target"] == "a very specific semantic query"
 
@@ -286,6 +335,7 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
 ) -> None:
     _mute_chmod(monkeypatch)
     authority = _authority_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(
         repo=authority, authority_repo=authority, home=tmp_path / "home",
         targets=("AITools",),
@@ -321,6 +371,7 @@ def test_zero_hit_call_does_not_satisfy_the_live_call_gate(
 ) -> None:
     _mute_chmod(monkeypatch)
     authority = _authority_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo=authority, authority_repo=authority, home=tmp_path / "home", request_id="req1")
     result = w.source_graph_query(ctx, mode="focus", query="q", target=None)
     assert result["hit_count"] > 0  # sanity: the fixture itself is non-empty
@@ -346,6 +397,7 @@ def test_cache_hit_call_does_not_satisfy_the_live_call_gate(
 ) -> None:
     _mute_chmod(monkeypatch)
     authority = _authority_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo=authority, authority_repo=authority, home=tmp_path / "home", request_id="req1")
     w.source_graph_query(ctx, mode="focus", query="repeat me")
     w.source_graph_query(ctx, mode="focus", query="repeat me")  # second call is a cache hit
@@ -358,7 +410,8 @@ def test_cache_hit_call_does_not_satisfy_the_live_call_gate(
     assert verification["cache_hits"] == 1
     # Only the first (live, non-cached) call counts toward the gate.
     assert verification["live_source_graph_calls"] == 1
-    assert verification["authority_index_identity"] == ["source_graph:legacy:shadow"]
+    # Source Graph is the sole authority since B849 -- never legacy/shadow.
+    assert verification["authority_index_identity"] == ["source_graph:canonical:sole_authority"]
 
 
 def test_process_launcher_live_call_gate_rejects_a_cache_only_ledger(tmp_path: Path) -> None:
@@ -393,6 +446,7 @@ def test_cache_does_not_leak_across_task_or_authority_repo_context(
     _mute_chmod(monkeypatch)
     authority_a = _authority_repo(tmp_path, name="authority_a")
     authority_b = _authority_repo(tmp_path, name="authority_b")
+    _stub_source_graph_engine(monkeypatch)
 
     ctx_a = _ctx(repo=authority_a, authority_repo=authority_a, home=tmp_path / "home_a",
                  request_id="req_a", task_id="TASK_A")
@@ -463,6 +517,7 @@ def test_all_three_adapters_receive_the_authority_bound_runtime(monkeypatch: pyt
     runtime = w.generate_worker_mcp_runtime(
         home=home, request_id="req1", task_id="T", runner="r", topic="t",
         repo=authority, authority_repo=authority, source_graph_targets=[], session_topic="t",
+        package_import_root=w.resolve_host_package_import_root(),
     )
     claude_cfg = json.loads(runtime.claude_mcp_config_path.read_text(encoding="utf-8"))
     copilot_cfg = json.loads(runtime.copilot_mcp_config_path.read_text(encoding="utf-8"))

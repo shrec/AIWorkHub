@@ -1,3 +1,16 @@
+"""B878: storage registry is canonical-only from creation.
+
+Superseded from the original B824 shadow/legacy-fallback design: a fresh
+registry now carries only ``id``/``component``/``canonical_durable_path`` and
+an ``authority`` block already asserting ``canonical_active`` -- no
+``legacy_source`` field, no baked-in rollback hash, no per-entry
+``integrity``/``migration`` bookkeeping. ``_parse_database`` still parses an
+older, richer registry (produced by an explicit migration/cutover tool) for
+backward compatibility, which is exercised separately in
+``test_aiworkhub_taskdb_migrator_b825_v1.py`` /
+``test_aiworkhub_fresh_taskdb_cutover_b832_v1.py``.
+"""
+
 from __future__ import annotations
 
 import json
@@ -18,10 +31,6 @@ from aiworkhub.storage_registry import (
 )
 
 
-REPO = Path(__file__).resolve().parents[3]
-CONFIG = REPO / ".aiworkhub" / "config" / "storage.json"
-PROJECT = REPO / ".aiworkhub" / "project.json"
-
 EXPECTED_PATHS = {
     "task_queue": "tasking/task_queue.sqlite",
     "source_graph": "source_graph/source_graph.sqlite",
@@ -31,18 +40,6 @@ EXPECTED_PATHS = {
     "memory": "memory/memory.sqlite",
     "kb": "kb/knowledge.sqlite",
 }
-
-EXPECTED_LEGACY = {
-    "task_queue": "bitnnv2/data/tasking/task_queue_v1.sqlite",
-    "source_graph": "AITools/source_graph.db",
-    "universal": "AITools/source_graph_universal.db",
-    "session": "AITools/session.db",
-    "transcript": "AITools/transcript_graph.db",
-    "memory": "AITools/ai_memory/ai_memory.db",
-    "kb": "AITools/kb.db",
-}
-
-EXPECTED_HASHES = {item["id"]: item["sha256"] for item in CANONICAL_DATABASES}
 
 
 def _walk_strings(value):
@@ -73,6 +70,30 @@ def _copy_registry_to_tmp_repo(tmp_path: Path, payload: dict | None = None) -> P
     return repo
 
 
+def test_canonical_databases_inventory_carries_no_legacy_or_hash_fields():
+    for item in CANONICAL_DATABASES:
+        assert set(item) == {"id", "component", "canonical_path"}
+        assert "legacy_source" not in item
+        assert "sha256" not in item
+
+
+def test_default_registry_payload_entries_are_minimal_and_already_canonical():
+    payload = default_registry_payload("repo_deadbeefdeadbeefdeadbeefdeadbeef")
+    assert set(EXPECTED_PATHS) == {item["id"] for item in payload["databases"]}
+    for item in payload["databases"]:
+        assert set(item) == {"id", "component", "canonical_durable_path", "authority"}
+        assert item["canonical_durable_path"] == EXPECTED_PATHS[item["id"]]
+        assert item["authority"] == {
+            "state": "canonical_active",
+            "canonical_active": True,
+            "legacy_active": False,
+            "live_cutover": True,
+        }
+        assert "legacy_source" not in item
+        assert "integrity" not in item
+        assert "migration" not in item
+
+
 def test_repository_registry_loads_canonical_inventory_without_host_paths(tmp_path: Path):
     repo = _copy_registry_to_tmp_repo(tmp_path)
     payload = json.loads((repo / ".aiworkhub" / "config" / "storage.json").read_text(encoding="utf-8"))
@@ -98,15 +119,13 @@ def test_repository_registry_loads_canonical_inventory_without_host_paths(tmp_pa
     assert set(registry.databases) == set(EXPECTED_PATHS)
     for db_id, db in registry.databases.items():
         assert db.canonical_path == EXPECTED_PATHS[db_id]
-        assert db.legacy_source == EXPECTED_LEGACY[db_id]
-        assert db.rollback_source_sha256 == EXPECTED_HASHES[db_id]
-        assert db.integrity_state == "canonical_inventory_hash_supplied"
-        assert db.authority_state == "shadow"
-        assert db.canonical_active is False
+        assert db.rollback_source_sha256 == ""
+        assert db.integrity_state == ""
+        assert db.authority_state == "canonical_active"
+        assert db.canonical_active is True
         assert db.legacy_active is False
-        assert db.live_cutover is False
-        assert db.migration_generation == 0
-        assert payload["databases"][list(EXPECTED_PATHS).index(db_id)]["integrity"]["sparse_worktree_missing_is_not_absence"] is True
+        assert db.live_cutover is True
+        assert db.migration_generation == 1
 
 
 def test_resolved_paths_are_manifest_bound_under_aiworkhub(tmp_path: Path):
@@ -146,3 +165,28 @@ def test_registry_rejects_traversal_and_symlinked_durable_paths(tmp_path):
     os.symlink(outside, kb_dir)
     with pytest.raises(PathEscapeError, match="symlink"):
         load_storage_registry(repo)
+
+
+def test_richer_legacy_style_entry_still_parses_for_backward_compatibility(tmp_path: Path):
+    """An older registry, produced before this task's simplification (or by
+    an explicit migration/cutover tool), still supplies ``integrity`` and
+    ``migration`` blocks -- those remain valid, non-fresh input."""
+    repo = _copy_registry_to_tmp_repo(tmp_path)
+    registry_path = repo / ".aiworkhub/config/storage.json"
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    kb_entry = next(item for item in payload["databases"] if item["id"] == "kb")
+    kb_entry["integrity"] = {"state": "cutover_verified", "rollback_source_sha256": "a" * 64}
+    kb_entry["migration"] = {
+        "generation": 3,
+        "cutover_performed": True,
+        "rollback_performed": False,
+        "legacy_deleted": False,
+        "rollback_source_hash": "a" * 64,
+    }
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    registry = load_storage_registry(repo)
+    db = registry.databases["kb"]
+    assert db.migration_generation == 3
+    assert db.integrity_state == "cutover_verified"
+    assert db.rollback_source_sha256 == "a" * 64

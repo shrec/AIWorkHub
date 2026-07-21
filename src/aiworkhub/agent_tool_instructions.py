@@ -81,8 +81,8 @@ POLICY = ToolPolicy(
 # B833: informational cross-reference only. Deliberately NOT part of
 # ``POLICY`` -- adding it there would change ``render_canonical()`` /
 # ``render_projection()`` byte output, which is pinned exactly by
-# ``tools/geoai-task-mcp/eval/aiworkhub_agent_tool_instruction_activation_
-# b821_v1.json``. Kept here so callers/tests have one canonical place to
+# the pinned agent-tool activation evaluation. Kept here so callers/tests
+# have one canonical place to
 # check the dynamic worker MCP tool names against the policy module without
 # hand-duplicating the list.
 WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (

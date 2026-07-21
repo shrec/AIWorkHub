@@ -1,9 +1,14 @@
 """AIWorkHub repository-local storage registry.
 
-The registry starts as a shadow migration contract and may promote one store
-through an explicit, verified cutover. Loading and resolution are manifest/
-repo-id bound and fail closed on malformed authority, traversal, symlink, or
-cross-repository reuse.
+A fresh registry is canonical-only from creation: every entry's authority is
+already ``canonical_active`` under this repository's own ``.aiworkhub`` tree,
+with no fixed legacy source path and no historic-project hash baked in. There
+is no automatic legacy discovery, seeding, or fallback here -- an explicit,
+caller-selected import tool (see ``source_graph_migration.py``) may still
+copy data from a caller-named legacy path into the canonical location, but
+this module never reads or requires one. Loading and resolution are
+manifest/repo-id bound and fail closed on malformed authority, traversal,
+symlink, or cross-repository reuse.
 """
 
 from __future__ import annotations
@@ -25,50 +30,36 @@ CANONICAL_DATABASES: tuple[dict[str, str], ...] = (
         "id": "task_queue",
         "component": "task_mcp",
         "canonical_path": "tasking/task_queue.sqlite",
-        "legacy_source": "bitnnv2/data/tasking/task_queue_v1.sqlite",
-        "sha256": "23ecc369f601c3339a802a383d6f15e147df129771e016c05419b2fcb95fb2dd",
     },
     {
         "id": "source_graph",
         "component": "source_graph",
         "canonical_path": "source_graph/source_graph.sqlite",
-        "legacy_source": "AITools/source_graph.db",
-        "sha256": "6d645a92301727613473eb670982fe56b3a2664a5e43881083eae84b03ac0417",
     },
     {
         "id": "universal",
         "component": "source_graph",
         "canonical_path": "source_graph/universal.sqlite",
-        "legacy_source": "AITools/source_graph_universal.db",
-        "sha256": "d1bea7d3e8be1f9e59516c4f7ad0b193cc18f33e7a9af14fe3f4880a42597e3e",
     },
     {
         "id": "session",
         "component": "sessions",
         "canonical_path": "sessions/sessions.sqlite",
-        "legacy_source": "AITools/session.db",
-        "sha256": "34a702b54f17b30b36c16b3e602241c18d35cbc232b11dd99f50e18b7c07b66b",
     },
     {
         "id": "transcript",
         "component": "sessions",
         "canonical_path": "sessions/transcript_graph.sqlite",
-        "legacy_source": "AITools/transcript_graph.db",
-        "sha256": "773eab9a8cf5a075edaf2962a1250937a68e71bd8bb305ecbb3f7b8d54789196",
     },
     {
         "id": "memory",
         "component": "memory",
         "canonical_path": "memory/memory.sqlite",
-        "legacy_source": "AITools/ai_memory/ai_memory.db",
-        "sha256": "8fe74da44c6c0dae5cc54a6e062959c531edd9b9a9a591f96fbc6cffb6c17883",
     },
     {
         "id": "kb",
         "component": "kb",
         "canonical_path": "kb/knowledge.sqlite",
-        "legacy_source": "AITools/kb.db",
-        "sha256": "5188b5e8ea9d7afe53bf2e3a2440619c00d3463943b9ca10aa5ffeabacf19886",
     },
 )
 
@@ -86,7 +77,6 @@ class StorageDatabase:
     db_id: str
     component: str
     canonical_path: str
-    legacy_source: str
     rollback_source_sha256: str
     integrity_state: str
     authority_state: str
@@ -105,33 +95,32 @@ class StorageRegistry:
 
 
 def default_registry_payload(repo_id: str) -> dict[str, Any]:
-    """Return the portable registry payload for the known canonical inventory."""
+    """Return the portable, canonical-only registry payload.
+
+    Every entry carries only ``id``, ``component``, ``canonical_durable_path``
+    and an ``authority`` block already asserting ``canonical_active`` under
+    this repository's own ``.aiworkhub`` tree from the moment the registry is
+    created -- there is no shadow/legacy-fallback phase, no fixed
+    ``legacy_source`` path, no historic-project hash, and no
+    integrity/migration bookkeeping baked into a fresh entry. A repository
+    that owns its data from birth has nothing to migrate from and nothing to
+    roll back to, so ``_parse_database`` fills in the equivalent
+    already-cutover defaults for any entry that omits ``integrity``/
+    ``migration`` -- those blocks remain valid, and are still parsed, on any
+    older, richer registry produced by an explicit migration/cutover tool.
+    """
 
     databases: list[dict[str, Any]] = []
     for item in CANONICAL_DATABASES:
         databases.append({
             "id": item["id"],
             "component": item["component"],
-            "schema_version": 1,
             "canonical_durable_path": item["canonical_path"],
-            "legacy_source": item["legacy_source"],
-            "integrity": {
-                "state": "canonical_inventory_hash_supplied",
-                "rollback_source_sha256": item["sha256"],
-                "sparse_worktree_missing_is_not_absence": True,
-            },
             "authority": {
-                "state": "shadow",
-                "canonical_active": False,
+                "state": "canonical_active",
+                "canonical_active": True,
                 "legacy_active": False,
-                "live_cutover": False,
-            },
-            "migration": {
-                "generation": 0,
-                "source_read_only": True,
-                "rollback_source_hash": item["sha256"],
-                "cutover_performed": False,
-                "legacy_deleted": False,
+                "live_cutover": True,
             },
         })
 
@@ -220,25 +209,40 @@ def _parse_database(item: Mapping[str, Any], repo_root: Path) -> StorageDatabase
     db_id = str(item.get("id") or "")
     component = str(item.get("component") or "")
     canonical_path = str(item.get("canonical_durable_path") or "")
-    legacy_source = str(item.get("legacy_source") or "")
-    if not db_id or not component or not canonical_path or not legacy_source:
+    if not db_id or not component or not canonical_path:
         raise StorageRegistryInvalidError("database_required_field_missing")
     _ensure_relative_safe(repo_root / HUB_DIRNAME, canonical_path, f"{db_id}.canonical_durable_path")
-    _ensure_relative_safe(repo_root, legacy_source, f"{db_id}.legacy_source")
 
-    integrity = item.get("integrity")
     authority = item.get("authority")
-    migration = item.get("migration")
-    if not isinstance(integrity, Mapping) or not isinstance(authority, Mapping) or not isinstance(migration, Mapping):
+    if not isinstance(authority, Mapping):
         raise StorageRegistryInvalidError(f"database_state_missing:{db_id}")
+    # ``integrity``/``migration`` are optional bookkeeping blocks: a fresh,
+    # canonical-only entry (see ``default_registry_payload``) carries neither
+    # -- it has nothing to roll back to -- so an absent block defaults to the
+    # equivalent already-cutover-generation-1 state rather than being
+    # rejected. An older, richer registry produced by an explicit
+    # migration/cutover tool still supplies both and is parsed unchanged.
+    integrity_raw = item.get("integrity")
+    integrity: Mapping[str, Any] = integrity_raw if isinstance(integrity_raw, Mapping) else {}
+    migration_raw = item.get("migration")
+    migration: Mapping[str, Any] = migration_raw if isinstance(migration_raw, Mapping) else {}
+    fresh_canonical_only = not integrity_raw and not migration_raw
     state = str(authority.get("state") or "")
     canonical_active = authority.get("canonical_active") is True
     legacy_active = authority.get("legacy_active") is True
     live_cutover = authority.get("live_cutover") is True
-    cutover_performed = migration.get("cutover_performed") is True
-    rollback_performed = migration.get("rollback_performed") is True
-    legacy_deleted = migration.get("legacy_deleted") is True
-    generation = int(migration.get("generation") or 0)
+    if fresh_canonical_only and state == "canonical_active" and canonical_active:
+        # A fresh, never-migrated entry is, by construction, an implicit
+        # generation-1 cutover with nothing rolled back and nothing deleted.
+        cutover_performed = True
+        rollback_performed = False
+        legacy_deleted = False
+        generation = 1
+    else:
+        cutover_performed = migration.get("cutover_performed") is True
+        rollback_performed = migration.get("rollback_performed") is True
+        legacy_deleted = migration.get("legacy_deleted") is True
+        generation = int(migration.get("generation") or 0)
     shadow = (
         state == "shadow" and not canonical_active and not legacy_active
         and not live_cutover and not cutover_performed
@@ -256,16 +260,19 @@ def _parse_database(item: Mapping[str, Any], repo_root: Path) -> StorageDatabase
     if legacy_deleted or not (shadow or verified_cutover or verified_rollback):
         raise StorageRegistryInvalidError(f"authority_state_invalid:{db_id}")
 
+    # A rollback hash is only meaningful once an explicit, caller-selected
+    # migration has actually copied data in (see source_graph_migration.py);
+    # a canonical-only entry with nothing migrated carries neither field.
     rollback_hash = str(integrity.get("rollback_source_sha256") or "")
     migration_hash = str(migration.get("rollback_source_hash") or "")
-    if len(rollback_hash) != 64 or rollback_hash != migration_hash:
-        raise StorageRegistryInvalidError(f"rollback_hash_invalid:{db_id}")
+    if rollback_hash or migration_hash:
+        if len(rollback_hash) != 64 or rollback_hash != migration_hash:
+            raise StorageRegistryInvalidError(f"rollback_hash_invalid:{db_id}")
 
     return StorageDatabase(
         db_id=db_id,
         component=component,
         canonical_path=canonical_path,
-        legacy_source=legacy_source,
         rollback_source_sha256=rollback_hash,
         integrity_state=str(integrity.get("state") or ""),
         authority_state=str(authority.get("state") or ""),

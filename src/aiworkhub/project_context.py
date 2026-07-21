@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from . import worker_ai_tools_mcp as _worker_tools
 
 
 SCHEMA_ID = "aiworkhub.task_mcp.project_context_bundle.v1"
@@ -23,9 +23,7 @@ MAX_QUERY_BYTES = 512
 MAX_TOPIC_BYTES = 128
 MAX_BUDGET = 160
 MAX_TOOL_OUTPUT_BYTES = 24 * 1024
-MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
 MAX_BUNDLE_BYTES = 64 * 1024
-MAX_TIMEOUT_SECONDS = 12
 MAX_TARGETS = 12
 MAX_TARGET_BYTES = 256
 MAX_SECTION_ROWS = 40
@@ -142,45 +140,6 @@ def _tool_cap(name: str, cap: str, default: int) -> int:
     return int(TOOL_CAPS.get(name, {}).get(cap) or default)
 
 
-def _run_fixed_argv(
-    argv: list[str],
-    *,
-    cwd: Path,
-    timeout_seconds: int = MAX_TIMEOUT_SECONDS,
-    max_output_bytes: int = MAX_TOOL_OUTPUT_BYTES,
-) -> tuple[str, bool]:
-    try:
-        result = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
-            shell=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProjectContextError(f"context_tool_failed:{Path(argv[1]).name}:{exc}") from exc
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
-        raise ProjectContextError(
-            f"context_tool_failed:{Path(argv[1]).name}:rc={result.returncode}:"
-            f"{stderr[-300:] or stdout[-300:]}"
-        )
-    raw = result.stdout
-    if len(raw) > MAX_RAW_TOOL_OUTPUT_BYTES:
-        raise ProjectContextError(
-            f"context_tool_raw_budget_overflow:{Path(argv[1]).name}:"
-            f"{len(raw)}>{MAX_RAW_TOOL_OUTPUT_BYTES}"
-        )
-    truncated = len(raw) > max_output_bytes
-    if not stdout.strip():
-        raise ProjectContextError(f"context_tool_empty:{Path(argv[1]).name}")
-    return stdout, truncated
-
-
 def _json_hit_count(value: Any) -> int:
     if isinstance(value, list):
         return len(value) + sum(_json_hit_count(item) for item in value)
@@ -233,6 +192,7 @@ def _section(
     degraded: str = "",
     requested: bool = True,
     executed: bool = True,
+    hit_count: int | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     cap_bytes = _tool_cap(name, "bytes", MAX_TOOL_OUTPUT_BYTES)
@@ -240,11 +200,13 @@ def _section(
     if len(content.encode("utf-8")) > cap_bytes:
         content, cap_truncated = _bounded_text(content, cap_bytes)
         truncated = truncated or cap_truncated
+    if hit_count is None:
+        hit_count = _content_hit_count(name, content) if executed and not degraded else 0
     return {
         "name": name,
         "requested": requested,
         "executed": executed,
-        "hit_count": _content_hit_count(name, content) if executed and not degraded else 0,
+        "hit_count": hit_count,
         "byte_cap": cap_bytes,
         "row_cap": cap_rows,
         "cap_enforced": True,
@@ -465,7 +427,7 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
     """Query the canonical AIWorkHub Source Graph in-process.
 
     This is a direct import call into :mod:`aiworkhub.source_graph` -- no
-    subprocess, no operational dependency on ``AITools/source_graph.py``.
+    subprocess and no repository-provided helper-script dependency.
     The repository (and therefore the durable database under
     ``<repo>/.aiworkhub/source_graph``) is resolved from ``repo`` via
     repository identity, never a fixed path or ambient ``cwd``.
@@ -489,48 +451,43 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
     return canonical, False
 
 
-def _session_argv(repo: Path, contract: dict[str, Any]) -> list[str]:
-    script = repo / "AITools" / "transcript_graph.py"
-    session = contract["session"]
-    return [
-        sys.executable,
-        str(script),
-        "current-state",
-        session["topic"],
-        "--limit",
-        str(session["limit"]),
-        "--json",
-        "--no-refresh",
-    ]
+def _worker_tool_context(repo: Path, card: dict[str, Any], contract: dict[str, Any]) -> _worker_tools.WorkerToolContext:
+    """Bind this precomputation pass to the same canonical, in-process
+    Session Manager / AI Memory / KB readers ``worker_ai_tools_mcp`` exposes
+    to a live worker MCP call -- no subprocess, no direct SQLite reader
+    duplicated here. ``repo`` is the coordinator-owned host repository (never
+    an isolated worktree), so it is bound as both ``repo`` and
+    ``authority_repo``; there is no per-request audit ledger for this
+    precomputation pass (``audit_ledger_path=None`` is a documented no-op for
+    ``_append_audit``).
+    """
+
+    return _worker_tools.WorkerToolContext(
+        task_id=str(card.get("task_id") or ""),
+        runner=str(card.get("runner") or ""),
+        topic=str(card.get("topic") or ""),
+        request_id="",
+        repo=repo,
+        authority_repo=repo,
+        source_graph_targets=tuple(contract["source_graph"]["targets"]),
+        session_topic=contract["session"]["topic"],
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+    )
 
 
-def _kb_argv(repo: Path, contract: dict[str, Any]) -> list[str] | None:
-    kb = contract.get("kb")
-    if not kb:
-        return None
-    return [
-        sys.executable,
-        str(repo / "AITools" / "kb.py"),
-        "search",
-        kb["query"],
-        "--limit",
-        str(kb["limit"]),
-    ]
+def _canonical_tool_result(result: dict[str, Any], tool: str) -> tuple[str, bool, int]:
+    """Unwrap a bounded ``worker_ai_tools_mcp`` tool result, or raise.
 
+    Those tools never raise -- a missing/non-canonical authority database or
+    an invalid argument comes back as ``{"ok": False, "reason": ...}`` (see
+    ``_violation`` in ``worker_ai_tools_mcp``) -- so this is what turns that
+    into the same fail-closed/degrade contract this module's callers expect.
+    """
 
-def _ai_memory_argv(repo: Path, contract: dict[str, Any]) -> list[str] | None:
-    memory = contract.get("ai_memory")
-    if not memory:
-        return None
-    return [
-        sys.executable,
-        str(repo / "AITools" / "ai_memory" / "ai_memory.py"),
-        "search",
-        memory["query"],
-        "--limit",
-        str(memory["limit"]),
-        "--json",
-    ]
+    if not result.get("ok"):
+        raise ProjectContextError(f"context_tool_failed:{tool}:{result.get('reason')}")
+    return str(result["content"]), bool(result.get("truncated")), int(result.get("hit_count") or 0)
 
 
 def _degrade_or_raise(required: bool, reason: str) -> tuple[str, bool, str]:
@@ -547,16 +504,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     if contract is None:
         return None
     required = bool(contract["required"])
-    for relative in ("AITools/transcript_graph.py",):
-        if not (repo / relative).is_file():
-            if required:
-                raise ProjectContextError(f"context_tool_missing:{relative}")
-    if contract.get("kb") and not (repo / "AITools/kb.py").is_file():
-        if required:
-            raise ProjectContextError("context_tool_missing:AITools/kb.py")
-    if contract.get("ai_memory") and not (repo / "AITools/ai_memory/ai_memory.py").is_file():
-        if required:
-            raise ProjectContextError("context_tool_missing:AITools/ai_memory/ai_memory.py")
+    ctx = _worker_tool_context(repo, card, contract)
 
     sections: list[dict[str, Any]] = []
 
@@ -601,11 +549,13 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     sections.append(source_section)
 
     try:
-        session_text, session_truncated = _run_fixed_argv(_session_argv(repo, contract), cwd=repo)
-        session_text, json_truncated = _canonical_json_output("session_current_state", session_text)
-        session_truncated = session_truncated or json_truncated
+        session_result = _worker_tools.session_current_state(ctx, limit=contract["session"]["limit"])
+        session_text, session_truncated, session_hit_count = _canonical_tool_result(
+            session_result, "session_current_state"
+        )
     except ProjectContextError as exc:
         session_text, session_truncated, degraded = _degrade_or_raise(required, str(exc))
+        session_hit_count = 0
     else:
         degraded = ""
     sections.append(_section(
@@ -614,20 +564,18 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         content=session_text,
         truncated=session_truncated,
         degraded=degraded,
+        hit_count=session_hit_count,
     ))
 
-    memory_argv = _ai_memory_argv(repo, contract)
-    if memory_argv is not None:
+    if contract.get("ai_memory") is not None:
         try:
-            memory_text, memory_truncated = _run_fixed_argv(
-                memory_argv, cwd=repo, max_output_bytes=8 * 1024
+            memory_result = _worker_tools.ai_memory_search(
+                ctx, query=contract["ai_memory"]["query"], limit=contract["ai_memory"]["limit"],
             )
-            memory_text, json_truncated = _canonical_json_output(
-                "ai_memory", memory_text, max_bytes=8 * 1024
-            )
-            memory_truncated = memory_truncated or json_truncated
+            memory_text, memory_truncated, memory_hit_count = _canonical_tool_result(memory_result, "ai_memory")
         except ProjectContextError as exc:
             memory_text, memory_truncated, degraded = _degrade_or_raise(False, str(exc))
+            memory_hit_count = 0
         else:
             degraded = ""
         sections.append(_section(
@@ -636,16 +584,16 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             content=memory_text,
             truncated=memory_truncated,
             degraded=degraded,
+            hit_count=memory_hit_count,
         ))
 
-    kb_argv = _kb_argv(repo, contract)
-    if kb_argv is not None:
+    if contract.get("kb") is not None:
         try:
-            kb_text, kb_truncated = _run_fixed_argv(kb_argv, cwd=repo, max_output_bytes=8 * 1024)
-            kb_text, plain_truncated = _bounded_text(kb_text, 8 * 1024)
-            kb_truncated = kb_truncated or plain_truncated
+            kb_result = _worker_tools.kb_search(ctx, query=contract["kb"]["query"], limit=contract["kb"]["limit"])
+            kb_text, kb_truncated, kb_hit_count = _canonical_tool_result(kb_result, "kb")
         except ProjectContextError as exc:
             kb_text, kb_truncated, degraded = _degrade_or_raise(False, str(exc))
+            kb_hit_count = 0
         else:
             degraded = ""
         sections.append(_section(
@@ -654,6 +602,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             content=kb_text,
             truncated=kb_truncated,
             degraded=degraded,
+            hit_count=kb_hit_count,
         ))
 
     if required and not any(s["content"].strip() for s in sections):

@@ -1,0 +1,17 @@
+{
+  "schema_id": "aiworkhub.task_mcp.fixture_rebase.b871.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_B437_SOURCE_GRAPH_FIXTURE_REBASE_B871_V1",
+  "runner": "claude_sonnet5_aiworkhub_b437_source_graph_fixture_rebase_b871_v1",
+  "verdict": "PASS",
+  "goal": "Rebase tests/test_worker_ai_infra_context_b437_v1.py onto B849 canonical in-process Source Graph authority",
+  "change_summary": "Replaced AITools/source_graph.py subprocess-stub fixture with a deterministic project_context._source_graph_direct monkeypatch (same pattern proven by B866/B829); no production code changed",
+  "assertions_preserved": [
+    "test_exact_source_graph_targets_policy_and_metadata_are_bounded",
+    "test_required_empty_code_source_graph_fails_before_claim",
+    "test_data_classification_source_graph_can_be_non_gating_with_input_shard",
+    "test_common_prompt_delivery_and_receipt_are_distinct",
+    "test_dashboard_exposes_compact_ai_infra_without_raw_context"
+  ],
+  "test_command": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_worker_ai_infra_context_b437_v1.py",
+  "test_result": "5 passed"
+}

@@ -4,6 +4,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -92,11 +93,6 @@ def _repo(tmp_path: Path, *, source_payload: dict, session_payload: dict) -> Pat
     repo = tmp_path / "repo"
     (repo / "AITools" / "ai_memory").mkdir(parents=True)
     _write(
-        repo / "AITools/source_graph.py",
-        "import json\nprint('[*] Language: python (python)')\n"
-        f"print(json.dumps({source_payload!r}, ensure_ascii=False))\n",
-    )
-    _write(
         repo / "AITools/transcript_graph.py",
         f"import json\nprint(json.dumps({session_payload!r}, ensure_ascii=False))\n",
     )
@@ -109,6 +105,59 @@ def _repo(tmp_path: Path, *, source_payload: dict, session_payload: dict) -> Pat
         "import sys\nprint(\"[kb] no results for '%s'\" % sys.argv[2])\n",
     )
     return repo
+
+
+def _install_source_graph_stub(source_payload: dict):
+    """Stand in for aiworkhub.source_graph's real in-process query engine
+    (its own correctness is covered by that module's own test suite) so
+    this fixture can assert project-context envelope/token-economy
+    behavior against a deterministic payload without building a real
+    on-disk Source Graph index. Source Graph is queried in-process via
+    ``project_context._source_graph_direct`` since B849 (no subprocess,
+    no ``AITools/source_graph.py``)."""
+    canonical = json.dumps(source_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return mock.patch.object(
+        project_context, "_source_graph_direct",
+        lambda repo, contract: (canonical, False),
+    )
+
+
+def _install_worker_tools_stub(*, session_hit: bool = True, memory_hit: bool = False, kb_hit: bool = False):
+    """Deterministic in-process Session Manager / AI Memory / KB stub
+    (B879 canonical authority). ``collect_project_context`` calls
+    ``worker_ai_tools_mcp.session_current_state`` / ``ai_memory_search`` /
+    ``kb_search`` in-process against the repository's canonical
+    ``.aiworkhub`` SQLite authority -- no subprocess, no ``AITools/*.py``
+    dependency. Monkeypatching these call sites directly mirrors
+    ``_install_source_graph_stub`` above."""
+
+    def fake_session(ctx, *, limit: int = 12):
+        evidence = (
+            [{"source_id": "42", "timestamp": "2026-07-18T10:00:00Z", "kind": "progress", "snippet": "bounded"}]
+            if session_hit else []
+        )
+        content = json.dumps(
+            {"topic": ctx.session_topic, "state": "current" if session_hit else "unknown", "evidence": evidence},
+            ensure_ascii=False, sort_keys=True,
+        )
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(evidence)}
+
+    def fake_memory(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "ctx", "value": "bounded", "tags": "task_mcp"}] if memory_hit else []
+        content = json.dumps({"results": results, "count": len(results)}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    def fake_kb(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "pipeline.stage_order", "title": "x", "category": "module"}] if kb_hit else []
+        content = json.dumps({"results": results, "count": len(results)}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    return mock.patch.multiple(
+        project_context._worker_tools,
+        session_current_state=fake_session,
+        ai_memory_search=fake_memory,
+        kb_search=fake_kb,
+    )
 
 
 def _card() -> dict:
@@ -151,7 +200,8 @@ def _card() -> dict:
 
 def _collect(tmp_path: Path) -> project_context.ProjectContextResult:
     repo = _repo(tmp_path, source_payload=SOURCE_GRAPH_PAYLOAD, session_payload=SESSION_PAYLOAD)
-    result = project_context.collect_project_context(repo, _card())
+    with _install_source_graph_stub(SOURCE_GRAPH_PAYLOAD), _install_worker_tools_stub():
+        result = project_context.collect_project_context(repo, _card())
     assert result is not None
     return result
 
@@ -250,22 +300,20 @@ def test_max_bundle_budget_rejection_stays_fail_closed(
 ) -> None:
     repo = _repo(tmp_path, source_payload=SOURCE_GRAPH_PAYLOAD, session_payload=SESSION_PAYLOAD)
     monkeypatch.setattr(project_context, "MAX_BUNDLE_BYTES", 64)
-    with pytest.raises(
-        project_context.ProjectContextError, match="project_context_bundle_budget_overflow"
-    ):
-        project_context.collect_project_context(repo, _card())
+    with _install_source_graph_stub(SOURCE_GRAPH_PAYLOAD), _install_worker_tools_stub():
+        with pytest.raises(
+            project_context.ProjectContextError, match="project_context_bundle_budget_overflow"
+        ):
+            project_context.collect_project_context(repo, _card())
 
 
 def test_required_source_graph_empty_result_still_rejects(tmp_path: Path) -> None:
     repo = _repo(tmp_path, source_payload=SOURCE_GRAPH_PAYLOAD, session_payload=SESSION_PAYLOAD)
-    _write(
-        repo / "AITools/source_graph.py",
-        "import json\nprint('[*] Language: python (python)')\nprint(json.dumps({}))\n",
-    )
-    with pytest.raises(
-        project_context.ProjectContextError, match="source_graph_required_empty_result"
-    ):
-        project_context.collect_project_context(repo, _card())
+    with _install_source_graph_stub({}):
+        with pytest.raises(
+            project_context.ProjectContextError, match="source_graph_required_empty_result"
+        ):
+            project_context.collect_project_context(repo, _card())
 
 
 def test_envelope_overhead_stays_bounded_as_evidence_scales(tmp_path: Path) -> None:
@@ -286,7 +334,8 @@ def test_envelope_overhead_stays_bounded_as_evidence_scales(tmp_path: Path) -> N
     large_session["current_source"] = dict(SESSION_PAYLOAD["current_source"])
     large_session["current_source"]["snippet"] = SESSION_PAYLOAD["current_source"]["snippet"] * 4
     repo = _repo(tmp_path / "large", source_payload=large_source, session_payload=large_session)
-    large_result = project_context.collect_project_context(repo, _card())
+    with _install_source_graph_stub(large_source), _install_worker_tools_stub():
+        large_result = project_context.collect_project_context(repo, _card())
     assert large_result is not None
     large_bytes = len(large_result.prompt_bundle.encode("utf-8"))
     large_content_bytes = sum(

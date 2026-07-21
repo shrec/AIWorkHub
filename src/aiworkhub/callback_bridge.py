@@ -1966,8 +1966,32 @@ class CallbackBridge:
 # visible error) rather than silently doing nothing or fabricating delivery.
 SUPPORTED_DISPATCH_PROVIDERS: frozenset[str] = frozenset({"codex", "claude"})
 
-_DISPATCHER_REGISTRY_LOCK = threading.Lock()
-_DISPATCHER_REGISTRY: dict[str, "CallbackDispatcher"] = {}
+# B875: anchored on ``sys`` (a module the interpreter itself never reloads
+# or evicts from ``sys.modules``) rather than on this module's own globals.
+# Some test fixtures (e.g. the B844 bundled-runtime fallback harness) purge
+# every ``aiworkhub.*`` entry from ``sys.modules`` around an in-process
+# re-import to exercise a clean-import code path; a plain module-global dict
+# would then silently fork into two disconnected registries -- the stale
+# one already bound by any test module that imported ``callback_bridge``
+# before the purge, and a fresh empty one picked up by every subsequent
+# (re-)import, including lazy ones like ``core._callback_bridge_module()``.
+# Anchoring the (lock, dict) pair on ``sys`` under a private attribute name
+# guarantees every generation of this module -- old or freshly re-imported
+# -- resolves to the exact same lock and the exact same registry for the
+# life of the process, so "exactly one dispatcher per repository" holds
+# regardless of how many times ``aiworkhub.callback_bridge`` gets reloaded.
+_DISPATCHER_REGISTRY_ANCHOR_ATTR = "_aiworkhub_callback_dispatcher_registry_v1"
+
+
+def _dispatcher_registry_state() -> tuple[threading.Lock, dict[str, "CallbackDispatcher"]]:
+    anchor = getattr(sys, _DISPATCHER_REGISTRY_ANCHOR_ATTR, None)
+    if anchor is None:
+        anchor = (threading.Lock(), {})
+        setattr(sys, _DISPATCHER_REGISTRY_ANCHOR_ATTR, anchor)
+    return anchor
+
+
+_DISPATCHER_REGISTRY_LOCK, _DISPATCHER_REGISTRY = _dispatcher_registry_state()
 
 
 def _dispatcher_registry_key(repo_root: Path | str) -> str:

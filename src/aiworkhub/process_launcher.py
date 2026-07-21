@@ -29,6 +29,7 @@ from typing import Any, Callable
 import fcntl
 
 from . import core
+from . import task_engine
 try:
     from . import project_context
 except ImportError:
@@ -151,6 +152,10 @@ EXTERNAL_READONLY_ROOTS: tuple[Path, ...] = (
 )
 PROCESS_LOG_ENV = "AIWORKHUB_PROCESS_LOG_PATH"
 PROCESS_DIR_ENV = "AIWORKHUB_PROCESS_DIR"
+# Repository-local, non-durable runtime tree (never the historical
+# any package-install/monorepo log path): .aiworkhub/runtime/process_logs/.
+PROCESS_LOG_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/process_events.jsonl")
+PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
 DEFAULT_MAX_PROCESSES = 4
 MAX_CONFIGURED_PROCESSES = 32
 MAX_LOG_TAIL_BYTES = 64 * 1024
@@ -456,7 +461,7 @@ def _process_log_path(repo: Path) -> Path:
     return Path(
         os.environ.get(
             PROCESS_LOG_ENV,
-            str(Path(repo) / "tools/geoai-task-mcp/logs/process_events.jsonl"),
+            str(Path(repo) / PROCESS_LOG_DEFAULT_REL),
         )
     )
 
@@ -1256,16 +1261,16 @@ class ProcessManager:
         self.process_log_path = process_log_path or Path(
             os.environ.get(
                 PROCESS_LOG_ENV,
-                str(self.repo / "tools/geoai-task-mcp/logs/process_events.jsonl"),
+                str(self.repo / PROCESS_LOG_DEFAULT_REL),
             )
         )
         self.process_dir = process_dir or Path(
             os.environ.get(
                 PROCESS_DIR_ENV,
-                str(self.repo / "tools/geoai-task-mcp/logs/processes"),
+                str(self.repo / PROCESS_DIR_DEFAULT_REL),
             )
         )
-        self._show_task = show_task or core.show_task
+        self._show_task = show_task or self._default_show_task
         self._collision_guard = collision_guard or core.collision_guard
         self._adapter_builder = adapter_builder
         self._popen = popen_factory or subprocess.Popen
@@ -1276,6 +1281,18 @@ class ProcessManager:
         self._watching: set[str] = set()
         if self.isolation_enabled and self.process_log_path.is_file():
             self._reconcile_persisted_requests()
+
+    def _default_show_task(self, task_id: str) -> dict[str, Any]:
+        """The sole claim/finalization authority: ``self.repo`` -- the exact
+        repository this ProcessManager (and every isolated workspace it
+        launched) is bound to -- never an independently, ambiently
+        re-resolved repository (``core.show_task`` -> ``core.repo_root()``).
+        Every internal caller of ``self._show_task`` (preflight, exact-claim-
+        state, GC eligibility, status) goes through this one binding, so the
+        launcher and the finalizer can never disagree about which
+        ``.aiworkhub/tasking/task_queue.sqlite`` is canonical for this
+        worker's workspace."""
+        return task_engine.show_task(self.repo, task_id)
 
     @contextmanager
     def _registry_lock(self):
@@ -1588,6 +1605,7 @@ class ProcessManager:
                     adapter_id,
                     list(plan.argv),
                     backend=sandbox_backend,
+                    package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
                 )
 
                 claim = core.claim_start_exact(
@@ -2575,18 +2593,27 @@ class ProcessManager:
                 else:
                     terminal_state = "finalize_failed"
                 # Keep the isolated candidate intact for coordinator
-                # diagnosis/retry on every genuine terminal failure, not only
-                # validation_failed. Deleting it here forces needless model
-                # reruns and destroys the evidence needed to distinguish a
-                # product defect from a validator/promotion-race defect (the
-                # coordinator review-first lifecycle owns cleanup after its
-                # accept/reject decision, not the worker's own finalize path).
-                # The one exception is a lost-claim race (error starts with
-                # "claim_ownership_lost"): a different runner already
-                # legitimately owns this task, so this specific worktree is
-                # moot -- nobody will ever review it, cleanup here is correct.
+                # diagnosis/retry on every genuine terminal failure, including
+                # a lost-claim race (error starts with "claim_ownership_lost").
+                # Deleting it here forces needless model reruns and destroys
+                # the evidence needed to distinguish a product defect from a
+                # validator/promotion-race defect (the coordinator
+                # review-first lifecycle owns cleanup after its accept/reject
+                # decision, not the worker's own finalize path). B863: a
+                # claim_ownership_lost read is not reliable proof that a
+                # different runner legitimately owns this task -- it can also
+                # be a false positive from a launcher/finalizer canonical-
+                # authority disagreement (the B860/B861 failure mode), and
+                # this worker's own claim episode may still be exact-current.
+                # Cleanup here used to be unconditional on ownership_lost,
+                # which deleted still-valid worktrees on every false positive.
+                # Deletion is deferred entirely to the canonical-status-gated
+                # sweep in _gc_finalized_workspace, which independently
+                # re-reads this exact self.repo's task_queue.sqlite and
+                # requires a genuinely finished/archived status before ever
+                # touching disk.
                 ownership_lost = error.startswith("claim_ownership_lost")
-                cleanup = ownership_lost
+                cleanup = False
                 if not ownership_lost and not promoted:
                     # release-launch must see the clean, normalized
                     # terminal_state (not the raw, worker-controlled error

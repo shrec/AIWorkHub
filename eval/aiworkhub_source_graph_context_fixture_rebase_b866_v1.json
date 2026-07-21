@@ -1,0 +1,95 @@
+{
+  "schema_id": "aiworkhub.task_mcp.aiworkhub_source_graph_context_fixture_rebase_b866_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_SOURCE_GRAPH_CONTEXT_FIXTURE_REBASE_B866_V1",
+  "runner": "claude_sonnet5_aiworkhub_source_graph_context_fixture_rebase_b866_v1",
+  "topic": "task_mcp",
+  "mode": "fixture_rebase_no_production_change",
+  "goal": "Rebase the four named B829/B833/B834/B835 fixture test files onto the current AIWorkHub 0.6.0 repo-local authority (real .aiworkhub/project.json manifest + .aiworkhub/config/storage.json registry, in-process aiworkhub.source_graph) that the B849 Source Graph refactor introduced after these fixtures were written, with zero production runtime changes.",
+  "root_cause": {
+    "summary": "aiworkhub.source_graph became the sole Source Graph implementation (task B849): worker_ai_tools_mcp.source_graph_query and project_context._source_graph_direct both now call aiworkhub.source_graph.focus/slice_/bundle in-process against <repo>/.aiworkhub/source_graph/source_graph.sqlite, resolved via aiworkhub.storage_registry.load_storage_registry (strict schema: schema_id, registry_version, repo_id matching the manifest, per-database integrity/authority/migration objects). The four fixtures still wrote a fake subprocess-invoked AITools/source_graph.py stub and a hand-rolled minimal storage.json -- neither is read by the current code path, so every fixture that queried Source Graph either raised RepositoryUnresolvedError (manifest_missing) or (once a placeholder file was substituted) sqlite3.DatabaseError.",
+    "evidence": "Before this task: 24/72 tests failing across the four files (git blame/HEAD run of `pytest tests/test_aiworkhub_context_optimization_b829_v1.py tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py`)."
+  },
+  "fixes_applied": [
+    {
+      "id": "b833_b834_canonical_authority_binding",
+      "description": "_authority_repo/_fake_repo now call aiworkhub.repository_state.bootstrap_repository(repo) to write a real manifest + the matching storage_registry.default_registry_payload registry, plus a placeholder byte file at .aiworkhub/source_graph/source_graph.sqlite so the existence/size gate passes; _worktree_repo bootstraps the manifest+registry but never creates that file, reproducing the fresh-git-worktree shape (authority resolves, database is absent) that test_source_graph_query_against_isolated_worktree_authority_is_a_violation_not_empty_success exercises."
+    },
+    {
+      "id": "b833_b834_source_graph_engine_stub",
+      "description": "Added _stub_source_graph_engine(monkeypatch), which monkeypatches aiworkhub.source_graph.focus/slice_/bundle (module-attribute patch, so worker_ai_tools_mcp's `from . import source_graph as _source_graph_mod` call sees it) to a deterministic payload and records (mode, query, budget) calls -- the in-process replacement for the old subprocess argv-echo trick. The real FTS query engine's own correctness stays covered by aiworkhub.source_graph's own test suite, not re-tested here."
+    },
+    {
+      "id": "b834_authority_index_identity_string",
+      "description": "Source Graph is the sole authority since B849 and never resolves through the legacy/shadow toggle; updated the expected authority_index_identity assertion from 'source_graph:legacy:shadow' to 'source_graph:canonical:sole_authority' to match _resolve_source_graph_db's real return value."
+    },
+    {
+      "id": "b829_b835_source_graph_direct_stub",
+      "description": "project_context.collect_project_context now calls the module-private _source_graph_direct(repo, contract) in-process instead of running AITools/source_graph.py as a subprocess through _run_fixed_argv. Both fixtures now monkeypatch/mock.patch.object project_context._source_graph_direct directly with a deterministic (canonical_json_text, truncated) return, mirroring the existing fake_run pattern already used for the still-subprocess-based transcript_graph.py/ai_memory.py/kb.py tools."
+    },
+    {
+      "id": "b829_cwd_dependent_and_stale_absolute_eval_paths",
+      "description": "EVAL_JSON/EVAL_ROWS were plain relative Paths ('tools/geoai-task-mcp/eval/...') that only resolved correctly when pytest ran from the outer GeoAI root, and PROCESS_DIRS hardcoded a stale absolute container path ('/repo/AIWorkHub/tools/geoai-task-mcp/logs/processes') alongside a repo-root-relative one -- neither is a legal AIWorkHub 0.6.0 repo-local path. Both now derive from Path(__file__).resolve().parents[1], matching the pattern already used correctly in test_aiworkhub_project_context_minimal_tokens_b835_v1.py, so the suite passes identically from both the outer GeoAI root and the nested tools/geoai-task-mcp root."
+    }
+  ],
+  "removed_dead_fixtures": [
+    "AITools/source_graph.py fake subprocess stub scripts in all four files (no longer invoked by any production code path)",
+    "b833/b834's hand-rolled flat .aiworkhub/config/storage.json writer used as the Source Graph authority source (replaced by the canonical bootstrap_repository-generated registry; the flat writer is kept only where a test explicitly exercises the generic legacy-schema _resolve_authority_db path)"
+  ],
+  "verification": {
+    "before": {
+      "test_aiworkhub_context_optimization_b829_v1.py": "2 failed, 2 passed",
+      "test_aiworkhub_dynamic_worker_mcp_b833_v1.py": "4 failed, 29 passed",
+      "test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py": "6 failed, 17 passed",
+      "test_aiworkhub_project_context_minimal_tokens_b835_v1.py": "10 failed, 2 passed"
+    },
+    "after": {
+      "test_aiworkhub_context_optimization_b829_v1.py": "4 passed",
+      "test_aiworkhub_dynamic_worker_mcp_b833_v1.py": "33 passed",
+      "test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py": "23 passed",
+      "test_aiworkhub_project_context_minimal_tokens_b835_v1.py": "12 passed",
+      "combined": "72 passed, 0 failed",
+      "commands_run": [
+        "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_context_optimization_b829_v1.py tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py",
+        "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_context_optimization_b829_v1.py tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py tools/geoai-task-mcp/tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py (run from the outer GeoAI root)"
+      ],
+      "both_roots_pass": true
+    },
+    "not_run_out_of_scope": {
+      "test_worker_ai_infra_context_b437_v1.py": "3 of its tests independently fail against the same _source_graph_direct refactor (source_graph_repo_unresolved:manifest_missing) but that file is not in this task's allowed_writes; left untouched and unreported as passing."
+    }
+  },
+  "safety": {
+    "production_runtime_change": false,
+    "legacy_aiworkinghub_path_present": false,
+    "geoai_product_specific_path_present": false,
+    "card_scope_weakened": false,
+    "exact_validation_weakened": false
+  },
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/src/aiworkhub/project_context.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_aiworkhub_context_optimization_b829_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_source_graph_context_fixture_rebase_b866_v1.json"
+  ],
+  "not_modified": [
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/src/aiworkhub/project_context.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/src/aiworkhub/storage_registry.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_state.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_context_optimization_b829_v1.json",
+    "tools/geoai-task-mcp/eval/aiworkhub_context_optimization_rows_b829_v1.jsonl",
+    "tools/geoai-task-mcp/eval/aiworkhub_dynamic_worker_mcp_b833_v1.json",
+    "tools/geoai-task-mcp/eval/aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.json",
+    "tools/geoai-task-mcp/eval/aiworkhub_project_context_minimal_tokens_b835_v1.json"
+  ],
+  "known_limitations": [
+    "test_worker_ai_infra_context_b437_v1.py is broken by the same B849 _source_graph_direct in-process refactor (source_graph_repo_unresolved:manifest_missing on 3 of its tests) but is outside this task's allowed_writes; a follow-up fixture-rebase task should cover it the same way this task covered b829/b833/b834/b835."
+  ]
+}
