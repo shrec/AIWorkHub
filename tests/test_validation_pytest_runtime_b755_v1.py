@@ -124,7 +124,9 @@ class TestReproducesSanitizedHomePytestImportFailure(_TolerateNestedSeccompChmod
         home = self.tmp_path / "sanitized_home"
         env = worker_workspace.sanitized_env("validation", home=home)
         result = worker_workspace.subprocess.run(
-            [sys.executable, "-m", "pytest", "--version"],
+            # ``-S`` makes the absent-runtime precondition deterministic even
+            # when CI itself runs from a virtualenv that contains pytest.
+            [sys.executable, "-S", "-m", "pytest", "--version"],
             env=env,
             cwd=str(self.tmp_path),
             text=True,
@@ -217,6 +219,10 @@ class TestIsPytestValidationCommand(unittest.TestCase):
 # --- 4. run_validations end-to-end: success, fail-closed, unchanged non-pytest, credentials, cleanup ---
 
 
+@unittest.skipIf(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    "GitHub hosted runners cannot execute nested Landlock validation sandboxes",
+)
 class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
     def test_pytest_command_succeeds_with_trusted_root_prepended_and_project_pythonpath_preserved(self) -> None:
         fake_root = self.tmp_path / "trusted_site_packages"
