@@ -361,7 +361,9 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
             break
         time.sleep(0.02)
     assert deadline_result is not None and deadline_result.get("terminal")
-    assert deadline_result["state"] == "review_ready", deadline_result
+    assert deadline_result["state"] == "review_ready", json.dumps(
+        deadline_result, sort_keys=True, default=str
+    )
     assert (git_task_repo / "out" / "result.txt").read_text(encoding="utf-8") == "worker-result\n"
     final_row = _row(git_task_repo, "TASK_B882J")
     assert final_row["worker_status"] == "review"
