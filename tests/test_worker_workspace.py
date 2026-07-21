@@ -144,6 +144,10 @@ def test_promotion_is_scope_checked_parent_guarded_and_restart_idempotent(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
 )
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock workers",
+)
 def test_landlock_fallback_allows_declared_output_and_denies_parent_and_git_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -708,6 +712,10 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(tmp_path: Path) ->
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock validations",
 )
 def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
     monkeypatch: pytest.MonkeyPatch,
