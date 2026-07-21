@@ -143,6 +143,186 @@ def test_unsupported_language_is_explicit_fail_closed_not_regex_approximated(tmp
     assert extraction.edges == ()
 
 
+# ---------------------------------------------------------------------------
+# B881: truthful bounded JS/TS family file-level evidence (no fabrication)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "suffix,expected_language",
+    [
+        (".js", "javascript"), (".jsx", "javascript"), (".mjs", "javascript"),
+        (".cjs", "javascript"), (".ts", "typescript"), (".tsx", "typescript"),
+    ],
+)
+def test_js_ts_family_gets_file_level_evidence_not_fail_closed(tmp_path, suffix, expected_language):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "pkg" / f"widget{suffix}"
+    _write(target, "export function widget() { return 1; }\n")
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+    assert extraction.status == "file_evidence_only"
+    assert extraction.language == expected_language
+    assert len(extraction.source_hash) == 64
+    assert len(extraction.entities) == 1
+    entity = extraction.entities[0]
+    assert entity.kind == "file"
+    assert entity.evidence_label == sgast.FILE_EVIDENCE
+    assert entity.file_path == f"pkg/widget{suffix}"
+    assert entity.signature == "bytes=39"
+    # No function/call/import/class is invented from JS/TS source text.
+    assert extraction.edges == ()
+
+
+def test_former_empty_result_regression_js_target_now_produces_non_empty_slice(tmp_path):
+    """B880 regression: a JS/TS target must never come back empty merely
+    because Python AST extraction was the only semantic extractor wired in."""
+
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "extension" / "extension.js", "module.exports = function activate() {};\n")
+    report = sg.build_index(repo, incremental=True)
+    assert report.errors == []
+    assert report.entities_written == 1
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        matches = sg.find(conn, "extension.js")
+        assert matches
+        assert matches[0]["file_path"] == "extension/extension.js"
+        assert matches[0]["evidence_label"] == sgast.FILE_EVIDENCE
+    finally:
+        conn.close()
+
+    payload = sg.slice_(repo, "extension.js", budget=10)
+    assert payload["matches"], "target slice must be non-empty for a real JS file"
+    assert payload["matches"][0]["file_path"] == "extension/extension.js"
+
+    bundle_payload = sg.bundle(repo, "refactor", "extension.js", max_lines=10)
+    assert bundle_payload["sections"]
+    assert bundle_payload["sections"][0]["file"]["language"] == "javascript"
+    assert bundle_payload["sections"][0]["file"]["status"] == "file_evidence_only"
+    # No fabricated semantic entities/edges beyond the one file-evidence row.
+    assert bundle_payload["sections"][0]["edges"] == []
+    assert len(bundle_payload["sections"][0]["entities"]) == 1
+    assert bundle_payload["sections"][0]["entities"][0]["kind"] == "file"
+
+
+def test_js_ts_family_incremental_rename_and_delete_no_stale_evidence(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    old_path = repo / "web" / "old_widget.ts"
+    _write(old_path, "export const widget = 1;\n")
+    r1 = sg.build_index(repo, incremental=True)
+    assert r1.files_changed == 1
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert sg.context(conn, "web/old_widget.ts")["found"] is True
+    finally:
+        conn.close()
+
+    r2 = sg.build_index(repo, incremental=True)
+    assert r2.files_changed == 0 and r2.files_unchanged == 1
+
+    old_path.unlink()
+    new_path = repo / "web" / "new_widget.ts"
+    _write(new_path, "export const widget = 1;\n")
+    r3 = sg.build_index(repo, incremental=True)
+    assert r3.files_removed == 1
+    assert r3.files_changed == 1
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert sg.context(conn, "web/old_widget.ts")["found"] is False
+        assert sg.context(conn, "web/new_widget.ts")["found"] is True
+        stale = conn.execute(
+            "SELECT COUNT(*) FROM entities WHERE file_path='web/old_widget.ts'"
+        ).fetchone()[0]
+        assert stale == 0
+    finally:
+        conn.close()
+
+    new_path.unlink()
+    r4 = sg.build_index(repo, incremental=True)
+    assert r4.files_removed == 1
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert sg.context(conn, "web/new_widget.ts")["found"] is False
+    finally:
+        conn.close()
+
+
+def test_js_ts_family_respects_ignored_directories(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "real.tsx", "export const Real = () => null;\n")
+    _write(repo / "node_modules" / "pkg" / "vendored.js", "module.exports = 1;\n")
+    _write(repo / "dist" / "bundle.js", "console.log(1);\n")
+    files = sg.iter_source_files(repo)
+    rels = {p.relative_to(repo).as_posix() for p in files}
+    assert "src/real.tsx" in rels
+    assert not any(rel.startswith(("node_modules/", "dist/")) for rel in rels)
+
+
+def test_cmake_generated_ts_timestamp_files_excluded_not_mislabeled_typescript(tmp_path):
+    """CMake writes non-source ``.ts`` dependency-timestamp files under
+    ``CMakeFiles/`` -- these must never be indexed as truthful "typescript"
+    evidence, since they are not TypeScript source at all."""
+
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "real.ts", "export const real = 1;\n")
+    _write(
+        repo / "build" / "CMakeFiles" / "target.dir" / "compiler_depend.ts",
+        "# CMAKE generated file: DO NOT EDIT!\n",
+    )
+    files = sg.iter_source_files(repo)
+    rels = {p.relative_to(repo).as_posix() for p in files}
+    assert "src/real.ts" in rels
+    assert not any("CMakeFiles" in rel for rel in rels)
+
+
+def test_js_ts_family_deterministic_byte_cap_on_slice(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    for i in range(20):
+        _write(repo / "pkg" / f"module_probe_{i}.js", f"module.exports = {i};\n")
+    sg.build_index(repo, incremental=True)
+
+    payload = sg.focus(repo, "module_probe", budget=5)
+    assert payload["mode"] == "focus"
+    assert len(payload["matches"]) <= 5
+    encoded = json.dumps(payload).encode("utf-8")
+    assert len(encoded) <= max(512, 5 * 512)
+    for match in payload["matches"]:
+        assert match["evidence_label"] == sgast.FILE_EVIDENCE
+
+
+def test_python_ast_extraction_unchanged_alongside_js_ts_family(tmp_path):
+    """Preserve the Python semantic graph exactly when JS/TS files coexist
+    in the same repository as the file-level (non-semantic) evidence."""
+
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "core.py", "def caller():\n    return callee()\n\ndef callee():\n    return 1\n")
+    _write(repo / "pkg" / "widget.ts", "export const widget = 1;\n")
+    report = sg.build_index(repo, incremental=True)
+    assert report.errors == []
+
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        py_matches = sg.func(conn, "caller")
+        assert len(py_matches) == 1
+        assert py_matches[0]["evidence_label"] == sgast.EXTRACTED
+        edge = conn.execute(
+            "SELECT dst_name, evidence_label FROM edges WHERE src_qualname=? AND kind='calls'",
+            ("pkg/core.py.caller",),
+        ).fetchone()
+        assert edge["dst_name"] == "callee"
+        assert edge["evidence_label"] == sgast.EXTRACTED
+
+        ts_context = sg.context(conn, "pkg/widget.ts")
+        assert ts_context["found"] is True
+        assert ts_context["edges"] == []
+        assert len(ts_context["entities"]) == 1
+        assert ts_context["entities"][0]["kind"] == "file"
+    finally:
+        conn.close()
+
+
 def test_python_syntax_error_is_explicit_fail_closed(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     target = repo / "pkg" / "broken.py"

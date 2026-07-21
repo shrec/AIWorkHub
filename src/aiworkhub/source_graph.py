@@ -10,9 +10,11 @@ Design constraints (see task card B849):
 
   * No model/API/network call, no Graphify dependency, no ``graph.json``
     authority, no second external graph product -- SQLite only.
-  * Extraction is AST-first for Python (:mod:`aiworkhub.source_graph_ast`);
-    unsupported languages fail closed rather than being approximated with
-    regex heuristics mislabeled as extracted evidence.
+  * Extraction is AST-first for Python (:mod:`aiworkhub.source_graph_ast`).
+    The JavaScript/TypeScript family gets truthful file-level evidence
+    (path/hash/language/size, no fabricated functions/calls/edges); every
+    other unsupported language fails closed rather than being approximated
+    with regex heuristics mislabeled as extracted evidence.
   * Incremental indexing removes every entity/edge a changed OR deleted
     file owned before re-indexing it, so renames/deletes never leave a
     stale edge behind.
@@ -61,6 +63,11 @@ DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
     HUB_DIRNAME, ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
     "dist", "build",
+    # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
+    # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
+    # "typescript" evidence would be a false language label, not truthful
+    # evidence of real JS/TS source.
+    "CMakeFiles",
     # Ephemeral nested worktrees and editor/agent state, not canonical
     # source: ``.claude/worktrees/<task>`` holds full nested checkouts of
     # this same repository (their own ``tools/``, ``scripts/`` trees would
@@ -176,15 +183,19 @@ def _now_iso() -> str:
 # File discovery -- generic, repo-agnostic (no project-specific hardcoding)
 # ---------------------------------------------------------------------------
 
+INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS
+
+
 def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
     out: list[Path] = []
-    for path in sorted(repo_root.rglob("*.py")):
-        rel_parts = path.relative_to(repo_root).parts[:-1]
-        if any(part in DEFAULT_EXCLUDE_DIR_NAMES or part.endswith(".egg-info") for part in rel_parts):
-            continue
-        out.append(path)
-    return out
+    for ext in INDEXED_EXTENSIONS:
+        for path in repo_root.rglob(f"*{ext}"):
+            rel_parts = path.relative_to(repo_root).parts[:-1]
+            if any(part in DEFAULT_EXCLUDE_DIR_NAMES or part.endswith(".egg-info") for part in rel_parts):
+                continue
+            out.append(path)
+    return sorted(set(out))
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +711,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "BUILD_REVISION",
+    "INDEXED_EXTENSIONS",
     "BuildReport",
     "MAX_BUDGET_ROWS",
     "MAX_COMPONENT_NODES",

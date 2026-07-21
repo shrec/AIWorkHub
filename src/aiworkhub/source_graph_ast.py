@@ -17,6 +17,14 @@ Languages other than Python have no AST extractor wired in here. Rather
 than approximate them with regex heuristics mislabeled as ``EXTRACTED``
 evidence (the failure mode this migration removes), unsupported files are
 recorded with ``status="unsupported_fail_closed"`` and zero entities/edges.
+
+The JavaScript/TypeScript family (``.js .jsx .mjs .cjs .ts .tsx``) is the
+one documented exception: B881 gives these files a truthful *file-level*
+authority record -- one ``kind="file"`` entity carrying the exact
+language, path, byte size and content hash directly observed from disk
+(``FILE_EVIDENCE``) -- without inventing any function/class/call/import
+inside the file. No parser dependency is added; nothing about the file's
+internal structure is claimed.
 """
 
 from __future__ import annotations
@@ -27,15 +35,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v1"
+FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 
 EXTRACTED = "EXTRACTED"
 INFERRED = "INFERRED"
 AMBIGUOUS = "AMBIGUOUS"
+FILE_EVIDENCE = "FILE_EVIDENCE"
 
-ENTITY_KINDS = ("module", "class", "function", "method", "import")
+ENTITY_KINDS = ("module", "class", "function", "method", "import", "file")
 EDGE_KINDS = ("imports", "calls", "defines", "inherits")
 
 PYTHON_EXTENSIONS = (".py",)
+
+# JS/TS family languages get file-level (not semantic) evidence: real path,
+# hash, size and language, no fabricated entities/edges inside the file.
+JS_TS_LANGUAGE_BY_EXTENSION: dict[str, str] = {
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+}
+JS_TS_EXTENSIONS = tuple(JS_TS_LANGUAGE_BY_EXTENSION)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -97,6 +119,10 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
         )
     source_hash = sha256_bytes(raw)
 
+    js_ts_language = JS_TS_LANGUAGE_BY_EXTENSION.get(file_path.suffix)
+    if js_ts_language is not None:
+        return _extract_file_evidence(rel, raw, js_ts_language, source_hash, build_revision)
+
     if file_path.suffix not in PYTHON_EXTENSIONS:
         return FileExtraction(
             file_path=rel, language=file_path.suffix.lstrip(".") or "unknown",
@@ -119,6 +145,29 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
         )
 
     return _extract_python_ast(rel, tree, source_hash, build_revision)
+
+
+def _extract_file_evidence(
+    rel: str, raw: bytes, language: str, source_hash: str, build_revision: str,
+) -> FileExtraction:
+    """One truthful ``kind="file"`` entity: exact path/language/size/hash.
+
+    No function/class/call/import is claimed for the file's contents --
+    there is no JS/TS parser here, so nothing beyond directly observed
+    file facts (line count, byte size, language, hash) is recorded.
+    """
+
+    line_count = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
+    entity = Entity(
+        kind="file", name=rel, qualname=rel, file_path=rel,
+        line_start=1, line_end=max(1, line_count), signature=f"bytes={len(raw)}",
+        evidence_label=FILE_EVIDENCE, extractor=FILE_EVIDENCE_EXTRACTOR_ID,
+        confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+    )
+    return FileExtraction(
+        file_path=rel, language=language, status="file_evidence_only",
+        source_hash=source_hash, entities=(entity,), edges=(),
+    )
 
 
 def _sig_of(node: ast.AST) -> str:
@@ -328,7 +377,11 @@ __all__ = [
     "ENTITY_KINDS",
     "EXTRACTED",
     "EXTRACTOR_ID",
+    "FILE_EVIDENCE",
+    "FILE_EVIDENCE_EXTRACTOR_ID",
     "INFERRED",
+    "JS_TS_EXTENSIONS",
+    "JS_TS_LANGUAGE_BY_EXTENSION",
     "Edge",
     "Entity",
     "FileExtraction",
