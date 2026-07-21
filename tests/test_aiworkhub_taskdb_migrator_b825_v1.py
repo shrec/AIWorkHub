@@ -1,35 +1,22 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import sqlite3
-import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 
-REPO = Path(__file__).resolve().parents[3]
-SRC = REPO / "tools" / "aiworkhub" / "src"
-AIT = REPO / "AITools"
-for path in (SRC, AIT):
-    text = str(path)
-    if text not in sys.path:
-        sys.path.insert(0, text)
+REPO = Path(__file__).resolve().parents[1]
 
+from aiworkhub import fresh_task_store
 from aiworkhub import task_store_migration as migrator
 from aiworkhub.repository_state import bootstrap_repository
 
 
-def _taskdb_module():
-    spec = importlib.util.spec_from_file_location("taskdb_for_b825_tests", AIT / "taskdb.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-taskdb = _taskdb_module()
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _make_repo(tmp_path: Path, repo_id: str = "repo_b825_test_00000001") -> Path:
@@ -41,29 +28,62 @@ def _make_repo(tmp_path: Path, repo_id: str = "repo_b825_test_00000001") -> Path
 
 
 def _seed_db(path: Path, task_id: str = "SAME_TASK_ID") -> None:
-    with taskdb.open_db(path) as conn:
-        taskdb.init_db(conn)
-        taskdb.upsert_card(
-            conn,
-            {
-                "task_id": task_id,
-                "runner": "codex_b825",
-                "topic": "task_mcp",
-                "mode": "migration",
-                "status": "review",
-                "worker_status": "review",
-                "priority": "high",
-                "objective": "preserve identity",
-                "origin_thread_id": "11111111-2222-4333-8444-555555555555",
-                "allowed_writes": ["x"],
-                "forbidden": ["y"],
-            },
-            preserve_lifecycle=False,
+    now = _utc_now()
+    card = {
+        "task_id": task_id,
+        "runner": "codex_b825",
+        "topic": "task_mcp",
+        "mode": "migration",
+        "status": "review",
+        "worker_status": "review",
+        "priority": "high",
+        "objective": "preserve identity",
+        "origin_thread_id": "11111111-2222-4333-8444-555555555555",
+        "allowed_writes": ["x"],
+        "forbidden": ["y"],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(fresh_task_store._FRESH_SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO tasks(
+              task_id, runner, mode, status, worker_status, priority, objective,
+              card_json, created_at, updated_at, origin_thread_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                card["runner"],
+                card["mode"],
+                card["status"],
+                card["worker_status"],
+                card["priority"],
+                card["objective"],
+                json.dumps(card, sort_keys=True),
+                now,
+                now,
+                card["origin_thread_id"],
+            ),
         )
-        taskdb.append_event(conn, task_id, "review", "codex_b825", {"kept": True})
+        for event in ("card_upserted", "review"):
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, event, "codex_b825", json.dumps({"kept": True}), now),
+            )
         conn.execute(
             "INSERT INTO task_artifacts(task_id, path, kind, summary_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (task_id, "artifact.json", "evidence", "{}", taskdb.utc_now()),
+            (task_id, "artifact.json", "evidence", "{}", now),
+        )
+        conn.execute(
+            """
+            INSERT INTO callback_outbox(
+              task_id, origin_thread_id, transition, episode_id, state,
+              created_at, updated_at, batch_id
+            ) VALUES (?, ?, 'review_ready', '0', 'pending', ?, ?, 'batch-a')
+            """,
+            (task_id, card["origin_thread_id"], now, now),
         )
         conn.execute(
             """
@@ -71,11 +91,7 @@ def _seed_db(path: Path, task_id: str = "SAME_TASK_ID") -> None:
               batch_id, origin_thread_id, state, created_at, updated_at, member_count
             ) VALUES ('batch-a', '11111111-2222-4333-8444-555555555555', 'pending', ?, ?, 1)
             """,
-            (taskdb.utc_now(), taskdb.utc_now()),
-        )
-        conn.execute(
-            "UPDATE callback_outbox SET batch_id='batch-a' WHERE task_id=?",
-            (task_id,),
+            (now, now),
         )
         conn.commit()
 
@@ -93,7 +109,7 @@ def test_shadow_uses_sqlite_backup_api_with_active_wal_and_preserves_parity(tmp_
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute(
             "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            ("SAME_TASK_ID", "concurrent_committed", "test", "{}", taskdb.utc_now()),
+            ("SAME_TASK_ID", "concurrent_committed", "test", "{}", _utc_now()),
         )
         writer.commit()
         result = migrator.create_shadow(root)
@@ -131,7 +147,7 @@ def test_mismatch_rejection_when_source_changes_after_shadow(monkeypatch: pytest
         with sqlite3.connect(source) as conn:
             conn.execute(
                 "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                ("SAME_TASK_ID", "after_shadow", "test", "{}", taskdb.utc_now()),
+                ("SAME_TASK_ID", "after_shadow", "test", "{}", _utc_now()),
             )
             conn.commit()
 
@@ -179,19 +195,20 @@ def test_two_repositories_with_identical_task_ids_do_not_cross_queues(tmp_path: 
     assert snapshots[0]["task_identities"][0]["status"] == "review"
 
 
-def test_taskdb_env_override_beats_manifest_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_migration_uses_explicit_source_and_ignores_ambient_legacy_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _make_repo(tmp_path)
     override = tmp_path / "compat.sqlite"
     monkeypatch.setenv("BITNN_TASK_QUEUE_DB", str(override))
-    spec = importlib.util.spec_from_file_location("taskdb_b825_override", AIT / "taskdb.py")
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert module.DEFAULT_DB == override
+    paths = migrator.resolve_task_store_paths(root, source_db="explicit/source.sqlite")
+    assert paths.source_db == (root / "explicit/source.sqlite").resolve()
+    assert paths.source_db != override
 
 
 def test_evidence_json_is_valid() -> None:
     payload = json.loads(
-        (REPO / "tools/geoai-task-mcp/eval/aiworkhub_taskdb_migrator_b825_v1.json").read_text()
+        (REPO / "eval/aiworkhub_taskdb_migrator_b825_v1.json").read_text()
     )
     assert payload["task_id"] == "CODEX_GPT55_AIWORKHUB_TASKDB_MIGRATOR_B825_V1"
     assert payload["default_action"] == "shadow_only"

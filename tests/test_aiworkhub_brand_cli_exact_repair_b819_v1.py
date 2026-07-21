@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 import types
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -123,7 +123,18 @@ def test_dashboard_mcp_app_registration_survives_legacy_import(monkeypatch):
 
 
 def test_legacy_and_branded_console_entry_points_resolve_to_same_main():
-    scripts = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["scripts"]
+    scripts: dict[str, str] = {}
+    in_scripts = False
+    for line in PYPROJECT.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_scripts = stripped == "[project.scripts]"
+            continue
+        if not in_scripts:
+            continue
+        match = re.fullmatch(r'([A-Za-z0-9_-]+)\s*=\s*"([^"]+)"', stripped)
+        if match:
+            scripts[match.group(1)] = match.group(2)
 
     assert scripts["aiworkhub"] == "aiworkhub.server:main"
     assert scripts["aiworkhub"] == scripts["aiworkhub"]
