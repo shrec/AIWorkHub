@@ -1,4 +1,4 @@
-"""B853: AIWorkHub VS Code release -- HTTP/8765 removal + GLM canary.
+"""B853: AIWorkHub VS Code release -- HTTP/8765 removal.
 
 Verifies (a) ``aiworkhub.dashboard`` no longer contains any HTTP listener /
 browser / fixed-port runtime while its canonical snapshot/detail builders
@@ -341,18 +341,43 @@ def test_glm_release_eval_json_is_valid() -> None:
     assert payload["task_id"] == "CLAUDE_SONNET5_AIWORKHUB_VSCODE_RELEASE_GLM_B853_V1"
 
 
-def test_extension_js_glm_canary_never_polls_or_auto_spends() -> None:
+def test_extension_js_has_no_model_diagnostics_or_glm_canary_surface() -> None:
+    """B880: the Model capabilities / GLM canary diagnostics surface has been
+    removed entirely -- no inbound messages, handlers, or vscode.lm usage."""
     ext_path = _TOOL_ROOT / "vscode-extension" / "extension.js"
     ext = ext_path.read_text(encoding="utf-8")
-    assert "runGlmCanary" in ext
-    assert "refreshModelCapabilities" in ext
-    assert "vscode.lm.selectChatModels" in ext
-    assert "modal: true" in ext
-    assert "Send Prompt" in ext
-    # The reschedule()/setInterval refresh timer must never reference the
-    # GLM canary or model-capability refresh -- both stay explicit-click only.
-    marker = "reschedule() {"
-    start = ext.index(marker)
-    reschedule_body = ext[start : start + 600]
-    assert "runGlmCanary" not in reschedule_body
-    assert "refreshModelCapabilities" not in reschedule_body
+    for forbidden in (
+        "runGlmCanary",
+        "refreshModelCapabilities",
+        "cancelGlmCanary",
+        "vscode.lm.selectChatModels",
+        "GLM_CANARY_FIXED_PROMPT",
+        "MODEL_CAPABILITY_STATES",
+    ):
+        assert forbidden not in ext, f"obsolete model-diagnostics symbol still present: {forbidden}"
+
+
+@pytest.mark.parametrize("media_file", ("app.js", "app.css"))
+def test_media_files_have_no_model_diagnostics_or_glm_canary_surface(media_file: str) -> None:
+    """B880: the webview media bundle (JS + CSS) carries no dead Model
+    capabilities / GLM canary DOM bindings, render/status logic, click
+    handlers, or styling -- these were left over from the extension.js-only
+    B880 v1 pass and are removed here."""
+    media_path = _TOOL_ROOT / "vscode-extension" / "media" / media_file
+    source = media_path.read_text(encoding="utf-8")
+    for forbidden in (
+        "refresh-model-capabilities-button",
+        "refreshModelCapabilities",
+        "model-capability-state",
+        "model-capability-list",
+        "modelCapabilityState",
+        "modelCapabilityList",
+        "modelCapabilities",
+        "renderModelCapabilities",
+        "glm-canary",
+        "glmCanary",
+        "runGlmCanary",
+        "cancelGlmCanary",
+        "renderGlmCanary",
+    ):
+        assert forbidden not in source, f"obsolete model-diagnostics symbol still present in {media_file}: {forbidden}"

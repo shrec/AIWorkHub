@@ -109,13 +109,6 @@ const elements = {
   mcpRuntimeVersion: document.querySelector("#mcp-runtime-version"),
   targetState: document.querySelector("#target-state"),
   targetButtons: Array.from(document.querySelectorAll("[data-provider]")),
-  refreshModelCapabilitiesButton: document.querySelector("#refresh-model-capabilities-button"),
-  modelCapabilityState: document.querySelector("#model-capability-state"),
-  modelCapabilityList: document.querySelector("#model-capability-list"),
-  glmCanaryButton: document.querySelector("#glm-canary-button"),
-  glmCanaryCancelButton: document.querySelector("#glm-canary-cancel-button"),
-  glmCanaryState: document.querySelector("#glm-canary-state"),
-  glmCanaryOutput: document.querySelector("#glm-canary-output"),
 };
 
 function createElement(tag, className, text) {
@@ -761,49 +754,6 @@ function renderCoordinatorTargets(info) {
   }
 }
 
-// ── Model capability discovery + GLM canary (bounded, user-triggered only) ─
-// This panel never polls: it renders only in response to the
-// "modelCapabilities" / "glmCanary" messages the host posts back after an
-// explicit click on one of the two buttons below. It never auto-runs on
-// "ready", on snapshot refresh, or on a timer.
-function renderModelCapabilities(payload) {
-  const info = payload && typeof payload === "object" ? payload : {};
-  const state = String(info.state || "REQUEST_FAILED");
-  const models = asArray(info.models);
-  elements.modelCapabilityState.textContent = info.glmAvailable
-    ? `${state}: GLM model visible`
-    : `${state}${info.reason ? `: ${info.reason}` : ""}`;
-  const fragment = document.createDocumentFragment();
-  for (const model of models) {
-    const label = [model.vendor, model.family, model.version, model.id, model.name]
-      .filter(Boolean)
-      .join(" / ");
-    const tokens = Number.isFinite(model.maxInputTokens) ? `${formatCount(model.maxInputTokens)} max input tokens` : "token limit unknown";
-    fragment.appendChild(createElement("li", "", `${label} (${tokens})`));
-  }
-  if (!models.length) {
-    fragment.appendChild(createElement("li", "cell-secondary", "No models reported"));
-  }
-  elements.modelCapabilityList.replaceChildren(fragment);
-}
-
-function renderGlmCanary(payload) {
-  const info = payload && typeof payload === "object" ? payload : {};
-  const state = String(info.state || "idle");
-  const running = state === "running";
-  elements.glmCanaryButton.disabled = running;
-  elements.glmCanaryCancelButton.disabled = !running;
-  const reasonSuffix = info.reason ? `: ${info.reason}` : "";
-  elements.glmCanaryState.textContent = `${state}${reasonSuffix}`;
-  if (state === "completed" && typeof info.outputPreview === "string") {
-    elements.glmCanaryOutput.hidden = false;
-    elements.glmCanaryOutput.textContent = info.outputTruncated ? `${info.outputPreview}…` : info.outputPreview;
-  } else if (!running) {
-    elements.glmCanaryOutput.hidden = true;
-    elements.glmCanaryOutput.textContent = "";
-  }
-}
-
 function requestRefresh() {
   elements.refreshButton.disabled = true;
   elements.refreshButton.textContent = "Refreshing";
@@ -1133,14 +1083,6 @@ window.addEventListener("message", (event) => {
       renderCoordinatorTargets(message.payload);
       break;
     }
-    case "modelCapabilities": {
-      renderModelCapabilities(message.payload);
-      break;
-    }
-    case "glmCanary": {
-      renderGlmCanary(message.payload);
-      break;
-    }
     case "liveOutput": {
       renderLiveOutput(message.payload);
       break;
@@ -1180,21 +1122,6 @@ for (const button of elements.targetButtons) {
     vscode.postMessage({ type: "selectCoordinatorTarget", provider: button.dataset.provider });
   });
 }
-
-// Both buttons below are the ONLY way this Webview ever requests model
-// capability discovery or the GLM canary -- neither is invoked from any
-// timer, refresh cycle, or "ready" handshake.
-elements.refreshModelCapabilitiesButton.addEventListener("click", () => {
-  vscode.postMessage({ type: "refreshModelCapabilities" });
-});
-
-elements.glmCanaryButton.addEventListener("click", () => {
-  vscode.postMessage({ type: "runGlmCanary" });
-});
-
-elements.glmCanaryCancelButton.addEventListener("click", () => {
-  vscode.postMessage({ type: "cancelGlmCanary" });
-});
 
 elements.statusFilters.addEventListener("click", (event) => {
   const button = event.target.closest("[data-status]");

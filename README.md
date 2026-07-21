@@ -448,27 +448,12 @@ The extension packages as a self-contained VSIX
 editable install, or network-time package install, and it opens as a normal
 editor tab under Remote-SSH.
 
-### Model capability discovery + GLM canary (bounded, user-triggered)
-
-The dashboard editor tab has a "Model capabilities" panel with two explicit,
-user-clicked actions -- neither ever runs on activation, on the refresh
-timer, or during any snapshot poll:
-
-- **Refresh Model Capabilities** calls `vscode.lm.selectChatModels` once and
-  reports sanitized `vendor`/`family`/`version`/`id`/`name`/token-limit
-  metadata per model, plus one of `AVAILABLE` / `NOT_VISIBLE` /
-  `ACCESS_DENIED` / `REQUEST_FAILED`.
-- **Run GLM Canary** asks a native modal ("Send Prompt?") to confirm it will
-  spend model quota/credits, then sends exactly one fixed, minimal prompt to
-  one discovered GLM-family chat model, with cancellation support and a hard
-  cap on how much of the reply is kept. It executes no tools, writes no
-  repository data, and is never invoked automatically.
-
-This is a bounded discovery/canary check, **not** an autonomous Task MCP
-worker: it never claims, launches, or completes a task. The repo-local BYOK
-subprocess adapters (`deepseek_copilot_cli` etc., see
-`deepseek_credentials.py` above) remain the only local-launch,
-task-claiming adapters this project ships.
+The dashboard editor tab has no manual model-probe or canary surface: there
+is no "Model capabilities" panel, no `vscode.lm.selectChatModels` discovery
+action, and no credit-consuming GLM canary prompt anywhere in the extension.
+Model routing and task execution run only through the real autonomous
+worker adapters (`deepseek_copilot_cli` etc., see `deepseek_credentials.py`
+above), never through a manually-triggered diagnostics probe.
 
 Task-bound AI context telemetry is metadata-only. Source Graph, Session
 current-state, AI Memory, and KB sections report requested/executed state, hit

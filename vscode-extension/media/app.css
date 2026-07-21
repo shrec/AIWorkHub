@@ -438,69 +438,9 @@ main {
   font-weight: 650;
 }
 
-.model-capabilities {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 14px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  font-size: 11px;
-}
-
-.model-capabilities .section-heading {
-  min-height: auto;
-  padding: 0;
-  border-bottom: 0;
-}
-
-.model-capabilities h3 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.glm-canary-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.glm-canary-note {
-  margin: 0;
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.secondary-button {
-  height: 26px;
-  padding: 0 10px;
-  color: var(--ink-soft);
-  background: var(--surface-subtle);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  font-size: 11px;
-}
-
-.secondary-button:disabled,
 .primary-button:disabled {
   opacity: 0.55;
   cursor: default;
-}
-
-#glm-canary-output {
-  margin: 0;
-  padding: 8px;
-  max-height: 140px;
-  overflow: auto;
-  color: var(--ink-soft);
-  background: var(--surface-subtle);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  font-size: 11px;
-  white-space: pre-wrap;
 }
 
 .workspace {

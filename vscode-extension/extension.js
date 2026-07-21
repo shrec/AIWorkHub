@@ -25,9 +25,6 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "setRefreshInterval",
   "selectCoordinatorTarget",
   "initializeStorage",
-  "refreshModelCapabilities",
-  "runGlmCanary",
-  "cancelGlmCanary",
   "requestLiveOutput",
 ]);
 
@@ -40,42 +37,9 @@ const OUTBOUND_TYPES = Object.freeze({
   repositoryInfo: "repositoryInfo",
   runtimeInfo: "runtimeInfo",
   coordinatorTargets: "coordinatorTargets",
-  modelCapabilities: "modelCapabilities",
-  glmCanary: "glmCanary",
   liveOutput: "liveOutput",
 });
 
-// ── Bounded VS Code Language Model API discovery + GLM canary ──────────────
-// This surface is a capability PROBE, never a task worker: it only ever
-// (a) lists sanitized chat-model metadata on an explicit user click, and
-// (b) sends exactly one fixed prompt to one GLM model on an explicit user
-// click that a native modal confirms first. It never runs on activation,
-// on the refresh timer (ViewState.reschedule), or on any snapshot poll --
-// see refreshModelCapabilities/runGlmCanary below, which are called from
-// nowhere except handleInboundMessage. It never claims a Task MCP task,
-// never launches a process, and is wholly separate from the repo-local BYOK
-// subprocess adapters (deepseek_copilot_cli et al., see
-// src/aiworkhub/deepseek_credentials.py and README.md) -- those remain the
-// only local-launch, task-claiming adapters this extension knows about.
-const MODEL_CAPABILITY_STATES = Object.freeze({
-  available: "AVAILABLE",
-  notVisible: "NOT_VISIBLE",
-  accessDenied: "ACCESS_DENIED",
-  requestFailed: "REQUEST_FAILED",
-});
-// Substrings matched case-insensitively against a sanitized model's
-// family/id/name to identify a GLM-5.2-family chat model made visible to
-// this extension by the VS Code Language Model API. Never used to select a
-// non-GLM model for the canary.
-const GLM_FAMILY_HINTS = Object.freeze(["glm-5.2", "glm-5", "glm"]);
-// The one fixed, minimal canary prompt. Never interpolated with repository
-// content, task data, or user input -- exactly this string, every run.
-const GLM_CANARY_FIXED_PROMPT =
-  "Reply with one short sentence confirming you received this AIWorkHub GLM canary ping. Do not call any tool.";
-// Hard cap on how much of the model's streamed reply this canary keeps --
-// defends the Webview/output channel from an unbounded response, never a
-// cap on how much the model is asked to produce.
-const GLM_CANARY_MAX_OUTPUT_CHARS = 400;
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
 const ALLOWED_REFRESH_INTERVALS_MS = new Set([10000, 30000, 60000]);
 const DEFAULT_REFRESH_INTERVAL_MS = 30000;
@@ -790,26 +754,6 @@ function readConfiguredRefreshIntervalMs() {
   return ALLOWED_REFRESH_INTERVALS_MS.has(configured) ? configured : DEFAULT_REFRESH_INTERVAL_MS;
 }
 
-// Bounded, sanitized projection of a vscode.LanguageModelChat -- exactly the
-// vendor/family/version/id/name/token-limit metadata the acceptance surface
-// requires, string-length-capped, and nothing else (no auth/session state).
-function sanitizeModelInfo(model) {
-  const info = model && typeof model === "object" ? model : {};
-  return {
-    vendor: String(info.vendor || "").slice(0, 80),
-    family: String(info.family || "").slice(0, 80),
-    version: String(info.version || "").slice(0, 40),
-    id: String(info.id || "").slice(0, 120),
-    name: String(info.name || "").slice(0, 160),
-    maxInputTokens: Number.isFinite(info.maxInputTokens) ? info.maxInputTokens : null,
-  };
-}
-
-function isGlmModelInfo(info) {
-  const haystack = `${info.family} ${info.id} ${info.name}`.toLowerCase();
-  return GLM_FAMILY_HINTS.some((hint) => haystack.includes(hint));
-}
-
 function sanitizeErrorMessage(err) {
   // Every message reaching here is one of this module's own literal Error
   // strings (mcp_not_running / mcp_request_timeout / no_workspace_folder /
@@ -962,145 +906,6 @@ async function pushInitializeStorage(view) {
   }
 }
 
-// Bounded, user-triggered model capability discovery. Called ONLY from
-// handleInboundMessage's "refreshModelCapabilities" case -- never from
-// activation, ViewState.reschedule, or any snapshot poll. Calls
-// vscode.lm.selectChatModels() exactly once per invocation, reports the
-// sanitized model list plus one of AVAILABLE / NOT_VISIBLE / ACCESS_DENIED /
-// REQUEST_FAILED, and never sends a prompt or spends model credits.
-async function refreshModelCapabilities(view) {
-  if (!vscode.lm || typeof vscode.lm.selectChatModels !== "function") {
-    view.postMessage({
-      type: OUTBOUND_TYPES.modelCapabilities,
-      payload: { state: MODEL_CAPABILITY_STATES.requestFailed, reason: "lm_api_unavailable", models: [], glmAvailable: false },
-    });
-    return;
-  }
-  try {
-    const models = await vscode.lm.selectChatModels({});
-    const sanitized = models.map(sanitizeModelInfo);
-    const glmVisible = sanitized.some(isGlmModelInfo);
-    view.postMessage({
-      type: OUTBOUND_TYPES.modelCapabilities,
-      payload: {
-        state: glmVisible ? MODEL_CAPABILITY_STATES.available : MODEL_CAPABILITY_STATES.notVisible,
-        reason: glmVisible ? "ok" : "glm_not_visible",
-        models: sanitized,
-        glmAvailable: glmVisible,
-      },
-    });
-  } catch (err) {
-    const code = String((err && err.code) || "");
-    const message = sanitizeErrorMessage(err);
-    const accessDenied = code === "NoPermissions" || /permission|consent|denied/i.test(message);
-    view.postMessage({
-      type: OUTBOUND_TYPES.modelCapabilities,
-      payload: {
-        state: accessDenied ? MODEL_CAPABILITY_STATES.accessDenied : MODEL_CAPABILITY_STATES.requestFailed,
-        reason: message,
-        models: [],
-        glmAvailable: false,
-      },
-    });
-  }
-}
-
-// Single in-flight cancellation token for the GLM canary -- at most one run
-// at a time; a second click while busy is reported, never queued or
-// silently dropped.
-let glmCanaryTokenSource = null;
-
-function cancelGlmCanary(view) {
-  if (glmCanaryTokenSource) {
-    glmCanaryTokenSource.cancel();
-  }
-  view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "cancel_requested" } });
-}
-
-// The bounded, user-triggered GLM discovery canary. Called ONLY from
-// handleInboundMessage's "runGlmCanary" case. Requires an explicit native
-// modal credit confirmation on every single run (never remembered, never
-// auto-approved), sends exactly the one fixed GLM_CANARY_FIXED_PROMPT,
-// supports cancellation via CancellationTokenSource, caps the kept output at
-// GLM_CANARY_MAX_OUTPUT_CHARS, passes no `tools` to sendRequest (executes no
-// tools), and writes nothing to the repository -- only posts a message back
-// into this Webview.
-async function runGlmCanary(view) {
-  if (glmCanaryTokenSource) {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "busy" } });
-    return;
-  }
-  if (!vscode.lm || typeof vscode.lm.selectChatModels !== "function") {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "unavailable", reason: "lm_api_unavailable" } });
-    return;
-  }
-
-  let glmModels;
-  try {
-    const models = await vscode.lm.selectChatModels({});
-    glmModels = models.filter((model) => isGlmModelInfo(sanitizeModelInfo(model)));
-  } catch (err) {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "error", reason: sanitizeErrorMessage(err) } });
-    return;
-  }
-  if (!glmModels.length) {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "not_visible", reason: "no_glm_model_visible" } });
-    return;
-  }
-  const model = glmModels[0];
-  const info = sanitizeModelInfo(model);
-
-  // Explicit, per-run, native modal confirmation -- the Webview cannot spend
-  // credits on its own; only this host-owned modal, answered "Send Prompt",
-  // proceeds. Declining or dismissing always cancels the run.
-  const confirmation = await vscode.window.showWarningMessage(
-    `Send one fixed canary prompt to ${info.name || info.id} (${info.vendor}/${info.family})? This uses your model quota/credits.`,
-    { modal: true, detail: "AIWorkHub sends exactly one short fixed prompt, executes no tools, and writes no repository data." },
-    "Send Prompt",
-  );
-  if (confirmation !== "Send Prompt") {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "cancelled", reason: "user_declined_confirmation" } });
-    return;
-  }
-
-  const tokenSource = new vscode.CancellationTokenSource();
-  glmCanaryTokenSource = tokenSource;
-  view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "running", model: info } });
-
-  try {
-    const messages = [vscode.LanguageModelChatMessage.User(GLM_CANARY_FIXED_PROMPT)];
-    const request = await model.sendRequest(messages, {}, tokenSource.token);
-    let output = "";
-    let truncated = false;
-    for await (const fragment of request.text) {
-      if (tokenSource.token.isCancellationRequested) {
-        break;
-      }
-      output += fragment;
-      if (output.length >= GLM_CANARY_MAX_OUTPUT_CHARS) {
-        output = output.slice(0, GLM_CANARY_MAX_OUTPUT_CHARS);
-        truncated = true;
-        break;
-      }
-    }
-    if (tokenSource.token.isCancellationRequested) {
-      view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "cancelled", reason: "user_cancelled", model: info } });
-    } else {
-      view.postMessage({
-        type: OUTBOUND_TYPES.glmCanary,
-        payload: { state: "completed", model: info, outputPreview: output, outputTruncated: truncated },
-      });
-    }
-  } catch (err) {
-    view.postMessage({ type: OUTBOUND_TYPES.glmCanary, payload: { state: "error", reason: sanitizeErrorMessage(err), model: info } });
-  } finally {
-    if (glmCanaryTokenSource === tokenSource) {
-      glmCanaryTokenSource = null;
-    }
-    tokenSource.dispose();
-  }
-}
-
 // The ONLY inbound message handler: rejects anything outside the fixed
 // enum, and bounds/validates every payload (task_id pattern, allowlisted
 // refresh intervals) before it can influence an MCP tool call.
@@ -1160,15 +965,6 @@ function handleInboundMessage(view, message) {
     }
     case "initializeStorage":
       pushInitializeStorage(view);
-      break;
-    case "refreshModelCapabilities":
-      refreshModelCapabilities(view);
-      break;
-    case "runGlmCanary":
-      runGlmCanary(view);
-      break;
-    case "cancelGlmCanary":
-      cancelGlmCanary(view);
       break;
     case "requestLiveOutput": {
       const taskId = String(message.taskId || "");
@@ -1327,30 +1123,6 @@ function getHtmlForWebview(webview, extensionUri) {
       <button type="button" data-provider="claude">Claude</button>
       <button type="button" data-provider="copilot">Copilot</button>
       <strong id="target-state">Loading target state</strong>
-    </section>
-
-    <section class="model-capabilities" aria-label="VS Code Language Model capabilities">
-      <div class="section-heading">
-        <h2>Model capabilities</h2>
-        <button class="primary-button" id="refresh-model-capabilities-button" type="button">Refresh Model Capabilities</button>
-      </div>
-      <strong id="model-capability-state">Not checked yet</strong>
-      <ul class="path-list" id="model-capability-list"></ul>
-
-      <div class="section-heading glm-canary-heading">
-        <h3>GLM canary (uses credits)</h3>
-        <div>
-          <button class="primary-button" id="glm-canary-button" type="button">Run GLM Canary</button>
-          <button class="secondary-button" id="glm-canary-cancel-button" type="button" disabled>Cancel</button>
-        </div>
-      </div>
-      <p class="glm-canary-note">
-        Sends one fixed, minimal prompt to one GLM model discovered through the VS Code Language Model API,
-        after an explicit native credit-confirmation dialog. Executes no tools, writes no repository data,
-        and never runs automatically. This is a bounded discovery/canary check, not an autonomous Task MCP worker.
-      </p>
-      <strong id="glm-canary-state">Idle</strong>
-      <pre id="glm-canary-output" hidden></pre>
     </section>
 
     <div class="workspace">

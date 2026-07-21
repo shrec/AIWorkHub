@@ -10,6 +10,11 @@ of a tag.
 
 ### Changed
 
+- Removed the manual Model capabilities / GLM canary diagnostics surface
+  from the dashboard editor tab (no `vscode.lm.selectChatModels` discovery
+  action, no credit-consuming canary prompt) and its obsolete extension-only
+  and Python static tests; the real autonomous worker adapters, model
+  routing, task launch, and callback behavior are unaffected.
 - Python package (`aiworkhub`, `pyproject.toml`) and VS Code extension
   (`vscode-extension/package.json`) versions aligned at `0.6.0`, including
   the extension's own `EXPECTED_MCP_PACKAGE_VERSION` runtime-compatibility
