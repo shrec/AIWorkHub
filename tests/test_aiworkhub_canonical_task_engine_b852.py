@@ -26,7 +26,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import aiworkhub  # noqa: E402
-from aiworkhub import core, task_store  # noqa: E402
+from aiworkhub import callback_store, core, task_store  # noqa: E402
 
 
 NOW = "2026-07-20T00:00:00+00:00"
@@ -236,6 +236,73 @@ def test_full_lifecycle_auto_pickup_review_done(writable_repo, tmp_path, monkeyp
     assert row["completed_at"]
 
 
+def test_mark_review_enqueues_repo_local_callback(writable_repo):
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    _insert_task(
+        writable_repo,
+        "TASK_CALLBACK",
+        "claude_coding",
+        "coding",
+        card_extra={"origin_thread_id": thread_id},
+    )
+
+    picked = core.auto_pickup("claude_coding", "coding")
+    assert picked["ok"] is True
+    reviewed = core.mark_review("TASK_CALLBACK")
+    assert reviewed["ok"] is True
+    assert reviewed["callback_enqueued"] is True
+
+    db_path = callback_store.resolve_db_path(writable_repo)
+    conn = callback_store.open_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT task_id, origin_thread_id, transition, state, episode_id "
+            "FROM callback_outbox WHERE task_id=?",
+            ("TASK_CALLBACK",),
+        ).fetchone()
+        assert callback_store._task_still_in_matching_terminal_state(
+            conn, "TASK_CALLBACK", "review_ready", row["episode_id"]
+        ) is True
+    finally:
+        conn.close()
+    assert row is not None
+    assert dict(row) == {
+        "task_id": "TASK_CALLBACK",
+        "origin_thread_id": thread_id,
+            "transition": "review_ready",
+            "state": "pending",
+            "episode_id": "1",
+        }
+
+
+def test_callback_batches_are_partitioned_by_originating_provider(writable_repo):
+    _insert_task(writable_repo, "TASK_CODEX_ROUTE", "codex_worker", "coding")
+    _insert_task(writable_repo, "TASK_CLAUDE_ROUTE", "claude_worker", "coding")
+    conn = callback_store.open_db(callback_store.resolve_db_path(writable_repo))
+    try:
+        callback_store.init_db(conn)
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_status='review' "
+            "WHERE task_id IN ('TASK_CODEX_ROUTE','TASK_CLAUDE_ROUTE')"
+        )
+        conn.commit()
+        assert callback_store.enqueue_callback(
+            conn, "TASK_CODEX_ROUTE", "codex-thread", "review_ready", provider="codex"
+        )
+        assert callback_store.enqueue_callback(
+            conn, "TASK_CLAUDE_ROUTE", "claude-session", "review_ready", provider="claude"
+        )
+        claude = callback_store.claim_pending_callback_batch(conn, provider="claude")
+        assert claude is not None
+        assert [m["task_id"] for m in claude["members"]] == ["TASK_CLAUDE_ROUTE"]
+        callback_store.mark_batch_delivered(conn, claude["batch_id"])
+        codex = callback_store.claim_pending_callback_batch(conn, provider="codex")
+        assert codex is not None
+        assert [m["task_id"] for m in codex["members"]] == ["TASK_CODEX_ROUTE"]
+    finally:
+        conn.close()
+
+
 def test_claim_start_exact_and_reject_review(writable_repo, tmp_path, monkeypatch):
     _coordinator_env(tmp_path, monkeypatch)
     _insert_task(writable_repo, "TASK_F", "claude_coding", "coding")
@@ -255,12 +322,33 @@ def test_claim_start_exact_and_reject_review(writable_repo, tmp_path, monkeypatc
     assert row["status"] == "pending"
 
 
+def test_claim_start_exact_repairs_empty_denormalized_topic(writable_repo):
+    _insert_task(
+        writable_repo,
+        "TASK_CARD_IDENTITY",
+        "claude_coding",
+        "",
+        card_extra={"runner": "claude_coding", "topic": "coding"},
+    )
+
+    claimed = core.claim_start_exact(
+        "TASK_CARD_IDENTITY", "claude_coding", "coding"
+    )
+    assert claimed["ok"] is True
+    row = _row(writable_repo, "TASK_CARD_IDENTITY")
+    assert row["runner"] == "claude_coding"
+    assert row["topic"] == "coding"
+    assert row["status"] == "processing"
+    assert json.loads(row["card_json"])["claim_epoch"] == 1
+
+
 def test_mark_done_requires_coordinator_token(writable_repo, tmp_path, monkeypatch):
     # The coordinator token cache is process-global by design (it is
     # scrubbed from os.environ exactly once); reset it explicitly so an
     # earlier test's configured token cannot leak into this negative case.
     monkeypatch.setattr(aiworkhub, "_coordinator_token", "", raising=False)
     monkeypatch.setattr(aiworkhub, "_coordinator_token_file", "", raising=False)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
     _insert_task(writable_repo, "TASK_G", "claude_coding", "coding")
     picked = core.auto_pickup("claude_coding", "coding")
     assert picked["ok"] is True
@@ -271,6 +359,60 @@ def test_mark_done_requires_coordinator_token(writable_repo, tmp_path, monkeypat
     assert denied["ok"] is False
     row = _row(writable_repo, "TASK_G")
     assert row["worker_status"] == "review"
+
+
+def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, monkeypatch):
+    session_id = "5be44029-03da-4683-aae3-c68ecb07b1a4"
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": session_id, "window_id": "claude_vscode_123"},
+    )
+    created = core.create_task(
+        task_id="TASK_MANAGER_CREATE",
+        title="Manager-created task",
+        runner="claude_worker",
+        topic="coding",
+        objective="Prove canonical MCP task creation.",
+        acceptance=["created once"],
+        allowed_writes=["src/example.py"],
+        forbidden=["secrets/**"],
+    )
+    assert created["ok"] is True, created
+    card = json.loads(created["stdout"])
+    assert card["coordinator_provider"] == "claude"
+    assert card["origin_thread_id"] == session_id
+    assert _row(writable_repo, "TASK_MANAGER_CREATE")["worker_status"] == "unclaimed"
+
+    duplicate = core.create_task(
+        task_id="TASK_MANAGER_CREATE",
+        title="Must not overwrite",
+        runner="claude_worker",
+        topic="coding",
+        objective="Must be rejected.",
+        acceptance=["rejected"],
+        allowed_writes=[],
+    )
+    assert duplicate["ok"] is False
+    assert "task_already_exists" in duplicate["stderr"]
+
+
+def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo, monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "thread_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "codex_vscode_123",
+        },
+    )
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    result = core.manager_bootstrap()
+    assert result["role"] == "manager"
+    assert result["workflow"][0] == "aiworkhub_task_create"
+    assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]
 
 
 def test_usage_report_empty_no_events(repo):

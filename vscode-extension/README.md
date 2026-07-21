@@ -13,7 +13,7 @@ npm --prefix vscode-extension run package
 Install the generated VSIX:
 
 ```bash
-code --install-extension vscode-extension/dist/aiworkhub-0.6.1.vsix
+code --install-extension vscode-extension/dist/aiworkhub-0.6.2.vsix
 ```
 
 Remote-SSH users install it into the remote workspace extension host. The extension kind is `workspace`, so the MCP stdio child and Python runtime execute on the workspace host with no external browser, iframe, HTTP listener, static port, LAN IP, or port forwarding.

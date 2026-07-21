@@ -16,12 +16,12 @@ from aiworkhub import agent_tool_instructions as instr  # noqa: E402
 def test_canonical_order_is_exact_and_compact() -> None:
     text = instr.render_canonical()
     expected = [
-        "1. validate Task MCP card identity/scope.",
-        "2. consume and acknowledge injected project-context receipt.",
-        "3. use Source Graph for code discovery, slicing, impact and exact read targets.",
-        "4. use Session Manager current state for non-trivial continuity.",
-        "5. query targeted AI Memory.",
-        "6. query targeted KB.",
+        "1. validate the injected AIWorkHub Task MCP receipt, identity and scope.",
+        "2. consume and acknowledge the injected project-context receipt.",
+        "3. call aiworkhub_worker_source_graph_query for code discovery, slicing, impact and exact read targets.",
+        "4. call aiworkhub_worker_session_current_state for non-trivial continuity.",
+        "5. call aiworkhub_worker_ai_memory_search for one bounded task-specific memory query.",
+        "6. call aiworkhub_worker_kb_search/get/related for unresolved authoritative project facts.",
         "7. execute exact card action and validation.",
     ]
     positions = [text.index(item) for item in expected]
@@ -31,8 +31,8 @@ def test_canonical_order_is_exact_and_compact() -> None:
 
 def test_adaptive_invocation_without_empty_ceremony() -> None:
     text = instr.render_canonical()
-    assert "Task MCP receipt is always required." in text
-    assert "Source Graph is required for code tasks." in text
+    assert "AIWorkHub MCP is the only authority for project AI tools" in text
+    assert "Task MCP receipt is always required; Source Graph is required for code tasks." in text
     assert "run only when the card requests them or the task is non-trivial" in text
     assert "Do not make empty irrelevant calls" in text
 
@@ -55,9 +55,9 @@ def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:
 
 def test_session_memory_kb_are_tool_use_only_and_zero_hit_is_bounded() -> None:
     text = instr.render_canonical()
-    assert "Do not checkpoint tiny reads; never store secrets." in text
+    assert "Never store secrets or fabricate session evidence." in text
     assert "issue one bounded task-specific query" in text
-    assert "no raw logs, prompts, credentials or duplicate session state" in text
+    assert "Do not query legacy memory files directly." in text
     assert "After a zero hit, do not repeat the query unless task scope changes." in text
     assert "authoritative project contracts/docs" in text
 

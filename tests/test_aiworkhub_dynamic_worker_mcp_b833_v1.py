@@ -158,7 +158,7 @@ def _seed_transcript_db(path: Path, *, topic: str) -> None:
 
 
 def _bootstrap_manifest_and_registry(repo: Path) -> None:
-    """Canonical AIWorkHub 0.6.1 repo-local authority: a real
+    """Canonical AIWorkHub 0.6.2 repo-local authority: a real
     ``.aiworkhub/project.json`` manifest plus the matching
     ``.aiworkhub/config/storage.json`` registry -- the current explicit
     binding every authority lookup (generic and Source Graph) resolves

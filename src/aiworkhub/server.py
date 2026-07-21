@@ -248,6 +248,50 @@ mcp = FastMCP("AIWorkHub MCP")
 
 
 @mcp.tool()
+def aiworkhub_manager_bootstrap() -> dict[str, Any]:
+    """READ-ONLY: explain this repository's manager workflow and callback lanes."""
+
+    return core.manager_bootstrap()
+
+
+@mcp.tool()
+def aiworkhub_task_create(
+    task_id: str,
+    title: str,
+    runner: str,
+    topic: str,
+    objective: str,
+    acceptance: list[str],
+    allowed_writes: list[str],
+    forbidden: list[str] | None = None,
+    required_outputs: list[str] | None = None,
+    validation: list[str] | None = None,
+    priority: str = "normal",
+    callback_required: bool = True,
+) -> dict[str, Any]:
+    """MANAGER WRITE: create one new canonical repo-local task card.
+
+    The live manager session supplies callback provider/origin identity;
+    callers cannot route a task into another chat or overwrite an existing id.
+    """
+
+    return core.create_task(
+        task_id=task_id,
+        title=title,
+        runner=runner,
+        topic=topic,
+        objective=objective,
+        acceptance=acceptance,
+        allowed_writes=allowed_writes,
+        forbidden=forbidden,
+        required_outputs=required_outputs,
+        validation=validation,
+        priority=priority,
+        callback_required=callback_required,
+    )
+
+
+@mcp.tool()
 def aiworkhub_task_health() -> dict[str, Any]:
     """Check parent AIWorkHub task queue health and write-gate state."""
 
@@ -892,6 +936,23 @@ def aiworkhub_dispatcher_stop() -> dict[str, Any]:
     so no cross-repository read or delivery can happen afterward."""
 
     return core.dispatcher_stop()
+
+
+@mcp.tool()
+def aiworkhub_claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
+    """BLOCKING READ/CLAIM: wait for a callback for this verified Claude
+    Code manager session.  Call ``aiworkhub_claude_callback_ack`` immediately
+    after receipt; an unacknowledged lease is retried, never lost."""
+
+    return core.claude_callback_wait(timeout_seconds)
+
+
+@mcp.tool()
+def aiworkhub_claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
+    """WRITE: acknowledge one exact callback batch returned to this same
+    verified Claude manager session."""
+
+    return core.claude_callback_ack(batch_id, lease_id)
 
 
 def main() -> None:

@@ -89,6 +89,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import stat
@@ -138,6 +139,9 @@ SIDEBAND_MAX_OWNED_THREAD_IDS = 512
 SIDEBAND_SOCKET_BIND_MAX_ATTEMPTS = 8
 SIDEBAND_OWNER_LEASE_SECONDS = 90.0
 SIDEBAND_OWNER_HEARTBEAT_SECONDS = 15.0
+SIDEBAND_INSTANCE_ID_RE = re.compile(
+    rf"^[0-9a-f]{{{SIDEBAND_INSTANCE_ID_BYTES * 2}}}$"
+)
 
 
 # --- executable / invocation-shape resolution --------------------------------
@@ -428,6 +432,74 @@ def list_live_sideband_instances(sideband_dir: Path | str) -> list[SidebandInsta
     return instances
 
 
+def gc_stale_sideband_instances(sideband_dir: Path | str) -> dict[str, int]:
+    """Remove crashed mux registry rows and their private endpoint artifacts.
+
+    A VS Code reload can terminate the extension host without giving the mux a
+    chance to run ``shutdown()``.  The durable callback queue must survive that
+    event, but the process-local routing descriptors must not accumulate or
+    masquerade as additional owners.  Cleanup is deliberately conservative:
+    any descriptor whose recorded process is still alive is retained even when
+    the remaining JSON is malformed, while only bounded, canonical instance-id
+    filenames are allowed to select sibling ``.sock``/``.cap`` artifacts.
+    """
+    directory = sideband_instances_dir(sideband_dir)
+    report = {
+        "scanned": 0,
+        "live": 0,
+        "removed": 0,
+        "artifacts_removed": 0,
+        "kept_live_invalid": 0,
+    }
+    try:
+        entries = sorted(directory.glob("*.json"))
+    except OSError:
+        return report
+
+    for entry in entries:
+        report["scanned"] += 1
+        if _read_instance_descriptor(entry) is not None:
+            report["live"] += 1
+            continue
+
+        # A descriptor can fail full schema validation while its owner is
+        # nevertheless alive (for example, during a rolling version change).
+        # Read only owner-controlled, bounded regular files for this liveness
+        # rescue check; never delete another live mux's registration.
+        owner_live = False
+        try:
+            st = os.lstat(entry)
+            if (
+                stat.S_ISREG(st.st_mode)
+                and st.st_uid == os.getuid()
+                and stat.S_IMODE(st.st_mode) == 0o600
+                and st.st_size <= SIDEBAND_REGISTRY_MAX_BYTES
+            ):
+                raw = json.loads(entry.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    owner_live = _pid_is_live(raw.get("pid"), raw.get("pid_start_time"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        if owner_live:
+            report["kept_live_invalid"] += 1
+            continue
+
+        with contextlib.suppress(FileNotFoundError, OSError):
+            entry.unlink()
+            report["removed"] += 1
+
+        instance_id = entry.stem
+        if not SIDEBAND_INSTANCE_ID_RE.fullmatch(instance_id):
+            continue
+        root = Path(sideband_dir)
+        for suffix in ("sock", "cap"):
+            artifact = root / f"{instance_id}.{suffix}"
+            with contextlib.suppress(FileNotFoundError, OSError):
+                artifact.unlink()
+                report["artifacts_removed"] += 1
+    return report
+
+
 def find_owning_sideband_instances(sideband_dir: Path | str, thread_id: str) -> list[SidebandInstance]:
     """Live instances whose OWN observed extension traffic bound ``thread_id``.
 
@@ -636,6 +708,7 @@ class AppServerMux:
     def start(self) -> None:
         ensure_private_dir(self._sideband_dir)
         ensure_private_dir(self._instances_dir)
+        gc_stale_sideband_instances(self._sideband_dir)
         self._bind_socket()
         write_capability_token(self._capability_path, self._capability_token)
         self._write_registry()

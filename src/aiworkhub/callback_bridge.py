@@ -833,6 +833,24 @@ class SidebandCallbackClient:
     ) -> None:
         self._sideband_dir = Path(sideband_dir) if sideband_dir else default_sideband_dir()
         self._timeout = timeout
+        self._socket_lock = threading.Lock()
+        self._active_socket: _socket.socket | None = None
+
+    def stop(self) -> None:
+        """Interrupt an in-flight sideband read during extension shutdown.
+
+        Without this, reload killed the dispatcher process while its durable
+        batch remained leased for the full App Server timeout, blocking the
+        replacement dispatcher for the same coordinator thread.
+        """
+        with self._socket_lock:
+            sock = self._active_socket
+            self._active_socket = None
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.shutdown(_socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
 
     def _resolve_owner(self, thread_id: str):
         instances = find_owning_sideband_instances(self._sideband_dir, thread_id)
@@ -873,6 +891,8 @@ class SidebandCallbackClient:
         token = self._read_capability(owner.capability_path)
         sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         sock.settimeout(self._timeout)
+        with self._socket_lock:
+            self._active_socket = sock
         try:
             try:
                 sock.connect(str(owner.socket_path))
@@ -886,6 +906,9 @@ class SidebandCallbackClient:
                 raise SidebandUnavailableError(f"sideband write failed: {exc}") from exc
             raw = self._recv_line(sock)
         finally:
+            with self._socket_lock:
+                if self._active_socket is sock:
+                    self._active_socket = None
             with contextlib.suppress(OSError):
                 sock.close()
 
@@ -1516,6 +1539,7 @@ class CallbackBridge:
         claude_repo_id: str = "",
         claude_window_id: str = "",
         claude_cli_run_fn: Any | None = None,
+        provider: str = "",
     ):
         # lease_margin_seconds is a deliberate, visible constructor override
         # for tests/dev exercising short lease-expiry scenarios; the CLI
@@ -1563,6 +1587,7 @@ class CallbackBridge:
         # is deployed as a separate bridge process/db from any codex-
         # transport bridge for the same repo, never mixed in one instance.
         self._transport = transport
+        self._provider = str(provider or "").strip().lower()
         self._sideband_dir = Path(sideband_dir) if sideband_dir else default_sideband_dir()
         self._claude_executable = claude_executable
         self._claude_repo_id = claude_repo_id
@@ -1846,6 +1871,10 @@ class CallbackBridge:
         }
 
     def _claim_batch(self, conn) -> dict[str, Any] | None:
+        if self._provider:
+            return self._callback_store.claim_pending_callback_batch(
+                conn, self._lease_seconds, self._max_batch_members, provider=self._provider,
+            )
         return self._callback_store.claim_pending_callback_batch(
             conn, self._lease_seconds, self._max_batch_members,
         )
@@ -1908,6 +1937,8 @@ class CallbackBridge:
 
     def stop_daemon(self) -> None:
         self._stop_event.set()
+        if self._sideband_client is not None:
+            self._sideband_client.stop()
 
     def dry_run(self, task_id: str, state: str, *, thread_id: str = "") -> dict[str, Any]:
         """Validate the callback pipeline without sending a real turn.
@@ -2050,6 +2081,7 @@ class CallbackDispatcher:
                 return
             kwargs: dict[str, Any] = dict(self._bridge_kwargs)
             kwargs["repo"] = self.repo_root
+            kwargs["provider"] = self.provider
             if self.provider == "codex":
                 # Existing canonical Codex transport (AppServerClient by
                 # default; "sideband" may be supplied explicitly through

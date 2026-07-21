@@ -16,6 +16,7 @@ package-local ``callback_store.py`` module owns this schema now -- never
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -199,6 +200,140 @@ def test_core_dispatcher_ensure_started_uninitialized_repo_not_degraded(tmp_path
     assert result["dispatcher_started"] is False
     # No dispatcher thread was ever spawned for an uninitialized repo.
     assert callback_bridge.get_dispatcher(root) is None
+
+
+def test_core_dispatcher_forwards_extension_selected_sideband_transport(tmp_path, monkeypatch):
+    root = tmp_path / "repo_sideband"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "sideband")
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_sideband_test")
+    captured = {}
+
+    class FakeDispatcher:
+        def health(self):
+            return {"dispatcher_running": True, "provider": "codex"}
+
+    def fake_ensure(repo_root, provider, **kwargs):
+        captured.update(repo_root=repo_root, provider=provider, **kwargs)
+        return FakeDispatcher()
+
+    monkeypatch.setattr(callback_bridge, "ensure_dispatcher", fake_ensure)
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: callback_bridge)
+    result = core.dispatcher_ensure_started()
+    assert result["dispatcher_started"] is True
+    assert captured["bridge_kwargs"] == {"transport": "sideband"}
+
+
+def test_claude_manager_derives_window_and_coordinator_capability(tmp_path, monkeypatch):
+    root = tmp_path / "repo_claude_manager"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.delenv("AIWORKHUB_WINDOW_ID", raising=False)
+    identity = {
+        "provider": "claude",
+        "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+        "window_id": "claude_vscode_1234",
+    }
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: identity)
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "claude"},
+    )
+    result = core.dispatcher_ensure_started()
+    assert result["status"] == "manager_inbox"
+    assert result["dispatcher_started"] is False
+    assert result["manager_route"] == identity
+    assert core._verify_coordinator_capability("codex") == (
+        True,
+        "trusted_claude_manager_route",
+    )
+
+
+def test_codex_manager_ancestry_grants_coordinator_capability(monkeypatch):
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "codex_mux_1234",
+            "window_id": "codex_vscode_1234",
+        },
+    )
+    assert core._verify_coordinator_capability("codex") == (
+        True,
+        "trusted_codex_manager_route",
+    )
+
+
+def test_claude_manager_wait_and_ack_is_two_phase(tmp_path, monkeypatch):
+    root = tmp_path / "repo_claude_wait"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    identity = {
+        "provider": "claude",
+        "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+        "window_id": "claude_vscode_1234",
+    }
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: identity)
+    db_path = Path(task_store.storage_readiness(root).canonical_db)
+    conn = callback_store.open_db(db_path)
+    try:
+        now = callback_store.utc_now()
+        card = {
+            "task_id": "CLAUDE_WAIT_CANARY",
+            "runner": "claude_wait_canary",
+            "topic": "task_mcp",
+            "status": "review",
+            "worker_status": "review",
+            "origin_thread_id": identity["session_id"],
+            "claim_epoch": 0,
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,status,worker_status,objective,card_json,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                card["task_id"], card["runner"], "review", "review", "canary",
+                json.dumps(card), now, now,
+            ),
+        )
+        conn.commit()
+        callback_store.enqueue_callback(
+            conn,
+            "CLAUDE_WAIT_CANARY",
+            "11111111-1111-4111-8111-111111111111",
+            "review_ready",
+            provider="claude",
+        )
+    finally:
+        conn.close()
+
+    takeover = core.dispatcher_ensure_started()
+    assert takeover["status"] == "manager_inbox"
+    assert takeover["rebound_callback_count"] == 1
+    received = core.claude_callback_wait(timeout_seconds=1)
+    assert received["status"] == "callback_ready"
+    assert received["members"][0]["task_id"] == "CLAUDE_WAIT_CANARY"
+
+    conn = callback_store.open_db(db_path)
+    try:
+        state = conn.execute(
+            "SELECT state FROM callback_batches WHERE batch_id=?",
+            (received["batch_id"],),
+        ).fetchone()[0]
+        assert state == "inflight"
+    finally:
+        conn.close()
+
+    ack = core.claude_callback_ack(received["batch_id"], received["lease_id"])
+    assert ack["status"] == "delivered"
 
 
 def test_core_dispatcher_ensure_started_then_stop_on_initialized_repo(tmp_path, monkeypatch):

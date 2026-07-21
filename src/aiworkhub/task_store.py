@@ -17,9 +17,9 @@ Two responsibilities live here:
   metadata, canonical DB existence, schema, and an SQLite quick_check must
   all pass.
 * ``initialize_repository`` -- the one bounded, idempotent, fail-closed
-  initialization action: create/repair ``.aiworkhub/project.json``,
-  ``.aiworkhub/config/storage.json``, and a fresh, schema-only canonical
-  task_queue.sqlite. Never imports or deletes any legacy database.
+  initialization action. Fresh repositories get canonical empty stores;
+  older registries may migrate only their explicitly declared repo-local
+  legacy SQLite sources. Legacy files are retained as rollback artifacts.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .repository_state import (
+    HUB_DIRNAME,
     ManifestInvalidError,
     ManifestMissingError,
     RepositoryState,
@@ -219,6 +220,119 @@ def _atomic_init_schema(path: Path) -> None:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+def _sqlite_backup(source: Path, destination: Path) -> None:
+    """Consistent SQLite backup; never byte-copy a possibly-live WAL DB."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_suffix(destination.suffix + ".migration.tmp")
+    if tmp.exists():
+        tmp.unlink()
+    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    dst = sqlite3.connect(str(tmp))
+    try:
+        src.backup(dst)
+        if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise InitializationRefusedError(f"legacy_backup_quick_check_failed:{source.name}")
+        dst.commit()
+    finally:
+        dst.close()
+        src.close()
+    os.replace(tmp, destination)
+
+
+def _initialize_auxiliary_schema(db_id: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        if db_id == "source_graph":
+            from . import source_graph
+            conn.executescript(source_graph.SCHEMA)
+        elif db_id == "transcript":
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS documents(doc_id INTEGER PRIMARY KEY,source_id TEXT,timestamp TEXT,kind TEXT,content TEXT);"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(content);"
+            )
+        elif db_id == "memory":
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(key,value,tags,scope);"
+            )
+        elif db_id == "kb":
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY,key TEXT UNIQUE,title TEXT,body TEXT,category TEXT,tags TEXT,source_refs TEXT);"
+                "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(key,title,body,category,tags);"
+                "CREATE TABLE IF NOT EXISTS links(from_key TEXT,to_key TEXT,relation TEXT);"
+            )
+        else:
+            conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -> dict[str, Any]:
+    """Migrate shadow AI-tool DBs once, then activate canonical authority."""
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    rows = payload.get("databases") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise InitializationRefusedError("storage_registry_databases_invalid")
+    migrated: list[str] = []
+    initialized: list[str] = []
+    activated: list[str] = []
+    for entry in rows:
+        if not isinstance(entry, dict) or entry.get("id") == "task_queue":
+            continue
+        db_id = str(entry.get("id") or "")
+        rel = str(entry.get("canonical_durable_path") or "")
+        if not db_id or not rel:
+            raise InitializationRefusedError("auxiliary_database_entry_invalid")
+        canonical = (repo.root / HUB_DIRNAME / rel).resolve()
+        if not canonical.is_relative_to(repo.root):
+            raise InitializationRefusedError(f"auxiliary_database_path_escape:{db_id}")
+        if not canonical.exists():
+            legacy_rel = str(entry.get("legacy_source") or "")
+            legacy = (repo.root / legacy_rel).resolve() if legacy_rel else None
+            if legacy is not None and legacy.is_relative_to(repo.root) and legacy.is_file():
+                _sqlite_backup(legacy, canonical)
+                migrated.append(db_id)
+            else:
+                _initialize_auxiliary_schema(db_id, canonical)
+                initialized.append(db_id)
+        conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
+        try:
+            qc = conn.execute("PRAGMA quick_check(1)").fetchone()[0]
+        finally:
+            conn.close()
+        if qc != "ok":
+            raise InitializationRefusedError(f"auxiliary_db_quick_check_failed:{db_id}:{qc}")
+        authority = entry.setdefault("authority", {})
+        changed = db_id in migrated or db_id in initialized
+        if not authority.get("canonical_active") or authority.get("state") != "canonical_active":
+            authority.update({
+                "state": "canonical_active", "canonical_active": True,
+                "legacy_active": False, "live_cutover": True,
+            })
+            activated.append(db_id)
+            changed = True
+        integrity = entry.setdefault("integrity", {})
+        integrity["state"] = "canonical_quick_check_ok"
+        # Hash a database only on its one-time migration/activation.  In
+        # particular, do not re-read a multi-gigabyte Source Graph on every
+        # idempotent Initialize AIWorkHub call.
+        if changed or not integrity.get("canonical_sha256"):
+            integrity["canonical_sha256"] = sha256_file(canonical)
+        migration = entry.setdefault("migration", {})
+        migration.update({
+            "generation": max(1, int(migration.get("generation") or 0)),
+            "cutover_performed": True,
+            "rollback_performed": False,
+            "legacy_deleted": False,
+            "source_read_only": True,
+        })
+    if migrated or initialized or activated:
+        _atomic_write_json(registry_path, payload)
+    return {"migrated": migrated, "initialized": initialized, "activated": activated}
 
 
 def sha256_file(path: Path) -> str:
@@ -679,12 +793,11 @@ def initialize_repository(
 ) -> dict[str, Any]:
     """The one bounded, idempotent, fail-closed initialization action.
 
-    Creates or validates ``.aiworkhub/project.json``,
-    ``.aiworkhub/config/storage.json``, and a fresh canonical
-    ``.aiworkhub/tasking/task_queue.sqlite`` with the required schema.
-    Refuses a repo-id/path mismatch. Never imports or deletes legacy data:
-    this function only ever creates a brand-new, empty canonical DB -- it
-    never reads a legacy database's rows.
+    Creates or validates the manifest, registry and canonical task queue.
+    A fresh repository receives empty compatible auxiliary stores.  An older
+    AIWorkHub registry that explicitly names a repository-relative read-only
+    ``legacy_source`` is migrated once with SQLite's online backup API and
+    switched to canonical authority; legacy files are never deleted.
     """
     normalized_expected = str(expected_repo_id or "").strip() or None
 
@@ -725,6 +838,8 @@ def initialize_repository(
         _activate_canonical_authority(registry_path, canonical_db)
         activated = True
 
+    auxiliary = _reconcile_auxiliary_databases(repo, registry_path)
+
     readiness = storage_readiness(repo.root)
     return {
         "ok": readiness.ready,
@@ -734,8 +849,9 @@ def initialize_repository(
         "created_canonical_db": created_db,
         "upgraded_canonical_schema": bool(locals().get("upgraded_schema", False)),
         "activated_canonical_authority": activated,
-        "legacy_imported": False,
+        "legacy_imported": bool(auxiliary["migrated"]),
         "legacy_deleted": False,
+        "auxiliary_storage": auxiliary,
         "storage": readiness.as_dict(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

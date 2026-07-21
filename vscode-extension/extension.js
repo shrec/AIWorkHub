@@ -8,7 +8,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.1";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.3";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -208,6 +208,57 @@ function findPythonExecutable(root) {
   return "python3";
 }
 
+function ensureRepositoryCoordinatorCapability(root) {
+  // One capability per repository, never one mutable host-global token shared
+  // by every VS Code window.  The latter let opening repo B rotate the token
+  // underneath repo A's already-running MCP child, causing deterministic
+  // coordinator_capability_denied:token_mismatch on review finalization.
+  // Runtime is repo-local and gitignored by the AIWorkHub layout contract.
+  const runtimeDir = path.join(root, ".aiworkhub", "runtime");
+  fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    fs.chmodSync(runtimeDir, 0o700);
+  }
+  const tokenFile = path.join(runtimeDir, "coordinator.token");
+  try {
+    const stat = fs.lstatSync(tokenFile);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("repository coordinator capability is not a regular file");
+    }
+    if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) {
+      fs.chmodSync(tokenFile, 0o600);
+    }
+    const token = fs.readFileSync(tokenFile, "utf8").trim();
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      throw new Error("repository coordinator capability has invalid content");
+    }
+    return { tokenFile, token };
+  } catch (err) {
+    if (err && err.code !== "ENOENT") throw err;
+  }
+
+  const token = crypto.randomBytes(32).toString("hex");
+  try {
+    const fd = fs.openSync(tokenFile, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, token, { encoding: "utf8" });
+      if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { tokenFile, token };
+  } catch (err) {
+    // Another window for the SAME repo may win the exclusive create race.
+    // Re-read its owner-controlled result; never rotate/overwrite it.
+    if (!err || err.code !== "EEXIST") throw err;
+    const existing = fs.readFileSync(tokenFile, "utf8").trim();
+    if (!/^[a-f0-9]{64}$/.test(existing)) {
+      throw new Error("repository coordinator capability race produced invalid content");
+    }
+    return { tokenFile, token: existing };
+  }
+}
+
 function routeStatePath(root) {
   return path.join(root, ".aiworkhub", "config", TARGET_ROUTE_KEY);
 }
@@ -390,6 +441,7 @@ class McpStdioClient {
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
       AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
       AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
+      AIWORKHUB_CALLBACK_TRANSPORT: "sideband",
     };
     // Extension-local runtime import path: `import aiworkhub` must always
     // resolve to the package this extension bundled under its own
@@ -408,6 +460,18 @@ class McpStdioClient {
     // launch gate, regardless of the ambient extension-host environment.
     delete env.AIWORKHUB_ALLOW_WRITES;
     delete env.AIWORKHUB_ALLOW_LAUNCH;
+    // Never inherit a stale coordinator secret from the extension host.
+    // Load the current owner-only file into this private child environment;
+    // package init scrubs it before any submodule can copy the environment.
+    delete env.BITNN_TASKCTL_COORDINATOR_TOKEN;
+    delete env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE;
+    try {
+      const capability = ensureRepositoryCoordinatorCapability(root);
+      env.BITNN_TASKCTL_COORDINATOR_TOKEN = capability.token;
+      env.BITNN_TASKCTL_COORDINATOR_TOKEN_FILE = capability.tokenFile;
+    } catch (_err) {
+      // Missing/unsafe token leaves coordinator mutations fail-closed.
+    }
 
     this.intentionalStop = false;
     this.initialized = false;
@@ -642,6 +706,48 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 // this extension's extensionKind is "workspace". Never derived from the
 // selected repository, an editable install, or a fixed host path.
 let extensionRuntimeDir = null;
+let extensionMuxExecutable = null;
+
+function shouldRepairCodexMuxSetting(currentValue) {
+  const current = String(currentValue || "").trim();
+  if (!current) return true;
+  if (current.includes("geoai-app-server-mux")) return true;
+  if (current.includes("aiworkhub-app-server-mux") && !fs.existsSync(current)) return true;
+  return !fs.existsSync(current);
+}
+
+async function ensureCodexMuxConfigured(context) {
+  if (process.platform === "win32") {
+    outputChannel.appendLine("[callback] Codex sideband mux requires a native Windows launcher");
+    return false;
+  }
+  const muxPath = path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
+  extensionMuxExecutable = muxPath;
+  try {
+    fs.accessSync(muxPath, fs.constants.R_OK | fs.constants.X_OK);
+  } catch (err) {
+    outputChannel.appendLine(`[callback] bundled mux unavailable: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+  const config = vscode.workspace.getConfiguration("chatgpt");
+  const current = config.get("cliExecutable", "");
+  const inspected = config.inspect("cliExecutable") || {};
+  // This setting is application-scoped. A same-looking value inherited
+  // from Remote Machine/workspace configuration is not authoritative for
+  // the OpenAI extension and previously caused a false "configured" result.
+  // Always materialize the desired value through VS Code's Global target.
+  if (
+    path.resolve(String(current || muxPath)) === path.resolve(muxPath)
+    && inspected.globalValue === muxPath
+  ) return true;
+  if (!shouldRepairCodexMuxSetting(current)) {
+    outputChannel.appendLine("[callback] preserved existing custom chatgpt.cliExecutable");
+    return false;
+  }
+  await config.update("cliExecutable", muxPath, vscode.ConfigurationTarget.Global);
+  outputChannel.appendLine("[callback] repaired chatgpt.cliExecutable to bundled AIWorkHub mux; reload once");
+  return true;
+}
 
 function installedExtensionVersion() {
   return String((extensionContext && extensionContext.extension && extensionContext.extension.packageJSON && extensionContext.extension.packageJSON.version) || "0.3.0");
@@ -776,6 +882,7 @@ class ViewState {
     this.repoUriStr = "";
     this.repoId = "";
     this.claimEpisode = "";
+    this.snapshotRequestSeq = 0;
   }
 
   bindClient(client) {
@@ -820,17 +927,20 @@ class ViewState {
 }
 
 async function pushSnapshot(view) {
+  const requestSeq = ++view.snapshotRequestSeq;
   try {
     const client = getMcpClient();
     view.bindClient(client);
     const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
-    if (payload && view.stillBoundTo(client)) {
+    if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
-    } else if (!payload) {
+    } else if (!payload && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
     }
   } catch (err) {
-    view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(err) });
+    if (requestSeq === view.snapshotRequestSeq) {
+      view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(err) });
+    }
   }
 }
 
@@ -1117,12 +1227,9 @@ function getHtmlForWebview(webview, extensionUri) {
       <button class="primary-button" id="initialize-button" type="button">Initialize AIWorkHub</button>
     </section>
 
-    <section class="target-selector" aria-label="Coordinator target">
-      <span>Coordinator target</span>
-      <button type="button" data-provider="codex">Codex</button>
-      <button type="button" data-provider="claude">Claude</button>
-      <button type="button" data-provider="copilot">Copilot</button>
-      <strong id="target-state">Loading target state</strong>
+    <section class="target-selector" aria-label="Coordinator routing">
+      <span>Coordinator routing</span>
+      <strong id="target-state">Automatic by originating chat</strong>
     </section>
 
     <div class="workspace">
@@ -1615,11 +1722,12 @@ async function selectRepositoryCommand() {
   refreshDashboardCommand();
 }
 
-function activate(context) {
+async function activate(context) {
   extensionContext = context;
   extensionRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
+  await ensureCodexMuxConfigured(context);
 
   // Resolve the initial active repository and label.
   try {
@@ -1658,6 +1766,17 @@ function activate(context) {
     vscode.commands.registerCommand(`${EXT_ID}.restartDashboard`, () => restartMcpConnectionCommand()),
     vscode.commands.registerCommand(`${EXT_ID}.selectRepository`, () => selectRepositoryCommand())
   );
+
+  // Startup activation is the callback lifecycle owner.  An initialized
+  // repository must start its MCP child and dispatcher even when the user
+  // never opens the dashboard during this window/session.
+  if (activeRepoIdentity && activeRepoIdentity.root) {
+    getMcpClient().ensureStarted().catch((err) => {
+      outputChannel.appendLine(
+        `[mcp] startup dispatcher activation failed: ${sanitizeErrorMessage(err)}`,
+      );
+    });
+  }
 }
 
 async function deactivate() {

@@ -730,27 +730,14 @@ function renderRuntimeInfo(info) {
 
 function renderCoordinatorTargets(info) {
   const payload = info && typeof info === "object" ? info : {};
-  const selected = String(payload.selected_provider || "codex");
-  const target = payload.targets && payload.targets[selected] ? payload.targets[selected] : {};
-  const stateLabel = String(target.capability_state || "unknown").replace(/_/g, " ");
   if (elements.targetState) {
-    elements.targetState.textContent = `${selected}: ${stateLabel}`;
+    elements.targetState.textContent = "automatic: routed by originating chat";
     elements.targetState.title = JSON.stringify({
       repo_id: payload.repo_id,
       window_id: payload.window_id,
       claim_episode: payload.claim_episode,
-      route: target.route || {},
-      wake: target.wake || {},
+      routing: "per-task coordinator_provider + thread/session identity",
     });
-  }
-  for (const button of elements.targetButtons) {
-    const active = button.dataset.provider === selected;
-    button.classList.toggle("is-active", active);
-    button.setAttribute("aria-pressed", active ? "true" : "false");
-    const item = payload.targets && payload.targets[button.dataset.provider] ? payload.targets[button.dataset.provider] : {};
-    button.title = item.wake && item.wake.supported === false
-      ? "Durable callback inbox with explicit notification/open-chat action"
-      : "Direct wake only when a supported VS Code/provider API is available";
   }
 }
 

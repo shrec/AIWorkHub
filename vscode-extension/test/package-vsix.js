@@ -19,6 +19,8 @@ const out = path.join(dist, `${pkg.name}-${pkg.version}.vsix`);
 // at this directory.
 const PY_RUNTIME_SRC = path.join(root, "..", "src", "aiworkhub");
 const PY_RUNTIME_DEST = path.join(extensionDir, "runtime", "aiworkhub");
+const MUX_LAUNCHER_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux");
+const MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux");
 // Never bundle bytecode caches or OS cruft -- only the real package source
 // and its data assets (e.g. dashboard_static/*.css/.js/.html).
 const PY_RUNTIME_SKIP_DIRS = new Set(["__pycache__", ".pytest_cache"]);
@@ -70,6 +72,9 @@ if (!fs.existsSync(path.join(PY_RUNTIME_SRC, "__init__.py"))) {
   throw new Error(`aiworkhub Python package not found at ${PY_RUNTIME_SRC}`);
 }
 copyPythonRuntime(PY_RUNTIME_SRC, PY_RUNTIME_DEST);
+fs.mkdirSync(path.dirname(MUX_LAUNCHER_DEST), { recursive: true });
+fs.copyFileSync(MUX_LAUNCHER_SRC, MUX_LAUNCHER_DEST);
+fs.chmodSync(MUX_LAUNCHER_DEST, 0o755);
 if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "server.py"))) {
   throw new Error("bundled aiworkhub runtime is missing server.py after copy");
 }
@@ -81,6 +86,9 @@ if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "callback_store.py"))) {
 }
 if (!fs.existsSync(path.join(PY_RUNTIME_DEST, "dashboard_static", "index.html"))) {
   throw new Error("bundled aiworkhub runtime is missing dashboard_static assets after copy");
+}
+if (!fs.existsSync(MUX_LAUNCHER_DEST) || !(fs.statSync(MUX_LAUNCHER_DEST).mode & 0o111)) {
+  throw new Error("bundled App Server mux launcher is missing or not executable");
 }
 
 const manifest = `<?xml version="1.0" encoding="utf-8"?>

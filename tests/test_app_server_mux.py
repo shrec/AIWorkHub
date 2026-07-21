@@ -37,6 +37,7 @@ from aiworkhub.app_server_mux import (  # noqa: E402
     SIDEBAND_ALLOWED_METHODS,
     AppServerMux,
     default_sideband_dir,
+    gc_stale_sideband_instances,
     is_app_server_invocation,
     resolve_real_executable,
 )
@@ -100,6 +101,61 @@ def test_resolve_real_executable_from_private_pin(monkeypatch, tmp_path):
     monkeypatch.delenv(app_server_mux.ENV_REAL_EXECUTABLE, raising=False)
     monkeypatch.setenv(app_server_mux.ENV_SIDEBAND_DIR, str(sideband))
     assert resolve_real_executable() == str(real)
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, json.dumps(payload).encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def test_stale_sideband_gc_removes_dead_descriptor_and_artifacts(tmp_path):
+    sideband = tmp_path / "sideband"
+    instances = sideband / app_server_mux.SIDEBAND_INSTANCES_SUBDIR
+    instances.mkdir(parents=True, mode=0o700)
+    instance_id = "deadbeef"
+    registry = instances / f"{instance_id}.json"
+    _write_private_json(registry, {
+        "instance_id": instance_id,
+        "pid": 999_999_999,
+        "pid_start_time": 1,
+    })
+    socket_path = sideband / f"{instance_id}.sock"
+    cap_path = sideband / f"{instance_id}.cap"
+    socket_path.touch()
+    cap_path.touch()
+
+    report = gc_stale_sideband_instances(sideband)
+
+    assert report == {
+        "scanned": 1,
+        "live": 0,
+        "removed": 1,
+        "artifacts_removed": 2,
+        "kept_live_invalid": 0,
+    }
+    assert not registry.exists()
+    assert not socket_path.exists()
+    assert not cap_path.exists()
+
+
+def test_stale_sideband_gc_preserves_live_but_incomplete_descriptor(tmp_path):
+    sideband = tmp_path / "sideband"
+    instances = sideband / app_server_mux.SIDEBAND_INSTANCES_SUBDIR
+    instances.mkdir(parents=True, mode=0o700)
+    registry = instances / "cafebabe.json"
+    _write_private_json(registry, {
+        "pid": os.getpid(),
+        "pid_start_time": app_server_mux._proc_start_time(os.getpid()),
+    })
+
+    report = gc_stale_sideband_instances(sideband)
+
+    assert report["kept_live_invalid"] == 1
+    assert report["removed"] == 0
+    assert registry.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,10 @@ assert.strictEqual(pkg.name, "aiworkhub");
 assert.strictEqual(pkg.displayName, "AIWorkHub");
 assert.deepStrictEqual(pkg.extensionKind, ["workspace"]);
 assert.strictEqual(pkg.icon, "media/aiworkhub-icon.png");
+assert.ok(
+  pkg.activationEvents.includes("onStartupFinished"),
+  "AIWorkHub callbacks must activate after VS Code startup without opening the dashboard"
+);
 
 const commands = new Map(pkg.contributes.commands.map((command) => [command.command, command.title]));
 assert.deepStrictEqual([...commands.keys()].sort(), [
@@ -62,6 +66,16 @@ assert.ok(ext.includes('const DISPLAY_NAME = "AIWorkHub"'));
 assert.ok(ext.includes('const PANEL_VIEW_TYPE = "aiworkhub.dashboard"'));
 assert.strictEqual((ext.match(/createWebviewPanel/g) || []).length, 1);
 assert.ok(ext.includes("registerWebviewPanelSerializer(PANEL_VIEW_TYPE"));
+assert.ok(ext.includes("startup dispatcher activation failed"));
+assert.ok(ext.includes("ensureRepositoryCoordinatorCapability(root)"));
+assert.ok(ext.includes('path.join(root, ".aiworkhub", "runtime")'));
+assert.ok(!ext.includes('homedir(), ".config", "aiworkhub", "taskctl_coordinator.token"'));
+assert.ok(ext.includes("snapshotRequestSeq"));
+assert.ok(ext.includes("requestSeq === view.snapshotRequestSeq"));
+assert.ok(ext.includes("AIWORKHUB_CALLBACK_TRANSPORT"));
+assert.ok(ext.includes('getConfiguration("chatgpt")'));
+assert.ok(ext.includes('config.inspect("cliExecutable")'));
+assert.ok(ext.includes('path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux")'));
 assert.ok(ext.includes("retainContextWhenHidden: true"));
 assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
@@ -146,5 +160,7 @@ assert.ok(packageVsix.includes("__pycache__"));
 assert.ok(packageVsix.includes("dashboard_static"));
 assert.ok(fs.existsSync(path.join(root, "..", "src", "aiworkhub", "server.py")));
 assert.ok(fs.existsSync(path.join(root, "..", "src", "aiworkhub", "dashboard_static", "index.html")));
+assert.ok(packageVsix.includes("MUX_LAUNCHER_SRC"));
+assert.ok(packageVsix.includes("chmodSync(MUX_LAUNCHER_DEST, 0o755)"));
 
 console.log("AIWorkHub VS Code extension static contract checks passed");

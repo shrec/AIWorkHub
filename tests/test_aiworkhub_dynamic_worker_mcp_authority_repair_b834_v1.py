@@ -117,7 +117,7 @@ def _authority_repo(tmp_path: Path, *, name: str = "authority_repo") -> Path:
 
 
 def _worktree_repo(tmp_path: Path, *, name: str = "worktree") -> Path:
-    """A worktree-shaped repo: current AIWorkHub 0.6.1 manifest+registry
+    """A worktree-shaped repo: current AIWorkHub 0.6.2 manifest+registry
     present (so authority resolution succeeds) but no Source Graph database
     ever built -- the exact shape of a fresh ``git worktree add --detach``
     checkout, which is what makes it unsafe as an authority source."""

@@ -68,7 +68,9 @@ def initialize_repository_full(
     #   - .aiworkhub/project.json (manifest) + the DURABLE_LAYOUT dirs
     #     (tasking, sessions, memory, kb, config) via bootstrap_repository
     #   - .aiworkhub/config/storage.json (storage registry)
-    #   - .aiworkhub/tasking/task_queue.sqlite (canonical task queue, schema-only)
+    #   - .aiworkhub/tasking/task_queue.sqlite (canonical task queue)
+    #   - canonical Source Graph/session/memory/KB stores; an older registry's
+    #     explicitly declared legacy SQLite sources are migrated once
     result = task_store.initialize_repository(repo_root, expected_repo_id=expected_repo_id)
 
     provisioned: list[str] = []

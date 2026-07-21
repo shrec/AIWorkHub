@@ -6,7 +6,9 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,7 @@ from . import (
 )
 from . import repository_state
 from . import task_store
+from . import callback_store
 
 
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
@@ -69,6 +72,9 @@ COORDINATOR_COMMANDS = frozenset({"done", "reject-review", "release-launch", "ar
 # package __init__ (imported above) so existing callers keep working against
 # core.COORDINATOR_TOKEN_ENV unchanged.
 DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordinator.token"
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+_TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 # ---------------------------------------------------------------------------
 # B852: canonical, repo-local task-store write layer.
@@ -122,6 +128,120 @@ def _canonical_result(
     }
 
 
+def _claude_manager_identity() -> dict[str, str] | None:
+    """Verify that this MCP server is the direct child of an interactive
+    Claude Code VS Code session bound to the same repository.
+
+    The parent process and Claude's per-PID session descriptor are both
+    same-uid local runtime state. No credential is read or exposed.
+    """
+    parent_pid = os.getppid()
+    try:
+        cmdline = Path(f"/proc/{parent_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
+        descriptor_path = Path.home() / ".claude" / "sessions" / f"{parent_pid}.json"
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(descriptor, dict) or "/claude " not in cmdline:
+        return None
+    if int(descriptor.get("pid") or -1) != parent_pid:
+        return None
+    if descriptor.get("kind") != "interactive" or descriptor.get("entrypoint") != "claude-vscode":
+        return None
+    session_id = str(descriptor.get("sessionId") or "").strip()
+    if not _UUID_RE.fullmatch(session_id):
+        return None
+    try:
+        descriptor_cwd = Path(str(descriptor.get("cwd") or "")).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if descriptor_cwd != repo_root():
+        return None
+    return {
+        "provider": "claude",
+        "session_id": session_id,
+        "window_id": f"claude_vscode_{parent_pid}",
+    }
+
+
+def _codex_manager_identity() -> dict[str, str] | None:
+    """Verify the bounded local process chain for this Codex chat MCP.
+
+    Codex spawns MCP servers below its App Server process, so the server's
+    *direct* parent is not named ``codex``.  Requiring a direct parent made a
+    genuine manager look like a headless worker and forced users to shuttle a
+    mutable host-global token.  Accept only a same-uid, short ancestor chain
+    containing BOTH the Codex App Server and the installed AIWorkHub mux.
+    """
+    pid = os.getppid()
+    saw_codex_app_server = False
+    mux_pid = 0
+    for _ in range(6):
+        if pid <= 1:
+            break
+        proc = Path(f"/proc/{pid}")
+        try:
+            if proc.stat().st_uid != os.geteuid():
+                return None
+            cmdline = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
+            status = proc.joinpath("status").read_text(encoding="utf-8")
+            parent_pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+        except (OSError, UnicodeDecodeError, StopIteration, ValueError):
+            return None
+        lowered = cmdline.lower()
+        if "codex" in lowered and "app-server" in lowered:
+            saw_codex_app_server = True
+        if "aiworkhub-app-server-mux" in lowered:
+            mux_pid = pid
+            break
+        pid = parent_pid
+    if not saw_codex_app_server or not mux_pid:
+        return None
+    identity = {
+        "provider": "codex",
+        "session_id": f"codex_mux_{mux_pid}",
+        "window_id": f"codex_vscode_{mux_pid}",
+    }
+    try:
+        from . import app_server_mux
+
+        matches = [
+            instance for instance in app_server_mux.list_live_sideband_instances(
+                app_server_mux.default_sideband_dir()
+            )
+            if instance.pid == mux_pid and instance.owned_thread_ids
+        ]
+        if len(matches) == 1:
+            thread_id = matches[0].owned_thread_ids[-1]
+            if _UUID_RE.fullmatch(thread_id):
+                identity["thread_id"] = thread_id
+                identity["session_id"] = thread_id
+    except (OSError, RuntimeError):
+        pass
+    return identity
+
+
+def _current_chat_provider(card: dict[str, Any] | None = None) -> str:
+    """Resolve callback ownership from the task/session, never a dashboard
+    global toggle when a concrete chat identity is available."""
+    explicit = str((card or {}).get("coordinator_provider") or "").strip().lower()
+    if explicit in ("codex", "claude", "copilot"):
+        return explicit
+    if _claude_manager_identity() is not None:
+        return "claude"
+    try:
+        parent_cmd = Path(f"/proc/{os.getppid()}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8").lower()
+    except (OSError, UnicodeDecodeError):
+        parent_cmd = ""
+    if "codex" in parent_cmd:
+        return "codex"
+    try:
+        selected = read_selected_coordinator_target(repo_root()).get("selected_provider")
+    except Exception:
+        selected = ""
+    return selected if selected in ("codex", "claude", "copilot") else "codex"
+
+
 def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     """In-process equivalent of ``AITools/taskctl.py::_require_coordinator``.
 
@@ -131,6 +251,11 @@ def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     out to taskctl.py and letting ITS ``_require_coordinator`` do the check
     inside a child process.
     """
+    claude_identity = _claude_manager_identity()
+    if claude_identity is not None:
+        return True, "trusted_claude_manager_route"
+    if runner == CODEX_RUNNER and _codex_manager_identity() is not None:
+        return True, "trusted_codex_manager_route"
     if runner != CODEX_RUNNER:
         return False, f"coordinator_runner_mismatch:expected={CODEX_RUNNER}:got={runner}"
     scrub_coordinator_capability_from_environment()
@@ -1229,10 +1354,27 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
+        row = conn.execute("SELECT card_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        try:
+            stored_card = json.loads(row["card_json"] or "{}") if row is not None else {}
+        except (TypeError, json.JSONDecodeError):
+            stored_card = {}
+        if not isinstance(stored_card, dict):
+            stored_card = {}
+        try:
+            claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
+        except (TypeError, ValueError):
+            claim_epoch = 1
+        stored_card.update(
+            claim_epoch=claim_epoch,
+            status="processing",
+            worker_status="claimed",
+            claimed_by=runner,
+        )
         cur = conn.execute(
-            "UPDATE tasks SET worker_status='claimed', status='processing', claimed_by=?, "
+            "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
             "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
-            (runner, now, now, now, task_id),
+            (json.dumps(stored_card, ensure_ascii=False), runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -1268,20 +1410,38 @@ def claim_start_exact(
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
         row = conn.execute(
-            "SELECT runner, topic FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT runner, topic, card_json FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()
         if row is None:
             conn.rollback()
             return _canonical_result(ok=False, returncode=1, stderr=f"task_not_found:{task_id}", command=command)
-        if row["runner"] != runner or row["topic"] != topic:
+        try:
+            stored_card = json.loads(row["card_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            stored_card = {}
+        if not isinstance(stored_card, dict):
+            stored_card = {}
+        stored_runner = str(row["runner"] or stored_card.get("runner") or "")
+        stored_topic = str(row["topic"] or stored_card.get("topic") or "")
+        if stored_runner != runner or stored_topic != topic:
             conn.rollback()
             return _canonical_result(
                 ok=False, returncode=1, stderr=f"identity_mismatch:task_id={task_id}", command=command
             )
+        try:
+            claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
+        except (TypeError, ValueError):
+            claim_epoch = 1
+        stored_card.update(
+            claim_epoch=claim_epoch,
+            status="processing",
+            worker_status="claimed",
+            claimed_by=runner,
+        )
         cur = conn.execute(
-            "UPDATE tasks SET worker_status='claimed', status='processing', claimed_by=?, "
+            "UPDATE tasks SET card_json=?, runner=?, topic=?, worker_status='claimed', status='processing', claimed_by=?, "
             "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
-            (runner, now, now, now, task_id),
+            (json.dumps(stored_card, ensure_ascii=False), runner, topic, runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -1634,6 +1794,175 @@ def _live_card(task_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | No
     return card, None
 
 
+def manager_bootstrap() -> dict[str, Any]:
+    """Compact, model-readable manager contract for a newly attached chat."""
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    provider = str((identity or {}).get("provider") or _current_chat_provider())
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.manager_bootstrap.v1",
+        "role": "manager" if identity else "worker_or_unverified_client",
+        "provider": provider,
+        "repo": str(repo_root()),
+        "manager_route": identity or {},
+        "workflow": [
+            "aiworkhub_task_create",
+            "aiworkhub_task_auto_pickup or aiworkhub_agent_launch_task",
+            "aiworkhub_task_mark_review",
+            "provider callback receipt",
+            "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
+        ],
+        "callback": {
+            "codex": "pushes to the exact origin thread through the App Server mux",
+            "claude": "call aiworkhub_dispatcher_ensure_started, then aiworkhub_claude_callback_wait and immediately ack",
+        },
+        "rules": [
+            "Create tasks through aiworkhub_task_create; never require repository-local AITools/taskctl.py.",
+            "Use the returned task_id exactly and never fabricate callback batch/lease ids.",
+            "Workers stop at review; a verified manager finalizes or rejects review.",
+            "Each repository owns its own task database, callback lanes, and runtime capability.",
+        ],
+    }
+
+
+def create_task(
+    task_id: str,
+    title: str,
+    runner: str,
+    topic: str,
+    objective: str,
+    acceptance: list[str],
+    allowed_writes: list[str],
+    forbidden: list[str] | None = None,
+    required_outputs: list[str] | None = None,
+    validation: list[str] | None = None,
+    priority: str = "normal",
+    callback_required: bool = True,
+) -> dict[str, Any]:
+    """Create one new canonical task card for the verified manager chat.
+
+    Identity, callback provider, and origin thread are derived from the live
+    manager route.  They are intentionally not caller-controlled parameters.
+    Existing task ids are never overwritten.
+    """
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    if identity is None:
+        return _lifecycle_error("manager_identity_required:task_create", 126)
+    # Creation has no pre-existing card whose runner/topic could authorize the
+    # write, so the normal card-scoped allowlist is inapplicable here.  Keep
+    # the write gate, then require the verified manager capability directly.
+    blocked = _canonical_write_gate("add-card")
+    if blocked is not None:
+        return blocked
+    capability_ok, capability_reason = _verify_coordinator_capability(CODEX_RUNNER)
+    if not capability_ok:
+        return _lifecycle_error(capability_reason, 126)
+
+    task_id = str(task_id or "").strip()
+    runner = str(runner or "").strip()
+    topic = str(topic or "").strip()
+    title = str(title or "").strip()
+    objective = str(objective or "").strip()
+    priority = str(priority or "normal").strip().lower()
+    if not _TASK_ID_RE.fullmatch(task_id):
+        return _lifecycle_error("invalid_task_id", 2)
+    if not _TASK_IDENTITY_RE.fullmatch(runner) or not _TASK_IDENTITY_RE.fullmatch(topic):
+        return _lifecycle_error("invalid_runner_or_topic", 2)
+    if not title or len(title) > 300 or not objective or len(objective) > 4000:
+        return _lifecycle_error("invalid_title_or_objective", 2)
+    if priority not in ("low", "normal", "high", "critical"):
+        return _lifecycle_error("invalid_priority", 2)
+
+    def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
+        if not isinstance(value, list) or (required and not value) or len(value) > 128:
+            raise ValueError(f"invalid_{name}")
+        result: list[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if not text or len(text) > 1000:
+                raise ValueError(f"invalid_{name}")
+            result.append(text)
+        return result
+
+    try:
+        acceptance2 = bounded_strings(acceptance, "acceptance", required=True)
+        writes2 = bounded_strings(allowed_writes, "allowed_writes")
+        forbidden2 = bounded_strings(forbidden or [], "forbidden")
+        outputs2 = bounded_strings(required_outputs or [], "required_outputs")
+        validation2 = bounded_strings(validation or [], "validation")
+    except ValueError as exc:
+        return _lifecycle_error(str(exc), 2)
+    for item in writes2:
+        path = Path(item)
+        if path.is_absolute() or ".." in path.parts:
+            return _lifecycle_error("invalid_allowed_write_path", 2)
+
+    origin_thread_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
+    if not _UUID_RE.fullmatch(origin_thread_id):
+        return _lifecycle_error("manager_route_has_no_valid_origin_thread", 126)
+    provider = str(identity["provider"])
+    now = datetime.now(timezone.utc).isoformat()
+    card = {
+        "schema_id": "aiworkhub.task_card.v1",
+        "task_id": task_id,
+        "title": title,
+        "runner": runner,
+        "topic": topic,
+        "mode": "",
+        "priority": priority,
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "objective": objective,
+        "origin_thread_id": origin_thread_id,
+        "coordinator_provider": provider,
+        "callback_required": bool(callback_required),
+        "acceptance": acceptance2,
+        "allowed_writes": writes2,
+        "forbidden": forbidden2,
+        "required_outputs": outputs2,
+        "validation": validation2,
+    }
+    command = ["add-card", task_id]
+    try:
+        conn = _canonical_connect()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    try:
+        callback_store.init_db(conn)
+        if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone() is not None:
+            return _canonical_result(
+                ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
+            )
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,topic,mode,status,worker_status,priority,objective,card_json,created_at,updated_at,archived_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'')",
+            (
+                task_id, runner, topic, "", "pending", "unclaimed", priority,
+                objective, json.dumps(card, ensure_ascii=False), now, now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) VALUES(?,?,?,?,?)",
+            (
+                task_id, "created", CODEX_RUNNER,
+                json.dumps({"provider": provider, "topic": topic}, ensure_ascii=False), now,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return _canonical_result(
+            ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
+        )
+    finally:
+        conn.close()
+    return _canonical_result(
+        ok=True,
+        stdout=json.dumps(card, ensure_ascii=False),
+        command=command,
+    )
+
+
 def mark_review(task_id: str, runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
     """Request review for the exact task owner recorded on the live card.
 
@@ -1667,6 +1996,7 @@ def mark_review(task_id: str, runner: str | None = None, topic: str | None = Non
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
+        callback_store.init_db(conn)
         cur = conn.execute(
             "UPDATE tasks SET worker_status='review', status='review', updated_at=? "
             "WHERE task_id=? AND worker_status IN ('claimed','in_progress')",
@@ -1687,12 +2017,36 @@ def mark_review(task_id: str, runner: str | None = None, topic: str | None = Non
                 now,
             ),
         )
+        origin_thread_id = callback_store.read_origin_thread(conn, task_id)
+        if not origin_thread_id:
+            origin_thread_id = str(card.get("origin_thread_id") or "").strip()
+        callback_provider = _current_chat_provider(card)
+        claude_route = _claude_manager_identity() if callback_provider == "claude" else None
+        if claude_route is not None:
+            # The reviewing Claude manager's live session is the callback
+            # authority. Repair a legacy/missing origin that may have been
+            # stamped by the task authoring chat before provider-aware
+            # routing existed.
+            origin_thread_id = claude_route["session_id"]
+            conn.execute(
+                "UPDATE tasks SET origin_thread_id=? WHERE task_id=?",
+                (origin_thread_id, task_id),
+            )
+        callback_enqueued = callback_store.enqueue_callback(
+            conn,
+            task_id,
+            origin_thread_id or "",
+            "review_ready",
+            provider=callback_provider,
+        )
         conn.commit()
     finally:
         conn.close()
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["callback_enqueued"] = callback_enqueued
+    return result
 
 
 def mark_done(task_id: str, runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
@@ -2441,13 +2795,69 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "repo": str(root),
         }
     target = read_selected_coordinator_target(root)
-    provider = target["selected_provider"]
+    claude_identity = _claude_manager_identity()
+    if os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower() == "sideband":
+        provider = "codex"
+        claude_identity = None
+    elif claude_identity is not None:
+        provider = "claude"
+    else:
+        provider = target["selected_provider"]
+    window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
+    if not window_id and claude_identity is not None:
+        window_id = claude_identity["window_id"]
+    if claude_identity is not None and provider == "claude":
+        # A second ``claude --resume --print`` process cannot wake an already
+        # open Claude Code webview.  The verified manager instead owns a
+        # two-phase MCP long-poll inbox (callback_wait/callback_ack).  Do not
+        # start the old CLI dispatcher and do not consume its retry budget.
+        bridge = _callback_bridge_module()
+        bridge.stop_dispatcher(root)
+        conn = _canonical_connect()
+        try:
+            rebound_count = callback_store.rebind_pending_callbacks(
+                conn,
+                provider="claude",
+                origin_thread_id=claude_identity["session_id"],
+            )
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "status": "manager_inbox",
+            "dispatcher_started": False,
+            "repo": str(root),
+            "provider": "claude",
+            "manager_route": claude_identity,
+            "reason": "claude_manager_uses_mcp_callback_wait",
+            "rebound_callback_count": rebound_count,
+        }
+    if not window_id:
+        # Headless worker MCP processes never own callback dispatch. They
+        # may claim work and mark it for review, but only the repository-
+        # bound VS Code extension child has the window identity and lifecycle
+        # needed to wake a coordinator UI. Report the role boundary as a
+        # normal state instead of attempting a doomed transport launch.
+        return {
+            "ok": True,
+            "status": "headless_worker",
+            "dispatcher_started": False,
+            "reason": "dispatcher_owned_by_vscode_extension",
+            "repo": str(root),
+            "provider": provider,
+        }
     bridge = _callback_bridge_module()
+    bridge_kwargs: dict[str, Any] = {}
+    if provider == "codex":
+        transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
+        if transport:
+            bridge_kwargs["transport"] = transport
     dispatcher = bridge.ensure_dispatcher(
         root,
         provider,
         repo_id=readiness.repo_id,
-        window_id=os.environ.get("AIWORKHUB_WINDOW_ID", ""),
+        window_id=window_id,
+        bridge_kwargs=bridge_kwargs,
     )
     health = dispatcher.health()
     return {
@@ -2455,7 +2865,94 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         "status": "started" if health.get("dispatcher_running") else "start_failed",
         "dispatcher_started": bool(health.get("dispatcher_running")),
         "repo": str(root),
+        "manager_route": claude_identity or {},
         **health,
+    }
+
+
+def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
+    """Wait for one callback batch belonging to this exact Claude manager.
+
+    Returning the batch wakes the already-open Claude turn through its own
+    MCP request.  Delivery remains inflight until ``claude_callback_ack``;
+    if the tool response is lost, the normal lease reclaim path retries it.
+    """
+    identity = _claude_manager_identity()
+    if identity is None:
+        return {"ok": False, "reason": "verified_claude_manager_required"}
+    timeout = max(1, min(int(timeout_seconds), 300))
+    deadline = time.monotonic() + timeout
+    while True:
+        conn = _canonical_connect()
+        try:
+            batch = callback_store.claim_pending_callback_batch(
+                conn, lease_seconds=max(120, timeout + 30), provider="claude"
+            )
+        finally:
+            conn.close()
+        if batch is not None:
+            if batch.get("origin_thread_id") != identity["session_id"]:
+                conn = _canonical_connect()
+                try:
+                    callback_store.defer_batch_busy(
+                        conn,
+                        str(batch["batch_id"]),
+                        "callback_belongs_to_different_claude_session",
+                        delay_seconds=30.0,
+                    )
+                finally:
+                    conn.close()
+            else:
+                members = [
+                    {
+                        "task_id": str(member.get("task_id") or ""),
+                        "state": str(member.get("transition") or ""),
+                        "event_id": str(member.get("event_id") or ""),
+                        "request_id": str(member.get("request_id") or ""),
+                    }
+                    for member in batch.get("members", [])
+                ]
+                return {
+                    "ok": True,
+                    "status": "callback_ready",
+                    "provider": "claude",
+                    "batch_id": batch["batch_id"],
+                    "lease_id": batch["lease_id"],
+                    "origin_thread_id": batch["origin_thread_id"],
+                    "members": members,
+                }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                "ok": True,
+                "status": "timeout_no_callback",
+                "provider": "claude",
+                "waited_seconds": timeout,
+            }
+        time.sleep(min(0.5, remaining))
+
+
+def claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
+    """Durably acknowledge a callback returned by ``claude_callback_wait``."""
+    identity = _claude_manager_identity()
+    if identity is None:
+        return {"ok": False, "reason": "verified_claude_manager_required"}
+    conn = _canonical_connect()
+    try:
+        acknowledged = callback_store.acknowledge_callback_batch(
+            conn,
+            batch_id,
+            lease_id,
+            provider="claude",
+            origin_thread_id=identity["session_id"],
+        )
+    finally:
+        conn.close()
+    return {
+        "ok": acknowledged,
+        "status": "delivered" if acknowledged else "ack_rejected",
+        "provider": "claude",
+        "batch_id": batch_id,
     }
 
 

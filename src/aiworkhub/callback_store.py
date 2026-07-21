@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,9 +78,18 @@ def resolve_db_path(repo: str | Path) -> Path:
 
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    for attempt in range(5):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 4:
+                conn.close()
+                raise
+            time.sleep(0.05 * (attempt + 1))
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -101,6 +111,7 @@ def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS callback_outbox (
           outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
           task_id TEXT NOT NULL,
+          provider TEXT NOT NULL DEFAULT '',
           origin_thread_id TEXT NOT NULL DEFAULT '',
           transition TEXT NOT NULL DEFAULT '',
           episode_id TEXT NOT NULL DEFAULT '0',
@@ -119,6 +130,7 @@ def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     for column, ddl in (
+        ("provider", "TEXT NOT NULL DEFAULT ''"),
         ("episode_id", "TEXT NOT NULL DEFAULT '0'"),
         ("event_id", "TEXT NOT NULL DEFAULT ''"),
         ("request_id", "TEXT NOT NULL DEFAULT ''"),
@@ -146,6 +158,7 @@ def _ensure_callback_batches_table(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS callback_batches (
           batch_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL DEFAULT '',
           origin_thread_id TEXT NOT NULL DEFAULT '',
           state TEXT NOT NULL DEFAULT 'pending',
           created_at TEXT NOT NULL,
@@ -163,6 +176,7 @@ def _ensure_callback_batches_table(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     for column, ddl in (
+        ("provider", "TEXT NOT NULL DEFAULT ''"),
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("last_error", "TEXT NOT NULL DEFAULT ''"),
         ("lease_id", "TEXT NOT NULL DEFAULT ''"),
@@ -254,6 +268,7 @@ def enqueue_callback(
     origin_thread_id: str,
     transition: str,
     *,
+    provider: str = "",
     episode_id: str | None = None,
     event_id: str = "",
     request_id: str = "",
@@ -264,6 +279,9 @@ def enqueue_callback(
     if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
         return False
     validated_thread = str(origin_thread_id or "").strip()
+    validated_provider = str(provider or "").strip().lower()
+    if validated_provider not in ("", "codex", "claude", "copilot"):
+        return False
     if not validated_thread:
         return False
     _ensure_callback_outbox_table(conn)
@@ -273,16 +291,16 @@ def enqueue_callback(
         conn.execute(
             """
             INSERT INTO callback_outbox(
-              task_id, origin_thread_id, transition, episode_id, event_id,
+              task_id, provider, origin_thread_id, transition, episode_id, event_id,
               request_id, state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (task_id, validated_thread, transition, resolved_episode, event_id, request_id, now, now),
+            (task_id, validated_provider, validated_thread, transition, resolved_episode, event_id, request_id, now, now),
         )
         conn.commit()
     except sqlite3.IntegrityError:
         return False
-    append_event(conn, task_id, "callback_enqueued", "", {"transition": transition, "episode_id": resolved_episode})
+    append_event(conn, task_id, "callback_enqueued", "", {"transition": transition, "episode_id": resolved_episode, "provider": validated_provider})
     return True
 
 
@@ -302,7 +320,12 @@ def _task_still_in_matching_terminal_state(
         card = {}
     if not isinstance(card, dict):
         card = {}
-    merged = {**dict(row), **card}
+    # ``card_json`` is the immutable task-card snapshot while the dedicated
+    # lifecycle columns are the live canonical state.  Native task-engine
+    # transitions update those columns directly, so a stale card-level
+    # ``status``/``worker_status`` must never override the live row and make a
+    # genuine review callback look superseded.
+    merged = {**card, **dict(row)}
     current_status = task_store.canonical_status(merged)
     current_episode = str(card.get("claim_epoch") or 0)
     if current_episode != str(episode_id):
@@ -416,6 +439,7 @@ def claim_pending_callback_batch(
     conn: sqlite3.Connection,
     lease_seconds: int = 120,
     max_members: int = DEFAULT_CALLBACK_BATCH_MAX_MEMBERS,
+    provider: str = "",
 ) -> dict | None:
     """Atomically claim one delivery batch, or None if nothing is claimable.
 
@@ -427,6 +451,8 @@ def claim_pending_callback_batch(
     is still in the future is skipped, never blocking other threads."""
     _ensure_callback_outbox_table(conn)
     _ensure_callback_batches_table(conn)
+    provider = str(provider or "").strip().lower()
+    provider_where = " AND provider=?" if provider else ""
     while True:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -436,14 +462,16 @@ def claim_pending_callback_batch(
             inflight_threads = {
                 row["origin_thread_id"]
                 for row in conn.execute(
-                    "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='inflight'"
+                    "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='inflight'" + provider_where,
+                    (provider,) if provider else (),
                 ).fetchall()
             }
 
             due_pending_batch = None
             for row in conn.execute(
-                "SELECT * FROM callback_batches WHERE state='pending' "
-                "ORDER BY created_at ASC, batch_id ASC"
+                "SELECT * FROM callback_batches WHERE state='pending' " + provider_where +
+                " ORDER BY created_at ASC, batch_id ASC",
+                (provider,) if provider else (),
             ).fetchall():
                 if row["origin_thread_id"] in inflight_threads:
                     continue
@@ -457,14 +485,16 @@ def claim_pending_callback_batch(
                 reserved_threads = inflight_threads | {
                     row["origin_thread_id"]
                     for row in conn.execute(
-                        "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='pending'"
+                        "SELECT DISTINCT origin_thread_id FROM callback_batches WHERE state='pending'" + provider_where,
+                        (provider,) if provider else (),
                     ).fetchall()
                 }
                 oldest_unassigned = None
                 for row in conn.execute(
                     "SELECT origin_thread_id FROM callback_outbox "
-                    "WHERE state='pending' AND batch_id='' "
-                    "ORDER BY created_at ASC, outbox_id ASC"
+                    "WHERE state='pending' AND batch_id='' " + provider_where +
+                    " ORDER BY created_at ASC, outbox_id ASC",
+                    (provider,) if provider else (),
                 ).fetchall():
                     if row["origin_thread_id"] not in reserved_threads:
                         oldest_unassigned = row
@@ -475,9 +505,9 @@ def claim_pending_callback_batch(
                 thread_id = oldest_unassigned["origin_thread_id"]
                 candidates = conn.execute(
                     "SELECT outbox_id FROM callback_outbox "
-                    "WHERE state='pending' AND batch_id='' AND origin_thread_id=? "
-                    "ORDER BY created_at ASC, outbox_id ASC LIMIT ?",
-                    (thread_id, max(1, int(max_members))),
+                    "WHERE state='pending' AND batch_id='' AND origin_thread_id=? " + provider_where +
+                    " ORDER BY created_at ASC, outbox_id ASC LIMIT ?",
+                    (thread_id, provider, max(1, int(max_members))) if provider else (thread_id, max(1, int(max_members))),
                 ).fetchall()
                 batch_id = uuid.uuid4().hex
                 for candidate in candidates:
@@ -488,10 +518,10 @@ def claim_pending_callback_batch(
                 conn.execute(
                     """
                     INSERT INTO callback_batches(
-                      batch_id, origin_thread_id, state, created_at, updated_at, member_count
-                    ) VALUES (?, ?, 'pending', ?, ?, ?)
+                      batch_id, provider, origin_thread_id, state, created_at, updated_at, member_count
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
                     """,
-                    (batch_id, thread_id, now_iso, now_iso, len(candidates)),
+                    (batch_id, provider, thread_id, now_iso, now_iso, len(candidates)),
                 )
             else:
                 batch_id = due_pending_batch["batch_id"]
@@ -563,6 +593,86 @@ def mark_batch_delivered(conn: sqlite3.Connection, batch_id: str) -> None:
         (now, batch_id),
     )
     conn.commit()
+
+
+def acknowledge_callback_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    lease_id: str,
+    *,
+    provider: str,
+    origin_thread_id: str,
+) -> bool:
+    """Acknowledge one exact leased batch after a manager received it.
+
+    The lease, provider and originating thread must all match.  This keeps
+    the MCP long-poll path two-phase: a dropped tool response is reclaimed
+    after lease expiry instead of being falsely recorded as delivered.
+    """
+    _ensure_callback_batches_table(conn)
+    row = conn.execute(
+        "SELECT state, lease_id, provider, origin_thread_id "
+        "FROM callback_batches WHERE batch_id=?",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["state"] != "inflight"
+        or row["lease_id"] != lease_id
+        or str(row["provider"] or "").lower() != str(provider or "").lower()
+        or row["origin_thread_id"] != origin_thread_id
+    ):
+        return False
+    mark_batch_delivered(conn, batch_id)
+    return True
+
+
+def rebind_pending_callbacks(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str,
+) -> int:
+    """Move only durable, unconsumed callbacks to a verified manager route.
+
+    This is the reload/session-rollover path.  Inflight deliveries are never
+    stolen.  Existing pending batches are superseded and their members become
+    unbatched so the new manager can claim them immediately.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    provider = str(provider or "").strip().lower()
+    origin_thread_id = str(origin_thread_id or "").strip()
+    if not provider or not origin_thread_id:
+        raise ValueError("provider and origin_thread_id are required")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT outbox_id, batch_id FROM callback_outbox "
+            "WHERE provider=? AND state='pending' AND origin_thread_id<>?",
+            (provider, origin_thread_id),
+        ).fetchall()
+        batch_ids = {str(row["batch_id"] or "") for row in rows if row["batch_id"]}
+        now = utc_now()
+        for batch_id in batch_ids:
+            conn.execute(
+                "UPDATE callback_batches SET state='superseded', lease_id='', "
+                "lease_expires_at='', updated_at=? WHERE batch_id=? AND state='pending'",
+                (now, batch_id),
+            )
+        if rows:
+            conn.execute(
+                "UPDATE callback_outbox SET origin_thread_id=?, batch_id='', "
+                "lease_id='', lease_expires_at='', last_error='', updated_at=? "
+                "WHERE provider=? AND state='pending' AND origin_thread_id<>?",
+                (origin_thread_id, now, provider, origin_thread_id),
+            )
+        conn.commit()
+        return len(rows)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _iso_plus_seconds(now_iso: str, delay_seconds: float) -> str:

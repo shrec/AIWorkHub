@@ -21,10 +21,10 @@ import shutil
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-MUX_MODULE_PATH = REPO_ROOT / "tools" / "aiworkhub" / "src" / "aiworkhub" / "app_server_mux.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MUX_MODULE_PATH = REPO_ROOT / "src" / "aiworkhub" / "app_server_mux.py"
 CONSOLE_SCRIPT_NAME = "aiworkhub-app-server-mux"
-DEFAULT_CONSOLE_SCRIPT = REPO_ROOT / "tools" / "aiworkhub" / "scripts" / CONSOLE_SCRIPT_NAME
+DEFAULT_CONSOLE_SCRIPT = REPO_ROOT / "scripts" / CONSOLE_SCRIPT_NAME
 SETTING_KEY = "chatgpt.cliExecutable"
 ENV_REAL_EXECUTABLE = "AIWORKHUB_APP_SERVER_MUX_REAL_EXECUTABLE"
 

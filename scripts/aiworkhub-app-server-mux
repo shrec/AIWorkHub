@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Repository-local executable entry point for the VS Code Codex mux."""
+"""Install-tree independent AIWorkHub Codex App Server mux launcher."""
 from pathlib import Path
 import sys
 
-SRC = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(SRC))
+ROOT = Path(__file__).resolve().parents[1]
+for candidate in (ROOT / "runtime", ROOT / "src"):
+    if (candidate / "aiworkhub" / "app_server_mux.py").is_file():
+        sys.path.insert(0, str(candidate))
+        break
+else:
+    raise SystemExit("AIWorkHub mux runtime is missing")
 
 from aiworkhub.app_server_mux import main
 

@@ -265,10 +265,10 @@ def initialize_view(repo_id: str = "") -> dict[str, Any]:
     var the extension host spawns this child process with -- never a fixed
     path relative to this package's own install location) and, when the
     caller supplies one, an expected ``repo_id`` that must match any existing
-    manifest exactly. Creates/repairs ``.aiworkhub/project.json``,
-    ``.aiworkhub/config/storage.json``, and a fresh, schema-only canonical
-    ``.aiworkhub/tasking/task_queue.sqlite``. Never imports or deletes any
-    legacy database -- a brand-new canonical DB is always empty.
+    manifest exactly. Creates/repairs the repository-local canonical stores.
+    Fresh repositories receive empty compatible databases; an older registry
+    may migrate only its explicitly declared repo-local legacy SQLite files
+    with a consistent backup. Legacy files are never deleted.
     """
     root = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
     if not root:
