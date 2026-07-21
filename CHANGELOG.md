@@ -4,6 +4,17 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.5] - 2026-07-21
+
+### Fixed
+
+- Persist manager-derived `origin_thread_id` in both the canonical task row
+  and immutable card JSON so review transitions enqueue callbacks reliably.
+- Preserve card origin identity when reading older rows whose denormalized
+  origin column is empty.
+- Make concurrent callback schema upgrades tolerate only a verified
+  duplicate-column winner, preventing reload-time dispatcher thread loss.
+
 ## [0.6.4] - 2026-07-21
 
 ### Fixed

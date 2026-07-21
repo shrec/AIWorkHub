@@ -141,7 +141,18 @@ def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
         ("lease_expires_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if not _column_exists(conn, "callback_outbox", column):
-            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {column} {ddl}")
+            try:
+                conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {column} {ddl}")
+            except sqlite3.OperationalError as exc:
+                # Two extension/dispatcher clients may initialize the same
+                # repo immediately after reload. Both can observe a missing
+                # column before one wins ALTER TABLE. The loser's duplicate
+                # is success only after the column is independently visible;
+                # every other schema/database error remains fail-closed.
+                if "duplicate column name" not in str(exc).lower() or not _column_exists(
+                    conn, "callback_outbox", column
+                ):
+                    raise
     conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_callback_outbox_state ON callback_outbox(state)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_callback_outbox_batch_id ON callback_outbox(batch_id)")

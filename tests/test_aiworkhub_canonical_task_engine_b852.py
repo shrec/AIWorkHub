@@ -388,7 +388,9 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
     card = json.loads(created["stdout"])
     assert card["coordinator_provider"] == "claude"
     assert card["origin_thread_id"] == session_id
-    assert _row(writable_repo, "TASK_MANAGER_CREATE")["worker_status"] == "unclaimed"
+    stored = _row(writable_repo, "TASK_MANAGER_CREATE")
+    assert stored["worker_status"] == "unclaimed"
+    assert stored["origin_thread_id"] == session_id
 
     duplicate = core.create_task(
         task_id="TASK_MANAGER_CREATE",

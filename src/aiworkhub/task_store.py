@@ -72,7 +72,7 @@ REQUIRED_TABLES: tuple[str, ...] = (
 )
 
 REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
-    "tasks": ("task_id", "runner", "topic", "status", "worker_status", "card_json"),
+    "tasks": ("task_id", "runner", "topic", "status", "worker_status", "card_json", "origin_thread_id"),
     "callback_outbox": ("task_id", "origin_thread_id", "episode_id", "batch_id", "state"),
 }
 
@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   claimed_at TEXT,
   started_at TEXT,
   completed_at TEXT,
+  origin_thread_id TEXT,
   archived_at TEXT NOT NULL DEFAULT ''
 );
 
@@ -382,6 +383,9 @@ def _upgrade_compatible_schema(path: Path) -> bool:
         if "topic" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
             changed = True
+        if "origin_thread_id" not in task_columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN origin_thread_id TEXT")
+            changed = True
         # Older writers could persist the canonical topic in card_json while
         # leaving the indexed column empty.  Reconcile those rows on every
         # explicit initialize/upgrade; otherwise exact worker launch rejects
@@ -570,6 +574,8 @@ def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
         card = {**card_json, **card}
         if not card.get("topic") and card_json.get("topic"):
             card["topic"] = card_json["topic"]
+        if not card.get("origin_thread_id") and card_json.get("origin_thread_id"):
+            card["origin_thread_id"] = card_json["origin_thread_id"]
     card["status"] = canonical_status(card)
     return card
 

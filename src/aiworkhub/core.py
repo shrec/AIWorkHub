@@ -1937,11 +1937,12 @@ def create_task(
                 ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
             )
         conn.execute(
-            "INSERT INTO tasks(task_id,runner,topic,mode,status,worker_status,priority,objective,card_json,created_at,updated_at,archived_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'')",
+            "INSERT INTO tasks(task_id,runner,topic,mode,status,worker_status,priority,objective,card_json,created_at,updated_at,origin_thread_id,archived_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '')",
             (
                 task_id, runner, topic, "", "pending", "unclaimed", priority,
                 objective, json.dumps(card, ensure_ascii=False), now, now,
+                origin_thread_id,
             ),
         )
         conn.execute(
