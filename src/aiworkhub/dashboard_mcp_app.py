@@ -200,7 +200,15 @@ def health_view() -> dict[str, Any]:
     render its connection banner.  Never calls ``dashboard.build_snapshot``:
     polling stays cheap and cannot pull the queue/cost/process payload.
     """
-    root_raw = str(os.environ.get("AIWORKHUB_REPO_ROOT") or "").strip()
+    # The VS Code dashboard child exports both names.  Manager MCP clients
+    # launched through the Codex/Claude mux use the canonical core binding
+    # name (AIWORKHUB_REPO), so accept it as the equivalent repo-local source
+    # instead of reporting a false degraded/unselected state.
+    root_raw = str(
+        os.environ.get("AIWORKHUB_REPO_ROOT")
+        or os.environ.get("AIWORKHUB_REPO")
+        or ""
+    ).strip()
     if not root_raw:
         result: dict[str, Any] = {
             "ok": False,
@@ -270,7 +278,11 @@ def initialize_view(repo_id: str = "") -> dict[str, Any]:
     may migrate only its explicitly declared repo-local legacy SQLite files
     with a consistent backup. Legacy files are never deleted.
     """
-    root = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+    root = str(
+        os.environ.get("AIWORKHUB_REPO_ROOT")
+        or os.environ.get("AIWORKHUB_REPO")
+        or ""
+    ).strip()
     if not root:
         return {
             "ok": False,

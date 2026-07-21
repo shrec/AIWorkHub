@@ -72,7 +72,10 @@ COORDINATOR_COMMANDS = frozenset({"done", "reject-review", "release-launch", "ar
 # package __init__ (imported above) so existing callers keep working against
 # core.COORDINATOR_TOKEN_ENV unchanged.
 DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordinator.token"
-_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+# RFC 9562 defines UUID versions 6, 7 and 8 in addition to the historical
+# 1-5 set.  Current Codex thread ids are UUIDv7, so rejecting the version
+# nibble above 5 discards a genuine mux-owned origin thread.
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 

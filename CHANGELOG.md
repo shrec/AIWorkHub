@@ -4,6 +4,17 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.4] - 2026-07-21
+
+### Fixed
+
+- Accept RFC 9562 UUIDv7/v8 manager session identities so current Codex
+  origin threads survive mux ownership validation and `aiworkhub_task_create`
+  can bind callbacks to the real originating chat.
+- Treat `AIWORKHUB_REPO` as the manager-mux equivalent of the VS Code
+  dashboard child's `AIWORKHUB_REPO_ROOT`, preventing false degraded health
+  when both surfaces address the same canonical repository.
+
 ## [0.6.3] - 2026-07-21
 
 ### Fixed

@@ -32,6 +32,12 @@ from aiworkhub import callback_store, core, task_store  # noqa: E402
 NOW = "2026-07-20T00:00:00+00:00"
 
 
+def test_manager_origin_identity_accepts_modern_uuid_versions():
+    assert core._UUID_RE.fullmatch("019f5097-6dbe-7172-870a-945afc5f3bfa")
+    assert core._UUID_RE.fullmatch("019f5097-6dbe-8172-870a-945afc5f3bfa")
+    assert not core._UUID_RE.fullmatch("019f5097-6dbe-9172-870a-945afc5f3bfa")
+
+
 def _init_repo(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()
