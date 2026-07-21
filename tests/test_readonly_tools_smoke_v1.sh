@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ── test_readonly_tools_smoke_v1.sh ──────────────────────────────────
-# Smoke test for geoai-task-mcp read-only tools.
+# Smoke test for aiworkhub read-only tools.
 # Runs the Python test harness with ALLOW_WRITES=0.
 # Must be run from repo root.
 #
@@ -13,13 +13,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Read-Only Tool Smoke Test v1 ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 # ── Run the Python test harness ─────────────────────────────────────

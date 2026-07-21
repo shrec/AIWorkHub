@@ -1,0 +1,29 @@
+{
+  "schema_id": "aiworkhub.canonical_task_engine_callback.b852.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CANONICAL_TASK_ENGINE_CALLBACK_B852_V1",
+  "goal": "Replace core.py's subprocess dependency on AITools/taskctl.py and AITools/taskdb.py with repo-local canonical task_store.sqlite access, since no aiworkhub.task_engine module exists anywhere in the repo and none may be created (allowed_writes limited to core.py/server.py/test/eval).",
+  "converted_functions": [
+    "health", "review_queue", "list_tasks", "show_task", "pending_for_runner",
+    "auto_pickup", "claim_start_exact", "mark_review", "mark_done",
+    "reject_review", "release_launch", "collision_guard",
+    "callback_outbox_status", "usage_report", "export_jsonl"
+  ],
+  "new_helpers": ["_canonical_connect", "_canonical_write_gate", "_verify_coordinator_capability"],
+  "compat_notes": [
+    "list_tasks preserves taskctl's '[bucket] [topic] [runner] task_id' stdout line format (consumed by dashboard.py::parse_task_list, completion_inbox.py::_parse_list_task_ids)",
+    "usage_report preserves 'task | runner=... | cost=$...' pipe format (consumed by cost_ledger.py::USAGE_LINE_RE)",
+    "usage_report reports 'No usage records.' because canonical tasks schema has no token/cost columns; aggregation over future task_events(event='usage_record') rows is wired but no write path records them yet in this task's scope"
+  ],
+  "isolation_verified": "two temp repos with identical task_id stay isolated (separate canonical DBs); repo with no AITools/ directory passes lifecycle + callback tests end to end",
+  "validation": {
+    "test_aiworkhub_canonical_task_engine_b852": "12 passed",
+    "test_aiworkhub_vscode_release_b853": "24 passed",
+    "taskctl_verify": "PASS",
+    "taskctl_collision_guard": "collision_free=true"
+  },
+  "known_blocker_out_of_scope": {
+    "file": "tools/geoai-task-mcp/tests/test_server_runtime_wiring.py::test_real_core_lifecycle_calls_scope_identity_and_capability",
+    "reason": "asserts core.claim_start_exact/mark_review/mark_done/reject_review/release_launch invoke subprocess.run with exact taskctl argv -- directly contradicts this task's acceptance criterion (no taskctl/taskdb subprocess). Not in allowed_writes; needs a follow-up task to rewrite this test against the canonical-DB contract."
+  },
+  "not_created": "no task_engine.py module exists or was created; all lifecycle-write logic lives in core.py against the existing task_store.py canonical schema, task_store.py itself untouched"
+}

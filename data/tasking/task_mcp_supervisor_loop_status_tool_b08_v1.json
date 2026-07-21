@@ -10,27 +10,27 @@
   "mode": "readonly_tool_contract_and_smoke_no_server_patch",
   "objective": "Prepare the read-only supervisor-loop status tool contract and smoke implementation plan from B07, without touching server.py or enabling launch/writes.",
   "read_first": [
-    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
-    "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+    "tools/aiworkhub/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/aiworkhub/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+    "tools/aiworkhub/src/aiworkhub/core.py"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
-    "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_tool_b08_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh"
+    "tools/aiworkhub/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+    "tools/aiworkhub/eval/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh"
   ],
   "acceptance": [
     "Must define read-only tool input/output schema for task_id -> supervisor_state + detected error.",
     "Must include smoke cases for clean task, collision, stale task, runner_topic_mismatch, missing artifact, and failed validation.",
     "Must specify exact future source patch paths but must not patch source in this task.",
     "Must preserve no credential read, no daemon, no real process launch, no task status mutation, no write gate.",
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh passes.",
+    "bash tools/aiworkhub/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh passes.",
     "python3 AITools/taskctl.py verify passes."
   ],
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "forbidden": [

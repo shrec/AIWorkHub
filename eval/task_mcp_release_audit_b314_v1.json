@@ -26,13 +26,13 @@
       "tool_freeze"
     ],
     "source_files_audited": [
-      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_supervisor.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/__init__.py",
+      "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+      "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+      "tools/aiworkhub/src/aiworkhub/worker_supervisor.py",
+      "tools/aiworkhub/src/aiworkhub/core.py",
+      "tools/aiworkhub/src/aiworkhub/server.py",
+      "tools/aiworkhub/src/aiworkhub/dashboard.py",
+      "tools/aiworkhub/src/aiworkhub/__init__.py",
       "AITools/taskctl.py"
     ],
     "exact_tool_count": 33,

@@ -31,12 +31,12 @@ EVAL_JSON="$MCPROOT/eval/runner_topic_allowlist_patch_b06_v1.json"
 NEXT_WAVE_JSON="$MCPROOT/data/tasking/runner_topic_allowlist_patch_next_wave_b06_v1.json"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Runner/Topic Allowlist Patch Test B06 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 echo "--- [1/8] eval JSON structure ---"
@@ -59,7 +59,7 @@ for k, v in forbidden.items():
     assert v is False, f"forbidden op {k} not confirmed false: {v}"
 
 ap = d["applied_patch"]
-assert ap["target_file"] == "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+assert ap["target_file"] == "tools/geoai-task-mcp/src/aiworkhub/core.py"
 assert ap["target_function"] == "check_runner_topic_allowlist(runner, topic, action)"
 assert ap["matches_b05_proposal_exactly"] is True
 assert ap["malformed_token_check_unchanged"] is True
@@ -77,8 +77,8 @@ echo ""
 echo "--- [2/8] regression: 11 existing static pairs byte-identical LIVE ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 assert len(core.RUNNER_TOPIC_ALLOWLIST) == 11, f'expected 11 static pairs, got {len(core.RUNNER_TOPIC_ALLOWLIST)}'
 
@@ -101,8 +101,8 @@ echo ""
 echo "--- [3/8] codex wildcard unchanged ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 for action in core.CODEX_ALLOWED_ACTIONS:
     real = core.check_runner_topic_allowlist('codex', 'any_topic_at_all', action)
@@ -117,8 +117,8 @@ echo ""
 echo "--- [4/8] new_behavior_measured cross-validated LIVE ---"
 EVAL_JSON="$EVAL_JSON" python3 - <<'PYEOF'
 import json, os, sys
-sys.path.insert(0, os.path.join(os.environ["GEOAI_REPO"], "tools/geoai-task-mcp/src"))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ["AIWORKHUB_REPO"], "tools/geoai-task-mcp/src"))
+from aiworkhub import core
 
 d = json.load(open(os.environ["EVAL_JSON"]))
 examples = d["new_behavior_measured"]
@@ -150,8 +150,8 @@ echo ""
 echo "--- [5/8] write gate + launch status match live module ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core, cli_adapter_dryrun as cad
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core, cli_adapter_dryrun as cad
 assert core.writes_allowed() is False, 'core.writes_allowed() must be False'
 assert cad.writes_allowed() is False, 'cli_adapter_dryrun.writes_allowed() must be False'
 assert cad.launch_enabled() is False, 'launch_enabled() must be False'
@@ -178,7 +178,7 @@ assert d["status"] == "applied_this_task_scope_only", d["status"]
 ap = d["applied_in_this_task"]
 assert ap["process_launch"] is False
 assert "off" in ap["write_gate"].lower()
-assert ap["target_file"] == "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+assert ap["target_file"] == "tools/geoai-task-mcp/src/aiworkhub/core.py"
 
 gen = d["not_applied_generalization_next_wave"]
 assert len(gen["other_per_wave_topics_observed_in_project_memory"]) >= 1
@@ -192,7 +192,7 @@ echo ""
 
 echo "--- [7/8] core.py shows as this task's own change (nested repo) ---"
 # tools/geoai-task-mcp is its OWN nested git repo (has its own .git), so it
-# must be queried directly -- the parent GeoAI repo only sees it as a single
+# must be queried directly -- the parent AIWorkHub repo only sees it as a single
 # untracked directory. This is a SHARED checkout: other concurrent workers'
 # in-flight files (e.g. review_summarizer.py, server.py, launch_queue_persist.py)
 # may legitimately be dirty at the same time and are NOT this task's concern
@@ -201,9 +201,9 @@ echo "--- [7/8] core.py shows as this task's own change (nested repo) ---"
 # source file -- is present as a modification; it does not require the
 # nested repo to otherwise be clean.
 cd "$MCPROOT"
-CORE_STATUS="$(git status --porcelain -- src/geoai_task_mcp/core.py 2>/dev/null || true)"
+CORE_STATUS="$(git status --porcelain -- src/aiworkhub/core.py 2>/dev/null || true)"
 if [ -z "$CORE_STATUS" ]; then
-    echo "FAIL: expected src/geoai_task_mcp/core.py to show as modified in the nested geoai-task-mcp repo, found none"
+    echo "FAIL: expected src/aiworkhub/core.py to show as modified in the nested aiworkhub repo, found none"
     exit 1
 fi
 echo "core.py change present in nested repo: OK ($CORE_STATUS)"

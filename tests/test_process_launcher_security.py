@@ -28,12 +28,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -49,12 +49,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import process_launcher, worker_workspace  # noqa: E402
+from aiworkhub import process_launcher, worker_workspace  # noqa: E402
 
 
 def _chmod_blocked_by_sandbox() -> bool:

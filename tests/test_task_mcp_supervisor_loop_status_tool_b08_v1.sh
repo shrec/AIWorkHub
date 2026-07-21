@@ -43,12 +43,12 @@ NEXT_WAVE_JSON="$MCPROOT/data/tasking/task_mcp_supervisor_loop_status_tool_next_
 SELF_TASK_ID="CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_B08_V1"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Task MCP Supervisor Loop STATUS TOOL Contract Test B08 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 echo "--- [1/10] contract JSON: tool_schema + derivation_algorithm shape ---"
@@ -67,7 +67,7 @@ for k in required_top:
     assert k in d, f"missing top-level section: {k}"
 
 ts = d["tool_schema"]
-assert ts["tool_name"] == "geoai_supervisor_loop_status"
+assert ts["tool_name"] == "aiworkhub_supervisor_loop_status"
 assert "task_id" in ts["input_schema"] and ts["input_schema"]["task_id"]["required"] is True
 for opt in ("runner", "topic", "supervisor_request_id", "previous_snapshot", "reported_validation_verdict"):
     assert opt in ts["input_schema"], f"input_schema missing {opt}"
@@ -126,8 +126,8 @@ fp = d["future_source_patch_paths"]
 assert fp["requires_source_patch"] is True
 paths = {p["path"] for p in fp["patches"]}
 expected = {
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
 }
 assert paths == expected, f"future_source_patch_paths mismatch: {paths} != {expected}"
 for p in fp["patches"]:
@@ -181,8 +181,8 @@ echo ""
 echo "--- [6/10] clean_task: LIVE cross-validation of mapping step (read-only) ---"
 SELF_TASK_ID="$SELF_TASK_ID" python3 -c "
 import os, sys
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 task_id = os.environ['SELF_TASK_ID']
 result = core.show_task(task_id)
@@ -208,8 +208,8 @@ echo ""
 echo "--- [7/10] runner_topic_mismatch: LIVE cross-validation (same 4 as B07) ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 checks = [
     ('not_claude_task_mcp_prefixed', 'task_mcp', 'auto-pickup', 'unknown_runner_topic_pair'),
@@ -227,7 +227,7 @@ echo ""
 echo "--- [8/10] collision: fixture-only cross-validation against unmodified scan_collisions ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.environ['GEOAI_REPO'])
+sys.path.insert(0, os.environ['AIWORKHUB_REPO'])
 from scripts.build_tasking_parallel_group_collision_guard_v1 import scan_collisions
 
 synthetic_a = {

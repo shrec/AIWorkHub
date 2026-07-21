@@ -37,7 +37,7 @@ import sys
 
 sys.path.insert(0, "src")
 
-from geoai_task_mcp import completion_inbox
+from aiworkhub import completion_inbox
 
 failures = []
 

@@ -19,12 +19,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -40,12 +40,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import dashboard, process_launcher, project_context  # noqa: E402
+from aiworkhub import dashboard, process_launcher, project_context  # noqa: E402
 
 
 def _write_tool(path: Path, body: str) -> None:
@@ -98,7 +98,7 @@ def _card(*, task_type: str = "code", source_required: bool | None = None) -> di
         "mode": "bundle",
         "bundle_type": "feature",
         "query": "Natural language fallback",
-        "targets": ["tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"],
+        "targets": ["tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"],
         "budget": 32,
     }
     if source_required is not None:
@@ -112,7 +112,7 @@ def _card(*, task_type: str = "code", source_required: bool | None = None) -> di
         "claimed_by": "",
         "mode": "data_classification" if task_type == "data_classification" else "code",
         "immutable_input_shard": "lexicon/shards/immutable-001.jsonl",
-        "read_first": ["tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"],
+        "read_first": ["tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"],
         "allowed_writes": ["tools/geoai-task-mcp/eval/out.json"],
         "project_context": {
             "required": True,
@@ -131,7 +131,7 @@ def test_exact_source_graph_targets_policy_and_metadata_are_bounded(tmp_path: Pa
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
     source = next(section for section in payload["sections"] if section["name"] == "source_graph")
-    assert source["target"] == "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+    assert source["target"] == "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"
     assert source["hit_count"] > 0
     args = json.loads((repo / "source_args.json").read_text(encoding="utf-8"))
     assert "Natural language fallback" not in args
@@ -251,7 +251,7 @@ def test_common_prompt_delivery_and_receipt_are_distinct(tmp_path: Path) -> None
 def test_dashboard_exposes_compact_ai_infra_without_raw_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     process_log = tmp_path / "events.jsonl"
     event = {
-        "schema_id": "geoai.task_mcp.process_event.v1",
+        "schema_id": "aiworkhub.task_mcp.process_event.v1",
         "timestamp": "2026-07-16T00:00:00+00:00",
         "request_id": "run-b437",
         "task_id": "TASK_B437",

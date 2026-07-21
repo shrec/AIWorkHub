@@ -13,19 +13,19 @@
   "historical_dead_letters_rewritten": false,
   "b683_batch_marked_delivered_synthetically": false,
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py"
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py"
   ],
   "worker_validation": {
     "commands": [
       {
-        "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+        "command": "python3 -m pytest -q tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
         "passed": 15,
         "failed": 0
       },
       {
-        "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
+        "command": "python3 -m pytest -q tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py tools/aiworkhub/tests/test_app_server_mux.py",
         "passed": 162,
         "failed": 3,
         "failed_tests_pre_existing_and_unrelated": [
@@ -33,12 +33,12 @@
           "test_app_server_mux.py::test_installer_print_config_default_shows_apply_and_rollback",
           "test_app_server_mux.py::test_installer_never_touches_vscode_settings_or_sideband_dir"
         ],
-        "failure_reason": "This isolated task worktree is missing the untracked, pre-existing fixture tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py (confirmed untracked in the main GeoAI checkout too, and outside this task's allowed_writes and this worktree's writable scripts/ permissions). Unrelated to the B684 sideband delivery-path change: no test exercising callback_bridge.py or app_server_mux.py sideband/mux behavior fails."
+        "failure_reason": "This isolated task worktree is missing the untracked, pre-existing fixture tools/aiworkhub/scripts/install_vscode_app_server_mux.py (confirmed untracked in the main AIWorkHub checkout too, and outside this task's allowed_writes and this worktree's writable scripts/ permissions). Unrelated to the B684 sideband delivery-path change: no test exercising callback_bridge.py or app_server_mux.py sideband/mux behavior fails."
       }
     ]
   },
   "coordinator_validation": {
-    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
+    "command": "python3 -m pytest -q tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py tools/aiworkhub/tests/test_app_server_mux.py",
     "passed": 180,
     "failed": 0,
     "note": "Codex reran validation in the full canonical checkout, including the installer fixture missing from the isolated worker worktree. Service reload and the preserved B683 event are the live canary."

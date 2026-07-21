@@ -10,8 +10,8 @@ EVAL_JSON="$REPO_ROOT/tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict
 EVAL_JSONL="$REPO_ROOT/tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl"
 NEXT_WAVE="$REPO_ROOT/tools/geoai-task-mcp/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json"
 MACHINE_CARDS="$REPO_ROOT/bitnnv2/data/tasking/machine_task_cards_v1.jsonl"
-CORE_PY="$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
-SERVER_PY="$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+CORE_PY="$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/core.py"
+SERVER_PY="$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/server.py"
 B08_CONTRACT="$REPO_ROOT/tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json"
 
 PASS=0
@@ -133,9 +133,9 @@ check "LIVE: supervisor_loop_status NOT in core.py" python3 -c "
 with open('$CORE_PY') as f:
     assert 'supervisor_loop_status' not in f.read(), 'B08 wiring already in core.py!'
 "
-check "LIVE: geoai_supervisor_loop_status NOT in server.py" python3 -c "
+check "LIVE: aiworkhub_supervisor_loop_status NOT in server.py" python3 -c "
 with open('$SERVER_PY') as f:
-    assert 'geoai_supervisor_loop_status' not in f.read(), 'B08 wiring already in server.py!'
+    assert 'aiworkhub_supervisor_loop_status' not in f.read(), 'B08 wiring already in server.py!'
 "
 
 # ------------------------------------------------------------------
@@ -175,8 +175,8 @@ d = json.load(open('$B08_CONTRACT'))
 fsp = d.get('future_source_patch_paths', {})
 patches = fsp.get('patches', [])
 paths = [p['path'] for p in patches]
-assert 'tools/geoai-task-mcp/src/geoai_task_mcp/core.py' in paths, f'core.py not in {paths}'
-assert 'tools/geoai-task-mcp/src/geoai_task_mcp/server.py' in paths, f'server.py not in {paths}'
+assert 'tools/geoai-task-mcp/src/aiworkhub/core.py' in paths, f'core.py not in {paths}'
+assert 'tools/geoai-task-mcp/src/aiworkhub/server.py' in paths, f'server.py not in {paths}'
 "
 
 # ------------------------------------------------------------------

@@ -5,15 +5,15 @@ REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO"
 
 export PYTHONPATH="$REPO/tools/geoai-task-mcp/src"
-export GEOAI_REPO="$REPO"
+export AIWORKHUB_REPO="$REPO"
 
 python3 - <<'PY'
 import json
 from pathlib import Path
 
-from geoai_task_mcp import core, cost_ledger, launch_queue_persist
+from aiworkhub import core, cost_ledger, launch_queue_persist
 
-repo = Path(__import__("os").environ["GEOAI_REPO"])
+repo = Path(__import__("os").environ["AIWORKHUB_REPO"])
 eval_path = repo / "tools/geoai-task-mcp/eval/mcp_cost_ledger_aggregator_b288_v1.json"
 
 def fake_usage_report(runner=None, topic=None, status=None):
@@ -68,7 +68,7 @@ assert result["aggregates"]["by_runner"]["runner_a"]["total_tokens"] == 42
 assert all(v is False for v in result["authority_flags"].values())
 
 doc = {
-    "schema_id": "geoai.mcp_cost_ledger_aggregator.b288.v1",
+    "schema_id": "aiworkhub.mcp_cost_ledger_aggregator.b288.v1",
     "task_id": "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B288_V1",
     "runner": "claude_task_mcp_cost_ledger_b288",
     "topic": "task_mcp",

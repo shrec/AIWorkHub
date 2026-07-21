@@ -4,11 +4,11 @@
   "date": "2026-07-04",
   "status": "proposed_not_queued",
   "enqueued": false,
-  "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B112 locks in the git-HEAD pin now that the tools/geoai-task-mcp subsystem is committed (nested repo HEAD bb47987, B110 manifest present). Two additive, read-only regression guards: (1) the B111 self-test .sh now ASSERTS committed_source==git_head whenever the B110 manifest is committed in the nested-repo or parent-repo HEAD, so the comparison target can never silently regress to a working_tree_snapshot; (2) a dedicated test (test_mcp_manifest_git_head_pin_b112_v1.sh) replicates the B111 resolution (git_head), regenerates BYTE-IDENTICAL to the HEAD blob (fp recomputes), and adds two teeth: IMMUNITY (a private mktemp repo proves dirtying the manifest working copy leaves `git show HEAD:<rel>` byte-clean == committed, so the pin measures HEAD not the working tree) and REGRESSION (the git_head assertion rejects, non-zero, a simulated resolver that downgrades to working_tree_snapshot while the manifest is committed). Verified: committed_source=git_head, HEAD blob sha256=e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708, 11 read-only tools, 4 write-gated, zero drift, manifest_fingerprint=ac7a5bad... recomputes. READ-ONLY: mutates no tracked file (before/after sha256 of manifest + B111/B112 eval artifacts unchanged), launches no agent/model/server, makes no network call, does not enable any write gate; authority_flags all FALSE at worker scope. Adapter/runner/topic launch SELECTION remains a LEARNED-router target (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this is an ABCR/validator drift-protection tooth over the executor surface, never a runtime cognitive router.",
+  "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B112 locks in the git-HEAD pin now that the tools/aiworkhub subsystem is committed (nested repo HEAD bb47987, B110 manifest present). Two additive, read-only regression guards: (1) the B111 self-test .sh now ASSERTS committed_source==git_head whenever the B110 manifest is committed in the nested-repo or parent-repo HEAD, so the comparison target can never silently regress to a working_tree_snapshot; (2) a dedicated test (test_mcp_manifest_git_head_pin_b112_v1.sh) replicates the B111 resolution (git_head), regenerates BYTE-IDENTICAL to the HEAD blob (fp recomputes), and adds two teeth: IMMUNITY (a private mktemp repo proves dirtying the manifest working copy leaves `git show HEAD:<rel>` byte-clean == committed, so the pin measures HEAD not the working tree) and REGRESSION (the git_head assertion rejects, non-zero, a simulated resolver that downgrades to working_tree_snapshot while the manifest is committed). Verified: committed_source=git_head, HEAD blob sha256=e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708, 11 read-only tools, 4 write-gated, zero drift, manifest_fingerprint=ac7a5bad... recomputes. READ-ONLY: mutates no tracked file (before/after sha256 of manifest + B111/B112 eval artifacts unchanged), launches no agent/model/server, makes no network call, does not enable any write gate; authority_flags all FALSE at worker scope. Adapter/runner/topic launch SELECTION remains a LEARNED-router target (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this is an ABCR/validator drift-protection tooth over the executor surface, never a runtime cognitive router.",
   "produced_artifacts": [
-    "tools/geoai-task-mcp/tests/test_mcp_unified_contract_manifest_selftest_b111_v1.sh",
-    "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
-    "tools/geoai-task-mcp/eval/mcp_manifest_git_head_pin_b112_v1.json"
+    "tools/aiworkhub/tests/test_mcp_unified_contract_manifest_selftest_b111_v1.sh",
+    "tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "tools/aiworkhub/eval/mcp_manifest_git_head_pin_b112_v1.json"
   ],
   "composes": [
     "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_MANIFEST_SELFTEST_B111_V1",
@@ -27,7 +27,7 @@
       "goal": "Add a guard that the committed B112 eval evidence stays consistent with the live HEAD blob: if the B110 manifest HEAD blob sha256 ever diverges from the committed_sha256 recorded in mcp_manifest_git_head_pin_b112_v1.json (e.g. the manifest is re-committed without refreshing the evidence), fail loudly so stale head-pin evidence cannot pass silently.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh"
+        "tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh"
       ],
       "acceptance": [
         "committed eval committed_sha256 == live HEAD manifest blob sha256",

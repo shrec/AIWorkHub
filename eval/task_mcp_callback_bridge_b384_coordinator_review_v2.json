@@ -5,7 +5,7 @@
   "verdict": "REJECT_REPAIR_PROTOCOL_AND_DURABILITY",
   "candidate": {
     "request_id": "6ed0e3becef04ffaabda4617fb002ad2",
-    "worktree": "/tmp/geoai-task-mcp-worktrees/6ed0e3becef04ffaabda4617fb002ad2/worktree",
+    "worktree": "/tmp/aiworkhub-worktrees/6ed0e3becef04ffaabda4617fb002ad2/worktree",
     "taskdb_sha256": "1ce3c70ab4a36f5ce0a8fdc497710e6684f3bcffa22ac4f781570b2ee9364b40",
     "callback_bridge_sha256": "01931746b075c90fbe9e2db5a96edbce81f6438655396b7f6075e45f39020976",
     "test_callback_bridge_sha256": "a4f4b9bb83bcc0202caa9b452911bb75dca3e6797d51d97c39f1e5c0949f29fb",

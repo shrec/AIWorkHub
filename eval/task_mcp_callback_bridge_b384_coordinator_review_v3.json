@@ -26,16 +26,16 @@
     "AITools/taskctl.py",
     "AITools/test_taskctl_exact_claim_start_mcp.py",
     "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_bridge_finish_b384_v1.json",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/_fake_app_server.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_process_launcher_security.py"
+    "tools/aiworkhub/eval/task_mcp_callback_bridge_finish_b384_v1.json",
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/_fake_app_server.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_process_launcher_security.py"
   ],
   "rejected_stale_merges": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/deepseek_credentials.py"
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/runtime_adapters.py",
+    "tools/aiworkhub/src/aiworkhub/deepseek_credentials.py"
   ],
   "rejection_reason": "Those candidate copies predated current Lexicon runner allowlists and weakened the accepted DeepSeek credential and configurable Codex inner-sandbox behavior; canonical versions were preserved.",
   "protocol_authority": {

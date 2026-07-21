@@ -10,9 +10,9 @@
   ],
   "purpose": "Resolve (as a dry-run policy design, not a code patch) the B04 finding that per-wave task_mcp runners (e.g. this task's own runner claude_task_mcp_allowlist_dryrun_b05) are rejected by core.RUNNER_TOPIC_ALLOWLIST with reason=unknown_runner_topic_pair. This artifact re-measures the gap against the live module via read-only introspection (import + call, no file text read, no subprocess), enumerates blocked examples, and records a safe next-wave source-patch proposal. It adds zero execution code and edits no .py file.",
   "measurement_method": {
-    "how": "python3 -c 'import geoai_task_mcp.core as core; core.check_runner_topic_allowlist(runner, topic, action)' -- direct in-process introspection of the already-shipped pure function. No file was Read/grepped for source text (source_graph.py/cgraph.py do not index tools/geoai-task-mcp/src -- confirmed gap, out of scope for this task's allowed_writes). No subprocess, no daemon, no network call.",
-    "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py: check_runner_topic_allowlist(runner, topic, action)",
-    "companion_module_checked": "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py: launch_enabled(), LAUNCH_IMPLEMENTED, writes_allowed()"
+    "how": "python3 -c 'import aiworkhub.core as core; core.check_runner_topic_allowlist(runner, topic, action)' -- direct in-process introspection of the already-shipped pure function. No file was Read/grepped for source text (source_graph.py/cgraph.py do not index tools/aiworkhub/src -- confirmed gap, out of scope for this task's allowed_writes). No subprocess, no daemon, no network call.",
+    "module_under_test": "tools/aiworkhub/src/aiworkhub/core.py: check_runner_topic_allowlist(runner, topic, action)",
+    "companion_module_checked": "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py: launch_enabled(), LAUNCH_IMPLEMENTED, writes_allowed()"
   },
   "forbidden_operations_confirmed_not_taken": {
     "source_code_patch": false,
@@ -89,7 +89,7 @@
   "write_gate_status_measured": {
     "core.writes_allowed()": false,
     "cli_adapter_dryrun.writes_allowed()": false,
-    "GEOAI_TASK_MCP_ALLOW_WRITES_env": null,
+    "AIWORKHUB_ALLOW_WRITES_env": null,
     "note": "Default-off write gate confirmed unchanged and untouched by this artifact."
   },
   "launch_status_measured": {
@@ -99,7 +99,7 @@
   },
   "finding_confirmed": "The B04 gap is real and current: any per-wave task_mcp runner (naming pattern 'claude_task_mcp_<slug>_b<NN>') is rejected by check_runner_topic_allowlist with unknown_runner_topic_pair because RUNNER_TOPIC_ALLOWLIST only contains exact tuples for stable topic-continuous workers. This blocks a hypothetical FUTURE real MCP-mediated call (auto-pickup/review/usage) made under this exact runner/topic; it does NOT block taskctl.py direct CLI usage (taskctl.py has no allowlist dependency), which is how this very task was executed.",
   "proposal_pointer": {
-    "path": "tools/geoai-task-mcp/data/tasking/runner_topic_allowlist_dryrun_next_wave_b05_v1.json",
+    "path": "tools/aiworkhub/data/tasking/runner_topic_allowlist_dryrun_next_wave_b05_v1.json",
     "status": "proposed_not_applied",
     "summary": "Additive PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix rule for topic=='task_mcp' only, restricted to a conservative action subset, with all existing static pairs left byte-identical. Described only; no code was changed by this task."
   },

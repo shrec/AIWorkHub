@@ -65,7 +65,7 @@
     "frozen_v1_tool_contract_still_33_tools": true
   },
   "validation": {
-    "pytest_tools_geoai_task_mcp_tests": "PASS (150 passed, 1 xfailed)",
+    "pytest_tools_aiworkhub_tests": "PASS (150 passed, 1 xfailed)",
     "test_deepseek_copilot_adapter_b343_v1": "PASS (39 passed)",
     "test_mcp_stdio_subprocess_client_smoke_b109_v1_sh": "PASS (frozen_contract_v1=true, 33 tools)",
     "taskctl_verify": "PASS",
@@ -80,10 +80,10 @@
   ],
   "blocked_credential_live_replay_plan": [
     "geoai-task-deepseek-credential set   # host, outside repo, 0600, getpass",
-    "Confirm geoai_completion_inbox.adapter_readiness shows deepseek_copilot_cli.launchable=true",
-    "Start MCP server with GEOAI_TASK_MCP_ALLOW_LAUNCH=1 and GEOAI_TASK_MCP_ALLOW_WRITES=1",
-    "geoai_agent_launch_task(task_id=<pending deepseek canary card>, runner=deepseek_*, topic=task_mcp, adapter_id=deepseek_copilot_cli, model=deepseek-v4-pro)",
-    "geoai_agent_collect_result(request_id) until review_ready; return the task to Codex review",
+    "Confirm aiworkhub_completion_inbox.adapter_readiness shows deepseek_copilot_cli.launchable=true",
+    "Start MCP server with AIWORKHUB_ALLOW_LAUNCH=1 and AIWORKHUB_ALLOW_WRITES=1",
+    "aiworkhub_agent_launch_task(task_id=<pending deepseek canary card>, runner=deepseek_*, topic=task_mcp, adapter_id=deepseek_copilot_cli, model=deepseek-v4-pro)",
+    "aiworkhub_agent_collect_result(request_id) until review_ready; return the task to Codex review",
     "Assert: no product source mutated, only allowed_writes touched, shell=false, exact claim->review lifecycle"
   ],
   "authority_flags": {
@@ -98,16 +98,16 @@
   "commit_contract": "NO_COMMIT",
   "codex_review_required": true,
   "files_written": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/deepseek_credentials.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
-    "tools/geoai-task-mcp/pyproject.toml",
-    "tools/geoai-task-mcp/tests/test_deepseek_copilot_adapter_b343_v1.py",
-    "tools/geoai-task-mcp/README.md",
-    "tools/geoai-task-mcp/MVP_ROADMAP.md",
-    "tools/geoai-task-mcp/eval/deepseek_copilot_live_launch_canary_b343_v1.json"
+    "tools/aiworkhub/src/aiworkhub/deepseek_credentials.py",
+    "tools/aiworkhub/src/aiworkhub/runtime_adapters.py",
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py",
+    "tools/aiworkhub/pyproject.toml",
+    "tools/aiworkhub/tests/test_deepseek_copilot_adapter_b343_v1.py",
+    "tools/aiworkhub/README.md",
+    "tools/aiworkhub/MVP_ROADMAP.md",
+    "tools/aiworkhub/eval/deepseek_copilot_live_launch_canary_b343_v1.json"
   ]
 }

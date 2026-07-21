@@ -26,37 +26,37 @@
   "detail": {
     "concurrent_sessions": 2,
     "frozen_schema_fingerprints": {
-      "geoai_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
-      "geoai_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
-      "geoai_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-      "geoai_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-      "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-      "geoai_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-      "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-      "geoai_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-      "geoai_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-      "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-      "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-      "geoai_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-      "geoai_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-      "geoai_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-      "geoai_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a"
+      "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+      "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+      "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+      "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+      "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+      "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+      "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+      "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+      "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+      "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+      "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
+      "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+      "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+      "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+      "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a"
     },
     "launch_enabled": false,
     "launch_implemented": false,
     "launched_agent_or_model_token_hits": [],
     "readonly_tools_visible": [
-      "geoai_cli_adapter_audit_summary_readonly",
-      "geoai_cli_adapter_plan_readonly",
-      "geoai_cli_adapter_report_readonly",
-      "geoai_task_audit_log_read",
-      "geoai_task_collision_guard",
-      "geoai_task_health",
-      "geoai_task_list",
-      "geoai_task_pending_for_runner",
-      "geoai_task_review_queue",
-      "geoai_task_show",
-      "geoai_task_usage_report"
+      "aiworkhub_cli_adapter_audit_summary_readonly",
+      "aiworkhub_cli_adapter_plan_readonly",
+      "aiworkhub_cli_adapter_report_readonly",
+      "aiworkhub_task_audit_log_read",
+      "aiworkhub_task_collision_guard",
+      "aiworkhub_task_health",
+      "aiworkhub_task_list",
+      "aiworkhub_task_pending_for_runner",
+      "aiworkhub_task_review_queue",
+      "aiworkhub_task_show",
+      "aiworkhub_task_usage_report"
     ],
     "round_allow_set": {
       "distinct_audit_dirs": true,
@@ -108,35 +108,35 @@
       "concurrent_sessions": 2,
       "failing_check": null,
       "frozen_schema_fingerprints": {
-        "geoai_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
-        "geoai_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
-        "geoai_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-        "geoai_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-        "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-        "geoai_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-        "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-        "geoai_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-        "geoai_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-        "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-        "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-        "geoai_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-        "geoai_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-        "geoai_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-        "geoai_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a"
+        "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+        "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+        "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+        "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+        "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+        "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+        "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+        "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+        "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+        "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+        "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
+        "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+        "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+        "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+        "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a"
       },
       "launched_agent_or_model_token_hits": [],
       "readonly_tools_visible": [
-        "geoai_cli_adapter_audit_summary_readonly",
-        "geoai_cli_adapter_plan_readonly",
-        "geoai_cli_adapter_report_readonly",
-        "geoai_task_audit_log_read",
-        "geoai_task_collision_guard",
-        "geoai_task_health",
-        "geoai_task_list",
-        "geoai_task_pending_for_runner",
-        "geoai_task_review_queue",
-        "geoai_task_show",
-        "geoai_task_usage_report"
+        "aiworkhub_cli_adapter_audit_summary_readonly",
+        "aiworkhub_cli_adapter_plan_readonly",
+        "aiworkhub_cli_adapter_report_readonly",
+        "aiworkhub_task_audit_log_read",
+        "aiworkhub_task_collision_guard",
+        "aiworkhub_task_health",
+        "aiworkhub_task_list",
+        "aiworkhub_task_pending_for_runner",
+        "aiworkhub_task_review_queue",
+        "aiworkhub_task_show",
+        "aiworkhub_task_usage_report"
       ],
       "round_allow_set": {
         "distinct_audit_dirs": true,
@@ -175,7 +175,7 @@
       "server_command_normalized": [
         "<python>",
         "-m",
-        "geoai_task_mcp.server"
+        "aiworkhub.server"
       ],
       "server_launch_pattern_hits": [],
       "session_runners": [
@@ -185,10 +185,10 @@
       "total_tools_visible": 15,
       "total_tools_visible_session_b": 15,
       "write_gated_tools_visible": [
-        "geoai_task_auto_pickup",
-        "geoai_task_export_jsonl",
-        "geoai_task_mark_done",
-        "geoai_task_mark_review"
+        "aiworkhub_task_auto_pickup",
+        "aiworkhub_task_export_jsonl",
+        "aiworkhub_task_mark_done",
+        "aiworkhub_task_mark_review"
       ]
     },
     "schema_fingerprint_mismatches_session_a": [],
@@ -196,7 +196,7 @@
     "server_command_normalized": [
       "<python>",
       "-m",
-      "geoai_task_mcp.server"
+      "aiworkhub.server"
     ],
     "server_launch_pattern_hits": [],
     "session_runners": [
@@ -207,10 +207,10 @@
     "total_tools_visible_session_b": 15,
     "transport": "two concurrent mcp.client.stdio.stdio_client + mcp.ClientSession sessions over real OS stdio pipes (out-of-process subprocesses, barrier-synced overlap)",
     "write_gated_tools_visible": [
-      "geoai_task_auto_pickup",
-      "geoai_task_export_jsonl",
-      "geoai_task_mark_done",
-      "geoai_task_mark_review"
+      "aiworkhub_task_auto_pickup",
+      "aiworkhub_task_export_jsonl",
+      "aiworkhub_task_mark_done",
+      "aiworkhub_task_mark_review"
     ]
   },
   "eval_id": "mcp_stdio_concurrent_client_smoke_b110_v1",

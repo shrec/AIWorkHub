@@ -6,10 +6,10 @@
 
   "this_task_scope": {
     "artifacts_added": [
-      "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_b09_v1.json",
-      "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
-      "tools/geoai-task-mcp/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
+      "tools/aiworkhub/eval/task_mcp_source_patch_deconflict_b09_v1.json",
+      "tools/aiworkhub/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
+      "tools/aiworkhub/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
     ],
     "source_code_changed": false,
     "process_launch": false,
@@ -30,7 +30,7 @@
   "proposed_next_wave_tasks": [
     {
       "task_id_suggestion": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1",
-      "summary": "Apply the B08 contract's future_source_patch_paths patches to core.py and server.py: add supervisor_loop_status() pure function implementing the 7-step derivation_algorithm (reusing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state), then register @mcp.tool() geoai_supervisor_loop_status in server.py. Ship with live-wired smoke tests for all 6 B08 scenarios. B09 confirms: zero active write-lane conflicts — SAFE TO PROCEED.",
+      "summary": "Apply the B08 contract's future_source_patch_paths patches to core.py and server.py: add supervisor_loop_status() pure function implementing the 7-step derivation_algorithm (reusing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state), then register @mcp.tool() aiworkhub_supervisor_loop_status in server.py. Ship with live-wired smoke tests for all 6 B08 scenarios. B09 confirms: zero active write-lane conflicts — SAFE TO PROCEED.",
       "owner": "future coder task (Claude or DeepSeek coder), not created by this worker",
       "requires_source_patch": true,
       "b09_deconflict_status": "LANE_CLEAR",

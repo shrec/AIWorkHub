@@ -11,8 +11,8 @@ MCP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EVAL_JSON="$MCP_ROOT/eval/task_mcp_live_tool_inventory_reverify_b251_v1.json"
 EVAL_JSONL="$MCP_ROOT/eval/task_mcp_live_tool_inventory_reverify_rows_b251_v1.jsonl"
 NEXT_WAVE="$MCP_ROOT/data/tasking/task_mcp_live_tool_inventory_reverify_next_wave_b251_v1.json"
-SERVER_PY="$MCP_ROOT/src/geoai_task_mcp/server.py"
-CLI_ADAPTER_PY="$MCP_ROOT/src/geoai_task_mcp/cli_adapter_readonly_tool.py"
+SERVER_PY="$MCP_ROOT/src/aiworkhub/server.py"
+CLI_ADAPTER_PY="$MCP_ROOT/src/aiworkhub/cli_adapter_readonly_tool.py"
 
 PASS=0
 FAIL=0

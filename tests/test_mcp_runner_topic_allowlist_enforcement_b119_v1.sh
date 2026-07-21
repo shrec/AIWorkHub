@@ -11,7 +11,7 @@ set -euo pipefail
 #      sites unaffected).
 #   2. the write gate itself is untouched: still off by default, still the
 #      FIRST check (core.WRITE_COMMANDS unchanged; writes_allowed() honors
-#      GEOAI_TASK_MCP_ALLOW_WRITES exactly as before).
+#      AIWORKHUB_ALLOW_WRITES exactly as before).
 #   3. no launch capability was added (launch_queue_contract invariants
 #      unchanged: LAUNCH_IMPLEMENTED is still the constant False).
 #   4. the REAL parent task queue is not mutated (taskctl verify).
@@ -25,18 +25,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR_AUDIT="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b119_allowlist_sh.XXXXXX")"
+TMPDIR_AUDIT="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b119_allowlist_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR_AUDIT"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$TMPDIR_AUDIT/audit.jsonl"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
+export AIWORKHUB_AUDIT_LOG_PATH="$TMPDIR_AUDIT/audit.jsonl"
 
 echo "=== MCP Runner/Topic Allowlist Enforcement Smoke Test B119 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
-echo "AUDIT_LOG=$GEOAI_TASK_MCP_AUDIT_LOG_PATH"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
+echo "AUDIT_LOG=$AIWORKHUB_AUDIT_LOG_PATH"
 
 python3 "$MCPROOT/tests/runner_topic_allowlist_enforcement_smoke.py"
 echo ""
@@ -48,7 +48,7 @@ echo "=== Defense-in-depth checks ==="
 GATE_STATE="$(python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import core, launch_queue_contract as lqc
+from aiworkhub import core, launch_queue_contract as lqc
 write_commands_ok = core.WRITE_COMMANDS == {"auto-pickup", "done", "export-jsonl", "review", "start", "usage"}
 has_allowlist_fn = hasattr(core, "check_runner_topic_allowlist")
 has_matrix = hasattr(core, "RUNNER_TOPIC_ALLOWLIST") and len(core.RUNNER_TOPIC_ALLOWLIST) == 11
@@ -67,7 +67,7 @@ echo "allowlist matrix present + write gate untouched + launch still disabled: O
 READONLY_OK="$(python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import core
+from aiworkhub import core
 ro = ["list", "show", "export", "verify", "review-queue", "collision-guard", "usage-report"]
 print(all(not core._is_write_command([c]) for c in ro))
 ')"
@@ -78,12 +78,12 @@ fi
 echo "read-only tools confirmed unaffected: OK"
 
 # Write gate still off.
-ACTUAL="$(python3 -c 'import os; print(os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES","0"))')"
+ACTUAL="$(python3 -c 'import os; print(os.environ.get("AIWORKHUB_ALLOW_WRITES","0"))')"
 if [ "$ACTUAL" != "0" ]; then
-    echo "FAIL: GEOAI_TASK_MCP_ALLOW_WRITES=$ACTUAL (expected 0)"
+    echo "FAIL: AIWORKHUB_ALLOW_WRITES=$ACTUAL (expected 0)"
     exit 1
 fi
-echo "GEOAI_TASK_MCP_ALLOW_WRITES confirmed still 0 (off)"
+echo "AIWORKHUB_ALLOW_WRITES confirmed still 0 (off)"
 
 # Parent queue intact.
 python3 "$ROOT/AITools/taskctl.py" verify

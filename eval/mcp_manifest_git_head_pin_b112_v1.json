@@ -23,9 +23,9 @@
   "source_provenance": {
     "committed_manifest_rel": "eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
     "committed_source": "git_head",
-    "committed_source_note": "tools/geoai-task-mcp is now a committed nested git repo; the B110 manifest is pinned to that repo's HEAD blob (immune to a concurrently-dirty working tree), upgraded from the B111 working_tree_snapshot fallback.",
+    "committed_source_note": "tools/aiworkhub is now a committed nested git repo; the B110 manifest is pinned to that repo's HEAD blob (immune to a concurrently-dirty working tree), upgraded from the B111 working_tree_snapshot fallback.",
     "head_blob_sha256": "e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708",
-    "pin_repo": "tools/geoai-task-mcp",
+    "pin_repo": "tools/aiworkhub",
     "pin_ref": "HEAD",
     "resolution_order": [
       "nested_repo_head",

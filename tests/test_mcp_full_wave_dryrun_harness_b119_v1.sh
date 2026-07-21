@@ -6,8 +6,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== MCP Full Wave Dryrun Harness (B122 real repair) ==="
 

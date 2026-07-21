@@ -9,10 +9,10 @@
   "objective": "Add a compact read-only Codex handoff markdown renderer over the existing B116 codex-handoff report so Codex can review completed worker tasks without manual parsing.",
   "parent_task": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1",
   "next_wave_candidate": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B117_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
   "modules_under_test": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py (render_codex_handoff_markdown, build_codex_handoff_markdown_report)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_task_codex_handoff_markdown tool)"
+    "tools/aiworkhub/src/aiworkhub/review_summarizer.py (render_codex_handoff_markdown, build_codex_handoff_markdown_report)",
+    "tools/aiworkhub/src/aiworkhub/server.py (aiworkhub_task_codex_handoff_markdown tool)"
   ],
   "checks_total": 41,
   "checks_passed": 41,
@@ -24,10 +24,10 @@
     "wrapper_preserves_b116_shape": "PASS - build_codex_handoff_markdown_report is additive-only: every original B116 field (contract, task_count, handoff_reports, authority_flags, recommended_stage_commands, ...) unchanged, plus new markdown + markdown_contract fields",
     "fixture_queue_zero_mutation": "PASS - fixture dir sha256 identical before/after; only review-queue/show issued; no done/review/start/auto-pickup/export-jsonl/usage",
     "empty_queue_case": "PASS - empty fixture queue yields task_count=0, markdown reports 'tasks: 0'",
-    "single_tool_registered": "PASS - server tool count 18 -> 19, exactly one new tool geoai_task_codex_handoff_markdown added",
+    "single_tool_registered": "PASS - server tool count 18 -> 19, exactly one new tool aiworkhub_task_codex_handoff_markdown added",
     "server_tool_wiring_live_readonly": "PASS - tool is callable, returns ok=True + markdown string + markdown_contract label; live review-queue stdout identical before/after tool call",
-    "write_gate_default_off": "PASS - GEOAI_TASK_MCP_ALLOW_WRITES=0 verified in test + authority_flags.write_gate_enabled=True",
-    "b116_regression": "PASS - tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh still 70/70 PASS (build_codex_handoff_report untouched, only additive functions appended)",
+    "write_gate_default_off": "PASS - AIWORKHUB_ALLOW_WRITES=0 verified in test + authority_flags.write_gate_enabled=True",
+    "b116_regression": "PASS - tools/aiworkhub/tests/test_mcp_codex_handoff_e2e_b116_v1.sh still 70/70 PASS (build_codex_handoff_report untouched, only additive functions appended)",
     "bash_test_exit": "PASS - test_mcp_codex_handoff_markdown_render_b119_v1.sh exits 0",
     "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns PASS",
     "live_review_queue_unchanged_full_session": "PASS - python3 AITools/taskctl.py review-queue output byte-identical before vs after the full work unit (diff empty)"
@@ -37,7 +37,7 @@
     "must register exactly one read-only MCP tool or justify if server already exposes equivalent",
     "must prove live/fixture review queue unchanged before/after",
     "must not mutate task status, stage files, commit, launch process, or enable write gates",
-    "bash tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh passes",
+    "bash tools/aiworkhub/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh passes",
     "python3 AITools/taskctl.py verify passes"
   ],
   "invariants_verified": {
@@ -65,14 +65,14 @@
   "tool_inventory_note": {
     "server_tools_before": 18,
     "server_tools_after": 19,
-    "added_tool": "geoai_task_codex_handoff_markdown",
+    "added_tool": "aiworkhub_task_codex_handoff_markdown",
     "note": "B119 intentionally registers one new read-only MCP tool; existing tool-count-sensitive tests (b109/b110 stdio smoke, mvp_contract_audit) were already stale/pre-existing failures noted in the B116 eval and are out of scope for this task."
   },
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
-  "next_wave_tasks_ref": "tools/geoai-task-mcp/data/tasking/mcp_codex_handoff_markdown_render_next_wave_b119_v1.json"
+  "next_wave_tasks_ref": "tools/aiworkhub/data/tasking/mcp_codex_handoff_markdown_render_next_wave_b119_v1.json"
 }

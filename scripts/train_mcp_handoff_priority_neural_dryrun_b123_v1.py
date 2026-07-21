@@ -38,15 +38,15 @@ in the signal_atlas topic).
 
 Inputs (read-only, never written):
   bitnnv2/data/curriculum/mcp_codex_handoff_priority_targets_b119_v1.jsonl
-  tools/geoai-task-mcp/eval/mcp_codex_handoff_priority_distill_b119_v1.json  (reference baseline numbers only)
+  tools/aiworkhub/eval/mcp_codex_handoff_priority_distill_b119_v1.json  (reference baseline numbers only)
 
 Outputs (this task's allowed_writes):
-  tools/geoai-task-mcp/eval/mcp_handoff_priority_neural_dryrun_b123_v1.json
-  tools/geoai-task-mcp/eval/mcp_handoff_priority_neural_dryrun_rows_b123_v1.jsonl
-  tools/geoai-task-mcp/data/tasking/mcp_handoff_priority_neural_dryrun_next_wave_b123_v1.json
+  tools/aiworkhub/eval/mcp_handoff_priority_neural_dryrun_b123_v1.json
+  tools/aiworkhub/eval/mcp_handoff_priority_neural_dryrun_rows_b123_v1.jsonl
+  tools/aiworkhub/data/tasking/mcp_handoff_priority_neural_dryrun_next_wave_b123_v1.json
 
 Usage:
-  python3 tools/geoai-task-mcp/scripts/train_mcp_handoff_priority_neural_dryrun_b123_v1.py
+  python3 tools/aiworkhub/scripts/train_mcp_handoff_priority_neural_dryrun_b123_v1.py
 """
 from __future__ import annotations
 
@@ -64,19 +64,19 @@ ROOT = Path(__file__).resolve().parents[3]
 TASK_ID = "CLAUDE_TASK_MCP_HANDOFF_PRIORITY_NEURAL_DRYRUN_B123_V1"
 
 CURRICULUM = ROOT / "bitnnv2/data/curriculum/mcp_codex_handoff_priority_targets_b119_v1.jsonl"
-DISTILL_EVAL_REF = ROOT / "tools/geoai-task-mcp/eval/mcp_codex_handoff_priority_distill_b119_v1.json"
+DISTILL_EVAL_REF = ROOT / "tools/aiworkhub/eval/mcp_codex_handoff_priority_distill_b119_v1.json"
 
 EVAL_JSON = Path(os.environ.get(
     "MCP_HANDOFF_NEURAL_DRYRUN_B123_EVAL_JSON",
-    str(ROOT / "tools/geoai-task-mcp/eval/mcp_handoff_priority_neural_dryrun_b123_v1.json"),
+    str(ROOT / "tools/aiworkhub/eval/mcp_handoff_priority_neural_dryrun_b123_v1.json"),
 ))
 EVAL_ROWS = Path(os.environ.get(
     "MCP_HANDOFF_NEURAL_DRYRUN_B123_EVAL_ROWS",
-    str(ROOT / "tools/geoai-task-mcp/eval/mcp_handoff_priority_neural_dryrun_rows_b123_v1.jsonl"),
+    str(ROOT / "tools/aiworkhub/eval/mcp_handoff_priority_neural_dryrun_rows_b123_v1.jsonl"),
 ))
 NEXT_WAVE = Path(os.environ.get(
     "MCP_HANDOFF_NEURAL_DRYRUN_B123_NEXT_WAVE",
-    str(ROOT / "tools/geoai-task-mcp/data/tasking/mcp_handoff_priority_neural_dryrun_next_wave_b123_v1.json"),
+    str(ROOT / "tools/aiworkhub/data/tasking/mcp_handoff_priority_neural_dryrun_next_wave_b123_v1.json"),
 ))
 
 CLASSES = ["low", "needs_codex_judgment", "high"]
@@ -388,7 +388,7 @@ def main() -> None:
 
     now = datetime.now(timezone.utc).isoformat()
     summary = {
-        "schema_id": "geoai.mcp_handoff_priority_neural_dryrun_eval.v1",
+        "schema_id": "aiworkhub.mcp_handoff_priority_neural_dryrun_eval.v1",
         "task_id": TASK_ID,
         "timestamp": now,
         "verdict": verdict,
@@ -495,7 +495,7 @@ def main() -> None:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     next_wave = {
-        "schema_id": "geoai.mcp_handoff_priority_neural_dryrun_next_wave.v1",
+        "schema_id": "aiworkhub.mcp_handoff_priority_neural_dryrun_next_wave.v1",
         "parent_task_id": TASK_ID,
         "runner": "claude_task_mcp_handoff_neural_b123",
         "topic": "task_mcp",

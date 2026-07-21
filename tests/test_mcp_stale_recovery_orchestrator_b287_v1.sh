@@ -5,15 +5,15 @@ REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO"
 
 export PYTHONPATH="$REPO/tools/geoai-task-mcp/src"
-export GEOAI_REPO="$REPO"
+export AIWORKHUB_REPO="$REPO"
 
 python3 - <<'PY'
 import json
 from pathlib import Path
 
-from geoai_task_mcp import stale_recovery
+from aiworkhub import stale_recovery
 
-repo = Path(__import__("os").environ["GEOAI_REPO"])
+repo = Path(__import__("os").environ["AIWORKHUB_REPO"])
 eval_path = repo / "tools/geoai-task-mcp/eval/mcp_stale_recovery_orchestrator_b287_v1.json"
 
 inbox = {
@@ -49,7 +49,7 @@ assert all(row["readonly"] is True for row in actions)
 assert all(v is False for v in result["authority_flags"].values())
 
 doc = {
-    "schema_id": "geoai.mcp_stale_recovery_orchestrator.b287.v1",
+    "schema_id": "aiworkhub.mcp_stale_recovery_orchestrator.b287.v1",
     "task_id": "CLAUDE_TASK_MCP_STALE_RECOVERY_ORCHESTRATOR_B287_V1",
     "runner": "claude_task_mcp_stale_recovery_b287",
     "topic": "task_mcp",

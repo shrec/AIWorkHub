@@ -32,7 +32,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import worker_workspace  # noqa: E402
+from aiworkhub import worker_workspace  # noqa: E402
 
 
 def _manual_workspace(tmp_path: Path, request_id: str) -> tuple[Path, worker_workspace.WorkerWorkspace]:

@@ -1,15 +1,15 @@
 {
   "mcpServers": {
-    "geoai-task-mcp": {
+    "aiworkhub": {
       "command": "python3",
       "args": [
         "-m",
-        "geoai_task_mcp.server"
+        "aiworkhub.server"
       ],
       "env": {
-        "PYTHONPATH": "/home/shrek/GeoAI/tools/geoai-task-mcp/src",
-        "GEOAI_REPO": "/home/shrek/GeoAI",
-        "GEOAI_TASK_MCP_ALLOW_WRITES": "0"
+        "PYTHONPATH": "/home/shrek/AIWorkHub/tools/aiworkhub/src",
+        "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+        "AIWORKHUB_ALLOW_WRITES": "0"
       }
     }
   }

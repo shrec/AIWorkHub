@@ -25,7 +25,7 @@ set -euo pipefail
 #   9. this task's own footprint touches zero paths under
 #      tools/geoai-task-mcp/src/ (nested repo is shared with concurrent
 #      workers; their dirty src/ files are NOT this task's concern).
-#  10. parent GeoAI task queue is not mutated (taskctl verify).
+#  10. parent AIWorkHub task queue is not mutated (taskctl verify).
 #
 # Isolation: read-only against the live module (in-process import + pure
 # function calls only, no subprocess beyond taskctl verify, no daemon, no
@@ -40,12 +40,12 @@ EVAL_JSON="$MCPROOT/eval/task_mcp_supervisor_loop_contract_b07_v1.json"
 NEXT_WAVE_JSON="$MCPROOT/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Task MCP Supervisor Loop Contract Test B07 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 echo "--- [1/10] contract JSON: flow_legs + per-leg schema shape ---"
@@ -179,8 +179,8 @@ echo ""
 echo "--- [6/10] runner_topic_mismatch examples cross-validated LIVE (read-only, no source patch) ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 checks = [
     ('not_claude_task_mcp_prefixed', 'task_mcp', 'auto-pickup', 'unknown_runner_topic_pair'),
@@ -255,7 +255,7 @@ echo ""
 echo "--- [9/10] this task's own footprint touches zero paths under src/ ---"
 # tools/geoai-task-mcp is its OWN nested git repo, SHARED with other
 # concurrent workers -- other in-flight tasks may legitimately hold
-# src/core.py, src/geoai_task_mcp/server.py, etc. dirty at the same time.
+# src/core.py, src/aiworkhub/server.py, etc. dirty at the same time.
 # This check only confirms THIS task's 4 allowed_writes paths (all already
 # asserted to exist above) contain zero src/ paths -- it does NOT require
 # the nested repo's src/ tree to be globally clean.

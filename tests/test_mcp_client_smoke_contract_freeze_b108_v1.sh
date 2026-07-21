@@ -2,11 +2,11 @@
 set -euo pipefail
 # ---------------------------------------------------------------------------
 # test_mcp_client_smoke_contract_freeze_b108_v1.sh
-# Drives the geoai-task-mcp FastMCP server through a REAL MCP ClientSession
+# Drives the aiworkhub FastMCP server through a REAL MCP ClientSession
 # (mcp_client_smoke_contract_freeze.py) and asserts the read-only tool
 # contract v1 is frozen: read-only tools visible over tools/list, input
 # schemas byte-stable vs frozen fingerprints, and NO queue/audit writes with
-# GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1. Also asserts server.py holds no
+# AIWORKHUB_ALLOW_WRITES unset AND =1. Also asserts server.py holds no
 # process-launch code. Parent task queue must stay verify-intact.
 #
 # Isolation: the smoke owns a private mktemp audit state dir; the result JSON
@@ -16,16 +16,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 SMOKE="$MCPROOT/tests/mcp_client_smoke_contract_freeze.py"
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b108_client_smoke.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b108_client_smoke.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== MCP Client Smoke Contract Freeze Test B108 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMPDIR_STATE"
 
 # --- 0. server.py holds no process-launch code (defense in depth) ----------

@@ -14,7 +14,7 @@ set -euo pipefail
 #     the fixture dir sha256 is unchanged before/after and no write
 #     taskctl command (done/review/start/auto-pickup/export-jsonl/usage)
 #     was ever issued;
-#   - asserts the registered MCP server tool geoai_task_codex_handoff_markdown
+#   - asserts the registered MCP server tool aiworkhub_task_codex_handoff_markdown
 #     is wired, callable, and reads the LIVE review queue read-only (stdout
 #     identical before/after);
 #   - asserts write gate stays default-off throughout.
@@ -23,25 +23,25 @@ set -euo pipefail
 # no writes to the real parent queue.
 #
 # Usage:
-#   GEOAI_TASK_MCP_ALLOW_WRITES=0 bash \
+#   AIWORKHUB_ALLOW_WRITES=0 bash \
 #     tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 echo "=== B119 MCP Codex Handoff Markdown Render Test ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 # ── Validate ALLOW_WRITES is off (write gate must stay default-off) ─────
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 
@@ -56,7 +56,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from geoai_task_mcp import core, review_summarizer
+from aiworkhub import core, review_summarizer
 
 FAILURES: list[str] = []
 PASSES: list[str] = []
@@ -156,7 +156,7 @@ RISKY = {
     "priority": "p_risky",
     "objective": "Touches shared server.py + a manifest and declares no validation.",
     "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/src/aiworkhub/server.py",
         "bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
     ],
     "validation": [],
@@ -291,13 +291,13 @@ def test_empty_queue_render() -> None:
 def test_server_tool_wiring_live_readonly() -> None:
     print("[test_server_tool_wiring_live_readonly] registered MCP tool reads live queue read-only")
     try:
-        from geoai_task_mcp import server  # noqa: F401
+        from aiworkhub import server  # noqa: F401
     except Exception as exc:  # pragma: no cover - mcp SDK missing in minimal env
         check(False, f"import server (mcp SDK): {exc}")
         return
 
-    tool = getattr(server, "geoai_task_codex_handoff_markdown", None)
-    check(tool is not None, "server exposes geoai_task_codex_handoff_markdown")
+    tool = getattr(server, "aiworkhub_task_codex_handoff_markdown", None)
+    check(tool is not None, "server exposes aiworkhub_task_codex_handoff_markdown")
     if tool is None:
         return
 
@@ -310,7 +310,7 @@ def test_server_tool_wiring_live_readonly() -> None:
     after = core.run_taskctl(["review-queue"]).stdout
 
     check(isinstance(result, dict) and result.get("ok") is True, "server tool returns ok report")
-    check(result.get("server_tool") == "geoai_task_codex_handoff_markdown", "server_tool label set")
+    check(result.get("server_tool") == "aiworkhub_task_codex_handoff_markdown", "server_tool label set")
     check(result.get("markdown_contract") == review_summarizer.MARKDOWN_RENDER_CONTRACT,
           "server tool markdown_contract label")
     check(isinstance(result.get("markdown"), str), "server tool markdown field is a string")

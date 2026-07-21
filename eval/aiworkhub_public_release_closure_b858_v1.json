@@ -1,0 +1,107 @@
+{
+  "schema_id": "geoai.task_mcp.worker_eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_PUBLIC_RELEASE_CLOSURE_B858_V1",
+  "verdict": "review",
+  "summary": "Aligned Python/VS Code extension release versions at 0.6.0 (pyproject.toml, __init__.__version__, vscode-extension/package.json, extension.js EXPECTED_MCP_PACKAGE_VERSION), rewrote README.md to open with what AIWorkHub is plus a five-minute VS Code quickstart reflecting current .aiworkhub-local canonical authority instead of the historical AITools/taskctl.py parent-repo design, added docs/ARCHITECTURE.md and docs/GETTING_STARTED.md, added CHANGELOG.md, corrected GitHub URLs in SECURITY.md and vscode-extension/package.json to the repository's actual current remote, hardened .gitignore, refreshed the extension README's stale VSIX version reference, added minimal GitHub issue/PR templates, and updated one stale README-title assertion in an existing rebrand test. Did not touch dashboard.py's HTTP server or the unrelated pre-existing b829/b833/b834/b835/b821/b816 test failures -- see known_issues.",
+  "version_alignment": {
+    "target_version": "0.6.0",
+    "pyproject_toml": "0.6.0",
+    "src_aiworkhub_init_version": "0.6.0",
+    "vscode_extension_package_json": "0.6.0",
+    "extension_js_expected_mcp_package_version": "0.6.0",
+    "vscode_extension_readme_vsix_reference": "aiworkhub-0.6.0.vsix",
+    "vsix_packaged": "vscode-extension/dist/aiworkhub-0.6.0.vsix (npm run package, PASS)"
+  },
+  "github_hygiene": {
+    "actual_git_remote": "https://github.com/shrec/AIWorkingHub.git",
+    "finding": "SECURITY.md and vscode-extension/package.json (repository/bugs/homepage) linked to https://github.com/shrec/AIWorkHub, a repository that does not exist at the current remote. Corrected both to the repository's real current remote (shrec/AIWorkingHub) so release links are not dead.",
+    "canonical_branding_unchanged": "Display name, Python package, CLI aliases, MCP tool prefix, and env var prefix remain canonical AIWorkHub/aiworkhub/AIWORKHUB per eval/aiworkhub_rebrand_regression_repair_b838_v1.json and eval/aiworkhub_canonical_cutover_final_b843_v1.json -- only the GitHub repository URL differs from the product name today.",
+    "recommendation_for_codex": "This worker does not rename the GitHub repository (forbidden). If/when Codex renames shrec/AIWorkingHub to shrec/AIWorkHub, the URLs in SECURITY.md and vscode-extension/package.json should be updated back to match at that time.",
+    "issue_pr_ci_metadata": "Added .github/ISSUE_TEMPLATE/bug_report.md, .github/ISSUE_TEMPLATE/feature_request.md, .github/PULL_REQUEST_TEMPLATE.md. .github/workflows/ci.yml and release.yml were already coherent (matrix Python 3.10-3.12, wheel+sdist+VSIX build, version-vs-tag gate, draft release, optional Open VSX/Marketplace publish) and needed no change."
+  },
+  "git_tree_state": {
+    "finding": "This nested repository's git HEAD (2 commits) only tracks an early skeleton (contracts/, data/tasking/*, src/aiworkinghub/, src/geoai_task_mcp/, tests/test_aiworkinghub_*). The current canonical implementation (src/aiworkhub/, tests/test_aiworkhub_*, vscode-extension/, docs/, most of eval/, scripts/, .github/, CODE_OF_CONDUCT.md, CONTRIBUTING.md, SECURITY.md) is entirely untracked on disk, while the old src/aiworkinghub/*.py and src/geoai_task_mcp/*.py sources are already deleted from disk (git status shows them ` D`, i.e. tracked-but-removed) -- only a stale, gitignored __pycache__ remains under src/aiworkinghub/.",
+    "implication": "Legacy duplicate packages are confirmed removed from the working tree (satisfies the 'legacy duplicate packages remain removed' acceptance check), but git history has not yet been updated to match -- that is exactly the one clean commit Codex owns at publication time per this task's NO_COMMIT contract.",
+    "not_performed_by_worker": "git add / git commit / git rm of any kind (forbidden: git_commit)."
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/CHANGELOG.md",
+    "tools/geoai-task-mcp/docs/ARCHITECTURE.md",
+    "tools/geoai-task-mcp/docs/GETTING_STARTED.md",
+    "tools/geoai-task-mcp/pyproject.toml",
+    "tools/geoai-task-mcp/src/aiworkhub/__init__.py",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/README.md",
+    "tools/geoai-task-mcp/SECURITY.md",
+    "tools/geoai-task-mcp/.gitignore",
+    "tools/geoai-task-mcp/.github/ISSUE_TEMPLATE/bug_report.md",
+    "tools/geoai-task-mcp/.github/ISSUE_TEMPLATE/feature_request.md",
+    "tools/geoai-task-mcp/.github/PULL_REQUEST_TEMPLATE.md",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_canonical_rebrand_b837_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_public_release_closure_b858_v1.json"
+  ],
+  "validation": [
+    {
+      "command": "PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_*.py tests/test_repository_state.py tests/test_repository_mux.py tests/test_callback_bridge.py tests/test_process_launcher.py tests/test_process_launcher_security.py tests/test_server_runtime_wiring.py",
+      "status": "PARTIAL",
+      "result": "469 passed, 42 failed -- identical failure count/set before and after this task's edits (baseline captured before any change); zero regressions introduced. See known_issues for the failing files."
+    },
+    {
+      "command": "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+      "status": "PASS"
+    },
+    {
+      "command": "node --check tools/geoai-task-mcp/vscode-extension/media/app.js",
+      "status": "PASS"
+    },
+    {
+      "command": "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+      "status": "PASS",
+      "result": "vscode-extension/dist/aiworkhub-0.6.0.vsix"
+    },
+    {
+      "command": "python3 -c version-match assertion (vscode-extension/package.json == 0.6.0 and pyproject.toml == 0.6.0)",
+      "status": "PASS"
+    },
+    {
+      "command": "git -C tools/geoai-task-mcp diff --check",
+      "status": "PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "status": "PASS",
+      "result": "VERIFY: PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard --print",
+      "status": "PASS",
+      "result": "collision_free=true, active_cards=1, collision_count=0"
+    }
+  ],
+  "known_issues": {
+    "pre_existing_not_caused_by_this_task": [
+      {
+        "file": "tests/test_aiworkhub_vscode_release_b853.py",
+        "count": 16,
+        "cause": "src/aiworkhub/dashboard.py still contains the full loopback HTTP server (create_server/main/DashboardHTTPServer/DashboardRequestHandler/argparse/socket/webbrowser/port 8765) that this test (and eval/aiworkhub_vscode_release_glm_b853_v1.json, previously reported verdict=review with all checks pass) expects removed. tests/test_dashboard.py (not in this task's validation command list) still exercises that same HTTP server extensively and would itself regress if the server were removed without also retiring/rewriting that legacy suite. Resolving this HTTP-dashboard-removal-vs-legacy-test conflict is a larger, separate engineering decision outside this task's branding/version/docs/hygiene scope and outside required_outputs; not attempted here to avoid an unreviewed re-implementation of possibly-contested B853 work."
+      },
+      {
+        "files": [
+          "tests/test_aiworkhub_agent_tool_instruction_activation_b821_v1.py",
+          "tests/test_aiworkhub_agent_tool_instruction_generator_b816_v2.py",
+          "tests/test_aiworkhub_context_optimization_b829_v1.py",
+          "tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+          "tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+          "tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py"
+        ],
+        "count": 26,
+        "cause": "Fixture/eval-artifact and dynamic-worker-MCP-authority failures unrelated to release naming/version/docs; unchanged by this task's edits (identical before/after)."
+      }
+    ],
+    "fixed_by_this_task": [
+      "tests/test_aiworkhub_canonical_rebrand_b837_v1.py::test_readme_and_migration_manifest_are_release_facing regressed against the new README title ('# AIWorkHub' vs the old '# AIWorkHub MCP' assertion) and was updated to the looser, still-canonical prefix check in the same edit that changed the README title."
+    ]
+  }
+}

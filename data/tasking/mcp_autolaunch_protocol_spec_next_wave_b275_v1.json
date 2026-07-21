@@ -54,7 +54,7 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B254_V1",
-      "goal": "Unchanged from B254's proposal: wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH AND GEOAI_TASK_MCP_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off. Requires B275 protocol spec, B276 dryrun spec, B277 safety gate impl, and B278 polling loop to be complete first.",
+      "goal": "Unchanged from B254's proposal: wire the gated launch executor behind AIWORKHUB_ALLOW_LAUNCH AND AIWORKHUB_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off. Requires B275 protocol spec, B276 dryrun spec, B277 safety gate impl, and B278 polling loop to be complete first.",
       "mode": "implementation_gated_launch",
       "runner": "claude_coding",
       "topic": "coding",

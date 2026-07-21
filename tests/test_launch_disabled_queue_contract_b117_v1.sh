@@ -17,18 +17,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
-MODULE="$MCPROOT/src/geoai_task_mcp/launch_queue_contract.py"
+MODULE="$MCPROOT/src/aiworkhub/launch_queue_contract.py"
 
-TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/geoai_launch_disabled_queue_b117.XXXXXX")"
+TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_launch_disabled_queue_b117.XXXXXX")"
 trap 'rm -rf "$TMPWORK"' EXIT
 
 # Ensure gates are unset for the primary run (do not inherit an enabled ambient).
-unset GEOAI_TASK_MCP_ALLOW_LAUNCH || true
-unset GEOAI_TASK_MCP_ALLOW_WRITES || true
-export GEOAI_REPO="$ROOT"
+unset AIWORKHUB_ALLOW_LAUNCH || true
+unset AIWORKHUB_ALLOW_WRITES || true
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== Launch-Disabled Queue Contract Smoke Test B117 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "MODULE=$MODULE"
 echo "TMPWORK=$TMPWORK"
 
@@ -40,7 +40,7 @@ echo "=== Defense-in-depth checks ==="
 
 # (2) Launch must stay disabled even with BOTH enable flags forced on. Load the
 #     module by file path so the package __init__ is never imported.
-STATE="$(GEOAI_TASK_MCP_ALLOW_LAUNCH=1 GEOAI_TASK_MCP_ALLOW_WRITES=1 python3 - "$MODULE" <<'PY'
+STATE="$(AIWORKHUB_ALLOW_LAUNCH=1 AIWORKHUB_ALLOW_WRITES=1 python3 - "$MODULE" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("lqc_b117_check", sys.argv[1])
 m = importlib.util.module_from_spec(spec)

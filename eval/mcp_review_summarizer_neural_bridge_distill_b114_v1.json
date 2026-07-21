@@ -7,12 +7,12 @@
   "topic": "task_mcp",
   "mode": "mcp_review_summarizer_neural_distill_no_launch",
   "objective": "Extract neural curriculum/distillation targets from review_summarizer output patterns for learned task review prioritization, without making the deterministic summarizer a runtime authority.",
-  "build_script": "tools/geoai-task-mcp/scripts/build_mcp_review_summarizer_neural_bridge_distill_b114_v1.py",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_neural_bridge_distill_b114_v1.sh",
+  "build_script": "tools/aiworkhub/scripts/build_mcp_review_summarizer_neural_bridge_distill_b114_v1.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_neural_bridge_distill_b114_v1.sh",
   "outputs": {
-    "distill_rows_jsonl": "tools/geoai-task-mcp/eval/mcp_review_summarizer_neural_bridge_distill_rows_b114_v1.jsonl",
-    "eval_json": "tools/geoai-task-mcp/eval/mcp_review_summarizer_neural_bridge_distill_b114_v1.json",
-    "next_wave_json": "tools/geoai-task-mcp/data/tasking/mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json"
+    "distill_rows_jsonl": "tools/aiworkhub/eval/mcp_review_summarizer_neural_bridge_distill_rows_b114_v1.jsonl",
+    "eval_json": "tools/aiworkhub/eval/mcp_review_summarizer_neural_bridge_distill_b114_v1.json",
+    "next_wave_json": "tools/aiworkhub/data/tasking/mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json"
   },
   "acceptance_results": {
     "curriculum_rows_emitted": 41,
@@ -139,8 +139,8 @@
     "mixed_task_commit"
   ],
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   }
 }

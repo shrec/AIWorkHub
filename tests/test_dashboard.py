@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -30,12 +31,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -51,12 +52,64 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import dashboard  # noqa: E402
+from aiworkhub import dashboard, task_store  # noqa: E402
+
+
+NOW = "2026-07-21T00:00:00+00:00"
+
+
+def _init_canonical_repo(tmp_path: Path, name: str = "repo") -> Path:
+    root = tmp_path / name
+    root.mkdir()
+    result = task_store.initialize_repository(root)
+    assert result["ok"], result
+    return root
+
+
+def _canonical_db(root: Path) -> Path:
+    readiness = task_store.storage_readiness(root)
+    assert readiness.ready, readiness.reason
+    return Path(readiness.canonical_db)
+
+
+def _insert_canonical_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: str = "pending",
+    worker_status: str = "unclaimed",
+    runner: str = "r",
+    topic: str = "task_mcp",
+) -> None:
+    card = {
+        "task_id": task_id,
+        "status": status,
+        "worker_status": worker_status,
+        "runner": runner,
+        "topic": topic,
+    }
+    conn.execute(
+        "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, priority, "
+        "objective, card_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            runner,
+            topic,
+            "solo",
+            status,
+            worker_status,
+            "normal",
+            "objective",
+            json.dumps(card, sort_keys=True),
+            NOW,
+            NOW,
+        ),
+    )
 
 
 def _chmod_blocked_by_sandbox() -> bool:
@@ -379,28 +432,33 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
 def test_callback_bridge_health_batch_stats_never_expose_full_thread_id(tmp_path, monkeypatch):
     """B402: real end-to-end proof (not a mocked provider) that a live
     inflight batch's origin_thread_id never reaches the dashboard -- only
-    redacted counts/ages, via the REAL DashboardProvider/taskctl/taskdb
+    redacted counts/ages, via the REAL canonical DashboardProvider/task_store
     stack, not FakeProvider."""
-    aitools_dir = _TOOL_ROOT.parents[1] / "AITools"
-    if str(aitools_dir) not in sys.path:
-        sys.path.insert(0, str(aitools_dir))
-    import taskdb  # noqa: PLC0415
-
-    db_path = tmp_path / "task_queue.sqlite"
-    monkeypatch.setenv("BITNN_TASK_QUEUE_DB", str(db_path))
-    conn = taskdb.open_db(db_path)
-    taskdb.init_db(conn)
+    root = _init_canonical_repo(tmp_path)
+    conn = sqlite3.connect(_canonical_db(root))
     thread_id = "11111111-2222-4333-8444-555555555555"
+    batch_id = "batch-redacted-health"
     for i in range(3):
-        taskdb.upsert_card(conn, {
-            "task_id": f"REAL_BATCH_{i}", "runner": "r", "topic": "task_mcp",
-            "status": "review", "worker_status": "review",
-            "origin_thread_id": thread_id,
-        })
-    taskdb.claim_pending_callback_batch(conn, lease_seconds=60)
+        task_id = f"REAL_BATCH_{i}"
+        _insert_canonical_task(
+            conn, task_id, status="review", worker_status="review"
+        )
+        conn.execute(
+            "INSERT INTO callback_outbox "
+            "(task_id, origin_thread_id, episode_id, batch_id, transition, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'review_ready', 'inflight', ?, ?)",
+            (task_id, thread_id, f"episode-{i}", batch_id, NOW, NOW),
+        )
+    conn.execute(
+        "INSERT INTO callback_batches "
+        "(batch_id, origin_thread_id, state, created_at, updated_at) "
+        "VALUES (?, ?, 'inflight', ?, ?)",
+        (batch_id, thread_id, NOW, NOW),
+    )
+    conn.commit()
     conn.close()
 
-    provider = dashboard.DashboardProvider()
+    provider = dashboard.DashboardProvider(repo_root=root)
     health = provider.get_callback_bridge_health()
     serialized = json.dumps(health)
     assert thread_id not in serialized
@@ -419,33 +477,22 @@ def test_exact_status_counts_reports_totals_past_default_task_limit(tmp_path, mo
     SQLite aggregate over (archived_at, status, worker_status) -- never by
     fetching/rendering the finished row list -- and build_snapshot's
     status_counts/row_counts must reflect that exact total even though task
-    rows stay bounded. A real taskdb, not a mocked provider."""
-    import importlib
-
-    taskdb = importlib.import_module("AITools.taskdb")
-    db_path = tmp_path / "task_queue.sqlite"
-    monkeypatch.setattr(taskdb, "DEFAULT_DB", db_path)
-    with taskdb.open_db(db_path) as conn:
-        taskdb.init_db(conn)
+    rows stay bounded. A real canonical task store, not a mocked provider."""
+    root = _init_canonical_repo(tmp_path)
+    db_path = _canonical_db(root)
+    with sqlite3.connect(db_path) as conn:
         for i in range(501):
-            taskdb.upsert_card(conn, {
-                "task_id": f"FINISHED_B455_{i}",
-                "runner": "r",
-                "topic": "task_mcp",
-                "status": "finished",
-                "worker_status": "done",
-            })
-        taskdb.upsert_card(conn, {
-            "task_id": "PENDING_B455_0",
-            "runner": "r",
-            "topic": "task_mcp",
-            "status": "pending",
-            "worker_status": "unclaimed",
-        })
-        before_total = taskdb.task_count(conn)
+            _insert_canonical_task(
+                conn,
+                f"FINISHED_B455_{i}",
+                status="finished",
+                worker_status="done",
+            )
+        _insert_canonical_task(conn, "PENDING_B455_0")
+        before_total = int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
     assert before_total == 502
 
-    counts = dashboard.exact_status_counts(db_path)
+    counts = dashboard.exact_status_counts(root)
     assert counts["finished"] == 501
     assert counts["finished"] > dashboard.DEFAULT_TASK_LIMIT
     assert counts["pending"] == 1
@@ -453,7 +500,7 @@ def test_exact_status_counts_reports_totals_past_default_task_limit(tmp_path, mo
 
     class ExactOnlyProvider(FakeProvider):
         def get_exact_status_counts(self):
-            return dashboard.exact_status_counts(db_path)
+            return dashboard.exact_status_counts(root)
 
     snapshot = dashboard.build_snapshot(ExactOnlyProvider())
     assert snapshot["status_counts"]["finished"] == 501
@@ -467,8 +514,8 @@ def test_exact_status_counts_reports_totals_past_default_task_limit(tmp_path, mo
     )
 
     # A pure read: the snapshot build must never mutate the queue.
-    with taskdb.open_db(db_path) as conn:
-        assert taskdb.task_count(conn) == before_total
+    with sqlite3.connect(db_path) as conn:
+        assert int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]) == before_total
 
 
 def test_snapshot_isolates_provider_failures_without_hiding_healthy_groups():
@@ -487,58 +534,46 @@ def test_snapshot_isolates_provider_failures_without_hiding_healthy_groups():
     }
 
 
-def test_production_provider_uses_only_existing_read_paths(monkeypatch):
+def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path):
     calls = []
+    root = _init_canonical_repo(tmp_path)
 
-    def fake_list_tasks(status="pending", topic=None, limit=80):
-        calls.append(("core.list_tasks", status, topic, limit))
-        return {
-            "ok": True,
-            "returncode": 0,
-            "stdout": f"[{status}] [imagery] [runner_a_b12] TASK_{status.upper()}_B12_V1\n",
-            "stderr": "",
-        }
+    def fake_list_tasks(repo_root, status="pending", limit=80):
+        calls.append(("task_store.list_tasks", repo_root, status, limit))
+        return [{
+            "task_id": f"TASK_{status.upper()}_B12_V1",
+            "status": status,
+            "topic": "imagery",
+            "runner": "runner_a_b12",
+        }]
 
-    def fake_show_task(task_id):
-        calls.append(("core.show_task", task_id))
-        return {"ok": True, "returncode": 0, "stdout": json.dumps({"task_id": task_id})}
+    def fake_get_task(repo_root, task_id):
+        calls.append(("task_store.get_task", repo_root, task_id))
+        return {"task_id": task_id}
 
-    def fake_inbox(**kwargs):
-        calls.append(("completion_inbox.build_completion_inbox", kwargs))
-        return {"review_queue": [], "stale_processing": [], "read_errors": []}
+    def forbidden_legacy_provider(*_args, **_kwargs):
+        raise AssertionError("canonical dashboard must not call a legacy provider")
 
-    def fake_ledger(**kwargs):
-        calls.append(("cost_ledger.build_cost_ledger", kwargs))
-        return {"aggregates": {"by_runner": {}}, "source_status": {}}
+    monkeypatch.setattr(dashboard.task_store, "list_tasks", fake_list_tasks)
+    monkeypatch.setattr(dashboard.task_store, "get_task", fake_get_task)
+    monkeypatch.setattr(
+        dashboard.completion_inbox, "build_completion_inbox", forbidden_legacy_provider
+    )
+    monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", forbidden_legacy_provider)
+    monkeypatch.setattr(dashboard.core, "collision_guard", forbidden_legacy_provider)
 
-    def fake_collision(print_json=True):
-        calls.append(("core.collision_guard", print_json))
-        report = {"collision_free": False, "collision_count": 1, "file_collisions": []}
-        return {"ok": False, "returncode": 1, "stdout": f"COLLISION\n{json.dumps(report)}", "stderr": ""}
-
-    monkeypatch.setattr(dashboard.core, "list_tasks", fake_list_tasks)
-    monkeypatch.setattr(dashboard.core, "show_task", fake_show_task)
-    monkeypatch.setattr(dashboard.completion_inbox, "build_completion_inbox", fake_inbox)
-    monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", fake_ledger)
-    monkeypatch.setattr(dashboard.core, "collision_guard", fake_collision)
-
-    provider = dashboard.DashboardProvider(task_limit=25, stale_processing_hours=6)
+    provider = dashboard.DashboardProvider(
+        task_limit=25, stale_processing_hours=6, repo_root=root
+    )
     assert provider.list_tasks("pending")[0]["task_id"] == "TASK_PENDING_B12_V1"
     assert provider.get_task("TASK_PENDING_B12_V1") == {"task_id": "TASK_PENDING_B12_V1"}
-    assert provider.get_completion_inbox()["review_queue"] == []
+    assert provider.get_completion_inbox()["review_queue"][0]["task_id"] == "TASK_REVIEW_B12_V1"
     assert provider.get_cost_ledger()["aggregates"]["by_runner"] == {}
-    assert provider.get_collision_report()["collision_count"] == 1
+    assert provider.get_collision_report()["collision_free"] is True
 
-    assert calls == [
-        ("core.list_tasks", "pending", None, 25),
-        ("core.show_task", "TASK_PENDING_B12_V1"),
-        (
-            "completion_inbox.build_completion_inbox",
-            {"limit": 25, "stale_processing_hours": 6.0},
-        ),
-        ("cost_ledger.build_cost_ledger", {"include_tasks": False}),
-        ("core.collision_guard", True),
-    ]
+    assert ("task_store.list_tasks", root, "pending", 25) in calls
+    assert ("task_store.get_task", root, "TASK_PENDING_B12_V1") in calls
+    assert all(call[0].startswith("task_store.") for call in calls)
 
 
 def test_process_run_reader_uses_latest_allowlisted_events_without_manager_side_effects(
@@ -548,7 +583,7 @@ def test_process_run_reader_uses_latest_allowlisted_events_without_manager_side_
     process_log = tmp_path / "process_events.jsonl"
     events = [
         {
-            "schema_id": "geoai.task_mcp.process_event.v1",
+            "schema_id": "aiworkhub.task_mcp.process_event.v1",
             "timestamp": "2026-07-10T10:00:00+00:00",
             "request_id": "run-1",
             "task_id": "TASK_REVIEW_B12_V1",
@@ -560,7 +595,7 @@ def test_process_run_reader_uses_latest_allowlisted_events_without_manager_side_
             "secret_environment": "must-not-be-exposed",
         },
         {
-            "schema_id": "geoai.task_mcp.process_event.v1",
+            "schema_id": "aiworkhub.task_mcp.process_event.v1",
             "timestamp": "2026-07-10T10:05:00+00:00",
             "request_id": "run-1",
             "state": "review_ready",
@@ -620,7 +655,7 @@ def test_agent_processes_expose_derived_liveness_never_the_raw_status_path(tmp_p
 
     own_ticks = dashboard.process_launcher._pid_start_ticks(os.getpid())
     events = [{
-        "schema_id": "geoai.task_mcp.process_event.v1",
+        "schema_id": "aiworkhub.task_mcp.process_event.v1",
         "timestamp": "2026-07-10T10:00:00+00:00",
         "request_id": "req-1",
         "task_id": "TASK_LIVE_B412_V1",
@@ -781,7 +816,7 @@ def test_ephemeral_server_serves_assets_and_json_get_endpoints():
         status, headers, payload = request(server, "GET", "/")
         assert status == 200
         assert headers["Content-Type"].startswith("text/html")
-        assert b"GeoAI Task Operations" in payload
+        assert b"AIWorkHub Task Operations" in payload
         assert b'id="tab-usage"' in payload
         assert b'id="tab-returns"' in payload
 
@@ -946,7 +981,7 @@ def test_vscode_embed_route_relaxes_frame_ancestors_only():
         assert "base-uri 'none'" in csp
         assert "form-action 'none'" in csp
         # same underlying document as "/" -- no separate/copied frontend
-        assert b"GeoAI Task Operations" in payload
+        assert b"AIWorkHub Task Operations" in payload
         assert headers["X-Content-Type-Options"] == "nosniff"
 
         status, _, head_payload = request(server, "HEAD", dashboard.VSCODE_EMBED_PATH)
@@ -1011,30 +1046,29 @@ def test_api_and_mutation_endpoints_keep_auth_unchanged_by_embed_route(tmp_path,
 
 
 def test_archive_post_requires_capability_and_never_echoes_token(tmp_path, monkeypatch):
-    import importlib
-    import geoai_task_mcp
+    import aiworkhub
 
     token = "dashboard-test-capability"
     token_path = tmp_path / "coordinator.token"
     token_path.write_text(token, encoding="utf-8")
     token_path.chmod(0o600)
-    monkeypatch.setattr(geoai_task_mcp, "coordinator_config", lambda: ("", str(token_path)))
+    monkeypatch.setattr(aiworkhub, "coordinator_config", lambda: ("", str(token_path)))
 
-    taskdb = importlib.import_module("AITools.taskdb")
-    db_path = tmp_path / "queue.sqlite"
-    monkeypatch.setattr(taskdb, "DEFAULT_DB", db_path)
-    with taskdb.open_db(db_path) as conn:
-        taskdb.init_db(conn)
-        taskdb.upsert_card(conn, {
-            "task_id": "ARCHIVE_HTTP_TEST",
-            "status": "finished",
-            "worker_status": "done",
-            "runner": "test",
-            "topic": "test",
-        })
+    root = _init_canonical_repo(tmp_path, "archive-repo")
+    with sqlite3.connect(_canonical_db(root)) as conn:
+        _insert_canonical_task(
+            conn,
+            "ARCHIVE_HTTP_TEST",
+            status="finished",
+            worker_status="done",
+            runner="test",
+            topic="test",
+        )
 
     body = json.dumps({"task_id": "ARCHIVE_HTTP_TEST", "reason": "cleanup"}).encode()
-    with running_server(FakeProvider()) as server:
+    provider = FakeProvider()
+    provider.repo_root = root
+    with running_server(provider) as server:
         status, _, payload = request(server, "POST", "/api/archive", body)
         assert status == 401
         assert token.encode() not in payload
@@ -1055,24 +1089,20 @@ def test_archive_post_requires_capability_and_never_echoes_token(tmp_path, monke
         assert decode_json(payload)["ok"] is True
         assert token.encode() not in payload
 
-    with taskdb.open_db(db_path) as conn:
-        assert taskdb.is_archived(conn, "ARCHIVE_HTTP_TEST")
-        serialized_events = json.dumps(
-            taskdb.get_task_events(conn, "ARCHIVE_HTTP_TEST"), ensure_ascii=False,
-        )
-        assert token not in serialized_events
+    assert task_store.get_task(root, "ARCHIVE_HTTP_TEST")["status"] == "archived"
+    serialized_events = json.dumps(
+        task_store.get_task_events(root, "ARCHIVE_HTTP_TEST"), ensure_ascii=False,
+    )
+    assert token not in serialized_events
 
 
 def test_health_identity_get_exposes_bounded_non_secret_queue_identity(tmp_path, monkeypatch):
-    import importlib
+    root = _init_canonical_repo(tmp_path, "identity-repo")
+    db_path = _canonical_db(root)
+    provider = FakeProvider()
+    provider.repo_root = root
 
-    taskdb = importlib.import_module("AITools.taskdb")
-    db_path = tmp_path / "queue.sqlite"
-    monkeypatch.setattr(taskdb, "DEFAULT_DB", db_path)
-    with taskdb.open_db(db_path) as conn:
-        taskdb.init_db(conn)
-
-    with running_server(FakeProvider()) as server:
+    with running_server(provider) as server:
         status, _, payload = request(server, "GET", "/api/health-identity")
         assert status == 200
         identity = decode_json(payload)

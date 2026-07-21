@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch and supervise one exact GeoAI task through the real stdio MCP API."""
+"""Launch and supervise one exact AIWorkHub task through the real stdio MCP API."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from mcp.client.stdio import get_default_environment, stdio_client
 
 
 REPO = Path(__file__).resolve().parents[3]
-SRC = REPO / "tools/geoai-task-mcp/src"
+SRC = REPO / "tools/aiworkhub/src"
 TERMINAL_STATES = {
     "review_ready",
     "exited",
@@ -56,17 +56,17 @@ async def run(args: argparse.Namespace) -> int:
     env = get_default_environment()
     env.update({
         "PYTHONPATH": str(SRC),
-        "GEOAI_REPO": str(REPO),
-        "GEOAI_TASK_MCP_ALLOW_WRITES": "1",
-        "GEOAI_TASK_MCP_ALLOW_LAUNCH": "1",
-        "GEOAI_TASK_MCP_MAX_PROCESSES": str(args.max_processes),
+        "AIWORKHUB_REPO": str(REPO),
+        "AIWORKHUB_ALLOW_WRITES": "1",
+        "AIWORKHUB_ALLOW_LAUNCH": "1",
+        "AIWORKHUB_MAX_PROCESSES": str(args.max_processes),
     })
-    codex_inner_sandbox = os.environ.get("GEOAI_TASK_MCP_CODEX_INNER_SANDBOX_MODE")
+    codex_inner_sandbox = os.environ.get("AIWORKHUB_CODEX_INNER_SANDBOX_MODE")
     if codex_inner_sandbox:
-        env["GEOAI_TASK_MCP_CODEX_INNER_SANDBOX_MODE"] = codex_inner_sandbox
+        env["AIWORKHUB_CODEX_INNER_SANDBOX_MODE"] = codex_inner_sandbox
     params = StdioServerParameters(
         command="/usr/bin/python3",
-        args=["-m", "geoai_task_mcp.server"],
+        args=["-m", "aiworkhub.server"],
         env=env,
         cwd=str(REPO),
     )
@@ -75,7 +75,7 @@ async def run(args: argparse.Namespace) -> int:
         async with ClientSession(read, write, read_timeout_seconds=read_timeout) as session:
             await session.initialize()
             launch_result = await session.call_tool(
-                "geoai_agent_launch_task",
+                "aiworkhub_agent_launch_task",
                 {
                     "task_id": args.task_id,
                     "runner": args.runner,
@@ -96,7 +96,7 @@ async def run(args: argparse.Namespace) -> int:
             while time.monotonic() < deadline:
                 await asyncio.sleep(args.poll_seconds)
                 status_result = await session.call_tool(
-                    "geoai_agent_task_status",
+                    "aiworkhub_agent_task_status",
                     {"request_id": request_id},
                     read_timeout_seconds=read_timeout,
                 )
@@ -109,7 +109,7 @@ async def run(args: argparse.Namespace) -> int:
                 }, ensure_ascii=False), flush=True)
                 if status.get("state") in TERMINAL_STATES:
                     collected_result = await session.call_tool(
-                        "geoai_agent_collect_result",
+                        "aiworkhub_agent_collect_result",
                         {"request_id": request_id, "max_log_bytes": 65536},
                         read_timeout_seconds=read_timeout,
                     )
@@ -117,7 +117,7 @@ async def run(args: argparse.Namespace) -> int:
                     print(json.dumps({"result": collected}, ensure_ascii=False, indent=2), flush=True)
                     return 0 if collected.get("review_ready") else 3
             await session.call_tool(
-                "geoai_agent_cancel_task",
+                "aiworkhub_agent_cancel_task",
                 {"request_id": request_id, "reason": "live_client_deadline"},
                 read_timeout_seconds=read_timeout,
             )

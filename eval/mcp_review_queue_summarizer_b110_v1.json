@@ -7,9 +7,9 @@
   "topic": "task_mcp",
   "mode": "mcp_review_queue_summarizer_readonly",
   "objective": "Read-only MCP review queue summarizer: inspect taskctl review queue, group finished worker tasks by topic/runner, return Codex-ready review checklist without mutating the queue.",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_queue_summarizer_b110_v1.sh",
-  "test_source": "tools/geoai-task-mcp/tests/mcp_review_queue_summarizer_smoke.py",
-  "module_source": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_queue_summarizer_b110_v1.sh",
+  "test_source": "tools/aiworkhub/tests/mcp_review_queue_summarizer_smoke.py",
+  "module_source": "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
   "acceptance_criteria": {
     "review_queue_inspection": "must call taskctl review-queue (read-only) and parse output",
     "task_grouping": "must group finished tasks by topic/runner key",
@@ -17,7 +17,7 @@
     "no_mutation": "must never call taskctl done/review/start/add-card or mutate queue/audit logs",
     "subprocess_tripwire": "SUBPROCESS_LAUNCH_TRIPWIRE must be 0",
     "contract_test_stubbed": "must include smoke test with stubbed taskctl backend and subprocess launch tripwire=0",
-    "test_passes": "bash tools/geoai-task-mcp/tests/test_mcp_review_queue_summarizer_b110_v1.sh passes",
+    "test_passes": "bash tools/aiworkhub/tests/test_mcp_review_queue_summarizer_b110_v1.sh passes",
     "verify_passes": "python3 AITools/taskctl.py verify passes"
   },
   "authority_flags": {
@@ -80,8 +80,8 @@
     "objective": "str"
   },
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   }
 }

@@ -38,8 +38,8 @@
     "scoped_subprocess_no_leak_test": "PASS"
   },
   "changed_paths": {
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py": "b09a27a4b8be31039c198bcbd0ce7db9e9b2946e33afb278b16a31e419dea5b2",
-    "tools/geoai-task-mcp/tests/test_worker_workspace.py": "9c6cea868c1fab5a300f74f9ec5672d83e295700179eb49c3c1a3372202d934e"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py": "b09a27a4b8be31039c198bcbd0ce7db9e9b2946e33afb278b16a31e419dea5b2",
+    "tools/aiworkhub/tests/test_worker_workspace.py": "9c6cea868c1fab5a300f74f9ec5672d83e295700179eb49c3c1a3372202d934e"
   },
   "preserved": [
     "process_launcher",

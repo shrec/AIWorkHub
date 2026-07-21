@@ -7,12 +7,12 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_DRYRUN_PLAN_TOOL_B106_V1",
-      "goal": "Expose cli_adapter_dryrun.plan_dryrun as a read-only MCP tool geoai_agent_launch_plan that returns the would-run argv + validation + collision preflight; starts no process; appends action=launch_planned audit entry.",
+      "goal": "Expose cli_adapter_dryrun.plan_dryrun as a read-only MCP tool aiworkhub_agent_launch_plan that returns the would-run argv + validation + collision preflight; starts no process; appends action=launch_planned audit entry.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_dryrun_plan_tool_b106_v1.sh",
-        "tools/geoai-task-mcp/eval/dryrun_plan_tool_b106_v1.json"
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_dryrun_plan_tool_b106_v1.sh",
+        "tools/aiworkhub/eval/dryrun_plan_tool_b106_v1.json"
       ],
       "acceptance": [
         "tool starts no process with ALLOW_LAUNCH unset (and even when set)",
@@ -25,9 +25,9 @@
       "goal": "Add a static runner/topic allowlist validator layered on validate_command; any unknown or off-topic runner/topic pair is blocked and audited. Still no launch.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/tests/test_runner_topic_allowlist_b106_v1.sh",
-        "tools/geoai-task-mcp/eval/runner_topic_allowlist_b106_v1.json"
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/tests/test_runner_topic_allowlist_b106_v1.sh",
+        "tools/aiworkhub/eval/runner_topic_allowlist_b106_v1.json"
       ],
       "acceptance": [
         "unknown runner/topic pair blocked and audited",
@@ -40,9 +40,9 @@
       "goal": "Attach per-task/per-adapter token_budget_max ceiling to the dry-run plan; an over-budget plan is marked blocked_over_budget and audited (never silently continued). Maps to taskctl usage fields.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/tests/test_dryrun_token_budget_b106_v1.sh",
-        "tools/geoai-task-mcp/eval/dryrun_token_budget_b106_v1.json"
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/tests/test_dryrun_token_budget_b106_v1.sh",
+        "tools/aiworkhub/eval/dryrun_token_budget_b106_v1.json"
       ],
       "acceptance": [
         "over-budget plan reported blocked_over_budget, never continued",
@@ -56,7 +56,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->adapter/runner/topic routing + abstain labels",
@@ -66,13 +66,13 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B107_V1",
-      "goal": "FINAL: add the real launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH mirroring the ALLOW_WRITES gate; a real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass, using argv-list only, no shell, cwd pinned, env scrubbed. Default stays fully disabled; rollback = unset the flag; executor never reviews its own task.",
+      "goal": "FINAL: add the real launch executor behind AIWORKHUB_ALLOW_LAUNCH mirroring the ALLOW_WRITES gate; a real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass, using argv-list only, no shell, cwd pinned, env scrubbed. Default stays fully disabled; rollback = unset the flag; executor never reviews its own task.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/tests/test_gated_launch_executor_b107_v1.sh",
-        "tools/geoai-task-mcp/eval/gated_launch_executor_b107_v1.json"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/tests/test_gated_launch_executor_b107_v1.sh",
+        "tools/aiworkhub/eval/gated_launch_executor_b107_v1.json"
       ],
       "acceptance": [
         "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",

@@ -15,9 +15,9 @@
   "builds_on": [
     "CLAUDE_TASK_MCP_COMPLETION_INBOX_SMOKE_B276_V1 (mcp_completion_inbox_smoke_b276_v1.json -- identified 5 missing pieces for automatic Codex notification: PUSH_MISSING, NO_DELTA_CURSOR, NO_ARTIFACT_BODY_READ, NO_OWNER_DELIVERY_CHANNEL, NO_ACK_OR_DEDUP_MARKER)",
     "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (task_mcp_autolaunch_dryrun_spec_b276_v1.json -- 15-field launch log/usage/accounting schema, section_4 completion return path, 4-gate safety model)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (current 24-tool surface: geoai_completion_inbox, geoai_task_collision_guard, geoai_task_usage_report, geoai_task_audit_log_read, geoai_supervisor_loop_status already exist and are reused as data sources by this spec, none modified)"
+    "tools/aiworkhub/src/aiworkhub/server.py (current 24-tool surface: aiworkhub_completion_inbox, aiworkhub_task_collision_guard, aiworkhub_task_usage_report, aiworkhub_task_audit_log_read, aiworkhub_supervisor_loop_status already exist and are reused as data sources by this spec, none modified)"
   ],
-  "summary": "This is a SPEC-ONLY artifact (no code changes to server.py or any _.py module; no new MCP tool is implemented or registered). It closes the B276 gap list by defining: (1) a 5-kind event taxonomy (completion, failure, stale, usage, duplicate_runner) with an exact JSON payload schema per kind plus a shared envelope; (2) an opaque delta-cursor design so a caller can ask for 'what changed since cursor X' instead of re-diffing a full snapshot client-side; (3) an 'automatic loop, no manual polling' definition that is honest about what it does NOT provide -- it specifies Codex's OWN agent loop calling a proposed geoai_completion_inbox_delta tool once per orchestration cycle using a cursor it persists itself, not a kernel-level push/webhook/inotify/daemon. No such tool is implemented here; server.py is unmodified. The spec explicitly keeps every process-launch and notification-delivery capability at the design stage and defers implementation, owner-channel wiring (email/Slack/desktop), and cursor-persistence-ownership to next-wave tasks that require additional infra/secrets decisions the owner has not yet made.",
+  "summary": "This is a SPEC-ONLY artifact (no code changes to server.py or any _.py module; no new MCP tool is implemented or registered). It closes the B276 gap list by defining: (1) a 5-kind event taxonomy (completion, failure, stale, usage, duplicate_runner) with an exact JSON payload schema per kind plus a shared envelope; (2) an opaque delta-cursor design so a caller can ask for 'what changed since cursor X' instead of re-diffing a full snapshot client-side; (3) an 'automatic loop, no manual polling' definition that is honest about what it does NOT provide -- it specifies Codex's OWN agent loop calling a proposed aiworkhub_completion_inbox_delta tool once per orchestration cycle using a cursor it persists itself, not a kernel-level push/webhook/inotify/daemon. No such tool is implemented here; server.py is unmodified. The spec explicitly keeps every process-launch and notification-delivery capability at the design stage and defers implementation, owner-channel wiring (email/Slack/desktop), and cursor-persistence-ownership to next-wave tasks that require additional infra/secrets decisions the owner has not yet made.",
   "protocol_sections": {
     "section_1_event_taxonomy": {
       "title": "Owner-Notification Event Taxonomy (5 kinds, mandatory)",
@@ -39,12 +39,12 @@
           "payload_fields": ["task_id", "runner", "topic", "claimed_at", "last_activity_at", "hours_since_activity", "stale_processing_hours_threshold"]
         },
         "usage": {
-          "derived_from": "core.usage_report() (existing geoai_task_usage_report tool) plus the B276 15-field launch log schema's usage_input_tokens/usage_output_tokens/cost_usd fields (spec-only in B276, still spec-only here -- no launch log file is created by this task)",
+          "derived_from": "core.usage_report() (existing aiworkhub_task_usage_report tool) plus the B276 15-field launch log schema's usage_input_tokens/usage_output_tokens/cost_usd fields (spec-only in B276, still spec-only here -- no launch log file is created by this task)",
           "trigger_condition": "a usage record exists for task_id/runner (recorded via taskctl.py usage, an already-existing command)",
           "payload_fields": ["task_id", "runner", "topic", "model", "usage_input_tokens", "usage_output_tokens", "cost_usd"]
         },
         "duplicate_runner": {
-          "derived_from": "core.collision_guard() (existing geoai_task_collision_guard tool) for same-task_id double-claim, and completion_inbox's runner_mismatch_warnings (B275) for batch-token mismatch between a runner name and the task_id it claimed",
+          "derived_from": "core.collision_guard() (existing aiworkhub_task_collision_guard tool) for same-task_id double-claim, and completion_inbox's runner_mismatch_warnings (B275) for batch-token mismatch between a runner name and the task_id it claimed",
           "trigger_condition": "collision_guard reports 2 distinct runner values that both claim the same task_id, OR a runner_task_batch_mismatch entry is present",
           "payload_fields": ["task_id", "conflicting_runner_a", "conflicting_runner_b", "task_id_batch_token", "runner_batch_token_a", "runner_batch_token_b", "mismatch_type"]
         }
@@ -74,20 +74,20 @@
     },
     "section_2b_delta_cursor_mechanism": {
       "title": "Delta Cursor Design (closes NO_DELTA_CURSOR)",
-      "description": "Closes the B276 gap where geoai_completion_inbox returns the FULL snapshot every call with no way to ask for only what's new. This section is a DESIGN, not an implementation -- no cursor storage code or new tool is added to server.py in this task.",
+      "description": "Closes the B276 gap where aiworkhub_completion_inbox returns the FULL snapshot every call with no way to ask for only what's new. This section is a DESIGN, not an implementation -- no cursor storage code or new tool is added to server.py in this task.",
       "cursor_token_format": "base64( max(updated_at across all facets) + '|' + sorted(task_ids already emitted at that exact updated_at) ) -- the tie-break list handles same-timestamp bursts so no event at the boundary is silently dropped or double-counted",
-      "cursor_ownership": "CALLER-OWNED, not server-owned. The proposed geoai_completion_inbox_delta(topic, since_cursor) tool stays a pure function of (live queue state, since_cursor) -- it persists nothing itself. Codex (or whatever orchestrator calls it) is responsible for storing the returned next_cursor and passing it back next call. This keeps the MCP server stateless and read-only, consistent with every other tool in server.py.",
-      "proposed_tool_signature": "geoai_completion_inbox_delta(topic: str | None = None, since_cursor: str | None = None, limit: int = 200) -> dict[str, Any] -- NOT IMPLEMENTED by this task. Returns {events: [envelope, ...], next_cursor: str, counts: {by_kind...}, truncated: bool, authority_flags: {...}}",
+      "cursor_ownership": "CALLER-OWNED, not server-owned. The proposed aiworkhub_completion_inbox_delta(topic, since_cursor) tool stays a pure function of (live queue state, since_cursor) -- it persists nothing itself. Codex (or whatever orchestrator calls it) is responsible for storing the returned next_cursor and passing it back next call. This keeps the MCP server stateless and read-only, consistent with every other tool in server.py.",
+      "proposed_tool_signature": "aiworkhub_completion_inbox_delta(topic: str | None = None, since_cursor: str | None = None, limit: int = 200) -> dict[str, Any] -- NOT IMPLEMENTED by this task. Returns {events: [envelope, ...], next_cursor: str, counts: {by_kind...}, truncated: bool, authority_flags: {...}}",
       "ack_dedup_note": "closes NO_ACK_OR_DEDUP_MARKER partially: because event_id is deterministic (section_2), a caller that stores the last N seen event_ids can dedup trivially without a server-side 'seen' flag. This still requires the CALLER to keep that set; the server records no per-consumer ack state (consistent with keeping the MCP tool read-only/stateless)."
     },
     "section_3_automatic_loop_definition_no_manual_polling": {
       "title": "What 'without manual polling' means here (and what it does NOT mean)",
-      "honest_framing": "This spec does NOT define a push/webhook/inotify/DB-trigger/message-queue. No such mechanism is implemented, and none is claimed to exist. 'Without manual polling' means: a human owner never has to run a shell command or open a file to check for new events -- instead, an ALREADY-RUNNING Codex orchestration agent calls one MCP tool (geoai_completion_inbox_delta, proposed, not yet implemented) at the top of its own loop iteration, exactly the way it already calls taskctl.py auto-pickup / geoai_supervisor_loop_status today. The polling is automatic-within-the-agent-loop, not manual-by-a-person. It remains, mechanically, a pull.",
+      "honest_framing": "This spec does NOT define a push/webhook/inotify/DB-trigger/message-queue. No such mechanism is implemented, and none is claimed to exist. 'Without manual polling' means: a human owner never has to run a shell command or open a file to check for new events -- instead, an ALREADY-RUNNING Codex orchestration agent calls one MCP tool (aiworkhub_completion_inbox_delta, proposed, not yet implemented) at the top of its own loop iteration, exactly the way it already calls taskctl.py auto-pickup / aiworkhub_supervisor_loop_status today. The polling is automatic-within-the-agent-loop, not manual-by-a-person. It remains, mechanically, a pull.",
       "loop_steps": [
         "1. Codex orchestration loop starts an iteration (already an existing pattern -- same cadence as its auto-pickup loop).",
-        "2. Codex calls geoai_completion_inbox_delta(topic=<its topic scope>, since_cursor=<cursor it stored last iteration>) -- proposed tool, not implemented in this task.",
+        "2. Codex calls aiworkhub_completion_inbox_delta(topic=<its topic scope>, since_cursor=<cursor it stored last iteration>) -- proposed tool, not implemented in this task.",
         "3. Tool returns {events: [...], next_cursor}; Codex stores next_cursor for the following iteration (caller-owned cursor, section_2b).",
-        "4. Codex branches on event_kind: completion -> run its existing review checklist (geoai_task_codex_handoff); failure -> create a repair task per the B276 completion_return_path step 6; stale -> flag for owner attention; usage -> append to its own cost ledger; duplicate_runner -> run geoai_task_collision_guard for the details and pause auto-pickup for that task_id.",
+        "4. Codex branches on event_kind: completion -> run its existing review checklist (aiworkhub_task_codex_handoff); failure -> create a repair task per the B276 completion_return_path step 6; stale -> flag for owner attention; usage -> append to its own cost ledger; duplicate_runner -> run aiworkhub_task_collision_guard for the details and pause auto-pickup for that task_id.",
         "5. If Codex itself is not currently running (session ended), NOTHING fires -- there is no background process. This is the honest limit: automatic-within-a-running-loop, not automatic-when-nothing-is-running."
       ],
       "not_claimed": [
@@ -149,13 +149,13 @@
   },
   "neural_bridge_note": "This spec introduces no learned decision authority and no regex/keyword cue router: event_kind classification is a fixed 1:1 mapping from an already-recorded task-card field state (lifecycle_state, validation_status, stale threshold, presence of a usage record, collision_guard output) to one of 5 taxonomy labels -- a deterministic support-boundary/evidence-extraction mapping over existing fields, not a routing or intelligence decision. If a future task teaches a controller to PRIORITIZE or SUMMARIZE these events (e.g. which failure to fix first), that becomes a neural curriculum target per neural_bridge_priority; this task only defines the deterministic event shape it would consume.",
   "files_changed": [
-    "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_owner_notification_loop_spec_next_wave_b277_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_loop_spec_b277_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_owner_notification_loop_spec_next_wave_b277_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_owner_notification_loop_spec_b277_v1.sh"
   ],
   "production_mcp_server_api_altered": false,
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_loop_spec_b277_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_owner_notification_loop_spec_b277_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "commit_contract": "NO_COMMIT",

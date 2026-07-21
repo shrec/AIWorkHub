@@ -1,0 +1,90 @@
+{
+  "schema_id": "aiworkhub.vscode_editor_tab_release_evidence.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_VSCODE_EDITOR_TAB_RELEASE_B840_V2",
+  "created_at": "2026-07-20T17:43:00Z",
+  "worker": "codex_gpt55_aiworkhub_vscode_editor_tab_release_b840_v2",
+  "status": "pass",
+  "outputs": {
+    "extension_dir": "tools/geoai-task-mcp/vscode-extension",
+    "manifest": "tools/geoai-task-mcp/vscode-extension/package.json",
+    "extension_host": "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "marketplace_icon": "tools/geoai-task-mcp/vscode-extension/media/aiworkhub-icon.png",
+    "activity_icon": "tools/geoai-task-mcp/vscode-extension/media/aiworkhub-activity.svg",
+    "vsix": "tools/geoai-task-mcp/vscode-extension/dist/aiworkhub-0.4.0.vsix"
+  },
+  "acceptance_evidence": {
+    "editor_dashboard": {
+      "view_type": "aiworkhub.dashboard",
+      "retain_context_when_hidden": true,
+      "serializer_registered": true,
+      "default_command": "aiworkhub.openDashboard",
+      "layout": "full-width responsive editor webview"
+    },
+    "activity_bar": {
+      "view_id": "aiworkhub.view",
+      "role": "lightweight repository launcher",
+      "dashboard_rendered_in_sidebar": false
+    },
+    "canonical_identity": {
+      "command_namespace": "aiworkhub",
+      "configuration_key": "aiworkhub.refreshIntervalMs",
+      "display_name": "AIWorkHub",
+      "legacy_public_aliases_removed": true
+    },
+    "repository_binding": {
+      "multi_root_requires_quickpick": true,
+      "multi_root_implicit_first_folder_selection": false,
+      "database_path_setting": false,
+      "bootstrap_dir": ".aiworkhub",
+      "bootstrap_atomic_manifest_final_write": true
+    },
+    "mcp_runtime": {
+      "transport": "stdio",
+      "child_spawn_sites": 1,
+      "session_scope": "one child per VS Code window plus selected repository",
+      "repo_switch_disposes_old_child": true,
+      "remote_ssh_workspace_extension_kind": true,
+      "network_dashboard_required": false,
+      "module_path": "aiworkhub.server",
+      "module_path_note": "The extension starts the canonical AIWorkHub MCP module and passes repository authority through the process environment."
+    },
+    "coordinator_targets": {
+      "providers": [
+            "codex",
+            "claude"
+      ],
+      "route_identity_fields": [
+        "provider",
+        "repo_id",
+        "window_id",
+        "thread_id",
+        "session_id",
+        "claim_episode"
+      ],
+        "claude_capability_state": "callback_required",
+        "copilot_capability_state": "deferred_to_future_release",
+      "private_ui_automation": false
+    },
+    "assets": {
+      "transparent_png_integrated": true,
+      "monochrome_activity_svg_integrated": true,
+      "coordinator_generated_transparent_png_integrated": true,
+      "asset_note": "Codex integrated the approved transparent AIWorkHub hub mark at 256x256 after worker handover."
+    }
+  },
+  "validation": [
+    {
+      "command": "npm --prefix tools/geoai-task-mcp/vscode-extension test",
+      "status": "pass"
+    },
+    {
+      "command": "npm --prefix tools/geoai-task-mcp/vscode-extension run package",
+      "status": "pass"
+    },
+    {
+      "command": "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_vscode_editor_tab_release_b840_v1.json",
+      "status": "pass"
+    }
+  ],
+  "no_commit_push_release": true
+}

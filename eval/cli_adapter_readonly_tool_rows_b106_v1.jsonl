@@ -1,20 +1,20 @@
 {"case": "readonly_marker", "READONLY": true, "note": "module is a constant read-only view, not a toggle"}
 {"case": "launch_impossible_default", "launch_enabled": false, "launch_implemented": false, "note": "no launcher exists in the read path"}
-{"case": "launch_impossible_with_flag", "env": {"GEOAI_TASK_MCP_ALLOW_LAUNCH": "1", "GEOAI_TASK_MCP_ALLOW_WRITES": "1"}, "launch_enabled": false, "launch_implemented": false, "note": "flags cannot enable launch"}
+{"case": "launch_impossible_with_flag", "env": {"AIWORKHUB_ALLOW_LAUNCH": "1", "AIWORKHUB_ALLOW_WRITES": "1"}, "launch_enabled": false, "launch_implemented": false, "note": "flags cannot enable launch"}
 {"case": "plan_valid_readonly", "argv": ["claude", "-p", "hi"], "would_run_argv": ["claude", "-p", "hi"], "decision": "launch_planned", "audit_written": false, "note": "validated plan; executes nothing; appends NO audit entry"}
-{"case": "plan_valid_no_audit_append_even_allow_writes", "env": {"GEOAI_TASK_MCP_ALLOW_WRITES": "1"}, "audit_lines_appended": 0, "note": "read-only holds regardless of write gate"}
+{"case": "plan_valid_no_audit_append_even_allow_writes", "env": {"AIWORKHUB_ALLOW_WRITES": "1"}, "audit_lines_appended": 0, "note": "read-only holds regardless of write gate"}
 {"case": "plan_invalid_blocked_readonly", "argv": ["curl", "http://x"], "would_run_argv": [], "decision": "launch_blocked_invalid_command", "audit_written": false, "note": "blocked; still no write"}
 {"case": "block_arbitrary_binary", "argv": ["rm", "-rf", "/"], "expected_ok": false, "note": "not on allowlist"}
 {"case": "block_empty_argv", "argv": [], "expected_ok": false, "note": "empty argv"}
 {"case": "block_taskctl_done", "argv": ["python3", "AITools/taskctl.py", "done", "X"], "expected_ok": false, "note": "done not on worker allowlist"}
 {"case": "block_manual_only_deepseek", "argv": ["deepseek_manual"], "expected_ok": false, "is_manual_only": true, "note": "manual external adapter never a local command"}
 {"case": "redact_secret_api_key", "env_name": "OPENAI_API_KEY", "input_value": "sk-SECRET-1", "output": "<redacted-secret>", "note": "value never emitted in plan"}
-{"case": "redact_secret_token", "env_name": "GEOAI_TASK_MCP_TOKEN", "input_value": "tok-DEADBEEF", "output": "<redacted-secret>", "note": "value never emitted"}
+{"case": "redact_secret_token", "env_name": "AIWORKHUB_TOKEN", "input_value": "tok-DEADBEEF", "output": "<redacted-secret>", "note": "value never emitted"}
 {"case": "redact_nonsecret_set", "env_name": "PYTHONPATH", "input_value": "/opt/x", "output": "<set>", "note": "non-secret reports set/unset only"}
 {"case": "redact_nonsecret_unset", "env_name": "EMPTYVAR", "input_value": "", "output": "<unset>", "note": "empty -> unset"}
 {"case": "audit_summary_readonly", "reads_existing_entries": true, "audit_lines_appended": 0, "note": "core.read_audit_log wrapper; reads, never appends"}
 {"case": "combined_report", "returns": ["plan", "audit_summary"], "readonly": true, "audit_lines_appended": 0, "note": "one read-only call returns both"}
 {"case": "no_launch_code_source_scan", "forbidden_patterns_absent": ["import subprocess", "subprocess.run", "subprocess.Popen", "os.system", "os.exec", "os.fork", "shell=True", "Popen("], "note": "tool source contains none"}
-{"case": "register_surface", "registered_tools": ["geoai_cli_adapter_plan_readonly", "geoai_cli_adapter_audit_summary_readonly", "geoai_cli_adapter_report_readonly"], "count": 3, "note": "register(mcp) exposes exactly the read-only surface; server.py untouched"}
-{"case": "write_gate_off_default", "GEOAI_TASK_MCP_ALLOW_WRITES": "0", "writes_allowed": false, "note": "write gate off unless explicitly enabled"}
+{"case": "register_surface", "registered_tools": ["aiworkhub_cli_adapter_plan_readonly", "aiworkhub_cli_adapter_audit_summary_readonly", "aiworkhub_cli_adapter_report_readonly"], "count": 3, "note": "register(mcp) exposes exactly the read-only surface; server.py untouched"}
+{"case": "write_gate_off_default", "AIWORKHUB_ALLOW_WRITES": "0", "writes_allowed": false, "note": "write gate off unless explicitly enabled"}
 {"case": "parent_queue_unmutated", "cmd": "taskctl verify", "returncode": 0, "note": "no task-queue mutation"}

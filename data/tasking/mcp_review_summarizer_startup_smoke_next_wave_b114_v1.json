@@ -5,7 +5,7 @@
   "topic": "task_mcp",
   "status": "completed",
   "verdict": "PASS",
-  "notes": "B114 startup smoke complete. geoai_task_review_summarize registered, readonly flags verified, write gate default-off, no queue/audit mutation on tool listing. All no-launch invariants preserved.",
+  "notes": "B114 startup smoke complete. aiworkhub_task_review_summarize registered, readonly flags verified, write gate default-off, no queue/audit mutation on tool listing. All no-launch invariants preserved.",
   "invariants_verified": {
     "READONLY": true,
     "NO_LAUNCH": true,
@@ -26,7 +26,7 @@
     },
     {
       "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
-      "objective": "End-to-end smoke test via MCP stdio transport: start server, call geoai_task_review_summarize via JSON-RPC, verify response shape",
+      "objective": "End-to-end smoke test via MCP stdio transport: start server, call aiworkhub_task_review_summarize via JSON-RPC, verify response shape",
       "runner": "deepseek_task_mcp_review_summarizer_b115",
       "topic": "task_mcp",
       "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1"],

@@ -12,7 +12,7 @@
       "topic": "task_mcp",
       "priority": "high",
       "mode": "mcp_completion_inbox_delta_implement_readonly",
-      "objective": "Implement geoai_completion_inbox_delta(topic, since_cursor, limit) exactly per B277 section_2b/section_2 (deterministic event_id, caller-owned cursor_token format, 5-kind event envelope). Pure function over existing completion_inbox.build_completion_inbox() + core.collision_guard() + core.usage_report() outputs -- no new mutation, no cursor persisted server-side.",
+      "objective": "Implement aiworkhub_completion_inbox_delta(topic, since_cursor, limit) exactly per B277 section_2b/section_2 (deterministic event_id, caller-owned cursor_token format, 5-kind event envelope). Pure function over existing completion_inbox.build_completion_inbox() + core.collision_guard() + core.usage_report() outputs -- no new mutation, no cursor persisted server-side.",
       "acceptance": [
         "New tool registered additively in server.py; all 24 existing tools still present (list_tools count check)",
         "event_id is deterministic (same underlying state -> same event_id across two calls)",
@@ -23,14 +23,14 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (this spec)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+        "tools/aiworkhub/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+        "tools/aiworkhub/src/aiworkhub/server.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox_delta.py",
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_delta_b278_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_delta_b278_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/completion_inbox_delta.py",
+        "tools/aiworkhub/eval/mcp_completion_inbox_delta_b278_v1.json",
+        "tools/aiworkhub/tests/test_mcp_completion_inbox_delta_b278_v1.sh"
       ]
     },
     {
@@ -39,15 +39,15 @@
       "topic": "task_mcp",
       "priority": "medium",
       "mode": "codex_owned_cursor_persistence_decision",
-      "objective": "Decide and implement WHERE Codex's own orchestration loop persists since_cursor between iterations (session-local state file vs a small dedicated JSON under tools/geoai-task-mcp/data/ vs in-memory only for a single continuous session). This is a Codex-authority decision (cursor consumer identity, retention policy, multi-session semantics) that a worker cannot make unilaterally per B277 section_2b (cursor is caller-owned, not server-owned).",
+      "objective": "Decide and implement WHERE Codex's own orchestration loop persists since_cursor between iterations (session-local state file vs a small dedicated JSON under tools/aiworkhub/data/ vs in-memory only for a single continuous session). This is a Codex-authority decision (cursor consumer identity, retention policy, multi-session semantics) that a worker cannot make unilaterally per B277 section_2b (cursor is caller-owned, not server-owned).",
       "acceptance": [
         "Documented cursor storage location and retention policy",
         "Wired into Codex's existing auto-pickup-equivalent loop cadence",
-        "No change to geoai_completion_inbox_delta's stateless contract"
+        "No change to aiworkhub_completion_inbox_delta's stateless contract"
       ],
       "depends_on": "CLAUDE_TASK_MCP_COMPLETION_INBOX_DELTA_TOOL_B278_V1",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json"
+        "tools/aiworkhub/eval/task_mcp_owner_notification_loop_spec_b277_v1.json"
       ]
     }
   ],

@@ -41,14 +41,14 @@ MANIFEST_REL="tools/geoai-task-mcp/eval/mcp_unified_contract_freeze_manifest_b11
 MANIFEST="$ROOT/$MANIFEST_REL"
 EVAL_ARTIFACT="$MCPROOT/eval/mcp_unified_contract_manifest_selftest_b111_v1.json"
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b111_manifest_selftest.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b111_manifest_selftest.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== MCP Unified Contract Manifest Self-Test B111 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMP"
 
 # --- 0. self-test script holds no launch/exec/shell code (defense in depth) --
@@ -169,7 +169,7 @@ PYEOF
 
 # neg1: binding fingerprint tamper -> byte drift AND fp mismatch (both teeth)
 tamper_and_expect_fail "binding_fp" \
-    'd["per_readonly_tool"]["geoai_task_health"]["input_schema_fp"] = "deadbeef"' \
+    'd["per_readonly_tool"]["aiworkhub_task_health"]["input_schema_fp"] = "deadbeef"' \
     0 0
 
 # neg2: scaffold field tamper (NOT covered by the binding fingerprint)

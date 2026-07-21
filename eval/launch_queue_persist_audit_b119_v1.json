@@ -7,7 +7,7 @@
   "runner": "claude_task_mcp_launch_persist_b119",
   "topic": "task_mcp",
   "verdict": "PASS",
-  "summary": "Added launch_queue_persist.py: append-only JSONL persistence + read-back audit for the disabled-by-default launch_queue_contract's LaunchRequest/LaunchDecision/ProcessLogEntry schemas. persist_intent()/persist_transition() call the unmodified contract (enqueue_intent -> evaluate_launch -> build_log_entry) and append one scrubbed record per call; the log file is opened in append mode only and is never truncated or rewritten. With both env gates unset (default) every persisted record's decision/to_state is blocked_launch_disabled; forcing BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH and GEOAI_TASK_MCP_ALLOW_WRITES on still yields blocked_launch_disabled records because no launcher is implemented (LAUNCH_IMPLEMENTED stays a constant False in the contract module). No subprocess/exec/fork/spawn/system/popen/shell/network code exists anywhere in the new module. Secrets never leak: persisted env_gate_status carries only the two explicit gate NAMEs mapped to '<set>'/'<unset>' tokens, and _scrub_entry drops any stray top-level key outside the frozen ProcessLogEntry schema as defense in depth.",
+  "summary": "Added launch_queue_persist.py: append-only JSONL persistence + read-back audit for the disabled-by-default launch_queue_contract's LaunchRequest/LaunchDecision/ProcessLogEntry schemas. persist_intent()/persist_transition() call the unmodified contract (enqueue_intent -> evaluate_launch -> build_log_entry) and append one scrubbed record per call; the log file is opened in append mode only and is never truncated or rewritten. With both env gates unset (default) every persisted record's decision/to_state is blocked_launch_disabled; forcing BOTH AIWORKHUB_ALLOW_LAUNCH and AIWORKHUB_ALLOW_WRITES on still yields blocked_launch_disabled records because no launcher is implemented (LAUNCH_IMPLEMENTED stays a constant False in the contract module). No subprocess/exec/fork/spawn/system/popen/shell/network code exists anywhere in the new module. Secrets never leak: persisted env_gate_status carries only the two explicit gate NAMEs mapped to '<set>'/'<unset>' tokens, and _scrub_entry drops any stray top-level key outside the frozen ProcessLogEntry schema as defense in depth.",
   "gates": {
     "append_only_never_truncates": true,
     "append_only_byte_prefix_preserved_across_calls": true,
@@ -47,9 +47,9 @@
     ]
   },
   "env": {
-    "log_path_env": "GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH",
-    "log_path_default_rel": "tools/geoai-task-mcp/logs/launch_queue_audit.jsonl",
-    "precedence": "explicit log_path kwarg > GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH > repo-root default"
+    "log_path_env": "AIWORKHUB_LAUNCH_QUEUE_LOG_PATH",
+    "log_path_default_rel": "tools/aiworkhub/logs/launch_queue_audit.jsonl",
+    "precedence": "explicit log_path kwarg > AIWORKHUB_LAUNCH_QUEUE_LOG_PATH > repo-root default"
   },
   "public_api": {
     "resolve_log_path(repo=None, log_path=None)": "-> Path, pure, never opens the file",
@@ -62,13 +62,13 @@
   "neural_bridge_note": "This module is a deterministic evidence/audit substrate only (append-only JSONL persistence of an already-pure contract's schemas); it decides no capability. Future adapter/runner/topic launch selection remains scoped to the learned routing + abstain policy tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 -- no regex/keyword cognition becomes launch or persistence authority here.",
   "no_launch_code_marker": "This module and its test contain NO process-launch code: no subprocess import, no child-process spawn, no os-level fork/exec/spawn/system/popen, no shell invocation, no network/API call. Launch/process code arrives only in the gated Phase-2 follow-up (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1) behind all launch_preconditions.",
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-    "tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh",
-    "tools/geoai-task-mcp/eval/launch_queue_persist_audit_b119_v1.json",
-    "tools/geoai-task-mcp/data/tasking/launch_queue_persist_audit_next_wave_b119_v1.json"
+    "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+    "tools/aiworkhub/tests/test_launch_queue_persist_audit_b119_v1.sh",
+    "tools/aiworkhub/eval/launch_queue_persist_audit_b119_v1.json",
+    "tools/aiworkhub/data/tasking/launch_queue_persist_audit_next_wave_b119_v1.json"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh -> PASS",
+    "bash tools/aiworkhub/tests/test_launch_queue_persist_audit_b119_v1.sh -> PASS",
     "python3 AITools/taskctl.py verify -> PASS"
   ]
 }

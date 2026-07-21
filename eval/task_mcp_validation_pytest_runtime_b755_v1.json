@@ -3,13 +3,13 @@
   "task_id": "CLAUDE_TASK_MCP_VALIDATION_PYTEST_RUNTIME_B755_V1",
   "objective": "Close the B753/B674 false-negative path: an isolated validation run's sanitized, credential-free HOME cannot import the operator-installed pytest package, so pytest-based validation commands fail with ModuleNotFoundError instead of exercising the product under test.",
   "bug_reproduction": {
-    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "command": "python3 -m pytest -q tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
     "observed_stderr": "/usr/bin/python3: No module named pytest",
     "cause": "site.getusersitepackages() under the sanitized validation HOME has no .local/lib/pythonX/site-packages of its own; the operator's real pytest install lives only under the parent host's real HOME.",
     "reproduced_in_unittest": "TestReproducesSanitizedHomePytestImportFailure.test_pytest_module_invocation_fails_under_a_fresh_sanitized_home"
   },
   "fix_summary": {
-    "changed_file": "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
+    "changed_file": "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
     "new_functions": [
       "_is_pytest_validation_command(argv) -> bool",
       "resolve_trusted_pytest_runtime_root() -> Path"
@@ -30,7 +30,7 @@
     {
       "acceptance": "Reproduce python3 -m pytest import failure under the current sanitized validation HOME while parent-host pytest is installed.",
       "status": "done",
-      "evidence": "TestReproducesSanitizedHomePytestImportFailure; also directly reproduced live in this session: `python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py` -> `/usr/bin/python3: No module named pytest`."
+      "evidence": "TestReproducesSanitizedHomePytestImportFailure; also directly reproduced live in this session: `python3 -m pytest -q tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py` -> `/usr/bin/python3: No module named pytest`."
     },
     {
       "acceptance": "For pytest validation only, resolve one canonical trusted Python package root, reject symlinks/untrusted ownership/world-writable paths, bind it read-only and prepend only that exact path to PYTHONPATH while preserving the card's relative project PYTHONPATH.",
@@ -50,11 +50,11 @@
     {
       "acceptance": "Use a standalone unittest-compatible regression command so this task's own validation does not depend on the bug it repairs.",
       "status": "done",
-      "evidence": "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py is stdlib unittest only (no pytest import) and is run directly via `python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py`."
+      "evidence": "tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py is stdlib unittest only (no pytest import) and is run directly via `python3 tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py`."
     }
   ],
   "test_results": {
-    "command": "python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py -v",
+    "command": "python3 tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py -v",
     "result": "Ran 14 tests: 13 passed, 1 skipped",
     "skipped_test": {
       "name": "TestResolveTrustedPytestRuntimeRoot.test_world_writable_root_is_rejected",

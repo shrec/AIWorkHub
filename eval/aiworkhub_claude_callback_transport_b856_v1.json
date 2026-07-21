@@ -1,0 +1,133 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CLAUDE_CALLBACK_TRANSPORT_B856_V1",
+  "schema": "aiworkhub.eval.compact_v1",
+  "scope": "backend-only Claude coordinator callback transport (VS Code UI/extension out of scope, owned by B855)",
+  "changed_files": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_claude_callback_transport_b856_v1.json"
+  ],
+  "design_summary": {
+    "mode_detection": "ClaudeCallbackAdapter.mode: panel (wake_transport injected) > cli_resume (ClaudeCliResumeClient configured) > unavailable (neither) -- capability-detected, never faked.",
+    "cli_transport": "ClaudeCliResumeClient shells out via build_claude_resume_command('claude', resume_session_id=...) + injectable run_fn; requires the response envelope to echo back the exact event_id/request_id sent before treating anything as delivered.",
+    "route_resolution": "CallbackBridge._deliver_batch_via_claude_cli builds a CoordinatorRouteKey via fail_on_incomplete_coordinator_route(repo_id, provider='claude', window_id, task_id, session_id) before invoking the CLI transport; repo_id/window_id are required non-empty constructor args (fail closed at construction, no cross-repository fallback).",
+    "outbox_reuse": "No taskdb.py schema change (out of allowed_writes). Claude session_id is carried in the existing origin_thread_id-keyed outbox column (validate_origin_thread_id already accepts UUID-shaped values). Provider dimension is a deployment/config distinction (transport='claude_cli' bridge instance = a dedicated claude-routed queue), never a second callback database.",
+    "busy_and_unavailable": "ClaudeCliBusyError and ClaudeCliUnavailableError both subclass BusyThreadError, so the existing, UNMODIFIED _process_batch busy-catch (defer_batch_busy, never dead-letters) durably parks both conditions. Only genuine protocol/ack-mismatch failures (ClaudeCliProtocolError) retain the bounded retry/dead-letter path.",
+    "status_contract": "CallbackBridge.claude_status() reports mode/transport/session_suffix (redacted_thread_suffix only)/pending_count/last_delivery_at/last_deferral_reason/health, sourced from the same taskdb.callback_outbox_stats() as health(); raw session id is never stored or serialized."
+  },
+  "acceptance_criteria": [
+    {
+      "id": "1_mode_detection",
+      "requirement": "Replace hard-coded unavailable path with panel/cli_resume/unavailable mode detection",
+      "tests": [
+        "test_mode_is_unavailable_with_no_transport_configured",
+        "test_mode_is_panel_when_wake_transport_supplied",
+        "test_mode_is_cli_resume_when_cli_client_configured",
+        "test_panel_takes_priority_over_cli_resume_when_both_configured",
+        "test_unavailable_mode_never_reports_panel_delivered"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "2_route_resolution",
+      "requirement": "Resolve repo_id/window_id/session_id via CoordinatorRouteKey, fail closed, no cross-repo fallback",
+      "tests": [
+        "test_claude_route_requires_session_id_fails_closed",
+        "test_claude_route_never_accepts_cross_repository_identity_reuse",
+        "test_adapter_rejects_non_claude_route",
+        "test_claude_cli_transport_requires_repo_and_window_identity_fail_closed"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "3_exactly_once_ack_before_delivered",
+      "requirement": "delivered only after a genuine matching ack; duplicate events idempotent",
+      "tests": [
+        "test_cli_client_requires_matching_ack_before_delivered",
+        "test_cli_client_delivers_on_genuine_matching_ack",
+        "test_adapter_never_marks_delivered_without_calling_cli_transport",
+        "test_e2e_review_ready_outbox_claude_transport_ack_delivered"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "4_busy_park_never_dead_letter",
+      "requirement": "active turn -> durable park, never parallel injection, never dead-letter",
+      "tests": [
+        "test_cli_client_detects_busy_session_as_busy_error",
+        "test_adapter_busy_defers_durably_without_raising_by_default",
+        "test_adapter_busy_raises_claude_cli_busy_error_subclass_of_busy_thread_error_when_asked",
+        "test_e2e_busy_session_parks_durably_never_dead_letters"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "5_reuse_durable_outbox_no_second_db",
+      "requirement": "participate in the existing taskdb.py outbox/lease/dedup machinery, no second_callback_database",
+      "tests": [
+        "test_e2e_review_ready_outbox_claude_transport_ack_delivered",
+        "test_e2e_busy_session_parks_durably_never_dead_letters",
+        "test_e2e_unavailable_cli_stays_pending_not_lost"
+      ],
+      "status": "pass",
+      "note": "No taskdb.py schema/file changes; CallbackBridge/_process_batch/claim_pending_callback_batch/mark_batch_delivered/defer_batch_busy/fail_batch_transient are reused unmodified for the claude_cli transport branch."
+    },
+    {
+      "id": "6_field_safety",
+      "requirement": "only task_id/state/event_id/request_id ever reach Claude; no worker output/prompt injection surface",
+      "tests": [
+        "test_build_claude_resume_command_is_pure_and_injectable",
+        "test_claude_cli_client_prompt_still_goes_through_the_same_safe_builder"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "7_status_health_redaction",
+      "requirement": "mode/redacted session suffix/pending age/last reason/health; never raw session_id in json output",
+      "tests": [
+        "test_claude_status_never_exposes_raw_session_id",
+        "test_e2e_busy_session_parks_durably_never_dead_letters"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "8_capability_negative",
+      "requirement": "unavailable panel never reported delivered; unavailable CLI stays pending, not lost/dead-lettered",
+      "tests": [
+        "test_unavailable_cli_executable_stays_pending_not_dead_lettered",
+        "test_claude_cli_unavailable_error_is_a_busy_thread_error_subclass",
+        "test_adapter_no_transport_configured_never_dead_letters_stays_pending",
+        "test_e2e_unavailable_cli_stays_pending_not_lost"
+      ],
+      "status": "pass"
+    },
+    {
+      "id": "9_codex_regression",
+      "requirement": "existing Codex callback behavior/tests unchanged",
+      "tests": [
+        "tools/geoai-task-mcp/tests/test_callback_bridge.py (full suite, 104 tests, unmodified expectations)"
+      ],
+      "status": "pass"
+    }
+  ],
+  "validation": {
+    "pytest_new_and_existing": "128 passed (24 new B856 + 104 existing Codex callback_bridge tests, zero existing test files modified)",
+    "commands": [
+      "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+      "python3 AITools/taskctl.py verify",
+      "python3 AITools/taskctl.py collision-guard --print"
+    ]
+  },
+  "forbidden_checklist": {
+    "unverified_private_extension_api": "not touched (no VS Code UI files edited)",
+    "ui_keystroke_or_clipboard_injection": "none",
+    "worker_output_in_callback": "no such parameter exists on build_callback_prompt/deliver_callback (verified by signature test)",
+    "cross_repository_session_fallback": "fail_on_incomplete_coordinator_route requires repo_id/window_id explicitly; CallbackBridge(transport='claude_cli') requires claude_repo_id/claude_window_id at construction",
+    "mark_delivered_before_ack": "mark_batch_delivered only called after deliver_or_defer returns (which itself requires a genuine matching ack from ClaudeCliResumeClient)",
+    "drop_on_busy": "ClaudeCliBusyError/ClaudeCliUnavailableError both subclass BusyThreadError -> durable park via defer_batch_busy, never dropped",
+    "http_dashboard_server": "none added",
+    "second_callback_database": "none added; reuses AITools/taskdb.py callback_outbox/callback_batches unmodified",
+    "git_commit": "not run (NO_COMMIT)",
+    "git_push": "not run"
+  }
+}

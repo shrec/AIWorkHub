@@ -4,7 +4,7 @@
   "task_id": "CLAUDE_SONNET5_TASK_MCP_VSCODE_DASHBOARD_EXTENSION_B445_V1",
   "date": "2026-07-16",
   "verdict": "BUILT_TESTS_PASS_BLOCKED_ON_DASHBOARD_ANTI_FRAMING_HEADERS",
-  "summary": "Built a self-contained VS Code Remote workspace extension (tools/vscode-geoai-task-operations) that surfaces the existing Task MCP dashboard as an Activity Bar launcher/status view plus one retained full-editor WebviewPanel, sourcing data exclusively from the dashboard's own /api/* endpoints. Health check runs on the remote/workspace extension host against the raw configured loopback URL; on failure with autoStart=true it starts exactly one repo-local `python3 -m geoai_task_mcp.dashboard` process (never a duplicate, only its own process ever killed) and polls /healthz with a bounded 20x500ms retry. The client-facing iframe address is resolved separately via vscode.env.asExternalUri so Remote-SSH needs no manual port forwarding. All 16 static smoke assertions pass, `taskctl verify` and `collision-guard` both pass. One real, structural blocker was found and is NOT hidden: tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py::DashboardRequestHandler._send_bytes unconditionally sends X-Frame-Options: DENY and CSP frame-ancestors 'none' on every response (static + /api/*), which a browser enforces regardless of the embedding webview's own CSP -- so the iframe will show a browser-level refusal until a separate follow-up task (outside this task's allowed_writes) relaxes those headers for the VS Code webview origin. Everything else in the contract (config, commands, panel reuse, autostart bounds/ownership, CSP restriction, no secrets/LAN IP/Simple Browser) is implemented and verified.",
+  "summary": "Built a self-contained VS Code Remote workspace extension (tools/vscode-geoai-task-operations) that surfaces the existing Task MCP dashboard as an Activity Bar launcher/status view plus one retained full-editor WebviewPanel, sourcing data exclusively from the dashboard's own /api/* endpoints. Health check runs on the remote/workspace extension host against the raw configured loopback URL; on failure with autoStart=true it starts exactly one repo-local `python3 -m aiworkhub.dashboard` process (never a duplicate, only its own process ever killed) and polls /healthz with a bounded 20x500ms retry. The client-facing iframe address is resolved separately via vscode.env.asExternalUri so Remote-SSH needs no manual port forwarding. All 16 static smoke assertions pass, `taskctl verify` and `collision-guard` both pass. One real, structural blocker was found and is NOT hidden: tools/aiworkhub/src/aiworkhub/dashboard.py::DashboardRequestHandler._send_bytes unconditionally sends X-Frame-Options: DENY and CSP frame-ancestors 'none' on every response (static + /api/*), which a browser enforces regardless of the embedding webview's own CSP -- so the iframe will show a browser-level refusal until a separate follow-up task (outside this task's allowed_writes) relaxes those headers for the VS Code webview origin. Everything else in the contract (config, commands, panel reuse, autostart bounds/ownership, CSP restriction, no secrets/LAN IP/Simple Browser) is implemented and verified.",
   "changed_paths": [
     "tools/vscode-geoai-task-operations/package.json",
     "tools/vscode-geoai-task-operations/extension.js",
@@ -12,7 +12,7 @@
     "tools/vscode-geoai-task-operations/README.md",
     "tools/vscode-geoai-task-operations/install_remote.sh",
     "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
-    "tools/geoai-task-mcp/eval/task_mcp_vscode_dashboard_extension_b445_v1.json"
+    "tools/aiworkhub/eval/task_mcp_vscode_dashboard_extension_b445_v1.json"
   ],
   "no_writes_outside_allowed": true,
   "existing_dashboard_and_other_extension_untouched": true,
@@ -58,7 +58,7 @@
     "extension_kind": "workspace",
     "health_check_runs_on": "remote/workspace extension host, against the raw loopback dashboardUrl (never the client-resolved address)",
     "client_facing_address": "vscode.env.asExternalUri(dashboardUrl) -- resolves VS Code's own tunnel; no owner-managed port forwarding required",
-    "autostart_process": "spawned on the remote/workspace host via workspace .venv (tools/geoai-task-mcp/.venv/bin/python3 preferred, falls back to .venv/bin/python3 then bare python3) with PYTHONPATH=tools/geoai-task-mcp/src, loopback host, configured port",
+    "autostart_process": "spawned on the remote/workspace host via workspace .venv (tools/aiworkhub/.venv/bin/python3 preferred, falls back to .venv/bin/python3 then bare python3) with PYTHONPATH=tools/aiworkhub/src, loopback host, configured port",
     "duplicate_prevention": "module-level dashboardProc handle checked before every spawn attempt",
     "process_ownership_on_stop": "only a process this extension itself started (dashboardProcOwned) is ever killed, on Restart Task Dashboard or deactivate"
   },
@@ -75,7 +75,7 @@
   "blocker": {
     "id": "dashboard_frame_ancestors_none",
     "severity": "blocks_end_to_end_iframe_render",
-    "location": "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py:DashboardRequestHandler._send_bytes",
+    "location": "tools/aiworkhub/src/aiworkhub/dashboard.py:DashboardRequestHandler._send_bytes",
     "description": "Every dashboard HTTP response (static assets and /api/*) unconditionally sends X-Frame-Options: DENY and Content-Security-Policy: ...; frame-ancestors 'none'. Browsers enforce frame-ancestors at the framed document, independent of the parent webview's own CSP, so the dashboard currently refuses to render inside this (or any) iframe.",
     "why_not_fixed_here": "dashboard.py is outside this task's allowed_writes (tools/vscode-geoai-task-operations/** and this eval JSON only); modifying it is explicitly out of scope for a worker-scoped write boundary.",
     "unblocks_when": "a separate, explicitly-scoped follow-up task relaxes dashboard.py's anti-framing headers for the VS Code webview origin (e.g. an allowlisted frame-ancestors value derived from the resolved asExternalUri origin, or a dedicated embed-mode flag), then a live reload/install verifies the iframe actually renders end-to-end.",
@@ -84,7 +84,7 @@
   "manual_handoff": {
     "install": "bash tools/vscode-geoai-task-operations/install_remote.sh",
     "after_install": "Run 'Developer: Reload Window' (or restart the extension host)",
-    "open": "Run command: GeoAI Tasks: Open Operations Dashboard (or click the GeoAI Tasks Activity Bar icon)",
+    "open": "Run command: AIWorkHub Tasks: Open Operations Dashboard (or click the AIWorkHub Tasks Activity Bar icon)",
     "worker_did_not_install_or_reload": true
   },
   "codex_review_requested": true,

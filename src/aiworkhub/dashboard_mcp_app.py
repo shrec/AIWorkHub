@@ -1,0 +1,413 @@
+"""Narrow, read-only MCP tool surface for the native VS Code Task Operations app.
+
+B615 replaces the iframe-embedded HTTP dashboard with a native VS Code
+Webview whose extension host talks to the Task MCP server over stdio. These
+three tools are the ENTIRE data surface the Webview needs: they call
+``dashboard.build_snapshot()`` / ``dashboard.build_task_detail()`` -- the
+same canonical builders the existing HTTP dashboard's ``/api/snapshot`` and
+``/api/task`` routes already use -- and add nothing except a defensive
+transport-size bound and task_id validation. No SQLite/taskctl read is
+duplicated here; no code path in this module can write queue/audit state or
+launch a process.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any, Mapping
+
+from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, task_store
+
+
+# Hard bound on the serialized tool response so a very large queue (many
+# thousands of process-log rows, a big cost ledger) can never balloon a
+# single MCP stdio response. This defends the transport only -- it never
+# changes what build_snapshot()/build_task_detail() compute, only how much of
+# it survives one tool call. Every drop is reported, never silent.
+MAX_SNAPSHOT_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_TASK_DETAIL_RESPONSE_BYTES = 1 * 1024 * 1024
+
+# Largest / least essential first. status_counts, tasks, and row_counts are
+# never trimmed by this list -- they are what the summary strip and task
+# table need on every refresh.
+_SNAPSHOT_TRIM_ORDER: tuple[str, ...] = (
+    "agent_processes",
+    "cost_usage",
+    "completion_inbox",
+    "collision_report",
+    "callback_bridge_health",
+    "summaries",
+    "warnings",
+)
+
+# Detail fields trimmed, largest first, only if the single-task payload is
+# still over budget (a huge validation_output/result blob on one card).
+_DETAIL_TRIM_FIELDS: tuple[str, ...] = (
+    "result",
+    "worker_result",
+    "completion_summary",
+    "review_summary",
+    "review_notes",
+    "validation_output",
+    "ai_infra_context",
+)
+
+# Bound on the Live Output tool's serialized response.
+MAX_LIVE_OUTPUT_BYTES = 64 * 1024
+
+# The ONE genuine "repository has never been initialized" reason prefix
+# ``task_store.storage_readiness`` can produce: ``inspect_repository`` raised
+# ``ManifestMissingError`` because no ``.aiworkhub/project.json`` has ever
+# been written. Every other ``storage_readiness`` reason (a corrupt/
+# mismatched storage registry, a missing/corrupt canonical DB, a schema or
+# quick_check failure, a manifest with the wrong schema/layout version) is a
+# REAL failure, not "never initialized" -- ``is_not_initialized_reason`` must
+# return False for those so the dashboard never tells a user with a corrupt
+# repository to "just click Init Repo" as though nothing has happened yet.
+_NOT_INITIALIZED_REASON_PREFIXES: tuple[str, ...] = ("manifest_invalid:manifest_missing",)
+
+
+def is_not_initialized_reason(reason: str) -> bool:
+    """True only for the genuine "never initialized" storage_readiness
+    reason -- never for a corrupt/mismatched registry, a missing/corrupt
+    canonical DB, or a schema/quick_check failure. Callers (health_view,
+    snapshot_view) use this to decide whether "Initialize AIWorkHub" is the
+    correct recommended action, so a real corruption is never masked as
+    "just click init"."""
+    text = str(reason or "")
+    return any(text.startswith(prefix) for prefix in _NOT_INITIALIZED_REASON_PREFIXES)
+
+
+def _readonly_authority_flags() -> dict[str, bool]:
+    return {
+        "readonly": True,
+        "queue_write": False,
+        "audit_write": False,
+        "process_launch": False,
+        "agent_launch": False,
+        "shell_invocation": False,
+    }
+
+
+def _byte_len(payload: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    )
+
+
+def _bound_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Trim the largest secondary sections until the snapshot fits the bound.
+
+    Never mutates the input; returns a shallow copy with 0+ fields replaced
+    by ``{"transport_truncated": true}`` and every trimmed field name
+    reported in ``transport_truncated_fields``.
+    """
+    result = dict(snapshot)
+    truncated: list[str] = []
+    for field in _SNAPSHOT_TRIM_ORDER:
+        if _byte_len(result) <= MAX_SNAPSHOT_RESPONSE_BYTES:
+            break
+        if result.get(field):
+            result[field] = {"transport_truncated": True}
+            truncated.append(field)
+    if truncated:
+        result["transport_truncated_fields"] = truncated
+    return result
+
+
+def _bound_task_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
+    """Trim the largest task fields until one task's detail fits the bound."""
+    result = dict(detail)
+    if _byte_len(result) <= MAX_TASK_DETAIL_RESPONSE_BYTES:
+        return result
+    task = dict(result.get("task") or {})
+    truncated: list[str] = []
+    for field in _DETAIL_TRIM_FIELDS:
+        if _byte_len({**result, "task": task}) <= MAX_TASK_DETAIL_RESPONSE_BYTES:
+            break
+        if field in task:
+            task[field] = "(transport_truncated)"
+            truncated.append(field)
+    result["task"] = task
+    if truncated:
+        result["transport_truncated_fields"] = truncated
+    return result
+
+
+def snapshot_view() -> dict[str, Any]:
+    """READ-ONLY: canonical dashboard snapshot for the native Webview.
+
+    Calls ``dashboard.build_snapshot()`` -- the SAME builder the HTTP
+    dashboard's ``/api/snapshot`` route uses -- and returns the identical
+    ``status_counts``, ``tasks``, ``row_counts``, ``summaries``,
+    ``cost_usage``, ``agent_processes``, and ``warnings`` shape the existing
+    dashboard.js already renders. Adds no second SQLite/taskctl read; only
+    applies the defensive transport bound documented on
+    ``MAX_SNAPSHOT_RESPONSE_BYTES``.
+    """
+    snapshot = dict(dashboard.build_snapshot())
+    storage = snapshot.get("storage")
+    if isinstance(storage, dict) and not storage.get("ready", True):
+        storage = dict(storage)
+        storage["not_initialized"] = is_not_initialized_reason(storage.get("reason", ""))
+        snapshot["storage"] = storage
+    snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"
+    snapshot["authority_flags"] = _readonly_authority_flags()
+    return _bound_snapshot(snapshot)
+
+
+def task_detail_view(task_id: str) -> dict[str, Any]:
+    """READ-ONLY: canonical detail for exactly one bounded task_id.
+
+    Validates ``task_id`` with the identical pattern the HTTP dashboard's
+    ``/api/task`` route enforces (``dashboard._TASK_ID_RE``) BEFORE ever
+    calling the provider, then calls ``dashboard.build_task_detail()`` -- the
+    same canonical builder ``/api/task`` uses. An invalid or unknown task_id
+    returns a bounded ``ok: false`` object; this never raises and never
+    reaches a write path.
+    """
+    candidate = str(task_id or "").strip()
+    if not dashboard._TASK_ID_RE.fullmatch(candidate):
+        return {
+            "ok": False,
+            "error": "invalid_task_id",
+            "server_tool": "aiworkhub_dashboard_task_detail",
+            "authority_flags": _readonly_authority_flags(),
+        }
+    detail = dashboard.build_task_detail(candidate)
+    if detail is None:
+        return {
+            "ok": False,
+            "error": "task_not_found",
+            "task_id": candidate,
+            "server_tool": "aiworkhub_dashboard_task_detail",
+            "authority_flags": _readonly_authority_flags(),
+        }
+    response = dict(detail)
+    response["ok"] = True
+    response["server_tool"] = "aiworkhub_dashboard_task_detail"
+    response["authority_flags"] = _readonly_authority_flags()
+    return _bound_task_detail(response)
+
+
+def health_view() -> dict[str, Any]:
+    """READ-ONLY: cheap liveness check for the Webview's connection banner.
+
+    Reads canonical repo-local storage directly.  The native dashboard must
+    not depend on a repository shipping ``AITools/taskctl.py`` merely to
+    render its connection banner.  Never calls ``dashboard.build_snapshot``:
+    polling stays cheap and cannot pull the queue/cost/process payload.
+    """
+    root_raw = str(os.environ.get("AIWORKHUB_REPO_ROOT") or "").strip()
+    if not root_raw:
+        result: dict[str, Any] = {
+            "ok": False,
+            "repo": "",
+            "storage": {
+                "ready": False,
+                "reason": "repo_root_not_selected",
+                "not_initialized": is_not_initialized_reason("repo_root_not_selected"),
+            },
+            "error": "repo_root_not_selected",
+        }
+    else:
+        readiness = task_store.storage_readiness(root_raw)
+        storage = readiness.as_dict()
+        if not readiness.ready:
+            storage["not_initialized"] = is_not_initialized_reason(readiness.reason)
+        result = {
+            "ok": bool(readiness.ready),
+            "repo": root_raw,
+            "storage": storage,
+        }
+    result["server_version"] = __version__
+    result["server_tool"] = "aiworkhub_dashboard_health"
+    result["authority_flags"] = _readonly_authority_flags()
+    # B857: best-effort dispatcher health -- never lets a dispatcher-side
+    # failure break this cheap connection-banner check. An uninitialized
+    # repository reports dispatcher status "uninitialized", not an error.
+    try:
+        result["dispatcher"] = core.dispatcher_health()
+    except Exception as exc:  # noqa: BLE001 -- health surface must never raise
+        result["dispatcher"] = {"ok": False, "status": "error", "error": f"dispatcher_health_failed:{type(exc).__name__}"}
+    return result
+
+
+def _initialize_authority_flags() -> dict[str, bool]:
+    return {
+        "readonly": False,
+        "queue_write": False,
+        "audit_write": False,
+        "process_launch": False,
+        "agent_launch": False,
+        "shell_invocation": False,
+        "repository_bootstrap_write": True,
+    }
+
+
+# Only a repo_id shaped like the extension's own generator output
+# (``repo_<32 lowercase hex>``) is honored as an identity expectation. Any
+# other value (e.g. the extension's "manifest-missing"/"manifest-invalid"
+# placeholder labels for a never-initialized repository) is treated as "no
+# expectation yet" so a legitimate first-time init is never refused by
+# accidentally adopting a placeholder string as the permanent repo_id.
+_REAL_REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
+
+
+def initialize_view(repo_id: str = "") -> dict[str, Any]:
+    """WRITE (bootstrap-only): the one bounded, idempotent, fail-closed
+    initialization action the Webview's "Initialize AIWorkHub" button
+    invokes.
+
+    Bound to the active repository via ``AIWORKHUB_REPO_ROOT`` (the same env
+    var the extension host spawns this child process with -- never a fixed
+    path relative to this package's own install location) and, when the
+    caller supplies one, an expected ``repo_id`` that must match any existing
+    manifest exactly. Creates/repairs ``.aiworkhub/project.json``,
+    ``.aiworkhub/config/storage.json``, and a fresh, schema-only canonical
+    ``.aiworkhub/tasking/task_queue.sqlite``. Never imports or deletes any
+    legacy database -- a brand-new canonical DB is always empty.
+    """
+    root = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+    if not root:
+        return {
+            "ok": False,
+            "error": "initialization_refused",
+            "message": "repository_root_not_bound",
+            "server_tool": "aiworkhub_dashboard_initialize",
+            "authority_flags": _initialize_authority_flags(),
+        }
+    candidate = str(repo_id or "").strip()
+    expected = candidate if _REAL_REPO_ID_RE.match(candidate) else None
+    try:
+        # Routes through repository_bootstrap.initialize_repository_full so
+        # the same bounded action ALSO provisions the Source Graph directory
+        # (never a second, separate init step) -- see repository_bootstrap.py.
+        result = repository_bootstrap.initialize_repository_full(root, expected_repo_id=expected)
+    except task_store.InitializationRefusedError as exc:
+        return {
+            "ok": False,
+            "error": "initialization_refused",
+            "message": str(exc)[:300],
+            "server_tool": "aiworkhub_dashboard_initialize",
+            "authority_flags": _initialize_authority_flags(),
+        }
+    except task_store.TaskStoreError as exc:
+        return {
+            "ok": False,
+            "error": "initialization_failed",
+            "message": str(exc)[:300],
+            "server_tool": "aiworkhub_dashboard_initialize",
+            "authority_flags": _initialize_authority_flags(),
+        }
+    response = dict(result)
+    response["server_tool"] = "aiworkhub_dashboard_initialize"
+    response["authority_flags"] = _initialize_authority_flags()
+    return response
+
+
+def task_live_output_view(task_id: str, cursor: int = 0) -> dict[str, Any]:
+    """READ-ONLY: bounded, single-task Live Output read for the dashboard's
+    selected-task panel.
+
+    Validates ``task_id`` with the same pattern every other task-scoped tool
+    enforces (``dashboard._TASK_ID_RE``) BEFORE calling
+    ``process_launcher.read_live_output_for_task`` -- the ONLY task this call
+    ever reads process-log/stdout/stderr evidence for; there is no
+    dashboard-wide fan-out across other tasks. An invalid task_id, or any
+    unexpected failure resolving the active repository, returns a bounded
+    ``ok: false`` object; this never raises.
+    """
+    candidate = str(task_id or "").strip()
+    if not dashboard._TASK_ID_RE.fullmatch(candidate):
+        return {
+            "ok": False,
+            "error": "invalid_task_id",
+            "server_tool": "aiworkhub_dashboard_task_live_output",
+            "authority_flags": _readonly_authority_flags(),
+        }
+    try:
+        safe_cursor = max(0, int(cursor))
+    except (TypeError, ValueError):
+        safe_cursor = 0
+
+    try:
+        repo_root = dashboard._default_repo_root()
+        result = process_launcher.read_live_output_for_task(
+            candidate,
+            repo=repo_root,
+            cursor=safe_cursor,
+            max_bytes=MAX_LIVE_OUTPUT_BYTES,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed, one task's read never crashes the tool call
+        result = {
+            "ok": False,
+            "task_id": candidate,
+            "error": "output_unavailable",
+            "reason": f"repository_unresolved:{type(exc).__name__}",
+            "cursor": safe_cursor,
+            "next_cursor": safe_cursor,
+            "truncated": False,
+            "output": "",
+            "stderr_tail": "",
+        }
+    response = dict(result)
+    response["server_tool"] = "aiworkhub_dashboard_task_live_output"
+    response["authority_flags"] = _readonly_authority_flags()
+    return response
+
+
+READONLY_TOOL_NAMES: tuple[str, ...] = (
+    "aiworkhub_dashboard_snapshot",
+    "aiworkhub_dashboard_task_detail",
+    "aiworkhub_dashboard_health",
+)
+
+# Stable tool_name -> callable map for server wiring / introspection. Kept
+# to this exact set of three (unchanged since B615/B853) so any existing
+# consumer asserting this precise tuple keeps passing; the newer
+# task-live-output tool is additive and lives in LIVE_OUTPUT_TOOLS below.
+READONLY_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_snapshot": snapshot_view,
+    "aiworkhub_dashboard_task_detail": task_detail_view,
+    "aiworkhub_dashboard_health": health_view,
+}
+
+# The one bounded write-capable tool: repository initialization. Kept
+# separate from READONLY_TOOLS/READONLY_TOOL_NAMES so its non-read-only
+# authority is never accidentally treated as part of the read-only surface.
+INITIALIZE_TOOL_NAME = "aiworkhub_dashboard_initialize"
+INITIALIZE_TOOLS: dict[str, Any] = {INITIALIZE_TOOL_NAME: initialize_view}
+
+# B855: the single-task Live Output tool. Read-only (no queue/audit write,
+# no process launch) exactly like READONLY_TOOLS, but kept in its own
+# name/dict pair -- additive to the historical READONLY_TOOL_NAMES/
+# READONLY_TOOLS tuple/dict so an existing exact-tuple assertion on those two
+# names (see tests/test_aiworkhub_vscode_release_b853.py) keeps passing
+# unchanged.
+LIVE_OUTPUT_TOOL_NAME = "aiworkhub_dashboard_task_live_output"
+LIVE_OUTPUT_TOOLS: dict[str, Any] = {LIVE_OUTPUT_TOOL_NAME: task_live_output_view}
+
+
+def register(mcp: Any) -> tuple[str, ...]:
+    """Register the dashboard MCP tools; return their names.
+
+    Accepts any object exposing a FastMCP-style ``tool(name=...)`` decorator
+    factory (mirrors ``cli_adapter_readonly_tool.register``). Every tool in
+    ``READONLY_TOOLS`` plus ``LIVE_OUTPUT_TOOLS`` (snapshot, task detail,
+    health, task live output) is read-only: none writes queue/audit state
+    and none launches a process. ``aiworkhub_dashboard_initialize`` is the
+    sole bounded exception -- it only ever creates/repairs the repository's
+    own ``.aiworkhub`` manifest, storage registry, canonical task DB, and
+    Source Graph directory (see
+    ``repository_bootstrap.initialize_repository_full``).
+    """
+    for name, fn in READONLY_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in LIVE_OUTPUT_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in INITIALIZE_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    return READONLY_TOOL_NAMES + (LIVE_OUTPUT_TOOL_NAME,) + (INITIALIZE_TOOL_NAME,)

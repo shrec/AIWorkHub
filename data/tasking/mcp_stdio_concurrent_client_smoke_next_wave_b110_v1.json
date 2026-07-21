@@ -3,7 +3,7 @@
   "parent_task": "CLAUDE_TASK_MCP_STDIO_CONCURRENT_CLIENT_SMOKE_B110_V1",
   "date": "2026-07-04",
   "status": "proposed_not_queued",
-  "notes": "PROPOSAL only, NOT enqueued into any live queue (worker does NOT create tasks via taskctl; Codex triages). B110 extended the B109 real-stdio single-session smoke to CONCURRENCY: it opens TWO independent mcp.client.stdio.stdio_client subprocess sessions to the geoai-task-mcp server at the SAME TIME (overlapping lifetimes forced by an asyncio.Barrier(2): neither session proceeds to tools/call until BOTH have initialized and listed tools, so both server subprocesses are provably alive at once) and drives every read-only tool from BOTH over real OS pipes. It re-proves the SAME frozen contract v1 under concurrency: 11 read-only + 4 write-gated tools visible (15 total) in BOTH sessions, all inputSchema sha256 fingerprints byte-identical to B108 in each session and identical across the two concurrent sessions (no drift), and zero queue/audit writes with GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1 run concurrently in both children (each session's isolated audit dir byte-identical + empty, parent queue verify-intact). Adds a falsifiable NO-CROSS-SESSION-BLEED teeth: each session uses a DISTINCT runner identity (alpha/bravo) and a DISTINCT private audit dir; each session's pending_for_runner result echoes ONLY its own runner and never the other's (application-layer teeth), and audit dirs stay isolated + empty (MCP-owned-state teeth). Determinism proven by running the smoke TWICE and asserting the path-free run_signature is byte-identical. concurrent_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/agent_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. Only the MCP server subprocess is launched per session (sys.executable -m geoai_task_mcp.server); no shell, no agent/model process, no network. Neural-control-first: this is a deterministic transport/coordination VALIDATOR (evidence extractor / dry-run harness), never runtime cognition; adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), and no regex/keyword cue router is introduced here as launch authority.",
+  "notes": "PROPOSAL only, NOT enqueued into any live queue (worker does NOT create tasks via taskctl; Codex triages). B110 extended the B109 real-stdio single-session smoke to CONCURRENCY: it opens TWO independent mcp.client.stdio.stdio_client subprocess sessions to the aiworkhub server at the SAME TIME (overlapping lifetimes forced by an asyncio.Barrier(2): neither session proceeds to tools/call until BOTH have initialized and listed tools, so both server subprocesses are provably alive at once) and drives every read-only tool from BOTH over real OS pipes. It re-proves the SAME frozen contract v1 under concurrency: 11 read-only + 4 write-gated tools visible (15 total) in BOTH sessions, all inputSchema sha256 fingerprints byte-identical to B108 in each session and identical across the two concurrent sessions (no drift), and zero queue/audit writes with AIWORKHUB_ALLOW_WRITES unset AND =1 run concurrently in both children (each session's isolated audit dir byte-identical + empty, parent queue verify-intact). Adds a falsifiable NO-CROSS-SESSION-BLEED teeth: each session uses a DISTINCT runner identity (alpha/bravo) and a DISTINCT private audit dir; each session's pending_for_runner result echoes ONLY its own runner and never the other's (application-layer teeth), and audit dirs stay isolated + empty (MCP-owned-state teeth). Determinism proven by running the smoke TWICE and asserting the path-free run_signature is byte-identical. concurrent_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/agent_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. Only the MCP server subprocess is launched per session (sys.executable -m aiworkhub.server); no shell, no agent/model process, no network. Neural-control-first: this is a deterministic transport/coordination VALIDATOR (evidence extractor / dry-run harness), never runtime cognition; adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), and no regex/keyword cue router is introduced here as launch authority.",
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_STDIO_CONCURRENT_RESULT_SCHEMA_FREEZE_B111_V1",
@@ -11,9 +11,9 @@
       "goal": "Combine B110 concurrency with the B109 OUTPUT/result contract freeze: run TWO concurrent stdio subprocess sessions and freeze each read-only tool's structured-result key/type skeleton (volatile fields normalized) over the SAME real pipe from BOTH sessions at once, asserting the result-skeleton fingerprints are byte-identical to the frozen set in each session and identical across the two concurrent sessions. Read-only; only the MCP server launched; no queue/audit write; no shell.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_concurrent_result_schema_freeze.py",
-        "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_result_schema_freeze_b111_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_stdio_concurrent_result_schema_freeze_b111_v1.json"
+        "tools/aiworkhub/tests/mcp_stdio_concurrent_result_schema_freeze.py",
+        "tools/aiworkhub/tests/test_mcp_stdio_concurrent_result_schema_freeze_b111_v1.sh",
+        "tools/aiworkhub/eval/mcp_stdio_concurrent_result_schema_freeze_b111_v1.json"
       ],
       "acceptance": [
         "two concurrent stdio sessions each freeze the read-only result skeleton by fingerprint over real pipes",
@@ -27,9 +27,9 @@
       "goal": "Generalize B110 from 2 to N concurrent stdio subprocess sessions (N derived from cpu budget, adaptive not hardcoded: N = max(2, min(cpu_count-1, cap))) to stress the frozen contract + no-bleed + no-write proof under real fan-out concurrency, with an asyncio.Barrier(N) overlap proof and per-session distinct runner + isolated audit dir. Assert every session sees the frozen fingerprints, no session's pending_for_runner echoes any other session's runner, all isolated audit dirs stay empty, and the parent queue stays verify-intact.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_nway_concurrent_smoke.py",
-        "tools/geoai-task-mcp/tests/test_mcp_stdio_nway_concurrent_smoke_b111_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_stdio_nway_concurrent_smoke_b111_v1.json"
+        "tools/aiworkhub/tests/mcp_stdio_nway_concurrent_smoke.py",
+        "tools/aiworkhub/tests/test_mcp_stdio_nway_concurrent_smoke_b111_v1.sh",
+        "tools/aiworkhub/eval/mcp_stdio_nway_concurrent_smoke_b111_v1.json"
       ],
       "acceptance": [
         "N concurrent stdio sessions (N adaptive from cpu budget) all see the frozen fingerprints under Barrier(N) overlap",
@@ -44,7 +44,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->adapter/runner/topic routing + abstain labels",

@@ -3,16 +3,16 @@
   "parent_task": "CLAUDE_TASK_MCP_LAUNCH_DISABLED_QUEUE_CONTRACT_B117_V1",
   "date": "2026-07-05",
   "status": "proposal",
-  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). The launch-queue contract stays PURE and launch DISABLED by default. Every follow-up keeps launch disabled until the FINAL gated task wires GEOAI_TASK_MCP_ALLOW_LAUNCH, and only behind ALL launch_preconditions (both gates + allowlist + collision preflight + cwd/env sandbox + concurrency cap + audit). Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). The launch-queue contract stays PURE and launch DISABLED by default. Every follow-up keeps launch disabled until the FINAL gated task wires AIWORKHUB_ALLOW_LAUNCH, and only behind ALL launch_preconditions (both gates + allowlist + collision preflight + cwd/env sandbox + concurrency cap + audit). Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_LAUNCH_QUEUE_PERSIST_AUDIT_B118_V1",
       "goal": "Add append-only persistence + audit for launch-queue state transitions, reusing core.write_audit_entry (env NAME->status tokens only, never values). Every request still terminates blocked_launch_disabled while the gate is off; the pure contract's build_log_entry SHAPE becomes the on-disk record. No agent process spawned.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b118_v1.sh",
-        "tools/geoai-task-mcp/eval/launch_queue_persist_audit_b118_v1.json"
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/tests/test_launch_queue_persist_audit_b118_v1.sh",
+        "tools/aiworkhub/eval/launch_queue_persist_audit_b118_v1.json"
       ],
       "acceptance": [
         "state transitions round-trip through append-only persistence",
@@ -22,12 +22,12 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_LAUNCH_PLAN_TOOL_DRYRUN_B118_V1",
-      "goal": "Expose a read-only geoai_launch_plan MCP tool that returns describe_intent() (would-run argv + resolved adapter + collision preflight) and executes nothing. Dry-run is the only behaviour; starts no process even with ALLOW_LAUNCH unset.",
+      "goal": "Expose a read-only aiworkhub_launch_plan MCP tool that returns describe_intent() (would-run argv + resolved adapter + collision preflight) and executes nothing. Dry-run is the only behaviour; starts no process even with ALLOW_LAUNCH unset.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_launch_plan_tool_dryrun_b118_v1.sh",
-        "tools/geoai-task-mcp/eval/launch_plan_tool_dryrun_b118_v1.json"
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_launch_plan_tool_dryrun_b118_v1.sh",
+        "tools/aiworkhub/eval/launch_plan_tool_dryrun_b118_v1.json"
       ],
       "acceptance": [
         "plan tool returns a plan dict and spawns no process with ALLOW_LAUNCH unset",
@@ -40,9 +40,9 @@
       "goal": "Add the static runner/topic allowlist safety boundary (which runner/topic pairs may EVER be prepared for a future launch); any unknown/off-topic pair is blocked and audited. Static human-configured boundary only; NOT the intelligence layer (learned selection is deferred to the neural migration).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_runner_topic_allowlist.py",
-        "tools/geoai-task-mcp/tests/test_launch_runner_topic_allowlist_b118_v1.sh",
-        "tools/geoai-task-mcp/eval/launch_runner_topic_allowlist_b118_v1.json"
+        "tools/aiworkhub/src/aiworkhub/launch_runner_topic_allowlist.py",
+        "tools/aiworkhub/tests/test_launch_runner_topic_allowlist_b118_v1.sh",
+        "tools/aiworkhub/eval/launch_runner_topic_allowlist_b118_v1.json"
       ],
       "acceptance": [
         "unknown/off-topic runner-topic pair is blocked and audited",
@@ -56,7 +56,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->adapter/runner/topic routing + abstain labels",
@@ -66,13 +66,13 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1",
-      "goal": "FINAL: wire the GEOAI_TASK_MCP_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate; permit a real launch ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass (allowlist, collision preflight, cwd/env sandbox, concurrency cap, audit). Default stays fully disabled; rollback = unset the flag; the executor adapter never reviews/finalizes its own task.",
+      "goal": "FINAL: wire the AIWORKHUB_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate; permit a real launch ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass (allowlist, collision preflight, cwd/env sandbox, concurrency cap, audit). Default stays fully disabled; rollback = unset the flag; the executor adapter never reviews/finalizes its own task.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_orch_gated_enablement_b106_v1.sh",
-        "tools/geoai-task-mcp/eval/orch_gated_enablement_b106_v1.json"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_orch_gated_enablement_b106_v1.sh",
+        "tools/aiworkhub/eval/orch_gated_enablement_b106_v1.json"
       ],
       "acceptance": [
         "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",

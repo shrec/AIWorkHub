@@ -7,12 +7,12 @@
   "summary": "Reproduced and repaired the retained-worktree disk leak: ProcessManager._finalize_isolated_request intentionally sets cleanup=False for every non-success terminal state (validation_failed/cancelled/scope_rejected/worker_failed/timed_out/promotion_conflict/finalize_failed) so a human/Codex reviewer can inspect the isolated git worktree + HOME before it is deleted, but nothing ever revisited those retained directories once the coordinator finished reviewing and ran taskctl done/archive -- the workspace stayed on disk forever. Added a fail-closed GC pass (ProcessManager._gc_finalized_workspace(s)) wired into the existing ProcessManager.reconcile() entry point (the same call task_reconciler.py's scan loop already runs on every interval), plus a shared, reusable path-shape validator (worker_workspace.assert_gc_safe_workspace_shape) that re-derives the one legal <configured_root>/<request_id>/{worktree,home} location from request_id alone and never trusts persisted metadata blindly. 26/26 new tests pass; the pre-existing durable-reconciler suite (test_task_liveness_reconciler.py) stays green except two pre-existing, unrelated environment failures (a supervisor heartbeat timing test and a missing scripts/ file, both untouched by this diff -- see known_environment_gaps).",
   "root_cause": {
     "description": "cleanup=False on every failure terminal path in _finalize_isolated_request is a deliberate, documented design decision (retain evidence for coordinator review), not a bug. The gap is that no code path EVER revisits a retained workspace after the coordinator's own accept/reject decision (taskctl done -> status=finished, or taskctl archive -> archived_at set). ProcessManager only re-scans persisted requests when a NEW instance is constructed or an explicit status/list_processes/reconcile call happens (same structural class of gap as the B411/B412 launcher-loss regression this repo already fixed for exited-but-unfinalized workers), and even then the re-scan only finalizes; it never garbage-collects an already-finalized, already-retained workspace.",
-    "additional_finding": "core._lifecycle_state (tools/geoai-task-mcp/src/geoai_task_mcp/core.py:480-503) never checks card['archived_at'] -- it can only return finished/blocked/review/processing/pending, never 'archived' (AITools/taskdb.py's canonical_status treats a non-empty archived_at as taking priority over every other field). A GC keyed off core._lifecycle_state alone would never become eligible for an archived task; process_launcher._canonical_task_status fixes this locally for the GC path without touching core.py's existing, load-bearing behavior."
+    "additional_finding": "core._lifecycle_state (tools/aiworkhub/src/aiworkhub/core.py:480-503) never checks card['archived_at'] -- it can only return finished/blocked/review/processing/pending, never 'archived' (AITools/taskdb.py's canonical_status treats a non-empty archived_at as taking priority over every other field). A GC keyed off core._lifecycle_state alone would never become eligible for an archived task; process_launcher._canonical_task_status fixes this locally for the GC path without touching core.py's existing, load-bearing behavior."
   },
   "fix": {
     "files_changed": [
-      "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+      "tools/aiworkhub/src/aiworkhub/process_launcher.py"
     ],
     "worker_workspace_py": [
       "Added configured_worktree_root(): factored the WORKTREE_ROOT_ENV/tempdir default computation out of create_workspace() into one shared function so a GC path can re-derive the exact same root create_workspace() itself used, instead of duplicating/drifting the logic.",
@@ -24,7 +24,7 @@
       "Added _process_proven_dead(pid, ticks): the fail-closed, opposite-biased counterpart to the existing _pid_matches (which is written to favor 'still the same process' for cancel/liveness). GC needs 'not proven dead' to mean 'do nothing' -- an alive PID with unknown/unrecorded start ticks is NOT proof of death.",
       "Added ProcessManager._gc_finalized_workspace(request_id, event): the single-request, fail-closed GC evaluator. Requires, in order: event.state in GC_CANDIDATE_PROCESS_STATES, event.workspace_retained is true, request_id not in _active_request_ids() (belt-and-suspenders against the in-memory live registry), a readable+parseable *.request.json whose workspace.request_id/repo match exactly, a successful task_id lookup whose canonical status (via _canonical_task_status) is finished or archived, _process_proven_dead(pid, ticks) true, and assert_gc_safe_workspace_shape() passing. Only then calls the EXISTING cleanup_workspace() (already idempotent by construction: existence-guarded git-worktree-remove, ignore_errors=True rmtree) and appends one auditable event that copies the request's own current terminal state unchanged (never altering the task's terminal outcome or any earlier review/release callback transition) plus bounded, non-secret GC evidence fields (workspace_gc, workspace_gc_at, workspace_gc_reason, workspace_retained=false). Every failure mode returns a bounded {'gc': false, 'reason': ...} instead of deleting anything.",
       "Added ProcessManager._gc_finalized_workspaces(): the per-scan sweep over _latest_by_request(), calling _gc_finalized_workspace per candidate (each under its own _registry_lock() critical section, mirroring _reconcile_persisted_requests's existing per-request locking style rather than one lock held across the whole scan).",
-      "ProcessManager.reconcile() now also calls _gc_finalized_workspaces() and merges gc_scanned/gc_cleaned/gc_skipped into its return dict -- the ONE required integration point: task_reconciler.py's existing scan loop (daemon or run-once) already calls reconcile() on GEOAI_TASK_MCP_RECONCILER_SCAN_INTERVAL_SECONDS, so a finalized workspace is swept within one normal reconciliation interval with no new daemon, no cron, and no broad rm -rf."
+      "ProcessManager.reconcile() now also calls _gc_finalized_workspaces() and merges gc_scanned/gc_cleaned/gc_skipped into its return dict -- the ONE required integration point: task_reconciler.py's existing scan loop (daemon or run-once) already calls reconcile() on AIWORKHUB_RECONCILER_SCAN_INTERVAL_SECONDS, so a finalized workspace is swept within one normal reconciliation interval with no new daemon, no cron, and no broad rm -rf."
     ],
     "invariants_preserved": [
       "never_weakens_retention: cleanup=False in _finalize_isolated_request is completely untouched; a workspace is retained for review exactly as before. GC only ever acts strictly AFTER the coordinator has independently finished/archived the task.",
@@ -35,8 +35,8 @@
     ]
   },
   "tests": {
-    "new_test_file": "tools/geoai-task-mcp/tests/test_finalized_workspace_gc_b512_v1.py",
-    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_finalized_workspace_gc_b512_v1.py",
+    "new_test_file": "tools/aiworkhub/tests/test_finalized_workspace_gc_b512_v1.py",
+    "command": "python3 -m pytest -q tools/aiworkhub/tests/test_finalized_workspace_gc_b512_v1.py",
     "result": "26 passed",
     "cases": [
       "test_finalized_task_with_dead_process_is_gc_cleaned",
@@ -66,9 +66,9 @@
       "test_gc_never_invokes_review_or_release_callbacks_and_leaves_task_card_untouched",
       "test_reconcile_wires_gc_into_the_existing_reconciliation_entry_point"
     ],
-    "regression_check_command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_task_liveness_reconciler.py",
+    "regression_check_command": "python3 -m pytest -q tools/aiworkhub/tests/test_task_liveness_reconciler.py",
     "regression_check_result": "21 passed, 2 failed (both pre-existing, unrelated -- see known_environment_gaps)",
-    "note_on_test_environment": "This isolated worktree lacks geoai_task_mcp/project_context.py -- an uncommitted sibling file in the parent repo not declared in this task's read_first/allowed_writes, so worktree seeding never copied it in. process_launcher.py imports it unconditionally at module scope, so test_task_liveness_reconciler.py (pre-existing, unmodified by this task) fails to collect here too. This test file installs a minimal local stub (mirroring the existing deepseek_credentials stub pattern already used by test_task_liveness_reconciler.py and test_process_launcher_security.py) so the GC logic can be exercised end-to-end in this sandbox; the coordinator's real environment has the real module and needs no stub."
+    "note_on_test_environment": "This isolated worktree lacks aiworkhub/project_context.py -- an uncommitted sibling file in the parent repo not declared in this task's read_first/allowed_writes, so worktree seeding never copied it in. process_launcher.py imports it unconditionally at module scope, so test_task_liveness_reconciler.py (pre-existing, unmodified by this task) fails to collect here too. This test file installs a minimal local stub (mirroring the existing deepseek_credentials stub pattern already used by test_task_liveness_reconciler.py and test_process_launcher_security.py) so the GC logic can be exercised end-to-end in this sandbox; the coordinator's real environment has the real module and needs no stub."
   },
   "known_environment_gaps": {
     "description": "Two pre-existing failures observed while regression-checking test_task_liveness_reconciler.py (a file this task did not modify) are environment/sandbox limitations, not caused by this diff:",
@@ -80,7 +80,7 @@
       },
       {
         "test": "test_service_can_write_lifecycle_and_see_isolated_worktrees",
-        "reason": "Reads tools/geoai-task-mcp/scripts/geoai-task-reconciler.service, which is missing from this isolated worktree for the same seeding-scope reason as project_context.py (not in read_first/allowed_writes, not yet git-committed).",
+        "reason": "Reads tools/aiworkhub/scripts/geoai-task-reconciler.service, which is missing from this isolated worktree for the same seeding-scope reason as project_context.py (not in read_first/allowed_writes, not yet git-committed).",
         "reproduces_without_this_diffs_changes": true
       }
     ],

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ── test_mcp_review_summarizer_startup_smoke_b114_v1.sh ─────────────
 # B114 startup smoke test: MCP server module surface exposes
-# geoai_task_review_summarize with readonly flags, write gate default-off,
+# aiworkhub_task_review_summarize with readonly flags, write gate default-off,
 # and no queue mutation on tool listing.
 #
 # This test imports the server module directly (no process launch, no
@@ -11,25 +11,25 @@ set -euo pipefail
 # verifies tool registration and authority flag invariants.
 #
 # Usage:
-#   GEOAI_TASK_MCP_ALLOW_WRITES=0 bash \
+#   AIWORKHUB_ALLOW_WRITES=0 bash \
 #     tools/geoai-task-mcp/tests/test_mcp_review_summarizer_startup_smoke_b114_v1.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 echo "=== B114 MCP Review Summarizer Startup Smoke Test ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 # ── 1. Validate ALLOW_WRITES is off ─────────────────────────────────
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 
@@ -39,14 +39,14 @@ python3 -c "
 import sys, os
 sys.path.insert(0, os.path.join('$MCPROOT', 'src'))
 
-import geoai_task_mcp.server as server_mod
-from geoai_task_mcp import review_summarizer
+import aiworkhub.server as server_mod
+from aiworkhub import review_summarizer
 
 mcp = server_mod.mcp
 tm = mcp._tool_manager
 tools = tm._tools if hasattr(tm, '_tools') else {}
 
-REQUIRED_TOOL = 'geoai_task_review_summarize'
+REQUIRED_TOOL = 'aiworkhub_task_review_summarize'
 assert REQUIRED_TOOL in tools, \
     f'TOOL_MISSING: {REQUIRED_TOOL} not registered. Tools: {sorted(tools.keys())}'
 print(f'  PASS tool_registered: {REQUIRED_TOOL} found in tool list')
@@ -99,7 +99,7 @@ echo "--- Readonly flags ---"
 python3 -c "
 import sys, os
 sys.path.insert(0, os.path.join('$MCPROOT', 'src'))
-from geoai_task_mcp import review_summarizer
+from aiworkhub import review_summarizer
 
 flags = review_summarizer._authority_flags()
 print(f'  authority_flags: {flags}')
@@ -141,7 +141,7 @@ echo "--- Write gate default-off ---"
 python3 -c "
 import sys, os
 sys.path.insert(0, os.path.join('$MCPROOT', 'src'))
-from geoai_task_mcp import core, review_summarizer
+from aiworkhub import core, review_summarizer
 
 # write gate is default-off: ALLOW_WRITES=0 in env
 write_gate_on = core.writes_allowed()
@@ -183,14 +183,14 @@ else:
 print(f'  queue sha256 before: {before_sha}')
 
 # Import server module (this triggers tool registration, not execution)
-import geoai_task_mcp.server as _server_mod
+import aiworkhub.server as _server_mod
 
 # Access tool list (no tool execution)
 mcp = _server_mod.mcp
 tm = mcp._tool_manager
 tools = list((tm._tools if hasattr(tm, '_tools') else {}).keys())
 print(f'  tools listed: {len(tools)} tools')
-assert 'geoai_task_review_summarize' in tools, 'tool missing after import'
+assert 'aiworkhub_task_review_summarize' in tools, 'tool missing after import'
 
 # Snapshot queue sha256 after
 if os.path.exists(QUEUE_PATH):
@@ -241,8 +241,8 @@ import sys, os
 sys.path.insert(0, os.path.join('$MCPROOT', 'src'))
 
 # Import the server module — must not launch any subprocess during import
-import geoai_task_mcp.server as server_mod
-from geoai_task_mcp import review_summarizer
+import aiworkhub.server as server_mod
+from aiworkhub import review_summarizer
 
 # Verify SUBPROCESS_LAUNCH_TRIPWIRE is 0
 assert review_summarizer.SUBPROCESS_LAUNCH_TRIPWIRE == 0, \
@@ -261,7 +261,7 @@ assert 'multiprocessing' not in dir(review_summarizer), 'multiprocessing importe
 print('  PASS no_multiprocessing_import: review_summarizer does not import multiprocessing')
 
 # Verify the core module does not auto-launch
-from geoai_task_mcp import core
+from aiworkhub import core
 assert hasattr(core, 'run_taskctl'), 'core.run_taskctl missing'
 assert callable(core.run_taskctl), 'core.run_taskctl not callable'
 print('  PASS core.run_taskctl_callable: core can run taskctl but does not auto-launch')

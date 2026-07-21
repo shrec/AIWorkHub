@@ -16,7 +16,7 @@
   "write_lane_claimants_classification": [
     {
       "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_ENFORCEMENT_B119_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/core.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/core.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
@@ -24,7 +24,7 @@
     },
     {
       "task_id": "DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/core.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/core.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
@@ -32,7 +32,7 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_PATCH_B06_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/core.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/core.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
@@ -41,28 +41,28 @@
     {
       "task_id": "CLAUDE_TASK_MCP_AUTOPICKUP_DRYRUN_B118_V1",
       "write_paths": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/src/aiworkhub/server.py"
       ],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
-      "evidence": "auto_pickup_dryrun() + eligible_dryrun_candidates() + _lifecycle_state() + _compact_card() in core.py lines 283-374; geoai_task_auto_pickup_dryrun MCP tool registered in server.py line 74. B118 dry-run is live."
+      "evidence": "auto_pickup_dryrun() + eligible_dryrun_candidates() + _lifecycle_state() + _compact_card() in core.py lines 283-374; aiworkhub_task_auto_pickup_dryrun MCP tool registered in server.py line 74. B118 dry-run is live."
     },
     {
       "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_B104_V1",
       "write_paths": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/src/aiworkhub/server.py"
       ],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
-      "evidence": "read_audit_log() in core.py lines 437-497; geoai_task_audit_log_read MCP tool registered in server.py line 125. B104 audit log read is live."
+      "evidence": "read_audit_log() in core.py lines 437-497; aiworkhub_task_audit_log_read MCP tool registered in server.py line 125. B104 audit log read is live."
     },
     {
       "task_id": "CLAUDE_TASK_MCP_READONLY_TOOL_SERVER_WIRING_B107_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/server.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/server.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
@@ -70,27 +70,27 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_E2E_B116_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/server.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/server.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
-      "evidence": "geoai_task_codex_handoff + geoai_task_codex_handoff_markdown MCP tools registered in server.py lines 145-195. B116 handoff is live."
+      "evidence": "aiworkhub_task_codex_handoff + aiworkhub_task_codex_handoff_markdown MCP tools registered in server.py lines 145-195. B116 handoff is live."
     },
     {
       "task_id": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B119_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/server.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/server.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
-      "evidence": "geoai_task_codex_handoff_markdown tool lives in server.py (same registration as B116 E2E, markdown renderer integrated)."
+      "evidence": "aiworkhub_task_codex_handoff_markdown tool lives in server.py (same registration as B116 E2E, markdown renderer integrated)."
     },
     {
       "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
-      "write_paths": ["tools/geoai-task-mcp/src/geoai_task_mcp/server.py"],
+      "write_paths": ["tools/aiworkhub/src/aiworkhub/server.py"],
       "status": "finished",
       "worker_status": "done",
       "classification": "ALREADY_DONE",
-      "evidence": "geoai_task_review_summarize MCP tool registered in server.py lines 133-141. B111 review summarizer wiring is live."
+      "evidence": "aiworkhub_task_review_summarize MCP tool registered in server.py lines 133-141. B111 review summarizer wiring is live."
     }
   ],
 
@@ -153,8 +153,8 @@
       {
         "risk_id": "R1_concurrent_worker_dirty_source",
         "severity": "LOW",
-        "detail": "tools/geoai-task-mcp is a nested git repo. If another worker has uncommitted dirty changes to core.py or server.py at the time B08 wiring is applied, a merge conflict could occur. Mitigation: the B08 wiring coder should check `git status` in tools/geoai-task-mcp before applying patches.",
-        "mitigation": "Pre-flight: git status in tools/geoai-task-mcp; abort if core.py or server.py are dirty from another task."
+        "detail": "tools/aiworkhub is a nested git repo. If another worker has uncommitted dirty changes to core.py or server.py at the time B08 wiring is applied, a merge conflict could occur. Mitigation: the B08 wiring coder should check `git status` in tools/aiworkhub before applying patches.",
+        "mitigation": "Pre-flight: git status in tools/aiworkhub; abort if core.py or server.py are dirty from another task."
       },
       {
         "risk_id": "R2_future_wave_enablement",
@@ -172,7 +172,7 @@
       {
         "step": 0,
         "name": "preflight_git_status",
-        "action": "In tools/geoai-task-mcp nested repo: git status -- core.py server.py. Abort if dirty from another task.",
+        "action": "In tools/aiworkhub nested repo: git status -- core.py server.py. Abort if dirty from another task.",
         "owner": "B08 wiring coder",
         "safe_if": "core.py and server.py are clean OR dirty only from the coder's own B08 patch"
       },
@@ -180,7 +180,7 @@
         "step": 1,
         "name": "apply_core_py_patch",
         "action": "Add supervisor_loop_status() pure function to core.py per B08 contract derivation_algorithm ordered_steps 1-7. Insert after existing read_audit_log() function (after line ~497). Reuse show_task, check_runner_topic_allowlist, collision_guard, _lifecycle_state — zero new subprocess/exec/network calls.",
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "path": "tools/aiworkhub/src/aiworkhub/core.py",
         "insert_after_line_approx": 497,
         "owner": "B08 wiring coder",
         "safe_if": "step 0 passed"
@@ -188,8 +188,8 @@
       {
         "step": 2,
         "name": "apply_server_py_patch",
-        "action": "Register @mcp.tool() geoai_supervisor_loop_status in server.py calling core.supervisor_loop_status(...). Insert after geoai_task_codex_handoff_markdown registration (after line ~195), before cli_adapter_readonly_tool.register(mcp) call. Same FROZEN READ-ONLY CONTRACT style as geoai_task_codex_handoff (B116).",
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "action": "Register @mcp.tool() aiworkhub_supervisor_loop_status in server.py calling core.supervisor_loop_status(...). Insert after aiworkhub_task_codex_handoff_markdown registration (after line ~195), before cli_adapter_readonly_tool.register(mcp) call. Same FROZEN READ-ONLY CONTRACT style as aiworkhub_task_codex_handoff (B116).",
+        "path": "tools/aiworkhub/src/aiworkhub/server.py",
         "insert_after_line_approx": 195,
         "owner": "B08 wiring coder",
         "safe_if": "step 1 applied cleanly"
@@ -213,18 +213,18 @@
   },
 
   "b08_contract_cross_reference": {
-    "contract_path": "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+    "contract_path": "tools/aiworkhub/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
     "future_source_patch_paths": [
       {
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "path": "tools/aiworkhub/src/aiworkhub/core.py",
         "change_summary": "Add supervisor_loop_status(task_id, runner, topic, previous_snapshot, reported_validation_verdict) implementing derivation_algorithm 7 ordered_steps",
         "requires_source_patch": true,
         "applied_by": "future coder task (B08 wiring)",
         "b09_status": "LANE_CLEAR"
       },
       {
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "change_summary": "Register @mcp.tool() geoai_supervisor_loop_status in FROZEN READ-ONLY CONTRACT style",
+        "path": "tools/aiworkhub/src/aiworkhub/server.py",
+        "change_summary": "Register @mcp.tool() aiworkhub_supervisor_loop_status in FROZEN READ-ONLY CONTRACT style",
         "requires_source_patch": true,
         "applied_by": "future coder task (B08 wiring)",
         "b09_status": "LANE_CLEAR"

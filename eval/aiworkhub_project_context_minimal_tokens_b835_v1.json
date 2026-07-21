@@ -1,0 +1,39 @@
+{
+  "fixture": {
+    "description": "Representative B834-shaped fixture: Source Graph + session current-state evidence with non-zero hits, AI Memory and KB both zero-hit optional tools.",
+    "session_evidence_bytes": 994,
+    "source_graph_evidence_bytes": 234,
+    "zero_hit_optional_tools": [
+      "ai_memory",
+      "kb"
+    ]
+  },
+  "runner": "claude_sonnet5_aiworkhub_project_context_minimal_tokens_b835_v1",
+  "safety": {
+    "b434_b437_regressions_preserved": true,
+    "b829_eval_artifacts_untouched": true,
+    "max_bundle_bytes_fail_closed": true,
+    "metadata_observability_preserved": true,
+    "source_graph_first_fail_closed": true
+  },
+  "schema_id": "aiworkhub.task_mcp.project_context_minimal_tokens.b835.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_PROJECT_CONTEXT_MINIMAL_TOKENS_B835_V1",
+  "token_economy": {
+    "after_bundle_bytes": 1644,
+    "approximate_token_estimate_after": 411,
+    "approximate_token_estimate_before_card_reference": 1068,
+    "before_bundle_bytes_card_reference_b834": 4272,
+    "before_bundle_bytes_measured_pre_change": 4044,
+    "byte_cap_gate": 2100,
+    "json_double_encoding_avoided": true,
+    "json_double_encoding_note": "Tool JSON is canonicalized once with compact separators and embedded as a single already-minimal JSON-text string; no second json.dumps pass or indent-driven padding is applied to it. Full nested-object (non-string) embedding for source_graph/session content was evaluated but rejected: it breaks the pinned regression fixtures in test_worker_project_context_b434_v1.py and test_worker_ai_infra_context_b437_v1.py, which call json.loads(section['content']) and require content to stay a parseable JSON string.",
+    "meets_50pct_reduction_gate": true,
+    "meets_byte_cap_gate": true,
+    "non_empty_evidence_count": 2,
+    "omitted_zero_hit_optional_count": 2,
+    "reduction_ratio_vs_card_reference_b834": 0.6152,
+    "reduction_ratio_vs_measured_pre_change": 0.5935,
+    "token_estimate_label": "byte_count_divided_by_4_heuristic_not_exact_provider_token_or_cost_truth"
+  },
+  "verdict": "PASS"
+}

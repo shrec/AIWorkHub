@@ -1,0 +1,109 @@
+{
+  "name": "aiworkhub",
+  "displayName": "AIWorkHub",
+  "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
+  "version": "0.6.0",
+  "publisher": "shrec",
+  "license": "MIT",
+  "icon": "media/aiworkhub-icon.png",
+  "extensionKind": [
+    "workspace"
+  ],
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "aiworkhub",
+    "mcp",
+    "dashboard",
+    "remote-ssh"
+  ],
+  "activationEvents": [
+    "onCommand:aiworkhub.openDashboard",
+    "onCommand:aiworkhub.refreshDashboard",
+    "onCommand:aiworkhub.restartDashboard",
+    "onCommand:aiworkhub.selectRepository",
+    "onView:aiworkhub.view",
+    "onWebviewPanel:aiworkhub.dashboard"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "test": "node test/extension-static.test.js",
+    "package": "node test/package-vsix.js"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aiworkhub",
+          "title": "AIWorkHub",
+          "icon": "media/aiworkhub-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "aiworkhub": [
+        {
+          "type": "webview",
+          "id": "aiworkhub.view",
+          "name": "AIWorkHub"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aiworkhub.openDashboard",
+        "title": "AIWorkHub: Open Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "aiworkhub.refreshDashboard",
+        "title": "AIWorkHub: Refresh Dashboard",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aiworkhub.restartDashboard",
+        "title": "AIWorkHub: Restart MCP Connection",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "aiworkhub.selectRepository",
+        "title": "AIWorkHub: Select Repository",
+        "icon": "$(repo)"
+      }
+    ],
+    "configuration": {
+      "title": "AIWorkHub",
+      "properties": {
+        "aiworkhub.refreshIntervalMs": {
+          "type": "number",
+          "default": 30000,
+          "enum": [
+            10000,
+            30000,
+            60000
+          ],
+          "description": "Default auto-refresh interval in milliseconds for a newly opened AIWorkHub dashboard editor tab."
+        },
+        "aiworkhub.pythonPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Optional Python executable containing the installed aiworkhub package. Empty uses the selected repository's .venv/bin/python3 or python3 from PATH."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shrec/AIWorkingHub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shrec/AIWorkingHub/issues"
+  },
+  "homepage": "https://github.com/shrec/AIWorkingHub"
+}

@@ -17,7 +17,7 @@ set -euo pipefail
 # an input fp, an output-schema fp, a result-skeleton fp, and the manifest
 # self-fingerprint, and assert the gate exits non-zero each time.
 #
-# Read-only; launches no agent/model; GEOAI_TASK_MCP_ALLOW_WRITES irrelevant.
+# Read-only; launches no agent/model; AIWORKHUB_ALLOW_WRITES irrelevant.
 # Isolation: all artifacts in a private mktemp dir; no shared file mutated.
 # Parallel-safe.
 # ---------------------------------------------------------------------------
@@ -29,14 +29,14 @@ B108="$MCPROOT/tests/mcp_client_smoke_contract_freeze.py"
 B109="$MCPROOT/tests/mcp_readonly_result_schema_freeze.py"
 MANIFEST="$MCPROOT/eval/mcp_unified_contract_freeze_manifest_b110_v1.json"
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b110_unified_gate.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b110_unified_gate.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== MCP Unified Contract Freeze Gate Test B110 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMP"
 
 # --- 0. gate script holds no launch/exec/shell code (defense in depth) ------
@@ -125,27 +125,27 @@ PYEOF
 
 # 3a. input-schema drift on a read-only tool
 mutate_and_expect_fail "input_ro" "$R108" \
-    'd["detail"]["frozen_schema_fingerprints"]["geoai_task_list"] = "deadbeef"' \
+    'd["detail"]["frozen_schema_fingerprints"]["aiworkhub_task_list"] = "deadbeef"' \
     "input_schema_drift"
 
 # 3b. write-gated input-schema drift
 mutate_and_expect_fail "input_wg" "$R108" \
-    'd["detail"]["frozen_schema_fingerprints"]["geoai_task_auto_pickup"] = "deadbeef"' \
+    'd["detail"]["frozen_schema_fingerprints"]["aiworkhub_task_auto_pickup"] = "deadbeef"' \
     "write_gated_input_drift"
 
 # 3c. output-schema drift on a read-only tool
 mutate_and_expect_fail "output_ro" "$R109" \
-    'd["detail"]["frozen_output_schema_fingerprints"]["geoai_task_show"] = "deadbeef"' \
+    'd["detail"]["frozen_output_schema_fingerprints"]["aiworkhub_task_show"] = "deadbeef"' \
     "output_schema_drift"
 
 # 3d. result-skeleton drift on a read-only tool
 mutate_and_expect_fail "skel_ro" "$R109" \
-    'd["detail"]["frozen_result_skeleton_fingerprints"]["geoai_task_health"] = "deadbeef"' \
+    'd["detail"]["frozen_result_skeleton_fingerprints"]["aiworkhub_task_health"] = "deadbeef"' \
     "result_skeleton_drift"
 
 # 3e. manifest tamper (self-fingerprint no longer matches binding)
 mutate_and_expect_fail "manifest_tamper" "$MANIFEST" \
-    'd["per_readonly_tool"]["geoai_task_health"]["input_schema_fp"] = "deadbeef"' \
+    'd["per_readonly_tool"]["aiworkhub_task_health"]["input_schema_fp"] = "deadbeef"' \
     "manifest_fingerprint"
 
 echo "all negative drift injections correctly rejected: OK"

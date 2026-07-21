@@ -7,12 +7,12 @@
 
   "this_task_scope": {
     "artifacts_added_or_modified": [
-      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (supervisor_loop_status, LIFECYCLE_TO_SUPERVISOR_STATE, _parse_show_task_card, _extract_collision_report -- additive append only)",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_supervisor_loop_status tool -- additive insert only)",
-      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_b11_v1.json",
-      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_wiring_rows_b11_v1.jsonl",
-      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_wiring_next_wave_b11_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh"
+      "tools/aiworkhub/src/aiworkhub/core.py (supervisor_loop_status, LIFECYCLE_TO_SUPERVISOR_STATE, _parse_show_task_card, _extract_collision_report -- additive append only)",
+      "tools/aiworkhub/src/aiworkhub/server.py (aiworkhub_supervisor_loop_status tool -- additive insert only)",
+      "tools/aiworkhub/eval/task_mcp_supervisor_loop_status_wiring_b11_v1.json",
+      "tools/aiworkhub/eval/task_mcp_supervisor_loop_status_wiring_rows_b11_v1.jsonl",
+      "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_status_wiring_next_wave_b11_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_status_wiring_b11_v1.sh"
     ],
     "source_code_changed": true,
     "source_code_change_type": "additive_append_only_no_existing_lines_touched",
@@ -31,7 +31,7 @@
     "proposed_next_wave_tasks": [
       {
         "task_id_suggestion": "MCP_SUPERVISOR_LOOP_STATUS_REAL_CALLER_INTEGRATION_V1",
-        "summary": "Wire an actual Codex/supervisor consumer to call geoai_supervisor_loop_status with a real previous_snapshot held from its own last observation, instead of the current per-call synthetic/no-snapshot usage in this task's tests. This is a caller-side integration task, not a change to the tool itself.",
+        "summary": "Wire an actual Codex/supervisor consumer to call aiworkhub_supervisor_loop_status with a real previous_snapshot held from its own last observation, instead of the current per-call synthetic/no-snapshot usage in this task's tests. This is a caller-side integration task, not a change to the tool itself.",
         "owner": "future integration task, not created by this worker",
         "requires_source_patch": "caller-side only; supervisor_loop_status itself needs no change"
       }
@@ -40,7 +40,7 @@
 
   "required_tests_verified_by_this_task": [
     "core.supervisor_loop_status callable + LIFECYCLE_TO_SUPERVISOR_STATE mapping exact",
-    "server.geoai_supervisor_loop_status registered, existing ~15+ tools preserved",
+    "server.aiworkhub_supervisor_loop_status registered, existing ~15+ tools preserved",
     "live_real_task (clean_task) scenario against the live queue",
     "not_found scenario (stdout-string miss detection, not returncode)",
     "runner_topic_mismatch: 4-example direct cross-validation + 2 tool-integration calls (mismatched + allowed control)",

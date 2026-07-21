@@ -11,27 +11,27 @@
   "recommended_model": "claude-sonnet-5",
   "read_first": [
     "AGENTS.md",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_episode_b674_coordinator_review_v1.json",
+    "tools/aiworkhub/eval/task_mcp_callback_launch_episode_b674_coordinator_review_v1.json",
     "AITools/taskdb.py",
     "AITools/taskctl.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/tests/test_process_launcher.py",
     "AITools/test_taskctl_origin_thread_callback_b384_v1.py"
   ],
   "allowed_writes": [
     "AITools/taskdb.py",
     "AITools/taskctl.py",
     "AITools/test_taskctl_callback_launch_identity_b756_v1.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/tests/test_callback_launch_identity_b756_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_launch_identity_b756_v1.json"
   ],
   "required_outputs": [
     "AITools/test_taskctl_callback_launch_identity_b756_v1.py",
-    "tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+    "tools/aiworkhub/tests/test_callback_launch_identity_b756_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_launch_identity_b756_v1.json"
   ],
   "acceptance": [
     "Preserve B674's useful request_id-widened outbox migration only if every existing row is preserved, historical delivered rows are not replayed, and repeated initialization is idempotent.",
@@ -43,9 +43,9 @@
   ],
   "validation": [
     "python3 AITools/test_taskctl_callback_launch_identity_b756_v1.py",
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_launch_identity_b756_v1.py",
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_callback_launch_identity_b756_v1.json"
+    "python3 -m pytest -q tools/aiworkhub/tests/test_callback_launch_identity_b756_v1.py",
+    "python3 -m pytest -q tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_callback_bridge.py",
+    "python3 -m json.tool tools/aiworkhub/eval/task_mcp_callback_launch_identity_b756_v1.json"
   ],
   "forbidden": [
     "runner_topic_allowlist_bypass",
@@ -65,7 +65,7 @@
   "project_context": {
     "required": true,
     "task_type": "code",
-    "source_graph": {"required": true, "mode": "focus", "budget": 150, "query": "callback outbox request identity exact allowlist claim bind child spawn fail closed", "targets": ["AITools/taskdb.py", "AITools/taskctl.py", "tools/geoai-task-mcp/src/geoai_task_mcp/core.py", "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"]},
+    "source_graph": {"required": true, "mode": "focus", "budget": 150, "query": "callback outbox request identity exact allowlist claim bind child spawn fail closed", "targets": ["AITools/taskdb.py", "AITools/taskctl.py", "tools/aiworkhub/src/aiworkhub/core.py", "tools/aiworkhub/src/aiworkhub/process_launcher.py"]},
     "session": {"topic": "Task MCP callback launch identity B756", "limit": 20},
     "ai_memory": {"query": "B674 callback lost distinct request allowlist bypass", "limit": 10},
     "kb": {"query": "Task MCP durable callback exact launch identity", "limit": 8}

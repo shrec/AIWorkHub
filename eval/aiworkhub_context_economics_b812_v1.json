@@ -1,0 +1,153 @@
+{
+  "schema_id": "geoai.task_mcp.context_economics.v1",
+  "eval_id": "aiworkhub_context_economics_b812_v1",
+  "eval_label": "honest_context_token_economics_measurement",
+  "generated_by": "deepseek_aiworkhub_context_economics_b812_v1",
+  "authority_class": "measurement",
+  "summary": {
+    "what_changed": "Replaced misleading raw-bytes vs envelope-bytes comparison with honest provider-neutral context economics model that defines separate populations, computes only evidence-backed ratios, and never presents byte estimates as token or dollar truth.",
+    "key_fix": "Section-byte sum is now labeled selected_source_bytes (AFTER tool selection), not raw_context_bytes (which falsely implied a naive repository estimate).",
+    "populations_defined": [
+      "naive_discover_bytes: raw file bytes for read_first + allowed_writes (null when not measured)",
+      "selected_source_bytes: tool output content after Source Graph selection",
+      "serialized_envelope_bytes: JSON wrapper metadata overhead",
+      "delivered_prompt_bytes: full bundle entering the prompt",
+      "cached_input_tokens: provider cache hits (semantics vary by provider)",
+      "model_input_tokens / model_output_tokens / cost_usd: provider billing"
+    ],
+    "cache_semantics": {
+      "openai_shape": "cached_input_tokens is a SUBSET of input_tokens — no double-count",
+      "claude_shape": "cache_read + cache_creation are DISJOINT from input_tokens — sum for total"
+    }
+  },
+  "dashboard_ready_sample": {
+    "record_type": "dashboard_ready",
+    "summary": {
+      "total_tasks": 8,
+      "accepted_tasks": 3,
+      "total_cost_usd": 0.245,
+      "cost_per_accepted_usd": 0.081667,
+      "cost_per_review_ready_usd": 0.081667,
+      "overall_cache_hit_rate": 0.35
+    },
+    "by_adapter": {
+      "claude_cli": {
+        "task_count": 3,
+        "total_cost_usd": 0.12,
+        "total_input_tokens": 24000,
+        "total_output_tokens": 1500,
+        "total_cached_tokens": 8000,
+        "total_delivered_bytes": 48000,
+        "total_selected_bytes": 36000,
+        "total_envelope_bytes": 12000
+      },
+      "deepseek_v4_pro": {
+        "task_count": 5,
+        "total_cost_usd": 0.125,
+        "total_input_tokens": 28000,
+        "total_output_tokens": 2000,
+        "total_cached_tokens": 6000,
+        "total_delivered_bytes": 65000,
+        "total_selected_bytes": 55000,
+        "total_envelope_bytes": 10000
+      }
+    },
+    "by_task_type": {
+      "code": {
+        "task_count": 6,
+        "total_cost_usd": 0.18,
+        "total_input_tokens": 42000,
+        "total_output_tokens": 2500,
+        "total_cached_tokens": 12000,
+        "total_delivered_bytes": 88000,
+        "total_selected_bytes": 72000,
+        "total_envelope_bytes": 16000
+      },
+      "research": {
+        "task_count": 2,
+        "total_cost_usd": 0.065,
+        "total_input_tokens": 10000,
+        "total_output_tokens": 1000,
+        "total_cached_tokens": 2000,
+        "total_delivered_bytes": 25000,
+        "total_selected_bytes": 19000,
+        "total_envelope_bytes": 6000
+      }
+    },
+    "by_outcome": {
+      "accepted": {
+        "task_count": 3,
+        "total_cost_usd": 0.09,
+        "total_input_tokens": 18000,
+        "total_output_tokens": 900,
+        "total_cached_tokens": 7000,
+        "total_delivered_bytes": 42000,
+        "total_selected_bytes": 34000,
+        "total_envelope_bytes": 8000
+      },
+      "failed": {
+        "task_count": 2,
+        "total_cost_usd": 0.055,
+        "total_input_tokens": 10000,
+        "total_output_tokens": 800,
+        "total_cached_tokens": 1500,
+        "total_delivered_bytes": 22000,
+        "total_selected_bytes": 18000,
+        "total_envelope_bytes": 4000
+      },
+      "review_ready": {
+        "task_count": 3,
+        "total_cost_usd": 0.1,
+        "total_input_tokens": 24000,
+        "total_output_tokens": 1800,
+        "total_cached_tokens": 5500,
+        "total_delivered_bytes": 49000,
+        "total_selected_bytes": 39000,
+        "total_envelope_bytes": 10000
+      }
+    },
+    "authority_flags": {
+      "runtime_authority": false,
+      "support_authority": false,
+      "dashboard_mutation": false,
+      "canonical_cost_ledger": false
+    }
+  },
+  "comparison_example": {
+    "comparison_label": "source_graph_policy_v2_vs_v1_hypothetical",
+    "before_narrative": "Old policy: wide focus, large budget, more raw bytes per task.",
+    "after_narrative": "New policy: tighter selection, smaller bundles.",
+    "delta": {
+      "cost_usd_delta": -0.07,
+      "cost_usd_change_pct": -28.57,
+      "accepted_tasks_delta": 2
+    }
+  },
+  "design_rules": {
+    "never": [
+      "call_section_byte_sum_a_raw_repository_estimate",
+      "present_byte_estimates_as_token_or_dollar_truth",
+      "fabricate_10x_claims",
+      "double_count_provider_token_fields",
+      "report_unknown_baselines_as_zero"
+    ],
+    "always": [
+      "label_selected_source_bytes_as_post_tool_selection_not_raw_repo",
+      "set_naive_discover_to_null_when_not_measured",
+      "report_negative_savings_honestly",
+      "document_cache_semantics_per_provider",
+      "compute_ratios_only_when_both_operands_measurable"
+    ]
+  },
+  "integration_notes": {
+    "context_economics_module": "tools/aiworkhub/src/aiworkhub/context_economics.py",
+    "project_context_metadata_source": "project_context.py collect_project_context metadata output",
+    "usage_source": "process_launcher.py provider-reported usage fields",
+    "dashboard_reads": "estimated_raw_context_vs_bundle_bytes in dashboard.py context_details()",
+    "not_editing_in_this_task": [
+      "dashboard.py (no dashboard mutation)",
+      "project_context.py (no project_context integration change)",
+      "cost_ledger.py (separate aggregation path)"
+    ]
+  }
+}

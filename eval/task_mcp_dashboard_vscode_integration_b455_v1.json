@@ -12,12 +12,12 @@
     "after": "dashboard.exact_status_counts(db_path)['finished'] == 501 and build_snapshot(...)['status_counts']['finished'] == 501 (> DEFAULT_TASK_LIMIT), proven in test_exact_status_counts_reports_totals_past_default_task_limit."
   },
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
-    "tools/geoai-task-mcp/tests/test_dashboard.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py",
+    "tools/aiworkhub/tests/test_dashboard.py",
     "tools/vscode-geoai-task-operations/extension.js",
     "tools/vscode-geoai-task-operations/README.md",
     "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
-    "tools/geoai-task-mcp/eval/task_mcp_dashboard_vscode_integration_b455_v1.json"
+    "tools/aiworkhub/eval/task_mcp_dashboard_vscode_integration_b455_v1.json"
   ],
   "no_writes_outside_allowed": true,
   "core_py_untouched": true,
@@ -25,8 +25,8 @@
   "credentials_untouched": true,
   "callback_lifecycle_untouched": true,
   "file_hashes_sha256": {
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py": "276802841871633b10f79d471c8a93df675bcf125e8d3c4a54db1768b2b9ddf1",
-    "tools/geoai-task-mcp/tests/test_dashboard.py": "ff7a99056ed47d65353488f5bc5b54e512928be804290b6400bc90c553813886",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py": "276802841871633b10f79d471c8a93df675bcf125e8d3c4a54db1768b2b9ddf1",
+    "tools/aiworkhub/tests/test_dashboard.py": "ff7a99056ed47d65353488f5bc5b54e512928be804290b6400bc90c553813886",
     "tools/vscode-geoai-task-operations/extension.js": "49e48bbb80ace6f9a84e588e038c51206763c3327c2bf9cc746f21a45ec7a2e1",
     "tools/vscode-geoai-task-operations/README.md": "6640c33ce0d849d50e6b82d5af3c6ead01b9fe5276332dcbe58e75532b10d1a4",
     "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "c6d11a169fb4d9c4317c332c3c7bde1c78af2ae523055f4256b711874e85ee00"
@@ -62,7 +62,7 @@
   },
   "tests": {
     "python_pytest": {
-      "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_dashboard.py",
+      "command": "python3 -m pytest -q tools/aiworkhub/tests/test_dashboard.py",
       "result": "44 passed, 2 failed",
       "new_tests": [
         "test_exact_status_counts_reports_totals_past_default_task_limit",
@@ -76,11 +76,11 @@
       "pre_existing_unrelated_failures": [
         {
           "test": "test_callback_bridge_health_batch_stats_never_expose_full_thread_id",
-          "reason": "geoai_task_mcp.core has no attribute 'callback_outbox_status' in this isolated worktree -- function absent from core.py entirely (confirmed via AST scan), same class of pre-existing worktree gap as the deepseek_credentials stub this test file already bridges. Not caused by this task; core.py is untouched and forbidden (core_py_change)."
+          "reason": "aiworkhub.core has no attribute 'callback_outbox_status' in this isolated worktree -- function absent from core.py entirely (confirmed via AST scan), same class of pre-existing worktree gap as the deepseek_credentials stub this test file already bridges. Not caused by this task; core.py is untouched and forbidden (core_py_change)."
         },
         {
           "test": "test_agent_processes_expose_derived_liveness_never_the_raw_status_path",
-          "reason": "geoai_task_mcp.process_launcher has no attribute 'read_supervisor_status' in this isolated worktree -- function absent from process_launcher.py entirely (confirmed via AST scan). Not caused by this task; process_launcher.py is untouched and out of allowed_writes."
+          "reason": "aiworkhub.process_launcher has no attribute 'read_supervisor_status' in this isolated worktree -- function absent from process_launcher.py entirely (confirmed via AST scan). Not caused by this task; process_launcher.py is untouched and out of allowed_writes."
         }
       ]
     },

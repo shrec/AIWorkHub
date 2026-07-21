@@ -3,16 +3,16 @@
   "parent_task": "CLAUDE_TASK_MCP_CLIENT_SMOKE_CONTRACT_FREEZE_B108_V1",
   "date": "2026-07-04",
   "status": "proposal",
-  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). B108 froze the READ-ONLY tool contract v1 by driving a REAL MCP ClientSession (initialize/tools_list/tools_call over in-memory streams): 11 read-only tools visible, 15 input schemas byte-stable vs frozen sha256 fingerprints, and zero queue/audit writes with GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1 (byte-identical empty audit state dir, queue verify-intact). frozen_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. No process launch is enabled and none is proposed until the FINAL gated executor, behind ALL launch_preconditions plus ALLOW_LAUNCH=1 AND ALLOW_WRITES=1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). B108 froze the READ-ONLY tool contract v1 by driving a REAL MCP ClientSession (initialize/tools_list/tools_call over in-memory streams): 11 read-only tools visible, 15 input schemas byte-stable vs frozen sha256 fingerprints, and zero queue/audit writes with AIWORKHUB_ALLOW_WRITES unset AND =1 (byte-identical empty audit state dir, queue verify-intact). frozen_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. No process launch is enabled and none is proposed until the FINAL gated executor, behind ALL launch_preconditions plus ALLOW_LAUNCH=1 AND ALLOW_WRITES=1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_STDIO_SUBPROCESS_CLIENT_SMOKE_B109_V1",
-      "goal": "Extend the B108 in-memory client smoke to a true out-of-process stdio transport: launch the server via scripts/run_stdio.sh (python -m geoai_task_mcp.server) and drive it with mcp.client.stdio.stdio_client + ClientSession over real stdin/stdout pipes, asserting the SAME frozen schema fingerprints and the SAME no-write proof. This validates the exact VS Code/Claude/Codex stdio launch path. Server process is the MCP server itself (not an agent launch); still no queue/audit write, no agent/process launch beyond the server, no shell=True.",
+      "goal": "Extend the B108 in-memory client smoke to a true out-of-process stdio transport: launch the server via scripts/run_stdio.sh (python -m aiworkhub.server) and drive it with mcp.client.stdio.stdio_client + ClientSession over real stdin/stdout pipes, asserting the SAME frozen schema fingerprints and the SAME no-write proof. This validates the exact VS Code/Claude/Codex stdio launch path. Server process is the MCP server itself (not an agent launch); still no queue/audit write, no agent/process launch beyond the server, no shell=True.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py",
-        "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_stdio_subprocess_client_smoke_b109_v1.json"
+        "tools/aiworkhub/tests/mcp_stdio_client_smoke.py",
+        "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+        "tools/aiworkhub/eval/mcp_stdio_subprocess_client_smoke_b109_v1.json"
       ],
       "acceptance": [
         "server driven over real stdio pipes via stdio_client + ClientSession",
@@ -25,9 +25,9 @@
       "goal": "Freeze the read-only tools' OUTPUT/result contract (structuredContent shape), complementing B108 which froze inputSchema. Snapshot a canonical, value-independent key/type skeleton of each read-only tool's structured result (drop volatile fields like paths/counts/timestamps) and byte-freeze its fingerprint, so an accidental output-shape change is caught. Read-only; no launch; no write.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_readonly_result_schema_freeze.py",
-        "tools/geoai-task-mcp/tests/test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_readonly_tool_result_schema_freeze_b109_v1.json"
+        "tools/aiworkhub/tests/mcp_readonly_result_schema_freeze.py",
+        "tools/aiworkhub/tests/test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh",
+        "tools/aiworkhub/eval/mcp_readonly_tool_result_schema_freeze_b109_v1.json"
       ],
       "acceptance": [
         "each read-only tool's structured-result key/type skeleton frozen by fingerprint",
@@ -41,7 +41,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->adapter/runner/topic routing + abstain labels",

@@ -10,12 +10,12 @@
     "mcp_batch_collision_guard_b119_v1",
     "agent_launcher_mvp_b02_v1"
   ],
-  "purpose": "Define the input/output schema, derivation algorithm, and smoke-case plan for a NEW read-only MCP tool, geoai_supervisor_loop_status, that implements B07's leg-4 observation (mcp_to_codex_status_and_handoff) over the LIVE queue: task_id -> supervisor_state + detected error. This artifact is design/schema ONLY. It adds no server wiring, no subprocess/exec/fork/shell/network code beyond what tools/geoai-task-mcp/src/geoai_task_mcp/core.py already runs read-only, and it patches NO source file. It does not enable real process launch and does not mutate any task status.",
-  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/geoai-task-mcp/src/. No .py file is created or modified by this task. tools/geoai-task-mcp is a nested git repo shared with other concurrent workers; any dirty src/ files observed at task time belong to OTHER in-flight tasks, not this one.",
+  "purpose": "Define the input/output schema, derivation algorithm, and smoke-case plan for a NEW read-only MCP tool, aiworkhub_supervisor_loop_status, that implements B07's leg-4 observation (mcp_to_codex_status_and_handoff) over the LIVE queue: task_id -> supervisor_state + detected error. This artifact is design/schema ONLY. It adds no server wiring, no subprocess/exec/fork/shell/network code beyond what tools/aiworkhub/src/aiworkhub/core.py already runs read-only, and it patches NO source file. It does not enable real process launch and does not mutate any task status.",
+  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/aiworkhub/src/. No .py file is created or modified by this task. tools/aiworkhub is a nested git repo shared with other concurrent workers; any dirty src/ files observed at task time belong to OTHER in-flight tasks, not this one.",
 
   "tool_schema": {
-    "tool_name": "geoai_supervisor_loop_status",
-    "authority_profile": "same_as_geoai_task_codex_handoff_b116: frozen read-only contract, no write-gate toggle, no mutation parameters",
+    "tool_name": "aiworkhub_supervisor_loop_status",
+    "authority_profile": "same_as_aiworkhub_task_codex_handoff_b116: frozen read-only contract, no write-gate toggle, no mutation parameters",
     "input_schema": {
       "task_id": {"type": "string", "required": true},
       "runner": {"type": "string", "required": false, "description": "optional identity hint; when supplied, cross-checked read-only against core.check_runner_topic_allowlist -- never used to gate a write, only to detect runner_topic_mismatch for reporting"},
@@ -122,11 +122,11 @@
     },
     "no_real_process_launch": {
       "enforced": true,
-      "detail": "geoai_supervisor_loop_status is a pure read/derive tool: it calls only core.show_task, core.check_runner_topic_allowlist, core.collision_guard (all pre-existing, all read-only taskctl subcommands: show/collision-guard), and a filesystem existence check. It never calls run_taskctl with allow_write=True and never appends an audit entry."
+      "detail": "aiworkhub_supervisor_loop_status is a pure read/derive tool: it calls only core.show_task, core.check_runner_topic_allowlist, core.collision_guard (all pre-existing, all read-only taskctl subcommands: show/collision-guard), and a filesystem existence check. It never calls run_taskctl with allow_write=True and never appends an audit entry."
     },
     "no_writes_unless_explicit_future_gate": {
       "enforced": true,
-      "detail": "Every task-status-mutating action stays behind the EXISTING GEOAI_TASK_MCP_ALLOW_WRITES gate plus the B119 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check. This contract adds zero new write paths and does not touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST."
+      "detail": "Every task-status-mutating action stays behind the EXISTING AIWORKHUB_ALLOW_WRITES gate plus the B119 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check. This contract adds zero new write paths and does not touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST."
     }
   },
 
@@ -147,12 +147,12 @@
     "note": "Exact paths and additions a FUTURE coder task would make to implement this contract for real. NOT applied by this task -- acceptance criterion 'must specify exact future source patch paths but must not patch source in this task'.",
     "patches": [
       {
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+        "path": "tools/aiworkhub/src/aiworkhub/core.py",
         "change": "Add a new pure function `supervisor_loop_status(task_id: str, runner: str | None = None, topic: str | None = None, previous_snapshot: dict | None = None, reported_validation_verdict: str | None = None) -> dict[str, Any]` implementing exactly the ordered_steps in derivation_algorithm above, composed only from show_task, check_runner_topic_allowlist, collision_guard, and a new module-level LIFECYCLE_TO_SUPERVISOR_STATE dict matching lifecycle_state_to_supervisor_state_mapping. Adds zero new subprocess/exec/network calls beyond the existing run_taskctl call sites it reuses."
       },
       {
-        "path": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "change": "Register `@mcp.tool() def geoai_supervisor_loop_status(task_id: str, runner: str | None = None, topic: str | None = None, previous_snapshot: dict | None = None, reported_validation_verdict: str | None = None) -> dict[str, Any]` calling `core.supervisor_loop_status(...)`, docstring FROZEN READ-ONLY CONTRACT in the same style as geoai_task_codex_handoff (B116), no write-gate toggle, no mutation parameters."
+        "path": "tools/aiworkhub/src/aiworkhub/server.py",
+        "change": "Register `@mcp.tool() def aiworkhub_supervisor_loop_status(task_id: str, runner: str | None = None, topic: str | None = None, previous_snapshot: dict | None = None, reported_validation_verdict: str | None = None) -> dict[str, Any]` calling `core.supervisor_loop_status(...)`, docstring FROZEN READ-ONLY CONTRACT in the same style as aiworkhub_task_codex_handoff (B116), no write-gate toggle, no mutation parameters."
       }
     ],
     "owner": "future coder task (e.g. CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1), not created or applied by this worker",
@@ -160,7 +160,7 @@
   },
 
   "neural_bridge_note": {
-    "doctrine": "Per GeoAI neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This contract adds NO cue router: derivation_algorithm is a static, human-authored safety/interface boundary (a deterministic classifier composed entirely of pre-existing pure functions), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
+    "doctrine": "Per AIWorkHub neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This contract adds NO cue router: derivation_algorithm is a static, human-authored safety/interface boundary (a deterministic classifier composed entirely of pre-existing pure functions), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
     "migration_task_id_unaffected": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
     "curriculum_path_unaffected": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
     "not_a_bare_promise": true
@@ -177,7 +177,7 @@
   },
 
   "rollback": {
-    "action": "Delete the 4 new artifact files introduced by this task (this contract, its eval, its next_wave proposal, its test). Nothing outside tools/geoai-task-mcp/{contracts,eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
+    "action": "Delete the 4 new artifact files introduced by this task (this contract, its eval, its next_wave proposal, its test). Nothing outside tools/aiworkhub/{contracts,eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
     "trigger_conditions": [
       "any smoke_case gains an undocumented task_status_mutation",
       "any error_taxonomy code diverges from the 5 already frozen in task_mcp_supervisor_loop_contract_b07_v1",

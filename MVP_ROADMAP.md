@@ -1,6 +1,6 @@
-# GeoAI Task MCP MVP Roadmap
+# AIWorkHub MCP MVP Roadmap
 
-Goal: increase GeoAI development throughput by letting MCP-capable agents read and eventually operate the task queue directly.
+Goal: increase AIWorkHub development throughput by letting MCP-capable agents read and eventually operate the task queue directly.
 
 Current rule: keep the existing parent task system active until this repository is complete enough to replace manual copy/paste coordination.
 
@@ -57,12 +57,12 @@ Status: complete for local stdio MVP.
 - Use: candidate catalog for DeepSeek-compatible worker surfaces and setup patterns.
 - Initial candidates to benchmark: DeepSeek-TUI, Reasonix, Deep Code, OpenCode/Cline/Qwen Code/Codex/Copilot integration guides.
 - Boundary: research/source marker only. No launch authority, write authority, or task authority is granted from this source.
-- Required gates before any adapter launch: explicit allow-list, per-run audit log, process log capture, no default-on launch, `GEOAI_TASK_MCP_ALLOW_LAUNCH=1`, and existing task write gates.
+- Required gates before any adapter launch: explicit allow-list, per-run audit log, process log capture, no default-on launch, `AIWORKHUB_ALLOW_LAUNCH=1`, and existing task write gates.
 
 ## Phase 3 — Project Switch Readiness
 
 - [x] Run one full task wave dry-run through MCP without queue mutation or process launch.
-- [x] Run one owner-approved real task through `geoai_agent_launch_task` (`CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1`).
+- [x] Run one owner-approved real task through `aiworkhub_agent_launch_task` (`CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1`).
 - [x] Validate collision guard before and after the live canary batch.
 - [x] Validate no parent-repo task state corruption (`taskctl verify` PASS after completion).
 - [x] Freeze MCP tool contract v1.
@@ -92,11 +92,11 @@ Status: complete for local stdio MVP.
 
 To run the single bounded no-product-mutation live canary once a real key exists:
 
-1. `geoai-task-deepseek-credential set` (host, outside repo, 0600).
-2. Confirm `geoai_agent_adapter_readiness` shows `deepseek_copilot_cli.launchable=true`.
-3. Start the MCP server with `GEOAI_TASK_MCP_ALLOW_LAUNCH=1` and
-   `GEOAI_TASK_MCP_ALLOW_WRITES=1`.
-4. `geoai_agent_launch_task(task_id=<pending deepseek canary card>,
+1. `aiworkhub-deepseek-credential set` (host, outside repo, 0600).
+2. Confirm `aiworkhub_agent_adapter_readiness` shows `deepseek_copilot_cli.launchable=true`.
+3. Start the MCP server with `AIWORKHUB_ALLOW_LAUNCH=1` and
+   `AIWORKHUB_ALLOW_WRITES=1`.
+4. `aiworkhub_agent_launch_task(task_id=<pending deepseek canary card>,
    runner=deepseek_*, topic=task_mcp, adapter_id=deepseek_copilot_cli,
    model=deepseek-v4-pro)`; collect and return the task to Codex review.
    The worker mutates no product source and touches only its allowed_writes.
@@ -128,7 +128,7 @@ the live daemon is enabled and its durable queue is observable.
       reason -- timed_out/cancelled/scope_rejected/validation_failed/
       worker_failed-as-launch_failed). Every claimed terminal result remains
       visible as top-level `review`; it never automatically requeues the card.
-- [x] Local callback bridge (`geoai_task_mcp/callback_bridge.py`) speaking
+- [x] Local callback bridge (`aiworkhub/callback_bridge.py`) speaking
       the real `codex app-server --listen stdio://` newline-delimited
       JSON-RPC protocol: `initialize` -> `initialized` -> `thread/resume` ->
       `turn/start` -> wait `turn/completed`, with request-id correlation,
@@ -139,7 +139,7 @@ the live daemon is enabled and its durable queue is observable.
 - [x] Fixed coordinator-only turn prompt: validated `task_id`, normalized
       terminal transition, event id -- no worker output, logs, objectives,
       errors, artifacts, tool input, or full `origin_thread_id`.
-- [x] `geoai-task-callback-bridge` CLI: `run-once`, `daemon`, `status`,
+- [x] `aiworkhub-callback-bridge` CLI: `run-once`, `daemon`, `status`,
       `dry-run`; user-systemd example in README.md.
 - [x] Read-only, redacted dashboard section (`callback_bridge_health` via
       `taskctl.py callback-outbox-status`): bound/unbound task counts,
@@ -153,7 +153,7 @@ the live daemon is enabled and its durable queue is observable.
   reconciled byte-for-byte against the trusted host's already-accepted state
   -- no blind overwrite of newer canonical content.
 - [x] Fake executable App Server test harness
-      (`tools/geoai-task-mcp/tests/_fake_app_server.py`): a real subprocess
+      (`tools/aiworkhub/tests/_fake_app_server.py`): a real subprocess
       speaking the actual wire, strictly enforcing sequence (rejects
       missing/out-of-order `initialize`/`initialized`/`thread/resume`/
       `turn/start`), plus busy/timeout/process-death/mismatched-id
@@ -165,7 +165,7 @@ the live daemon is enabled and its durable queue is observable.
       outbox claim all pass. Evidence:
       `eval/task_mcp_callback_bridge_b384_coordinator_review_v3.json`.
 - [x] Live daemon enablement: Codex superseded 24 stale pre-episode/tombstone
-      outbox rows, enabled `geoai-task-callback-bridge.service`, and verified
+      outbox rows, enabled `aiworkhub-callback-bridge.service`, and verified
       it active with zero pending/inflight/dead-letter rows. No synthetic real
       callback was sent; the first wake will come from a genuine worker
       terminal event.
@@ -179,9 +179,9 @@ the wire sequence against a fake executable App Server; never starts a real
 ```bash
 FAKE_APP_SERVER_LOG=/tmp/geoai_cb_canary.jsonl \
   python3 -c "
-import sys; sys.path.insert(0, 'tools/geoai-task-mcp/src')
-from geoai_task_mcp.callback_bridge import CallbackBridge
-b = CallbackBridge(repo='.', executable=[sys.executable, 'tools/geoai-task-mcp/tests/_fake_app_server.py'])
+import sys; sys.path.insert(0, 'tools/aiworkhub/src')
+from aiworkhub.callback_bridge import CallbackBridge
+b = CallbackBridge(repo='.', executable=[sys.executable, 'tools/aiworkhub/tests/_fake_app_server.py'])
 print(b.dry_run('SOME_TASK_ID', 'review_ready'))
 "
 ```
@@ -191,7 +191,7 @@ reviewed this candidate on the trusted host (binds against the real installed
 `codex` binary and the real outbox -- run only after review):
 
 ```bash
-geoai-task-callback-bridge --executable codex daemon
+aiworkhub-callback-bridge --executable codex daemon
 ```
 
 ## Phase 5 — Operational Closure: Batched Delivery, Configurable Timeout/Lease
@@ -232,8 +232,8 @@ review turns.
       queue so a task that changed state mid-turn needs no separate wake.
 - [x] Configurable App Server timeout/lease: `--app-server-timeout-seconds`/
       `--lease-seconds`/`--max-batch-members` CLI flags (or
-      `GEOAI_CALLBACK_APP_SERVER_TIMEOUT_SECONDS`/`GEOAI_CALLBACK_LEASE_SECONDS`/
-      `GEOAI_CALLBACK_MAX_BATCH_MEMBERS` env vars), validated at startup:
+      `AIWORKHUB_CALLBACK_APP_SERVER_TIMEOUT_SECONDS`/`AIWORKHUB_CALLBACK_LEASE_SECONDS`/
+      `AIWORKHUB_CALLBACK_MAX_BATCH_MEMBERS` env vars), validated at startup:
       `validate_lease_and_timeout` enforces `lease >= timeout + margin`
       (default margin 300s) and rejects an invalid combination immediately
       rather than silently running with one. No 60-second implicit timeout
@@ -254,7 +254,7 @@ review turns.
       dashboard.py code changes needed (verified end-to-end against a real
       SQLite DB, never a full `origin_thread_id`).
 - [x] Real fake-App-Server integration coverage added to
-      `tools/geoai-task-mcp/tests/test_callback_bridge.py`: eight-event
+      `tools/aiworkhub/tests/test_callback_bridge.py`: eight-event
       single-thread batching, an event arriving during an in-flight turn,
       two-thread separation (never coalesced), restart recovery (same
       durable `batch_id` reclaimed after an expired lease), busy-thread
@@ -309,7 +309,7 @@ Server saw the owner thread idle and sat in `turn/start` for 6+ minutes while
 the real extension already had its own App Server child and the active
 rollout open.
 
-- [x] `geoai_task_mcp/app_server_mux.py`: a transparent Codex CLI wrapper
+- [x] `aiworkhub/app_server_mux.py`: a transparent Codex CLI wrapper
       installable as the extension's `chatgpt.cliExecutable`. Non-app-server
       invocations `execvp` the real binary with the exact argv/exit
       behavior (full process-image replacement -- no proxying artifact
@@ -329,7 +329,7 @@ rollout open.
       `params` only -- a client-supplied `id`, `jsonrpc`, or any other key
       claiming extra transport authority is rejected), bounded request/
       response sizes and deadlines, collision-free synthetic wire ids
-      (`geoai-sideband-<uuid4>-<seq>`) so a sideband response is routed
+      (`aiworkhub-sideband-<uuid4>-<seq>`) so a sideband response is routed
       back over the socket and never leaks into the extension's stdout,
       duplicate-request suppression (bounded TTL cache keyed by
       method+params), and readiness gated on passively observing the
@@ -338,7 +338,7 @@ rollout open.
       socket loss, or on protocol mismatch, a sideband call fails closed
       with a bounded `SidebandNotReady` deferral; this mux never spawns a
       second/separate App Server as a fallback.
-- [x] `geoai_task_mcp/callback_bridge.py::SidebandCallbackClient`: reaches
+- [x] `aiworkhub/callback_bridge.py::SidebandCallbackClient`: reaches
       the extension-owned App Server through the mux's socket instead of
       spawning a subprocess. Resumes the exact bound thread, reuses the
       SAME `select_steer_target` decision as `AppServerClient` (active with
@@ -357,7 +357,7 @@ rollout open.
       extension, systemd, the live callback DB, or any process. Codex owns
       applying the setting, the extension host reload, the live canary
       against the extension-owned thread, recovery, and finally enabling
-      `geoai-task-callback-bridge.service`.
+      `aiworkhub-callback-bridge.service`.
 - [x] Fake child-App-Server (`tests/_fake_app_server.py`, unchanged, reused)
       plus fake extension-client (OS-pipe-driven, `tests/test_app_server_mux.py`)
       E2E coverage: transparent extension traffic, server-originated
@@ -464,13 +464,13 @@ Status: coordinator-accepted.
 
 ## Deferred Public Product Extraction — AI Working Hub
 
-This is a future task only; it must not interrupt the current GeoAI roadmap.
+This is a future task only; it must not interrupt the current AIWorkHub roadmap.
 
-- Public product/repository name: **AI Working Hub** (`AIWorkingHub`).
+- Public product/repository name: **AI Working Hub** (`AIWorkHub`).
 - Positioning: repository-native, model-agnostic AI orchestration, source
   context, sessions, memory, knowledge and editor monitoring.
 - Each opened repository owns its complete durable state under
-  `.aiworkinghub/`. On first attach the tool initializes that directory; on
+  `.aiworkhub/`. On first attach the tool initializes that directory; on
   later attaches it discovers and resumes the existing state directly.
 - MCP/VS Code installations remain replaceable and do not own project data.
   Credentials and disposable process/runtime files remain outside canonical
@@ -479,11 +479,11 @@ This is a future task only; it must not interrupt the current GeoAI roadmap.
   opens the dashboard for its active repository folder. The only shared layer
   is a multi-thread/VS Code-instance mux routing callbacks by stable
   `(repo_id, thread_id, task_id, event_id)` identity.
-- Intended public identifiers: repository `AIWorkingHub`, package/CLI
-  `aiworkinghub`, short CLI alias `aiwh`, MCP server `aiworkinghub-mcp`, and
+- Intended public identifiers: repository `AIWorkHub`, package/CLI
+  `aiworkhub`, short CLI alias `awh`, MCP server `aiworkhub-mcp`, and
   VS Code extension `AI Working Hub`.
 - Extraction begins only after the current Task MCP is operationally closed;
-  project-specific GeoAI policy remains a repository profile rather than part
+  project-specific AIWorkHub policy remains a repository profile rather than part
   of the generic public core.
 
 ## Non-goals For MVP

@@ -15,9 +15,9 @@
       "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
       "priority": "task_mcp_b120_frozen_tuple_refresh",
       "read_first": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py",
-        "tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py",
-        "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py"
+        "tools/aiworkhub/tests/mcp_stdio_client_smoke.py",
+        "tools/aiworkhub/tests/mcp_stdio_concurrent_client_smoke.py",
+        "tools/aiworkhub/tests/mcp_client_smoke_contract_freeze.py"
       ],
       "ready": true
     },
@@ -29,9 +29,9 @@
       "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
       "priority": "task_mcp_b121_mvp_audit_refresh",
       "read_first": [
-        "tools/geoai-task-mcp/eval/mvp_contract_audit_v1.json",
-        "tools/geoai-task-mcp/eval/mvp_contract_audit_rows_v1.jsonl",
-        "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh"
+        "tools/aiworkhub/eval/mvp_contract_audit_v1.json",
+        "tools/aiworkhub/eval/mvp_contract_audit_rows_v1.jsonl",
+        "tools/aiworkhub/tests/test_mvp_contract_audit_v1.sh"
       ],
       "ready": true
     },
@@ -43,7 +43,7 @@
       "depends_on": ["DEEPSEEK_TASK_MCP_STALE_SMOKE_INVENTORY_REFRESH_B119_V1"],
       "priority": "task_mcp_b122_readme_refresh",
       "read_first": [
-        "tools/geoai-task-mcp/README.md"
+        "tools/aiworkhub/README.md"
       ],
       "ready": true
     }

@@ -24,13 +24,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from geoai_task_mcp import process_launcher, worker_workspace
-from geoai_task_mcp.process_launcher import (
+from aiworkhub import process_launcher, worker_workspace
+from aiworkhub.process_launcher import (
     LaunchRejected,
     _validate_allow_empty_required_outputs,
     _validate_required_outputs_contract,
 )
-from geoai_task_mcp.worker_workspace import (
+from aiworkhub.worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
     validate_required_outputs,

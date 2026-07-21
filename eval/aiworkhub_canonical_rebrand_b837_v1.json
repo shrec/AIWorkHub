@@ -1,0 +1,55 @@
+{
+  "schema_id": "aiworkhub.task_mcp.canonical_rebrand_b837_v1.eval.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_CANONICAL_REBRAND_B837_V1",
+  "canonical": {
+    "display_name": "AIWorkHub",
+    "abbreviation": "AWH",
+    "python_package": "aiworkhub",
+    "state_root": ".aiworkhub",
+    "env_prefix": "AIWORKHUB",
+    "mcp_tool_prefix": "aiworkhub"
+  },
+  "identity_mapping": {
+    "package": {
+      "old": "removed legacy package",
+      "new": "aiworkhub"
+    },
+    "console_scripts": {
+      "new": [
+        "aiworkhub",
+        "awh",
+        "aiworkhub-mcp",
+        "aiworkhub-health",
+        "aiworkhub-dashboard",
+        "aiworkhub-callback-bridge",
+        "aiworkhub-deepseek-credential",
+        "aiworkhub-app-server-mux",
+        "aiworkhub-reconciler"
+      ]
+    },
+    "mcp_tools": {
+      "new_prefix": "aiworkhub_",
+      "legacy_aliases_retained": false
+    },
+    "environment": {
+      "new_prefix": "AIWORKHUB_",
+      "legacy_aliases_retained": false
+    },
+    "state": {
+      "new_root": ".aiworkhub",
+      "legacy_root_retained": false
+    }
+  },
+  "deleted_legacy_artifacts": [
+    "legacy source package directory"
+  ],
+  "validation": {
+    "compileall": "source package compileall passed",
+    "pytest_status": "blocked in this worker image because pytest and mcp are absent and pip installs fail with operation-not-permitted filesystem errors"
+  },
+  "scan_evidence": {
+    "scope": "release-facing AIWorkHub package, README, pyproject and B837 manifest/test",
+    "case_insensitive_old_brand_occurrences": 0,
+    "note": "The coordinator's exact regression command still names one legacy test path, so full tracked-subtree filename zero requires coordinator reconciliation of that command."
+  }
+}

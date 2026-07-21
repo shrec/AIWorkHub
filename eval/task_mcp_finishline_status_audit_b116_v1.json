@@ -7,7 +7,7 @@
     "dirty_files": [],
     "untracked_count": 1,
     "untracked_files": [
-      "tools/geoai-task-mcp/"
+      "tools/aiworkhub/"
     ],
     "total_changed": 1,
     "is_nested_git_repo": true,
@@ -70,7 +70,7 @@
     {
       "step": 2,
       "checkbox": "p1_dryrun_auto_pickup",
-      "label": "Add --dry-run flag to geoai_task_auto_pickup",
+      "label": "Add --dry-run flag to aiworkhub_task_auto_pickup",
       "rationale": "Workers need to preview what auto_pickup would claim before committing. Safety prerequisite for wave execution.",
       "estimated_effort": "1 session",
       "depends_on": [

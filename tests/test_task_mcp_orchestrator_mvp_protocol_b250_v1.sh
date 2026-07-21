@@ -16,7 +16,7 @@ set -euo pipefail
 #   1. protocol JSON parses; all required top-level sections present.
 #   2. tool_authority_tiers has exactly 4 tiers with the expected names, each
 #      non-empty; total tool count is internally consistent (24, including
-#      geoai_task_auto_pickup_dryrun -- corrected omission).
+#      aiworkhub_task_auto_pickup_dryrun -- corrected omission).
 #   3. lifecycle_states == exactly the 5 frozen states, each
 #      task_status_mutation == false.
 #   4. error_taxonomy == exactly the 5 frozen codes.
@@ -24,7 +24,7 @@ set -euo pipefail
 #   6. safety_model covers credential/shell/per-project-isolation/daemon/
 #      network/write-gate dimensions.
 #   7. timeout_rules cites the real 3600s/concurrency=1 constants, the
-#      live-enforced 60s DEFAULT_TIMEOUT_SECONDS/GEOAI_TASK_MCP_TIMEOUT
+#      live-enforced 60s DEFAULT_TIMEOUT_SECONDS/AIWORKHUB_TIMEOUT
 #      subprocess constant (core.py), and marks the execution_timeout
 #      extension as PROPOSED, not frozen.
 #   8. neural_bridge_note cites the exact unaffected migration id + curriculum
@@ -38,7 +38,7 @@ set -euo pipefail
 #      JSON/JSONL artifacts' raw text.
 #  13. this task's own footprint touches zero paths under
 #      tools/geoai-task-mcp/src/.
-#  14. parent GeoAI task queue is not mutated (taskctl verify).
+#  14. parent AIWorkHub task queue is not mutated (taskctl verify).
 #
 # Isolation: read-only, no subprocess beyond taskctl verify, no daemon, no
 # network, no env mutation. Never calls taskctl review/done/auto-pickup.
@@ -117,17 +117,17 @@ assert total_tools == 24, f"expected 24 total tools across 4 tiers, got {total_t
 # TIER_1 must include the previously-missing already-committed read-only tool
 tier1 = next(t for t in tiers if t["tier"] == "TIER_1_READ_ONLY_NAVIGATION")
 tier1_names = {m["tool_name"] for m in tier1["member_tools"]}
-assert "geoai_task_auto_pickup_dryrun" in tier1_names, "geoai_task_auto_pickup_dryrun (real, HEAD-committed, read-only) must be present in TIER_1"
+assert "aiworkhub_task_auto_pickup_dryrun" in tier1_names, "aiworkhub_task_auto_pickup_dryrun (real, HEAD-committed, read-only) must be present in TIER_1"
 assert len(tier1["member_tools"]) == 15, f"expected 15 TIER_1 tools, got {len(tier1['member_tools'])}"
 
 # TIER_2 and TIER_3 must each have all 4 canonical tools present by name
 tier2 = next(t for t in tiers if t["tier"] == "TIER_2_WRITE_GATED_LIFECYCLE")
 tier2_names = {m["tool_name"] for m in tier2["member_tools"]}
-assert tier2_names == {"geoai_task_auto_pickup", "geoai_task_mark_review", "geoai_task_mark_done", "geoai_task_export_jsonl"}
+assert tier2_names == {"aiworkhub_task_auto_pickup", "aiworkhub_task_mark_review", "aiworkhub_task_mark_done", "aiworkhub_task_export_jsonl"}
 
 tier3 = next(t for t in tiers if t["tier"] == "TIER_3_LAUNCH_PLAN_DRYRUN_ONLY")
 tier3_names = {m["tool_name"] for m in tier3["member_tools"]}
-assert tier3_names == {"geoai_agent_launch_task", "geoai_agent_task_status", "geoai_agent_collect_result", "geoai_agent_cancel_task"}
+assert tier3_names == {"aiworkhub_agent_launch_task", "aiworkhub_agent_task_status", "aiworkhub_agent_collect_result", "aiworkhub_agent_cancel_task"}
 for m in tier3["member_tools"]:
     assert m["implemented"] != True, f"TIER_3 tool {m['tool_name']} must never claim full implementation (plan-only)"
 
@@ -220,7 +220,7 @@ assert sm["shell_execution_policy"]["no_shell_true"] is True
 assert sm["shell_execution_policy"]["argv_list_only"] is True
 assert sm["shell_execution_policy"]["no_arbitrary_command"] is True
 assert "scope_today" in sm["per_project_isolation"]
-assert "GEOAI_REPO" in sm["per_project_isolation"]["mechanism"]
+assert "AIWORKHUB_REPO" in sm["per_project_isolation"]["mechanism"]
 assert sm["daemon_policy"]["no_daemon_start"] is True
 assert sm["network_policy"]["no_network_launch"] is True
 assert sm["write_gate_policy"]["both_required_for_future_launch"] is True
@@ -256,12 +256,12 @@ assert "the ONLY timeout constant anywhere in this nested repo" not in tr["sourc
 # Second, currently-enforced timeout constant (core.py DEFAULT_TIMEOUT_SECONDS) must be present
 live = tr["live_enforced_timeout_constant"]
 assert live["name"] == "DEFAULT_TIMEOUT_SECONDS"
-assert live["env_override"] == "GEOAI_TASK_MCP_TIMEOUT"
+assert live["env_override"] == "AIWORKHUB_TIMEOUT"
 assert live["default_value_seconds"] == 60
 assert live["currently_enforced"] is True
 assert "core.py:16" in live["source"]
 assert "run_taskctl" in live["mechanism"]
-assert "geoai_task_auto_pickup_dryrun" in live["scope"], "scope must include the newly-added tool"
+assert "aiworkhub_task_auto_pickup_dryrun" in live["scope"], "scope must include the newly-added tool"
 
 on_exceed = tr["on_exceed"]
 assert "PROPOSED" in on_exceed["status"] and "NOT part of the frozen 5-code" in on_exceed["status"]

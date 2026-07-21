@@ -5,10 +5,10 @@
   "objective": "Give every isolated run_validations() call a private, request-unique, explicitly exec-probed scratch directory instead of inheriting TMPDIR/HOME from a mount that may be noexec, fail closed when no candidate is exec-capable, and never weaken Landlock/bubblewrap scope, shell-free argv parsing, credential isolation, or the isolated task-queue DB.",
   "root_cause": {
     "summary": "run_validations() set TMPDIR/TMP/TEMP to workspace.home/tmp (landlock) or bubblewrap's private /tmp, both of which can live on a noexec-mounted filesystem. A validation command that compiled a native ELF into TMPDIR and then executed it got rc=126 (permission denied) even though the compiled product itself was correct -- an infrastructure failure indistinguishable, at the worker level, from a genuine product/test bug.",
-    "evidence_path": "tools/geoai-task-mcp/logs/processes/64165cc7a85949ca88e8106c1d42e176.request.json"
+    "evidence_path": "tools/aiworkhub/logs/processes/64165cc7a85949ca88e8106c1d42e176.request.json"
   },
   "fix_summary": [
-    "Added provision_validation_exec_scratch(): tries an optional admin-pinned GEOAI_TASK_MCP_VALIDATION_EXEC_SCRATCH_ROOT override, else /dev/shm then the system tempdir, in order.",
+    "Added provision_validation_exec_scratch(): tries an optional admin-pinned AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT override, else /dev/shm then the system tempdir, in order.",
     "Each candidate gets a request-unique 0700 subdirectory (rejects a pre-existing symlink or directory at that exact path) that is then explicitly exec-probed with _probe_exec_capable_dir() before being trusted.",
     "_probe_exec_capable_dir() creates its own probe file via an atomic O_CREAT|O_EXCL open with mode=0700 (no separate chmod/fchmod call), writes a trivial shell script, and executes it; PermissionError/timeout means the candidate is rejected and cleaned up, and the next candidate is tried.",
     "If every candidate fails, provision_validation_exec_scratch() raises WorkspaceError(\"validation_exec_scratch_unavailable:...\") -- fail closed before any validation command ever runs, never a silent rc=126 deep inside the worker's own compile step.",
@@ -17,12 +17,12 @@
     "No change to Landlock/bubblewrap filesystem scope beyond the one new, request-private, non-shared exec-scratch grant; no shell_true; no chmod/remount of any shared/parent path; provider credential passthrough and the isolated task-queue DB env var are untouched."
   ],
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/aiworkhub/eval/task_mcp_validation_exec_scratch_b753_v1.json"
   ],
   "tests": {
-    "new_file": "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "new_file": "tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
     "new_file_result": "15 passed in 1.88s",
     "coverage": [
       "test_compile_and_execute_native_binary_succeeds_via_provisioned_scratch: compile+execute success (the exact B751 shape, now fixed)",
@@ -38,13 +38,13 @@
       "test_concurrent_validation_runs_get_isolated_scratch_directories / test_concurrent_provisioning_produces_distinct_named_directories: concurrent requests get distinct, non-interfering scratch directories"
     ],
     "existing_suite_regression_check": {
-      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_workspace.py",
+      "command": "PYTHONPATH=tools/aiworkhub/src python3 -m pytest -q tools/aiworkhub/tests/test_worker_workspace.py",
       "result": "8 failed, 18 passed, 9 errors in 0.28s",
       "note": "Identical failed/error test names before and after this change (verified by diffing the run against an unmodified worker_workspace.py in the same shell). Every failure/error traces to git init or fchmod/chmod raising PermissionError, or site.getusersitepackages() not existing under this session's synthetic HOME -- this authoring/worker session runs inside the exact Landlock+seccomp sandbox worker_workspace.py implements (confirmed via /proc/self/status: Seccomp=2, NoNewPrivs=1, and a bare `os.chmod`/`git init` failing identically with zero code changes), which unconditionally denies chmod-family syscalls for this whole process tree, including child processes such as git itself. None of the failures reference any line this task touched."
     },
     "process_launcher_tests": {
-      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py",
-      "result": "not runnable from this isolated worktree: process_launcher.py imports geoai_task_mcp.project_context, an untracked file present in the live parent repo but outside this task's read_first/allowed_writes, so it was not seeded into this worktree by create_workspace(). tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py was not modified by this task (not in allowed_writes) and run_validations()'s public signature (workspace, commands, *, timeout_seconds=...) is unchanged, so process_launcher.py's one call site (run_validations(workspace, metadata.get('validation') or [])) is source-compatible with no code review needed beyond that signature check."
+      "command": "PYTHONPATH=tools/aiworkhub/src python3 -m pytest -q tools/aiworkhub/tests/test_process_launcher.py",
+      "result": "not runnable from this isolated worktree: process_launcher.py imports aiworkhub.project_context, an untracked file present in the live parent repo but outside this task's read_first/allowed_writes, so it was not seeded into this worktree by create_workspace(). tools/aiworkhub/src/aiworkhub/process_launcher.py was not modified by this task (not in allowed_writes) and run_validations()'s public signature (workspace, commands, *, timeout_seconds=...) is unchanged, so process_launcher.py's one call site (run_validations(workspace, metadata.get('validation') or [])) is source-compatible with no code review needed beyond that signature check."
     }
   },
   "verdict": "fixed_and_tested"

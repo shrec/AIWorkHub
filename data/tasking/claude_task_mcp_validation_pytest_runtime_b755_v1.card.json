@@ -11,19 +11,19 @@
   "recommended_model": "claude-sonnet-5",
   "read_first": [
     "AGENTS.md",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_coordinator_review_v1.json",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
-    "tools/geoai-task-mcp/tests/test_worker_workspace.py"
+    "tools/aiworkhub/eval/task_mcp_validation_exec_scratch_b753_coordinator_review_v1.json",
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/aiworkhub/tests/test_worker_workspace.py"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py",
+    "tools/aiworkhub/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
   ],
   "required_outputs": [
-    "tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+    "tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py",
+    "tools/aiworkhub/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
   ],
   "acceptance": [
     "Reproduce python3 -m pytest import failure under the current sanitized validation HOME while parent-host pytest is installed.",
@@ -33,8 +33,8 @@
     "Use a standalone unittest-compatible regression command so this task's own validation does not depend on the bug it repairs; cover pytest success, untrusted/symlink rejection, non-pytest unchanged behavior, credential isolation and cleanup."
   ],
   "validation": [
-    "python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py",
-    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
+    "python3 tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py",
+    "python3 -m json.tool tools/aiworkhub/eval/task_mcp_validation_pytest_runtime_b755_v1.json"
   ],
   "forbidden": [
     "real_home_passthrough",
@@ -53,7 +53,7 @@
   "project_context": {
     "required": true,
     "task_type": "code",
-    "source_graph": {"required": true, "mode": "focus", "budget": 90, "query": "worker validation sanitized HOME PYTHONPATH readonly pytest runtime", "targets": ["tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py"]},
+    "source_graph": {"required": true, "mode": "focus", "budget": 90, "query": "worker validation sanitized HOME PYTHONPATH readonly pytest runtime", "targets": ["tools/aiworkhub/src/aiworkhub/worker_workspace.py"]},
     "session": {"topic": "Task MCP pytest validation runtime B755", "limit": 12},
     "ai_memory": {"query": "B753 B674 pytest missing sanitized HOME", "limit": 6},
     "kb": {"query": "Task MCP validation sandbox Python runtime", "limit": 6}

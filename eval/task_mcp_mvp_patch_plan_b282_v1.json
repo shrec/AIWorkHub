@@ -30,50 +30,50 @@
     "context7_used": false,
     "context7_unavailable": false,
     "local_docs_sufficient": true,
-    "reason": "Pure repo-local patch plan over existing GeoAI-owned modules (launch_queue_contract.py, launch_queue_persist.py, server.py, completion_inbox.py). No new external library/SDK/API surface is introduced; the MCP tool registration pattern (@mcp.tool() via FastMCP) is reused unchanged from 21 existing tools already in server.py, so no FastMCP doc lookup was needed."
+    "reason": "Pure repo-local patch plan over existing AIWorkHub-owned modules (launch_queue_contract.py, launch_queue_persist.py, server.py, completion_inbox.py). No new external library/SDK/API surface is introduced; the MCP tool registration pattern (@mcp.tool() via FastMCP) is reused unchanged from 21 existing tools already in server.py, so no FastMCP doc lookup was needed."
   },
   "builds_on": [
-    "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1 (tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json: queue_request envelope schema section_1, completion_inbox integration section_2, usage accounting section_3, 9-state/12-transition state machine section_4)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py (build_completion_inbox: review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, read_errors facets)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py (B119: LaunchRequest/LaunchDecision/ProcessLogEntry/ResultHandoff dataclasses, enqueue_intent/evaluate_launch/describe_intent, GEOAI_TASK_MCP_ALLOW_LAUNCH + GEOAI_TASK_MCP_ALLOW_WRITES gates, LAUNCH_IMPLEMENTED=False constant)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py (B119: persist_transition/persist_intent/read_persisted_log append-only JSONL audit log at tools/geoai-task-mcp/logs/launch_queue_audit.jsonl, override via GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (24 registered @mcp.tool() functions as of this plan: 21 directly-decorated + 3 via cli_adapter_readonly_tool.register(mcp) per server.py:249-252 comment)"
+    "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1 (tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json: queue_request envelope schema section_1, completion_inbox integration section_2, usage accounting section_3, 9-state/12-transition state machine section_4)",
+    "tools/aiworkhub/src/aiworkhub/completion_inbox.py (build_completion_inbox: review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, read_errors facets)",
+    "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py (B119: LaunchRequest/LaunchDecision/ProcessLogEntry/ResultHandoff dataclasses, enqueue_intent/evaluate_launch/describe_intent, AIWORKHUB_ALLOW_LAUNCH + AIWORKHUB_ALLOW_WRITES gates, LAUNCH_IMPLEMENTED=False constant)",
+    "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py (B119: persist_transition/persist_intent/read_persisted_log append-only JSONL audit log at tools/aiworkhub/logs/launch_queue_audit.jsonl, override via AIWORKHUB_LAUNCH_QUEUE_LOG_PATH)",
+    "tools/aiworkhub/src/aiworkhub/server.py (24 registered @mcp.tool() functions as of this plan: 21 directly-decorated + 3 via cli_adapter_readonly_tool.register(mcp) per server.py:249-252 comment)"
   ],
   "key_finding_supersedes_b281_next_wave": {
-    "finding": "B281's next_wave proposed CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 as a brand-new module (queue_request.py) writing to a brand-new log (mcp_queue_requests_b282_v1.jsonl). Direct inspection of the existing source tree (not listed in this task's read_first, opened because it is load-bearing for an 'exact API surface' plan) shows this would duplicate ~80% of already-built B119 infrastructure: launch_queue_contract.py already defines LaunchRequest/LaunchDecision/ProcessLogEntry/ResultHandoff plus enqueue_intent/evaluate_launch/describe_intent, and launch_queue_persist.py already provides an append-only JSONL persistence + read_persisted_log() read path, both wired into server.py as 3 read-only tools (geoai_launch_queue_describe_readonly, geoai_launch_queue_evaluate_readonly, geoai_launch_queue_audit_summary_readonly).",
-    "recommendation": "The MVP patch EXTENDS launch_queue_contract.py + launch_queue_persist.py additively (new optional dataclass fields, no removed/renamed fields) and adds ONE new write-gated MCP tool (geoai_task_queue_request) that reuses the existing log path, instead of creating a parallel schema/log/module. This plan supersedes CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 from the B281 next_wave file; see next_wave file for the corrected task card (renumbered B286 to avoid batch-token collision with this planning task's own B282 id)."
+    "finding": "B281's next_wave proposed CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 as a brand-new module (queue_request.py) writing to a brand-new log (mcp_queue_requests_b282_v1.jsonl). Direct inspection of the existing source tree (not listed in this task's read_first, opened because it is load-bearing for an 'exact API surface' plan) shows this would duplicate ~80% of already-built B119 infrastructure: launch_queue_contract.py already defines LaunchRequest/LaunchDecision/ProcessLogEntry/ResultHandoff plus enqueue_intent/evaluate_launch/describe_intent, and launch_queue_persist.py already provides an append-only JSONL persistence + read_persisted_log() read path, both wired into server.py as 3 read-only tools (aiworkhub_launch_queue_describe_readonly, aiworkhub_launch_queue_evaluate_readonly, aiworkhub_launch_queue_audit_summary_readonly).",
+    "recommendation": "The MVP patch EXTENDS launch_queue_contract.py + launch_queue_persist.py additively (new optional dataclass fields, no removed/renamed fields) and adds ONE new write-gated MCP tool (aiworkhub_task_queue_request) that reuses the existing log path, instead of creating a parallel schema/log/module. This plan supersedes CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 from the B281 next_wave file; see next_wave file for the corrected task card (renumbered B286 to avoid batch-token collision with this planning task's own B282 id)."
   },
   "mvp_patch_plan": {
     "principle": "Additive-only. No existing dataclass field renamed/removed, no existing MCP tool signature changed, no existing test invalidated. LAUNCH_IMPLEMENTED stays a hardcoded False constant in every new code path -- the MVP patch grants zero process-launch authority.",
     "exact_files": {
       "modify_additive_only": [
         {
-          "path": "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
+          "path": "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
           "change": "Add 4 new OPTIONAL fields to LaunchRequest (model: str|None=None, owner_prompt: str='', requested_at: str|None=None, stale_timeout_seconds: int=7200); add deterministic_request_id(task_id, runner, requested_at) -> sha1(f'{task_id}:{runner}:{requested_at}').hexdigest()[:16] helper (matches B281 section_1 request_id spec exactly); add 'duplicate_blocked' and 'rolled_back' to the decision string vocabulary returned by evaluate_launch (LaunchDecision.decision stays a plain str, no enum break). LAUNCH_IMPLEMENTED, launch_enabled(), ProcessState members unchanged."
         },
         {
-          "path": "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
+          "path": "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
           "change": "Extend _PROCESS_LOG_KEYS with the 4 new field names plus 'rollback_of_request_id' (str|None, default None) so _scrub_entry keeps them; add find_open_requests(task_id) -> list[dict] built on top of the existing read_persisted_log() (no new file I/O primitive, reuses the same read-only file open) to answer the duplicate-runner and idempotency checks. persist_transition/persist_intent signatures gain only new keyword-only optional args (backward compatible)."
         },
         {
-          "path": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-          "change": "Register ONE new @mcp.tool() geoai_task_queue_request (write-gated, mirrors the existing geoai_task_auto_pickup write-gated pattern at server.py:56-60). Existing 24 tools unchanged; new total 25. No existing tool's parameters, docstring contract, or return shape touched."
+          "path": "tools/aiworkhub/src/aiworkhub/server.py",
+          "change": "Register ONE new @mcp.tool() aiworkhub_task_queue_request (write-gated, mirrors the existing aiworkhub_task_auto_pickup write-gated pattern at server.py:56-60). Existing 24 tools unchanged; new total 25. No existing tool's parameters, docstring contract, or return shape touched."
         }
       ],
       "new_files": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/stale_recovery.py (B287: read-only recommend-only module, consumes completion_inbox.build_completion_inbox()['stale_processing'] + launch_queue_persist.read_persisted_log())",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cost_ledger.py (B288: read-only aggregator, UNIONs launch_queue_persist log entries with core.usage_report())"
+        "tools/aiworkhub/src/aiworkhub/stale_recovery.py (B287: read-only recommend-only module, consumes completion_inbox.build_completion_inbox()['stale_processing'] + launch_queue_persist.read_persisted_log())",
+        "tools/aiworkhub/src/aiworkhub/cost_ledger.py (B288: read-only aggregator, UNIONs launch_queue_persist log entries with core.usage_report())"
       ],
       "test_files": [
-        "tools/geoai-task-mcp/tests/test_mcp_queue_request_tool_b286_v1.sh",
-        "tools/geoai-task-mcp/tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh",
-        "tools/geoai-task-mcp/tests/test_mcp_cost_ledger_aggregator_b288_v1.sh"
+        "tools/aiworkhub/tests/test_mcp_queue_request_tool_b286_v1.sh",
+        "tools/aiworkhub/tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh",
+        "tools/aiworkhub/tests/test_mcp_cost_ledger_aggregator_b288_v1.sh"
       ]
     },
     "api_surface_new_tool": {
-      "name": "geoai_task_queue_request",
+      "name": "aiworkhub_task_queue_request",
       "write_gated": true,
-      "gate": "core.writes_allowed() / GEOAI_TASK_MCP_ALLOW_WRITES=1 (identical gate name/semantics as every other write-gated tool in server.py; GEOAI_TASK_MCP_ALLOW_LAUNCH is NOT sufficient by itself and is not read by this tool -- it stays scoped to the still-unimplemented launcher)",
+      "gate": "core.writes_allowed() / AIWORKHUB_ALLOW_WRITES=1 (identical gate name/semantics as every other write-gated tool in server.py; AIWORKHUB_ALLOW_LAUNCH is NOT sufficient by itself and is not read by this tool -- it stays scoped to the still-unimplemented launcher)",
       "input_schema": {
         "task_id": "str, required",
         "runner": "str, required",
@@ -88,7 +88,7 @@
         "request_id": "str|None, optional; server computes deterministic_request_id(task_id, runner, requested_at) when omitted"
       },
       "output_schema": {
-        "tool": "geoai_task_queue_request",
+        "tool": "aiworkhub_task_queue_request",
         "contract": "B282_v1_mvp_queue_request_extends_launch_queue_contract",
         "readonly": false,
         "idempotent_noop": "bool -- true when the same request_id already has a non-terminal entry (queued/planned/blocked_launch_disabled) in the audit log; matches B281 section_1 idempotency_rule",
@@ -98,20 +98,20 @@
         "decision": "LaunchDecision.as_dict() -- permitted is always false; state is always blocked_launch_disabled because LAUNCH_IMPLEMENTED stays False",
         "persisted_entry": "ProcessLogEntry.as_dict() extended, or null when write gate is closed or the request was an idempotent/duplicate no-op",
         "authority_flags": "same shape as _launch_queue_authority_flags(), all false, write_gate_enabled mirrors core.writes_allowed()",
-        "server_tool": "geoai_task_queue_request"
+        "server_tool": "aiworkhub_task_queue_request"
       },
-      "reuses_existing_log": "tools/geoai-task-mcp/logs/launch_queue_audit.jsonl (GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH override) -- no new file, no new log format, append-only preserved."
+      "reuses_existing_log": "tools/aiworkhub/logs/launch_queue_audit.jsonl (AIWORKHUB_LAUNCH_QUEUE_LOG_PATH override) -- no new file, no new log format, append-only preserved."
     },
-    "queue_request_schema": "B281 section_1 queue_request_envelope, realized as the geoai_task_queue_request input_schema above; request_id generation matches B281's sha1(task_id + runner + requested_at)[:16] rule exactly via deterministic_request_id().",
+    "queue_request_schema": "B281 section_1 queue_request_envelope, realized as the aiworkhub_task_queue_request input_schema above; request_id generation matches B281's sha1(task_id + runner + requested_at)[:16] rule exactly via deterministic_request_id().",
     "completion_inbox_integration": {
       "no_new_read_tool_needed": true,
-      "flow": "Worker finishes -> taskctl.py review <task_id> -> completion_inbox.build_completion_inbox()['review_queue'] shows it (unchanged, B275 contract). Codex detects via existing geoai_completion_inbox tool. No change required to completion_inbox.py for the MVP patch; stale_recovery.py (B287) is an ADDITIONAL consumer of the same build_completion_inbox()['stale_processing'] facet, read-only, no new taskctl call added."
+      "flow": "Worker finishes -> taskctl.py review <task_id> -> completion_inbox.build_completion_inbox()['review_queue'] shows it (unchanged, B275 contract). Codex detects via existing aiworkhub_completion_inbox tool. No change required to completion_inbox.py for the MVP patch; stale_recovery.py (B287) is an ADDITIONAL consumer of the same build_completion_inbox()['stale_processing'] facet, read-only, no new taskctl call added."
     },
     "safety_gates": {
-      "G_WRITE_EXISTING": "core.writes_allowed() / GEOAI_TASK_MCP_ALLOW_WRITES -- reused unchanged; geoai_task_queue_request behaves like every other write-gated tool: gate closed -> persisted_entry=null, no file write.",
-      "G_LAUNCH_EXISTING": "launch_queue_contract.LAUNCH_IMPLEMENTED stays a hardcoded False constant; GEOAI_TASK_MCP_ALLOW_LAUNCH is read only for gate_status() reporting, never to permit a spawn. No code path in this MVP patch imports subprocess/os.exec/os.spawn/os.system/os.popen.",
-      "G_DUPLICATE_RUNNER": "Before persisting, geoai_task_queue_request calls find_open_requests(task_id). If any open (non-terminal) entry exists for a DIFFERENT runner than the requester, the call returns duplicate_runner_blocked=true and persisted_entry=null -- mirrors core.collision_guard()'s existing collision semantics, no new collision authority introduced.",
-      "G_STALE_RECOVERY": "geoai_task_queue_request cross-checks completion_inbox.build_completion_inbox()['stale_processing'] for the task_id; if present, the persisted entry is tagged stale_recovery_requeue=true instead of being treated as a first launch, preventing double-processing of a merely-stale (not dead) task.",
+      "G_WRITE_EXISTING": "core.writes_allowed() / AIWORKHUB_ALLOW_WRITES -- reused unchanged; aiworkhub_task_queue_request behaves like every other write-gated tool: gate closed -> persisted_entry=null, no file write.",
+      "G_LAUNCH_EXISTING": "launch_queue_contract.LAUNCH_IMPLEMENTED stays a hardcoded False constant; AIWORKHUB_ALLOW_LAUNCH is read only for gate_status() reporting, never to permit a spawn. No code path in this MVP patch imports subprocess/os.exec/os.spawn/os.system/os.popen.",
+      "G_DUPLICATE_RUNNER": "Before persisting, aiworkhub_task_queue_request calls find_open_requests(task_id). If any open (non-terminal) entry exists for a DIFFERENT runner than the requester, the call returns duplicate_runner_blocked=true and persisted_entry=null -- mirrors core.collision_guard()'s existing collision semantics, no new collision authority introduced.",
+      "G_STALE_RECOVERY": "aiworkhub_task_queue_request cross-checks completion_inbox.build_completion_inbox()['stale_processing'] for the task_id; if present, the persisted entry is tagged stale_recovery_requeue=true instead of being treated as a first launch, preventing double-processing of a merely-stale (not dead) task.",
       "G_ROLLBACK": "Because the audit log is append-only (existing invariant, unchanged), rollback is a NEW compensating record: rollback_of_request_id references the original request_id and decision='rolled_back'. No delete/rewrite/truncate path is ever introduced; read_persisted_log() consumers can filter rolled_back chains.",
       "G_USAGE_EXISTING": "core.usage_report() remains the sole source of truth for token/cost counts; cost_ledger.py (B288) only aggregates (UNION + dedup by task_id/runner/model), it never writes usage data itself."
     },
@@ -175,17 +175,17 @@
   "remaining_gaps_not_solved_by_this_plan": [
     "NO_PROCESS_SPAWN_IMPLEMENTED: unchanged from B281 -- still deferred to a future explicitly-gated task.",
     "NO_OWNER_DELIVERY_CHANNEL: unchanged from B277/B281 blocker 1.",
-    "NO_TRUE_PUSH: detection stays pull-based (agent loop calls completion_inbox / geoai_task_queue_request), unchanged from B281.",
+    "NO_TRUE_PUSH: detection stays pull-based (agent loop calls completion_inbox / aiworkhub_task_queue_request), unchanged from B281.",
     "NO_ARTIFACT_BODY_READ: this plan and the tools it specifies operate on task-card metadata and the launch-queue audit log only, never artifact file contents."
   ],
-  "next_wave": "tools/geoai-task-mcp/data/tasking/task_mcp_mvp_patch_plan_next_wave_b282_v1.json",
+  "next_wave": "tools/aiworkhub/data/tasking/task_mcp_mvp_patch_plan_next_wave_b282_v1.json",
   "files_written": [
-    "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_mvp_patch_plan_next_wave_b282_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_mvp_patch_plan_b282_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_mvp_patch_plan_next_wave_b282_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_mvp_patch_plan_b282_v1.sh"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_mvp_patch_plan_b282_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_mvp_patch_plan_b282_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "commit_contract": "NO_COMMIT",

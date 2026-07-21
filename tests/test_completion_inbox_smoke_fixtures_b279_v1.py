@@ -6,7 +6,7 @@ Source spec (read-only, not modified by this task):
 Turns B278's 6 fixture-driven smoke scenarios (completion, blocked,
 duplicate_runner, stale, usage, tool_error) + 2 edge cases (no_pending_task,
 duplicate_runner_cross_reference) into real pytest functions that exercise
-``geoai_task_mcp.completion_inbox`` and ``geoai_task_mcp.core`` directly.
+``aiworkhub.completion_inbox`` and ``aiworkhub.core`` directly.
 
 Isolation contract (acceptance requirement -- "monkeypatch taskctl subprocess
 calls; no live SQLite writes or model CLI launch"):
@@ -16,7 +16,7 @@ calls; no live SQLite writes or model CLI launch"):
     fixture injection -- this bypasses ``core.list_tasks``/``core.show_task``
     entirely, so ``subprocess.run`` is never invoked (zero live-DB touch).
   * scenario_usage and scenario_tool_error explicitly monkeypatch
-    ``geoai_task_mcp.core.subprocess.run`` with ``pytest``'s ``monkeypatch``
+    ``aiworkhub.core.subprocess.run`` with ``pytest``'s ``monkeypatch``
     fixture -- the real ``taskctl.py`` binary and the live
     ``task_queue_v1.sqlite`` are never invoked/read/written by this file.
   * No test in this file imports or spawns any model/agent CLI.
@@ -43,7 +43,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import completion_inbox, core  # noqa: E402
+from aiworkhub import completion_inbox, core  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

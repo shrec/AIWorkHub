@@ -28,19 +28,19 @@
     "run_before_writing_executed": "python3 AITools/taskctl.py guard CLAUDE_TASK_MCP_LIVE_LAUNCH_CANARY_B313_V1 --runner claude_task_mcp_live_launch_canary_b313 --topic task_mcp",
     "guard_result": "PASS",
     "read_first_paths_read": [
-      "tools/geoai-task-mcp/README.md",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+      "tools/aiworkhub/README.md",
+      "tools/aiworkhub/src/aiworkhub/process_launcher.py"
     ],
     "writes_confined_to_allowed_writes": true,
     "allowed_writes": [
-      "tools/geoai-task-mcp/eval/task_mcp_live_launch_canary_b313_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
+      "tools/aiworkhub/eval/task_mcp_live_launch_canary_b313_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
     ]
   },
   "process_launcher_observations": {
     "build_worker_prompt_function": "process_launcher.py:build_worker_prompt() generates the exact CLI prompt injected into this session; its template matches the prompt I received",
     "shell_false_invariant": "ProcessManager.launch() passes shell=False to subprocess.Popen; no shell interpretation of worker commands",
-    "dual_env_gate": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 and GEOAI_TASK_MCP_ALLOW_WRITES=1 must both be set for real process launch",
+    "dual_env_gate": "AIWORKHUB_ALLOW_LAUNCH=1 and AIWORKHUB_ALLOW_WRITES=1 must both be set for real process launch",
     "launch_implemented_true": "LAUNCH_IMPLEMENTED=True constant confirms real process launch is implemented (not a stub)",
     "process_group_isolation": "start_new_session=True + _terminate_process_group() ensures clean lifecycle",
     "audit_log_append_only": "process_events.jsonl is O_APPEND only; never rewritten",
@@ -86,7 +86,7 @@
   "commit_contract": "NO_COMMIT",
   "codex_review_required": true,
   "files_written": [
-    "tools/geoai-task-mcp/eval/task_mcp_live_launch_canary_b313_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_live_launch_canary_b313_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_live_launch_canary_b313_v1.sh"
   ]
 }

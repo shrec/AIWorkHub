@@ -1,0 +1,42 @@
+{
+  "schema_id": "aiworkhub.task_mcp.agent_tool_instruction_activation_b821_v1.eval.v1",
+  "task_id": "DEEPSEEK_AIWORKHUB_AGENT_TOOL_INSTRUCTION_ACTIVATION_B821_V1",
+  "runner": "deepseek_aiworkhub_agent_tool_instruction_activation_b821_v1",
+  "topic": "task_mcp",
+  "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae",
+  "canonical_bytes": 1728,
+  "projections": {
+    "AGENTS.md": {
+      "bytes": 1826,
+      "sha256": "e0d673002a549d36975929afead922837eeb5806ed7e4a97b776217c0ca45d89",
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae"
+    },
+    "CLAUDE.md": {
+      "bytes": 1826,
+      "sha256": "f5ea8f01e56e4994c99ae874fd17c2a90028545921614135e32562fab39bcf0d",
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae"
+    },
+    ".github/copilot-instructions.md": {
+      "bytes": 1848,
+      "sha256": "368b6ccbdeefcff43344c9b5131965ab069c865c57aaf4061de84aedd8f028e1",
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae"
+    }
+  },
+  "mcp_tool_names": [
+    "aiworkhub_agent_tool_instruction_preview",
+    "aiworkhub_agent_tool_instruction_inspect",
+    "aiworkhub_agent_tool_instruction_apply"
+  ],
+  "cli_commands": [
+    "preview",
+    "inspect",
+    "apply"
+  ],
+  "providers": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".github/copilot-instructions.md"
+  ],
+  "managed_marker_start": "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->",
+  "managed_marker_end": "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
+}

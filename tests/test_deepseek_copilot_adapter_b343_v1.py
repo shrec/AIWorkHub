@@ -24,7 +24,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import (  # noqa: E402
+from aiworkhub import (  # noqa: E402
     deepseek_credentials as dc,
     process_launcher,
     runtime_adapters,
@@ -641,7 +641,7 @@ def test_usage_parser_invents_nothing_when_no_usage(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_dashboard_snapshot_includes_adapter_readiness_without_secret(tmp_path):
-    from geoai_task_mcp import dashboard
+    from aiworkhub import dashboard
 
     path = tmp_path / "cred.json"
     _write_credential(path)
@@ -673,7 +673,7 @@ def test_dashboard_snapshot_includes_adapter_readiness_without_secret(tmp_path):
 
 
 def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_path):
-    from geoai_task_mcp import server
+    from aiworkhub import server
 
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
@@ -686,7 +686,7 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
                         lambda: SimpleNamespace(list_processes=lambda limit: {"ok": True, "processes": []}))
     monkeypatch.setattr(server.core, "repo_root", lambda: repo_dir)
 
-    result = server.geoai_completion_inbox()
+    result = server.aiworkhub_completion_inbox()
     readiness = result["adapter_readiness"]
     ids = {a["adapter_id"] for a in readiness["adapters"]}
     assert ADAPTER in ids
@@ -697,7 +697,7 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
 
 
 def test_dashboard_snapshot_tolerates_provider_without_readiness_method():
-    from geoai_task_mcp import dashboard
+    from aiworkhub import dashboard
 
     class _MinimalProvider:
         def list_tasks(self, status):

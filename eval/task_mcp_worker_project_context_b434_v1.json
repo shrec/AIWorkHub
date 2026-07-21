@@ -18,26 +18,26 @@
   },
   "commands": [
     {
-      "cmd": ".venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "cmd": ".venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
       "result": "not_run_environment_blocked",
       "returncode": 127,
       "stdout": "",
       "stderr": "/usr/bin/bash: line 1: .venv/bin/python: No such file or directory"
     },
     {
-      "cmd": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "cmd": "python3 -m pytest -q tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
       "result": "not_run_environment_blocked",
       "returncode": 1,
       "stdout": "",
       "stderr": "/usr/bin/python3: No module named pytest"
     },
     {
-      "cmd": "python3 -m py_compile tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "cmd": "python3 -m py_compile tools/aiworkhub/src/aiworkhub/project_context.py tools/aiworkhub/src/aiworkhub/process_launcher.py tools/aiworkhub/src/aiworkhub/runtime_adapters.py tools/aiworkhub/src/aiworkhub/worker_workspace.py tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
       "result": "pass",
       "returncode": 0
     },
     {
-      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src python3 -c \"from geoai_task_mcp import process_launcher, project_context, runtime_adapters, worker_workspace; print('import ok')\"",
+      "cmd": "PYTHONPATH=tools/aiworkhub/src python3 -c \"from aiworkhub import process_launcher, project_context, runtime_adapters, worker_workspace; print('import ok')\"",
       "result": "pass",
       "returncode": 0,
       "stdout": "import ok"
@@ -55,20 +55,20 @@
       "stdout": "collision_free=true - no overlapping allowed_writes (118 active cards)"
     },
     {
-      "cmd": ".venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_process_launcher_security.py tools/geoai-task-mcp/tests/test_runtime_adapters.py tools/geoai-task-mcp/tests/test_worker_workspace.py",
+      "cmd": ".venv/bin/python -m pytest -q tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_process_launcher_security.py tools/aiworkhub/tests/test_runtime_adapters.py tools/aiworkhub/tests/test_worker_workspace.py",
       "result": "not_run_environment_blocked",
       "returncode": 127,
       "stdout": "",
       "stderr": "/usr/bin/bash: line 1: .venv/bin/python: No such file or directory"
     },
     {
-      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src /home/shrek/GeoAI/.venv/bin/python -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
+      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
       "result": "coordinator_pass",
       "returncode": 0,
       "stdout": "8 passed"
     },
     {
-      "cmd": "PYTHONPATH=tools/geoai-task-mcp/src /home/shrek/GeoAI/.venv/bin/python -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_process_launcher_security.py tools/geoai-task-mcp/tests/test_runtime_adapters.py tools/geoai-task-mcp/tests/test_worker_workspace.py",
+      "cmd": "PYTHONPATH=tools/aiworkhub/src /home/shrek/AIWorkHub/.venv/bin/python -m pytest -q -p no:cacheprovider tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_process_launcher_security.py tools/aiworkhub/tests/test_runtime_adapters.py tools/aiworkhub/tests/test_worker_workspace.py",
       "result": "coordinator_pass",
       "returncode": 0,
       "stdout": "45 passed"
@@ -88,11 +88,11 @@
   ],
   "worker_pytest_blocker": "the isolated worktree had no local .venv; Codex coordinator reran the exact focused suites with the parent repository venv and accepted the corrected 8/8 plus 45/45 results",
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/runtime_adapters.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_worker_project_context_b434_v1.json"
+    "tools/aiworkhub/src/aiworkhub/project_context.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/runtime_adapters.py",
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/tests/test_worker_project_context_b434_v1.py",
+    "tools/aiworkhub/eval/task_mcp_worker_project_context_b434_v1.json"
   ]
 }

@@ -1,0 +1,79 @@
+{
+  "schema_id": "geoai.task_mcp.aiworkhub_vscode_release_handshake_evidence.v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_VSCODE_RELEASE_HANDSHAKE_B820_V1",
+  "runner": "codex_gpt55_aiworkhub_vscode_release_handshake_b820_v1",
+  "verdict": "TASK_SCOPED_PASS_GLOBAL_TASKCTL_PREEXISTING_FAIL",
+  "changed_paths": [
+    "tools/vscode-geoai-task-operations/package.json",
+    "tools/vscode-geoai-task-operations/extension.js",
+    "tools/vscode-geoai-task-operations/media/app.js",
+    "tools/vscode-geoai-task-operations/media/app.css",
+    "tools/vscode-geoai-task-operations/README.md",
+    "tools/vscode-geoai-task-operations/install_remote.sh",
+    "tools/vscode-geoai-task-operations/test_extension_smoke.sh",
+    "tools/aiworkhub/eval/aiworkhub_vscode_release_handshake_b820_v1.json"
+  ],
+  "release_handshake": {
+    "display_name": "AIWorkHub",
+    "extension_version_prefix": "0.3.",
+    "expected_mcp_package_version": "0.2.0",
+    "repository_label_visible": true,
+    "host_paths_exposed": false,
+    "runtime_version_visible": true,
+    "stale_runtime_banner": "Reload/Restart required",
+    "mismatch_detection": [
+      "mcp_version_mismatch",
+      "mcp_capability_mismatch"
+    ],
+    "raw_mcp_capabilities_exposed_to_webview": false
+  },
+  "compatibility": {
+    "legacy_command_ids_retained": [
+      "geoaiTaskOperations.openDashboard",
+      "geoaiTaskOperations.refreshDashboard",
+      "geoaiTaskOperations.restartDashboard"
+    ],
+    "user_facing_titles_use_aiworkhub": true,
+    "readme_handoff_uses_aiworkhub": true,
+    "installer_handoff_uses_aiworkhub": true
+  },
+  "security_boundaries": {
+    "http_dashboard_dependency": false,
+    "iframe": false,
+    "browser_open": false,
+    "hardcoded_lan_ip": false,
+    "secret_exposure": false,
+    "write_action": false,
+    "arbitrary_mcp_tool_call_surface": false
+  },
+  "validation": [
+    {
+      "command": "bash tools/vscode-geoai-task-operations/test_extension_smoke.sh",
+      "status": "PASS"
+    },
+    {
+      "command": "node --check tools/vscode-geoai-task-operations/extension.js",
+      "status": "PASS"
+    },
+    {
+      "command": "node --check tools/vscode-geoai-task-operations/media/app.js",
+      "status": "PASS"
+    },
+    {
+      "command": "python3 -m json.tool tools/aiworkhub/eval/aiworkhub_vscode_release_handshake_b820_v1.json",
+      "status": "PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "status": "FAIL",
+      "failure_scope": "unrelated_active_queue",
+      "summary": "10 pre-existing active queue errors: Lexicon B480 cards assigned to B475 runners plus duplicate active runners; no failure references AIWorkHub paths or this task id."
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard",
+      "status": "FAIL",
+      "failure_scope": "unrelated_active_queue",
+      "summary": "9 pre-existing active-card collisions in parse_place_spatial and lexicon review/eval paths; no collision references allowed_writes for this contract."
+    }
+  ]
+}

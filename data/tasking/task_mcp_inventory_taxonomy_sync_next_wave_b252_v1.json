@@ -14,24 +14,24 @@
       "TASK_MCP_B250_TAXONOMY_PATCH"
     ],
     "allowed_writes": [
-      "tools/geoai-task-mcp/README.md",
-      "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
-      "tools/geoai-task-mcp/tests/mcp_live_tool_inventory_fixture.py",
-      "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
-      "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
-      "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
-      "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh"
+      "tools/aiworkhub/README.md",
+      "tools/aiworkhub/tests/mcp_client_smoke_contract_freeze.py",
+      "tools/aiworkhub/tests/mcp_live_tool_inventory_fixture.py",
+      "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "tools/aiworkhub/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh",
+      "tools/aiworkhub/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh"
     ],
-    "new_file_note": "tools/geoai-task-mcp/tests/mcp_live_tool_inventory_fixture.py is a NEW companion fixture (proposal 2, option b) -- a single source-of-truth list of the 20 live tools + tier split, derived from server.py @mcp.tool() decorators + cli_adapter_readonly_tool.READONLY_TOOL_NAMES, that README generation and the stdio smoke tests should both import instead of re-deriving or hardcoding counts.",
+    "new_file_note": "tools/aiworkhub/tests/mcp_live_tool_inventory_fixture.py is a NEW companion fixture (proposal 2, option b) -- a single source-of-truth list of the 20 live tools + tier split, derived from server.py @mcp.tool() decorators + cli_adapter_readonly_tool.READONLY_TOOL_NAMES, that README generation and the stdio smoke tests should both import instead of re-deriving or hardcoding counts.",
     "pre_patch_step": "Re-run a static AST-based live inventory count (same method as tests/test_task_mcp_live_tool_inventory_reverify_b251_v1.sh step 5) immediately before patching, in case another worker has changed server.py/cli_adapter_readonly_tool.py since this plan's baseline (2026-07-07T21:00:00Z reverify). Do not copy this plan's counts blindly if the live AST count differs.",
     "acceptance": [
       "README.md 'Exposed Tools' section lists all live tools with correct tier split.",
       "mcp_client_smoke_contract_freeze.py B108 tuples remain byte-identical (renamed export only, historical fingerprint values untouched); new companion fixture added.",
       "test_mcp_stdio_subprocess_client_smoke_b109_v1.sh and test_mcp_stdio_concurrent_client_smoke_b110_v1.sh assert the live readonly/write_gated counts (imported from the companion fixture, not hardcoded).",
       "test_mcp_neural_launch_routing_dryrun_b109_v1.sh asserts collision_rows length against a freshly re-derived live curriculum row count, not a hardcoded historical number.",
-      "task_mcp_orchestrator_mvp_protocol_b250_v1.json TIER_1 includes geoai_task_codex_handoff_markdown (implemented:true) and geoai_supervisor_loop_status.implemented==true; its paired test total_tools assertion updated in the same change.",
-      "Full parallel test bundle for tools/geoai-task-mcp/tests re-run green after the patch (bounded worker pool, do not oversubscribe if other workers are active)."
+      "task_mcp_orchestrator_mvp_protocol_b250_v1.json TIER_1 includes aiworkhub_task_codex_handoff_markdown (implemented:true) and aiworkhub_supervisor_loop_status.implemented==true; its paired test total_tools assertion updated in the same change.",
+      "Full parallel test bundle for tools/aiworkhub/tests re-run green after the patch (bounded worker pool, do not oversubscribe if other workers are active)."
     ],
     "priority": "medium",
     "rationale_for_single_coordinated_task": "All 5 proposals rebase test/doc assertions onto the SAME underlying live-inventory fact (20 tools, 16/4 tier split). Splitting them into 5 separate patch tasks risks each worker deriving the count independently and landing mutually inconsistent numbers -- which already happened once inside B251 itself (STALE_3's 14-vs-16 arithmetic slip, corrected by this plan). A single task with one source-of-truth derivation step, applied atomically across all 8 target files, eliminates that failure mode."

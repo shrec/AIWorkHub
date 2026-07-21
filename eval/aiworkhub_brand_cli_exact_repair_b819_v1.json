@@ -1,0 +1,31 @@
+{
+  "schema_id": "aiworkhub.exact_repair_evidence.v1",
+  "task_id": "CODEX_GPT55_AIWORKINGHUB_BRAND_CLI_EXACT_REPAIR_B819_V1",
+  "mode": "exact_two_failure_compatibility_repair",
+  "repaired_failures": [
+    "aiworkhub.server compatibility alias delegates to aiworkhub.server",
+    "focused import test proves aiworkhub.server exposes dashboard_mcp_app and registers dashboard tools when the canonical dashboard module is present"
+  ],
+  "changed_paths": [
+    "tools/aiworkhub/pyproject.toml",
+    "tools/aiworkhub/src/aiworkhub/__init__.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_aiworkhub_brand_cli_exact_repair_b819_v1.py",
+    "tools/aiworkhub/eval/aiworkhub_brand_cli_exact_repair_b819_v1.json"
+  ],
+  "legacy_entry_points_preserved": [
+    "aiworkhub",
+    "aiworkhub-health",
+    "geoai-task-dashboard"
+  ],
+  "new_entry_point_aliases": {
+    "aiworkhub": "aiworkhub.server:main",
+    "awh": "aiworkhub.server:main",
+    "aiworkhub-mcp": "aiworkhub.server:main"
+  },
+  "alias_identity_contract": {
+    "aiworkhub.server.mcp": "aiworkhub.server.mcp",
+    "aiworkhub.server.main": "aiworkhub.server.main",
+    "state_root": "canonical aiworkhub.server/core only"
+  }
+}

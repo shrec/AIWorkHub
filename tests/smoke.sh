@@ -2,18 +2,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEOAI_REPO="${GEOAI_REPO:-$(cd "$ROOT/../.." && pwd)}"
+AIWORKHUB_REPO="${AIWORKHUB_REPO:-$(cd "$ROOT/../.." && pwd)}"
 
 export PYTHONPATH="$ROOT/src"
-export GEOAI_REPO
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO
+export AIWORKHUB_ALLOW_WRITES=0
 
-python3 -m geoai_task_mcp.health >/tmp/geoai_task_mcp_health.json
+python3 -m aiworkhub.health >/tmp/aiworkhub_health.json
 python3 - <<'PY'
 import json
 from pathlib import Path
 
-data = json.loads(Path("/tmp/geoai_task_mcp_health.json").read_text())
+data = json.loads(Path("/tmp/aiworkhub_health.json").read_text())
 assert data["ok"] is True, data
 assert data["writes_allowed"] is False, data
 assert data["verify"]["returncode"] == 0, data
@@ -21,7 +21,7 @@ print("health ok")
 PY
 
 python3 - <<'PY'
-from geoai_task_mcp import core
+from aiworkhub import core
 
 review = core.review_queue()
 assert "stdout" in review

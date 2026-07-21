@@ -11,7 +11,7 @@ _SRC = _TOOL_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import core, dashboard, dashboard_mcp_app  # noqa: E402
+from aiworkhub import core, dashboard, dashboard_mcp_app  # noqa: E402
 
 
 FAKE_SNAPSHOT: dict[str, Any] = {
@@ -91,7 +91,7 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
     assert calls == [((), {})]
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
     assert result["tasks"] == FAKE_SNAPSHOT["tasks"]
-    assert result["server_tool"] == "geoai_dashboard_snapshot"
+    assert result["server_tool"] == "aiworkhub_dashboard_snapshot"
     assert result["authority_flags"]["readonly"] is True
     assert result["authority_flags"]["queue_write"] is False
     assert "transport_truncated_fields" not in result
@@ -145,7 +145,7 @@ def test_task_detail_view_rejects_invalid_task_id_without_touching_provider(monk
     result = dashboard_mcp_app.task_detail_view(bad_id)
     assert result["ok"] is False
     assert result["error"] == "invalid_task_id"
-    assert result["server_tool"] == "geoai_dashboard_task_detail"
+    assert result["server_tool"] == "aiworkhub_dashboard_task_detail"
 
 
 def test_task_detail_view_reports_not_found(monkeypatch):
@@ -169,7 +169,7 @@ def test_task_detail_view_reuses_build_task_detail_as_sole_data_builder(monkeypa
     assert calls == ["TASK_B615_DETAIL_V1"]
     assert result["ok"] is True
     assert result["task"]["task_id"] == "TASK_B615_DETAIL_V1"
-    assert result["server_tool"] == "geoai_dashboard_task_detail"
+    assert result["server_tool"] == "aiworkhub_dashboard_task_detail"
     assert result["authority_flags"]["process_launch"] is False
 
 
@@ -211,7 +211,7 @@ def test_health_view_delegates_to_core_health_and_never_calls_build_snapshot(mon
     result = dashboard_mcp_app.health_view()
     assert result["ok"] is True
     assert result["writes_allowed"] is False
-    assert result["server_tool"] == "geoai_dashboard_health"
+    assert result["server_tool"] == "aiworkhub_dashboard_health"
     assert result["server_version"]
     assert result["authority_flags"]["agent_launch"] is False
 
@@ -238,19 +238,19 @@ def test_register_binds_exactly_the_three_narrow_tools():
 
     assert set(names) == set(dashboard_mcp_app.READONLY_TOOL_NAMES)
     assert set(fake_mcp.registered) == {
-        "geoai_dashboard_snapshot",
-        "geoai_dashboard_task_detail",
-        "geoai_dashboard_health",
+        "aiworkhub_dashboard_snapshot",
+        "aiworkhub_dashboard_task_detail",
+        "aiworkhub_dashboard_health",
     }
-    assert fake_mcp.registered["geoai_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view
-    assert fake_mcp.registered["geoai_dashboard_task_detail"] is dashboard_mcp_app.task_detail_view
-    assert fake_mcp.registered["geoai_dashboard_health"] is dashboard_mcp_app.health_view
+    assert fake_mcp.registered["aiworkhub_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view
+    assert fake_mcp.registered["aiworkhub_dashboard_task_detail"] is dashboard_mcp_app.task_detail_view
+    assert fake_mcp.registered["aiworkhub_dashboard_health"] is dashboard_mcp_app.health_view
 
 
 def test_task_id_validation_reuses_the_dashboard_http_route_pattern():
     # Same compiled pattern object as dashboard._TASK_ID_RE -- never a second,
     # potentially drifting, task_id regex.
-    assert dashboard_mcp_app.task_detail_view.__module__ == "geoai_task_mcp.dashboard_mcp_app"
+    assert dashboard_mcp_app.task_detail_view.__module__ == "aiworkhub.dashboard_mcp_app"
     assert dashboard._TASK_ID_RE.fullmatch("TASK_OK_V1")
 
 

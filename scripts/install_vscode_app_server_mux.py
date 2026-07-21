@@ -10,7 +10,7 @@ systemd, the live callback DB, or any running process. It only prints:
 
 Codex owns applying the setting, reloading the VS Code extension host, the
 live canary against the extension-owned thread, recovery, and finally
-enabling ``geoai-task-callback-bridge.service`` -- none of that happens here.
+enabling ``aiworkhub-callback-bridge.service`` -- none of that happens here.
 """
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MUX_MODULE_PATH = REPO_ROOT / "tools" / "geoai-task-mcp" / "src" / "geoai_task_mcp" / "app_server_mux.py"
-CONSOLE_SCRIPT_NAME = "geoai-app-server-mux"
-DEFAULT_CONSOLE_SCRIPT = REPO_ROOT / "tools" / "geoai-task-mcp" / "scripts" / CONSOLE_SCRIPT_NAME
+MUX_MODULE_PATH = REPO_ROOT / "tools" / "aiworkhub" / "src" / "aiworkhub" / "app_server_mux.py"
+CONSOLE_SCRIPT_NAME = "aiworkhub-app-server-mux"
+DEFAULT_CONSOLE_SCRIPT = REPO_ROOT / "tools" / "aiworkhub" / "scripts" / CONSOLE_SCRIPT_NAME
 SETTING_KEY = "chatgpt.cliExecutable"
-ENV_REAL_EXECUTABLE = "GEOAI_APP_SERVER_MUX_REAL_EXECUTABLE"
+ENV_REAL_EXECUTABLE = "AIWORKHUB_APP_SERVER_MUX_REAL_EXECUTABLE"
 
 
 def find_real_codex_executable() -> str | None:
@@ -97,7 +97,7 @@ def render_report(wrapper_executable: str | None = None) -> dict:
             "the new `chatgpt.cliExecutable` value and spawns its App Server "
             "child through the mux.",
             "Run the Codex-owned live canary against the extension-owned "
-            "thread before enabling geoai-task-callback-bridge.service.",
+            "thread before enabling aiworkhub-callback-bridge.service.",
         ],
         "rollback_instructions": [
             f"Set `{SETTING_KEY}` back to the `rollback_setting` value above "
@@ -111,7 +111,7 @@ def render_report(wrapper_executable: str | None = None) -> dict:
 def real_executable_pin() -> dict:
     real = find_real_codex_executable() or "codex"
     return {
-        "path": str(Path.home() / ".geoai" / "app_server_mux" / "real_executable"),
+        "path": str(Path.home() / ".aiworkhub" / "app_server_mux" / "real_executable"),
         "value": real,
         "required_mode": "0600",
     }

@@ -7,7 +7,7 @@
   "next_wave_tasks": [
     {
       "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1",
-      "objective": "Wire review_summarizer as a geoai_task_review_summarize MCP tool in server.py",
+      "objective": "Wire review_summarizer as a aiworkhub_task_review_summarize MCP tool in server.py",
       "runner": "deepseek_task_mcp_review_summarizer_b111",
       "topic": "task_mcp",
       "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1"],

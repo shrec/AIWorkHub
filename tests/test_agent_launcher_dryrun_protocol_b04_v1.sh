@@ -17,7 +17,7 @@ set -euo pipefail
 #   3. prompt composition formula (contract-json + read_first paths) recomputes
 #      deterministically and the truncate_and_flag budget policy triggers
 #      correctly at a small budget
-#   4. launch stays impossible even with GEOAI_TASK_MCP_ALLOW_LAUNCH=1
+#   4. launch stays impossible even with AIWORKHUB_ALLOW_LAUNCH=1
 #   5. write gate stays OFF by default
 #   6. task_id_binding_check is read-only (taskctl show, never review/done)
 #      for both a known and an unknown task_id
@@ -25,7 +25,7 @@ set -euo pipefail
 #   8. parent task queue is not mutated (taskctl verify)
 #
 # Isolation: uses a per-run mktemp audit path; overrides
-# GEOAI_TASK_MCP_AUDIT_LOG_PATH. Never calls taskctl review/done. No shared
+# AIWORKHUB_AUDIT_LOG_PATH. Never calls taskctl review/done. No shared
 # repo artifact is written. Parallel-safe.
 # ---------------------------------------------------------------------------
 
@@ -34,18 +34,18 @@ MCPROOT="$ROOT/tools/geoai-task-mcp"
 EVAL_JSON="$MCPROOT/eval/agent_launcher_dryrun_protocol_b04_v1.json"
 TASK_ID="CLAUDE_TASK_MCP_AGENT_LAUNCHER_DRYRUN_PROTOCOL_B04_V1"
 
-TMPDIR_AUDIT="$(mktemp -d "${TMPDIR:-/tmp}/geoai_dryrun_protocol_b04_sh.XXXXXX")"
+TMPDIR_AUDIT="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_dryrun_protocol_b04_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR_AUDIT"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$TMPDIR_AUDIT/audit.jsonl"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
+export AIWORKHUB_AUDIT_LOG_PATH="$TMPDIR_AUDIT/audit.jsonl"
 
 echo "=== Agent Launcher DryRun Protocol Test B04 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
-echo "AUDIT_LOG=$GEOAI_TASK_MCP_AUDIT_LOG_PATH"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
+echo "AUDIT_LOG=$AIWORKHUB_AUDIT_LOG_PATH"
 echo ""
 
 echo "--- [1/8] eval JSON structure ---"
@@ -94,9 +94,9 @@ echo ""
 echo "--- [2/8] cross-validate examples against REAL cli_adapter_dryrun + core code ---"
 EVAL_JSON="$EVAL_JSON" python3 - <<'PYEOF'
 import json, os, sys
-sys.path.insert(0, os.path.join(os.environ["GEOAI_REPO"], "tools/geoai-task-mcp/src"))
-from geoai_task_mcp import cli_adapter_dryrun as cad
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ["AIWORKHUB_REPO"], "tools/geoai-task-mcp/src"))
+from aiworkhub import cli_adapter_dryrun as cad
+from aiworkhub import core
 
 d = json.load(open(os.environ["EVAL_JSON"]))
 examples = {k: v for k, v in d["dry_run_examples"].items() if k != "note"}
@@ -107,7 +107,7 @@ for name, ex in examples.items():
     req, resp = ex["request"], ex["response"]
     adapter_id, runner, topic, action = req["adapter_id"], req["runner"], req["topic"], req["action"]
 
-    real_argv = cad.build_argv_template(adapter_id, prompt, repo="<GEOAI_REPO>")
+    real_argv = cad.build_argv_template(adapter_id, prompt, repo="<AIWORKHUB_REPO>")
     assert real_argv == resp["would_run_argv"], (
         f"{name}: would_run_argv mismatch: real={real_argv} eval={resp['would_run_argv']}")
 
@@ -172,10 +172,10 @@ PYEOF
 echo ""
 
 echo "--- [4/8] Defense-in-depth: launch impossible even with ALLOW_LAUNCH=1 ---"
-LAUNCH_STATE="$(GEOAI_TASK_MCP_ALLOW_LAUNCH=1 python3 -c '
+LAUNCH_STATE="$(AIWORKHUB_ALLOW_LAUNCH=1 python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_dryrun as m
+from aiworkhub import cli_adapter_dryrun as m
 print(str(m.launch_enabled()) + "," + str(m.LAUNCH_IMPLEMENTED))
 ')"
 if [ "$LAUNCH_STATE" != "False,False" ]; then
@@ -186,12 +186,12 @@ echo "launch impossible with ALLOW_LAUNCH=1: OK ($LAUNCH_STATE)"
 echo ""
 
 echo "--- [5/8] write gate still off by default ---"
-ACTUAL="$(python3 -c 'import os; print(os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES","0"))')"
+ACTUAL="$(python3 -c 'import os; print(os.environ.get("AIWORKHUB_ALLOW_WRITES","0"))')"
 if [ "$ACTUAL" != "0" ]; then
-    echo "FAIL: GEOAI_TASK_MCP_ALLOW_WRITES=$ACTUAL (expected 0)"
+    echo "FAIL: AIWORKHUB_ALLOW_WRITES=$ACTUAL (expected 0)"
     exit 1
 fi
-echo "GEOAI_TASK_MCP_ALLOW_WRITES confirmed still 0 (off)"
+echo "AIWORKHUB_ALLOW_WRITES confirmed still 0 (off)"
 echo ""
 
 echo "--- [6/8] task_id_binding_check is read-only (taskctl show only) ---"

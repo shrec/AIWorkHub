@@ -7,20 +7,20 @@ set -euo pipefail
 # Verifies:
 #   1. blocked write attempts are logged to audit.jsonl
 #   2. no secrets/env values appear in the audit log
-#   3. GEOAI_TASK_MCP_ALLOW_WRITES stays default off
+#   3. AIWORKHUB_ALLOW_WRITES stays default off
 #   4. parent task queue is not mutated by blocked writes
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEOAI_REPO="${GEOAI_REPO:-$(cd "$ROOT/../.." && pwd)}"
+AIWORKHUB_REPO="${AIWORKHUB_REPO:-$(cd "$ROOT/../.." && pwd)}"
 
 export PYTHONPATH="$ROOT/src"
-export GEOAI_REPO
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Write-Gate Audit Smoke Test v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 
 # ------------------------------------------------------------------
 # Run the audit smoke test (Python)
@@ -39,12 +39,12 @@ fi
 # ------------------------------------------------------------------
 # Verify ALLOW_WRITES is still off (defense-in-depth)
 # ------------------------------------------------------------------
-ACTUAL="$(python3 -c 'import os; print(os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES","0"))')"
+ACTUAL="$(python3 -c 'import os; print(os.environ.get("AIWORKHUB_ALLOW_WRITES","0"))')"
 if [ "$ACTUAL" != "0" ]; then
-    echo "FAIL: GEOAI_TASK_MCP_ALLOW_WRITES=$ACTUAL (expected 0)"
+    echo "FAIL: AIWORKHUB_ALLOW_WRITES=$ACTUAL (expected 0)"
     exit 1
 fi
-echo "GEOAI_TASK_MCP_ALLOW_WRITES confirmed still 0 (off)"
+echo "AIWORKHUB_ALLOW_WRITES confirmed still 0 (off)"
 
 echo ""
 echo "ALL CHECKS PASSED"

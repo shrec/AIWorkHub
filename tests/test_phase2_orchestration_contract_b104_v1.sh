@@ -101,11 +101,11 @@ if inv.get("launch_code_added") is not False:
     fail("invariant.launch_code_added must be false")
 if inv.get("write_gate_disabled") is not False:
     fail("invariant.write_gate_disabled must be false")
-if inv.get("proposed_enable_flag") != "GEOAI_TASK_MCP_ALLOW_LAUNCH":
+if inv.get("proposed_enable_flag") != "AIWORKHUB_ALLOW_LAUNCH":
     fail("invariant.proposed_enable_flag mismatch")
 if inv.get("default") != "0":
     fail("invariant.default must be '0'")
-if "GEOAI_TASK_MCP_ALLOW_WRITES" not in str(inv.get("requires_also", "")):
+if "AIWORKHUB_ALLOW_WRITES" not in str(inv.get("requires_also", "")):
     fail("invariant.requires_also must require ALLOW_WRITES")
 if c.get("verdict") != "PASS":
     fail("verdict must be PASS")

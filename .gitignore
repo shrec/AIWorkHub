@@ -10,4 +10,9 @@ build/
 tmp/
 logs/
 .env
-
+node_modules/
+*.vsix
+*.sqlite
+*.sqlite3
+*.db
+.aiworkhub/

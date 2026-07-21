@@ -17,8 +17,8 @@
     "taskctl_verify_pass": true
   },
   "environment": {
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0"
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "AIWORKHUB_ALLOW_WRITES": "0"
   },
   "eval_id": "mcp_live_client_smoke_b118_v1",
   "extends": "mcp_stdio_subprocess_client_smoke_b109_v1",

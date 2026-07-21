@@ -1,0 +1,90 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CLAUDE_CALLBACK_TRANSPORT_B856_V1",
+  "title": "Deliver durable callbacks to the owning Claude coordinator",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_claude_callback_transport_b856_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "critical",
+  "queue_order": 0,
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "objective": "Close the backend half of the missing Claude coordinator callback transport without touching VS Code UI files. Terminal task events routed to provider=claude must resolve the exact repository/window/session owner, persist a compact versioned aiworkhub.claude_callback.v1 sideband envelope, support a repository-bound claude CLI --resume delivery mode, and record a genuine matching acknowledgment before marking delivered. Preserve durable pending delivery across reload, active turns, process crashes and temporary unavailability. B855 independently owns the extension-side panel capability binding.",
+  "acceptance": [
+    "The current hard-coded live_claude_panel_wake_transport_unavailable path is replaced by capability-detected delivery with an explicit panel, CLI-resume, or unavailable mode.",
+    "The backend resolves provider=claude through the current repo_id, window identity and Claude session identity without cross-repository fallback and emits aiworkhub.claude_callback.v1.",
+    "A terminal task event is delivered exactly once logically: duplicate events are idempotent and delivered is written only after matching acknowledgment.",
+    "If the Claude coordinator has an active turn, the callback remains durable pending and is retried after idle without parallel-turn injection or dead-letter churn.",
+    "Window reload, extension-host restart and temporary Claude unavailability preserve the queue and resume delivery automatically.",
+    "Only task_id, terminal state, event_id/request_id and an instruction to inspect the trusted review queue reach Claude; worker output, prompts, secrets and arbitrary card text are never injected.",
+    "The backend status contract reports Claude callback mode, redacted bound session suffix, pending age, last delivery/deferral reason and health without exposing the full session ID.",
+    "An end-to-end test proves review_ready -> durable outbox -> Claude transport -> matching ack -> delivered using the selected repository database.",
+    "A capability-negative test proves that an unavailable panel API is never reported as panel-delivered and that an unavailable CLI remains pending rather than lost.",
+    "Existing Codex callback behavior and repository isolation remain unchanged."
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/route_identity.py",
+    "tools/geoai-task-mcp/src/aiworkhub/app_server_mux.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_claude_callback_transport_b856_v1.json"
+  ],
+  "forbidden": [
+    "unverified_private_extension_api",
+    "ui_keystroke_or_clipboard_injection",
+    "worker_output_in_callback",
+    "cross_repository_session_fallback",
+    "mark_delivered_before_ack",
+    "drop_on_busy",
+    "http_dashboard_server",
+    "second_callback_database",
+    "git_commit",
+    "git_push"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/route_identity.py",
+    "tools/geoai-task-mcp/src/aiworkhub/app_server_mux.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_claude_callback_transport_b856_v1.json"
+  ],
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "slice",
+      "bundle_type": "feature",
+      "query": "ClaudeCallbackAdapter durable outbox route identity VS Code coordinator target acknowledgment",
+      "budget": 140,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+        "tools/geoai-task-mcp/src/aiworkhub/route_identity.py",
+        "tools/geoai-task-mcp/src/aiworkhub/app_server_mux.py",
+        "tools/geoai-task-mcp/tests/test_callback_bridge.py"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub Claude coordinator callback transport",
+      "limit": 8
+    },
+    "ai_memory": {
+      "query": "Claude coordinator callback durable queue busy turn exact session",
+      "limit": 3
+    },
+    "kb": {
+      "query": "AIWorkHub provider callback route and acknowledgment contract",
+      "limit": 3
+    }
+  },
+  "commit_contract": "NO_COMMIT. Stop at Codex review."
+}

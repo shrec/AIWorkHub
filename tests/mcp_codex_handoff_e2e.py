@@ -14,7 +14,7 @@ asserts:
   * write gate default-off; readonly / authority flags correct;
   * empty-queue and fixture-queue cases both yield a valid report;
   * task_ids filtering and batch_label pass-through work;
-  * the registered server tool `geoai_task_codex_handoff` is wired and reads
+  * the registered server tool `aiworkhub_task_codex_handoff` is wired and reads
     the LIVE queue read-only (stdout identical before/after).
 
 Isolation-safe / parallel-safe: mktemp dir, no fixed shared path, no writes
@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from geoai_task_mcp import core, review_summarizer
+from aiworkhub import core, review_summarizer
 
 
 FAILURES: list[str] = []
@@ -146,7 +146,7 @@ RISKY = {
     "priority": "p_risky",
     "objective": "Touches shared server.py + a manifest and declares no validation.",
     "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+        "tools/geoai-task-mcp/src/aiworkhub/server.py",
         "bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
     ],
     "validation": [],  # missing validation -> high risk
@@ -325,13 +325,13 @@ def test_task_id_filter() -> None:
 def test_server_tool_wiring_live_readonly() -> None:
     print("[test_server_tool_wiring_live_readonly] registered MCP tool reads live queue read-only")
     try:
-        from geoai_task_mcp import server  # noqa: F401
+        from aiworkhub import server  # noqa: F401
     except Exception as exc:  # pragma: no cover - mcp SDK missing in minimal env
         check(False, f"import server (mcp SDK): {exc}")
         return
 
-    tool = getattr(server, "geoai_task_codex_handoff", None)
-    check(tool is not None, "server exposes geoai_task_codex_handoff")
+    tool = getattr(server, "aiworkhub_task_codex_handoff", None)
+    check(tool is not None, "server exposes aiworkhub_task_codex_handoff")
     if tool is None:
         return
 
@@ -345,7 +345,7 @@ def test_server_tool_wiring_live_readonly() -> None:
     after = core.run_taskctl(["review-queue"]).stdout
 
     check(isinstance(result, dict) and result.get("ok") is True, "server tool returns ok report")
-    check(result.get("server_tool") == "geoai_task_codex_handoff", "server_tool label set")
+    check(result.get("server_tool") == "aiworkhub_task_codex_handoff", "server_tool label set")
     check(result.get("contract") == "B116_v1_codex_handoff_e2e_readonly", "server tool contract label")
     check(result.get("readonly") is True, "server tool readonly True")
     check(result.get("mutation_performed") is False, "server tool mutation_performed False")

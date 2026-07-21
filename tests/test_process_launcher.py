@@ -13,7 +13,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import process_launcher  # noqa: E402
+from aiworkhub import process_launcher  # noqa: E402
 
 
 def _card(task_id: str = "TASK_B1", state: str = "pending") -> dict:
@@ -371,7 +371,7 @@ def test_direct_launch_child_env_excludes_write_gate_launch_and_coordinator_secr
 ):
     """B314_F001/F003 regression: the non-isolated (isolation_enabled=False)
     launch path used to build the child env with plain os.environ.copy(),
-    which inherited every parent secret including GEOAI_TASK_MCP_ALLOW_WRITES
+    which inherited every parent secret including AIWORKHUB_ALLOW_WRITES
     (a write-gate bypass) and the taskctl coordinator token/token-file.
     sanitized_env() now builds an explicit minimal allowlist instead, so none
     of these leak into the spawned process regardless of what happens to be
@@ -414,7 +414,7 @@ def test_direct_launch_child_env_excludes_write_gate_launch_and_coordinator_secr
     ):
         assert leaked_key not in child_env, f"{leaked_key} leaked into child env"
     # The happy path still works: the launcher-owned override is present.
-    assert child_env["GEOAI_REPO"] == str((tmp_path / "repo").resolve())
+    assert child_env["AIWORKHUB_REPO"] == str((tmp_path / "repo").resolve())
 
 
 def test_direct_launch_duplicate_check_uses_pid_start_ticks_not_bare_liveness(

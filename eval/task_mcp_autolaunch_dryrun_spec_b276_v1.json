@@ -37,8 +37,8 @@
         "claude_cli": {
           "binary": "claude",
           "binary_path_check": "which claude || echo 'CLAUDE_NOT_FOUND'",
-          "template": "claude --print --allowedTools Bash,Read,Write,Edit,Grep,Glob,WebSearch,WebFetch --max-turns 200 --output-format text --model claude-sonnet-4-5 --dangerously-skip-permissions --system-prompt-file tools/geoai-task-mcp/data/agent_prompts/claude_worker_system_b276_v1.txt '<owner_prompt>'",
-          "env_required": ["GEOAI_TASK_MCP_ALLOW_LAUNCH=1", "GEOAI_TASK_MCP_ALLOW_WRITES=1"],
+          "template": "claude --print --allowedTools Bash,Read,Write,Edit,Grep,Glob,WebSearch,WebFetch --max-turns 200 --output-format text --model claude-sonnet-4-5 --dangerously-skip-permissions --system-prompt-file tools/aiworkhub/data/agent_prompts/claude_worker_system_b276_v1.txt '<owner_prompt>'",
+          "env_required": ["AIWORKHUB_ALLOW_LAUNCH=1", "AIWORKHUB_ALLOW_WRITES=1"],
           "pre_launch_checks": [
             "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic>",
             "python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic> --dryrun"
@@ -52,7 +52,7 @@
           "binary": "codex",
           "binary_path_check": "which codex || echo 'CODEX_NOT_FOUND'",
           "template": "codex exec --model gpt-5.5 --max-turns 200 --allowed-tools all --task-file <task_card_path>",
-          "env_required": ["GEOAI_TASK_MCP_ALLOW_LAUNCH=1", "GEOAI_TASK_MCP_ALLOW_WRITES=1"],
+          "env_required": ["AIWORKHUB_ALLOW_LAUNCH=1", "AIWORKHUB_ALLOW_WRITES=1"],
           "pre_launch_checks": [
             "python3 AITools/taskctl.py guard <task_id> --runner <runner> --topic <topic>",
             "python3 AITools/taskctl.py auto-pickup --runner <runner> --topic <topic> --dryrun"
@@ -82,7 +82,7 @@
         {
           "gate_id": "G1_env_dual_gate",
           "name": "Environment Dual-Gate",
-          "check": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1",
+          "check": "AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1",
           "default": "both '0' (disabled)",
           "failure_action": "block_launch_with_reason: env_gates_disabled",
           "note": "Mirrors launch_queue_contract.py ALLOW_LAUNCH_ENV / ALLOW_WRITES_ENV. Both must be explicitly set to '1' by the owner."
@@ -114,7 +114,7 @@
     },
     "section_3_log_usage_accounting": {
       "title": "Log, Usage, and Accounting Schema",
-      "description": "Every autolaunch attempt records a structured log entry with these 15 fields. The log is append-only JSONL stored at tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl.",
+      "description": "Every autolaunch attempt records a structured log entry with these 15 fields. The log is append-only JSONL stored at tools/aiworkhub/data/audit/mcp_autolaunch_log_b276_v1.jsonl.",
       "fields": {
         "launch_id": "UUID v4, unique per launch attempt",
         "task_id": "task card id from queue",
@@ -159,7 +159,7 @@
         {
           "step": 4,
           "actor": "completion_inbox (MCP tool)",
-          "action": "geoai_completion_inbox() detects task in review_queue",
+          "action": "aiworkhub_completion_inbox() detects task in review_queue",
           "verification": "task appears in review_queue[] with validation_status"
         },
         {
@@ -219,12 +219,12 @@
     "neural_routing_note": "Model/adapter selection (claude_cli vs codex_cli vs deepseek_manual) must eventually become a learned neural routing decision per neural-control-first doctrine. The static adapter map in this spec is a human-configured safety boundary, not intelligence. Future neural routing targets are tracked in mcp_neural_launch_routing_migration_b254_v1."
   },
   "files_written": [
-    "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_dryrun_spec_next_wave_b276_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_autolaunch_dryrun_spec_next_wave_b276_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
+    "bash tools/aiworkhub/tests/test_task_mcp_autolaunch_dryrun_spec_b276_v1.sh"
   ],
   "commit_contract": "NO_COMMIT",
   "codex_review_required": true

@@ -21,10 +21,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/geoai_mcp_neural_dryrun_sh.XXXXXX")"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_mcp_neural_dryrun_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 FAILURES=0
 

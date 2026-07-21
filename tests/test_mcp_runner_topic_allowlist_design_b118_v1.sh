@@ -21,10 +21,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/geoai_mcp_allowlist_design_sh.XXXXXX")"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_mcp_allowlist_design_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 FAILURES=0
 
@@ -189,8 +189,8 @@ print('all safety invariants hold')
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- 7. Core/server unchanged ---"
-CORE_PY="$MCPROOT/src/geoai_task_mcp/core.py"
-SERVER_PY="$MCPROOT/src/geoai_task_mcp/server.py"
+CORE_PY="$MCPROOT/src/aiworkhub/core.py"
+SERVER_PY="$MCPROOT/src/aiworkhub/server.py"
 if git -C "$ROOT" diff --name-only HEAD -- "$CORE_PY" | grep -q .; then
     fail "core.py was modified (forbidden)"
 else

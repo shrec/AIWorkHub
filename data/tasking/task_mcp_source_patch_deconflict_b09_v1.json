@@ -10,27 +10,27 @@
   "mode": "source_patch_lane_audit_no_source_patch",
   "objective": "Audit stale/pending task_mcp cards that still claim core.py/server.py write lanes and produce a safe deconflict plan before wiring the B08 supervisor status tool.",
   "read_first": [
-    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+    "tools/aiworkhub/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/server.py"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_b09_v1.json",
-    "tools/geoai-task-mcp/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_source_patch_deconflict_b09_v1.json",
+    "tools/aiworkhub/eval/task_mcp_source_patch_deconflict_rows_b09_v1.jsonl",
+    "tools/aiworkhub/data/tasking/task_mcp_source_patch_deconflict_next_wave_b09_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh"
   ],
   "acceptance": [
-    "Must inventory queued/stale cards that claim tools/geoai-task-mcp/src/geoai_task_mcp/core.py or server.py.",
+    "Must inventory queued/stale cards that claim tools/aiworkhub/src/aiworkhub/core.py or server.py.",
     "Must classify each lane claimant as active_needed, stale_superseded, already_done, or needs_owner_review.",
     "Must produce an ordered safe plan for when B09 supervisor status tool wiring may touch core.py/server.py.",
     "Must not patch source code, mutate task statuses, enable launch, or enable writes.",
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh passes.",
+    "bash tools/aiworkhub/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh passes.",
     "python3 AITools/taskctl.py verify passes."
   ],
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_source_patch_deconflict_b09_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "forbidden": [

@@ -1,26 +1,26 @@
-{"row_type": "live_tool", "tool_name": "geoai_task_health", "registration": "direct_decorator", "server_py_line": 16, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_review_queue", "registration": "direct_decorator", "server_py_line": 25, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_list", "registration": "direct_decorator", "server_py_line": 32, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_show", "registration": "direct_decorator", "server_py_line": 39, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_pending_for_runner", "registration": "direct_decorator", "server_py_line": 46, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_auto_pickup", "registration": "direct_decorator", "server_py_line": 53, "tier": "TIER_2_WRITE_GATED"}
-{"row_type": "live_tool", "tool_name": "geoai_task_auto_pickup_dryrun", "registration": "direct_decorator", "server_py_line": 60, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_mark_review", "registration": "direct_decorator", "server_py_line": 75, "tier": "TIER_2_WRITE_GATED"}
-{"row_type": "live_tool", "tool_name": "geoai_task_mark_done", "registration": "direct_decorator", "server_py_line": 82, "tier": "TIER_2_WRITE_GATED"}
-{"row_type": "live_tool", "tool_name": "geoai_task_collision_guard", "registration": "direct_decorator", "server_py_line": 89, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_usage_report", "registration": "direct_decorator", "server_py_line": 96, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_export_jsonl", "registration": "direct_decorator", "server_py_line": 107, "tier": "TIER_2_WRITE_GATED"}
-{"row_type": "live_tool", "tool_name": "geoai_task_audit_log_read", "registration": "direct_decorator", "server_py_line": 114, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_review_summarize", "registration": "direct_decorator", "server_py_line": 126, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_codex_handoff", "registration": "direct_decorator", "server_py_line": 160, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_task_codex_handoff_markdown", "registration": "direct_decorator", "server_py_line": 186, "tier": "TIER_1_READ_ONLY_but_absent_from_b250_taxonomy"}
-{"row_type": "live_tool", "tool_name": "geoai_supervisor_loop_status", "registration": "direct_decorator", "server_py_line": 212, "tier": "TIER_1_READ_ONLY", "note": "B11-added; b250 taxonomy still marks implemented=schema_only_pending_wiring"}
-{"row_type": "live_tool", "tool_name": "geoai_cli_adapter_plan_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 319, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_cli_adapter_audit_summary_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 320, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "live_tool", "tool_name": "geoai_cli_adapter_report_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 321, "tier": "TIER_1_READ_ONLY"}
-{"row_type": "stale_assertion", "id": "STALE_1_README_EXPOSED_TOOLS", "file": "tools/geoai-task-mcp/README.md", "lines": "53-71", "claimed_count": 12, "actual_count": 20, "severity": "docs_only_high_visibility"}
-{"row_type": "stale_assertion", "id": "STALE_2_FROZEN_B108_TOOL_LISTS", "file": "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py", "lines": "65-84", "claimed_count": 15, "actual_count": 20, "severity": "design_intentional_freeze_but_downstream_misuse"}
-{"row_type": "stale_assertion", "id": "STALE_3_STDIO_SUBPROCESS_SMOKE_COUNT", "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh", "lines": "88-89", "claimed_readonly": 11, "claimed_write_gated": 4, "severity": "pre_existing_known_test_failure"}
-{"row_type": "stale_assertion", "id": "STALE_4_STDIO_CONCURRENT_SMOKE_COUNT", "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh", "lines": "108-109", "claimed_readonly": 11, "claimed_write_gated": 4, "severity": "pre_existing_known_test_failure"}
-{"row_type": "stale_assertion", "id": "STALE_5_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_COUNT", "file": "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh", "lines": "192", "claimed_collision_rows": 3, "severity": "pre_existing_known_test_failure_same_cluster"}
-{"row_type": "stale_assertion", "id": "STALE_6_B250_TIER_TAXONOMY_MISSING_TOOL", "file": "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json", "lines": "39-55", "missing_tool": "geoai_task_codex_handoff_markdown", "also_stale_field": "geoai_supervisor_loop_status.implemented still schema_only_pending_wiring post-B11", "severity": "same_day_freshest_artifact_already_behind_live_tree"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_health", "registration": "direct_decorator", "server_py_line": 16, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_review_queue", "registration": "direct_decorator", "server_py_line": 25, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_list", "registration": "direct_decorator", "server_py_line": 32, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_show", "registration": "direct_decorator", "server_py_line": 39, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_pending_for_runner", "registration": "direct_decorator", "server_py_line": 46, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_auto_pickup", "registration": "direct_decorator", "server_py_line": 53, "tier": "TIER_2_WRITE_GATED"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_auto_pickup_dryrun", "registration": "direct_decorator", "server_py_line": 60, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_mark_review", "registration": "direct_decorator", "server_py_line": 75, "tier": "TIER_2_WRITE_GATED"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_mark_done", "registration": "direct_decorator", "server_py_line": 82, "tier": "TIER_2_WRITE_GATED"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_collision_guard", "registration": "direct_decorator", "server_py_line": 89, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_usage_report", "registration": "direct_decorator", "server_py_line": 96, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_export_jsonl", "registration": "direct_decorator", "server_py_line": 107, "tier": "TIER_2_WRITE_GATED"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_audit_log_read", "registration": "direct_decorator", "server_py_line": 114, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_review_summarize", "registration": "direct_decorator", "server_py_line": 126, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_codex_handoff", "registration": "direct_decorator", "server_py_line": 160, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_task_codex_handoff_markdown", "registration": "direct_decorator", "server_py_line": 186, "tier": "TIER_1_READ_ONLY_but_absent_from_b250_taxonomy"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_supervisor_loop_status", "registration": "direct_decorator", "server_py_line": 212, "tier": "TIER_1_READ_ONLY", "note": "B11-added; b250 taxonomy still marks implemented=schema_only_pending_wiring"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_cli_adapter_plan_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 319, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_cli_adapter_audit_summary_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 320, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "live_tool", "tool_name": "aiworkhub_cli_adapter_report_readonly", "registration": "cli_adapter_readonly_tool.register(mcp)", "source_file": "cli_adapter_readonly_tool.py", "source_line": 321, "tier": "TIER_1_READ_ONLY"}
+{"row_type": "stale_assertion", "id": "STALE_1_README_EXPOSED_TOOLS", "file": "tools/aiworkhub/README.md", "lines": "53-71", "claimed_count": 12, "actual_count": 20, "severity": "docs_only_high_visibility"}
+{"row_type": "stale_assertion", "id": "STALE_2_FROZEN_B108_TOOL_LISTS", "file": "tools/aiworkhub/tests/mcp_client_smoke_contract_freeze.py", "lines": "65-84", "claimed_count": 15, "actual_count": 20, "severity": "design_intentional_freeze_but_downstream_misuse"}
+{"row_type": "stale_assertion", "id": "STALE_3_STDIO_SUBPROCESS_SMOKE_COUNT", "file": "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh", "lines": "88-89", "claimed_readonly": 11, "claimed_write_gated": 4, "severity": "pre_existing_known_test_failure"}
+{"row_type": "stale_assertion", "id": "STALE_4_STDIO_CONCURRENT_SMOKE_COUNT", "file": "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh", "lines": "108-109", "claimed_readonly": 11, "claimed_write_gated": 4, "severity": "pre_existing_known_test_failure"}
+{"row_type": "stale_assertion", "id": "STALE_5_NEURAL_LAUNCH_ROUTING_COLLISION_ROW_COUNT", "file": "tools/aiworkhub/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh", "lines": "192", "claimed_collision_rows": 3, "severity": "pre_existing_known_test_failure_same_cluster"}
+{"row_type": "stale_assertion", "id": "STALE_6_B250_TIER_TAXONOMY_MISSING_TOOL", "file": "tools/aiworkhub/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json", "lines": "39-55", "missing_tool": "aiworkhub_task_codex_handoff_markdown", "also_stale_field": "aiworkhub_supervisor_loop_status.implemented still schema_only_pending_wiring post-B11", "severity": "same_day_freshest_artifact_already_behind_live_tree"}

@@ -1,0 +1,36 @@
+{
+  "schema_id": "geoai.task_mcp.eval.aiworkhub_standalone_callback_store.b859.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_STANDALONE_CALLBACK_STORE_B859_V1",
+  "evaluated_at": "2026-07-21T00:00:00Z",
+  "runner": "claude_sonnet5_aiworkhub_standalone_callback_store_b859_v1",
+  "verdict": "PASS",
+  "summary": "Prior partial migration (callback_store.py package-local outbox, VSIX guard) was already accepted with 138/138 passing and was left unchanged. This closure adds only the required isolated black-box test: an extracted-packaged-runtime subprocess with AITools verified unimportable delivers a fake-transport callback pending->delivered with matching ack, and a second case proves an unsupported dispatcher provider fails closed (no thread, pending stays pending, never delivered/dead-lettered).",
+  "contract_coverage": {
+    "extracted_runtime_no_aitools_on_syspath": "PASS",
+    "extracted_runtime_ack_delivery": "PASS",
+    "unsupported_transport_fails_closed_pending": "PASS",
+    "existing_callback_suite_untouched": "PASS",
+    "vsix_contains_callback_store": "PASS",
+    "no_second_callback_database": "PASS",
+    "b858_live_outbox_untouched": "PASS"
+  },
+  "test_count": 165,
+  "test_pass": 165,
+  "test_fail": 0,
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_aiworkhub_standalone_callback_store_b859.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_standalone_callback_store_b859_v1.json"
+  ],
+  "regression_safety": {
+    "test_aiworkhub_callback_dispatcher_lifecycle_b857": "PASS",
+    "test_aiworkhub_claude_callback_transport_b856": "PASS",
+    "test_aiworkhub_callback_stale_turn_recovery_b823_v1": "PASS",
+    "test_aiworkhub_canonical_task_engine_b852": "PASS",
+    "test_callback_bridge": "PASS",
+    "test_server_runtime_wiring": "PASS",
+    "no_monkeypatch_of_aitools_taskdb_default_db": true,
+    "node_check_extension_js": "PASS",
+    "npm_run_package_vsix_build": "PASS"
+  },
+  "notes": "No production code changed under src/aiworkhub or vscode-extension/extension.js -- the existing implementation already satisfied the acceptance surface per Codex's independent 138/138 confirmation. NO_COMMIT; stops at taskctl review."
+}

@@ -17,7 +17,7 @@
     {
       "step": 3,
       "task_id": "DEEPSEEK_TASK_MCP_FULL_WAVE_DRYRUN_HARNESS_B119_V1",
-      "action": "Codex-finalize (done) full-wave dry-run harness; then design a SEPARATE, explicitly-approved task to run one literal live wave with GEOAI_TASK_MCP_ALLOW_WRITES=1 (p3_full_task_wave real execution)."
+      "action": "Codex-finalize (done) full-wave dry-run harness; then design a SEPARATE, explicitly-approved task to run one literal live wave with AIWORKHUB_ALLOW_WRITES=1 (p3_full_task_wave real execution)."
     },
     {
       "step": 4,

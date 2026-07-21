@@ -2,7 +2,7 @@
 set -euo pipefail
 # ---------------------------------------------------------------------------
 # test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh
-# Freezes the OUTPUT contract of the geoai-task-mcp read-only tools: the
+# Freezes the OUTPUT contract of the aiworkhub read-only tools: the
 # canonical value->type SKELETON of every read-only tool's structuredContent
 # result, snapshot over a REAL MCP ClientSession
 # (mcp_readonly_result_schema_freeze.py). Complements B108 (input-schema freeze).
@@ -13,7 +13,7 @@ set -euo pipefail
 #     independent client sessions (volatile values normalized to type tokens);
 #   * FastMCP output-schema fingerprints byte-stable vs frozen (supplementary);
 #   * NO WRITES: MCP-owned state dir byte-identical + empty with
-#     GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1;
+#     AIWORKHUB_ALLOW_WRITES unset AND =1;
 #   * NO PROCESS LAUNCH inside introspection: run_taskctl stubbed, launch
 #     tripwire count 0, and launch-free tool modules hold no spawn code.
 #
@@ -27,16 +27,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 FREEZE="$MCPROOT/tests/mcp_readonly_result_schema_freeze.py"
-SRC_DIR="$MCPROOT/src/geoai_task_mcp"
+SRC_DIR="$MCPROOT/src/aiworkhub"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b109_result_freeze.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b109_result_freeze.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== MCP Read-only Tool Result-Schema Freeze Test B109 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMPDIR_STATE"
 
 # --- 0. launch-free tool modules hold no process-launch code ---------------

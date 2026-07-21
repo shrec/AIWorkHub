@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geoai-task-mcp"
-version = "0.2.0"
-description = "MCP server for GeoAI task queue orchestration"
+name = "aiworkhub"
+version = "0.6.0"
+description = "MCP server for AIWorkHub task queue orchestration"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,19 +13,18 @@ dependencies = [
 ]
 
 [project.scripts]
-geoai-task-mcp = "geoai_task_mcp.server:main"
-aiworkinghub = "geoai_task_mcp.server:main"
-aiwh = "geoai_task_mcp.server:main"
-aiworkinghub-mcp = "geoai_task_mcp.server:main"
-geoai-task-mcp-health = "geoai_task_mcp.health:main"
-geoai-task-dashboard = "geoai_task_mcp.dashboard:main"
-geoai-task-callback-bridge = "geoai_task_mcp.callback_bridge:main"
-geoai-task-deepseek-credential = "geoai_task_mcp.deepseek_credentials:main"
-geoai-app-server-mux = "geoai_task_mcp.app_server_mux:main"
-geoai-task-reconciler = "geoai_task_mcp.task_reconciler:main"
+aiworkhub = "aiworkhub.server:main"
+awh = "aiworkhub.server:main"
+aiworkhub-mcp = "aiworkhub.server:main"
+aiworkhub-health = "aiworkhub.health:main"
+aiworkhub-dashboard = "aiworkhub.dashboard:main"
+aiworkhub-callback-bridge = "aiworkhub.callback_bridge:main"
+aiworkhub-deepseek-credential = "aiworkhub.deepseek_credentials:main"
+aiworkhub-app-server-mux = "aiworkhub.app_server_mux:main"
+aiworkhub-reconciler = "aiworkhub.task_reconciler:main"
 
 [tool.setuptools.package-data]
-geoai_task_mcp = ["dashboard_static/*"]
+aiworkhub = ["dashboard_static/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

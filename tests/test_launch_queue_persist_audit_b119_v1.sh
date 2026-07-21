@@ -23,7 +23,7 @@ set -euo pipefail
 #   9. parent task queue is not mutated (taskctl verify).
 #
 # Isolation: per-run mktemp working dir + mktemp log file; the log path is
-# passed via GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH so concurrent test runs
+# passed via AIWORKHUB_LAUNCH_QUEUE_LOG_PATH so concurrent test runs
 # never share a file. Both launch_queue_persist.py and its sibling
 # launch_queue_contract.py are loaded by FILE PATH (never via package
 # __init__), so a concurrent worker editing __init__.py/server.py cannot
@@ -32,21 +32,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
-MODULE="$MCPROOT/src/geoai_task_mcp/launch_queue_persist.py"
+MODULE="$MCPROOT/src/aiworkhub/launch_queue_persist.py"
 
-TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/geoai_launch_persist_b119.XXXXXX")"
+TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_launch_persist_b119.XXXXXX")"
 trap 'rm -rf "$TMPWORK"' EXIT
 
 LOGFILE="$TMPWORK/launch_queue_audit.jsonl"
 
 # Ensure gates are unset for the primary run (do not inherit an enabled ambient).
-unset GEOAI_TASK_MCP_ALLOW_LAUNCH || true
-unset GEOAI_TASK_MCP_ALLOW_WRITES || true
-unset GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH || true
-export GEOAI_REPO="$ROOT"
+unset AIWORKHUB_ALLOW_LAUNCH || true
+unset AIWORKHUB_ALLOW_WRITES || true
+unset AIWORKHUB_LAUNCH_QUEUE_LOG_PATH || true
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== Launch-Queue Persist + Audit Test B119 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "MODULE=$MODULE"
 echo "TMPWORK=$TMPWORK"
 echo "LOGFILE=$LOGFILE"
@@ -129,7 +129,7 @@ BLOCKED = "blocked_launch_disabled"
 
 # ---------------------------------------------------------------- (1)+(2)
 # Gates unset (default): persist two intents, verify blocked + append-only.
-restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH=None, GEOAI_TASK_MCP_ALLOW_WRITES=None)
+restore = _with_env(AIWORKHUB_ALLOW_LAUNCH=None, AIWORKHUB_ALLOW_WRITES=None)
 try:
     assert not os.path.exists(LOGFILE), "log file must not pre-exist"
 
@@ -165,7 +165,7 @@ finally:
 
 # ---------------------------------------------------------------- (3)
 # BOTH gates forced ON -> record STILL blocked_launch_disabled (defense in depth).
-restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH="1", GEOAI_TASK_MCP_ALLOW_WRITES="1")
+restore = _with_env(AIWORKHUB_ALLOW_LAUNCH="1", AIWORKHUB_ALLOW_WRITES="1")
 try:
     assert m.lqc.env_gates_open() is True
     assert m.lqc.launch_enabled() is False
@@ -186,9 +186,9 @@ finally:
 # ---------------------------------------------------------------- (4)
 # Secret env value must never leak into the persisted log.
 restore = _with_env(
-    GEOAI_TASK_MCP_ALLOW_LAUNCH="1",
-    GEOAI_TASK_MCP_ALLOW_WRITES="1",
-    GEOAI_TASK_MCP_API_TOKEN="super-secret-value-should-never-appear",
+    AIWORKHUB_ALLOW_LAUNCH="1",
+    AIWORKHUB_ALLOW_WRITES="1",
+    AIWORKHUB_API_TOKEN="super-secret-value-should-never-appear",
 )
 try:
     r4 = m.persist_intent(
@@ -202,13 +202,13 @@ try:
     with open(LOGFILE, "r", encoding="utf-8") as fh:
         blob = fh.read()
     assert "super-secret-value-should-never-appear" not in blob
-    assert "GEOAI_TASK_MCP_API_TOKEN" not in blob
+    assert "AIWORKHUB_API_TOKEN" not in blob
 finally:
     restore()
 
 # ---------------------------------------------------------------- (5)
 # read_persisted_log(): accurate counts, all_blocked_launch_disabled True.
-restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH=None, GEOAI_TASK_MCP_ALLOW_WRITES=None)
+restore = _with_env(AIWORKHUB_ALLOW_LAUNCH=None, AIWORKHUB_ALLOW_WRITES=None)
 try:
     summary = m.read_persisted_log(log_path=LOGFILE)
     assert summary["ok"] is True
@@ -238,14 +238,14 @@ assert set(scrubbed) == set(m._PROCESS_LOG_KEYS)
 explicit = m.resolve_log_path(log_path="/tmp/explicit_wins.jsonl")
 assert str(explicit) == "/tmp/explicit_wins.jsonl"
 
-restore = _with_env(GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH="/tmp/env_wins.jsonl")
+restore = _with_env(AIWORKHUB_LAUNCH_QUEUE_LOG_PATH="/tmp/env_wins.jsonl")
 try:
     via_env = m.resolve_log_path()
     assert str(via_env) == "/tmp/env_wins.jsonl"
 finally:
     restore()
 
-restore = _with_env(GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH=None)
+restore = _with_env(AIWORKHUB_LAUNCH_QUEUE_LOG_PATH=None)
 try:
     default_path = m.resolve_log_path()
     assert str(default_path).endswith("tools/geoai-task-mcp/logs/launch_queue_audit.jsonl")

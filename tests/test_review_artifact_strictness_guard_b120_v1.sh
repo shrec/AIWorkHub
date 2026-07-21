@@ -35,7 +35,7 @@ GUARD="$MCPROOT/scripts/audit_review_artifact_strictness_b120_v1.py"
 OUT_JSON="$MCPROOT/eval/review_artifact_strictness_guard_b120_v1.json"
 OUT_ROWS="$MCPROOT/eval/review_artifact_strictness_guard_rows_b120_v1.jsonl"
 
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== B120 Review-Artifact Strictness Guard Test ==="
 echo "ROOT=$ROOT"
@@ -43,7 +43,7 @@ echo "GUARD=$GUARD"
 
 test -f "$GUARD"
 
-CHECK_PY="$(mktemp "${TMPDIR:-/tmp}/geoai_review_strictness_b120_check.XXXXXX.py")"
+CHECK_PY="$(mktemp "${TMPDIR:-/tmp}/aiworkhub_review_strictness_b120_check.XXXXXX.py")"
 trap 'rm -f "$CHECK_PY"' EXIT
 
 cat > "$CHECK_PY" <<'PY'
@@ -154,7 +154,7 @@ assert OUT_JSON.exists() and OUT_ROWS.exists()
 import shutil
 import tempfile
 
-fixture_dir = Path(tempfile.mkdtemp(prefix="geoai_b121_strictness_fixture_"))
+fixture_dir = Path(tempfile.mkdtemp(prefix="aiworkhub_b121_strictness_fixture_"))
 try:
     positive_sh = fixture_dir / "test_positive_fixture.sh"
     positive_sh.write_text(

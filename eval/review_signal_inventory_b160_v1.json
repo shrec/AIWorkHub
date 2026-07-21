@@ -74,46 +74,46 @@
     {
       "category": "risk",
       "exposed_via": [
-        "geoai_task_show",
-        "geoai_task_review_summarize"
+        "aiworkhub_task_show",
+        "aiworkhub_task_review_summarize"
       ],
       "gap": "No aggregated risk score across queue; human_brief.risk is optional text, not enumerated."
     },
     {
       "category": "change_size",
       "exposed_via": [
-        "geoai_task_show",
-        "geoai_task_review_summarize"
+        "aiworkhub_task_show",
+        "aiworkhub_task_review_summarize"
       ],
       "gap": "No file-type breakdown or scope-warning flag in MCP tool response; counts are implicit."
     },
     {
       "category": "validation",
       "exposed_via": [
-        "geoai_task_show",
-        "geoai_task_health (verify)"
+        "aiworkhub_task_show",
+        "aiworkhub_task_health (verify)"
       ],
       "gap": "No per-task test-pass/fail state stored; verify is queue-wide, not per-task."
     },
     {
       "category": "cost",
       "exposed_via": [
-        "geoai_task_usage_report"
+        "aiworkhub_task_usage_report"
       ],
       "gap": "Cost not joined into task card view; requires separate call. No cumulative cost per topic."
     },
     {
       "category": "collision",
       "exposed_via": [
-        "geoai_task_collision_guard"
+        "aiworkhub_task_collision_guard"
       ],
       "gap": "Per-card collision state not surfaced in show/list; requires full guard scan."
     },
     {
       "category": "staleness",
       "exposed_via": [
-        "geoai_task_list (status filter)",
-        "geoai_task_show (timestamps)"
+        "aiworkhub_task_list (status filter)",
+        "aiworkhub_task_show (timestamps)"
       ],
       "gap": "No computed staleness score or age-hours in tool response; raw timestamps only."
     }
@@ -277,7 +277,7 @@
       "acceptance_criteria"
     ]
   },
-  "source_registry": "/home/shrek/GeoAI/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+  "source_registry": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
   "status_family_counts": {
     "blocked": 25,
     "finished": 2647,

@@ -183,7 +183,7 @@
           "name": "Environment Dual-Gate",
           "priority": 1,
           "type": "owner_intent",
-          "contract": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1",
+          "contract": "AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1",
           "default": "both unset (treated as disabled)",
           "rationale": "Owner must explicitly opt in to automated launches. Outermost safety ring."
         },
@@ -426,10 +426,10 @@
   },
   "commit_contract": "NO_COMMIT",
   "codex_review_required": true,
-  "next_wave_pointer": "tools/geoai-task-mcp/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
+  "next_wave_pointer": "tools/aiworkhub/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
   "files_written": [
-    "tools/geoai-task-mcp/eval/mcp_autolaunch_protocol_spec_b275_v1.json",
-    "tools/geoai-task-mcp/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
-    "tools/geoai-task-mcp/tests/test_mcp_autolaunch_protocol_spec_b275_v1.sh"
+    "tools/aiworkhub/eval/mcp_autolaunch_protocol_spec_b275_v1.json",
+    "tools/aiworkhub/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json",
+    "tools/aiworkhub/tests/test_mcp_autolaunch_protocol_spec_b275_v1.sh"
   ]
 }

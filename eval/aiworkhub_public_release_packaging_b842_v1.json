@@ -1,0 +1,82 @@
+{
+  "schema_id": "geoai.task_mcp.public_release_packaging.v1",
+  "task_id": "DEEPSEEK_V4FLASH_AIWORKHUB_PUBLIC_RELEASE_PACKAGING_B842_V2",
+  "runner": "deepseek_v4flash_aiworkhub_public_release_packaging_b842_v2",
+  "topic": "task_mcp",
+  "generated_at": "2026-07-20T18:00:00Z",
+  "verdict": "PASS",
+  "verdict_detail": "All 7 required outputs created. All workflow/docs paths are root-relative (no tools/geoai-task-mcp/ prefix). CI and release are fail-closed: no || true, no continue-on-error, no if-no-files-found: ignore. CI runs npm test and npm run package canonical scripts. VSIX uploaded from vscode-extension/dist/aiworkhub-*.vsix. GitHub Release attachment is mandatory. Optional Marketplace/Open VSX publish jobs remain secret-gated but fail hard when configured. PUBLISHING.md standalone paths fixed. No runtime source, tests, extension implementation, Git history, commit, push or release was changed.",
+  "head_commit": "",
+  "head_commit_message": "",
+  "audit_scope": {
+    "areas_covered": [
+      "CI for Python package and VS Code extension — root-relative paths",
+      "Tag-driven VSIX release to GitHub Release — fail-closed",
+      "Secret-gated Marketplace and Open VSX publication — fail hard when enabled",
+      "Least-privilege workflow permissions",
+      "Contributor, security and publishing documentation — root-relative paths",
+      "Local VSIX installation and Remote-SSH workspace installation",
+      "AIWorkHub/AWH identity only — no legacy product names"
+    ],
+    "created_paths": [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+      "CONTRIBUTING.md",
+      "SECURITY.md",
+      "CODE_OF_CONDUCT.md",
+      "docs/PUBLISHING.md",
+      "eval/aiworkhub_public_release_packaging_b842_v1.json"
+    ],
+    "paths_documented_root_relative": true,
+    "no_host_paths": true,
+    "no_lan_addresses": true,
+    "no_local_ports": true,
+    "no_owner_credentials": true,
+    "no_legacy_product_names": true,
+    "no_consumer_project_paths": true,
+    "no_tools_geoai_task_mcp_prefix": true
+  },
+  "acceptance_checks": [
+    {
+      "id": "AC_01",
+      "description": "CI runs canonical Python test suite and VS Code extension static/package tests, uploads VSIX artifact, uses pinned major action versions with least-privilege permissions",
+      "status": "PASS",
+      "evidence": "ci.yml runs Python 3.10-3.12 matrix via actions/setup-python@v5 (pip install -e .), npm test and npm run package via actions/setup-node@v4, uploads vscode-extension/dist/aiworkhub-*.vsix via actions/upload-artifact@v4. Permissions: contents:read, actions:read, checks:write. Pinned major versions. No || true, no continue-on-error, no if-no-files-found: ignore. All failure paths hard-fail."
+    },
+    {
+      "id": "AC_02",
+      "description": "Tag-driven release workflow packages VSIX and attaches it to a GitHub Release; Marketplace/Open VSX conditional on explicit repository secrets",
+      "status": "PASS",
+      "evidence": "release.yml triggered on v* tags. Build step runs npm install then npm run package. github-release job uses softprops/action-gh-release@v2 with mandatory files attachment (no continue-on-error). publish-open-vsx and publish-marketplace jobs gated on secrets.OVSX_TOKEN and secrets.MARKETPLACE_TOKEN; when enabled they fail hard (no continue-on-error). GitHub Release succeeds regardless of publish jobs."
+    },
+    {
+      "id": "AC_03",
+      "description": "Workflows contain no fixed host path, LAN address, local port, owner credential, legacy product name or consumer-project path",
+      "status": "PASS",
+      "evidence": "All path references are root-relative (pyproject.toml, tests/, vscode-extension/). No tools/geoai-task-mcp/ prefix, no 127.0.0.1, no port numbers, no /home/ paths, no LAN addresses, no shrec/shrek/GeoAI consumer paths, no legacy product references. AIWorkHub/AWH identity only."
+    },
+    {
+      "id": "AC_04",
+      "description": "Contributor, security and publishing docs are concise, canonical, MIT-compatible and explain local VSIX installation plus Remote-SSH workspace installation",
+      "status": "PASS",
+      "evidence": "CONTRIBUTING.md covers setup (root-relative paths), tests, PR workflow, CoC reference, MIT license. SECURITY.md covers supported versions, reporting, scope, disclosure. CODE_OF_CONDUCT.md is adapted from Contributor Covenant v2.1 (MIT-compatible). PUBLISHING.md covers tag-driven release, local VSIX install (npm install, npm run package), Remote-SSH install, PyPI publish (no tools/ prefix)."
+    },
+    {
+      "id": "AC_05",
+      "description": "No runtime source, tests, extension implementation/package metadata, Git history, repository name, commit, push or release is changed by the worker",
+      "status": "PASS",
+      "evidence": "Only allowed_writes paths touched: .github/workflows/*, CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md, docs/PUBLISHING.md, eval file. No changes to src/, tests/, vscode-extension/package.json, vscode-extension/README.md, pyproject.toml, or any runtime source or test file."
+    }
+  ],
+  "test_methodology": {
+    "validation_commands_run": [
+      "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_public_release_packaging_b842_v1.json",
+      "git diff --check -- tools/geoai-task-mcp/.github tools/geoai-task-mcp/CONTRIBUTING.md tools/geoai-task-mcp/SECURITY.md tools/geoai-task-mcp/CODE_OF_CONDUCT.md tools/geoai-task-mcp/docs/PUBLISHING.md"
+    ],
+    "no_runtime_source_changed": true,
+    "no_test_changed": true,
+    "no_extension_implementation_changed": true,
+    "no_git_commit": true,
+    "no_git_push": true
+  }
+}

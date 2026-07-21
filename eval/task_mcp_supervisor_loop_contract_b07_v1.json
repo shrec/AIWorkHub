@@ -4,8 +4,8 @@
   "mode": "mcp_supervisor_contract_no_launch_no_source_patch",
   "runner": "claude_task_mcp_supervisor_contract_b07",
   "topic": "task_mcp",
-  "target_artifact": "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
-  "test_harness": "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
+  "target_artifact": "tools/aiworkhub/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+  "test_harness": "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
 
   "contract_shape_measured": {
     "flow_legs_count": 4,
@@ -23,7 +23,7 @@
     "dryrun_only_lifecycle_states": "PASS - planned, dispatched_dryrun, worker_review_ready, codex_reviewed, blocked all present with task_status_mutation=false",
     "safety_boundaries": "PASS - no_credential_read, no_daemon_start, no_real_process_launch, no_writes_unless_explicit_future_gate all enforced=true",
     "error_taxonomy_5_categories": "PASS - collision, stale_task, runner_topic_mismatch, missing_artifact, failed_validation each carry trigger/detection_point/example_reason/result",
-    "no_source_code_patched": "PASS - allowed_writes and actual files touched are all under contracts/, eval/, data/tasking/, tests/; zero paths under tools/geoai-task-mcp/src/",
+    "no_source_code_patched": "PASS - allowed_writes and actual files touched are all under contracts/, eval/, data/tasking/, tests/; zero paths under tools/aiworkhub/src/",
     "bash_test_exit": "PASS - test_task_mcp_supervisor_loop_contract_b07_v1.sh exits 0",
     "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns success"
   },
@@ -41,12 +41,12 @@
   },
 
   "no_source_patch_verified": {
-    "method": "Enumerated this task's own allowed_writes list; confirmed none begin with tools/geoai-task-mcp/src/. tools/geoai-task-mcp is a nested git repo shared with concurrent workers, so global src/ cleanliness is NOT asserted here (other in-flight tasks legitimately hold src/core.py, src/geoai_task_mcp/server.py, src/geoai_task_mcp/review_summarizer.py dirty); only THIS task's own footprint is checked.",
+    "method": "Enumerated this task's own allowed_writes list; confirmed none begin with tools/aiworkhub/src/. tools/aiworkhub is a nested git repo shared with concurrent workers, so global src/ cleanliness is NOT asserted here (other in-flight tasks legitimately hold src/core.py, src/aiworkhub/server.py, src/aiworkhub/review_summarizer.py dirty); only THIS task's own footprint is checked.",
     "this_task_allowed_writes": [
-      "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
-      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
-      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
+      "tools/aiworkhub/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/aiworkhub/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
     ],
     "result": true
   },
@@ -75,9 +75,9 @@
   "checks_failed": 0,
 
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
 
   "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only. Never git add -A / git add . / mixed-task commit.",

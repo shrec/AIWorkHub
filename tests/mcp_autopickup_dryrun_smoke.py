@@ -7,7 +7,7 @@ Proves the read-only ``core.auto_pickup_dryrun`` path:
      before/after — snapshot proven),
   3. respects the ``--runner``/``--topic`` filters (visible in the report),
   4. does NOT bypass the write gate — the real ``auto_pickup`` claim path stays
-     blocked with ``GEOAI_TASK_MCP_ALLOW_WRITES=0``, and the blocked attempt
+     blocked with ``AIWORKHUB_ALLOW_WRITES=0``, and the blocked attempt
      also leaves the queue unmutated.
 
 Isolation: operates on a per-run ``mktemp`` copy of the task queue via the
@@ -28,13 +28,13 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
-REPO = HERE.parents[3]                      # tests -> geoai-task-mcp -> tools -> GeoAI
+REPO = HERE.parents[3]                      # tests -> aiworkhub -> tools -> AIWorkHub
 SRC = HERE.parents[1] / "src"
 TASKCTL = REPO / "AITools" / "taskctl.py"
 REAL_QUEUE_DB = REPO / "bitnnv2" / "data" / "tasking" / "task_queue_v1.sqlite"
 
 sys.path.insert(0, str(SRC))
-from geoai_task_mcp import core  # noqa: E402
+from aiworkhub import core  # noqa: E402
 
 RUNNER = "claude_b118_dryrun_probe"
 OTHER_RUNNER = "claude_b118_other_probe"
@@ -146,16 +146,16 @@ def test_eligible_pure() -> None:
 def test_dryrun_no_mutation_isolated() -> None:
     saved = {k: os.environ.get(k) for k in (
         "BITNN_TASK_QUEUE_DB", "BITNN_TASK_CARDS_PATH", "BITNN_TASK_CARDS_MANIFEST",
-        "GEOAI_REPO", "GEOAI_TASK_MCP_ALLOW_WRITES",
+        "AIWORKHUB_REPO", "AIWORKHUB_ALLOW_WRITES",
     )}
-    tmp = Path(tempfile.mkdtemp(prefix="geoai_b118_dryrun_"))
+    tmp = Path(tempfile.mkdtemp(prefix="aiworkhub_b118_dryrun_"))
     try:
         db = tmp / "task_queue.sqlite"
         os.environ["BITNN_TASK_QUEUE_DB"] = str(db)
         os.environ["BITNN_TASK_CARDS_PATH"] = str(tmp / "cards.jsonl")
         os.environ["BITNN_TASK_CARDS_MANIFEST"] = str(tmp / "manifest.json")
-        os.environ["GEOAI_REPO"] = str(REPO)
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"   # write gate OFF
+        os.environ["AIWORKHUB_REPO"] = str(REPO)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"   # write gate OFF
 
         # isolation sanity: temp DB is NOT the real parent queue
         assert db.resolve() != REAL_QUEUE_DB.resolve(), "temp DB collides with real queue"

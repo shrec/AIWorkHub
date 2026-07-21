@@ -16,7 +16,7 @@
       "severity": "high",
       "evidence": "B278 section_2 (unchanged, re-confirmed here); test_scenario_tool_error_graceful_degrade_desired_future_contract (strict XFAIL)",
       "description": "No server.py tool, no completion_inbox.py facet, and no exception-handling wrapper exists anywhere for a read-source failure to degrade to a bounded result instead of an uncaught exception (test_scenario_tool_error_current_raises_uncaught proves the raise-through today).",
-      "proposed_fix": "Wrap the eventual geoai_completion_inbox_delta implementation's core.run_taskctl calls in a try/except that returns {\"ok\": false, \"error_kind\": \"read_source_failure\", \"error_message\": str(exc)} per B278's tool_error expected_payload shape, never letting the exception cross the MCP tool boundary."
+      "proposed_fix": "Wrap the eventual aiworkhub_completion_inbox_delta implementation's core.run_taskctl calls in a try/except that returns {\"ok\": false, \"error_kind\": \"read_source_failure\", \"error_message\": str(exc)} per B278's tool_error expected_payload shape, never letting the exception cross the MCP tool boundary."
     },
     {
       "id": "usage_report_not_structured",
@@ -30,18 +30,18 @@
       "severity": "medium",
       "evidence": "test_scenario_duplicate_runner (PASS, using a code-compatible fixture instead of B278's literal one)",
       "description": "B278's duplicate_runner fixture models TWO DIFFERENT runners colliding on one task_id (conflicting_runner_a vs conflicting_runner_b). The real completion_inbox facet (runner_mismatch_warnings, backed by _runner_task_batch_mismatch) only checks a SINGLE card's own runner against its OWN task_id's batch token -- a self-consistency check, not a cross-runner collision detector. The actual cross-runner collision detector is core.collision_guard()/core._extract_collision_report (different field shape entirely: file/conflicting_tasks), untouched by this task's fixtures beyond being named here.",
-      "proposed_fix": "Before geoai_completion_inbox_delta claims to emit a duplicate_runner event, decide explicitly whether it is sourced from _runner_task_batch_mismatch (self-consistency) or collision_guard (cross-runner file collision) -- they are not interchangeable, and B278's fixture shape only matches neither cleanly today."
+      "proposed_fix": "Before aiworkhub_completion_inbox_delta claims to emit a duplicate_runner event, decide explicitly whether it is sourced from _runner_task_batch_mismatch (self-consistency) or collision_guard (cross-runner file collision) -- they are not interchangeable, and B278's fixture shape only matches neither cleanly today."
     },
     {
       "id": "envelope_field_name_drift",
       "severity": "low",
-      "evidence": "field_shape_mismatches_documented list in tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_pytest_b279_v1.json",
+      "evidence": "field_shape_mismatches_documented list in tools/aiworkhub/eval/task_mcp_owner_notification_smoke_pytest_b279_v1.json",
       "description": "Several facet field names differ from the B277/B278 canonical envelope: stale_hours vs hours_since_activity, last_activity_at vs last_recorded_at (plus an extra lifecycle_state key on latest_validation_facts), runner_task_batch_mismatch=None vs JSON false.",
-      "proposed_fix": "A thin adapter layer (not a rewrite of completion_inbox.py) should remap these field names when/if geoai_completion_inbox_delta is built, so the delta tool's payloads match the frozen B277 envelope schema exactly while completion_inbox.py itself keeps its current field names for backward compatibility with existing B275/B276 consumers."
+      "proposed_fix": "A thin adapter layer (not a rewrite of completion_inbox.py) should remap these field names when/if aiworkhub_completion_inbox_delta is built, so the delta tool's payloads match the frozen B277 envelope schema exactly while completion_inbox.py itself keeps its current field names for backward compatibility with existing B275/B276 consumers."
     }
   ],
   "not_done_by_this_task": [
-    "geoai_completion_inbox_delta is still not implemented (unchanged from B278)",
+    "aiworkhub_completion_inbox_delta is still not implemented (unchanged from B278)",
     "No new MCP tool registered in server.py",
     "No structured usage/tool_error facet added to completion_inbox.py or core.py"
   ],

@@ -8,11 +8,11 @@
   "mode": "mcp_review_handoff_e2e_no_workflow_switch",
   "objective": "Harden the MCP review-queue summarizer into a Codex-ready HANDOFF report tool: per review task summarize task_id, allowed_writes, validation commands, risks, and commit-hygiene status, strictly READ-ONLY over the parent task queue; register one MCP tool without switching runtime, disabling the write gate, or enabling process launch.",
   "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh",
-  "test_runner": "tools/geoai-task-mcp/tests/mcp_codex_handoff_e2e.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_codex_handoff_e2e_b116_v1.sh",
+  "test_runner": "tools/aiworkhub/tests/mcp_codex_handoff_e2e.py",
   "modules_under_test": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py (build_codex_handoff_report)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (geoai_task_codex_handoff tool)"
+    "tools/aiworkhub/src/aiworkhub/review_summarizer.py (build_codex_handoff_report)",
+    "tools/aiworkhub/src/aiworkhub/server.py (aiworkhub_task_codex_handoff tool)"
   ],
   "checks_total": 70,
   "checks_passed": 70,
@@ -36,14 +36,14 @@
     "zero_mutation_fixture_hash": "PASS - fixture dir sha256 identical before/after",
     "zero_mutation_no_write_cmd": "PASS - only review-queue/show issued; no done/review/start/auto-pickup/export-jsonl/usage",
     "zero_mutation_live_queue": "PASS - live review-queue stdout identical before/after server-tool call",
-    "server_tool_registered": "PASS - server exposes geoai_task_codex_handoff, callable, server_tool label set",
+    "server_tool_registered": "PASS - server exposes aiworkhub_task_codex_handoff, callable, server_tool label set",
     "server_tool_contract_label": "PASS - contract=B116_v1_codex_handoff_e2e_readonly",
     "authority_readonly": "PASS - True",
     "authority_process_launch": "PASS - False",
     "authority_agent_launch": "PASS - False",
     "authority_queue_write": "PASS - False",
     "authority_audit_write": "PASS - False",
-    "authority_write_gate_enabled": "PASS - True (GEOAI_TASK_MCP_ALLOW_WRITES=0)",
+    "authority_write_gate_enabled": "PASS - True (AIWORKHUB_ALLOW_WRITES=0)",
     "authority_subprocess_tripwire_zero": "PASS - True",
     "bash_test_exit": "PASS - test_mcp_codex_handoff_e2e_b116_v1.sh exits 0",
     "taskctl_verify": "PASS - python3 AITools/taskctl.py verify returns PASS",
@@ -53,8 +53,8 @@
     "must produce a Codex-ready report for an empty queue and a fixture queue",
     "must include task_id, runner, topic, allowed_writes, validation, risks, and recommended scoped stage list",
     "must not call taskctl done/review/start/auto-pickup or mutate parent queue",
-    "must keep GEOAI_TASK_MCP_ALLOW_WRITES default off",
-    "bash tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh passes",
+    "must keep AIWORKHUB_ALLOW_WRITES default off",
+    "bash tools/aiworkhub/tests/test_mcp_codex_handoff_e2e_b116_v1.sh passes",
     "python3 AITools/taskctl.py verify passes"
   ],
   "invariants_verified": {
@@ -79,7 +79,7 @@
   "tool_inventory_note": {
     "server_tools_before": 16,
     "server_tools_after": 17,
-    "added_tool": "geoai_task_codex_handoff",
+    "added_tool": "aiworkhub_task_codex_handoff",
     "note": "B116 intentionally registers one new read-only MCP tool, so the FastMCP tool count moves 16->17 by design."
   },
   "preexisting_failures_not_caused_by_b116": {
@@ -90,12 +90,12 @@
       "test_mvp_contract_audit_v1.sh": "stale 'audit' tool-name list missing 5 tools (cli_adapter x3 + review_summarize + codex_handoff) at baseline; predates b106",
       "test_mcp_neural_launch_routing_dryrun_b109_v1.sh": "collision-guard row drift (expected 3 collision rows, got 6); unrelated to B116 files (no server/summarizer dependency)"
     },
-    "owner_action": "the frozen tool-count / audit-list assertions in b109/b110 stdio smoke and mvp_contract_audit are outside B116 allowed_writes; their owners/Codex should bump the frozen inventory to 17 including geoai_task_codex_handoff."
+    "owner_action": "the frozen tool-count / audit-list assertions in b109/b110 stdio smoke and mvp_contract_audit are outside B116 allowed_writes; their owners/Codex should bump the frozen inventory to 17 including aiworkhub_task_codex_handoff."
   },
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
   "next_wave_task": "CLAUDE_TASK_MCP_CODEX_HANDOFF_MARKDOWN_RENDER_B117_V1"

@@ -270,11 +270,11 @@ echo "[16] Plan's referenced existing source files exist on disk"
 if $PYTHON3 -c "
 import os
 paths = [
-    'tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py',
-    'tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py',
-    'tools/geoai-task-mcp/src/geoai_task_mcp/server.py',
-    'tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py',
-    'tools/geoai-task-mcp/src/geoai_task_mcp/core.py',
+    'tools/geoai-task-mcp/src/aiworkhub/launch_queue_contract.py',
+    'tools/geoai-task-mcp/src/aiworkhub/launch_queue_persist.py',
+    'tools/geoai-task-mcp/src/aiworkhub/server.py',
+    'tools/geoai-task-mcp/src/aiworkhub/completion_inbox.py',
+    'tools/geoai-task-mcp/src/aiworkhub/core.py',
 ]
 missing = [p for p in paths if not os.path.isfile(os.path.join('$REPO_ROOT', p))]
 assert not missing, f'missing referenced files: {missing}'

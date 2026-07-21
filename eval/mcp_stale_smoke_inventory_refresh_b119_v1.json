@@ -13,33 +13,33 @@
     "registered_via_cli_adapter_readonly_tool_register": 3,
     "source": "static read of server.py + cli_adapter_readonly_tool.py (B251 reverify confirmed)",
     "tool_names": [
-      "geoai_task_health", "geoai_task_review_queue", "geoai_task_list", "geoai_task_show",
-      "geoai_task_pending_for_runner", "geoai_task_auto_pickup", "geoai_task_auto_pickup_dryrun",
-      "geoai_task_mark_review", "geoai_task_mark_done", "geoai_task_collision_guard",
-      "geoai_task_usage_report", "geoai_task_export_jsonl", "geoai_task_audit_log_read",
-      "geoai_task_review_summarize", "geoai_task_codex_handoff", "geoai_task_codex_handoff_markdown",
-      "geoai_supervisor_loop_status",
-      "geoai_cli_adapter_plan_readonly", "geoai_cli_adapter_audit_summary_readonly", "geoai_cli_adapter_report_readonly"
+      "aiworkhub_task_health", "aiworkhub_task_review_queue", "aiworkhub_task_list", "aiworkhub_task_show",
+      "aiworkhub_task_pending_for_runner", "aiworkhub_task_auto_pickup", "aiworkhub_task_auto_pickup_dryrun",
+      "aiworkhub_task_mark_review", "aiworkhub_task_mark_done", "aiworkhub_task_collision_guard",
+      "aiworkhub_task_usage_report", "aiworkhub_task_export_jsonl", "aiworkhub_task_audit_log_read",
+      "aiworkhub_task_review_summarize", "aiworkhub_task_codex_handoff", "aiworkhub_task_codex_handoff_markdown",
+      "aiworkhub_supervisor_loop_status",
+      "aiworkhub_cli_adapter_plan_readonly", "aiworkhub_cli_adapter_audit_summary_readonly", "aiworkhub_cli_adapter_report_readonly"
     ]
   },
   "stale_assertions_identified": [
     {
       "id": "STALE_B109_TOTAL_TOOLS_VISIBLE",
-      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
       "old_value": 15,
       "new_value": 20,
       "reason": "5 new tools added since B108 baseline: auto_pickup_dryrun, review_summarize, codex_handoff, codex_handoff_markdown, supervisor_loop_status"
     },
     {
       "id": "STALE_B110_TOTAL_TOOLS_VISIBLE",
-      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
       "old_value": 15,
       "new_value": 20,
       "reason": "Same 5 new tools; concurrent smoke sees same total count for both sessions"
     },
     {
       "id": "STALE_MVP_CONTRACT_AUDIT_TOOL_NAMES",
-      "file": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mvp_contract_audit_v1.sh",
       "old_behavior": "assert live_names == audit_names (11 audited vs 20 live)",
       "new_behavior": "subset check: assert audited tools present in live; report 9 new tools",
       "reason": "Audit JSON frozen at 11 tools; 9 new tools added since. Test updated to verify no audited tool was lost while acknowledging new additions."
@@ -47,37 +47,37 @@
   ],
   "changes_made": [
     {
-      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
       "change": "total_tools_visible assertion: 15 -> 20; comment updated"
     },
     {
-      "file": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
       "change": "total_tools_visible + total_tools_visible_session_b assertions: 15 -> 20; comment updated"
     },
     {
-      "file": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+      "file": "tools/aiworkhub/tests/test_mvp_contract_audit_v1.sh",
       "change": "live_names == audit_names equality check -> subset check (all audited tools still present); row_tool_names == audit_names -> subset check; added informational print of new tools"
     }
   ],
   "not_modified_by_design": [
     {
-      "file": "tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py",
+      "file": "tools/aiworkhub/tests/mcp_stdio_client_smoke.py",
       "reason": "Frozen READONLY_TOOLS/WRITE_GATED_TOOLS tuples (11+4) are a historical B108 baseline; not in allowed_writes. Smoke client still correctly reports live total_tools_visible=20 from server."
     },
     {
-      "file": "tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py",
+      "file": "tools/aiworkhub/tests/mcp_stdio_concurrent_client_smoke.py",
       "reason": "Same frozen tuples; not in allowed_writes."
     },
     {
-      "file": "tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py",
+      "file": "tools/aiworkhub/tests/mcp_client_smoke_contract_freeze.py",
       "reason": "Same frozen tuples + fingerprints; not in allowed_writes."
     },
     {
-      "file": "tools/geoai-task-mcp/eval/mvp_contract_audit_v1.json",
+      "file": "tools/aiworkhub/eval/mvp_contract_audit_v1.json",
       "reason": "Stale at 11 tools but not in allowed_writes. Next-wave task tracks this."
     },
     {
-      "file": "tools/geoai-task-mcp/eval/mvp_contract_audit_rows_v1.jsonl",
+      "file": "tools/aiworkhub/eval/mvp_contract_audit_rows_v1.jsonl",
       "reason": "Same stale scope; not in allowed_writes."
     }
   ],
@@ -108,14 +108,14 @@
     }
   },
   "new_tools_since_baseline": [
-    "geoai_task_auto_pickup_dryrun",
-    "geoai_task_review_summarize",
-    "geoai_task_codex_handoff",
-    "geoai_task_codex_handoff_markdown",
-    "geoai_supervisor_loop_status",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_report_readonly"
+    "aiworkhub_task_auto_pickup_dryrun",
+    "aiworkhub_task_review_summarize",
+    "aiworkhub_task_codex_handoff",
+    "aiworkhub_task_codex_handoff_markdown",
+    "aiworkhub_supervisor_loop_status",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_report_readonly"
   ],
   "commit_contract": "NO_COMMIT",
   "summary": "B119 stale smoke inventory refresh complete. Only test-shell constants updated (total_tools_visible 15->20 in b109/b110; mvp_contract_audit equality->subset check). No server code, smoke-client Python, or implementation behavior changed. All 3 tests pass. Write gate remains default-off."

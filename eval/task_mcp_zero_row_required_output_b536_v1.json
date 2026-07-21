@@ -19,9 +19,9 @@
     "test_pass": 27,
   "test_fail": 0,
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/tests/test_worker_required_empty_output_b536_v1.py"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/tests/test_worker_required_empty_output_b536_v1.py"
   ],
   "regression_safety": {
     "required_output_project_context_tests": "PASS",

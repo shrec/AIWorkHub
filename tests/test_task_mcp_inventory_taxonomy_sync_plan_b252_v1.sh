@@ -149,8 +149,8 @@ for f in \
   "tools/geoai-task-mcp/tests/test_mcp_neural_launch_routing_dryrun_b109_v1.sh" \
   "tools/geoai-task-mcp/eval/task_mcp_orchestrator_mvp_protocol_b250_v1.json" \
   "tools/geoai-task-mcp/tests/test_task_mcp_orchestrator_mvp_protocol_b250_v1.sh" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/server.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/server.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/cli_adapter_readonly_tool.py" \
   ; do
   if [[ -f "$f" ]]; then
     mtime_target=$(stat -c %Y "$f" 2>/dev/null || echo 0)

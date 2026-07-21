@@ -21,7 +21,7 @@
     "write_gate_enabled": false
   },
   "source_provenance": {
-    "pin_repo": "tools/geoai-task-mcp",
+    "pin_repo": "tools/aiworkhub",
     "pin_ref": "HEAD",
     "committed_manifest_rel": "eval/mcp_unified_contract_freeze_manifest_b110_v1.json",
     "committed_source": "git_head",
@@ -55,9 +55,9 @@
     "queue_mutation": false,
     "scratch_isolation": "all scratch in a private mktemp dir cleaned in a trap; per-test temp git repos; no shared fixed-path writes"
   },
-  "test": "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+  "test": "tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "bash tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "composes": [

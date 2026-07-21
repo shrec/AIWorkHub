@@ -15,21 +15,21 @@
   "objective": "Fix the reproduced callback regression where a valid terminal task event receives transient delivery result not_ready while the target thread is active and is incorrectly moved to dead_letter. Park it durably as waiting_for_thread_idle/pending, retry after readiness, and deliver exactly once without losing or duplicating the event.",
   "read_first": [
     "AGENTS.md",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_busy_callback_durable_park_b416_v1.json",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_bridge_operational_closure_b402_v1.json"
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py",
+    "tools/aiworkhub/eval/task_mcp_busy_callback_durable_park_b416_v1.json",
+    "tools/aiworkhub/eval/task_mcp_callback_bridge_operational_closure_b402_v1.json"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_not_ready_durable_park_b682_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_not_ready_durable_park_b682_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
   ],
   "required_outputs": [
-    "tools/geoai-task-mcp/tests/test_callback_not_ready_durable_park_b682_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
+    "tools/aiworkhub/tests/test_callback_not_ready_durable_park_b682_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
   ],
   "acceptance": [
     "Reproduce the exact B681 failure: a bound terminal review_ready event exists, delivery returns not_ready, and the current code would dead-letter it.",
@@ -51,9 +51,9 @@
     "taskctl_done_by_worker"
   ],
   "validation": [
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_not_ready_durable_park_b682_v1.py",
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
-    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
+    "python3 -m pytest -q tools/aiworkhub/tests/test_callback_not_ready_durable_park_b682_v1.py",
+    "python3 -m pytest -q tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py",
+    "python3 -m json.tool tools/aiworkhub/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
   ],
   "commit_contract": "NO_COMMIT. Bounded callback state-machine repair only; Codex owns finalization and service-reload decision.",
   "project_context": {
@@ -65,8 +65,8 @@
       "budget": 144,
       "query": "callback bridge not_ready dead_letter waiting_for_thread_idle durable park retry",
       "targets": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-        "tools/geoai-task-mcp/tests"
+        "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+        "tools/aiworkhub/tests"
       ]
     },
     "session": {"topic": "Task MCP callback not_ready regression", "limit": 16},

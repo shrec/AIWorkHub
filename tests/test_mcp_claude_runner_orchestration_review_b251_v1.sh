@@ -12,11 +12,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
-LAUNCH_CONTRACT_SRC="$MCPROOT/src/geoai_task_mcp/launch_queue_contract.py"
-LAUNCH_PERSIST_SRC="$MCPROOT/src/geoai_task_mcp/launch_queue_persist.py"
-DRYRUN_SRC="$MCPROOT/src/geoai_task_mcp/cli_adapter_dryrun.py"
-READONLY_TOOL_SRC="$MCPROOT/src/geoai_task_mcp/cli_adapter_readonly_tool.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
+LAUNCH_CONTRACT_SRC="$MCPROOT/src/aiworkhub/launch_queue_contract.py"
+LAUNCH_PERSIST_SRC="$MCPROOT/src/aiworkhub/launch_queue_persist.py"
+DRYRUN_SRC="$MCPROOT/src/aiworkhub/cli_adapter_dryrun.py"
+READONLY_TOOL_SRC="$MCPROOT/src/aiworkhub/cli_adapter_readonly_tool.py"
 
 EVAL_JSON="$MCPROOT/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
 NEXT_WAVE_JSON="$MCPROOT/data/tasking/mcp_claude_runner_orchestration_review_next_wave_b251_v1.json"

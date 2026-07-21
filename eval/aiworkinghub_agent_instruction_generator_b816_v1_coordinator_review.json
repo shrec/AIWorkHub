@@ -1,7 +1,0 @@
-{
-  "schema_id": "aiworkinghub.coordinator_review.v1",
-  "task_id": "CODEX_GPT55_AIWORKINGHUB_AGENT_INSTRUCTION_GENERATOR_B816_V1",
-  "verdict": "REJECT_SUPERSEDED_SCOPE",
-  "promoted_paths": [],
-  "reason": "Owner narrowed the generator to Task MCP, Source Graph, Session Manager, AI Memory and KB tool-use instructions only. The broader repository/domain-policy candidate is superseded by B816_V2."
-}

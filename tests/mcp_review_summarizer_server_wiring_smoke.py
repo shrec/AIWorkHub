@@ -2,15 +2,15 @@
 """Smoke test for B111 server wiring of review_summarizer as MCP tool.
 
 Validates:
-  - geoai_task_review_summarize MCP tool returns grouped tasks + checklist
+  - aiworkhub_task_review_summarize MCP tool returns grouped tasks + checklist
   - Read-only invariants preserved (no write-gate toggle in schema)
   - Never calls taskctl done/review/start/auto-pickup/add-card
   - No agent/model process launch
   - Output shape matches Codex review checklist expectation
 
 Usage:
-    GEOAI_TASK_MCP_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    GEOAI_REPO=/home/shrek/GeoAI python3 \
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
+    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 \
     tools/geoai-task-mcp/tests/mcp_review_summarizer_server_wiring_smoke.py
 """
 
@@ -25,8 +25,8 @@ from typing import Any
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
-from geoai_task_mcp import review_summarizer
-from geoai_task_mcp.core import TaskCtlResult
+from aiworkhub import review_summarizer
+from aiworkhub.core import TaskCtlResult
 
 
 FAILURES: list[str] = []
@@ -151,7 +151,7 @@ def stub_show_task(task_id: str) -> dict[str, Any]:
 
 # ── Simulated server tool call (mirrors server.py wiring) ────────────
 
-def geoai_task_review_summarize(
+def aiworkhub_task_review_summarize(
     task_ids: list[str] | None = None,
     batch_label: str | None = None,
 ) -> dict[str, Any]:
@@ -170,7 +170,7 @@ def geoai_task_review_summarize(
         result["requested_task_ids"] = task_ids
     if batch_label:
         result["batch_label"] = batch_label
-    result["server_tool"] = "geoai_task_review_summarize"
+    result["server_tool"] = "aiworkhub_task_review_summarize"
     result["contract"] = "B111_v1_readonly_server_wiring"
     return result
 
@@ -180,14 +180,14 @@ def geoai_task_review_summarize(
 print("=== B111 Review Summarizer Server Wiring Smoke Test ===\n")
 
 # Precondition
-assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0") == "0", (
-    "GEOAI_TASK_MCP_ALLOW_WRITES must be 0"
+assert os.environ.get("AIWORKHUB_ALLOW_WRITES", "0") == "0", (
+    "AIWORKHUB_ALLOW_WRITES must be 0"
 )
-print("precondition: GEOAI_TASK_MCP_ALLOW_WRITES=0  ✓")
+print("precondition: AIWORKHUB_ALLOW_WRITES=0  ✓")
 
 # ── Test 1: Basic call (no filtering) ───────────────────────────────
 CALLED_COMMANDS.clear()
-result = geoai_task_review_summarize()
+result = aiworkhub_task_review_summarize()
 
 if not result.get("ok"):
     fail("basic.ok", f"got {result.get('ok')}")
@@ -200,10 +200,10 @@ else:
     ok("basic.task_count=3")
 
 # ── Test 2: Server metadata fields present ──────────────────────────
-if result.get("server_tool") != "geoai_task_review_summarize":
+if result.get("server_tool") != "aiworkhub_task_review_summarize":
     fail("server_tool", f"got {result.get('server_tool')}")
 else:
-    ok("server_tool=geoai_task_review_summarize")
+    ok("server_tool=aiworkhub_task_review_summarize")
 
 if result.get("contract") != "B111_v1_readonly_server_wiring":
     fail("contract", f"got {result.get('contract')}")
@@ -250,7 +250,7 @@ for item in checklist:
 
 # ── Test 5: filter by task_ids ──────────────────────────────────────
 CALLED_COMMANDS.clear()
-filtered = geoai_task_review_summarize(
+filtered = aiworkhub_task_review_summarize(
     task_ids=["DEEPSEEK_STUB_TASK_A_V1", "DEEPSEEK_STUB_TASK_B_V1"],
 )
 filtered_checklist = filtered.get("codex_review_checklist", [])
@@ -269,7 +269,7 @@ else:
 
 # ── Test 6: batch_label ─────────────────────────────────────────────
 CALLED_COMMANDS.clear()
-batched = geoai_task_review_summarize(batch_label="review_batch_2026_07_04")
+batched = aiworkhub_task_review_summarize(batch_label="review_batch_2026_07_04")
 if batched.get("batch_label") != "review_batch_2026_07_04":
     fail("batch_label", f"got {batched.get('batch_label')}")
 else:

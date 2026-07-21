@@ -3,20 +3,20 @@ set -euo pipefail
 
 # ── test_mcp_review_summarizer_stdio_smoke_b115_v1.sh ───────────────────────
 # B115 stdio transport smoke test: start MCP server via stdio, send
-# JSON-RPC initialize + list_tools, find geoai_task_review_summarize,
+# JSON-RPC initialize + list_tools, find aiworkhub_task_review_summarize,
 # call it via tools/call, verify response shape, prove live queue
 # unchanged before/after. No agent/model launch, no network, no mutation.
 #
 # Usage:
-#   GEOAI_TASK_MCP_ALLOW_WRITES=0 bash \
+#   AIWORKHUB_ALLOW_WRITES=0 bash \
 #     tools/geoai-task-mcp/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 QUEUE_PATH="$ROOT/bitnnv2/data/tasking/task_queue_v1.sqlite"
 AUDIT_PATH="$ROOT/tools/geoai-task-mcp/logs/audit.jsonl"
@@ -24,13 +24,13 @@ AUDIT_PATH="$ROOT/tools/geoai-task-mcp/logs/audit.jsonl"
 echo "=== B115 MCP Review Summarizer Stdio Smoke Test ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo "QUEUE_PATH=$QUEUE_PATH"
 echo ""
 
 # ── 0. Validate ALLOW_WRITES is off ─────────────────────────────────────────
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 
@@ -55,7 +55,7 @@ echo ""
 
 # ── 2. Run the stdio smoke test (single Python process managing child) ──────
 echo "--- Stdio JSON-RPC smoke test ---"
-PYTHONPATH="$MCPROOT/src" GEOAI_REPO="$ROOT" GEOAI_TASK_MCP_ALLOW_WRITES=0 \
+PYTHONPATH="$MCPROOT/src" AIWORKHUB_REPO="$ROOT" AIWORKHUB_ALLOW_WRITES=0 \
   python3 - <<'PY'
 #!/usr/bin/env python3
 """B115 inline stdio smoke runner.
@@ -72,11 +72,11 @@ import sys
 import time
 
 
-ROOT = os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")
-MCPROOT = os.path.join(ROOT, "tools", "geoai-task-mcp")
-ALLOW_WRITES = os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0")
+ROOT = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
+MCPROOT = os.path.join(ROOT, "tools", "aiworkhub")
+ALLOW_WRITES = os.environ.get("AIWORKHUB_ALLOW_WRITES", "0")
 QUEUE_PATH = os.path.join(ROOT, "bitnnv2", "data", "tasking", "task_queue_v1.sqlite")
-AUDIT_PATH = os.path.join(ROOT, "tools", "geoai-task-mcp", "logs", "audit.jsonl")
+AUDIT_PATH = os.path.join(ROOT, "tools", "aiworkhub", "logs", "audit.jsonl")
 FAILURES = []
 
 
@@ -107,12 +107,12 @@ def main():
 
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(MCPROOT, "src")
-    env["GEOAI_REPO"] = ROOT
-    env["GEOAI_TASK_MCP_ALLOW_WRITES"] = ALLOW_WRITES
-    env["GEOAI_TASK_MCP_TIMEOUT"] = "30"
+    env["AIWORKHUB_REPO"] = ROOT
+    env["AIWORKHUB_ALLOW_WRITES"] = ALLOW_WRITES
+    env["AIWORKHUB_TIMEOUT"] = "30"
     env["PYTHONUNBUFFERED"] = "1"
 
-    server_cmd = [sys.executable, "-u", "-m", "geoai_task_mcp.server"]
+    server_cmd = [sys.executable, "-u", "-m", "aiworkhub.server"]
     print(f"  starting server: {server_cmd}")
     proc = subprocess.Popen(
         server_cmd,
@@ -169,7 +169,7 @@ def main():
         tool_names = [t["name"] for t in tools]
         pass_("tools_list_count", f"{len(tools)} tools")
 
-        required = "geoai_task_review_summarize"
+        required = "aiworkhub_task_review_summarize"
         review_tool = next((t for t in tools if t["name"] == required), None)
         if review_tool is None:
             fail("tool_find", f"{required} not in tools/list. Found: {tool_names}")

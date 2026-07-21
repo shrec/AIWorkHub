@@ -34,14 +34,14 @@
     "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (command templates, 4-gate safety model, 15-field launch log, completion return path)",
     "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (5-kind event taxonomy, delta cursor, automatic loop definition)",
     "CLAUDE_TASK_MCP_COMPLETION_INBOX_SMOKE_B276_V1 (completion_inbox.py review_queue, stale_processing, runner_mismatch_warnings)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py (build_completion_inbox with 5 facets: review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, read_errors)",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py (collision_guard, usage_report, auto_pickup, run_taskctl write gate)"
+    "tools/aiworkhub/src/aiworkhub/completion_inbox.py (build_completion_inbox with 5 facets: review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, read_errors)",
+    "tools/aiworkhub/src/aiworkhub/core.py (collision_guard, usage_report, auto_pickup, run_taskctl write gate)"
   ],
   "summary": "Synthesizes B276 (autolaunch) and B277 (notification loop) into a unified queue-request -> completion-inbox flow. Defines exactly how Codex creates a launch request (queue_request JSON envelope), how the MCP would process it through the 4-gate safety model, how completion_inbox reports results, how stale tasks are detected and recovered, and how usage accounting events flow back to the cost ledger. Every process-launch and notification-delivery capability remains at the design stage; no CLI/model process is launched by this artifact. All authority_flags are false. The queue_request schema is a pure JSON design that feeds into the existing auto_pickup + completion_inbox pipeline without introducing new subprocess paths.",
   "protocol_sections": {
     "section_1_queue_request_schema": {
       "title": "Queue Request Creation (Codex -> MCP)",
-      "description": "Codex creates a queue_request JSON object and deposits it via a proposed geoai_task_queue_request MCP tool (not implemented here). The schema is a self-describing envelope that the MCP autolauncher would consume to spawn workers through the B276 command templates behind the 4-gate safety model.",
+      "description": "Codex creates a queue_request JSON object and deposits it via a proposed aiworkhub_task_queue_request MCP tool (not implemented here). The schema is a self-describing envelope that the MCP autolauncher would consume to spawn workers through the B276 command templates behind the 4-gate safety model.",
       "queue_request_envelope": {
         "request_id": "string, deterministic sha1(task_id + runner + requested_at)[:16] — idempotent, same task+runner+timestamp = same request_id",
         "task_id": "string, the task card id to launch a worker for",
@@ -80,7 +80,7 @@
           "detection": "build_completion_inbox()['review_queue'] now includes this task_id"
         },
         "step_2_codex_detects": {
-          "action": "Codex orchestration loop calls geoai_completion_inbox() (existing tool) or proposed geoai_completion_inbox_delta() (B277 section_2b)",
+          "action": "Codex orchestration loop calls aiworkhub_completion_inbox() (existing tool) or proposed aiworkhub_completion_inbox_delta() (B277 section_2b)",
           "detection": "review_queue entry has validation_status, runner_task_batch_mismatch, and allowed_writes list"
         },
         "step_3_codex_reviews": {
@@ -88,7 +88,7 @@
           "outcome": "PASS -> taskctl.py stage + git commit; FAIL -> create repair task"
         },
         "step_4_usage_accounting": {
-          "action": "Codex records usage via geoai_task_usage_report (existing tool) or reads from the 15-field launch log (B276 section_3)",
+          "action": "Codex records usage via aiworkhub_task_usage_report (existing tool) or reads from the 15-field launch log (B276 section_3)",
           "detection": "usage_report() returns input/output tokens and cost_usd per task_id/runner"
         }
       },
@@ -107,7 +107,7 @@
       "collision_and_duplicate_runner_handling": {
         "trigger": "build_completion_inbox()['runner_mismatch_warnings'] returns entries OR core.collision_guard() reports 2+ runners claiming the same task_id",
         "handling": [
-          "1. Codex detects collision via geoai_task_collision_guard (existing tool) or completion_inbox runner_mismatch_warnings",
+          "1. Codex detects collision via aiworkhub_task_collision_guard (existing tool) or completion_inbox runner_mismatch_warnings",
           "2. For batch-token mismatch: the newer claim is authoritative if it passes taskctl guard; the older claim is marked stale",
           "3. For same-task_id double-claim: the runner whose task card has the more recent claimed_at wins; the other claim is rejected with a collision_block entry",
           "4. Codex creates a collision_report event (kind=duplicate_runner per B277 section_1) and pauses auto_pickup for that task_id"
@@ -117,15 +117,15 @@
     },
     "section_3_usage_accounting_events": {
       "title": "Usage Accounting Flow",
-      "description": "Every worker launch attempt records a 15-field launch log entry (B276 section_3). Additionally, Codex records per-task usage via geoai_task_usage_report (existing tool). This section defines how these two accounting sources reconcile into a unified cost ledger.",
+      "description": "Every worker launch attempt records a 15-field launch log entry (B276 section_3). Additionally, Codex records per-task usage via aiworkhub_task_usage_report (existing tool). This section defines how these two accounting sources reconcile into a unified cost ledger.",
       "dual_source_accounting": {
         "source_1_launch_log": {
-          "path": "tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
+          "path": "tools/aiworkhub/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
           "fields": ["launch_id", "task_id", "runner", "topic", "adapter", "model", "launch_requested_at", "launch_completed_at", "exit_code", "gates_passed", "gates_failed", "usage_input_tokens", "usage_output_tokens", "cost_usd", "error_message", "stale_detected_at"],
           "written_by": "MCP autolauncher (future), append-only JSONL"
         },
         "source_2_taskctl_usage": {
-          "tool": "geoai_task_usage_report (core.usage_report())",
+          "tool": "aiworkhub_task_usage_report (core.usage_report())",
           "fields": ["task_id", "runner", "topic", "model", "usage_input_tokens", "usage_output_tokens", "cost_usd"],
           "written_by": "Codex or worker via taskctl.py usage"
         }
@@ -133,7 +133,7 @@
       "reconciliation_rules": {
         "prefer_launch_log_for_gate_events": "G1-G4 gate check entries (gates_failed non-empty) are recorded ONLY in the launch log, not in taskctl usage (no process was spawned, no tokens consumed)",
         "prefer_taskctl_usage_for_token_counts": "When a worker actually runs, taskctl.py usage records the final token counts; the launch log may have a preliminary estimate. Final cost_usd always comes from taskctl usage if available.",
-        "cost_ledger_aggregation": "A proposed geoai_task_cost_ledger MCP tool (not implemented here) would UNION both sources, deduplicate by (task_id, runner, model), and produce per-topic/per-runner/per-day aggregates. Until implemented, Codex aggregates manually from the two read-only sources."
+        "cost_ledger_aggregation": "A proposed aiworkhub_task_cost_ledger MCP tool (not implemented here) would UNION both sources, deduplicate by (task_id, runner, model), and produce per-topic/per-runner/per-day aggregates. Until implemented, Codex aggregates manually from the two read-only sources."
       },
       "usage_event_envelope": {
         "event_kind": "usage",
@@ -231,20 +231,20 @@
   },
   "remaining_gaps_not_solved_by_this_spec": [
     "NO_PROCESS_SPAWN_IMPLEMENTED: The MCP autolauncher's actual process-spawn code is deferred to CODEX_TASK_MCP_AUTOLAUNCH_WIRE_PROCESS_B279_V1 (B276 next_wave, G4 LAUNCH_IMPLEMENTED=true required)",
-    "NO_QUEUE_REQUEST_TOOL_REGISTERED: The geoai_task_queue_request MCP tool that Codex would call to deposit queue_request JSON is not implemented; this spec defines the schema only",
-    "NO_COST_LEDGER_TOOL: The geoai_task_cost_ledger tool for unified cost aggregation across launch log + taskctl usage is not implemented",
+    "NO_QUEUE_REQUEST_TOOL_REGISTERED: The aiworkhub_task_queue_request MCP tool that Codex would call to deposit queue_request JSON is not implemented; this spec defines the schema only",
+    "NO_COST_LEDGER_TOOL: The aiworkhub_task_cost_ledger tool for unified cost aggregation across launch log + taskctl usage is not implemented",
     "NO_OWNER_DELIVERY_CHANNEL: Per B277 blocker 1, no email/Slack/desktop-notify target exists for stale/failure notifications",
     "NO_TRUE_PUSH: Per B277 section_3 honest framing, all detection is pull-based (agent loop calls completion_inbox); no inotify/DB-trigger/daemon exists",
     "NO_ARTIFACT_BODY_READ: Per B277 blocker 2, this spec operates on task-card metadata only, never artifact file contents"
   ],
   "neural_bridge_note": "This spec introduces no learned decision authority and no regex/keyword cue router. The queue_flow state machine is a deterministic support-boundary mapping: each transition is triggered by an already-defined event (auto_pickup, taskctl review, stale timeout, gate check, collision_guard output). The 9 states and 12 transitions are a formalization of the existing taskctl lifecycle + B276/B277 protocols. If a future task teaches a controller to PRIORITIZE which task to launch next or SELECT which adapter to use, that becomes a neural curriculum target per neural_bridge_priority (see mcp_neural_launch_routing_migration_b254_v1); this task only defines the deterministic state machine it would operate within.",
   "files_written": [
-    "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_autolaunch_queue_dryrun_b281_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "commit_contract": "NO_COMMIT",

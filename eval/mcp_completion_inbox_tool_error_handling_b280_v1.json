@@ -10,18 +10,18 @@
     "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_SMOKE_PYTEST_B279_V1 (tests/test_completion_inbox_smoke_fixtures_b279_v1.py -- documented finding_1_subprocess_raises_uncaught, finding_2_list_failure_silently_swallowed, finding_3_show_failure_is_recorded)",
     "data/tasking/task_mcp_owner_notification_smoke_pytest_next_wave_b279_v1.json blocker id=list_call_failure_silently_swallowed (severity high) and id=no_tool_error_event_kind_exists (severity high)"
   ],
-  "summary": "Implements bounded read-error reporting inside completion_inbox.py (no core.py/server.py change): every taskctl `list`/`show` call in _fetch_full_cards is now try/except-guarded so a raised exception degrades to a recorded error instead of crossing build_completion_inbox() uncaught, and the LIST call's returncode is now checked (previously only the SHOW call's returncode was checked) so a nonzero-returncode LIST failure with empty stdout is no longer indistinguishable from a genuinely empty queue. Both failure modes are surfaced via a new additive `read_errors` facet (scope: list|show, error_kind: nonzero_returncode|exception, bounded/truncated error_message) plus a `counts.read_errors` integer. The pre-existing `fetch_errors` facet (task_id + error, SHOW-scoped) keeps its exact original shape/contents for backward compatibility -- this closes blocker list_call_failure_silently_swallowed and blocker no_tool_error_event_kind_exists from the B279 next-wave file, scoped to the completion_inbox read layer only (no new geoai_completion_inbox_delta tool, no server.py change -- out of this task's allowed_writes).",
+  "summary": "Implements bounded read-error reporting inside completion_inbox.py (no core.py/server.py change): every taskctl `list`/`show` call in _fetch_full_cards is now try/except-guarded so a raised exception degrades to a recorded error instead of crossing build_completion_inbox() uncaught, and the LIST call's returncode is now checked (previously only the SHOW call's returncode was checked) so a nonzero-returncode LIST failure with empty stdout is no longer indistinguishable from a genuinely empty queue. Both failure modes are surfaced via a new additive `read_errors` facet (scope: list|show, error_kind: nonzero_returncode|exception, bounded/truncated error_message) plus a `counts.read_errors` integer. The pre-existing `fetch_errors` facet (task_id + error, SHOW-scoped) keeps its exact original shape/contents for backward compatibility -- this closes blocker list_call_failure_silently_swallowed and blocker no_tool_error_event_kind_exists from the B279 next-wave file, scoped to the completion_inbox read layer only (no new aiworkhub_completion_inbox_delta tool, no server.py change -- out of this task's allowed_writes).",
   "context7_usage": {
     "context7_used": false,
     "context7_unavailable": false,
     "reason": "Pure repo-local implementation task inside an already-read local module (completion_inbox.py); no new external library/framework/API/CLI/service surface was touched. Python's builtin try/except and existing core.list_tasks/core.show_task dict contract (already documented in-repo, verified by direct Read of core.py:261-366) fully define the change."
   },
   "known_indexer_gap_used": {
-    "gap": "bug.tools_geoai_task_mcp_not_indexed (AI Memory KB, ACTIVE since 2026-07-05)",
+    "gap": "bug.tools_aiworkhub_not_indexed (AI Memory KB, ACTIVE since 2026-07-05)",
     "workaround": "cgraph.py find / source_graph.py find both returned zero hits for 'def list_tasks' (re-verified this task), confirming the gap is still open; direct Read used on completion_inbox.py (read_first) and core.py:255-380 (needed to confirm list_tasks/show_task both return run_taskctl(...).as_dict() and that subprocess.run has no surrounding try/except -- the exact mechanism finding_1 in B279 documented) -- same documented workaround as prior task_mcp workers."
   },
   "implementation": {
-    "file": "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
+    "file": "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
     "changes": [
       "New helper _result_fields(result) -- extracts (returncode, stdout, stderr) from a dict or attribute-bearing object without raising; used for both LIST and SHOW results (previously only SHOW had this dict-or-object handling inline).",
       "_fetch_full_cards: LIST call now wrapped in try/except Exception -> read_errors entry {scope:list, status, topic, error_kind:exception, error_message} instead of propagating.",
@@ -38,14 +38,14 @@
     "facet_shape_compatibility": "additive-only: existing fetch_errors/review_queue/stale_processing/runner_mismatch_warnings/latest_validation_facts/counts keys and value shapes are byte-identical to pre-B280 behavior on the clean (no read-tool-failure) path; read_errors and counts.read_errors are the only new keys."
   },
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh -> 29/29 checks PASS, exit 0",
-    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh -> 21/21 checks PASS, exit 0 (regression: no facet-shape/behavior break)",
-    "python3 -m pytest tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py -> 11 passed, 1 xfailed, exit 0 (regression, incl. the pre-existing tool_error documentation tests)",
-    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> ALL CHECKS PASSED (regression: live MCP tool call + server.py wiring + queue DB byte-identical before/after)",
+    "bash tools/aiworkhub/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh -> 29/29 checks PASS, exit 0",
+    "bash tools/aiworkhub/tests/test_mcp_completion_inbox_smoke_b276_v1.sh -> 21/21 checks PASS, exit 0 (regression: no facet-shape/behavior break)",
+    "python3 -m pytest tools/aiworkhub/tests/test_completion_inbox_smoke_fixtures_b279_v1.py -> 11 passed, 1 xfailed, exit 0 (regression, incl. the pre-existing tool_error documentation tests)",
+    "bash tools/aiworkhub/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> ALL CHECKS PASSED (regression: live MCP tool call + server.py wiring + queue DB byte-identical before/after)",
     "python3 AITools/taskctl.py verify -> VERIFY: PASS"
   ],
   "new_test_coverage": {
-    "file": "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh",
+    "file": "tools/aiworkhub/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh",
     "checks": 29,
     "sections": [
       "s1: nonzero LIST-call returncode (empty stdout) -> read_errors scope=list, error_kind=nonzero_returncode -- tested separately from SHOW failure",
@@ -89,13 +89,13 @@
     {
       "id": "no_tool_error_event_kind_in_mcp_tool_schema",
       "severity": "medium",
-      "description": "read_errors is now populated inside build_completion_inbox()'s Python return value, but the geoai_completion_inbox MCP tool's advertised input/output JSON schema (server.py, out of this task's allowed_writes) has not been updated to document the new read_errors field for MCP clients that validate against a strict schema.",
-      "proposed_fix": "A follow-up task with server.py in allowed_writes should add read_errors to geoai_completion_inbox's documented output schema (additive property, non-breaking)."
+      "description": "read_errors is now populated inside build_completion_inbox()'s Python return value, but the aiworkhub_completion_inbox MCP tool's advertised input/output JSON schema (server.py, out of this task's allowed_writes) has not been updated to document the new read_errors field for MCP clients that validate against a strict schema.",
+      "proposed_fix": "A follow-up task with server.py in allowed_writes should add read_errors to aiworkhub_completion_inbox's documented output schema (additive property, non-breaking)."
     },
     {
-      "id": "geoai_completion_inbox_delta_still_not_implemented",
+      "id": "aiworkhub_completion_inbox_delta_still_not_implemented",
       "severity": "low",
-      "description": "This task deliberately stayed inside the existing geoai_completion_inbox facet set (completion_inbox.py only, per allowed_writes) and did not build the separate geoai_completion_inbox_delta tool discussed in B277/B278/B279 (structured usage facet, owner-notification envelope field renames). Those B279 next-wave blockers (usage_report_not_structured, duplicate_runner_envelope_shape_mismatch, envelope_field_name_drift) remain open and unrelated to this task's scope.",
+      "description": "This task deliberately stayed inside the existing aiworkhub_completion_inbox facet set (completion_inbox.py only, per allowed_writes) and did not build the separate aiworkhub_completion_inbox_delta tool discussed in B277/B278/B279 (structured usage facet, owner-notification envelope field renames). Those B279 next-wave blockers (usage_report_not_structured, duplicate_runner_envelope_shape_mismatch, envelope_field_name_drift) remain open and unrelated to this task's scope.",
       "proposed_fix": "Unchanged from B279 next-wave file -- separate task cards, not addressed here."
     }
   ],
@@ -103,8 +103,8 @@
   "codex_review_required": true,
   "do_not_mark_done": true,
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-    "tools/geoai-task-mcp/eval/mcp_completion_inbox_tool_error_handling_b280_v1.json",
-    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh"
+    "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+    "tools/aiworkhub/eval/mcp_completion_inbox_tool_error_handling_b280_v1.json",
+    "tools/aiworkhub/tests/test_mcp_completion_inbox_tool_error_handling_b280_v1.sh"
   ]
 }

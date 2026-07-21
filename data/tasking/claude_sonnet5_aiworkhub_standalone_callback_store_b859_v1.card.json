@@ -1,0 +1,103 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_STANDALONE_CALLBACK_STORE_B859_V1",
+  "title": "Repair standalone packaged callback storage and live delivery",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_standalone_callback_store_b859_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "critical",
+  "objective": "Fix the proven B857 live-canary failure. The packaged VSIX runtime contains aiworkhub but not repository AITools/taskdb.py; callback_bridge._taskdb_module therefore raises during dispatcher construction and the extension silently ignores the returned start_failed payload. Move the complete durable callback outbox/batch authority required by CallbackBridge into the standalone aiworkhub package on the same canonical repository-local .aiworkhub/tasking/task_queue.sqlite, remove every operational AITools/taskdb dependency from packaged runtime, make extension startup surface start_failed, and prove delivery from an extracted VSIX/runtime with no AITools directory anywhere on sys.path. Preserve the pending B858 review callback for the coordinator canary; do not supersede or fabricate it.",
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_store.py",
+    "tools/geoai-task-mcp/src/aiworkhub/task_store.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/test/package-vsix.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_standalone_callback_store_b859.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_standalone_callback_store_b859_v1.json"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/task_store.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/test/package-vsix.js",
+    "AITools/taskdb.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_canonical_task_engine_b852.py"
+  ],
+  "acceptance": [
+    "No production file under src/aiworkhub imports taskdb, AITools.taskdb, computes an AITools path, or requires the parent repository for callback operation.",
+    "The standalone aiworkhub callback store owns the required outbox and batch schema plus enqueue, claim/lease, supersede, busy defer, transient failure, delivered, dead-letter, stats and restart recovery operations used by CallbackBridge.",
+    "All callback operations resolve exactly the initialized repository's canonical .aiworkhub/tasking/task_queue.sqlite through task_store/storage registry; no fallback or second database is created.",
+    "Existing queue rows and schema are upgraded additively and remain readable; the pending B858 callback is neither deleted nor rewritten by migration.",
+    "CallbackBridge uses the package-local callback store directly and retains compact payload, batching, acknowledgement, retry/backoff, active-turn parking and Claude/Codex transport semantics.",
+    "The VS Code MCP handshake treats an ok response with dispatcher_started=false or status=start_failed as a visible failure, records the bounded diagnostic and does not claim callback readiness.",
+    "A black-box test copies/extracts only the packaged runtime into an isolated temporary directory, removes repository root and AITools from sys.path, initializes a fresh repo, creates a terminal callback, starts the dispatcher with a deterministic fake transport and observes pending-to-delivered with a matching acknowledgement.",
+    "A packaged-runtime test also proves an invalid/unsupported transport remains pending/fail-closed rather than delivered or dead-lettered accidentally.",
+    "Existing B856/B857 callback tests and canonical task-engine tests are rebased to package-local authority and pass without monkeypatching AITools/taskdb.DEFAULT_DB.",
+    "VSIX contains callback_store.py and its runtime can import/construct CallbackBridge using only bundled files plus Python standard library/runtime dependencies.",
+    "Worker performs no commit, push, extension install or manual mutation of the live B858 outbox; it stops at taskctl review for Codex."
+  ],
+  "validation": [
+    "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_standalone_callback_store_b859.py tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py tests/test_aiworkhub_claude_callback_transport_b856.py tests/test_aiworkhub_callback_stale_turn_recovery_b823_v1.py tests/test_aiworkhub_canonical_task_engine_b852.py tests/test_callback_bridge.py tests/test_server_runtime_wiring.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 -c \"import zipfile; p='tools/geoai-task-mcp/vscode-extension/dist/aiworkhub-0.6.0.vsix'; z=zipfile.ZipFile(p); assert any(n.endswith('/runtime/aiworkhub/callback_store.py') for n in z.namelist())\"",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_store.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_standalone_callback_store_b859.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_standalone_callback_store_b859_v1.json"
+  ],
+  "forbidden": [
+    "AITools_taskdb_runtime_dependency",
+    "fallback_database",
+    "second_callback_database",
+    "live_B858_outbox_manual_mutation",
+    "fake_delivery_without_ack",
+    "systemd_requirement",
+    "http_dashboard_server",
+    "git_commit",
+    "git_push"
+  ],
+  "commit_contract": "NO_COMMIT. Stop at Codex review.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "slice",
+      "bundle_type": "feature",
+      "query": "callback outbox batch claim lease busy defer acknowledgement task_store packaged VSIX standalone runtime",
+      "budget": 240,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/task_store.py",
+        "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+        "tools/geoai-task-mcp/vscode-extension/extension.js",
+        "AITools/taskdb.py"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub standalone callback store repair",
+      "limit": 10
+    },
+    "ai_memory": {
+      "query": "AIWorkHub packaged runtime callback AITools dependency live canary",
+      "limit": 4
+    },
+    "kb": {
+      "query": "AIWorkHub canonical task database callback delivery contract",
+      "limit": 4
+    }
+  }
+}

@@ -15,13 +15,13 @@
     "b471_preserved": "select_steer_target, the unique-newest-inProgress-by-startedAt selector, and the mux's thread/resume projection (id/status/startedAt only) are unchanged."
   },
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_app_server_mux.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/README.md",
-    "tools/geoai-task-mcp/MVP_ROADMAP.md",
-    "tools/geoai-task-mcp/scripts/geoai-task-callback-bridge.service"
+    "tools/aiworkhub/src/aiworkhub/app_server_mux.py",
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_app_server_mux.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/README.md",
+    "tools/aiworkhub/MVP_ROADMAP.md",
+    "tools/aiworkhub/scripts/geoai-task-callback-bridge.service"
   ],
   "new_tests": {
     "test_app_server_mux.py": [
@@ -50,7 +50,7 @@
   },
   "blocked_by_environment": {
     "isolated_worktree_missing_dependencies": [
-      "tools/geoai-task-mcp/tests/_fake_app_server.py and tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py exist untracked in the live /home/shrek/GeoAI checkout but were absent from this isolated git worktree (untracked files do not propagate to `git worktree add`); copied verbatim into this worktree, unmodified, solely to make the required pytest command executable -- not part of this task's diff",
+      "tools/aiworkhub/tests/_fake_app_server.py and tools/aiworkhub/scripts/install_vscode_app_server_mux.py exist untracked in the live /home/shrek/AIWorkHub checkout but were absent from this isolated git worktree (untracked files do not propagate to `git worktree add`); copied verbatim into this worktree, unmodified, solely to make the required pytest command executable -- not part of this task's diff",
       "AITools/taskdb.py in the live repo carries a large uncommitted addition (claim_pending_callback_batch, enqueue_callback, callback_outbox_stats, callback_batches table) that this isolated worktree's checkout predates; 22 test_callback_bridge.py cases that exercise CallbackBridge.run_once() through the real outbox therefore fail here with AttributeError on taskdb, NOT on anything touched by this task -- every failure trace bottoms out at taskdb, never at app_server_mux.py/callback_bridge.py/select_steer_target/SidebandCallbackClient. Not copied into this worktree (out of scope, too large to vet as a side effect of this task); expected to pass once run against the live repo's actual taskdb.py."
     ],
     "sandbox_fchmod_denied": "This sandbox denies the fchmod(2) syscall outright (EPERM) even on a file this process just created with an explicit 0600 os.open() mode -- write_capability_token's original hard fchmod() call made every sideband test fail before any of this task's logic ran. Fixed by wrapping fchmod in contextlib.suppress(OSError) (matching the pattern already used for ensure_private_dir's chmod) and keeping the trailing stat-based 0600 verification as the real, unconditional gate -- verified the umask in this sandbox (0o002) still yields exactly 0600 from the os.open() mode argument alone."

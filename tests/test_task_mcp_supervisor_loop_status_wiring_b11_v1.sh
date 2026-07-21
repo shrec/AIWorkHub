@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # B11 retry of the stale-claimed B10 wiring task: exercises the REAL
 # core.supervisor_loop_status() + the registered @mcp.tool()
-# geoai_supervisor_loop_status against the live queue and in-process
+# aiworkhub_supervisor_loop_status against the live queue and in-process
 # fixtures, covering all 6 B08-contract scenarios:
 #   live real task, not_found, runner_topic_mismatch, fixture missing_artifact,
 #   fixture collision, fixture stale_task, fixture failed_validation.
@@ -31,17 +31,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 echo "=== Task MCP Supervisor Loop STATUS WIRING Test B11 v1 (retry of stale B10) ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0 for this test, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0 for this test, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 
@@ -55,7 +55,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from geoai_task_mcp import core
+from aiworkhub import core
 
 FAILURES: list[str] = []
 PASSES: list[str] = []
@@ -70,7 +70,7 @@ def check(cond: bool, label: str) -> None:
         print(f"  FAIL - {label}")
 
 
-REPO_ROOT = Path(os.environ["GEOAI_REPO"]).resolve()
+REPO_ROOT = Path(os.environ["AIWORKHUB_REPO"]).resolve()
 SELF_TASK_ID = "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_WIRING_RETRY_B11_V1"
 
 # The relevant on-disk state a mutation could touch: the live task queue
@@ -164,26 +164,26 @@ def test_module_wiring() -> None:
     }, "LIFECYCLE_TO_SUPERVISOR_STATE matches B08 contract exactly")
 
     try:
-        from geoai_task_mcp import server
+        from aiworkhub import server
     except Exception as exc:  # pragma: no cover - mcp SDK missing in minimal env
         check(False, f"import server (mcp SDK): {exc}")
         return
 
-    tool = getattr(server, "geoai_supervisor_loop_status", None)
-    check(tool is not None, "server exposes geoai_supervisor_loop_status")
+    tool = getattr(server, "aiworkhub_supervisor_loop_status", None)
+    check(tool is not None, "server exposes aiworkhub_supervisor_loop_status")
 
-    server_text = (REPO_ROOT / "tools/geoai-task-mcp/src/geoai_task_mcp/server.py").read_text(encoding="utf-8")
-    def_count = server_text.count("def geoai_supervisor_loop_status(")
-    check(def_count == 1, f"exactly one geoai_supervisor_loop_status def in server.py (found {def_count})")
+    server_text = (REPO_ROOT / "tools/geoai-task-mcp/src/aiworkhub/server.py").read_text(encoding="utf-8")
+    def_count = server_text.count("def aiworkhub_supervisor_loop_status(")
+    check(def_count == 1, f"exactly one aiworkhub_supervisor_loop_status def in server.py (found {def_count})")
     tool_decorator_count = server_text.count("@mcp.tool()")
     check(tool_decorator_count >= 16, f"~15+ existing tools preserved plus the new one ({tool_decorator_count} @mcp.tool() decorators total)")
 
     # existing tools spot-checked still present (not disturbed)
     for existing in (
-        "geoai_task_health", "geoai_task_list", "geoai_task_show",
-        "geoai_task_auto_pickup", "geoai_task_mark_review", "geoai_task_mark_done",
-        "geoai_task_collision_guard", "geoai_task_codex_handoff",
-        "geoai_task_codex_handoff_markdown",
+        "aiworkhub_task_health", "aiworkhub_task_list", "aiworkhub_task_show",
+        "aiworkhub_task_auto_pickup", "aiworkhub_task_mark_review", "aiworkhub_task_mark_done",
+        "aiworkhub_task_collision_guard", "aiworkhub_task_codex_handoff",
+        "aiworkhub_task_codex_handoff_markdown",
     ):
         check(getattr(server, existing, None) is not None, f"existing tool preserved: {existing}")
 
@@ -223,7 +223,7 @@ def test_live_real_task() -> None:
 # ---------------------------------------------------------------------------
 def test_not_found() -> None:
     print("[test_not_found] nonexistent task_id")
-    fake_id = "GEOAI_TASK_MCP_SUPERVISOR_LOOP_STATUS_DOES_NOT_EXIST_B11_TEST"
+    fake_id = "AIWORKHUB_SUPERVISOR_LOOP_STATUS_DOES_NOT_EXIST_B11_TEST"
     result = core.supervisor_loop_status(fake_id)
     check(result["state"] == "not_found", "state=not_found")
     check(result["taskctl_status"] is None, "taskctl_status is None")
@@ -418,13 +418,13 @@ def test_fixture_failed_validation() -> None:
 def test_server_tool_wiring() -> None:
     print("[test_server_tool_wiring] registered MCP tool reads live queue read-only")
     try:
-        from geoai_task_mcp import server
+        from aiworkhub import server
     except Exception as exc:  # pragma: no cover - mcp SDK missing in minimal env
         check(False, f"import server (mcp SDK): {exc}")
         return
 
-    tool = getattr(server, "geoai_supervisor_loop_status", None)
-    check(tool is not None, "server exposes geoai_supervisor_loop_status")
+    tool = getattr(server, "aiworkhub_supervisor_loop_status", None)
+    check(tool is not None, "server exposes aiworkhub_supervisor_loop_status")
     if tool is None:
         return
 

@@ -43,12 +43,12 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import worker_workspace  # noqa: E402
+from aiworkhub import worker_workspace  # noqa: E402
 
-# The real GeoAI repo root: tests/ -> geoai-task-mcp/ -> tools/ -> GeoAI/.
-_GEOAI_REPO = Path(__file__).resolve().parents[3]
-_REAL_TASKDB = _GEOAI_REPO / "AITools" / "taskdb.py"
-_REAL_TASKCTL = _GEOAI_REPO / "AITools" / "taskctl.py"
+# The real AIWorkHub repo root: tests/ -> aiworkhub/ -> tools/ -> AIWorkHub/.
+_AIWORKHUB_REPO = Path(__file__).resolve().parents[3]
+_REAL_TASKDB = _AIWORKHUB_REPO / "AITools" / "taskdb.py"
+_REAL_TASKCTL = _AIWORKHUB_REPO / "AITools" / "taskctl.py"
 
 pytestmark = pytest.mark.skipif(
     not (_REAL_TASKDB.is_file() and _REAL_TASKCTL.is_file()),
@@ -75,14 +75,14 @@ def _unique_request_id(label: str) -> str:
 def _real_repo_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, label: str
 ) -> worker_workspace.WorkerWorkspace:
-    """An isolated worktree over the REAL GeoAI repo, scoped to a harmless
+    """An isolated worktree over the REAL AIWorkHub repo, scoped to a harmless
     throwaway eval path so no real production artifact is ever declared
     writable. Uses a per-test private worktree root (tmp_path) so concurrent
     test/worker activity on the shared repo cannot collide."""
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     scratch = f"tools/geoai-task-mcp/eval/_b328_test_scratch_{uuid.uuid4().hex}.json"
     return worker_workspace.create_workspace(
-        _GEOAI_REPO,
+        _AIWORKHUB_REPO,
         _unique_request_id(label),
         {
             "allowed_writes": [scratch],
@@ -134,7 +134,7 @@ def test_taskctl_verify_passes_inside_isolated_worktree_and_leaves_tracked_files
         assert status.returncode == 0
         assert "bitnnv2/data/tasking/machine_task_cards" not in status.stdout
     finally:
-        worker_workspace.cleanup_workspace(_GEOAI_REPO, workspace.path, workspace.home)
+        worker_workspace.cleanup_workspace(_AIWORKHUB_REPO, workspace.path, workspace.home)
 
 
 def test_detached_worktree_invariant_holds_with_provisioning_enabled(
@@ -142,13 +142,13 @@ def test_detached_worktree_invariant_holds_with_provisioning_enabled(
 ) -> None:
     workspace = _real_repo_workspace(monkeypatch, tmp_path, "detach")
     try:
-        assert workspace.path != _GEOAI_REPO
-        assert _GEOAI_REPO not in workspace.path.parents
+        assert workspace.path != _AIWORKHUB_REPO
+        assert _AIWORKHUB_REPO not in workspace.path.parents
         assert _git(workspace.path, "symbolic-ref", "-q", "HEAD").returncode != 0
         top = _git(workspace.path, "rev-parse", "--show-toplevel")
         assert Path(top.stdout.strip()).resolve() == workspace.path
     finally:
-        worker_workspace.cleanup_workspace(_GEOAI_REPO, workspace.path, workspace.home)
+        worker_workspace.cleanup_workspace(_AIWORKHUB_REPO, workspace.path, workspace.home)
 
 
 def test_cleanup_removes_the_isolated_queue_db_with_the_rest_of_home(
@@ -157,7 +157,7 @@ def test_cleanup_removes_the_isolated_queue_db_with_the_rest_of_home(
     workspace = _real_repo_workspace(monkeypatch, tmp_path, "cleanup")
     isolated_db = workspace.home / worker_workspace.TASK_QUEUE_ISOLATED_RELATIVE
     assert isolated_db.is_file()
-    worker_workspace.cleanup_workspace(_GEOAI_REPO, workspace.path, workspace.home)
+    worker_workspace.cleanup_workspace(_AIWORKHUB_REPO, workspace.path, workspace.home)
     assert not workspace.home.exists()
     assert not isolated_db.exists()
     assert not workspace.path.exists()
@@ -206,7 +206,7 @@ def test_b313_root_cause_reproduces_when_the_env_fix_is_bypassed(
         assert "sqlite3.OperationalError: unable to open database file" in result.stderr
         assert "AITools/taskdb.py" in result.stderr
     finally:
-        worker_workspace.cleanup_workspace(_GEOAI_REPO, workspace.path, workspace.home)
+        worker_workspace.cleanup_workspace(_AIWORKHUB_REPO, workspace.path, workspace.home)
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +222,10 @@ def test_sanitized_env_isolated_queue_db_is_under_home_and_never_parent_or_coord
 ) -> None:
     monkeypatch.setenv("BITNN_TASKCTL_COORDINATOR_TOKEN", "top-secret-coordinator-token")
     monkeypatch.setenv(
-        "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", "/home/shrek/.config/geoai/taskctl_coordinator.token"
+        "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", "/home/shrek/.config/aiworkhub/taskctl_coordinator.token"
     )
-    monkeypatch.setenv("BITNN_TASK_QUEUE_DB", str(_GEOAI_REPO / "bitnnv2/data/tasking/task_queue_v1.sqlite"))
-    monkeypatch.setenv("GEOAI_TASK_MCP_ALLOW_LAUNCH", "1")
+    monkeypatch.setenv("BITNN_TASK_QUEUE_DB", str(_AIWORKHUB_REPO / "bitnnv2/data/tasking/task_queue_v1.sqlite"))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-allowed")
 
     home = tmp_path / "home"
@@ -240,13 +240,13 @@ def test_sanitized_env_isolated_queue_db_is_under_home_and_never_parent_or_coord
     # Never the real production queue DB path, regardless of what the
     # coordinator's own os.environ happened to contain.
     assert env["BITNN_TASK_QUEUE_DB"] != str(
-        _GEOAI_REPO / "bitnnv2/data/tasking/task_queue_v1.sqlite"
+        _AIWORKHUB_REPO / "bitnnv2/data/tasking/task_queue_v1.sqlite"
     )
 
     assert "BITNN_TASKCTL_COORDINATOR_TOKEN" not in env
     assert "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
-    assert "GEOAI_TASK_MCP_ALLOW_LAUNCH" not in env
+    assert "AIWORKHUB_ALLOW_LAUNCH" not in env
 
 
 def test_sanitized_env_omits_isolated_queue_db_by_default(tmp_path: Path) -> None:
@@ -291,7 +291,7 @@ def _seed_fixture_parent_db(taskdb_module, path: Path, task_id: str) -> None:
 def test_provision_creates_absent_db_parent_directory_and_copies_read_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    taskdb = worker_workspace._load_repo_taskdb_module(_GEOAI_REPO)
+    taskdb = worker_workspace._load_repo_taskdb_module(_AIWORKHUB_REPO)
     parent_db = tmp_path / "fixture_parent" / "task_queue_v1.sqlite"
     _seed_fixture_parent_db(taskdb, parent_db, "FIXTURE_PARENT_TASK_B328_001")
     before_bytes = parent_db.read_bytes()
@@ -301,7 +301,7 @@ def test_provision_creates_absent_db_parent_directory_and_copies_read_only(
 
     home = tmp_path / "home"  # deliberately does not exist yet
     assert not home.exists()
-    destination = worker_workspace.provision_isolated_task_queue_db(_GEOAI_REPO, home)
+    destination = worker_workspace.provision_isolated_task_queue_db(_AIWORKHUB_REPO, home)
 
     assert destination == (home / worker_workspace.TASK_QUEUE_ISOLATED_RELATIVE).resolve()
     assert destination.is_file()

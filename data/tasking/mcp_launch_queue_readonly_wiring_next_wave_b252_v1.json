@@ -7,12 +7,12 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_LAUNCH_QUEUE_READONLY_COLLISION_PREFLIGHT_V1",
-      "goal": "Add the same B107 collision_preflight (would_collide against active task-card claims) to geoai_launch_queue_describe_readonly/_evaluate_readonly output, reusing scripts/build_tasking_parallel_group_collision_guard_v1.py exactly as cli_adapter_readonly_tool.collision_preflight does. Read-only: no lock, no claim write, no queue mutation.",
+      "goal": "Add the same B107 collision_preflight (would_collide against active task-card claims) to aiworkhub_launch_queue_describe_readonly/_evaluate_readonly output, reusing scripts/build_tasking_parallel_group_collision_guard_v1.py exactly as cli_adapter_readonly_tool.collision_preflight does. Read-only: no lock, no claim write, no queue mutation.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_mcp_launch_queue_readonly_collision_preflight_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_launch_queue_readonly_collision_preflight_v1.json"
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_mcp_launch_queue_readonly_collision_preflight_v1.sh",
+        "tools/aiworkhub/eval/mcp_launch_queue_readonly_collision_preflight_v1.json"
       ],
       "acceptance": [
         "describe/evaluate outputs report would_collide + collision_preflight, read-only",
@@ -25,9 +25,9 @@
       "goal": "Freeze the 3 new B252 tool result schemas (mirroring test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh for the B106 set) so a future change to launch_queue_contract.py/launch_queue_persist.py or server.py cannot silently drop a field Codex depends on (decision, permitted, launch_enabled, launch_implemented, readonly, authority_flags, total_entries, all_blocked_launch_disabled).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_launch_queue_readonly_result_schema_freeze.py",
-        "tools/geoai-task-mcp/tests/test_mcp_launch_queue_readonly_result_schema_freeze_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_launch_queue_readonly_result_schema_freeze_v1.json"
+        "tools/aiworkhub/tests/mcp_launch_queue_readonly_result_schema_freeze.py",
+        "tools/aiworkhub/tests/test_mcp_launch_queue_readonly_result_schema_freeze_v1.sh",
+        "tools/aiworkhub/eval/mcp_launch_queue_readonly_result_schema_freeze_v1.json"
       ],
       "acceptance": [
         "frozen key set asserted present for all 3 tool outputs",
