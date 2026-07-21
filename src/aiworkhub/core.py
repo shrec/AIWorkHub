@@ -6,7 +6,6 @@ import os
 import re
 import sqlite3
 import stat
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,7 +23,6 @@ from . import repository_state
 from . import task_store
 
 
-TASKCTL_REL = Path("AITools/taskctl.py")
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
 # Repository-local runtime tree (never durable, never shared across repos):
 # .aiworkhub/runtime/process_logs/audit.jsonl -- see repository_state.py's
@@ -776,8 +774,13 @@ def repo_root() -> Path:
 
 
 def taskctl_path(repo: Path | None = None) -> Path:
+    """Compatibility-only legacy path helper.
+
+    The installable AIWorkHub runtime does not require or execute this path.
+    Kept only for old tests/docs that compare historical taskctl locations.
+    """
     root = repo or repo_root()
-    return root / TASKCTL_REL
+    return root / "AITools/taskctl.py"
 
 
 def writes_allowed() -> bool:
@@ -819,11 +822,14 @@ def _coordinator_taskctl_env() -> dict[str, str]:
 
 
 def require_repo() -> Path:
-    root = repo_root()
-    taskctl = taskctl_path(root)
-    if not taskctl.exists():
-        raise FileNotFoundError(f"taskctl.py not found at {taskctl}")
-    return root
+    """Return the bound repository root.
+
+    Standalone VSIX/runtime installs must work in arbitrary repositories that
+    have never contained ``AITools/``. Storage readiness is checked by the
+    concrete operation via ``task_store``; this helper must not require a
+    legacy parent-repo script.
+    """
+    return repo_root()
 
 
 def _is_write_command(args: list[str]) -> bool:
@@ -892,16 +898,12 @@ def run_taskctl(
     topic: str | None = None,
     coordinator_capability: bool = False,
 ) -> TaskCtlResult:
-    """Run parent-repo taskctl with explicit write protection.
+    """Native taskctl-compat dispatcher with explicit write protection.
 
-    ``runner``/``topic`` are optional caller-identity hints for the B119
-    runner/topic allowlist (``check_runner_topic_allowlist``). They are
-    checked ONLY for write commands, and ONLY after the existing
-    ``AIWORKHUB_ALLOW_WRITES`` gate is already open -- this layer
-    narrows an open gate, it never widens or replaces it, and it never
-    enables writes or process launch on its own. Call sites that omit both
-    (``runner=None, topic=None``) skip this layer entirely and keep their
-    prior behavior.
+    Older in-package callers were written against ``core.run_taskctl([...])``.
+    Keep that API, but execute against this package's canonical
+    ``.aiworkhub/tasking/task_queue.sqlite`` task engine directly. This path
+    never shells out and never requires a repository-local ``AITools/`` tree.
     """
 
     scrub_coordinator_capability_from_environment()
@@ -912,66 +914,148 @@ def run_taskctl(
             "coordinator capability may only be passed to done, reject-review, release-launch, archive, or restore"
         )
 
-    root = require_repo()
-    if _is_write_command(args):
-        if not (allow_write and writes_allowed()):
-            blocked_reason = (
-                "write command blocked; set AIWORKHUB_ALLOW_WRITES=1 "
-                "and pass allow_write=True"
-            )
-            write_audit_entry(
-                tool_name=args[0],
-                action="blocked_write",
-                blocked_reason=blocked_reason,
-                repo=root,
-            )
+    command = list(args)
+    cmd = args[0]
+
+    def _as_result(result: dict[str, Any]) -> TaskCtlResult:
+        return TaskCtlResult(
+            command=list(result.get("command") or command),
+            returncode=int(result.get("returncode") if result.get("returncode") is not None else (0 if result.get("ok") else 1)),
+            stdout=str(result.get("stdout") or ""),
+            stderr=str(result.get("stderr") or ""),
+        )
+
+    def _value(flag: str, default: str | None = None) -> str | None:
+        try:
+            idx = args.index(flag)
+        except ValueError:
+            return default
+        if idx + 1 >= len(args):
+            return default
+        return args[idx + 1]
+
+    def _int_value(flag: str, default: int) -> int:
+        raw = _value(flag)
+        if raw is None:
+            return default
+        try:
+            return max(0, min(int(raw), 5000_000_000))
+        except ValueError:
+            return default
+
+    try:
+        if cmd == "verify":
+            readiness = task_store.storage_readiness(require_repo())
             return TaskCtlResult(
-                command=["python3", str(taskctl_path(root)), *args],
-                returncode=126,
-                stdout="",
-                stderr=blocked_reason,
+                command=command,
+                returncode=0 if readiness.ready else 1,
+                stdout=json.dumps(readiness.as_dict(), ensure_ascii=False),
+                stderr="" if readiness.ready else readiness.reason,
             )
+        if cmd in {"init-db", "init-repo"}:
+            blocked = _canonical_write_gate("init-db", runner=runner, topic=topic)
+            if blocked is not None:
+                return _as_result({**blocked, "command": command})
+            return _as_result(_canonical_result(
+                ok=True,
+                stdout=json.dumps(task_store.initialize_repository(require_repo()), ensure_ascii=False),
+                command=command,
+            ))
+        if cmd == "list":
+            return _as_result(list_tasks(
+                status=_value("--status", "pending") or "pending",
+                topic=_value("--topic"),
+                limit=_int_value("--limit", 80),
+            ))
+        if cmd == "review-queue":
+            return _as_result(review_queue())
+        if cmd == "show":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "show requires task_id")
+            return _as_result(show_task(args[1]))
+        if cmd == "export":
+            selected_runner = _value("--runner", runner)
+            if not selected_runner:
+                return TaskCtlResult(command, 2, "", "export requires --runner")
+            return _as_result(pending_for_runner(selected_runner, topic=_value("--topic", topic)))
+        if cmd == "auto-pickup":
+            selected_runner = _value("--runner", runner)
+            if not selected_runner:
+                return TaskCtlResult(command, 2, "", "auto-pickup requires --runner")
+            return _as_result(auto_pickup(selected_runner, _value("--topic", topic)))
+        if cmd == "claim-start":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "claim-start requires task_id")
+            selected_runner = _value("--runner", runner)
+            selected_topic = _value("--topic", topic)
+            if not selected_runner or not selected_topic:
+                return TaskCtlResult(command, 2, "", "claim-start requires --runner and --topic")
+            return _as_result(claim_start_exact(args[1], selected_runner, selected_topic, _value("--request-id", "") or ""))
+        if cmd == "review":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "review requires task_id")
+            return _as_result(mark_review(args[1], runner=_value("--runner", runner), topic=_value("--topic", topic)))
+        if cmd == "done":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "done requires task_id")
+            return _as_result(mark_done(args[1], runner=_value("--runner", runner), topic=_value("--topic", topic)))
+        if cmd == "reject-review":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "reject-review requires task_id")
+            return _as_result(reject_review(args[1], reason=_value("--reason", "") or "", topic=_value("--topic", topic)))
+        if cmd == "release-launch":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "release-launch requires task_id")
+            return _as_result(release_launch(
+                args[1],
+                claimed_by=_value("--claimed-by", "") or "",
+                reason=_value("--reason", "") or "",
+                topic=_value("--topic", topic),
+            ))
+        if cmd == "archive":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "archive requires task_id")
+            blocked = _canonical_write_gate("archive", runner=_value("--runner", runner), topic=_value("--topic", topic), coordinator_capability=coordinator_capability)
+            if blocked is not None:
+                return _as_result({**blocked, "command": command})
+            ok, reason = task_store.archive_task(require_repo(), args[1], actor=_value("--runner", runner) or "dashboard", reason=_value("--reason", "") or "")
+            return TaskCtlResult(command, 0 if ok else 1, reason, "" if ok else reason)
+        if cmd == "restore":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "restore requires task_id")
+            blocked = _canonical_write_gate("restore", runner=_value("--runner", runner), topic=_value("--topic", topic), coordinator_capability=coordinator_capability)
+            if blocked is not None:
+                return _as_result({**blocked, "command": command})
+            ok, reason = task_store.restore_task(require_repo(), args[1], actor=_value("--runner", runner) or "dashboard", reason=_value("--reason", "") or "")
+            return TaskCtlResult(command, 0 if ok else 1, reason, "" if ok else reason)
+        if cmd == "collision-guard":
+            return _as_result(collision_guard(print_json="--print" in args or "--json" in args))
+        if cmd == "callback-outbox-status":
+            return _as_result(callback_outbox_status())
+        if cmd == "usage-report":
+            return _as_result(usage_report(runner=_value("--runner", runner), topic=_value("--topic", topic), status=_value("--status")))
+        if cmd == "usage":
+            if len(args) < 2:
+                return TaskCtlResult(command, 2, "", "usage requires task_id")
+            return _as_result(record_usage(
+                args[1],
+                runner=_value("--runner", runner) or "",
+                topic=_value("--topic", topic),
+                model=_value("--model", ""),
+                provider=_value("--provider", ""),
+                source=_value("--source", ""),
+                note=_value("--note", ""),
+                input_tokens=_int_value("--input-tokens", 0),
+                output_tokens=_int_value("--output-tokens", 0),
+                total_tokens=_int_value("--total-tokens", 0),
+                cost_usd=float(_value("--cost-usd", "0") or 0),
+            ))
+        if cmd == "export-jsonl":
+            return _as_result(export_jsonl(runner=_value("--runner", runner), topic=_value("--topic", topic)))
+    except Exception as exc:
+        return TaskCtlResult(command, 1, "", f"native_task_command_failed:{type(exc).__name__}:{str(exc)[:500]}")
 
-        if runner is not None or topic is not None:
-            decision = check_runner_topic_allowlist(runner, topic, args[0])
-            if not decision["allowed"]:
-                card_decision = _check_card_scoped_write_authority(args, runner, topic)
-                if card_decision["allowed"]:
-                    decision = card_decision
-                else:
-                    reason = card_decision.get("reason") or decision["reason"]
-                    audit_action = (
-                        "blocked_malformed_runner_or_topic"
-                        if str(reason).startswith("malformed_")
-                        else "blocked_runner_topic_not_in_allowlist"
-                    )
-                    blocked_reason = f"runner/topic allowlist denied: {reason}"
-                    write_audit_entry(
-                        tool_name=args[0],
-                        action=audit_action,
-                        blocked_reason=blocked_reason,
-                        repo=root,
-                    )
-                    return TaskCtlResult(
-                        command=["python3", str(taskctl_path(root)), *args],
-                        returncode=126,
-                        stdout="",
-                        stderr=blocked_reason,
-                    )
-
-    command = ["python3", str(taskctl_path(root)), *args]
-    run_kwargs: dict[str, Any] = {
-        "cwd": root,
-        "text": True,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "timeout": timeout,
-        "check": False,
-    }
-    if coordinator_capability:
-        run_kwargs["env"] = _coordinator_taskctl_env()
-    proc = subprocess.run(command, **run_kwargs)
-    return TaskCtlResult(command, proc.returncode, proc.stdout, proc.stderr)
+    return TaskCtlResult(command, 127, "", f"unsupported_native_task_command:{cmd}")
 
 
 def _task_id_from_write_args(args: list[str]) -> str | None:
@@ -1045,7 +1129,8 @@ def health() -> dict[str, Any]:
     return {
         "ok": readiness.ready,
         "repo": str(root),
-        "taskctl": str(taskctl_path(root)),
+        "task_engine": "native_aiworkhub",
+        "runtime_storage": str(Path(repository_state.HUB_DIRNAME)),
         "writes_allowed": writes_allowed(),
         "verify": verify,
         "storage": readiness.as_dict(),
@@ -1053,7 +1138,17 @@ def health() -> dict[str, Any]:
 
 
 def review_queue() -> dict[str, Any]:
-    return list_tasks(status="review", limit=500)
+    command = ["review-queue"]
+    try:
+        rows = task_store.list_tasks(repo_root(), status="review", limit=500)
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    lines = [f"=== Codex Review Queue ({len(rows)}) ==="]
+    lines.extend(
+        f"  [{r.get('topic') or '?'}] [{r.get('runner') or '?'}] {r.get('task_id') or ''}"
+        for r in rows
+    )
+    return _canonical_result(ok=True, returncode=0, stdout="\n".join(lines), command=command)
 
 
 def list_tasks(status: str = "pending", topic: str | None = None, limit: int = 80) -> dict[str, Any]:
@@ -1843,6 +1938,71 @@ def callback_outbox_status() -> dict[str, Any]:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     stdout = json.dumps(stats, ensure_ascii=False, sort_keys=True)
     return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
+
+def record_usage(
+    task_id: str,
+    *,
+    runner: str,
+    topic: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    source: str | None = None,
+    note: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> dict[str, Any]:
+    """Append one native usage event to the canonical task store.
+
+    This is the standalone replacement for the historical
+    ``taskctl.py usage`` subprocess path used by the launcher. It preserves
+    the same event shape consumed by ``usage_report`` while staying fully
+    repo-local under ``.aiworkhub``.
+    """
+    command = ["usage", task_id]
+    if runner:
+        command.extend(["--runner", runner])
+    if topic:
+        command.extend(["--topic", topic])
+    blocked = _canonical_write_gate("usage", runner=runner or None, topic=topic, task_id=task_id)
+    if blocked is not None:
+        return {**blocked, "command": command}
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = str(card.get("topic") or topic or "")
+    payload = {
+        "runner": runner,
+        "topic": live_topic,
+        "status": card.get("status"),
+        "worker_status": card.get("worker_status"),
+        "model": model or "",
+        "provider": provider or "",
+        "source": source or "",
+        "note": note or "",
+        "records": 1,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "total_tokens": int(total_tokens or (int(input_tokens or 0) + int(output_tokens or 0))),
+        "cost_usd": float(cost_usd or 0.0),
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = _canonical_connect()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    try:
+        conn.execute(
+            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (task_id, "usage_record", runner, json.dumps(payload, ensure_ascii=False), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return _canonical_result(ok=True, returncode=0, stdout=f"usage recorded: {task_id}", command=command)
 
 
 def usage_report(runner: str | None = None, topic: str | None = None, status: str | None = None) -> dict[str, Any]:

@@ -5,7 +5,7 @@ already-shipped B850 (activation-time no-bootstrap) / B855 (Live Output) /
 B857 (dispatcher lifecycle) work:
 
 1. MCP health after activation/reload reports the exact active repo root,
-   repo_id, storage readiness and server version 0.6.0 -- never
+   repo_id, storage readiness and server version 0.6.1 -- never
    ``repo_root_not_selected`` once a repository is actually bound.
 2. Editor-tab deserialization reconnects automatically and converges the ONE
    lifecycle-owned dispatcher for the bound repository (static contract on
@@ -56,7 +56,7 @@ def _slice(source: str, marker: str, span: int) -> str:
 
 # ---------------------------------------------------------------------------
 # 1. MCP health reports exact active repo root, repo_id, storage readiness,
-#    server version 0.6.0 -- never repo_root_not_selected once bound.
+#    server version 0.6.1 -- never repo_root_not_selected once bound.
 # ---------------------------------------------------------------------------
 
 def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch):
@@ -77,7 +77,7 @@ def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch
     assert result["repo"] == str(root)
     assert result["storage"]["ready"] is True
     assert _REPO_ID_RE.match(result["storage"]["repo_id"])
-    assert result["server_version"] == "0.6.0"
+    assert result["server_version"] == "0.6.1"
     assert result["server_tool"] == "aiworkhub_dashboard_health"
     assert result["dispatcher"]["ok"] is True
 

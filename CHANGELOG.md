@@ -2,9 +2,21 @@
 
 All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
-not yet made its first public GitHub release, so entries below track the
-package/extension version pairs that have been aligned and validated ahead
-of a tag.
+noted by package/extension version and release tag.
+
+## [0.6.1] - 2026-07-21
+
+### Changed
+
+- Removed the runtime dependency on a repository-local `AITools/taskctl.py`:
+  the packaged MCP runtime now dispatches task operations directly against
+  the selected repository's `.aiworkhub/tasking/task_queue.sqlite` store.
+- Added native task verification, review-queue, lifecycle, export, collision,
+  callback-outbox, and usage-report compatibility operations.
+- Made the VSIX self-contained for initialized repositories and aligned the
+  Python package, MCP runtime, and VS Code extension versions at `0.6.1`.
+- Added regression coverage proving the installed runtime works without an
+  `AITools/` directory or a subprocess call to the legacy task controller.
 
 ## [0.6.0] - Unreleased (public release closure)
 
@@ -39,4 +51,5 @@ Code-owned App Server mux/sideband transport, and the canonical
 `aiworkhub` naming cutover) are tracked in detail in `MVP_ROADMAP.md`
 rather than duplicated here.
 
-[0.6.0]: https://github.com/shrec/AIWorkHub/compare/v0.5.0...HEAD
+[0.6.1]: https://github.com/shrec/AIWorkHub/releases/tag/v0.6.1
+[0.6.0]: https://github.com/shrec/AIWorkHub/compare/v0.5.0...v0.6.0

@@ -1,8 +1,9 @@
 """Local, explicitly gated model-process launcher for AIWorkHub task workers.
 
-The task queue remains authoritative in ``AITools/taskctl.py``.  This module
-only owns process lifecycle evidence: start, observe, collect, timeout, and
-cancel.  It never selects a task by keywords and it never invokes a shell.
+The authoritative task queue is the selected repository's canonical
+``.aiworkhub/tasking/task_queue.sqlite`` task store. This module only owns
+process lifecycle evidence: start, observe, collect, timeout, and cancel. It
+never selects a task by keywords and it never invokes a shell.
 """
 
 from __future__ import annotations

@@ -279,6 +279,95 @@ def test_usage_report_empty_no_events(repo):
     assert result["stdout"] == "No usage records."
 
 
+def test_run_taskctl_compat_dispatcher_no_aitools_or_subprocess(writable_repo):
+    _insert_task(writable_repo, "TASK_RUN_COMPAT", "claude_coding", "coding")
+
+    verify = core.run_taskctl(["verify"])
+    assert verify.returncode == 0
+    assert "task_queue.sqlite" in verify.stdout
+    assert "AITools" not in " ".join(verify.command)
+
+    listed = core.run_taskctl(["list", "--status", "pending", "--topic", "coding"])
+    assert listed.returncode == 0
+    assert "[pending] [coding] [claude_coding] TASK_RUN_COMPAT" in listed.stdout
+    assert "AITools" not in " ".join(listed.command)
+
+    claimed = core.run_taskctl(
+        [
+            "claim-start",
+            "TASK_RUN_COMPAT",
+            "--runner",
+            "claude_coding",
+            "--topic",
+            "coding",
+        ],
+        allow_write=True,
+        runner="claude_coding",
+        topic="coding",
+    )
+    assert claimed.returncode == 0, claimed.stderr
+
+    reviewed = core.run_taskctl(
+        ["review", "TASK_RUN_COMPAT", "--runner", "claude_coding", "--topic", "coding"],
+        allow_write=True,
+        runner="claude_coding",
+        topic="coding",
+    )
+    assert reviewed.returncode == 0, reviewed.stderr
+
+    queue = core.run_taskctl(["review-queue"])
+    assert queue.returncode == 0
+    assert "=== Codex Review Queue (1) ===" in queue.stdout
+    assert "  [coding] [claude_coding] TASK_RUN_COMPAT" in queue.stdout
+    assert "AITools" not in " ".join(queue.command)
+
+
+def test_run_taskctl_usage_records_native_event(writable_repo):
+    _insert_task(
+        writable_repo,
+        "TASK_USAGE_COMPAT",
+        "claude_coding",
+        "coding",
+        worker_status="claimed",
+        status="processing",
+        claimed_by="claude_coding",
+    )
+
+    usage = core.run_taskctl(
+        [
+            "usage",
+            "TASK_USAGE_COMPAT",
+            "--runner",
+            "claude_coding",
+            "--topic",
+            "coding",
+            "--model",
+            "test-model",
+            "--provider",
+            "test-provider",
+            "--source",
+            "test",
+            "--input-tokens",
+            "10",
+            "--output-tokens",
+            "5",
+            "--total-tokens",
+            "15",
+            "--cost-usd",
+            "0.01",
+        ],
+        allow_write=True,
+        runner="claude_coding",
+        topic="coding",
+    )
+    assert usage.returncode == 0, usage.stderr
+
+    report = core.run_taskctl(["usage-report", "--runner", "claude_coding"])
+    assert report.returncode == 0
+    assert "TASK_USAGE_COMPAT" in report.stdout
+    assert "tokens=15" in report.stdout
+
+
 # ---------------------------------------------------------------------------
 # Isolation across repos with identical task_ids
 # ---------------------------------------------------------------------------
