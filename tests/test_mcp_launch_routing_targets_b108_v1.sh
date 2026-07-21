@@ -21,10 +21,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/geoai_mcp_routing_targets_sh.XXXXXX")"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_mcp_routing_targets_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 FAILURES=0
 
@@ -77,7 +77,7 @@ with open('$CURR') as f:
         line = line.strip()
         if not line: continue
         r = json.loads(line)
-        assert r.get('schema') == 'geoai.mcp_launch_routing_target.v1', f'row {i}: bad schema'
+        assert r.get('schema') == 'aiworkhub.mcp_launch_routing_target.v1', f'row {i}: bad schema'
         assert 'curriculum_id' in r, f'row {i}: missing curriculum_id'
         assert 'task_context' in r, f'row {i}: missing task_context'
         assert 'labels' in r, f'row {i}: missing labels'

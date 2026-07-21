@@ -8,9 +8,9 @@
     "test asserts no launch/spawn tool registered"
    ],
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/adapters.py",
-    "tools/geoai-task-mcp/tests/test_adapter_abstraction_v1.sh",
-    "tools/geoai-task-mcp/eval/adapter_abstraction_v1.json"
+    "tools/aiworkhub/src/aiworkhub/adapters.py",
+    "tools/aiworkhub/tests/test_adapter_abstraction_v1.sh",
+    "tools/aiworkhub/eval/adapter_abstraction_v1.json"
    ],
    "goal": "Implement the adapter interface (LocalCliAdapter, ManualExternalAdapter) with read-only detect() only; no spawn, launch still disabled.",
    "mode": "NO_COMMIT",
@@ -23,12 +23,12 @@
     "no real launch enabled"
    ],
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/tests/test_launch_plan_v1.sh",
-    "tools/geoai-task-mcp/eval/launch_plan_v1.json"
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/tests/test_launch_plan_v1.sh",
+    "tools/aiworkhub/eval/launch_plan_v1.json"
    ],
-   "goal": "Add read-only geoai_agent_launch_plan tool returning the argv it WOULD run + collision preflight; executes nothing.",
+   "goal": "Add read-only aiworkhub_agent_launch_plan tool returning the argv it WOULD run + collision preflight; executes nothing.",
    "mode": "NO_COMMIT",
    "task_id": "CLAUDE_TASK_MCP_DRYRUN_PLAN_TOOL_V1"
   },
@@ -39,9 +39,9 @@
     "blocked transitions audited"
    ],
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_state.py",
-    "tools/geoai-task-mcp/tests/test_launch_state_v1.sh",
-    "tools/geoai-task-mcp/eval/launch_state_v1.json"
+    "tools/aiworkhub/src/aiworkhub/launch_state.py",
+    "tools/aiworkhub/tests/test_launch_state_v1.sh",
+    "tools/aiworkhub/eval/launch_state_v1.json"
    ],
    "goal": "Add launch-queue + process-state data model and per-action audit; every request terminates blocked_launch_disabled while gate off.",
    "mode": "NO_COMMIT",
@@ -55,7 +55,7 @@
    ],
    "allowed_writes": [
     "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+    "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
    ],
    "goal": "Produce trainable targets (curriculum rows) for a LEARNED adapter/runner/topic launch-routing + abstain policy; replaces any static allowlist with a neural router. No cue/regex router.",
    "mode": "NO_COMMIT",
@@ -68,12 +68,12 @@
     "blocked attempts audited"
    ],
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_launch_gated_enablement_v1.sh",
-    "tools/geoai-task-mcp/eval/launch_gated_enablement_v1.json"
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_launch_gated_enablement_v1.sh",
+    "tools/aiworkhub/eval/launch_gated_enablement_v1.json"
    ],
-   "goal": "FINAL: wire GEOAI_TASK_MCP_ALLOW_LAUNCH gate; permit a real launch only when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all safety gates pass. Default disabled.",
+   "goal": "FINAL: wire AIWORKHUB_ALLOW_LAUNCH gate; permit a real launch only when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all safety gates pass. Default disabled.",
    "mode": "NO_COMMIT",
    "task_id": "CLAUDE_TASK_MCP_LAUNCH_GATED_ENABLEMENT_V1"
   }

@@ -15,21 +15,21 @@
   "artifact_analysis": {
     "present_files": [
       {
-        "path": "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+        "path": "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
         "mtime": "2026-07-04T14:46:31+00:00",
         "relationship_to_b119": "predates_task_input",
         "reason": "B-number B109 != B119, mtime before B119 claimed_at 2026-07-05T18:30:46",
         "is_b119_output": false
       },
       {
-        "path": "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+        "path": "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
         "mtime": "2026-07-04T21:29:03+00:00",
         "relationship_to_b119": "predates_task_input",
         "reason": "B-number B110 != B119, mtime before B119 claimed_at",
         "is_b119_output": false
       },
       {
-        "path": "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh",
+        "path": "tools/aiworkhub/tests/test_mvp_contract_audit_v1.sh",
         "mtime": "2026-07-04T09:06:18+00:00",
         "relationship_to_b119": "predates_task_input",
         "reason": "B-number mvp_contract_audit_v1 != B119, mtime before B119 claimed_at",
@@ -38,16 +38,16 @@
     ],
     "missing_files": [
       {
-        "path": "tools/geoai-task-mcp/eval/mcp_stale_smoke_inventory_refresh_b119_v1.json",
+        "path": "tools/aiworkhub/eval/mcp_stale_smoke_inventory_refresh_b119_v1.json",
         "status": "confirmed_missing"
       },
       {
-        "path": "tools/geoai-task-mcp/data/tasking/mcp_stale_smoke_inventory_refresh_next_wave_b119_v1.json",
+        "path": "tools/aiworkhub/data/tasking/mcp_stale_smoke_inventory_refresh_next_wave_b119_v1.json",
         "status": "confirmed_missing"
       }
     ],
     "git_provenance": {
-      "repo_tracking": "tools/geoai-task-mcp/ is NOT tracked in main GeoAI git repo (has own .git). Present test files not in main repo git history.",
+      "repo_tracking": "tools/aiworkhub/ is NOT tracked in main AIWorkHub git repo (has own .git). Present test files not in main repo git history.",
       "note": "All three present files have mtimes before B119 claim time. B119 did not modify them."
     }
   },
@@ -78,14 +78,14 @@
     }
   },
   "new_tools_since_baseline": [
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_report_readonly",
-    "geoai_supervisor_loop_status",
-    "geoai_task_auto_pickup_dryrun",
-    "geoai_task_codex_handoff",
-    "geoai_task_codex_handoff_markdown",
-    "geoai_task_review_summarize"
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_report_readonly",
+    "aiworkhub_supervisor_loop_status",
+    "aiworkhub_task_auto_pickup_dryrun",
+    "aiworkhub_task_codex_handoff",
+    "aiworkhub_task_codex_handoff_markdown",
+    "aiworkhub_task_review_summarize"
   ],
   "summary": {
     "b119_never_completed": true,

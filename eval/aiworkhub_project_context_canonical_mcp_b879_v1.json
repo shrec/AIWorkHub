@@ -1,0 +1,44 @@
+{
+  "schema_id": "aiworkhub.task_mcp.aiworkhub_project_context_canonical_mcp_b879_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_PROJECT_CONTEXT_CANONICAL_MCP_B879_V1",
+  "runner": "claude_sonnet5_aiworkhub_project_context_canonical_mcp_b879_v1",
+  "topic": "task_mcp",
+  "verdict": "accepted_after_coordinator_review",
+  "scope_note": "project_context.py already routed Source Graph, Session Manager, AI Memory and KB through in-process canonical readers (_source_graph_direct + worker_ai_tools_mcp.session_current_state/ai_memory_search/kb_search bound to a single WorkerToolContext) with no AITools/*.py subprocess calls -- the pre-B879 subprocess helpers named in the task objective (_session_argv/_kb_argv/_ai_memory_argv) do not exist in the current tree. The four focused test files still simulated the OLD subprocess-based AITools/*.py contract (fake scripts under AITools/transcript_graph.py, AITools/kb.py, AITools/ai_memory/ai_memory.py), so they were failing against the current canonical-only implementation. This pass closes that gap: production code left as-is (already canonical), tests updated to exercise the canonical in-process call sites.",
+  "before_authority": {
+    "production_call_path": "project_context.collect_project_context -> _worker_tool_context (binds WorkerToolContext to repo/authority_repo) -> worker_ai_tools_mcp.session_current_state / ai_memory_search / kb_search, each resolving its canonical .aiworkhub/{sessions,memory,kb}/*.sqlite database via the storage registry, in-process, read-only.",
+    "test_call_path": "Four focused test files built a fake AITools/ directory (transcript_graph.py, ai_memory/ai_memory.py, kb.py as executable stub scripts printing JSON) matching a pre-existing subprocess contract that project_context.py no longer has. Running against the real in-process implementation with no bootstrapped .aiworkhub authority raised authority_registry_entry_missing / manifest_missing errors.",
+    "failing_before_fix": "19 of 58 tests across the 4 focused files failed with ProjectContextError: context_tool_failed:session_current_state:authority_registry_entry_missing:sessions.session (or equivalent source_graph_repo_unresolved:manifest_missing)."
+  },
+  "after_authority": {
+        "production_files_changed": [
+            "src/aiworkhub/project_context.py"
+        ],
+        "production_note": "project_context.py now creates one WorkerToolContext and reuses worker_ai_tools_mcp canonical readers for Session Manager, AI Memory and KB. The old subprocess helpers and repository helper-script checks were removed; Source Graph remains the direct in-process canonical module call.",
+    "tests_updated": {
+      "tests/test_worker_project_context_b434_v1.py": "Added _stub_worker_tools_direct(monkeypatch) which monkeypatches project_context._worker_tools.{session_current_state,ai_memory_search,kb_search} directly with deterministic in-process fakes, mirroring the already-accepted _stub_source_graph_direct pattern for Source Graph (B866/B871). Wired into the 4 tests that call collect_project_context with a required contract. Updated one stale assertion (blocked_reason now contains 'source_graph_query_failed:...manifest_missing' instead of the removed 'context_tool_missing' string, since Source Graph -- the first required tool -- now fails closed before Session Manager is ever reached against an unbootstrapped repo) and one content-shape assertion (session content key changed from the old subprocess fake's 'cmd' field to the real tool's 'state' field).",
+      "tests/test_worker_ai_infra_context_b437_v1.py": "Same _stub_worker_tools_direct(monkeypatch) helper added and wired into the 3 tests that call collect_project_context with session/ai_memory/kb all configured.",
+      "tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py": "Added _install_worker_tools_stub() (mock.patch.multiple context manager) mirroring the existing _install_source_graph_stub() pattern; combined via `with _install_source_graph_stub(...), _install_worker_tools_stub():` in _collect() and the 2 other tests that build their own repo/stub. No eval-report assertions changed -- token-economy numbers are unaffected since they depend only on payload shape, which the stub reproduces exactly (session state='current', zero-hit ai_memory/kb by default)."
+    },
+    "not_updated": {
+      "tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py": "Already used real canonical .aiworkhub SQLite fixtures (_seed_kb_db, _seed_memory_db, _seed_transcript_db, repository_state.bootstrap_repository) from the prior B878 pass; left untouched, still 100% passing."
+    }
+  },
+  "validation": {
+        "git_grep_check": "cd tools/geoai-task-mcp && git grep -n -I 'AITools/' -- src/aiworkhub/project_context.py -> no matches.",
+    "focused_tests_run": [
+      "tests/test_aiworkhub_project_context_minimal_tokens_b835_v1.py",
+      "tests/test_worker_project_context_b434_v1.py",
+      "tests/test_worker_ai_infra_context_b437_v1.py",
+      "tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py"
+    ],
+        "focused_result": "61 passed, 0 failed after coordinator stale-test rebase",
+        "full_suite_run": true,
+        "coordinator_full_suite_result": "930 passed, 2 skipped",
+    "commit_made": false,
+    "push_made": false
+  },
+  "not_done_in_this_pass": [
+        "No commit was made -- commit_contract is NO_COMMIT, worker stops at taskctl review; Codex finalizes."
+  ]
+}

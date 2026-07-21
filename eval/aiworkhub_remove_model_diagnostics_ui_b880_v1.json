@@ -1,0 +1,36 @@
+{
+  "schema_id": "aiworkhub.task_mcp.remove_model_diagnostics_ui_b880_v1.eval.v2",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_REMOVE_MODEL_DIAGNOSTICS_UI_B880_V1",
+  "runner": "claude_sonnet5_aiworkhub_remove_model_diagnostics_ui_b880_v1",
+  "topic": "task_mcp",
+  "objective_summary": "v2 (coordinator-rejected v1 follow-up): remove the remaining dead Model capabilities / GLM canary DOM bindings, render/status logic, click handlers, and CSS from vscode-extension/media/app.js and app.css; extend the absence test to cover the media bundle.",
+  "pre_state_finding": "v1 removed extension.js/docs/test surface but left media/app.js and media/app.css untouched (out of that pass's allowed_writes). Confirmed via direct read that extension.js's HTML generation never emits the ids app.js queried (#refresh-model-capabilities-button, #model-capability-state, #model-capability-list, #glm-canary-button, #glm-canary-cancel-button, #glm-canary-state, #glm-canary-output) -- app.js's querySelector calls for these always resolved to null, and app.css's .model-capabilities/.glm-canary-*/#glm-canary-output/.secondary-button rules had no live element to style.",
+  "changes": {
+    "deleted": [],
+    "modified": [
+      "vscode-extension/media/app.js: removed the 7 dead element refs (refreshModelCapabilitiesButton, modelCapabilityState, modelCapabilityList, glmCanaryButton, glmCanaryCancelButton, glmCanaryState, glmCanaryOutput) from the elements map; deleted renderModelCapabilities() and renderGlmCanary(); removed the 'modelCapabilities'/'glmCanary' cases from the window message-listener switch; removed the 3 dead click-handler registrations (refreshModelCapabilitiesButton, glmCanaryButton, glmCanaryCancelButton) and their preceding comment block.",
+      "vscode-extension/media/app.css: removed .model-capabilities, .model-capabilities .section-heading, .model-capabilities h3, .glm-canary-heading, .glm-canary-note, .secondary-button, and #glm-canary-output rule blocks; .secondary-button was only ever paired with the now-removed glm-canary-cancel-button (extension.js confirmed to emit no '.secondary-button' class), so its :disabled combinator was collapsed to .primary-button:disabled alone.",
+      "tests/test_aiworkhub_vscode_release_b853.py: added test_media_files_have_no_model_diagnostics_or_glm_canary_surface, parametrized over media/app.js and media/app.css, asserting absence of the DOM-id/handler/class/render-function symbols removed above."
+    ],
+    "unchanged_out_of_scope": [
+      "Worker adapters, task routing, launch, and callback dispatcher code paths were not touched -- this task only edits the two webview media files and one Python test."
+    ]
+  },
+  "validation": {
+    "media_grep_scope_check": "cd tools/geoai-task-mcp && git grep -n -i -E 'modelCapabilit|glmCanary|glm-canary|model-capabilit' -- vscode-extension/media/app.js vscode-extension/media/app.css -- 0 hits",
+    "node_syntax_check": "node --check vscode-extension/media/app.js -- PASS",
+    "npm_test": "PASS - AIWorkHub VS Code extension static contract checks passed",
+    "npm_run_package": "PASS - built dist/aiworkhub-0.6.0.vsix",
+    "pytest_test_aiworkhub_vscode_release_b853": "PASS - 26 passed"
+  },
+  "acceptance_check": {
+    "no_model_capabilities_or_glm_canary_dom_bindings_render_or_handlers_in_media_app_js": true,
+    "no_model_capabilities_or_glm_canary_css_in_media_app_css": true,
+    "worker_adapters_routing_task_launch_callback_untouched": true,
+    "initialize_aiworkhub_remains_sole_init_cta": true,
+    "extension_static_tests_and_packaging_pass": true,
+    "focused_python_release_tests_pass": true,
+    "absence_test_covers_media_files": true
+  },
+  "commit_contract": "NO_COMMIT. Stopped at Codex review."
+}

@@ -11,7 +11,7 @@ set -euo pipefail
 #   4. last_entries is capped at max_entries
 #   5. all authority flags remain false (except write_gate_enabled=true)
 #   6. no secrets/env values appear in output
-#   7. GEOAI_TASK_MCP_ALLOW_WRITES stays default off
+#   7. AIWORKHUB_ALLOW_WRITES stays default off
 #   8. parent task queue is not mutated
 #   9. read_audit_log is purely read-only (no subprocess, no file write)
 # ---------------------------------------------------------------------------
@@ -20,12 +20,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Audit Log Read Tool Smoke Test B104 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 
 # ------------------------------------------------------------------
 # Run the audit log read smoke test (Python)
@@ -49,12 +49,12 @@ echo ""
 echo "=== Defense-in-depth checks ==="
 
 # Verify ALLOW_WRITES is still off
-ACTUAL="$(python3 -c 'import os; print(os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES","0"))')"
+ACTUAL="$(python3 -c 'import os; print(os.environ.get("AIWORKHUB_ALLOW_WRITES","0"))')"
 if [ "$ACTUAL" != "0" ]; then
-    echo "FAIL: GEOAI_TASK_MCP_ALLOW_WRITES=$ACTUAL (expected 0)"
+    echo "FAIL: AIWORKHUB_ALLOW_WRITES=$ACTUAL (expected 0)"
     exit 1
 fi
-echo "GEOAI_TASK_MCP_ALLOW_WRITES confirmed still 0 (off)"
+echo "AIWORKHUB_ALLOW_WRITES confirmed still 0 (off)"
 
 # Verify taskctl verify still passes (parent queue intact)
 python3 "$ROOT/AITools/taskctl.py" verify

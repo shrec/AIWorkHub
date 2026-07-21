@@ -1,0 +1,65 @@
+{
+  "schema_id": "aiworkhub.task_mcp.public_release_identity_b877_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_PUBLIC_RELEASE_IDENTITY_B877_V1",
+  "runner": "claude_sonnet5_aiworkhub_public_release_identity_b877_v1",
+  "topic": "task_mcp",
+  "changed_files": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/CHANGELOG.md",
+    "tools/geoai-task-mcp/SECURITY.md",
+    "tools/geoai-task-mcp/vscode-extension/test/package-vsix.js"
+  ],
+  "corrections": [
+    {
+      "file": "SECURITY.md",
+      "issue": "stale advisory URL used shrec/AIWorkingHub",
+      "fix": "corrected to https://github.com/shrec/AIWorkHub/security/advisories/new"
+    },
+    {
+      "file": "CHANGELOG.md",
+      "issue": "0.6.0 entry retained a pending-GitHub-repository-rename statement",
+      "fix": "removed the pending-rename parenthetical, kept the SECURITY.md/package.json URL-correction note"
+    },
+    {
+      "file": "README.md",
+      "issue": "3 monorepo-relative paths (tools/geoai-task-mcp/src, tools/geoai-task-mcp/scripts/..., tools/geoai-task-mcp/logs/audit.jsonl) in MCP client config, mux install commands, and audit log default path",
+      "fix": "rewritten to standalone repository-relative paths (src, scripts/..., logs/audit.jsonl)"
+    },
+    {
+      "file": "vscode-extension/test/package-vsix.js",
+      "issue": "2 code comments referenced tools/geoai-task-mcp/src/aiworkhub and tools/geoai-task-mcp/README.md",
+      "fix": "comment-only rewrite to src/aiworkhub and this repo's top-level README.md; no logic change"
+    }
+  ],
+  "preserved_negative_regression": {
+    "file": "vscode-extension/test/extension-static.test.js",
+    "lines": [114, 119],
+    "assertion": "assert.ok(!ext.includes(\".aiworkinghub\"), \"the legacy .aiworkinghub path must never be referenced\")",
+    "status": "unchanged, intentionally retained"
+  },
+  "validation": {
+    "git_grep_geoai_aiworkinghub": {
+      "command": "git grep -n -I -i 'geoai|AIWorkingHub' -- README.md CHANGELOG.md SECURITY.md vscode-extension/test/package-vsix.js vscode-extension/test/extension-static.test.js",
+      "result": "PASS",
+      "remaining_matches": 2,
+      "remaining_matches_are": "explicit negative .aiworkinghub regression assertions only (allowed by acceptance criteria)"
+    },
+    "npm_test": {
+      "command": "cd vscode-extension && npm test --silent",
+      "result": "PASS",
+      "output": "AIWorkHub VS Code extension static contract checks passed"
+    },
+    "npm_run_package": {
+      "command": "cd vscode-extension && npm run package",
+      "result": "PASS",
+      "output": "vscode-extension/dist/aiworkhub-0.6.0.vsix"
+    }
+  },
+  "acceptance_check": {
+    "public_urls_use_canonical_repo": true,
+    "no_pending_rename_statement": true,
+    "no_monorepo_path_examples": true,
+    "no_geoai_or_aiworkinghub_branding_outside_negative_test": true,
+    "npm_test_and_vsix_package_pass_at_0_6_0": true
+  }
+}

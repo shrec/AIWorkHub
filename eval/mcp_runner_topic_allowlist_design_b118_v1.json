@@ -194,7 +194,7 @@
     "layers": [
       {
         "layer": "write_gate_env",
-        "check": "GEOAI_TASK_MCP_ALLOW_WRITES != '1'",
+        "check": "AIWORKHUB_ALLOW_WRITES != '1'",
         "action": "block all write commands with returncode=126",
         "priority": 1,
         "implemented": true,
@@ -235,9 +235,9 @@
     "topic": "coding",
     "mode": "implementation_gated_core_patch",
     "allowed_writes": [
-      "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-      "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
-      "tools/geoai-task-mcp/tests/runner_topic_allowlist_enforcement_smoke.py"
+      "tools/aiworkhub/src/aiworkhub/core.py",
+      "tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
+      "tools/aiworkhub/tests/runner_topic_allowlist_enforcement_smoke.py"
     ],
     "forbidden": [
       "server_py_mutation",
@@ -253,7 +253,7 @@
       "read-only tools are unaffected",
       "audit log records every allowlist denial",
       "CODE_ONLY — no runtime switch, no launch",
-      "bash tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes"
+      "bash tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes"
     ]
   },
   "gates": {
@@ -277,11 +277,11 @@
     "worker_cannot_finalize_own_task": true,
     "runner_topic_exact_match_only": true
   },
-  "neural_bridge_note": "This allowlist is a DETERMINISTIC SAFETY BOUNDARY, not a neural learning target. The neural controller learns adapter/runner/topic routing (B108/B109) and may select among ALLOWED entries; the allowlist is the hard boundary that prevents any neural choice from mutating the queue under an unauthorized identity. This is controller/verifier layer separation per GeoAI doctrine.",
+  "neural_bridge_note": "This allowlist is a DETERMINISTIC SAFETY BOUNDARY, not a neural learning target. The neural controller learns adapter/runner/topic routing (B108/B109) and may select among ALLOWED entries; the allowlist is the hard boundary that prevents any neural choice from mutating the queue under an unauthorized identity. This is controller/verifier layer separation per AIWorkHub doctrine.",
   "files_written": [
-    "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_design_b118_v1.json",
-    "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_design_rows_b118_v1.jsonl",
-    "tools/geoai-task-mcp/data/tasking/mcp_runner_topic_allowlist_design_next_wave_b118_v1.json",
-    "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_design_b118_v1.sh"
+    "tools/aiworkhub/eval/mcp_runner_topic_allowlist_design_b118_v1.json",
+    "tools/aiworkhub/eval/mcp_runner_topic_allowlist_design_rows_b118_v1.jsonl",
+    "tools/aiworkhub/data/tasking/mcp_runner_topic_allowlist_design_next_wave_b118_v1.json",
+    "tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_design_b118_v1.sh"
   ]
 }

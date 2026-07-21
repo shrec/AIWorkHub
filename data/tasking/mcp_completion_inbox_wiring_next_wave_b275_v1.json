@@ -7,30 +7,30 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_RESULT_SCHEMA_FREEZE_V1",
-      "goal": "Freeze the geoai_completion_inbox result schema (mirroring test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh) so a future change to completion_inbox.py or server.py cannot silently drop a field Codex depends on (review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, authority_flags, mutation).",
+      "goal": "Freeze the aiworkhub_completion_inbox result schema (mirroring test_mcp_readonly_tool_result_schema_freeze_b109_v1.sh) so a future change to completion_inbox.py or server.py cannot silently drop a field Codex depends on (review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, authority_flags, mutation).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_completion_inbox_result_schema_freeze.py",
-        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_result_schema_freeze_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_result_schema_freeze_v1.json"
+        "tools/aiworkhub/tests/mcp_completion_inbox_result_schema_freeze.py",
+        "tools/aiworkhub/tests/test_mcp_completion_inbox_result_schema_freeze_v1.sh",
+        "tools/aiworkhub/eval/mcp_completion_inbox_result_schema_freeze_v1.json"
       ],
       "acceptance": [
-        "frozen key set asserted present in geoai_completion_inbox output",
+        "frozen key set asserted present in aiworkhub_completion_inbox output",
         "test fails loudly if a depended-on key is removed or renamed",
         "no process launch, no queue/audit mutation"
       ]
     },
     {
       "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_ADD_INDEXER_COVERAGE_V1",
-      "goal": "Fix the documented indexer gap (kb bug.tools_geoai_task_mcp_not_indexed): add tools/geoai-task-mcp to source_graph.py's source_dirs (AITools/source_graph.toml) and source_graph_universal.py's project roots so server.py/core.py/completion_inbox.py/review_summarizer.py become queryable via the mandated indexer path instead of requiring a direct Read workaround on every future task touching this package.",
+      "goal": "Fix the documented indexer gap (kb bug.tools_aiworkhub_not_indexed): add tools/aiworkhub to source_graph.py's source_dirs (AITools/source_graph.toml) and source_graph_universal.py's project roots so server.py/core.py/completion_inbox.py/review_summarizer.py become queryable via the mandated indexer path instead of requiring a direct Read workaround on every future task touching this package.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "AITools/source_graph.toml"
       ],
       "acceptance": [
-        "source_graph.py context/body/find return real results for tools/geoai-task-mcp/**/*.py after build -i",
+        "source_graph.py context/body/find return real results for tools/aiworkhub/**/*.py after build -i",
         "no existing source_dir entry removed or altered",
-        "kb bug.tools_geoai_task_mcp_not_indexed updated/superseded to reflect the fix"
+        "kb bug.tools_aiworkhub_not_indexed updated/superseded to reflect the fix"
       ]
     },
     {
@@ -38,9 +38,9 @@
       "goal": "Strengthen stale_processing beyond the updated_at/started_at/claimed_at timestamp proxy: cross-check whether any file in the card's allowed_writes has a filesystem mtime newer than the card's last DB timestamp (real artifact activity signal), read-only (os.stat only, no content read of code files).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_stale_artifact_signal_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_stale_artifact_signal_v1.json"
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+        "tools/aiworkhub/tests/test_mcp_completion_inbox_stale_artifact_signal_v1.sh",
+        "tools/aiworkhub/eval/mcp_completion_inbox_stale_artifact_signal_v1.json"
       ],
       "acceptance": [
         "stale_processing entries report an artifact_activity_since_last_db_update bool",

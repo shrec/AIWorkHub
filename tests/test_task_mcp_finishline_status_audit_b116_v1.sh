@@ -21,7 +21,7 @@ echo ""
 
 # ── 1. Run audit script ──
 echo "--- Running audit script ---"
-cd /home/shrek/GeoAI
+cd /home/shrek/AIWorkHub
 python3 "$AUDIT_SCRIPT" > /tmp/b116_audit_stdout.txt 2>&1
 AUDIT_RC=$?
 if [ $AUDIT_RC -eq 0 ]; then

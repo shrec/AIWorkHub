@@ -8,13 +8,13 @@
   "mode": "mcp_review_summarizer_stdio_smoke_readonly",
   "objective": "End-to-end MCP stdio transport smoke test: start server, JSON-RPC initialize/list_tools/tools_call, verify response shape, prove queue unchanged, no agent/model launch.",
   "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STARTUP_SMOKE_B114_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh",
-  "test_runner": "tools/geoai-task-mcp/tests/_b115_stdio_smoke_runner.py",
-  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (stdio transport)",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh",
+  "test_runner": "tools/aiworkhub/tests/_b115_stdio_smoke_runner.py",
+  "module_under_test": "tools/aiworkhub/src/aiworkhub/server.py (stdio transport)",
   "acceptance_results": {
-    "initialize": "PASS — server=GeoAI Task MCP, protocol accepted",
+    "initialize": "PASS — server=AIWorkHub MCP, protocol accepted",
     "tools_list": "PASS — 16 tools returned via stdio transport",
-    "tool_found": "PASS — geoai_task_review_summarize in tools/list response",
+    "tool_found": "PASS — aiworkhub_task_review_summarize in tools/list response",
     "tool_desc_readonly": "PASS — tool description contains read-only invariant",
     "tools_call_ok": "PASS — tools/call returned 1 content item",
     "response_ok": "PASS — bool",
@@ -28,7 +28,7 @@
     "authority_flag_agent_launch": "PASS — False",
     "authority_flag_queue_write": "PASS — False",
     "authority_flag_write_gate_enabled": "PASS — True (gate active, writes blocked)",
-    "response_server_tool": "PASS — geoai_task_review_summarize",
+    "response_server_tool": "PASS — aiworkhub_task_review_summarize",
     "response_contract": "PASS — B111_v1_readonly_server_wiring",
     "response_batch_label": "PASS — b115_stdio_smoke",
     "response_shape_valid": "PASS — all required fields present and typed",
@@ -40,11 +40,11 @@
     "eval_json_valid": "PASS — JSON valid"
   },
   "acceptance_criteria": [
-    "must exercise MCP stdio/list-tools or equivalent JSON-RPC client path and find geoai_task_review_summarize",
+    "must exercise MCP stdio/list-tools or equivalent JSON-RPC client path and find aiworkhub_task_review_summarize",
     "must call/smoke response shape for review summarizer with readonly flags present",
     "must prove live queue unchanged before/after",
     "must not launch Claude/DeepSeek/Codex agents or any model process",
-    "bash tools/geoai-task-mcp/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh passes",
+    "bash tools/aiworkhub/tests/test_mcp_review_summarizer_stdio_smoke_b115_v1.sh passes",
     "python3 AITools/taskctl.py verify passes"
   ],
   "invariants_verified": {
@@ -66,9 +66,9 @@
     "mixed_task_commit"
   ],
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
 }

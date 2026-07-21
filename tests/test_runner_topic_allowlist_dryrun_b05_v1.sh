@@ -32,12 +32,12 @@ EVAL_JSON="$MCPROOT/eval/runner_topic_allowlist_dryrun_b05_v1.json"
 NEXT_WAVE_JSON="$MCPROOT/data/tasking/runner_topic_allowlist_dryrun_next_wave_b05_v1.json"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== Runner/Topic Allowlist DryRun Test B05 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 echo "--- [1/7] eval JSON structure ---"
@@ -71,8 +71,8 @@ echo ""
 echo "--- [2/7] cross-validate measured examples against REAL core code ---"
 EVAL_JSON="$EVAL_JSON" python3 - <<'PYEOF'
 import json, os, sys
-sys.path.insert(0, os.path.join(os.environ["GEOAI_REPO"], "tools/geoai-task-mcp/src"))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ["AIWORKHUB_REPO"], "tools/geoai-task-mcp/src"))
+from aiworkhub import core
 
 d = json.load(open(os.environ["EVAL_JSON"]))
 examples = d["blocked_examples_measured"]
@@ -104,8 +104,8 @@ echo ""
 echo "--- [3/7] write gate + launch status match live module ---"
 python3 -c "
 import sys, os
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core, cli_adapter_dryrun as cad
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core, cli_adapter_dryrun as cad
 assert core.writes_allowed() is False, 'core.writes_allowed() must be False'
 assert cad.writes_allowed() is False, 'cli_adapter_dryrun.writes_allowed() must be False'
 assert cad.launch_enabled() is False, 'launch_enabled() must be False'
@@ -151,8 +151,8 @@ echo ""
 echo "--- [5/7] task_mcp truly absent from the live/recorded allowlist (patch unapplied) ---"
 python3 -c "
 import json, os, sys
-sys.path.insert(0, os.path.join(os.environ['GEOAI_REPO'], 'tools/geoai-task-mcp/src'))
-from geoai_task_mcp import core
+sys.path.insert(0, os.path.join(os.environ['AIWORKHUB_REPO'], 'tools/geoai-task-mcp/src'))
+from aiworkhub import core
 
 live_topics = {topic for (_runner, topic) in core.RUNNER_TOPIC_ALLOWLIST.keys()}
 assert 'task_mcp' not in live_topics, (

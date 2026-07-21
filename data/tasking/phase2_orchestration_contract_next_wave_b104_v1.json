@@ -3,16 +3,16 @@
  "parent_task": "CLAUDE_TASK_MCP_PHASE2_ORCHESTRATION_CONTRACT_B104_V1",
  "date": "2026-07-04",
  "status": "proposal",
- "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps launch DISABLED by default; only the final gated task can wire GEOAI_TASK_MCP_ALLOW_LAUNCH, and only behind ALL launch_preconditions. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+ "notes": "PROPOSAL only, not enqueued (worker does NOT create tasks via taskctl). Every follow-up keeps launch DISABLED by default; only the final gated task can wire AIWORKHUB_ALLOW_LAUNCH, and only behind ALL launch_preconditions. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
  "follow_up_tasks": [
   {
    "task_id": "CLAUDE_TASK_MCP_ORCH_ADAPTER_IFACE_B105_V1",
    "goal": "Implement the LocalCliAdapter + ManualExternalAdapter interface (id, kind, detect, disabled_by_default, review_role) with read-only detect() only; no spawn, launch still disabled.",
    "mode": "NO_COMMIT",
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/adapters.py",
-    "tools/geoai-task-mcp/tests/test_orch_adapter_iface_b105_v1.sh",
-    "tools/geoai-task-mcp/eval/orch_adapter_iface_b105_v1.json"
+    "tools/aiworkhub/src/aiworkhub/adapters.py",
+    "tools/aiworkhub/tests/test_orch_adapter_iface_b105_v1.sh",
+    "tools/aiworkhub/eval/orch_adapter_iface_b105_v1.json"
    ],
    "acceptance": [
     "adapters module exposes no spawn/exec/fork symbol for agent processes",
@@ -22,12 +22,12 @@
   },
   {
    "task_id": "CLAUDE_TASK_MCP_ORCH_DRYRUN_PLAN_B105_V1",
-   "goal": "Add a read-only geoai_agent_launch_plan tool returning the argv it WOULD run + resolved adapter + collision preflight; executes nothing, appends action=launch_planned audit entry.",
+   "goal": "Add a read-only aiworkhub_agent_launch_plan tool returning the argv it WOULD run + resolved adapter + collision preflight; executes nothing, appends action=launch_planned audit entry.",
    "mode": "NO_COMMIT",
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_orch_dryrun_plan_b105_v1.sh",
-    "tools/geoai-task-mcp/eval/orch_dryrun_plan_b105_v1.json"
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_orch_dryrun_plan_b105_v1.sh",
+    "tools/aiworkhub/eval/orch_dryrun_plan_b105_v1.json"
    ],
    "acceptance": [
     "plan tool starts no process with ALLOW_LAUNCH unset",
@@ -40,9 +40,9 @@
    "goal": "Wire per-task/per-adapter token/cost reporting fields into the launch-plan audit and a usage summarizer that maps to `taskctl usage`; enforce token_budget_max as a per-task ceiling. No launch enabled.",
    "mode": "NO_COMMIT",
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/token_report.py",
-    "tools/geoai-task-mcp/tests/test_orch_token_cost_report_b105_v1.sh",
-    "tools/geoai-task-mcp/eval/orch_token_cost_report_b105_v1.json"
+    "tools/aiworkhub/src/aiworkhub/token_report.py",
+    "tools/aiworkhub/tests/test_orch_token_cost_report_b105_v1.sh",
+    "tools/aiworkhub/eval/orch_token_cost_report_b105_v1.json"
    ],
    "acceptance": [
     "token_cost_reporting_fields populated per task and per adapter",
@@ -55,9 +55,9 @@
    "goal": "Add launch-queue + process-state data model (queued, planned, blocked_launch_disabled, would_run, terminal) with per-transition audit; every request terminates blocked_launch_disabled while the gate is off. Pure data, no agent process.",
    "mode": "NO_COMMIT",
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_state.py",
-    "tools/geoai-task-mcp/tests/test_orch_launch_state_b105_v1.sh",
-    "tools/geoai-task-mcp/eval/orch_launch_state_b105_v1.json"
+    "tools/aiworkhub/src/aiworkhub/launch_state.py",
+    "tools/aiworkhub/tests/test_orch_launch_state_b105_v1.sh",
+    "tools/aiworkhub/eval/orch_launch_state_b105_v1.json"
    ],
    "acceptance": [
     "state model round-trips through persistence",
@@ -71,7 +71,7 @@
    "mode": "NO_COMMIT",
    "allowed_writes": [
     "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+    "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
    ],
    "acceptance": [
     "curriculum rows define task->adapter/runner/topic routing + abstain labels",
@@ -81,13 +81,13 @@
   },
   {
    "task_id": "CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1",
-   "goal": "FINAL: wire the GEOAI_TASK_MCP_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate; permit a real launch ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass. Default stays fully disabled; rollback = unset the flag.",
+   "goal": "FINAL: wire the AIWORKHUB_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate; permit a real launch ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass. Default stays fully disabled; rollback = unset the flag.",
    "mode": "NO_COMMIT",
    "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_orch_gated_enablement_b106_v1.sh",
-    "tools/geoai-task-mcp/eval/orch_gated_enablement_b106_v1.json"
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_orch_gated_enablement_b106_v1.sh",
+    "tools/aiworkhub/eval/orch_gated_enablement_b106_v1.json"
    ],
    "acceptance": [
     "launch unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass",

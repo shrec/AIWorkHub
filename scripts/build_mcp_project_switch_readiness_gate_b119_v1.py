@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """B119: MCP project-switch readiness gate — final scorecard.
 
-Read-only decision surface for whether GeoAI coordination may switch from
+Read-only decision surface for whether AIWorkHub coordination may switch from
 manual copy/paste task blocks to MCP-mediated task orchestration.
 
 This script NEVER mutates: it only reads existing evidence JSON/JSONL
@@ -25,11 +25,11 @@ pass:
   5. full_wave_dryrun   - one full task-wave dry-run harness finished
                            (B119) — note: a dry-run harness proves the
                            logic; it is NOT the same as a live wave run
-                           with GEOAI_TASK_MCP_ALLOW_WRITES=1, which
+                           with AIWORKHUB_ALLOW_WRITES=1, which
                            remains a separate, still-forbidden action.
 
 Usage:
-  python3 tools/geoai-task-mcp/scripts/build_mcp_project_switch_readiness_gate_b119_v1.py \
+  python3 tools/aiworkhub/scripts/build_mcp_project_switch_readiness_gate_b119_v1.py \
       [--finishline-audit PATH] [--finishline-rows PATH] \
       [--live-client-smoke PATH] [--autopickup-dryrun PATH] \
       [--launch-disabled-contract PATH] [--allowlist-design PATH] \
@@ -48,8 +48,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-REPO = Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")).expanduser().resolve()
-MCP_ROOT = REPO / "tools" / "geoai-task-mcp"
+REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+MCP_ROOT = REPO / "tools" / "aiworkhub"
 EVAL_DIR = MCP_ROOT / "eval"
 DATA_DIR = MCP_ROOT / "data" / "tasking"
 
@@ -228,7 +228,7 @@ def overlay_checkboxes(
                 r["gap_detail"] = (
                     "Full-wave DRY-RUN harness finished, but this validates simulated wave "
                     "logic only. A literal live wave (claim->work->review->done via MCP "
-                    "with GEOAI_TASK_MCP_ALLOW_WRITES=1) has not been executed and remains "
+                    "with AIWORKHUB_ALLOW_WRITES=1) has not been executed and remains "
                     "a separate, still-forbidden action pending this gate."
                 )
             else:
@@ -404,7 +404,7 @@ def main() -> int:
             "detail": "CLI adapter concrete implementations (claude/codex/deepseek) + candidate eval remain GAP per B116 audit; not in scope of the 5 named switch gates but part of full roadmap completion.",
         })
 
-    git_state = git_dirty_report("tools/geoai-task-mcp/")
+    git_state = git_dirty_report("tools/aiworkhub/")
 
     eval_summary: dict[str, Any] = {
         "eval_id": "mcp_project_switch_readiness_gate_b119_v1",
@@ -477,7 +477,7 @@ def main() -> int:
                 "task_id": FULL_WAVE_DRYRUN_TASK_ID,
                 "action": "Codex-finalize (done) full-wave dry-run harness; then design a SEPARATE, "
                           "explicitly-approved task to run one literal live wave with "
-                          "GEOAI_TASK_MCP_ALLOW_WRITES=1 (p3_full_task_wave real execution).",
+                          "AIWORKHUB_ALLOW_WRITES=1 (p3_full_task_wave real execution).",
             },
             {
                 "step": 4,

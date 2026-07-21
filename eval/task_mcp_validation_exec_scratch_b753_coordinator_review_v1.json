@@ -14,7 +14,7 @@
     "credential isolation preserved"
   ],
   "parent_verification": {
-    "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py tools/geoai-task-mcp/tests/test_worker_workspace.py tools/geoai-task-mcp/tests/test_process_launcher.py",
+    "command": "PYTHONPATH=tools/aiworkhub/src python3 -m pytest -q tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py tools/aiworkhub/tests/test_worker_workspace.py tools/aiworkhub/tests/test_process_launcher.py",
     "result": "67 passed in 2.69s",
     "new_focused_tests": "15 passed"
   },

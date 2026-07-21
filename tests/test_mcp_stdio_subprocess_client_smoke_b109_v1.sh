@@ -2,12 +2,12 @@
 set -euo pipefail
 # ---------------------------------------------------------------------------
 # test_mcp_stdio_subprocess_client_smoke_b109_v1.sh
-# Drives the geoai-task-mcp server as its OWN out-of-process subprocess over
+# Drives the aiworkhub server as its OWN out-of-process subprocess over
 # REAL OS stdio pipes (mcp.client.stdio.stdio_client + mcp.ClientSession) and
 # asserts the frozen tool contract v1 STILL holds across the pipe: the exact
 # 33-tool inventory is visible over tools/list, every input schema is
 # byte-stable vs the B109 frozen fingerprints, and NO queue/audit writes with
-# GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1. Also asserts ONLY the MCP server
+# AIWORKHUB_ALLOW_WRITES unset AND =1. Also asserts ONLY the MCP server
 # process is launched (no agent/model, no shell=True), its launch gate is
 # forced closed, and server.py holds no direct spawn primitive. Parent task
 # queue must stay verify-intact.
@@ -20,17 +20,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 SMOKE="$MCPROOT/tests/mcp_stdio_client_smoke.py"
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b109_stdio_smoke.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b109_stdio_smoke.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-unset GEOAI_TASK_MCP_ALLOW_WRITES GEOAI_TASK_MCP_ALLOW_LAUNCH
+export AIWORKHUB_REPO="$ROOT"
+unset AIWORKHUB_ALLOW_WRITES AIWORKHUB_ALLOW_LAUNCH
 
 echo "=== MCP STDIO Subprocess Client Smoke Test B109 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMPDIR_STATE"
 
 # --- 0. server.py holds no direct spawn primitive (defense in depth) -------
@@ -95,39 +95,39 @@ assert d["write_gated_tool_count"] == 4, d["write_gated_tool_count"]
 assert len(d["detail"]["readonly_tools_visible"]) == 11, d["detail"]["readonly_tools_visible"]
 
 expected_tools = {
-    "geoai_agent_cancel_task",
-    "geoai_agent_collect_result",
-    "geoai_agent_launch_task",
-    "geoai_agent_list_processes",
-    "geoai_agent_task_status",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_report_readonly",
-    "geoai_completion_inbox",
-    "geoai_launch_queue_audit_summary_readonly",
-    "geoai_launch_queue_describe_readonly",
-    "geoai_launch_queue_evaluate_readonly",
-    "geoai_supervisor_loop_status",
-    "geoai_task_audit_log_read",
-    "geoai_task_auto_pickup",
-    "geoai_task_auto_pickup_dryrun",
-    "geoai_task_codex_handoff",
-    "geoai_task_codex_handoff_markdown",
-    "geoai_task_collision_guard",
-    "geoai_task_cost_ledger",
-    "geoai_task_export_jsonl",
-    "geoai_task_health",
-    "geoai_task_list",
-    "geoai_task_mark_done",
-    "geoai_task_mark_review",
-    "geoai_task_pending_for_runner",
-    "geoai_task_queue_request",
-    "geoai_task_reject_review",
-    "geoai_task_review_queue",
-    "geoai_task_review_summarize",
-    "geoai_task_show",
-    "geoai_task_stale_recovery_recommend",
-    "geoai_task_usage_report",
+    "aiworkhub_agent_cancel_task",
+    "aiworkhub_agent_collect_result",
+    "aiworkhub_agent_launch_task",
+    "aiworkhub_agent_list_processes",
+    "aiworkhub_agent_task_status",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_report_readonly",
+    "aiworkhub_completion_inbox",
+    "aiworkhub_launch_queue_audit_summary_readonly",
+    "aiworkhub_launch_queue_describe_readonly",
+    "aiworkhub_launch_queue_evaluate_readonly",
+    "aiworkhub_supervisor_loop_status",
+    "aiworkhub_task_audit_log_read",
+    "aiworkhub_task_auto_pickup",
+    "aiworkhub_task_auto_pickup_dryrun",
+    "aiworkhub_task_codex_handoff",
+    "aiworkhub_task_codex_handoff_markdown",
+    "aiworkhub_task_collision_guard",
+    "aiworkhub_task_cost_ledger",
+    "aiworkhub_task_export_jsonl",
+    "aiworkhub_task_health",
+    "aiworkhub_task_list",
+    "aiworkhub_task_mark_done",
+    "aiworkhub_task_mark_review",
+    "aiworkhub_task_pending_for_runner",
+    "aiworkhub_task_queue_request",
+    "aiworkhub_task_reject_review",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_review_summarize",
+    "aiworkhub_task_show",
+    "aiworkhub_task_stale_recovery_recommend",
+    "aiworkhub_task_usage_report",
 }
 assert len(expected_tools) == 33
 assert d["detail"]["total_tools_visible"] == 33, d["detail"]["total_tools_visible"]
@@ -145,10 +145,10 @@ assert current_fp == frozen_fp, "live input schemas differ from the B109 freeze"
 
 # The equality gates must reject both schema mutation and inventory expansion.
 mutated_fp = dict(frozen_fp)
-mutated_fp["geoai_agent_launch_task"] = "deadbeef"
+mutated_fp["aiworkhub_agent_launch_task"] = "deadbeef"
 assert current_fp != mutated_fp
 expanded_tools = set(expected_tools)
-expanded_tools.add("geoai_unexpected_tool")
+expanded_tools.add("aiworkhub_unexpected_tool")
 assert set(current_fp) != expanded_tools
 
 # no-write proof: byte-identical AND empty state dir in BOTH rounds
@@ -160,7 +160,7 @@ for rk in ("round_allow_unset", "round_allow_set"):
     assert r["state_after"] == r["state_before"] == [], (rk, r)
 
 # only-the-server launched: normalized python + server module, no agent tokens
-assert d["detail"]["server_command_normalized"] == ["<python>", "-m", "geoai_task_mcp.server"], \
+assert d["detail"]["server_command_normalized"] == ["<python>", "-m", "aiworkhub.server"], \
     d["detail"]["server_command_normalized"]
 assert d["detail"]["launched_agent_or_model_token_hits"] == [], \
     d["detail"]["launched_agent_or_model_token_hits"]

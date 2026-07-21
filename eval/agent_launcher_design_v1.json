@@ -11,7 +11,7 @@
    "disabled_by_default": true,
    "human_in_the_loop": false,
    "id": "claude_cli",
-   "invocation_shape": "argv (NOT wired): ['claude','-p',<prompt>,'--cwd',GEOAI_REPO,...] launched as a separate local process/model; no shell=True, argv list only.",
+   "invocation_shape": "argv (NOT wired): ['claude','-p',<prompt>,'--cwd',AIWORKHUB_REPO,...] launched as a separate local process/model; no shell=True, argv list only.",
    "kind": "local_cli",
    "notes": "Separate Claude CLI model instance; a distinct process from this MCP server. Disabled by default; only L4 with all gates could ever spawn it.",
    "separate_model": true
@@ -21,7 +21,7 @@
    "disabled_by_default": true,
    "human_in_the_loop": false,
    "id": "codex_cli",
-   "invocation_shape": "argv (NOT wired): ['codex','exec',<prompt>,'--cwd',GEOAI_REPO,...] launched as a separate local process/model; no shell=True, argv list only.",
+   "invocation_shape": "argv (NOT wired): ['codex','exec',<prompt>,'--cwd',AIWORKHUB_REPO,...] launched as a separate local process/model; no shell=True, argv list only.",
    "kind": "local_cli",
    "notes": "Separate Codex CLI model instance; distinct process from this MCP server. Codex is also the reviewer/finalizer, so a launched Codex worker must not self-review. Disabled by default.",
    "separate_model": true
@@ -42,10 +42,10 @@
   "default": "0",
   "launch_actions_enabled": false,
   "launcher_code_added": false,
-  "proposed_enable_flag": "GEOAI_TASK_MCP_ALLOW_LAUNCH",
-  "requires_also": "GEOAI_TASK_MCP_ALLOW_WRITES=1"
+  "proposed_enable_flag": "AIWORKHUB_ALLOW_LAUNCH",
+  "requires_also": "AIWORKHUB_ALLOW_WRITES=1"
  },
- "neural_bridge_note": "Per GeoAI neural-control-first doctrine, future SELECTION of adapter/runner/topic (which agent to launch for which task) must be a LEARNED routing decision, not a regex/keyword cue router. This design deliberately adds NO cue router and NO runtime keyword branch: adapter availability is a read-only presence probe and routing is a static human-configured allowlist + explicit safety gates only. The intelligence layer (learned launch/route/abstain policy) is deferred to trainable targets — curriculum rows and an explicit MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 task card — so no hidden regex/table cognition is introduced as launch authority.",
+ "neural_bridge_note": "Per AIWorkHub neural-control-first doctrine, future SELECTION of adapter/runner/topic (which agent to launch for which task) must be a LEARNED routing decision, not a regex/keyword cue router. This design deliberately adds NO cue router and NO runtime keyword branch: adapter availability is a read-only presence probe and routing is a static human-configured allowlist + explicit safety gates only. The intelligence layer (learned launch/route/abstain policy) is deferred to trainable targets — curriculum rows and an explicit MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 task card — so no hidden regex/table cognition is introduced as launch authority.",
  "phases": [
   {
    "deliverable": "This design json, per-item rows jsonl, next-wave proposal, and an isolation-safe test asserting no launcher code and launch disabled.",
@@ -66,7 +66,7 @@
    "enables_launch": false,
    "exit_gate": "Plan tool returns a plan dict and spawns no process even with ALLOW_LAUNCH unset; an audit entry action='launch_planned' is appended; test proves no process started.",
    "phase_id": "L2",
-   "title": "Dry-run / plan-only launch tool (geoai_agent_launch_plan)"
+   "title": "Dry-run / plan-only launch tool (aiworkhub_agent_launch_plan)"
   },
   {
    "deliverable": "Data model + persistence schema for launch requests and their lifecycle states (queued, planned, blocked_launch_disabled, would_run, terminal). No real agent process is ever spawned; every request terminates in 'blocked_launch_disabled' while ALLOW_LAUNCH!=1. State-machine transitions are pure data.",
@@ -76,7 +76,7 @@
    "title": "Launch queue + process-state model (still disabled)"
   },
   {
-   "deliverable": "Wire the GEOAI_TASK_MCP_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate. A real launch is permitted ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND every safety_gate passes (allowlist, collision preflight, cwd/env sandbox, concurrency cap, audit). Default stays fully disabled; dry-run remains the default action.",
+   "deliverable": "Wire the AIWORKHUB_ALLOW_LAUNCH gate mirroring the ALLOW_WRITES write-gate. A real launch is permitted ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND every safety_gate passes (allowlist, collision preflight, cwd/env sandbox, concurrency cap, audit). Default stays fully disabled; dry-run remains the default action.",
    "enables_launch": true,
    "exit_gate": "Launch path unreachable unless ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all of write_gate_parity, runner_topic_allowlist, audit_log, collision_guard_preflight, dry_run_default, cwd_process_sandbox_pin, concurrency_cap pass; blocked attempts audited; rollback = unset ALLOW_LAUNCH restores disabled default.",
    "gated_by": [
@@ -96,7 +96,7 @@
   {
    "blocking": true,
    "gate_id": "write_gate_parity",
-   "requirement": "A launch requires GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1; both default '0'. Mirrors core.writes_allowed() / run_taskctl write-gate exactly."
+   "requirement": "A launch requires AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1; both default '0'. Mirrors core.writes_allowed() / run_taskctl write-gate exactly."
   },
   {
    "blocking": true,
@@ -121,7 +121,7 @@
   {
    "blocking": true,
    "gate_id": "cwd_process_sandbox_pin",
-   "requirement": "Any launched process has cwd pinned to GEOAI_REPO, a scrubbed env (no secret vars), argv-list only (no shell=True), and bounded timeout; no arbitrary command execution."
+   "requirement": "Any launched process has cwd pinned to AIWORKHUB_REPO, a scrubbed env (no secret vars), argv-list only (no shell=True), and bounded timeout; no arbitrary command execution."
   },
   {
    "blocking": true,

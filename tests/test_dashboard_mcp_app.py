@@ -11,7 +11,7 @@ _SRC = _TOOL_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import core, dashboard, dashboard_mcp_app  # noqa: E402
+from aiworkhub import core, dashboard, dashboard_mcp_app  # noqa: E402
 
 
 FAKE_SNAPSHOT: dict[str, Any] = {
@@ -91,7 +91,7 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
     assert calls == [((), {})]
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
     assert result["tasks"] == FAKE_SNAPSHOT["tasks"]
-    assert result["server_tool"] == "geoai_dashboard_snapshot"
+    assert result["server_tool"] == "aiworkhub_dashboard_snapshot"
     assert result["authority_flags"]["readonly"] is True
     assert result["authority_flags"]["queue_write"] is False
     assert "transport_truncated_fields" not in result
@@ -145,7 +145,7 @@ def test_task_detail_view_rejects_invalid_task_id_without_touching_provider(monk
     result = dashboard_mcp_app.task_detail_view(bad_id)
     assert result["ok"] is False
     assert result["error"] == "invalid_task_id"
-    assert result["server_tool"] == "geoai_dashboard_task_detail"
+    assert result["server_tool"] == "aiworkhub_dashboard_task_detail"
 
 
 def test_task_detail_view_reports_not_found(monkeypatch):
@@ -169,7 +169,7 @@ def test_task_detail_view_reuses_build_task_detail_as_sole_data_builder(monkeypa
     assert calls == ["TASK_B615_DETAIL_V1"]
     assert result["ok"] is True
     assert result["task"]["task_id"] == "TASK_B615_DETAIL_V1"
-    assert result["server_tool"] == "geoai_dashboard_task_detail"
+    assert result["server_tool"] == "aiworkhub_dashboard_task_detail"
     assert result["authority_flags"]["process_launch"] is False
 
 
@@ -198,10 +198,12 @@ def test_task_detail_view_bounds_oversized_task_fields(monkeypatch):
 # health_view
 # ---------------------------------------------------------------------------
 
-def test_health_view_delegates_to_core_health_and_never_calls_build_snapshot(monkeypatch):
-    monkeypatch.setattr(
-        core, "health", lambda: {"ok": True, "repo": "/repo", "writes_allowed": False, "verify": {}}
-    )
+def test_health_view_reads_repo_root_env_and_never_calls_build_snapshot(monkeypatch):
+    # B865/B850: health_view() reads AIWORKHUB_REPO_ROOT + task_store.storage_
+    # readiness directly (never core.health(), never dashboard.build_snapshot)
+    # so the connection banner never depends on a repository shipping
+    # AITools/taskctl.py and polling stays cheap.
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
 
     def _boom_snapshot():
         raise AssertionError("health_view must never call dashboard.build_snapshot")
@@ -209,9 +211,9 @@ def test_health_view_delegates_to_core_health_and_never_calls_build_snapshot(mon
     monkeypatch.setattr(dashboard, "build_snapshot", _boom_snapshot)
 
     result = dashboard_mcp_app.health_view()
-    assert result["ok"] is True
-    assert result["writes_allowed"] is False
-    assert result["server_tool"] == "geoai_dashboard_health"
+    assert result["ok"] is False
+    assert result["error"] == "repo_root_not_selected"
+    assert result["server_tool"] == "aiworkhub_dashboard_health"
     assert result["server_version"]
     assert result["authority_flags"]["agent_launch"] is False
 
@@ -232,25 +234,31 @@ class _FakeFastMCP:
         return _decorator
 
 
-def test_register_binds_exactly_the_three_narrow_tools():
+def test_register_binds_readonly_live_output_and_initialize_tools():
+    # B855/B850 added the task-live-output and initialize tools additively
+    # alongside the original three read-only tools; register() must bind all
+    # five, never dropping the original three or silently losing the newer
+    # two.
     fake_mcp = _FakeFastMCP()
     names = dashboard_mcp_app.register(fake_mcp)
 
-    assert set(names) == set(dashboard_mcp_app.READONLY_TOOL_NAMES)
-    assert set(fake_mcp.registered) == {
-        "geoai_dashboard_snapshot",
-        "geoai_dashboard_task_detail",
-        "geoai_dashboard_health",
+    expected_names = set(dashboard_mcp_app.READONLY_TOOL_NAMES) | {
+        dashboard_mcp_app.LIVE_OUTPUT_TOOL_NAME,
+        dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
-    assert fake_mcp.registered["geoai_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view
-    assert fake_mcp.registered["geoai_dashboard_task_detail"] is dashboard_mcp_app.task_detail_view
-    assert fake_mcp.registered["geoai_dashboard_health"] is dashboard_mcp_app.health_view
+    assert set(names) == expected_names
+    assert set(fake_mcp.registered) == expected_names
+    assert fake_mcp.registered["aiworkhub_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view
+    assert fake_mcp.registered["aiworkhub_dashboard_task_detail"] is dashboard_mcp_app.task_detail_view
+    assert fake_mcp.registered["aiworkhub_dashboard_health"] is dashboard_mcp_app.health_view
+    assert fake_mcp.registered["aiworkhub_dashboard_task_live_output"] is dashboard_mcp_app.task_live_output_view
+    assert fake_mcp.registered["aiworkhub_dashboard_initialize"] is dashboard_mcp_app.initialize_view
 
 
 def test_task_id_validation_reuses_the_dashboard_http_route_pattern():
     # Same compiled pattern object as dashboard._TASK_ID_RE -- never a second,
     # potentially drifting, task_id regex.
-    assert dashboard_mcp_app.task_detail_view.__module__ == "geoai_task_mcp.dashboard_mcp_app"
+    assert dashboard_mcp_app.task_detail_view.__module__ == "aiworkhub.dashboard_mcp_app"
     assert dashboard._TASK_ID_RE.fullmatch("TASK_OK_V1")
 
 

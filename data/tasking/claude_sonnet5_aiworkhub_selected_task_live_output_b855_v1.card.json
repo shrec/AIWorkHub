@@ -1,0 +1,123 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_SELECTED_TASK_LIVE_OUTPUT_B855_V1",
+  "title": "Ship Init Repo, reload restoration and selected-task live output",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_selected_task_live_output_b855_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "high",
+  "queue_order": 2,
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "objective": "Complete the AIWorkHub VS Code editor-tab repository UX. Replace the GLM-specific primary action with one prominent Init Repo action that atomically provisions every required repo-local AIWorkHub authority for a new repository. Repair reload deserialization so an already open tab rebuilds its repository-bound MCP client without close/reopen. Add a read-only bounded Live Output view for the selected task. Model invocation diagnostics, if retained, must be provider-neutral, explicit and secondary. Reuse existing canonical storage and ProcessManager authorities; create no fallback database or second log store.",
+  "acceptance": [
+    "Only when canonical storage readiness reports the explicit not_initialized state does the dashboard show Init Repo as the primary action; other failures show their real diagnostic and never masquerade as initialization.",
+    "Initialization never runs automatically on activation, reload, refresh, workspace switch, model discovery or task polling; it requires an explicit owner click and confirmation.",
+    "Init Repo canonicalizes the workspace root with platform APIs and works on Windows drive/junction paths, Linux/macOS symlinks, WSL and Remote-SSH without hard-coded host paths.",
+    "One explicit initialization atomically provisions repository identity/manifest, storage registry, canonical task database, Source Graph state, Session Manager, AI Memory, KB, callback/run/log locations and generated agent tool-use instructions under that repository's .aiworkhub authority.",
+    "Initialization is idempotent and non-destructive: existing valid state is reused, incompatible foreign repo identity fails closed, and partial failure never reports storage ready.",
+    "After successful initialization the same tab reconnects and transitions to Live without reload; Init Repo disappears completely and the dashboard only reads the existing repository-local authorities.",
+    "An initialized repository never auto-imports legacy databases, adopts another repository's state, creates fallback storage, or repeats bootstrap work during ordinary dashboard use.",
+    "The extension consumes only the versioned aiworkhub.claude_callback.v1 sideband envelope produced by B856, capability-detects the installed Claude Code extension, and reports panel binding honestly; no private API guessing, keystroke injection or clipboard injection is allowed.",
+    "The extension registers a WebviewPanelSerializer for the canonical AIWorkHub editor view type and fully rehydrates an open dashboard tab after window reload or extension-host restart.",
+    "Deserialization reapplies webview options/HTML/message handlers, recreates the repository-bound MCP client, resumes refresh, and transitions Connecting to Live without close/reopen.",
+    "Webview getState/setState or extension workspaceState restores only bounded presentation state such as selected task, filters and refresh interval; no task data or secrets are duplicated there.",
+    "Repeated deserialize/open cycles leave exactly one live panel controller and dispose old timers, listeners and MCP children.",
+    "The primary dashboard contains no GLM-specific canary block or hard-coded GLM invocation action; successful Model Capabilities discovery is presented as discovery only.",
+    "Any retained invocation smoke is provider-neutral, located under explicit diagnostics, requires model selection plus native credit confirmation, and never runs on refresh, reload, timer or task pickup.",
+    "Selected Task contains a Live Output section with combined or separately labeled stdout/stderr tail, liveness/exit state and last activity.",
+    "Only the selected task is queried; no dashboard-wide log fanout occurs.",
+    "The MCP response is bounded to at most 64 KiB, supports incremental cursor/offset refresh, and reports truncation.",
+    "ANSI/control sequences are removed, HTML is escaped, and configured secret redaction is applied before data reaches the webview.",
+    "Output is read only from the selected repository's .aiworkhub runtime records and cannot cross repository identity.",
+    "Claude/DeepSeek/GLM CLI launches captured by AIWorkHub are supported; opaque Copilot or Claude Chat sessions show output_unavailable with adapter reason.",
+    "Terminal tasks retain their final bounded tail; missing/deleted logs fail closed without degrading the whole dashboard.",
+    "Focused Python, Node serializer lifecycle and VSIX packaging tests pass."
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_bootstrap.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "tools/geoai-task-mcp/vscode-extension/media/style.css",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_selected_task_live_output_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_model_diagnostics_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_init_repo_b855.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_selected_task_live_output_b855_v1.json"
+  ],
+  "forbidden": [
+    "http_dashboard_server",
+    "second_log_database",
+    "full_transcript_eager_load",
+    "secret_or_environment_dump",
+    "repository_cross_read",
+    "chat_transcript_scraping",
+    "task_lifecycle_mutation",
+    "git_commit",
+    "git_push"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_state.py",
+    "tools/geoai-task-mcp/src/aiworkhub/task_store.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_bootstrap.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "tools/geoai-task-mcp/vscode-extension/media/style.css",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_vscode_release_b853.py"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_selected_task_live_output_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_model_diagnostics_b855.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_init_repo_b855.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_selected_task_live_output_b855_v1.json"
+  ],
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_selected_task_live_output_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_model_diagnostics_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_init_repo_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_release_b853.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "slice",
+      "bundle_type": "feature",
+      "query": "ProcessManager collect status selected task dashboard MCP VS Code live stdout stderr",
+      "budget": 120,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+        "tools/geoai-task-mcp/src/aiworkhub/dashboard.py",
+        "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+        "tools/geoai-task-mcp/vscode-extension/extension.js"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub selected-task live CLI output",
+      "limit": 6
+    },
+    "ai_memory": {
+      "query": "AIWorkHub process output security bounded tail dashboard",
+      "limit": 2
+    },
+    "kb": {
+      "query": "AIWorkHub process launcher collect output contract",
+      "limit": 2
+    }
+  },
+  "commit_contract": "NO_COMMIT. Stop at Codex review."
+}

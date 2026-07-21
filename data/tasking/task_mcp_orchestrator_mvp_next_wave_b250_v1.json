@@ -13,13 +13,13 @@
   "proposed_next_wave_tasks": [
     {
       "candidate_id": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_NEXT",
-      "goal": "Wire geoai_supervisor_loop_status per task_mcp_supervisor_loop_status_tool_b08_v1.future_source_patch_paths (add core.supervisor_loop_status() pure function + one @mcp.tool() registration in server.py). Real source patch, gated by a fresh collision check against whatever the in-flight B11 workflow leaves in core.py/server.py.",
+      "goal": "Wire aiworkhub_supervisor_loop_status per task_mcp_supervisor_loop_status_tool_b08_v1.future_source_patch_paths (add core.supervisor_loop_status() pure function + one @mcp.tool() registration in server.py). Real source patch, gated by a fresh collision check against whatever the in-flight B11 workflow leaves in core.py/server.py.",
       "why_genuine": "B08's contract, derivation_algorithm, and 6 smoke_cases are already fully specified and PASS-gated; only the wiring step is outstanding. Leaving a fully-specified, gate-passed tool unwired is exactly the 'validated but not wired' anti-pattern the project's empirical-governance rule forbids.",
       "blocked_on": "B11 in-flight core.py/server.py patch must land or be reconciled first to avoid a two-writer collision on the same files."
     },
     {
       "candidate_id": "CLAUDE_TASK_MCP_LIVE_TOOL_INVENTORY_REVERIFY_NEXT",
-      "goal": "Once B11 lands, re-run a live MCP tool listing (geoai_task_health or an MCP client introspection call) and bump every frozen tool-count assertion (test_mcp_stdio_subprocess_client_smoke_b109_v1.sh, test_mcp_stdio_concurrent_client_smoke_b110_v1.sh, test_mvp_contract_audit_v1.sh, README.md 'Exposed Tools') to the new real count in one coordinated patch.",
+      "goal": "Once B11 lands, re-run a live MCP tool listing (aiworkhub_task_health or an MCP client introspection call) and bump every frozen tool-count assertion (test_mcp_stdio_subprocess_client_smoke_b109_v1.sh, test_mcp_stdio_concurrent_client_smoke_b110_v1.sh, test_mvp_contract_audit_v1.sh, README.md 'Exposed Tools') to the new real count in one coordinated patch.",
       "why_genuine": "This protocol's own tool_authority_tiers deliberately did NOT hardcode a single 'current total N' because the live tree is mid-patch; the four listed pre-existing test failures are already documented as stale-assertion drift, not fixed. A dedicated task can close that drift once the tree is stable, instead of each new tool-adding task silently widening the gap."
     },
     {
@@ -34,12 +34,12 @@
     },
     {
       "candidate_id": "CLAUDE_TASK_MCP_DEFAULT_REPO_SUBMODULE_NEUTRALITY_NEXT",
-      "goal": "Remove core.py:13's hardcoded '/home/shrek/GeoAI' DEFAULT_REPO fallback (mvp_contract_audit_v1 finding F2) so per_project_isolation's cwd-pin is genuinely parameterized, not owner-path-specific, ahead of the MVP_ROADMAP Phase 3 submodule conversion.",
-      "why_genuine": "Directly blocks this protocol's own per_project_isolation claim of 'parameterized repo root, not literal multi-tenant' from being fully true; currently only true when GEOAI_REPO is explicitly set."
+      "goal": "Remove core.py:13's hardcoded '/home/shrek/AIWorkHub' DEFAULT_REPO fallback (mvp_contract_audit_v1 finding F2) so per_project_isolation's cwd-pin is genuinely parameterized, not owner-path-specific, ahead of the MVP_ROADMAP Phase 3 submodule conversion.",
+      "why_genuine": "Directly blocks this protocol's own per_project_isolation claim of 'parameterized repo root, not literal multi-tenant' from being fully true; currently only true when AIWORKHUB_REPO is explicitly set."
     }
   ],
   "not_created_as_taskctl_cards": true,
-  "rollback": "Delete this file; it proposes no code change and is referenced by nothing outside tools/geoai-task-mcp/data/tasking/.",
+  "rollback": "Delete this file; it proposes no code change and is referenced by nothing outside tools/aiworkhub/data/tasking/.",
   "neural_bridge_note": {
     "migration_task_id": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
     "curriculum_path": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",

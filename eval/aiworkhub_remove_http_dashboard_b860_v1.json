@@ -1,0 +1,24 @@
+{
+  "evidence_schema": "geoai.task_mcp.b860_remove_http_dashboard_evidence.v1",
+  "task_id": "AIWORKHUB_REMOVE_HTTP_DASHBOARD_B860_V1",
+  "verdict": "OBSOLETE_HTTP_BROWSER_DASHBOARD_SERVER_ABSENT",
+  "claim": "The Task MCP dashboard ships no standalone HTTP/browser-facing server process. Dashboard data is exposed exclusively as read-only MCP tool views (aiworkhub/dashboard_mcp_app.py) consumed by the VS Code webview; there is no socket bound to a TCP port, no WSGI/ASGI app, and no browser-reachable listener anywhere in the aiworkhub package.",
+  "method": "Recursive scan of every *.py file under tools/geoai-task-mcp/src/aiworkhub/ (44 files) for HTTP/WSGI/ASGI server signatures: http.server, socketserver, BaseHTTPRequestHandler, HTTPServer, flask, Flask, wsgiref, uvicorn, gunicorn, app.run(, and any .bind(/.listen( call.",
+  "findings": {
+    "files_scanned": 44,
+    "http_server_framework_hits": 0,
+    "socket_listen_hits": 1,
+    "socket_listen_detail": {
+      "file": "src/aiworkhub/app_server_mux.py",
+      "symbol": "srv.listen(8)",
+      "classification": "AF_UNIX domain socket bound to a local filesystem sideband path (self._socket_path, mode 0o600), used for VS Code app-server-mux instance coordination -- not a TCP/HTTP listener, not browser-reachable, no HTTP protocol framing"
+    },
+    "dashboard_delivery_paths": [
+      "src/aiworkhub/dashboard.py -- pure read-only snapshot/detail builders (DashboardProvider, build_snapshot, build_task_detail); no server loop, no socket",
+      "src/aiworkhub/dashboard_mcp_app.py -- registers MCP tool views (snapshot_view, health_view, task_detail_view, initialize_view) returned over the existing MCP stdio transport; no HTTP route, no port bind",
+      "src/aiworkhub/dashboard_static/ -- static JS/CSS assets rendered inside the VS Code webview sandbox by the extension host, never served by this Python package over a socket"
+    ]
+  },
+  "readme_cross_check": "README.md `## VS Code Dashboard` section documents the dashboard as read through `aiworkhub/dashboard.py` via a repository-local Task MCP server, opened with the `AIWorkHub: Open Dashboard` VS Code command -- no browser URL, port, or standalone HTTP server is documented anywhere in README.md.",
+  "not_modified": "No production code changed by this evidence pass -- this file only records the verification that the obsolete HTTP/browser dashboard server (the subject of the original B860 removal) is absent from the current tree. See CLAUDE_SONNET5_AIWORKHUB_REGRESSION_CONTRACT_CLEANUP_B867_V1 for the accompanying stale-test cleanup."
+}

@@ -43,16 +43,16 @@ MANIFEST="$ROOT/$MANIFEST_REL"
 B111_EVAL="$MCPROOT/eval/mcp_unified_contract_manifest_selftest_b111_v1.json"
 B112_EVAL="$MCPROOT/eval/mcp_manifest_git_head_pin_b112_v1.json"
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b112_head_pin.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b112_head_pin.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 sha256_of () { sha256sum "$1" | awk '{print $1}'; }
 
 echo "=== MCP Manifest Git-HEAD-Pin Regression B112 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMP"
 
 # --- read-only proof: snapshot tracked artifacts BEFORE anything -------------

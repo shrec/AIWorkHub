@@ -4,15 +4,15 @@
 Proves:
   * launch is impossible / not implemented -- no env flag can enable it
   * the plan tool is strictly READ-ONLY: it appends NO audit entry and mutates
-    NO queue state, even with GEOAI_TASK_MCP_ALLOW_WRITES=1
+    NO queue state, even with AIWORKHUB_ALLOW_WRITES=1
   * only allowlisted commands validate; everything else is blocked
   * env VALUES (incl. secrets) are redacted in plan / report / audit output
   * the audit-summary view is read-only (reads, never appends)
   * register(mcp) exposes exactly the read-only tool surface, no more
   * the module contains NO process-launch/exec/shell code
 
-Isolation: writes only to a per-test mktemp audit path; honors GEOAI_REPO /
-GEOAI_TASK_MCP_AUDIT_LOG_PATH env overrides; mutates no shared artifact. Safe
+Isolation: writes only to a per-test mktemp audit path; honors AIWORKHUB_REPO /
+AIWORKHUB_AUDIT_LOG_PATH env overrides; mutates no shared artifact. Safe
 under parallel execution.
 """
 
@@ -62,7 +62,7 @@ class _StubMCP:
 
 
 def _repo_root() -> Path:
-    return Path(os.environ.get("GEOAI_REPO", str(Path(__file__).resolve().parents[3])))
+    return Path(os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[3])))
 
 
 def _count_lines(path: Path) -> int:
@@ -74,14 +74,14 @@ def _count_lines(path: Path) -> int:
 def main() -> int:
     repo = _repo_root()
 
-    with tempfile.TemporaryDirectory(prefix="geoai_cli_adapter_readonly_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="aiworkhub_cli_adapter_readonly_") as tmpdir:
         audit_path = Path(tmpdir) / "audit.jsonl"
-        os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_path)
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ["GEOAI_REPO"] = str(repo)
+        os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_path)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ["AIWORKHUB_REPO"] = str(repo)
 
-        from geoai_task_mcp import cli_adapter_readonly_tool as mod
-        from geoai_task_mcp import core
+        from aiworkhub import cli_adapter_readonly_tool as mod
+        from aiworkhub import core
 
         # Seed the audit log with one pre-existing entry via the parent writer,
         # so we can later prove the read-only tool does NOT append.
@@ -95,8 +95,8 @@ def main() -> int:
         assert mod.LAUNCH_IMPLEMENTED is False
         assert mod.launch_enabled() is False
         # Even setting would-be enable flags cannot turn launch on.
-        os.environ["GEOAI_TASK_MCP_ALLOW_LAUNCH"] = "1"
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+        os.environ["AIWORKHUB_ALLOW_LAUNCH"] = "1"
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "1"
         assert mod.launch_enabled() is False, "launch must stay impossible even with flags set"
         assert mod.LAUNCH_IMPLEMENTED is False
 
@@ -140,8 +140,8 @@ def main() -> int:
         assert plan_ok["redacted_env"]["PATH"] == "<set>"
 
         # restore write gate OFF for the remainder
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ.pop("GEOAI_TASK_MCP_ALLOW_LAUNCH", None)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ.pop("AIWORKHUB_ALLOW_LAUNCH", None)
 
         # --- 5. READ-ONLY plan (invalid) -> blocked, still no write ---
         before = _count_lines(audit_path)
@@ -167,7 +167,7 @@ def main() -> int:
 
         # --- 7. Secret redaction helper: values never leak ---
         redacted = mod.redact_env({
-            "GEOAI_TASK_MCP_TOKEN": "tok-DEADBEEF",
+            "AIWORKHUB_TOKEN": "tok-DEADBEEF",
             "ANTHROPIC_AUTH": "priv-XYZ",
             "PYTHONPATH": "/opt/x",
             "EMPTYVAR": "",
@@ -175,7 +175,7 @@ def main() -> int:
         blob = json.dumps(redacted)
         for secret_value in ("tok-DEADBEEF", "priv-XYZ", "/opt/x"):
             assert secret_value not in blob, f"env value leaked: {secret_value!r}"
-        assert redacted["GEOAI_TASK_MCP_TOKEN"] == "<redacted-secret>"
+        assert redacted["AIWORKHUB_TOKEN"] == "<redacted-secret>"
         assert redacted["ANTHROPIC_AUTH"] == "<redacted-secret>"
         assert redacted["PYTHONPATH"] == "<set>"
         assert redacted["EMPTYVAR"] == "<unset>"

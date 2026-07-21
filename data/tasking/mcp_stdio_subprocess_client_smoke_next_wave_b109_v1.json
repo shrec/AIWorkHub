@@ -3,7 +3,7 @@
   "parent_task": "CLAUDE_TASK_MCP_STDIO_SUBPROCESS_CLIENT_SMOKE_B109_V1",
   "date": "2026-07-04",
   "status": "proposed_not_queued",
-  "notes": "PROPOSAL only, NOT enqueued into any live queue (worker does NOT create tasks via taskctl; Codex triages). B109 extended the B108 in-memory client smoke to a REAL out-of-process stdio transport: it launches ONLY the geoai-task-mcp server (sys.executable -m geoai_task_mcp.server) via mcp.client.stdio.stdio_client + StdioServerParameters and drives it through a real mcp.ClientSession over OS pipes (initialize/tools_list/tools_call), no shell=True, no agent/model launch. Over the pipe it re-proved the SAME frozen contract v1: 11 read-only + 4 write-gated tools visible (15 total), all input-schema sha256 fingerprints byte-identical to B108, deterministic across two independent subprocess sessions, and zero queue/audit writes with GEOAI_TASK_MCP_ALLOW_WRITES unset AND =1 in the child (byte-identical empty isolated audit dir, parent queue verify-intact). frozen_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/agent_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. No launch is enabled beyond the server subprocess itself and none is proposed until the FINAL gated executor, behind ALL launch_preconditions plus ALLOW_LAUNCH=1 AND ALLOW_WRITES=1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
+  "notes": "PROPOSAL only, NOT enqueued into any live queue (worker does NOT create tasks via taskctl; Codex triages). B109 extended the B108 in-memory client smoke to a REAL out-of-process stdio transport: it launches ONLY the aiworkhub server (sys.executable -m aiworkhub.server) via mcp.client.stdio.stdio_client + StdioServerParameters and drives it through a real mcp.ClientSession over OS pipes (initialize/tools_list/tools_call), no shell=True, no agent/model launch. Over the pipe it re-proved the SAME frozen contract v1: 11 read-only + 4 write-gated tools visible (15 total), all input-schema sha256 fingerprints byte-identical to B108, deterministic across two independent subprocess sessions, and zero queue/audit writes with AIWORKHUB_ALLOW_WRITES unset AND =1 in the child (byte-identical empty isolated audit dir, parent queue verify-intact). frozen_contract_v1=true, but authority_flags (contract_frozen/process_launch_authority/agent_launch_authority/write_gate_enabled/runtime_authority/default_authority) remain FALSE at worker scope: Codex review finalizes any authority. No launch is enabled beyond the server subprocess itself and none is proposed until the FINAL gated executor, behind ALL launch_preconditions plus ALLOW_LAUNCH=1 AND ALLOW_WRITES=1. Adapter/runner/topic SELECTION must become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1), never a regex/keyword cue router.",
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_STDIO_RESULT_SCHEMA_FREEZE_B110_V1",
@@ -11,9 +11,9 @@
       "goal": "Complement B109 (which froze inputSchema over stdio) by freezing the read-only tools' OUTPUT/result contract over the SAME real stdio pipe. Snapshot a canonical, value-independent key/type skeleton of each read-only tool's structured result (normalize volatile fields: paths/pids/counts/timestamps/rc) and byte-freeze its fingerprint so an accidental output-shape change is caught out-of-process. Read-only; only the MCP server is launched; no queue/audit write; no shell.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_result_schema_freeze.py",
-        "tools/geoai-task-mcp/tests/test_mcp_stdio_result_schema_freeze_b110_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_stdio_result_schema_freeze_b110_v1.json"
+        "tools/aiworkhub/tests/mcp_stdio_result_schema_freeze.py",
+        "tools/aiworkhub/tests/test_mcp_stdio_result_schema_freeze_b110_v1.sh",
+        "tools/aiworkhub/eval/mcp_stdio_result_schema_freeze_b110_v1.json"
       ],
       "acceptance": [
         "each read-only tool's structured-result key/type skeleton frozen by fingerprint over real stdio pipes",
@@ -27,9 +27,9 @@
       "goal": "Prove the stdio contract holds under concurrency: open TWO independent stdio_client subprocess sessions to the server at once and drive read-only tools_call from both, asserting the SAME frozen fingerprints, no cross-session state bleed, and the SAME no-write proof (ALLOW_WRITES unset AND =1) per isolated audit dir. Each launched process is only the MCP server; no agent/model; no shell.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py",
-        "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_stdio_concurrent_client_smoke_b110_v1.json"
+        "tools/aiworkhub/tests/mcp_stdio_concurrent_client_smoke.py",
+        "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+        "tools/aiworkhub/eval/mcp_stdio_concurrent_client_smoke_b110_v1.json"
       ],
       "acceptance": [
         "two concurrent stdio subprocess sessions both see frozen fingerprints, no state bleed",
@@ -44,7 +44,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->adapter/runner/topic routing + abstain labels",

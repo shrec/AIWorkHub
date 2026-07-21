@@ -22,19 +22,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_readonly_wiring_sh.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_readonly_wiring_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$TMPDIR_STATE/audit.jsonl"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_AUDIT_LOG_PATH="$TMPDIR_STATE/audit.jsonl"
 
 echo "=== Readonly Tool Server Wiring Test B107 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "STATE_DIR=$TMPDIR_STATE"
 
 # --- 0. server.py source contains no process-launch code ------------------
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
 for pat in "subprocess" "os.system" "os.popen" "os.exec" "os.fork" "os.spawn" "Popen(" "shell=True" "pty.spawn"; do
     if grep -Fq -- "$pat" "$SERVER_SRC"; then
         echo "FAIL: forbidden launch pattern '$pat' found in server.py"
@@ -52,10 +52,10 @@ from pathlib import Path
 
 import jsonschema
 
-from geoai_task_mcp import server
-from geoai_task_mcp import cli_adapter_readonly_tool as ro
+from aiworkhub import server
+from aiworkhub import cli_adapter_readonly_tool as ro
 
-AUDIT = Path(os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"])
+AUDIT = Path(os.environ["AIWORKHUB_AUDIT_LOG_PATH"])
 STATE_DIR = AUDIT.parent
 
 
@@ -88,8 +88,8 @@ print("PASS: exactly 3 read-only tools registered:", sorted(ro_names))
 
 # server did not lose its own pre-existing tools (additive wiring, not a
 # takeover of the FastMCP instance).
-assert "geoai_task_health" in tools_by_name
-assert "geoai_task_audit_log_read" in tools_by_name
+assert "aiworkhub_task_health" in tools_by_name
+assert "aiworkhub_task_audit_log_read" in tools_by_name
 print("PASS: pre-existing server tools still registered (additive wiring)")
 
 # --- 2. schemas serialize to valid JSON schema -----------------------------
@@ -105,12 +105,12 @@ print("PASS: all 3 tool input schemas are valid JSON schema")
 
 # --- 3. no writes with ALLOW_WRITES unset AND with ALLOW_WRITES=1 ----------
 calls = {
-    "geoai_cli_adapter_plan_readonly": {
+    "aiworkhub_cli_adapter_plan_readonly": {
         "task_id": "B107-T1", "runner": "test_runner", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["claude", "-p", "hi"],
     },
-    "geoai_cli_adapter_audit_summary_readonly": {"max_entries": 10},
-    "geoai_cli_adapter_report_readonly": {
+    "aiworkhub_cli_adapter_audit_summary_readonly": {"max_entries": 10},
+    "aiworkhub_cli_adapter_report_readonly": {
         "task_id": "B107-T2", "runner": "test_runner", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["codex", "exec", "review"],
     },
@@ -119,10 +119,10 @@ calls = {
 
 def _run_round(allow_writes):
     if allow_writes is None:
-        os.environ.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+        os.environ.pop("AIWORKHUB_ALLOW_WRITES", None)
         label = "<unset>"
     else:
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = allow_writes
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = allow_writes
         label = allow_writes
     before = _snapshot()
     for name, args in calls.items():
@@ -134,7 +134,7 @@ def _run_round(allow_writes):
         f"state dir mutated with ALLOW_WRITES={label}: before={before} after={after}"
     )
     assert after == [], f"state dir not empty with ALLOW_WRITES={label}: {after}"
-    print(f"PASS: no writes with GEOAI_TASK_MCP_ALLOW_WRITES={label} "
+    print(f"PASS: no writes with AIWORKHUB_ALLOW_WRITES={label} "
           f"(state snapshot: {after})")
 
 

@@ -7,7 +7,7 @@
   "runner": "claude_task_mcp_launch_disabled_queue_b117",
   "topic": "task_mcp",
   "verdict": "PASS",
-  "summary": "Added a pure, disabled-by-default MCP launch-queue CONTRACT module launch_queue_contract.py: defines the launch-request, process-state, process-log, and result-handoff schemas; represents/enqueues launch INTENTS; checks explicit env gates (GEOAI_TASK_MCP_ALLOW_LAUNCH + GEOAI_TASK_MCP_ALLOW_WRITES, both default '0' = disabled); and offers dry-run description only. It launches NOTHING: no subprocess/exec/fork/shell code, no network/API call, and no env flag can start a process because LAUNCH_IMPLEMENTED is a constant False. attempt_start() ALWAYS raises LaunchDisabledError. describe_intent()/evaluate_launch()/enqueue_intent() are side-effect-free (write nothing to disk); persistence + audit are deferred to the gated phase. workflow_switch and parent-queue mutation stay False.",
+  "summary": "Added a pure, disabled-by-default MCP launch-queue CONTRACT module launch_queue_contract.py: defines the launch-request, process-state, process-log, and result-handoff schemas; represents/enqueues launch INTENTS; checks explicit env gates (AIWORKHUB_ALLOW_LAUNCH + AIWORKHUB_ALLOW_WRITES, both default '0' = disabled); and offers dry-run description only. It launches NOTHING: no subprocess/exec/fork/shell code, no network/API call, and no env flag can start a process because LAUNCH_IMPLEMENTED is a constant False. attempt_start() ALWAYS raises LaunchDisabledError. describe_intent()/evaluate_launch()/enqueue_intent() are side-effect-free (write nothing to disk); persistence + audit are deferred to the gated phase. workflow_switch and parent-queue mutation stay False.",
   "gates": {
     "default_state_disabled": true,
     "launch_attempt_without_env_gate_refused": true,
@@ -35,15 +35,15 @@
   "invariant": {
     "launch_implemented": false,
     "launch_enabled_by_default": false,
-    "launch_enable_flag_has_no_effect_in_this_contract": "even GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1 cannot start a process; no launcher exists here (LAUNCH_IMPLEMENTED=False)",
-    "future_launch_requires_both_gates": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1",
+    "launch_enable_flag_has_no_effect_in_this_contract": "even AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1 cannot start a process; no launcher exists here (LAUNCH_IMPLEMENTED=False)",
+    "future_launch_requires_both_gates": "AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1",
     "env_gate_default": "0 (off)",
     "workflow_switch_enabled": false,
     "parent_queue_mutation_enabled": false
   },
   "env_gates": {
-    "allow_launch_env": "GEOAI_TASK_MCP_ALLOW_LAUNCH",
-    "allow_writes_env": "GEOAI_TASK_MCP_ALLOW_WRITES",
+    "allow_launch_env": "AIWORKHUB_ALLOW_LAUNCH",
+    "allow_writes_env": "AIWORKHUB_ALLOW_WRITES",
     "default": "0",
     "both_required_for_future_launch": true
   },
@@ -90,14 +90,14 @@
   "neural_bridge_note": "Static command/adapter allowlists are human-configured SAFETY boundaries, not a runtime cue router. Future adapter/runner/topic launch selection must become a LEARNED routing + abstain policy tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1; no regex/keyword cognition becomes launch authority.",
   "no_launch_code_marker": "This module and its tests contain NO process-launch code: no subprocess import, no child-process spawn, no os-level exec/fork, no shell invocation, no network/API call. Launch/process code arrives only in the gated Phase-2 follow-up (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_B106_V1) behind all launch_preconditions.",
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-    "tools/geoai-task-mcp/tests/launch_disabled_queue_contract_smoke.py",
-    "tools/geoai-task-mcp/tests/test_launch_disabled_queue_contract_b117_v1.sh",
-    "tools/geoai-task-mcp/eval/launch_disabled_queue_contract_b117_v1.json",
-    "tools/geoai-task-mcp/data/tasking/launch_disabled_queue_contract_next_wave_b117_v1.json"
+    "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+    "tools/aiworkhub/tests/launch_disabled_queue_contract_smoke.py",
+    "tools/aiworkhub/tests/test_launch_disabled_queue_contract_b117_v1.sh",
+    "tools/aiworkhub/eval/launch_disabled_queue_contract_b117_v1.json",
+    "tools/aiworkhub/data/tasking/launch_disabled_queue_contract_next_wave_b117_v1.json"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_launch_disabled_queue_contract_b117_v1.sh -> PASS",
+    "bash tools/aiworkhub/tests/test_launch_disabled_queue_contract_b117_v1.sh -> PASS",
     "python3 AITools/taskctl.py verify -> PASS"
   ]
 }

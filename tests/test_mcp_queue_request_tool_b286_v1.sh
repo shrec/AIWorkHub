@@ -8,19 +8,19 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 export PYTHONPATH="$REPO/tools/geoai-task-mcp/src"
-export GEOAI_REPO="$REPO"
-export GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH="$TMPDIR/launch_queue_audit.jsonl"
-unset GEOAI_TASK_MCP_ALLOW_WRITES
+export AIWORKHUB_REPO="$REPO"
+export AIWORKHUB_LAUNCH_QUEUE_LOG_PATH="$TMPDIR/launch_queue_audit.jsonl"
+unset AIWORKHUB_ALLOW_WRITES
 
 python3 - <<'PY'
 import json
 import os
 from pathlib import Path
 
-from geoai_task_mcp import core, launch_queue_contract
+from aiworkhub import core, launch_queue_contract
 
-repo = Path(os.environ["GEOAI_REPO"])
-log_path = Path(os.environ["GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH"])
+repo = Path(os.environ["AIWORKHUB_REPO"])
+log_path = Path(os.environ["AIWORKHUB_LAUNCH_QUEUE_LOG_PATH"])
 eval_path = repo / "tools/geoai-task-mcp/eval/mcp_queue_request_tool_b286_v1.json"
 
 requested_at = "2026-07-09T00:00:00+00:00"
@@ -41,7 +41,7 @@ assert gate_off["ok"] is False, gate_off
 assert gate_off["persisted_entry"] is None, gate_off
 assert not log_path.exists(), "write gate off must not create launch log"
 
-os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+os.environ["AIWORKHUB_ALLOW_WRITES"] = "1"
 first = core.queue_request(
     task_id=task_id,
     runner="claude_task_mcp_queue_request_b286",
@@ -102,7 +102,7 @@ assert bad["ok"] is False and bad["persisted_entry"] is None
 assert "unknown_adapter" in bad["blocked_reason"]
 
 doc = {
-    "schema_id": "geoai.mcp_queue_request_tool.b286.v1",
+    "schema_id": "aiworkhub.mcp_queue_request_tool.b286.v1",
     "task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1",
     "runner": "claude_task_mcp_queue_request_b286",
     "topic": "task_mcp",

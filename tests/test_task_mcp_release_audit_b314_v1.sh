@@ -124,7 +124,7 @@ echo "=== Test 3: Release blocking findings resolved ==="
 
 # F001: sanitized_env used in _launch_direct_for_tests (code, not comment)
 python3 << 'PYF001'
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/process_launcher.py") as f:
     lines = f.readlines()
 in_func = False; found_sanitized = False; found_copy_code = False
 for line in lines:
@@ -145,11 +145,11 @@ PYF001
 pass_test "T3_F001_sanitized_env_direct" || fail_test "T3_F001_sanitized_env_direct" "check failed"
 
 # F002: coordinator token late-binding
-grep -q 'refresh_coordinator_config()' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/__init__.py" && pass_test "T3_F002_coordinator_late_bind" || fail_test "T3_F002_coordinator_late_bind" "not found"
+grep -q 'refresh_coordinator_config()' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/__init__.py" && pass_test "T3_F002_coordinator_late_bind" || fail_test "T3_F002_coordinator_late_bind" "not found"
 
 # F003: sanitized_env builds from explicit keys (no os.environ.copy in function body)
 python3 << 'PYF003'
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py") as f:
     content = f.read()
 idx = content.find('def sanitized_env')
 assert idx != -1
@@ -163,11 +163,11 @@ PYF003
 pass_test "T3_F003_sanitized_env_clean" || fail_test "T3_F003_sanitized_env_clean" "check failed"
 
 # F004: bubblewrap_home_env_value
-grep -q 'bubblewrap_home_env_value' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py" && pass_test "T3_F004_home_source" || fail_test "T3_F004_home_source" "not found"
+grep -q 'bubblewrap_home_env_value' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py" && pass_test "T3_F004_home_source" || fail_test "T3_F004_home_source" "not found"
 
 # F007: unlink_if_regular has is_symlink check
 python3 << 'PYF007'
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py") as f:
     content = f.read()
 idx = content.find('def unlink_if_regular')
 assert idx != -1
@@ -179,10 +179,10 @@ PYF007
 pass_test "T3_F007_unlink_is_symlink" || fail_test "T3_F007_unlink_is_symlink" "check failed"
 
 # F008: _safe_tail uses O_NOFOLLOW
-grep -q 'O_NOFOLLOW' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py" && pass_test "T3_F008_o_nofollow" || fail_test "T3_F008_o_nofollow" "not found"
+grep -q 'O_NOFOLLOW' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/process_launcher.py" && pass_test "T3_F008_o_nofollow" || fail_test "T3_F008_o_nofollow" "not found"
 
 # F009: _pid_matches uses _pid_start_ticks
-grep -q '_pid_start_ticks' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py" && pass_test "T3_F009_pid_ticks" || fail_test "T3_F009_pid_ticks" "not found"
+grep -q '_pid_start_ticks' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/process_launcher.py" && pass_test "T3_F009_pid_ticks" || fail_test "T3_F009_pid_ticks" "not found"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -214,16 +214,16 @@ echo ""
 # Test 5: Exact 33-tool freeze
 # ---------------------------------------------------------------------------
 echo "=== Test 5: Exact 33-tool freeze ==="
-TOOL_COUNT_SERVER=$(grep -c '@mcp.tool()' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/server.py" 2>/dev/null || echo 0)
+TOOL_COUNT_SERVER=$(grep -c '@mcp.tool()' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/server.py" 2>/dev/null || echo 0)
 CLI_ADAPTER_TOOLS=3
 TOTAL_TOOLS=$((TOOL_COUNT_SERVER + CLI_ADAPTER_TOOLS))
 [ "$TOTAL_TOOLS" -eq 33 ] && pass_test "T5_count_33 ($TOOL_COUNT_SERVER+$CLI_ADAPTER_TOOLS)" || fail_test "T5_count_33" "got $TOTAL_TOOLS"
 
-grep -q 'cli_adapter_readonly_tool.register(mcp)' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/server.py" && pass_test "T5_cli_adapter_registered" || fail_test "T5_cli_adapter_registered" "not found"
+grep -q 'cli_adapter_readonly_tool.register(mcp)' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/server.py" && pass_test "T5_cli_adapter_registered" || fail_test "T5_cli_adapter_registered" "not found"
 
 python3 << 'PYT5'
 import re
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/server.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/server.py") as f:
     content = f.read()
 pattern = r'@mcp\.tool\(\)\s*\ndef\s+(\w+)\((.*?)\)'
 matches = re.findall(pattern, content, re.DOTALL)
@@ -316,13 +316,13 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "=== Test 8: Source file evidence ==="
 for src in \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/worker_supervisor.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/core.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/server.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py" \
-  "tools/geoai-task-mcp/src/geoai_task_mcp/__init__.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/worker_supervisor.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/core.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/server.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/dashboard.py" \
+  "tools/geoai-task-mcp/src/aiworkhub/__init__.py" \
   "AITools/taskctl.py"; do
   [ -f "$REPO_ROOT/$src" ] && pass_test "T8_${src##*/}" || fail_test "T8_${src##*/}" "missing"
 done
@@ -355,8 +355,8 @@ echo ""
 # Test 11: Host/Origin checks
 # ---------------------------------------------------------------------------
 echo "=== Test 11: Host/Origin checks ==="
-grep -q '127.0.0.1' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py" && pass_test "T11_dashboard_localhost" || fail_test "T11_dashboard_localhost" "not found"
-grep -q 'FastMCP' "$REPO_ROOT/tools/geoai-task-mcp/src/geoai_task_mcp/server.py" && pass_test "T11_server_stdio" || fail_test "T11_server_stdio" "not found"
+grep -q '127.0.0.1' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/dashboard.py" && pass_test "T11_dashboard_localhost" || fail_test "T11_dashboard_localhost" "not found"
+grep -q 'FastMCP' "$REPO_ROOT/tools/geoai-task-mcp/src/aiworkhub/server.py" && pass_test "T11_server_stdio" || fail_test "T11_server_stdio" "not found"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -375,14 +375,14 @@ checks = {
     'unlink_is_symlink': False,
     'pid_ticks': False,
 }
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/process_launcher.py") as f:
     c = f.read()
     checks['sanitized_env_in_direct'] = 'sanitized_env(adapter_id)' in c
     checks['O_NOFOLLOW'] = 'O_NOFOLLOW' in c
     checks['pid_ticks'] = '_pid_matches' in c
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/__init__.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/__init__.py") as f:
     checks['coordinator_late_bind'] = 'refresh_coordinator_config()' in f.read()
-with open("tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py") as f:
+with open("tools/geoai-task-mcp/src/aiworkhub/worker_workspace.py") as f:
     c = f.read()
     checks['bubblewrap_home'] = 'bubblewrap_home_env_value' in c
     checks['unlink_is_symlink'] = 'is_symlink()' in c

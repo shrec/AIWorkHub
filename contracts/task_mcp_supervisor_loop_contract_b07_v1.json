@@ -10,8 +10,8 @@
     "runner_topic_allowlist_design_b118_v1",
     "runner_topic_allowlist_patch_b06_v1"
   ],
-  "purpose": "Define the minimal SAFE MCP supervisor loop contract for Codex-managed worker pickup/review/result reporting: Codex -> MCP -> worker CLI -> MCP -> Codex. This artifact is design/schema ONLY. It adds no server wiring, no subprocess/exec/fork/shell/network code, and it patches NO source file. It does not enable real process launch and does not mutate any task status; every task-status write stays behind the pre-existing GEOAI_TASK_MCP_ALLOW_WRITES gate plus (for task_mcp-topic runners) the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check, both entirely unchanged by this task.",
-  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/geoai-task-mcp/src/. No .py file is created or modified by this task. tools/geoai-task-mcp is a nested git repo shared with other concurrent workers; any dirty src/ files observed at task time belong to OTHER in-flight tasks, not this one.",
+  "purpose": "Define the minimal SAFE MCP supervisor loop contract for Codex-managed worker pickup/review/result reporting: Codex -> MCP -> worker CLI -> MCP -> Codex. This artifact is design/schema ONLY. It adds no server wiring, no subprocess/exec/fork/shell/network code, and it patches NO source file. It does not enable real process launch and does not mutate any task status; every task-status write stays behind the pre-existing AIWORKHUB_ALLOW_WRITES gate plus (for task_mcp-topic runners) the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check, both entirely unchanged by this task.",
+  "no_source_patch_marker": "This task's allowed_writes contains zero paths under tools/aiworkhub/src/. No .py file is created or modified by this task. tools/aiworkhub is a nested git repo shared with other concurrent workers; any dirty src/ files observed at task time belong to OTHER in-flight tasks, not this one.",
 
   "flow_overview": "One supervised loop = 4 legs, always starting and ending at Codex. Codex requests a dispatch (leg 1); the MCP server would hand an argv template to a worker CLI process (leg 2, NEVER executed under this or any current contract); the worker CLI would report completion back to the MCP server (leg 3, unreachable in dryrun-only mode because no worker is ever really launched); and Codex polls status and performs the real finalization via taskctl OUTSIDE this MCP boundary (leg 4). Only legs 1 and 4 are ever exercised for real today; legs 2 and 3 are schema-reserved for the future gated launch executor.",
 
@@ -21,8 +21,8 @@
       "name": "codex_to_mcp_dispatch_request",
       "actor_from": "codex",
       "actor_to": "mcp_server",
-      "mcp_tool": "geoai_agent_launch_task",
-      "reused_from": "agent_launcher_mvp_b02_v1.tools.geoai_agent_launch_task",
+      "mcp_tool": "aiworkhub_agent_launch_task",
+      "reused_from": "agent_launcher_mvp_b02_v1.tools.aiworkhub_agent_launch_task",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
         "runner": {"type": "string", "required": true},
@@ -66,8 +66,8 @@
       "name": "worker_cli_to_mcp_result_report",
       "actor_from": "worker_cli",
       "actor_to": "mcp_server",
-      "mcp_tool": "geoai_agent_collect_result",
-      "reused_from": "agent_launcher_mvp_b02_v1.tools.geoai_agent_collect_result",
+      "mcp_tool": "aiworkhub_agent_collect_result",
+      "reused_from": "agent_launcher_mvp_b02_v1.tools.aiworkhub_agent_collect_result",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
         "request_id": {"type": "string", "required": false},
@@ -86,7 +86,7 @@
         "supervisor_state": {"type": "supervisor_state", "enum": ["worker_review_ready", "blocked"], "const_reachable_value_in_dryrun": "worker_review_ready is reported here only as an OBSERVATION of leg-2's external transition, never CAUSED by this call"},
         "error": {"type": ["object", "null"], "shape": "error_taxonomy_entry"}
       },
-      "reality_in_this_contract": "Always returns verdict=not_applicable_mvp or pending because no worker process was ever really launched by MCP (leg 2 is never executed). A real worker's own `taskctl review` call is the true signal; it is observed via leg 4 (geoai_agent_task_status), not created by this tool.",
+      "reality_in_this_contract": "Always returns verdict=not_applicable_mvp or pending because no worker process was ever really launched by MCP (leg 2 is never executed). A real worker's own `taskctl review` call is the true signal; it is observed via leg 4 (aiworkhub_agent_task_status), not created by this tool.",
       "lifecycle_transition": "worker_review_ready (report only; no MCP-caused state change)",
       "causer": "none (read-only observation of an already-external transition)"
     },
@@ -95,8 +95,8 @@
       "name": "mcp_to_codex_status_and_handoff",
       "actor_from": "mcp_server",
       "actor_to": "codex",
-      "mcp_tool": "geoai_agent_task_status",
-      "reused_from": "agent_launcher_mvp_b02_v1.tools.geoai_agent_task_status",
+      "mcp_tool": "aiworkhub_agent_task_status",
+      "reused_from": "agent_launcher_mvp_b02_v1.tools.aiworkhub_agent_task_status",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
         "request_id": {"type": "string", "required": false},
@@ -157,7 +157,7 @@
     {"from": "worker_review_ready", "to": "blocked", "trigger": "error_taxonomy match at leg 3/4 (failed_validation)", "leg": 4}
   ],
 
-  "lifecycle_invariant": "These 5 states describe the SUPERVISOR REQUEST's own tracked progress through the loop -- entirely distinct from, and read-only with respect to, the task card's own canonical status/worker_status fields owned exclusively by AITools/taskdb.py and mutated exclusively by AITools/taskctl.py's existing write commands. No tool in this contract writes task_status, worker_status, or any queue row. 'No writes unless explicit future gate' means even the currently-existing gated writes (auto-pickup/review/start/done/usage/export-jsonl) stay behind the pre-existing GEOAI_TASK_MCP_ALLOW_WRITES gate (default '0') and, for task_mcp-topic runners, the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check -- both entirely unchanged by this task.",
+  "lifecycle_invariant": "These 5 states describe the SUPERVISOR REQUEST's own tracked progress through the loop -- entirely distinct from, and read-only with respect to, the task card's own canonical status/worker_status fields owned exclusively by AITools/taskdb.py and mutated exclusively by AITools/taskctl.py's existing write commands. No tool in this contract writes task_status, worker_status, or any queue row. 'No writes unless explicit future gate' means even the currently-existing gated writes (auto-pickup/review/start/done/usage/export-jsonl) stay behind the pre-existing AIWORKHUB_ALLOW_WRITES gate (default '0') and, for task_mcp-topic runners, the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check -- both entirely unchanged by this task.",
 
   "common_types_extended": {
     "supervisor_state": {"enum": ["planned", "dispatched_dryrun", "worker_review_ready", "codex_reviewed", "blocked"]},
@@ -185,7 +185,7 @@
     },
     "no_writes_unless_explicit_future_gate": {
       "enforced": true,
-      "detail": "Every task-status-mutating action stays behind the EXISTING GEOAI_TASK_MCP_ALLOW_WRITES gate (default '0') plus, for task_mcp-topic runners, the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check (core.check_runner_topic_allowlist). This contract adds zero new write paths and does not touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST."
+      "detail": "Every task-status-mutating action stays behind the EXISTING AIWORKHUB_ALLOW_WRITES gate (default '0') plus, for task_mcp-topic runners, the B06 PER_WAVE_RUNNER_TOPIC_ALLOWLIST prefix check (core.check_runner_topic_allowlist). This contract adds zero new write paths and does not touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST."
     }
   },
 
@@ -213,7 +213,7 @@
       "trigger": "The supervisor's cached view of a task card (from an earlier taskctl show/export read) no longer matches the LIVE card when re-checked -- e.g. worker_status flips from unclaimed to claimed by a concurrent runner, or status regresses/advances unexpectedly between reads. This is the same shared-queue TOCTOU race already documented for parallel workers.",
       "detection_point": "leg 1 preflight re-read and leg 4 status re-read, comparing against the previously observed snapshot.",
       "example_reason": "stale_task:worker_status_changed:<task_id>:<observed_before>-><observed_now>",
-      "result": "supervisor_state -> blocked; Codex must re-run geoai_agent_task_status (leg 4) before retrying leg 1."
+      "result": "supervisor_state -> blocked; Codex must re-run aiworkhub_agent_task_status (leg 4) before retrying leg 1."
     },
     "runner_topic_mismatch": {
       "trigger": "The (runner, topic, action) triple fails core.check_runner_topic_allowlist -- unknown pair, malformed token, or action not permitted for that runner/topic.",
@@ -248,7 +248,7 @@
         "launch_enabled": false,
         "launch_implemented": false,
         "shell_invocation": false,
-        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "audit_ref": "tools/aiworkhub/logs/audit.jsonl",
         "blocked_reason": null,
         "supervisor_state": "dispatched_dryrun",
         "error": null
@@ -266,7 +266,7 @@
         "launch_enabled": false,
         "launch_implemented": false,
         "shell_invocation": false,
-        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "audit_ref": "tools/aiworkhub/logs/audit.jsonl",
         "blocked_reason": "runner/topic allowlist denied: unknown_runner_topic_pair",
         "supervisor_state": "blocked",
         "error": {"code": "runner_topic_mismatch", "reason": "runner_topic_mismatch:unknown_runner_topic_pair", "detected_at_leg": 1, "blocked": true}
@@ -305,7 +305,7 @@
   },
 
   "neural_bridge_note": {
-    "doctrine": "Per GeoAI neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This contract adds NO cue router: the lifecycle state machine and error taxonomy are static, human-authored safety/interface boundaries (a request/response shape plus a deterministic classifier reused from core._lifecycle_state), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
+    "doctrine": "Per AIWorkHub neural-control-first doctrine, adapter/runner/topic SELECTION for a real future launch must be a LEARNED routing + abstain decision, never a regex/keyword cue router. This contract adds NO cue router: the lifecycle state machine and error taxonomy are static, human-authored safety/interface boundaries (a request/response shape plus a deterministic classifier reused from core._lifecycle_state), not a cognitive routing decision. Intelligence over which task/adapter/runner to dispatch remains deferred to the tracked migration below.",
     "migration_task_id_unaffected": "MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1",
     "curriculum_path_unaffected": "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
     "not_a_bare_promise": true
@@ -322,7 +322,7 @@
   },
 
   "rollback": {
-    "action": "Delete the 4 new artifact files introduced by this task (this contract, its eval, its next_wave proposal, its test). Nothing outside tools/geoai-task-mcp/{contracts,eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
+    "action": "Delete the 4 new artifact files introduced by this task (this contract, its eval, its next_wave proposal, its test). Nothing outside tools/aiworkhub/{contracts,eval,data/tasking,tests} references them, and no source file was changed, so rollback is a pure file removal with zero code dependency and zero data migration.",
     "trigger_conditions": [
       "any lifecycle state gains an undocumented task_status_mutation",
       "any error_taxonomy category is dropped below 5",

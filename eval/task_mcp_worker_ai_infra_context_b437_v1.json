@@ -25,14 +25,14 @@
   },
   "commands": [
     {
-      "cmd": "/home/shrek/GeoAI/.venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
+      "cmd": "/home/shrek/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_ai_infra_context_b437_v1.py",
       "result": "pass",
       "returncode": 0,
       "stdout": "5 passed, 1 warning in 0.23s",
       "stderr_note": "pytest cache warning only: cache path creation blocked by sandbox permissions"
     },
     {
-      "cmd": "/home/shrek/GeoAI/.venv/bin/python -m pytest -q tools/geoai-task-mcp/tests/test_worker_project_context_b434_v1.py tools/geoai-task-mcp/tests/test_dashboard.py",
+      "cmd": "/home/shrek/AIWorkHub/.venv/bin/python -m pytest -q tools/aiworkhub/tests/test_worker_project_context_b434_v1.py tools/aiworkhub/tests/test_dashboard.py",
       "result": "blocked_preexisting_environment_or_out_of_scope",
       "returncode": 1,
       "stdout": "36 passed, 11 failed, 2 warnings in 0.47s",
@@ -43,7 +43,7 @@
       ]
     },
     {
-      "cmd": "python3 -m py_compile tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
+      "cmd": "python3 -m py_compile tools/aiworkhub/src/aiworkhub/project_context.py tools/aiworkhub/src/aiworkhub/process_launcher.py tools/aiworkhub/src/aiworkhub/dashboard.py tools/aiworkhub/tests/test_worker_ai_infra_context_b437_v1.py",
       "result": "pass",
       "returncode": 0
     },
@@ -71,14 +71,14 @@
     "ai_infra_context.estimate.label"
   ],
   "changed_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/project_context.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.js",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/index.html",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_static/dashboard.css",
-    "tools/geoai-task-mcp/tests/test_worker_ai_infra_context_b437_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_worker_ai_infra_context_b437_v1.json",
-    "tools/geoai-task-mcp/README.md"
+    "tools/aiworkhub/src/aiworkhub/project_context.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard_static/dashboard.js",
+    "tools/aiworkhub/src/aiworkhub/dashboard_static/index.html",
+    "tools/aiworkhub/src/aiworkhub/dashboard_static/dashboard.css",
+    "tools/aiworkhub/tests/test_worker_ai_infra_context_b437_v1.py",
+    "tools/aiworkhub/eval/task_mcp_worker_ai_infra_context_b437_v1.json",
+    "tools/aiworkhub/README.md"
   ]
 }

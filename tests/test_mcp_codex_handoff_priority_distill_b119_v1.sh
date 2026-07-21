@@ -47,15 +47,15 @@ CURRICULUM="$ROOT/bitnnv2/data/curriculum/mcp_codex_handoff_priority_targets_b11
 SOURCE_REGISTRY="$ROOT/bitnnv2/data/tasking/machine_task_cards_v1.jsonl"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 echo "=== B122 MCP Codex Handoff Priority Distill (real) Test ==="
 echo "ROOT=$ROOT"
 echo "BUILDER=$BUILDER"
 
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 

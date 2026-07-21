@@ -16,28 +16,28 @@ set -euo pipefail
 #   E. Secret redaction is preserved (known secret env name stays redacted).
 #
 # Isolation: everything lives under a per-run mktemp dir; the collision-guard
-# card source is redirected via GEOAI_TASK_MCP_COLLISION_CARDS_PATH and the
-# audit log via GEOAI_TASK_MCP_AUDIT_LOG_PATH. No shared repo artifact is ever
+# card source is redirected via AIWORKHUB_COLLISION_CARDS_PATH and the
+# audit log via AIWORKHUB_AUDIT_LOG_PATH. No shared repo artifact is ever
 # touched. Parallel-safe.
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
-MODULE="$MCPROOT/src/geoai_task_mcp/cli_adapter_readonly_tool.py"
+MODULE="$MCPROOT/src/aiworkhub/cli_adapter_readonly_tool.py"
 
-TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/geoai_readonly_collision_preflight_sh.XXXXXX")"
+TMPDIR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_readonly_collision_preflight_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR_RUN"' EXIT
 
 STATE_DIR="$TMPDIR_RUN/state"
 mkdir -p "$STATE_DIR"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$STATE_DIR/audit.jsonl"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
+export AIWORKHUB_AUDIT_LOG_PATH="$STATE_DIR/audit.jsonl"
 
 echo "=== B107 Read-Only Collision Preflight Test ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "STATE_DIR=$STATE_DIR"
 
 TASK_ID="CLAUDE_TASK_MCP_READONLY_COLLISION_PREFLIGHT_B107_V1"
@@ -63,10 +63,10 @@ with open('$CARDS_A', 'w', encoding='utf-8') as f:
     f.write(json.dumps(card) + chr(10))
 "
 
-RESULT_A="$(GEOAI_TASK_MCP_COLLISION_CARDS_PATH="$CARDS_A" python3 -c '
+RESULT_A="$(AIWORKHUB_COLLISION_CARDS_PATH="$CARDS_A" python3 -c '
 import json, sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 plan = m.plan_command_readonly(
     task_id="'"$TASK_ID"'", runner="'"$RUNNER"'", topic="'"$TOPIC"'",
     adapter_id="claude_cli", argv=["python3", "AITools/taskctl.py", "verify"],
@@ -104,10 +104,10 @@ CARDS_B="$STATE_DIR/cards_case_b.jsonl"
 : > "$CARDS_B"  # empty but existing file
 CARDS_B_MISSING="$STATE_DIR/cards_case_b_missing.jsonl"  # never created; exercises not-exists path
 
-RESULT_B="$(GEOAI_TASK_MCP_COLLISION_CARDS_PATH="$CARDS_B" python3 -c '
+RESULT_B="$(AIWORKHUB_COLLISION_CARDS_PATH="$CARDS_B" python3 -c '
 import json, sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 plan = m.plan_command_readonly(
     task_id="'"$TASK_ID"'", runner="'"$RUNNER"'", topic="'"$TOPIC"'",
     adapter_id="claude_cli", argv=["python3", "AITools/taskctl.py", "verify"],
@@ -124,10 +124,10 @@ fi
 echo "Case B (would_collide=false on fresh/empty state): OK"
 
 # Also exercise the not-yet-created cards path (missing file, not just empty).
-WOULD_COLLIDE_B_MISSING="$(GEOAI_TASK_MCP_COLLISION_CARDS_PATH="$CARDS_B_MISSING" python3 -c '
+WOULD_COLLIDE_B_MISSING="$(AIWORKHUB_COLLISION_CARDS_PATH="$CARDS_B_MISSING" python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 plan = m.plan_command_readonly(
     task_id="'"$TASK_ID"'", runner="'"$RUNNER"'", topic="'"$TOPIC"'",
     adapter_id="claude_cli", argv=["python3", "AITools/taskctl.py", "verify"],
@@ -152,10 +152,10 @@ snapshot() {
 
 SNAP_BEFORE="$(snapshot)"
 
-GEOAI_TASK_MCP_COLLISION_CARDS_PATH="$CARDS_A" python3 -c '
+AIWORKHUB_COLLISION_CARDS_PATH="$CARDS_A" python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 m.plan_command_readonly(
     task_id="'"$TASK_ID"'", runner="'"$RUNNER"'", topic="'"$TOPIC"'",
     adapter_id="claude_cli", argv=["python3", "AITools/taskctl.py", "verify"],
@@ -181,7 +181,7 @@ echo "Case C (no state mutation; snapshot identical before/after): OK"
 GATE_OFF="$(python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 print(m.writes_allowed())
 ')"
 if [ "$GATE_OFF" != "False" ]; then
@@ -202,7 +202,7 @@ echo "No launch/subprocess/exec/fork pattern in module source: OK"
 LAUNCH_STATE="$(python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 print(str(m.launch_enabled()) + "," + str(m.LAUNCH_IMPLEMENTED))
 ')"
 if [ "$LAUNCH_STATE" != "False,False" ]; then
@@ -214,10 +214,10 @@ echo "Launch impossible: OK ($LAUNCH_STATE)"
 # ---------------------------------------------------------------------------
 # Case E: secret redaction preserved.
 # ---------------------------------------------------------------------------
-REDACTED="$(GEOAI_TASK_MCP_COLLISION_CARDS_PATH="$CARDS_B_MISSING" python3 -c '
+REDACTED="$(AIWORKHUB_COLLISION_CARDS_PATH="$CARDS_B_MISSING" python3 -c '
 import sys
 sys.path.insert(0, "'"$MCPROOT"'/src")
-from geoai_task_mcp import cli_adapter_readonly_tool as m
+from aiworkhub import cli_adapter_readonly_tool as m
 plan = m.plan_command_readonly(
     task_id="'"$TASK_ID"'", runner="'"$RUNNER"'", topic="'"$TOPIC"'",
     adapter_id="claude_cli", argv=["python3", "AITools/taskctl.py", "verify"],

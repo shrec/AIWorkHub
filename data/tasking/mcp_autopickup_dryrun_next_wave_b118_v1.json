@@ -10,10 +10,10 @@
       "goal": "Add a batch dry-run: preview the next claimable task for a set of (runner, topic) pairs and run collision-guard preflight over the previewed candidate set, WITHOUT claiming any task. Reuse core.auto_pickup_dryrun + read-only collision_guard.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_mcp_dryrun_batch_collision_preflight_b119_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_dryrun_batch_collision_preflight_b119_v1.json"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_mcp_dryrun_batch_collision_preflight_b119_v1.sh",
+        "tools/aiworkhub/eval/mcp_dryrun_batch_collision_preflight_b119_v1.json"
       ],
       "acceptance": [
         "previews N runner/topic candidates with zero queue mutation (snapshot before/after identical)",
@@ -26,9 +26,9 @@
       "goal": "Extend the dry-run report with a read-only stale/in-progress diagnostic: for a runner/topic, report tasks already in-progress (would block a fresh pickup) and any stale claims, mirroring taskctl's in_progress branch. Read-only; no unstick, no mutation.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/tests/test_mcp_dryrun_stale_claim_diagnostic_b119_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_dryrun_stale_claim_diagnostic_b119_v1.json"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/tests/test_mcp_dryrun_stale_claim_diagnostic_b119_v1.sh",
+        "tools/aiworkhub/eval/mcp_dryrun_stale_claim_diagnostic_b119_v1.json"
       ],
       "acceptance": [
         "reports in-progress + stale claims for runner/topic without mutating any card",
@@ -41,9 +41,9 @@
       "goal": "Enforce a static runner/topic allow-list on the real (write-gated) auto_pickup claim path so an unknown/off-topic runner/topic string is refused before any mutation. Dry-run already reports the pair; this adds the write-path guard. Static allowlist is a SAFETY boundary, not a cue router.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforce_b119_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_runner_topic_allowlist_enforce_b119_v1.json"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_enforce_b119_v1.sh",
+        "tools/aiworkhub/eval/mcp_runner_topic_allowlist_enforce_b119_v1.json"
       ],
       "acceptance": [
         "unknown/off-topic runner/topic refused on the write path and audited",
@@ -57,7 +57,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_task_routing_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_task_routing_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_task_routing_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows define task->runner/topic routing + abstain labels",

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from geoai_task_mcp.callback_bridge import (
+from aiworkhub.callback_bridge import (
     CALLBACK_ELIGIBLE_STATES,
     build_batch_callback_prompt,
     build_callback_prompt,
@@ -48,7 +48,7 @@ def test_single_task_no_old_boilerplate():
         "logs",
         "artifacts",
         "objective text",
-        "The GeoAI Task MCP worker",
+        "The AIWorkHub MCP worker",
         "perform coordinator review/rebase",
     ):
         assert banned not in prompt, f"boilerplate leaked: {banned!r}"
@@ -95,7 +95,7 @@ def test_batch_no_old_boilerplate():
         "artifacts",
         "objective text",
         "does not need a separate wake",
-        "The GeoAI Task MCP worker",
+        "The AIWorkHub MCP worker",
     ):
         assert banned not in prompt, f"boilerplate leaked: {banned!r}"
 

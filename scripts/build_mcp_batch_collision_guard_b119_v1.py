@@ -4,7 +4,7 @@ MCP Batch Collision Guard B119 V1
 Validates task lists to ensure allowed_writes do not collide before or after wave execution.
 
 Usage:
-  python3 tools/geoai-task-mcp/scripts/build_mcp_batch_collision_guard_b119_v1.py --cards path/to.jsonl --mode [pre_wave|post_wave] --out out.json
+  python3 tools/aiworkhub/scripts/build_mcp_batch_collision_guard_b119_v1.py --cards path/to.jsonl --mode [pre_wave|post_wave] --out out.json
 """
 
 import argparse

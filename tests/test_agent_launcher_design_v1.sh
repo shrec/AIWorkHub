@@ -14,7 +14,7 @@ set -euo pipefail
 #     manual_copilot_deepseek}; manual is kind manual_external;
 #   - every safety gate is blocking==true;
 #   - the live MCP server registers NO launch/spawn/exec/process tool and
-#     server.py wires NO GEOAI_TASK_MCP_ALLOW_LAUNCH handling.
+#     server.py wires NO AIWORKHUB_ALLOW_LAUNCH handling.
 #
 # Isolation-safe / parallel-safe: reads only committed artifacts + imports the
 # module read-only; any scratch goes under a per-run mktemp -d; mutates no
@@ -25,9 +25,9 @@ MCPROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$MCPROOT/../.." && pwd)"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 # Never enable writes or launch inside the test.
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_ALLOW_WRITES=0
 
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -35,7 +35,7 @@ trap 'rm -rf "$SCRATCH"' EXIT
 EVAL_JSON="$MCPROOT/eval/agent_launcher_design_v1.json"
 ROWS_JSONL="$MCPROOT/eval/agent_launcher_design_rows_v1.jsonl"
 NEXT_WAVE="$MCPROOT/data/tasking/agent_launcher_design_next_wave_v1.json"
-SERVER_PY="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_PY="$MCPROOT/src/aiworkhub/server.py"
 
 echo "=== Agent Launcher Design v1 — validation ==="
 echo "MCPROOT=$MCPROOT"
@@ -44,7 +44,7 @@ echo "MCPROOT=$MCPROOT"
 # 1. server.py must not wire ALLOW_LAUNCH (raw source grep, no false pass)
 # ------------------------------------------------------------------
 if grep -q "ALLOW_LAUNCH" "$SERVER_PY"; then
-    echo "FAIL: GEOAI_TASK_MCP_ALLOW_LAUNCH is wired in server.py (must be design-only)"
+    echo "FAIL: AIWORKHUB_ALLOW_LAUNCH is wired in server.py (must be design-only)"
     exit 1
 fi
 echo "server.py: no ALLOW_LAUNCH wiring (ok)"
@@ -83,11 +83,11 @@ if inv.get("launch_actions_enabled") is not False:
     fail("invariant.launch_actions_enabled must be false")
 if inv.get("launcher_code_added") is not False:
     fail("invariant.launcher_code_added must be false")
-if inv.get("proposed_enable_flag") != "GEOAI_TASK_MCP_ALLOW_LAUNCH":
+if inv.get("proposed_enable_flag") != "AIWORKHUB_ALLOW_LAUNCH":
     fail("invariant.proposed_enable_flag mismatch")
 if inv.get("default") != "0":
     fail("invariant.default must be '0'")
-if "GEOAI_TASK_MCP_ALLOW_WRITES" not in str(inv.get("requires_also", "")):
+if "AIWORKHUB_ALLOW_WRITES" not in str(inv.get("requires_also", "")):
     fail("invariant.requires_also must require ALLOW_WRITES")
 if design.get("verdict") != "PASS":
     fail("verdict must be PASS")
@@ -195,7 +195,7 @@ for t in fu:
         fail(f"follow_up {t['task_id']} acceptance must be non-empty list")
 
 # --- LIVE server registry: NO launch/spawn/exec/process tool ---
-import geoai_task_mcp.server as srv
+import aiworkhub.server as srv
 tm = getattr(srv.mcp, "_tool_manager", None)
 if tm is None:
     fail("could not access FastMCP tool manager")

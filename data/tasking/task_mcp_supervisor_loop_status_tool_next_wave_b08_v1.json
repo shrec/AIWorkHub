@@ -6,15 +6,15 @@
 
   "this_task_scope": {
     "artifacts_added": [
-      "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
-      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_status_tool_b08_v1.json",
-      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh"
+      "tools/aiworkhub/contracts/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+      "tools/aiworkhub/eval/task_mcp_supervisor_loop_status_tool_b08_v1.json",
+      "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_status_tool_next_wave_b08_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_status_tool_b08_v1.sh"
     ],
     "source_code_changed": false,
     "process_launch": false,
     "task_status_mutated": false,
-    "write_gate": "off (GEOAI_TASK_MCP_ALLOW_WRITES unset/0; this task does not read, set, or touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST anywhere)"
+    "write_gate": "off (AIWORKHUB_ALLOW_WRITES unset/0; this task does not read, set, or touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST anywhere)"
   },
 
   "not_applied_generalization_next_wave": {
@@ -22,7 +22,7 @@
     "proposed_next_wave_tasks": [
       {
         "task_id_suggestion": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_WIRING_B09_V1",
-        "summary": "Apply the exact two patches listed in this contract's future_source_patch_paths: add core.supervisor_loop_status(task_id, runner=None, topic=None, previous_snapshot=None, reported_validation_verdict=None) implementing derivation_algorithm's 7 ordered_steps verbatim (reusing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state, zero new subprocess/exec calls), then register @mcp.tool() geoai_supervisor_loop_status in server.py in the same FROZEN READ-ONLY CONTRACT style as geoai_task_codex_handoff (B116). Ship with a live-wired test that calls the real MCP tool (not just fixtures) against at least one real task_id.",
+        "summary": "Apply the exact two patches listed in this contract's future_source_patch_paths: add core.supervisor_loop_status(task_id, runner=None, topic=None, previous_snapshot=None, reported_validation_verdict=None) implementing derivation_algorithm's 7 ordered_steps verbatim (reusing show_task/check_runner_topic_allowlist/collision_guard/_lifecycle_state, zero new subprocess/exec calls), then register @mcp.tool() aiworkhub_supervisor_loop_status in server.py in the same FROZEN READ-ONLY CONTRACT style as aiworkhub_task_codex_handoff (B116). Ship with a live-wired test that calls the real MCP tool (not just fixtures) against at least one real task_id.",
         "owner": "future coder task, not created by this worker",
         "requires_source_patch": true
       },
@@ -56,15 +56,15 @@
     "stale_task / missing_artifact / failed_validation verified via pure fixture logic matching derivation_algorithm steps 3/5/6",
     "eval JSON parses and required top-level sections present",
     "next_wave (this file) JSON parses and required top-level sections present",
-    "this task's own allowed_writes contains zero paths under tools/geoai-task-mcp/src/",
-    "python3 AITools/taskctl.py verify (parent GeoAI repo) passes"
+    "this task's own allowed_writes contains zero paths under tools/aiworkhub/src/",
+    "python3 AITools/taskctl.py verify (parent AIWorkHub repo) passes"
   ],
 
   "rollback": {
     "action": "Delete the 4 files this task added (contract, eval, this next_wave file, test). No source file was changed by this task, so rollback is a pure file removal with zero code dependency and zero data migration.",
     "trigger_conditions": [
       "a future task cites this contract's derivation_algorithm or lifecycle_state_to_supervisor_state_mapping inconsistently",
-      "a future task wires task_status_mutation into geoai_supervisor_loop_status without a dedicated write-gate task"
+      "a future task wires task_status_mutation into aiworkhub_supervisor_loop_status without a dedicated write-gate task"
     ]
   },
 

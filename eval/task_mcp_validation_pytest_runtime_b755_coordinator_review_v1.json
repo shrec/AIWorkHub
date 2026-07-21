@@ -13,9 +13,9 @@
     "credential isolation and B753 scratch cleanup preservation"
   ],
   "parent_verification": {
-    "focused_command": "python3 tools/geoai-task-mcp/tests/test_validation_pytest_runtime_b755_v1.py -v",
+    "focused_command": "python3 tools/aiworkhub/tests/test_validation_pytest_runtime_b755_v1.py -v",
     "focused_result": "14 passed",
-    "regression_command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_workspace.py tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
+    "regression_command": "python3 -m pytest -q tools/aiworkhub/tests/test_worker_workspace.py tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
     "regression_result": "50 passed"
   },
   "authority_boundary": "Only pytest validation commands receive the exact approved runtime root. Real HOME, credentials, arbitrary absolute PYTHONPATH entries, writable package state and package copying remain forbidden.",

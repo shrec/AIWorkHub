@@ -34,7 +34,7 @@
     "no_taskctl_done": true
   },
   "tests": {
-    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_process_launcher.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_dashboard.py AITools/test_taskctl_origin_thread_callback_b384_v1.py AITools/test_taskctl_owner_review_recovery_b304.py AITools/test_taskctl_terminal_review_only_b404_v1.py",
+    "command": "python3 -m pytest -q tools/aiworkhub/tests/test_process_launcher.py tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_dashboard.py AITools/test_taskctl_origin_thread_callback_b384_v1.py AITools/test_taskctl_owner_review_recovery_b304.py AITools/test_taskctl_terminal_review_only_b404_v1.py",
     "interpreter": ".venv (project venv with pytest installed) -- system python3 lacks pytest",
     "result": "147 passed, 0 failed, 1 warning (a benign pytest-cache write-permission warning under this sandbox, not a test failure)",
     "new_file": "AITools/test_taskctl_terminal_review_only_b404_v1.py -- 9 focused regression tests directly asserting the corrected invariant (status=review/worker_status=review_ready/review_outcome persisted, status never pending or blocked) across recover-stale default/--force/--owner-confirm, owner-review-recover --apply, every release-launch outcome bucket, the cmd_review success contrast (worker_status=review, not review_ready), the sole reject-review path back to pending, a never-claimed control card, and an end-to-end callback claim/deliver proof",
@@ -57,10 +57,10 @@
     "AITools/test_taskctl_owner_review_recovery_b304.py",
     "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
     "AITools/test_taskctl_terminal_review_only_b404_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_terminal_review_only_b404_v1.json"
+    "tools/aiworkhub/eval/task_mcp_terminal_review_only_b404_v1.json"
   ],
   "coordinator_preserved_paths": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py"
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py"
   ]
 }

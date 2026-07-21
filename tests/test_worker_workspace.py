@@ -13,7 +13,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import worker_workspace  # noqa: E402
+from aiworkhub import worker_workspace  # noqa: E402
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -229,15 +229,15 @@ def test_sanitized_env_is_allowlisted_and_json_files_are_0600(
 ) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "allowed-adapter-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-allowed")
-    monkeypatch.setenv("GEOAI_REPO", "/sensitive/parent")
-    monkeypatch.setenv("GEOAI_TASK_MCP_ALLOW_LAUNCH", "1")
+    monkeypatch.setenv("AIWORKHUB_REPO", "/sensitive/parent")
+    monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     home = tmp_path / "home"
     env = worker_workspace.sanitized_env("claude_cli", home=home)
     assert env["HOME"] == str(home)
     assert env["ANTHROPIC_API_KEY"] == "allowed-adapter-secret"
     assert "AWS_SECRET_ACCESS_KEY" not in env
-    assert "GEOAI_REPO" not in env
-    assert "GEOAI_TASK_MCP_ALLOW_LAUNCH" not in env
+    assert "AIWORKHUB_REPO" not in env
+    assert "AIWORKHUB_ALLOW_LAUNCH" not in env
 
     target = tmp_path / "private" / "request.json"
     target.parent.mkdir()

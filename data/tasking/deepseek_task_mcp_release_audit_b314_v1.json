@@ -10,29 +10,29 @@
   "mode": "task_mcp_independent_release_evidence_audit_no_production_edits",
   "objective": "Independently audit the current Task MCP launcher, capability boundary, dashboard, exact tool contract, and tests; produce reproducible release findings without editing production implementation.",
   "read_first": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_supervisor.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/src/aiworkhub/worker_supervisor.py",
+    "tools/aiworkhub/src/aiworkhub/core.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/src/aiworkhub/dashboard.py",
     "AITools/taskctl.py"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/eval/task_mcp_release_audit_b314_v1.json",
-    "tools/geoai-task-mcp/data/review/task_mcp_release_audit_b314_v1_rows.jsonl",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_release_audit_b314_v1_next_wave.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_release_audit_b314_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_release_audit_b314_v1.json",
+    "tools/aiworkhub/data/review/task_mcp_release_audit_b314_v1_rows.jsonl",
+    "tools/aiworkhub/data/tasking/task_mcp_release_audit_b314_v1_next_wave.json",
+    "tools/aiworkhub/tests/test_task_mcp_release_audit_b314_v1.sh"
   ],
   "acceptance": [
     "audit tests parent-write escape, symlink/glob escape, secret inheritance, lifecycle race, timeout overwrite, PID reuse, restart reconciliation, partial promotion, token accounting, Host/Origin checks, and exact 33-tool freeze",
     "every finding cites exact code/evidence and is classified release_blocking, repair_required, or residual_risk",
     "must not claim PASS solely because existing tests pass",
     "all generated audit artifacts are deterministic and authority-neutral",
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_release_audit_b314_v1.sh passes"
+    "bash tools/aiworkhub/tests/test_task_mcp_release_audit_b314_v1.sh passes"
   ],
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_release_audit_b314_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_release_audit_b314_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "authority_flags": {

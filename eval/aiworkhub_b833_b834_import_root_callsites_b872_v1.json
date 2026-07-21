@@ -1,0 +1,28 @@
+{
+  "schema_id": "aiworkhub.task_mcp.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_B833_B834_IMPORT_ROOT_CALLSITES_B872_V1",
+  "verdict": "repaired",
+  "problem": "B870 V2 made generate_worker_mcp_runtime's package_import_root a required keyword-only parameter (no derivation inside the function). B833/B834 test fixtures pre-date B870 and still call generate_worker_mcp_runtime without it, so both suites failed with TypeError: missing 1 required keyword-only argument: 'package_import_root'.",
+  "fix": {
+    "rule": "every direct fixture call to generate_worker_mcp_runtime now supplies package_import_root=w.resolve_host_package_import_root()",
+    "scope": "test-only rebase; no production runtime change and no optional/default parameter added to generate_worker_mcp_runtime",
+    "callsites_fixed": [
+      "test_aiworkhub_dynamic_worker_mcp_b833_v1.py:_ctx",
+      "test_aiworkhub_dynamic_worker_mcp_b833_v1.py:test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes",
+      "test_aiworkhub_dynamic_worker_mcp_b833_v1.py:test_generate_worker_mcp_runtime_is_idempotent_on_the_audit_key",
+      "test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py:_ctx",
+      "test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py:test_all_three_adapters_receive_the_authority_bound_runtime"
+    ]
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_b833_b834_import_root_callsites_b872_v1.json"
+  ],
+  "tests": {
+    "b833_repaired": "all generate_worker_mcp_runtime call sites in test_aiworkhub_dynamic_worker_mcp_b833_v1.py pass the explicit resolved package_import_root; every other B833 authority/cache/audit/tool-signature/live-call-gate assertion left intact",
+    "b834_repaired": "all generate_worker_mcp_runtime call sites in test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py pass the explicit resolved package_import_root; every other B834 authority-repair assertion left intact"
+  },
+  "validation_command": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py",
+  "validation_result": "56 passed"
+}

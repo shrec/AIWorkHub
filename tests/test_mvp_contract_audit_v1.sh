@@ -6,15 +6,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEOAI_REPO="${GEOAI_REPO:-$(cd "$ROOT/../.." && pwd)}"
+AIWORKHUB_REPO="${AIWORKHUB_REPO:-$(cd "$ROOT/../.." && pwd)}"
 
 export PYTHONPATH="$ROOT/src"
-export GEOAI_REPO
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO
+export AIWORKHUB_ALLOW_WRITES=0
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$TMP/audit.jsonl"
+export AIWORKHUB_AUDIT_LOG_PATH="$TMP/audit.jsonl"
 
 AUDIT_JSON="$ROOT/eval/mvp_contract_audit_v1.json"
 ROWS_JSONL="$ROOT/eval/mvp_contract_audit_rows_v1.jsonl"
@@ -54,7 +54,7 @@ audit_names = sorted(t["name"] for t in audit["tools"])
 audit_write_names = sorted(t["name"] for t in audit["tools"] if t["class"] == "write")
 
 # 3) TIE TO REAL CODE: enumerate the actually-registered FastMCP tools
-from geoai_task_mcp import server, core
+from aiworkhub import server, core
 live_names = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
 # B119 inventory refresh: audit was frozen at 11 tools; live now has 20.
 # Verify all audited tools are still present (subset check).
@@ -86,13 +86,13 @@ print(f"  row tools all present in live: {len(row_tool_names)}/{len(live_names)}
 assert any(r.get("kind") == "finding" for r in rows), "no finding rows"
 
 # 4) LIVE write-gate re-derivation (evidence-tied): blocked at ALLOW_WRITES=0
-assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES") == "0"
+assert os.environ.get("AIWORKHUB_ALLOW_WRITES") == "0"
 res = core.auto_pickup("mvp_audit_probe_runner_no_write", "mvp_audit_probe_topic")
 assert res["returncode"] == 126, ("expected blocked rc 126", res)
 assert "write command blocked" in res["stderr"], res
 
 # blocked probe must not have touched the parent queue: it only appends the temp audit log
-log_path = os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"]
+log_path = os.environ["AIWORKHUB_AUDIT_LOG_PATH"]
 assert log_path.startswith("/tmp") or "/tmp" in log_path, log_path
 
 print("audit artifacts consistent with live code; write gate live-verified")

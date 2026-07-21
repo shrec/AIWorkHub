@@ -8,13 +8,13 @@
   "mode": "mcp_review_summarizer_parser_fix_readonly",
   "objective": "Fix the B112 MCP review summarizer real-queue warnings by making the review-line parser suffix-tolerant and ensuring empty-queue results include fetch_errors=[], preserving read-only/no-launch invariants.",
   "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_B112_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_parser_fix_b113_v1.sh",
-  "test_source": "tools/geoai-task-mcp/tests/mcp_review_summarizer_real_queue_integration.py",
-  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_parser_fix_b113_v1.sh",
+  "test_source": "tools/aiworkhub/tests/mcp_review_summarizer_real_queue_integration.py",
+  "module_under_test": "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
   "fixes_applied": [
     {
       "id": "B113_REGEX_SUFFIX_TOLERANT",
-      "file": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+      "file": "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
       "line": 32,
       "change": "Removed $ anchor from _REVIEW_LINE_RE, added optional (?:\\s+.*)? suffix group. Now matches lines like '[topic] [runner] task_id — description'.",
       "old_pattern": "r\"^\\s*\\[(?P<topic>[^\\]]+)\\]\\s*\\[(?P<runner>[^\\]]+)\\]\\s*(?P<task_id>\\S+)$\"",
@@ -22,7 +22,7 @@
     },
     {
       "id": "B113_FETCH_ERRORS_EMPTY",
-      "file": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+      "file": "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
       "line": 110,
       "change": "Added 'fetch_errors': [] to empty-queue early-return dict for schema consistency.",
       "old": "return dict without fetch_errors key",
@@ -56,9 +56,9 @@
     "write_gate_enable"
   ],
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1"
 }

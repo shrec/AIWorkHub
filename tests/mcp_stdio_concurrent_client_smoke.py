@@ -4,7 +4,7 @@
 Extends the B109 real-stdio single-session smoke
 (``mcp_stdio_client_smoke.py``) to prove the frozen read-only tool contract
 holds under CONCURRENCY: it opens TWO independent ``stdio_client`` subprocess
-sessions to the ``geoai-task-mcp`` server *at the same time* (overlapping
+sessions to the ``aiworkhub`` server *at the same time* (overlapping
 lifetimes, forced by an ``asyncio.Barrier(2)``) and drives read-only
 ``tools/call`` from BOTH concurrently. Each session is a separate OS subprocess
 with its own OS stdio pipes and its own isolated audit-state dir.
@@ -20,7 +20,7 @@ Novel proof over B109 (which ran two sessions sequentially):
     falsifiable teeth), and each session's private audit dir stays empty +
     byte-identical (MCP-owned-state isolation teeth);
   * the SAME no-write proof holds per session with
-    ``GEOAI_TASK_MCP_ALLOW_WRITES`` UNSET and =1, run concurrently in both
+    ``AIWORKHUB_ALLOW_WRITES`` UNSET and =1, run concurrently in both
     children.
 
 Checks (all must pass for ``concurrent_contract_v1`` true):
@@ -40,7 +40,7 @@ Checks (all must pass for ``concurrent_contract_v1`` true):
   C8  same no-write proof with ALLOW_WRITES=1 in both children concurrently;
   C9  STDIO transport actually used out-of-process by both sessions;
   C10 ONLY the MCP server is launched by each session: python running
-      ``-m geoai_task_mcp.server`` -- no agent/model binary, no shell;
+      ``-m aiworkhub.server`` -- no agent/model binary, no shell;
   C11 server.py holds no subprocess/exec/fork/shell launch code and
       ``launch_enabled()`` / ``LAUNCH_IMPLEMENTED`` stay False.
 
@@ -55,7 +55,7 @@ become a learned router (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); no
 regex/keyword cue router is introduced here as launch authority.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src GEOAI_REPO=/home/shrek/GeoAI \
+    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
     python3 tools/geoai-task-mcp/tests/mcp_stdio_concurrent_client_smoke.py \
         [--out result.json]
 """
@@ -81,8 +81,8 @@ if SRC not in sys.path:
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import get_default_environment, stdio_client  # noqa: E402
 
-from geoai_task_mcp import cli_adapter_readonly_tool as ro  # noqa: E402
-from geoai_task_mcp import core  # noqa: E402
+from aiworkhub import cli_adapter_readonly_tool as ro  # noqa: E402
+from aiworkhub import core  # noqa: E402
 
 TASK_ID = "CLAUDE_TASK_MCP_STDIO_CONCURRENT_CLIENT_SMOKE_B110_V1"
 
@@ -93,44 +93,44 @@ RUNNER_B = "claude_task_mcp_concurrent_bravo_b110"
 
 # --- frozen read-only contract v1 (identical to B108/B109) ----------------
 READONLY_TOOLS: tuple[str, ...] = (
-    "geoai_task_health",
-    "geoai_task_review_queue",
-    "geoai_task_list",
-    "geoai_task_show",
-    "geoai_task_pending_for_runner",
-    "geoai_task_collision_guard",
-    "geoai_task_usage_report",
-    "geoai_task_audit_log_read",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_report_readonly",
+    "aiworkhub_task_health",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_list",
+    "aiworkhub_task_show",
+    "aiworkhub_task_pending_for_runner",
+    "aiworkhub_task_collision_guard",
+    "aiworkhub_task_usage_report",
+    "aiworkhub_task_audit_log_read",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_report_readonly",
 )
 
 WRITE_GATED_TOOLS: tuple[str, ...] = (
-    "geoai_task_auto_pickup",
-    "geoai_task_mark_review",
-    "geoai_task_mark_done",
-    "geoai_task_export_jsonl",
+    "aiworkhub_task_auto_pickup",
+    "aiworkhub_task_mark_review",
+    "aiworkhub_task_mark_done",
+    "aiworkhub_task_export_jsonl",
 )
 
 # The SAME byte-canonical sha256(inputSchema) values frozen at B108. A drift in
 # ANY tool's input schema flips concurrent_contract_v1 to false over the pipe.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
-    "geoai_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
-    "geoai_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
-    "geoai_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-    "geoai_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-    "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-    "geoai_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-    "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-    "geoai_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-    "geoai_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-    "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-    "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-    "geoai_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-    "geoai_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-    "geoai_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-    "geoai_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+    "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+    "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+    "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+    "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+    "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+    "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+    "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+    "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+    "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+    "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+    "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
+    "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+    "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+    "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+    "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
 }
 
 # server.py must contain none of these (defense in depth: the server never
@@ -171,20 +171,20 @@ def _readonly_args(runner: str, tag: str) -> dict[str, dict[str, Any]]:
     """Read-only tools_call payloads for a single concurrent session, keyed to
     that session's OWN runner identity so cross-session bleed is detectable."""
     return {
-        "geoai_task_health": {},
-        "geoai_task_review_queue": {},
-        "geoai_task_list": {"status": "pending", "limit": 3},
-        "geoai_task_show": {"task_id": TASK_ID},
-        "geoai_task_pending_for_runner": {"runner": runner},
-        "geoai_task_collision_guard": {"print_json": True},
-        "geoai_task_usage_report": {},
-        "geoai_task_audit_log_read": {"max_entries": 10},
-        "geoai_cli_adapter_plan_readonly": {
+        "aiworkhub_task_health": {},
+        "aiworkhub_task_review_queue": {},
+        "aiworkhub_task_list": {"status": "pending", "limit": 3},
+        "aiworkhub_task_show": {"task_id": TASK_ID},
+        "aiworkhub_task_pending_for_runner": {"runner": runner},
+        "aiworkhub_task_collision_guard": {"print_json": True},
+        "aiworkhub_task_usage_report": {},
+        "aiworkhub_task_audit_log_read": {"max_entries": 10},
+        "aiworkhub_cli_adapter_plan_readonly": {
             "task_id": f"B110-PLAN-{tag}", "runner": runner, "topic": "task_mcp",
             "adapter_id": "claude_cli", "argv": ["claude", "-p", "hi"],
         },
-        "geoai_cli_adapter_audit_summary_readonly": {"max_entries": 10},
-        "geoai_cli_adapter_report_readonly": {
+        "aiworkhub_cli_adapter_audit_summary_readonly": {"max_entries": 10},
+        "aiworkhub_cli_adapter_report_readonly": {
             "task_id": f"B110-REPORT-{tag}", "runner": runner, "topic": "task_mcp",
             "adapter_id": "claude_cli", "argv": ["codex", "exec", "review"],
         },
@@ -194,21 +194,21 @@ def _readonly_args(runner: str, tag: str) -> dict[str, dict[str, Any]]:
 def _server_params(audit_log: Path, allow_writes: bool) -> StdioServerParameters:
     """Build stdio params that launch ONLY the MCP server subprocess.
 
-    command = this python interpreter, args = ``-m geoai_task_mcp.server``.
+    command = this python interpreter, args = ``-m aiworkhub.server``.
     stdio_client spawns it directly over OS pipes (never a shell). Each session
-    gets its OWN isolated audit-log path; ``GEOAI_TASK_MCP_ALLOW_WRITES`` is
+    gets its OWN isolated audit-log path; ``AIWORKHUB_ALLOW_WRITES`` is
     set/unset per round to exercise both no-write branches.
     """
     env = get_default_environment()
     env["PYTHONPATH"] = SRC
-    env["GEOAI_REPO"] = str(core.repo_root())
-    env["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_log)
-    env.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+    env["AIWORKHUB_REPO"] = str(core.repo_root())
+    env["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_log)
+    env.pop("AIWORKHUB_ALLOW_WRITES", None)
     if allow_writes:
-        env["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+        env["AIWORKHUB_ALLOW_WRITES"] = "1"
     return StdioServerParameters(
         command=sys.executable,
-        args=["-m", "geoai_task_mcp.server"],
+        args=["-m", "aiworkhub.server"],
         env=env,
         cwd=str(core.repo_root()),
     )
@@ -265,7 +265,7 @@ async def _drive_session(
                     out["any_tool_error"] = True
                     out["error_tool"] = name
                     break
-                if name == "geoai_task_pending_for_runner":
+                if name == "aiworkhub_task_pending_for_runner":
                     structured = _extract_structured(r)
                     cmd = structured.get("command", [])
                     out["pending_command"] = [str(x) for x in cmd] if isinstance(cmd, list) else []
@@ -345,7 +345,7 @@ def run_smoke() -> dict[str, Any]:
     detail: dict[str, Any] = {}
     failing_check: str | None = None
 
-    root = Path(tempfile.mkdtemp(prefix="geoai_b110_concurrent_smoke_"))
+    root = Path(tempfile.mkdtemp(prefix="aiworkhub_b110_concurrent_smoke_"))
     try:
         # --- C10 launched-command proof (both sessions) --------------------
         params_a = _server_params(root / "probe_a.jsonl", allow_writes=False)
@@ -355,13 +355,13 @@ def run_smoke() -> dict[str, Any]:
         for p in (params_a, params_b):
             cmd_lower = " ".join([p.command, *p.args]).lower()
             is_python = os.path.basename(p.command).lower().startswith("python")
-            runs_server = p.args[:2] == ["-m", "geoai_task_mcp.server"]
-            scan = cmd_lower.replace("geoai_task_mcp.server", "")
+            runs_server = p.args[:2] == ["-m", "aiworkhub.server"]
+            scan = cmd_lower.replace("aiworkhub.server", "")
             hits = sorted({t for t in AGENT_MODEL_TOKENS if t in scan})
             agent_hits.extend(hits)
             launch_ok = launch_ok and is_python and runs_server and not hits
         checks["only_mcp_server_launched"] = bool(launch_ok)
-        detail["server_command_normalized"] = ["<python>", "-m", "geoai_task_mcp.server"]
+        detail["server_command_normalized"] = ["<python>", "-m", "aiworkhub.server"]
         detail["launched_agent_or_model_token_hits"] = sorted(set(agent_hits))
         detail["concurrent_sessions"] = 2
         detail["session_runners"] = [RUNNER_A, RUNNER_B]
@@ -442,7 +442,7 @@ def run_smoke() -> dict[str, Any]:
         }
 
         # --- C11 server holds no launch code -------------------------------
-        server_src = (Path(SRC) / "geoai_task_mcp" / "server.py").read_text(encoding="utf-8")
+        server_src = (Path(SRC) / "aiworkhub" / "server.py").read_text(encoding="utf-8")
         launch_hits = [p for p in LAUNCH_PATTERNS if p in server_src]
         checks["server_no_launch_code"] = (
             not launch_hits

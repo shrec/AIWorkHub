@@ -29,7 +29,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.abspath(
-    os.path.join(HERE, "..", "src", "geoai_task_mcp", "launch_queue_contract.py")
+    os.path.join(HERE, "..", "src", "aiworkhub", "launch_queue_contract.py")
 )
 
 # --- forbidden-call sentinels ----------------------------------------------
@@ -131,7 +131,7 @@ def main() -> int:
 
     # ------------------------------------------------------------------ (1)
     # Default state DISABLED, hermetically (gates unset regardless of ambient).
-    restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH=None, GEOAI_TASK_MCP_ALLOW_WRITES=None)
+    restore = _with_env(AIWORKHUB_ALLOW_LAUNCH=None, AIWORKHUB_ALLOW_WRITES=None)
     try:
         assert m.LAUNCH_IMPLEMENTED is False, "LAUNCH_IMPLEMENTED must be False"
         assert m.WORKFLOW_SWITCH_ENABLED is False, "workflow_switch must be False"
@@ -198,7 +198,7 @@ def main() -> int:
 
     # ------------------------------------------------------------------ (4)
     # Both gates forced ON -> launch STILL disabled and refused (defense-in-depth).
-    restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH="1", GEOAI_TASK_MCP_ALLOW_WRITES="1")
+    restore = _with_env(AIWORKHUB_ALLOW_LAUNCH="1", AIWORKHUB_ALLOW_WRITES="1")
     try:
         assert m.env_gates_open() is True, "both gates set should read as open"
         assert m.launch_enabled() is False, "launch_enabled must stay False even when gated"
@@ -215,7 +215,7 @@ def main() -> int:
         restore()
 
     # Only one gate set -> gates NOT open.
-    restore = _with_env(GEOAI_TASK_MCP_ALLOW_LAUNCH="1", GEOAI_TASK_MCP_ALLOW_WRITES=None)
+    restore = _with_env(AIWORKHUB_ALLOW_LAUNCH="1", AIWORKHUB_ALLOW_WRITES=None)
     try:
         assert m.env_gates_open() is False, "one gate is insufficient"
     finally:
@@ -257,9 +257,9 @@ def main() -> int:
     # ------------------------------------------------------------------ (6)
     # Process log records env as NAME->status tokens only, never a value/secret.
     restore = _with_env(
-        GEOAI_TASK_MCP_ALLOW_LAUNCH="1",
-        GEOAI_TASK_MCP_ALLOW_WRITES="1",
-        GEOAI_TASK_MCP_API_TOKEN="super-secret-value-should-never-appear",
+        AIWORKHUB_ALLOW_LAUNCH="1",
+        AIWORKHUB_ALLOW_WRITES="1",
+        AIWORKHUB_API_TOKEN="super-secret-value-should-never-appear",
     )
     try:
         tokens = m.env_gate_status_tokens()

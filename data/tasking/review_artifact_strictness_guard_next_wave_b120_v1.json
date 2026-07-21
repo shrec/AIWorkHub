@@ -10,9 +10,9 @@
       "goal": "Wire audit_review_artifact_strictness_b120_v1.build_report()/audit_wave() into review_summarizer.py's build_codex_handoff_report() so every queued-for-review task's handoff entry additionally carries a strictness_guard field (invalid/invalid_reasons/reviewer_action) derived from that task's own allowed_writes files, without adding any new taskctl write call.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
-        "tools/geoai-task-mcp/tests/test_review_strictness_handoff_wire_v1.sh",
-        "tools/geoai-task-mcp/eval/review_strictness_handoff_wire_v1.json"
+        "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
+        "tools/aiworkhub/tests/test_review_strictness_handoff_wire_v1.sh",
+        "tools/aiworkhub/eval/review_strictness_handoff_wire_v1.json"
       ],
       "acceptance": [
         "handoff report entries gain a strictness_guard field derived generically from each card's own allowed_writes (not the hardcoded B120 3-wave manifest)",
@@ -25,9 +25,9 @@
       "goal": "Replace the fixed KNOWN_WAVES manifest with generic discovery: given a task_id or a card's allowed_writes list, locate its eval JSON / rows JSONL / test script / builder script by path convention and audit them, so the guard works on any future wave without a code edit per wave.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
-        "tools/geoai-task-mcp/tests/test_review_strictness_generic_discovery_v1.sh",
-        "tools/geoai-task-mcp/eval/review_strictness_generic_discovery_v1.json"
+        "tools/aiworkhub/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/aiworkhub/tests/test_review_strictness_generic_discovery_v1.sh",
+        "tools/aiworkhub/eval/review_strictness_generic_discovery_v1.json"
       ],
       "acceptance": [
         "guard accepts a task_id/allowed_writes list and audits it without a manifest edit",
@@ -41,8 +41,8 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/review_artifact_strictness_targets_v1.jsonl",
-        "tools/geoai-task-mcp/scripts/audit_review_artifact_strictness_b120_v1.py",
-        "tools/geoai-task-mcp/tests/test_review_strictness_curriculum_v1.sh"
+        "tools/aiworkhub/scripts/audit_review_artifact_strictness_b120_v1.py",
+        "tools/aiworkhub/tests/test_review_strictness_curriculum_v1.sh"
       ],
       "acceptance": [
         "curriculum rows carry file-derived features + invalid/valid label + reason codes for each known wave",

@@ -4,13 +4,13 @@ set -euo pipefail
 # test_mcp_stdio_concurrent_client_smoke_b110_v1.sh
 # Proves the frozen read-only tool contract v1 holds under CONCURRENCY: two
 # independent mcp.client.stdio.stdio_client subprocess sessions are opened to
-# the geoai-task-mcp server AT THE SAME TIME (overlap forced by an
+# the aiworkhub server AT THE SAME TIME (overlap forced by an
 # asyncio.Barrier(2)) and driven through real mcp.ClientSession over OS pipes.
 # Asserts: both concurrent sessions see the SAME B108 frozen inputSchema
 # fingerprints (15 tools: 11 read-only + 4 write-gated), the two sessions agree
 # (no drift under concurrency), NO cross-session state bleed (each session's
 # pending_for_runner echoes ONLY its own runner; each isolated audit dir stays
-# empty + byte-identical), NO queue/audit writes with GEOAI_TASK_MCP_ALLOW_WRITES
+# empty + byte-identical), NO queue/audit writes with AIWORKHUB_ALLOW_WRITES
 # unset AND =1, ONLY the MCP server subprocess is launched (no agent/model, no
 # shell=True), and server.py holds no process-launch code. Determinism is
 # proven by running the smoke TWICE and asserting the path-free run_signature is
@@ -23,16 +23,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 SMOKE="$MCPROOT/tests/mcp_stdio_concurrent_client_smoke.py"
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b110_concurrent_smoke.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b110_concurrent_smoke.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
+export AIWORKHUB_REPO="$ROOT"
 
 echo "=== MCP STDIO Concurrent Client Smoke Test B110 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "TMP=$TMPDIR_STATE"
 
 # --- 0. server.py holds no process-launch code (defense in depth) ----------
@@ -135,7 +135,7 @@ for tag, d in (("run1", d1), ("run2", d2)):
         assert r["ok"] is True, (tag, rk)
 
     # only-the-server launched: normalized python + server module, no agent tokens
-    assert det["server_command_normalized"] == ["<python>", "-m", "geoai_task_mcp.server"], \
+    assert det["server_command_normalized"] == ["<python>", "-m", "aiworkhub.server"], \
         (tag, det["server_command_normalized"])
     assert det["launched_agent_or_model_token_hits"] == [], (tag, det["launched_agent_or_model_token_hits"])
 

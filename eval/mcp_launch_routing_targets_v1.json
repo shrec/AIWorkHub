@@ -53,8 +53,8 @@
   "neural_bridge_note": "These curriculum rows are TRAINING TARGETS for a learned neural router that selects adapter/runner/topic from task context and abstains when evidence is insufficient. The static TOPIC_TO_ADAPTER mapping and infer_adapter() function are curriculum LABEL GENERATORS only — they are NOT runtime launch authority. The collision preflight (B107) provides read-only evidence for abstain decisions. Production routing must be the neural model's learned dispatch, not a regex/keyword cue router. Safety gates (write gate, allowlist) remain deterministic boundaries after the neural router selects.",
   "files_written": [
     "bitnnv2/data/curriculum/mcp_launch_routing_targets_v1.jsonl",
-    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_v1.json",
-    "tools/geoai-task-mcp/eval/mcp_launch_routing_targets_rows_v1.jsonl",
-    "tools/geoai-task-mcp/data/tasking/mcp_launch_routing_targets_next_wave_v1.json"
+    "tools/aiworkhub/eval/mcp_launch_routing_targets_v1.json",
+    "tools/aiworkhub/eval/mcp_launch_routing_targets_rows_v1.jsonl",
+    "tools/aiworkhub/data/tasking/mcp_launch_routing_targets_next_wave_v1.json"
   ]
 }

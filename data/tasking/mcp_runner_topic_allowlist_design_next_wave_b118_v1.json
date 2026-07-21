@@ -17,14 +17,14 @@
         "unknown runner/topic pairs are rejected with audit log entry",
         "Codex 'done' action allowed for codex runner only",
         "read-only tools are unaffected (no runner/topic check on non-write commands)",
-        "bash tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes",
+        "bash tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh passes",
         "existing smoke tests still pass (no regression)",
         "python3 AITools/taskctl.py verify passes"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
-        "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
-        "tools/geoai-task-mcp/tests/runner_topic_allowlist_enforcement_smoke.py"
+        "tools/aiworkhub/src/aiworkhub/core.py",
+        "tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_enforcement_b119_v1.sh",
+        "tools/aiworkhub/tests/runner_topic_allowlist_enforcement_smoke.py"
       ],
       "forbidden": [
         "server_py_mutation",

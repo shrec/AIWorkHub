@@ -1,0 +1,99 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CALLBACK_DISPATCHER_LIFECYCLE_B857_V1",
+  "title": "Close repo-local callback dispatcher lifecycle",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_callback_dispatcher_lifecycle_b857_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "critical",
+  "objective": "Close the actual callback-delivery gap. AIWorkHub currently persists terminal events but leaves them pending because no callback dispatcher is owned by the VS Code extension lifecycle. Start exactly one repository-bound dispatcher after an initialized workspace becomes active, preserve pending delivery while a coordinator turn/transport is busy, route by the explicitly selected Codex or Claude coordinator target using only existing canonical transports, and stop/rebind cleanly on deactivate, reload or repository switch. Do not add a systemd dependency or a fallback database. Preserve compact callback envelopes and make health distinguish durable queued work from a broken dispatcher.",
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py",
+    "tools/geoai-task-mcp/tests/test_server_runtime_wiring.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_callback_dispatcher_lifecycle_b857_v1.json"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard_mcp_app.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_stale_turn_recovery_b823_v1.py",
+    "tools/geoai-task-mcp/tests/test_server_runtime_wiring.py"
+  ],
+  "acceptance": [
+    "An initialized repository starts exactly one callback dispatcher through the VS Code extension lifecycle; no user systemd unit, manual daemon command or dashboard HTTP server is required.",
+    "Activation, editor-tab deserialization and reload converge idempotently on one live repository-bound dispatcher, without duplicate polling loops or duplicate delivery.",
+    "Workspace/repository switch and extension deactivation stop the old dispatcher and prevent any cross-repository read or delivery.",
+    "The explicitly selected coordinator target controls routing: Codex uses the existing canonical Codex transport; Claude uses the versioned aiworkhub.claude_callback.v1 transport accepted in B856. Unsupported Copilot routing fails closed and remains visible without fabricating delivery.",
+    "Busy, temporarily unavailable or active-turn transports keep terminal callbacks pending with bounded backoff; they do not dead-letter or return tasks to pending.",
+    "A matching transport acknowledgement is required before the canonical outbox row is marked delivered; restarts safely recover leases and never duplicate an acknowledged callback.",
+    "Callback payloads remain compact: batch count and task_id/state lines only, with no worker output, logs, artifacts, prompts or objective text.",
+    "Dashboard/runtime health reports dispatcher running/stopped, target, repository identity, pending count and last delivery/error without marking an otherwise healthy uninitialized repository as degraded.",
+    "The public task lifecycle and callback status remain on the selected repository's .aiworkhub/tasking/task_queue.sqlite and do not invoke repository AITools/taskctl.py or AITools/taskdb.py.",
+    "The stale subprocess expectation in test_server_runtime_wiring.py is rebased to the canonical in-process engine contract.",
+    "Focused Python, Node and VSIX packaging tests pass. Codex can then run one real terminal-task canary and observe pending-to-delivered plus a callback in the bound coordinator thread."
+  ],
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py tools/geoai-task-mcp/tests/test_aiworkhub_callback_stale_turn_recovery_b823_v1.py tools/geoai-task-mcp/tests/test_server_runtime_wiring.py tools/geoai-task-mcp/tests/test_aiworkhub_canonical_task_engine_b852.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py",
+    "tools/geoai-task-mcp/tests/test_server_runtime_wiring.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_callback_dispatcher_lifecycle_b857_v1.json"
+  ],
+  "forbidden": [
+    "systemd_requirement",
+    "http_dashboard_server",
+    "fallback_task_database",
+    "cross_repository_callback",
+    "keystroke_or_clipboard_injection",
+    "private_vscode_or_chat_api_guessing",
+    "worker_output_in_callback",
+    "task_return_to_pending_on_delivery_failure",
+    "git_commit",
+    "git_push"
+  ],
+  "commit_contract": "NO_COMMIT. Stop at Codex review.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "slice",
+      "bundle_type": "feature",
+      "query": "callback bridge dispatcher daemon extension activation reload coordinator target outbox delivery acknowledgement",
+      "budget": 180,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+        "tools/geoai-task-mcp/src/aiworkhub/core.py",
+        "tools/geoai-task-mcp/vscode-extension/extension.js"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub callback dispatcher closure",
+      "limit": 8
+    },
+    "ai_memory": {
+      "query": "AIWorkHub callback active turn pending delivery extension lifecycle",
+      "limit": 3
+    },
+    "kb": {
+      "query": "AIWorkHub callback transport contract coordinator target",
+      "limit": 3
+    }
+  }
+}

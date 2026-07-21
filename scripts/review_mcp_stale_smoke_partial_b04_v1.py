@@ -10,13 +10,13 @@ os.chdir(ROOT)
 
 def main():
     result = {
-        "schema_id": "geoai.mcp_stale_smoke_partial_review.v1",
+        "schema_id": "aiworkhub.mcp_stale_smoke_partial_review.v1",
         "task_id": "DEEPSEEK_TASK_MCP_STALE_SMOKE_PARTIAL_REVIEW_B04_V1",
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "verdict": "RECOVER",
         "reason": "B119 never completed: all present files predate task, 2 outputs missing, all 3 smoke tests fail stale assertions."
     }
-    out = "tools/geoai-task-mcp/eval/mcp_stale_smoke_partial_review_b04_v1.json"
+    out = "tools/aiworkhub/eval/mcp_stale_smoke_partial_review_b04_v1.json"
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)

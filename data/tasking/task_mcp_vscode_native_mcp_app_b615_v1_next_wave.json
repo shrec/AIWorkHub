@@ -11,7 +11,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "docs/security/vscode_task_operations_mutation_ui_review_b616_v1.md",
-        "tools/geoai-task-mcp/eval/vscode_mutation_ui_security_review_b616_v1.json"
+        "tools/aiworkhub/eval/vscode_mutation_ui_security_review_b616_v1.json"
       ],
       "acceptance": [
         "no code changes to extension.js/media/*.js/server.py in this task",
@@ -21,7 +21,7 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_VSCODE_EXTENSION_TEST_HARNESS_B617_V1",
-      "goal": "Add a real @vscode/test-electron (or equivalent) integration harness that actually activates the extension, opens the panel, and exercises the ready/refresh/selectTask message round trip against a real spawned geoai_task_mcp.server child in a scratch task-queue fixture -- current coverage is static analysis (node --check + pattern assertions) only, with no live activation test.",
+      "goal": "Add a real @vscode/test-electron (or equivalent) integration harness that actually activates the extension, opens the panel, and exercises the ready/refresh/selectTask message round trip against a real spawned aiworkhub.server child in a scratch task-queue fixture -- current coverage is static analysis (node --check + pattern assertions) only, with no live activation test.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "tools/vscode-geoai-task-operations/test/**",
@@ -40,7 +40,7 @@
       "allowed_writes": [
         "tools/vscode-geoai-task-operations/extension.js",
         "tools/vscode-geoai-task-operations/test/**",
-        "tools/geoai-task-mcp/eval/vscode_stdio_protocol_hardening_b618_v1.json"
+        "tools/aiworkhub/eval/vscode_stdio_protocol_hardening_b618_v1.json"
       ],
       "acceptance": [
         "documented comparison of hand-rolled client vs. official SDK client behavior",
@@ -54,7 +54,7 @@
       "mode": "NO_COMMIT",
       "allowed_writes": [
         "bitnnv2/data/curriculum/mcp_dashboard_telemetry_signal_targets_v1.jsonl",
-        "tools/geoai-task-mcp/eval/mcp_dashboard_telemetry_signal_targets_v1.json"
+        "tools/aiworkhub/eval/mcp_dashboard_telemetry_signal_targets_v1.json"
       ],
       "acceptance": [
         "curriculum rows pair a liveness/telemetry snapshot with the eventual task outcome",

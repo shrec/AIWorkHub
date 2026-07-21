@@ -8,7 +8,7 @@ letting it hit the real taskctl.py processes. Validates:
   - Live task queue unchanged before/after (byte-identical snapshots)
   - Empty queue case (stub-injected, same as B111)
   - Non-empty fixture queue case (stub-injected)
-  - Write gate default-off (GEOAI_TASK_MCP_ALLOW_WRITES=0)
+  - Write gate default-off (AIWORKHUB_ALLOW_WRITES=0)
   - process_launch_authority=false
   - All forbidden operations verified
   - Output shape matches contract B111/B112
@@ -18,8 +18,8 @@ B113 FIX APPLIED: review_summarizer._REVIEW_LINE_RE now suffix-tolerant
 fetch_errors=[]. This test validates both fixes against real taskctl queue.
 
 Usage:
-    GEOAI_TASK_MCP_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    GEOAI_REPO=/home/shrek/GeoAI python3 \
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
+    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 \
     tools/geoai-task-mcp/tests/mcp_review_summarizer_real_queue_integration.py
 """
 
@@ -35,8 +35,8 @@ from typing import Any
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
-from geoai_task_mcp import review_summarizer
-from geoai_task_mcp.core import TaskCtlResult
+from aiworkhub import review_summarizer
+from aiworkhub.core import TaskCtlResult
 
 
 FAILURES: list[str] = []
@@ -61,7 +61,7 @@ def sha256(s: str) -> str:
 
 def run_taskctl_raw(args: list[str]) -> subprocess.CompletedProcess:
     """Run real taskctl.py and return raw CompletedProcess."""
-    repo = os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")
+    repo = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
     cmd = ["python3", os.path.join(repo, "AITools/taskctl.py")] + args
     return subprocess.run(
         cmd, cwd=repo, text=True,
@@ -81,12 +81,12 @@ def snapshot_review_queue() -> tuple[str, str]:
 
 print("=== B112 Real Queue Integration Test ===\n")
 
-assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0") == "0", (
-    "GEOAI_TASK_MCP_ALLOW_WRITES must be 0"
+assert os.environ.get("AIWORKHUB_ALLOW_WRITES", "0") == "0", (
+    "AIWORKHUB_ALLOW_WRITES must be 0"
 )
-print("precondition: GEOAI_TASK_MCP_ALLOW_WRITES=0  ✓")
-assert os.environ.get("GEOAI_REPO", ""), "GEOAI_REPO must be set"
-print(f"precondition: GEOAI_REPO={os.environ['GEOAI_REPO']}  ✓\n")
+print("precondition: AIWORKHUB_ALLOW_WRITES=0  ✓")
+assert os.environ.get("AIWORKHUB_REPO", ""), "AIWORKHUB_REPO must be set"
+print(f"precondition: AIWORKHUB_REPO={os.environ['AIWORKHUB_REPO']}  ✓\n")
 
 # ── Test 1: Real queue — snapshot BEFORE ────────────────────────────
 
@@ -196,18 +196,18 @@ for flag_name, expected in flag_assertions:
 # ── Test 6: Server tool path (real server module) ───────────────────
 
 print("\n--- Test 6: Server tool path ---")
-from geoai_task_mcp.server import geoai_task_review_summarize  # noqa: E402
+from aiworkhub.server import aiworkhub_task_review_summarize  # noqa: E402
 
-server_result = geoai_task_review_summarize()
+server_result = aiworkhub_task_review_summarize()
 if not server_result.get("ok"):
     fail("server.ok", f"got {server_result.get('ok')}")
 else:
     ok("server.ok=True")
 
-if server_result.get("server_tool") != "geoai_task_review_summarize":
+if server_result.get("server_tool") != "aiworkhub_task_review_summarize":
     fail("server.server_tool", f"got {server_result.get('server_tool')}")
 else:
-    ok("server.server_tool=geoai_task_review_summarize")
+    ok("server.server_tool=aiworkhub_task_review_summarize")
 
 if server_result.get("contract") != "B111_v1_readonly_server_wiring":
     fail("server.contract", f"got {server_result.get('contract')}")
@@ -218,7 +218,7 @@ else:
 
 print("\n--- Test 7: task_ids filtering ---")
 # Test filtering even with empty real-parse results (should survive gracefully)
-filtered = geoai_task_review_summarize(task_ids=["NONEXISTENT_TASK_ID"])
+filtered = aiworkhub_task_review_summarize(task_ids=["NONEXISTENT_TASK_ID"])
 filtered_cl = filtered.get("codex_review_checklist", [])
 if len(filtered_cl) != 0:
     fail("filtered.nonexistent", f"expected 0 results, got {len(filtered_cl)}")
@@ -232,7 +232,7 @@ else:
 # ── Test 8: batch_label via server tool ─────────────────────────────
 
 print("\n--- Test 8: batch_label ---")
-batched = geoai_task_review_summarize(batch_label="b112_real_integration")
+batched = aiworkhub_task_review_summarize(batch_label="b112_real_integration")
 if batched.get("batch_label") != "b112_real_integration":
     fail("batch_label", f"got {batched.get('batch_label')}")
 else:

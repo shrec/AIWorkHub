@@ -2,7 +2,7 @@
 """Smoke test: verify blocked write attempts are logged to audit.jsonl.
 
 Rules:
-- GEOAI_TASK_MCP_ALLOW_WRITES=0 (default) — writes must be BLOCKED.
+- AIWORKHUB_ALLOW_WRITES=0 (default) — writes must be BLOCKED.
 - Blocked attempt MUST appear in audit.jsonl.
 - Parent task queue (SQLite) MUST NOT be mutated.
 - Audit log MUST NOT contain secrets or env var VALUES.
@@ -19,21 +19,21 @@ from pathlib import Path
 
 
 def _repo_root() -> Path:
-    return Path(os.environ.get("GEOAI_REPO", str(Path(__file__).resolve().parents[2])))
+    return Path(os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[2])))
 
 
 def main() -> int:
     repo = _repo_root()
 
     # --- 1. Setup: temp audit log path so we don't pollute the real one ---
-    with tempfile.TemporaryDirectory(prefix="geoai_audit_smoke_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="aiworkhub_audit_smoke_") as tmpdir:
         audit_path = Path(tmpdir) / "audit.jsonl"
-        os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_path)
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ["GEOAI_REPO"] = str(repo)
+        os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_path)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ["AIWORKHUB_REPO"] = str(repo)
 
         # Import core AFTER env is set
-        from geoai_task_mcp import core
+        from aiworkhub import core
 
         # --- 2. Snapshot parent queue state BEFORE ---
         health_before = core.health()

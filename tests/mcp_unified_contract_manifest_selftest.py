@@ -105,7 +105,7 @@ FROZEN_MANIFEST_SCAFFOLD: dict[str, Any] = {
         "role": "deterministic_contract_freeze_validator",
     },
     "purpose": "One machine-readable binding of the B108 inputSchema freeze and the B109 output-schema + result-skeleton freeze per read-only tool, plus write-gated input schemas, so a single gate fails on ANY input-or-output drift and the two freezes cannot silently diverge.",
-    "schema_id": "geoai.mcp_unified_contract_freeze_manifest.v1",
+    "schema_id": "aiworkhub.mcp_unified_contract_freeze_manifest.v1",
     "task_id": "CLAUDE_TASK_MCP_UNIFIED_CONTRACT_FREEZE_GATE_B110_V1",
 }
 

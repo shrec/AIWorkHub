@@ -1,0 +1,81 @@
+{
+  "schema_id": "aiworkhub.task_mcp.multirepo_coordinator_routing_b839_v1.eval.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_MULTIREPO_COORDINATOR_ROUTING_B839_V1",
+  "runner": "codex_gpt55_aiworkhub_multirepo_coordinator_routing_b839_v1",
+  "verdict": "PARTIAL_ENV_BLOCKED",
+  "summary": "Repository-local bootstrap now publishes .aiworkhub/config/storage.json before the manifest seal; coordinator callback routes require repo_id, provider, VS Code window identity, task_id, and provider-specific thread/session identity; Claude callbacks without a supported live wake transport remain durable deferred resumable notifications instead of false deliveries.",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/repository_state.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_mux.py",
+    "tools/geoai-task-mcp/src/aiworkhub/route_identity.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/tests/test_repository_mux.py",
+    "tools/geoai-task-mcp/tests/test_repository_state.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_multirepo_coordinator_routing_b839_v1.json"
+  ],
+  "removed_duplicate_legacy_tests": true,
+  "legacy_named_test_glob_remaining": 0,
+  "route_contract": {
+    "repo_scoped": true,
+    "provider_scoped": true,
+    "window_scoped": true,
+    "codex_requires_thread_id": true,
+    "claude_requires_session_id": true,
+    "provider_only_rejected": true,
+    "thread_only_rejected": true,
+    "copilot_direct_wake": "deferred_not_implemented"
+  },
+  "repository_local_state": {
+    "bootstrap_creates_storage_registry": true,
+    "task_queue_path": ".aiworkhub/tasking/task_queue.sqlite",
+    "storage_registry_path": ".aiworkhub/config/storage.json",
+    "manifest_remains_final_atomic_seal": true,
+    "global_project_database_authority": false,
+    "caller_selected_repository_tool_parameter": false
+  },
+  "manual_smoke": {
+    "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 - <<'PY' ...",
+    "exit_code": 0,
+    "status": "PASS",
+    "covered": [
+      "bootstrap_repository",
+      "load_storage_registry",
+      "resolve_database_path(task_queue)",
+      "RepositoryWindowMux.persist_coordinator_callback",
+      "ClaudeCallbackAdapter.deferred_resumable"
+    ]
+  },
+  "validation": [
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m compileall -q tools/geoai-task-mcp/src/aiworkhub/repository_state.py tools/geoai-task-mcp/src/aiworkhub/repository_mux.py tools/geoai-task-mcp/src/aiworkhub/route_identity.py tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "VERIFY: PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "collision_free=true; no overlapping allowed_writes (105 active cards)"
+    }
+  ],
+  "no_commit_or_live_cutover": true
+}

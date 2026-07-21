@@ -8,11 +8,11 @@ No agent/model launch, no network, no mutation.
 
 import sys, os, json, subprocess, time, hashlib
 
-ROOT = os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")
-MCPROOT = os.path.join(ROOT, "tools", "geoai-task-mcp")
-ALLOW_WRITES = os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0")
+ROOT = os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")
+MCPROOT = os.path.join(ROOT, "tools", "aiworkhub")
+ALLOW_WRITES = os.environ.get("AIWORKHUB_ALLOW_WRITES", "0")
 QUEUE_PATH = os.path.join(ROOT, "bitnnv2", "data", "tasking", "task_queue_v1.sqlite")
-AUDIT_PATH = os.path.join(ROOT, "tools", "geoai-task-mcp", "logs", "audit.jsonl")
+AUDIT_PATH = os.path.join(ROOT, "tools", "aiworkhub", "logs", "audit.jsonl")
 
 FAILURES = []
 
@@ -45,13 +45,13 @@ def main():
     # Build env for the child server
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.join(MCPROOT, "src")
-    env["GEOAI_REPO"] = ROOT
-    env["GEOAI_TASK_MCP_ALLOW_WRITES"] = ALLOW_WRITES
-    env["GEOAI_TASK_MCP_TIMEOUT"] = "30"
+    env["AIWORKHUB_REPO"] = ROOT
+    env["AIWORKHUB_ALLOW_WRITES"] = ALLOW_WRITES
+    env["AIWORKHUB_TIMEOUT"] = "30"
     env["PYTHONUNBUFFERED"] = "1"
 
     # Start MCP server in stdio mode (text mode for line-based I/O)
-    server_cmd = [sys.executable, "-u", "-m", "geoai_task_mcp.server"]
+    server_cmd = [sys.executable, "-u", "-m", "aiworkhub.server"]
     print(f"  starting server: {server_cmd}")
 
     proc = subprocess.Popen(
@@ -121,8 +121,8 @@ def main():
         print(f"  tools/list: {len(tools)} tools returned")
         pass_("tools_list_count", f"{len(tools)} tools")
 
-        # --- Step D: find geoai_task_review_summarize ---
-        REQUIRED = "geoai_task_review_summarize"
+        # --- Step D: find aiworkhub_task_review_summarize ---
+        REQUIRED = "aiworkhub_task_review_summarize"
         review_tool = None
         for t in tools:
             if t["name"] == REQUIRED:
@@ -141,7 +141,7 @@ def main():
         else:
             fail("tool_desc_readonly", "missing readonly in description")
 
-        # --- Step E: call geoai_task_review_summarize ---
+        # --- Step E: call aiworkhub_task_review_summarize ---
         call_req = {
             "jsonrpc": "2.0",
             "id": 3,

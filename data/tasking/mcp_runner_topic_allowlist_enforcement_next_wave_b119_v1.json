@@ -7,20 +7,20 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_SERVER_WIRING_B120_V1",
-      "goal": "Thread a runner/topic identity into the geoai_task_mark_review / geoai_task_mark_done / geoai_task_export_jsonl MCP tool signatures in server.py so the B119 allowlist (core.check_runner_topic_allowlist, already accepting these as optional kwargs) is enforced end-to-end for all write-gated actions, not just auto_pickup. Requires server.py mutation (explicitly forbidden for B119).",
+      "goal": "Thread a runner/topic identity into the aiworkhub_task_mark_review / aiworkhub_task_mark_done / aiworkhub_task_export_jsonl MCP tool signatures in server.py so the B119 allowlist (core.check_runner_topic_allowlist, already accepting these as optional kwargs) is enforced end-to-end for all write-gated actions, not just auto_pickup. Requires server.py mutation (explicitly forbidden for B119).",
       "mode": "implementation_gated_core_patch",
       "runner": "claude_coding",
       "topic": "coding",
       "acceptance": [
-        "geoai_task_mark_review/mark_done/export_jsonl tool signatures accept runner (and topic where meaningful)",
+        "aiworkhub_task_mark_review/mark_done/export_jsonl tool signatures accept runner (and topic where meaningful)",
         "core.mark_review/mark_done/export_jsonl called with the supplied identity (no behavior change to core.py needed -- kwargs already exist)",
         "codex-only actions (done, export-jsonl) reject any non-codex runner end-to-end via the real MCP tool call",
         "existing B119 smoke + shell tests still pass unmodified",
         "python3 AITools/taskctl.py verify passes"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/tests/test_mcp_runner_topic_allowlist_server_wiring_b120_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/tests/test_mcp_runner_topic_allowlist_server_wiring_b120_v1.sh"
       ],
       "forbidden": [
         "core_py_semantic_change_to_allowlist_matrix",

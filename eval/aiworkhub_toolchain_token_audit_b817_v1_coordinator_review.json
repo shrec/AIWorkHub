@@ -1,0 +1,10 @@
+{
+  "schema_id": "aiworkhub.coordinator_review.v1",
+  "task_id": "DEEPSEEK_AIWORKINGHUB_TOOLCHAIN_TOKEN_AUDIT_B817_V1",
+  "verdict": "REJECT_INSUFFICIENT_PRODUCTION_EVIDENCE",
+  "promoted_paths": [],
+  "required_recent_tasks": 30,
+  "available_real_usage_records": 4,
+  "reason": "The audit exposed useful hypotheses but did not satisfy the required production sample and therefore cannot be authoritative for token economics decisions.",
+  "next_scope": "Rerun after context cache/economics telemetry yields at least 30 comparable task records, separating bytes, tokens, cached tokens and billed cost."
+}

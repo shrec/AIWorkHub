@@ -49,7 +49,7 @@ PROCESS_LAUNCH_IMPLEMENTED = False
 SUBPROCESS_LAUNCH_TRIPWIRE = 0
 QUEUE_MUTATION_TRIPWIRE = 0
 
-REPO = Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")).expanduser().resolve()
+REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
 sys.path.insert(0, str(REPO / "AITools"))
 import taskdb  # noqa: E402  -- real production canonical_status/card_sort_key/normalize_card
 
@@ -60,7 +60,7 @@ CARDS_PATH = Path(os.environ.get(
 MANIFEST_PATH = Path(os.environ.get(
     "BITNN_TASK_CARDS_MANIFEST", str(REPO / "bitnnv2" / "data" / "tasking" / "machine_task_cards_manifest_v1.json")))
 
-ROWS_SCHEMA = "geoai.mcp_full_wave_dryrun_harness_row.v1"
+ROWS_SCHEMA = "aiworkhub.mcp_full_wave_dryrun_harness_row.v1"
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -260,21 +260,21 @@ def stale_manifest_fixture(cards: list[dict]) -> dict[str, Any]:
 def write_gate_check(env: dict[str, str]) -> bool:
     """Return True iff `env` represents an ATTEMPTED bypass of the required
     write-gate-off invariant for a dryrun harness run."""
-    val = str(env.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0")).strip()
+    val = str(env.get("AIWORKHUB_ALLOW_WRITES", "0")).strip()
     return val not in ("", "0")
 
 
 def write_gate_bypass_fixture() -> dict[str, Any]:
     """Engineered failure-mode #3: the bypass detector must flag a synthetic
-    GEOAI_TASK_MCP_ALLOW_WRITES=1 env as a bypass attempt, must NOT flag a
+    AIWORKHUB_ALLOW_WRITES=1 env as a bypass attempt, must NOT flag a
     synthetic ...=0 env, and the REAL env this process is actually running
     under must show the gate held (expected: the bash test harness exports
-    GEOAI_TASK_MCP_ALLOW_WRITES=0)."""
+    AIWORKHUB_ALLOW_WRITES=0)."""
     real_bypass_detected = write_gate_check(os.environ)
-    synthetic_bypass_detected = write_gate_check({"GEOAI_TASK_MCP_ALLOW_WRITES": "1"})
-    synthetic_clean_detected_as_clean = not write_gate_check({"GEOAI_TASK_MCP_ALLOW_WRITES": "0"})
+    synthetic_bypass_detected = write_gate_check({"AIWORKHUB_ALLOW_WRITES": "1"})
+    synthetic_clean_detected_as_clean = not write_gate_check({"AIWORKHUB_ALLOW_WRITES": "0"})
     return {
-        "real_env_value": os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES"),
+        "real_env_value": os.environ.get("AIWORKHUB_ALLOW_WRITES"),
         "real_bypass_detected": real_bypass_detected,
         "synthetic_bypass_env_detected": synthetic_bypass_detected,
         "synthetic_clean_env_detected_as_clean": synthetic_clean_detected_as_clean,
@@ -316,7 +316,7 @@ def _write_missing_queue_report(eval_out: Path, rows_out: Path, next_wave_out: P
         }) + "\n")
     next_wave_out.parent.mkdir(parents=True, exist_ok=True)
     next_wave_out.write_text(json.dumps({
-        "schema_id": "geoai.mcp_full_wave_harness_real_repair_next_wave.v1",
+        "schema_id": "aiworkhub.mcp_full_wave_harness_real_repair_next_wave.v1",
         "verdict": "FAIL", "reason": "parent_queue_missing", "tasks": [],
     }, indent=2) + "\n", encoding="utf-8")
     print(f"FAIL: parent queue missing (db_exists={DB_PATH.exists()} cards_exists={CARDS_PATH.exists()})")
@@ -435,7 +435,7 @@ def build(eval_out: Path, next_wave_out: Path) -> int:
 
     next_wave_out.parent.mkdir(parents=True, exist_ok=True)
     next_wave_out.write_text(json.dumps({
-        "schema_id": "geoai.mcp_full_wave_harness_real_repair_next_wave.v1",
+        "schema_id": "aiworkhub.mcp_full_wave_harness_real_repair_next_wave.v1",
         "task_id": "CLAUDE_TASK_MCP_FULL_WAVE_HARNESS_REAL_REPAIR_B122_V1",
         "verdict": verdict,
         "summary": (

@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 
-_STATIC = Path(__file__).resolve().parents[1] / "src" / "geoai_task_mcp" / "dashboard_static"
+_STATIC = Path(__file__).resolve().parents[1] / "src" / "aiworkhub" / "dashboard_static"
 _HTML_PATH = _STATIC / "index.html"
 _CSS_PATH = _STATIC / "dashboard.css"
 

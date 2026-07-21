@@ -5,7 +5,7 @@
   "topic": "task_mcp",
   "date": "2026-07-08",
   "mode": "mcp_completion_inbox_smoke",
-  "builds_on": "CLAUDE_TASK_MCP_COMPLETION_INBOX_WIRING_B275_V1 (mcp_completion_inbox_wiring_b275_v1.json, tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py + server.py:@mcp.tool() geoai_completion_inbox)",
+  "builds_on": "CLAUDE_TASK_MCP_COMPLETION_INBOX_WIRING_B275_V1 (mcp_completion_inbox_wiring_b275_v1.json, tools/aiworkhub/src/aiworkhub/completion_inbox.py + server.py:@mcp.tool() aiworkhub_completion_inbox)",
   "verdict": "PASS",
   "no_external_paid_model_launched": true,
   "context7_usage": {
@@ -13,7 +13,7 @@
     "local_docs_sufficient": true,
     "reason": "Pure repo-local smoke test of an already-wired, already-verified local FastMCP tool (completion_inbox.py + server.py, both read_first). No new external library/SDK/API question was open; nothing beyond stdlib subprocess/asyncio/datetime introspection was needed."
   },
-  "summary": "Smoke-tested the B275 geoai_completion_inbox MCP tool without launching any external/paid model or agent process, then assessed the minimal owner-notification loop it implements and what is still missing for AUTOMATIC (push) Codex notification. Test script tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh runs 21 checks in 5 sections: (1) module invariants (READONLY=True, LAUNCH_IMPLEMENTED=False, SUBPROCESS_LAUNCH_TRIPWIRE=0); (2) fixture-based facet correctness via injected _list_tasks/_show_task stubs -- review_queue, stale_processing (24h threshold), runner_mismatch_warnings, latest_validation_facts all verified against 4 synthetic cards (one clean review card, one deliberately batch-mismatched review card b999-vs-B123, one stale processing card @48h, one fresh processing card @1h), fully deterministic, no live-DB dependency; (3) a real (non-stubbed) build_completion_inbox() call with subprocess.run monkeypatched as a spy -- confirms every subprocess argv is `python3 .../taskctl.py <list|show> ...` and the subcommand token (argv element immediately after the taskctl.py path, not any later flag VALUE such as `--status review`) is never one of the write subcommands (review/done/start/auto-pickup/add-card/export-jsonl/stage/guard-staged/usage); (4) live task_queue_v1.sqlite fingerprint (size+mtime) asserted byte-identical before/after a real call; (5) server.py additive-wiring check via `await server.mcp.list_tools()` -- geoai_completion_inbox is registered (24 tools total) and two pre-existing sentinel tools (geoai_task_review_queue, geoai_task_mark_done) remain present, i.e. no accidental tool removal.",
+  "summary": "Smoke-tested the B275 aiworkhub_completion_inbox MCP tool without launching any external/paid model or agent process, then assessed the minimal owner-notification loop it implements and what is still missing for AUTOMATIC (push) Codex notification. Test script tools/aiworkhub/tests/test_mcp_completion_inbox_smoke_b276_v1.sh runs 21 checks in 5 sections: (1) module invariants (READONLY=True, LAUNCH_IMPLEMENTED=False, SUBPROCESS_LAUNCH_TRIPWIRE=0); (2) fixture-based facet correctness via injected _list_tasks/_show_task stubs -- review_queue, stale_processing (24h threshold), runner_mismatch_warnings, latest_validation_facts all verified against 4 synthetic cards (one clean review card, one deliberately batch-mismatched review card b999-vs-B123, one stale processing card @48h, one fresh processing card @1h), fully deterministic, no live-DB dependency; (3) a real (non-stubbed) build_completion_inbox() call with subprocess.run monkeypatched as a spy -- confirms every subprocess argv is `python3 .../taskctl.py <list|show> ...` and the subcommand token (argv element immediately after the taskctl.py path, not any later flag VALUE such as `--status review`) is never one of the write subcommands (review/done/start/auto-pickup/add-card/export-jsonl/stage/guard-staged/usage); (4) live task_queue_v1.sqlite fingerprint (size+mtime) asserted byte-identical before/after a real call; (5) server.py additive-wiring check via `await server.mcp.list_tools()` -- aiworkhub_completion_inbox is registered (24 tools total) and two pre-existing sentinel tools (aiworkhub_task_review_queue, aiworkhub_task_mark_done) remain present, i.e. no accidental tool removal.",
   "gates": {
     "no_external_model_or_agent_process_launched": true,
     "readonly_invariants_hold": true,
@@ -43,10 +43,10 @@
   },
   "minimal_owner_notification_loop_definition": {
     "receive_worker_completion": "A worker finishes its claimed task and runs `taskctl.py review <task_id> --runner <runner>` (never `done` -- Codex finalizes). This flips the card's canonical status to 'review' in bitnnv2/data/tasking/task_queue_v1.sqlite -- the ONLY state transition this loop depends on; nothing new was added for it (already true of the existing taskctl review command).",
-    "summarize_artifacts": "geoai_completion_inbox's review_queue facet (completion_inbox.py:_compact_review_entry, already wired in B275) exposes task_id/runner/claimed_by/topic/priority/objective(<=160 chars)/allowed_writes(<=10 paths)/updated_at/review_at/validation_status/runner_task_batch_mismatch per review-state card -- a compact per-task artifact summary Codex can read in one call.",
-    "expose_review_queue": "The same tool call (geoai_completion_inbox(topic=...)) returns review_queue sorted by updated_at desc, plus stale_processing/runner_mismatch_warnings/latest_validation_facts as orchestration context, plus counts + fetch_errors + authority_flags + mutation for self-auditing. Already implemented and verified in B275; this task only smoke-tested it.",
+    "summarize_artifacts": "aiworkhub_completion_inbox's review_queue facet (completion_inbox.py:_compact_review_entry, already wired in B275) exposes task_id/runner/claimed_by/topic/priority/objective(<=160 chars)/allowed_writes(<=10 paths)/updated_at/review_at/validation_status/runner_task_batch_mismatch per review-state card -- a compact per-task artifact summary Codex can read in one call.",
+    "expose_review_queue": "The same tool call (aiworkhub_completion_inbox(topic=...)) returns review_queue sorted by updated_at desc, plus stale_processing/runner_mismatch_warnings/latest_validation_facts as orchestration context, plus counts + fetch_errors + authority_flags + mutation for self-auditing. Already implemented and verified in B275; this task only smoke-tested it.",
     "missing_pieces_for_automatic_codex_notification": [
-      "PUSH_MISSING: the tool is pull-only -- Codex (or the owner) must actively CALL geoai_completion_inbox; nothing fires an event, webhook, or process signal the instant a card transitions to 'review'. No file-watch/inotify/DB-trigger/message-queue exists on task_queue_v1.sqlite.",
+      "PUSH_MISSING: the tool is pull-only -- Codex (or the owner) must actively CALL aiworkhub_completion_inbox; nothing fires an event, webhook, or process signal the instant a card transitions to 'review'. No file-watch/inotify/DB-trigger/message-queue exists on task_queue_v1.sqlite.",
       "NO_DELTA_CURSOR: review_queue returns the FULL current snapshot every call; there is no 'since last poll' cursor/ack, so a caller cannot cheaply tell which review cards are NEW since the last check without external bookkeeping (e.g. diffing task_id sets client-side).",
       "NO_ARTIFACT_BODY_READ: the objective/allowed_writes summary is metadata-only (truncated strings from the task card) -- it does NOT open/summarize the actual JSON eval artifacts a worker produced (e.g. this file's own body); Codex must still read those artifacts directly for detail.",
       "NO_OWNER_DELIVERY_CHANNEL: nothing pushes to an owner-facing channel (email/Slack/desktop notify/log tail) when a new review card appears -- the surface is exclusively an in-session MCP tool call from within a Codex/agent process.",
@@ -55,13 +55,13 @@
     "conclusion": "The PULL half of the loop (receive-completion-signal via canonical status + summarize + expose) is complete and smoke-verified. The PUSH/automatic-notification half is NOT implemented -- see next_wave proposal for a scoped, still-read-only path (poll-and-diff wrapper) rather than a new mutation surface."
   },
   "files_changed": [
-    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh",
-    "tools/geoai-task-mcp/eval/mcp_completion_inbox_smoke_b276_v1.json",
-    "tools/geoai-task-mcp/data/tasking/mcp_completion_inbox_smoke_next_wave_b276_v1.json"
+    "tools/aiworkhub/tests/test_mcp_completion_inbox_smoke_b276_v1.sh",
+    "tools/aiworkhub/eval/mcp_completion_inbox_smoke_b276_v1.json",
+    "tools/aiworkhub/data/tasking/mcp_completion_inbox_smoke_next_wave_b276_v1.json"
   ],
   "production_mcp_server_api_altered": false,
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_smoke_b276_v1.sh -> PASS (21/21 checks)",
+    "bash tools/aiworkhub/tests/test_mcp_completion_inbox_smoke_b276_v1.sh -> PASS (21/21 checks)",
     "python3 AITools/taskctl.py verify -> PASS",
     "python3 AITools/taskctl.py guard CLAUDE_TASK_MCP_COMPLETION_INBOX_SMOKE_B276_V1 --runner claude_task_mcp_inbox_smoke_b276 --topic task_mcp -> PASS"
   ],

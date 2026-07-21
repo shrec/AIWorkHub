@@ -5,7 +5,7 @@ Read-only audit: maps every MVP_ROADMAP checkbox to evidence_refs + status,
 identifies the shortest safe next-wave sequence, and emits compact JSON/JSONL.
 Never mutates parent queue, never enables workflow_switch or launch.
 
-Outputs (all under tools/geoai-task-mcp/):
+Outputs (all under tools/aiworkhub/):
   eval/task_mcp_finishline_status_audit_b116_v1.json
   eval/task_mcp_finishline_status_audit_rows_b116_v1.jsonl
   data/tasking/task_mcp_finishline_status_audit_next_wave_b116_v1.json
@@ -22,12 +22,12 @@ from pathlib import Path
 from typing import Any
 
 # ── paths ──────────────────────────────────────────────────────────────
-REPO = Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")).expanduser().resolve()
-MCP_ROOT = REPO / "tools" / "geoai-task-mcp"
+REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+MCP_ROOT = REPO / "tools" / "aiworkhub"
 EVAL_DIR = MCP_ROOT / "eval"
 DATA_DIR = MCP_ROOT / "data" / "tasking"
 SCRIPTS_DIR = MCP_ROOT / "scripts"
-SRC_DIR = MCP_ROOT / "src" / "geoai_task_mcp"
+SRC_DIR = MCP_ROOT / "src" / "aiworkhub"
 TESTS_DIR = MCP_ROOT / "tests"
 
 # ── authority flags (hard invariant) ───────────────────────────────────
@@ -46,8 +46,8 @@ def run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
 
 
 def git_dirty_report() -> dict[str, Any]:
-    """Report dirty/untracked state inside tools/geoai-task-mcp/."""
-    result = run(["git", "status", "--short", "--", "tools/geoai-task-mcp/"])
+    """Report dirty/untracked state inside tools/aiworkhub/."""
+    result = run(["git", "status", "--short", "--", "tools/aiworkhub/"])
     lines = [l for l in result.stdout.splitlines() if l.strip()]
     dirty: list[str] = []
     untracked: list[str] = []
@@ -122,9 +122,9 @@ def audit_all() -> list[dict[str, Any]]:
         "label": "Standalone Python package skeleton",
         "status": "DONE",
         "evidence_refs": [
-            "pyproject.toml: name=geoai-task-mcp, version=0.1.0, requires mcp>=1.0.0",
-            "src/geoai_task_mcp/__init__.py: __version__=0.1.0",
-            "src/geoai_task_mcp/health.py: CLI entry point",
+            "pyproject.toml: name=aiworkhub, version=0.1.0, requires mcp>=1.0.0",
+            "src/aiworkhub/__init__.py: __version__=0.1.0",
+            "src/aiworkhub/health.py: CLI entry point",
         ],
         "timestamp": ts,
     })
@@ -134,7 +134,7 @@ def audit_all() -> list[dict[str, Any]]:
         "label": "FastMCP stdio server",
         "status": "DONE",
         "evidence_refs": [
-            "server.py: FastMCP('GeoAI Task MCP'), stdio transport, main()->mcp.run()",
+            "server.py: FastMCP('AIWorkHub MCP'), stdio transport, main()->mcp.run()",
             "scripts/run_stdio.sh: PYTHONPATH wrapper",
             "test_mcp_stdio_client_smoke tests exist",
         ],
@@ -146,7 +146,7 @@ def audit_all() -> list[dict[str, Any]]:
         "label": "Read-only task tools over taskctl.py",
         "status": "DONE",
         "evidence_refs": [
-            "server.py: geoai_task_health, geoai_task_review_queue, geoai_task_list, geoai_task_show, geoai_task_pending_for_runner, geoai_task_collision_guard, geoai_task_usage_report, geoai_task_audit_log_read, geoai_task_review_summarize, geoai_task_codex_handoff + cli_adapter_readonly_tool.register()",
+            "server.py: aiworkhub_task_health, aiworkhub_task_review_queue, aiworkhub_task_list, aiworkhub_task_show, aiworkhub_task_pending_for_runner, aiworkhub_task_collision_guard, aiworkhub_task_usage_report, aiworkhub_task_audit_log_read, aiworkhub_task_review_summarize, aiworkhub_task_codex_handoff + cli_adapter_readonly_tool.register()",
             "core.py: all underlying read-only wrappers call taskctl without allow_write=True",
             "eval/mvp_contract_audit_v1.json: counts.read=7 (stale, now >=10)",
         ],
@@ -160,7 +160,7 @@ def audit_all() -> list[dict[str, Any]]:
         "evidence_refs": [
             "core.py: auto_pickup/mark_review/mark_done/export_jsonl -> run_taskctl(allow_write=True) gated by writes_allowed()",
             "core.py: WRITE_COMMANDS set + _is_write_command guard",
-            "core.py: write_audit_entry on blocked attempt, GEOAI_TASK_MCP_ALLOW_WRITES default 0",
+            "core.py: write_audit_entry on blocked attempt, AIWORKHUB_ALLOW_WRITES default 0",
             "eval/mvp_contract_audit_v1.json: counts.write_gated=4, unsafe_ungated_writes=0",
         ],
         "timestamp": ts,
@@ -200,7 +200,7 @@ def audit_all() -> list[dict[str, Any]]:
         "evidence_refs": [
             "core.py: write_audit_entry() — append-only JSONL, sanitized env vars (names only, never values)",
             "core.py: read_audit_log() — returns counts by tool/action + last N entries",
-            "server.py: geoai_task_audit_log_read tool wired",
+            "server.py: aiworkhub_task_audit_log_read tool wired",
             "tests/test_audit_log_read_tool_b104_v1.sh: audit log read smoke test",
         ],
         "timestamp": ts,
@@ -239,8 +239,8 @@ def audit_all() -> list[dict[str, Any]]:
         "label": "Task result handoff summarizer (Codex-ready report)",
         "status": "DONE",
         "evidence_refs": [
-            "server.py: geoai_task_review_summarize (B111 wiring)",
-            "server.py: geoai_task_codex_handoff (B116 e2e handoff report)",
+            "server.py: aiworkhub_task_review_summarize (B111 wiring)",
+            "server.py: aiworkhub_task_codex_handoff (B116 e2e handoff report)",
             "review_summarizer.py: summarize_review_queue(), build_codex_handoff_report()",
             "tests/test_mcp_codex_handoff_e2e_b116_v1.sh: e2e handoff test",
             "tests/test_mcp_review_queue_summarizer_b110_v1.sh: queue summarizer test",
@@ -452,7 +452,7 @@ def build_next_wave(rows: list[dict[str, Any]]) -> dict[str, Any]:
     sequence.append({
         "step": 2,
         "checkbox": "p1_dryrun_auto_pickup",
-        "label": "Add --dry-run flag to geoai_task_auto_pickup",
+        "label": "Add --dry-run flag to aiworkhub_task_auto_pickup",
         "rationale": "Workers need to preview what auto_pickup would claim before committing. Safety prerequisite for wave execution.",
         "estimated_effort": "1 session",
         "depends_on": ["p0_mcp_client_smoke"],

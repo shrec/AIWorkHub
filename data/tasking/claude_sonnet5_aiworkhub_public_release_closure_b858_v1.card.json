@@ -1,0 +1,120 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_PUBLIC_RELEASE_CLOSURE_B858_V1",
+  "title": "Close AIWorkHub public release and documentation",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_public_release_closure_b858_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "critical",
+  "objective": "Prepare the nested tools/geoai-task-mcp repository as the canonical public AIWorkHub release. Audit the complete current worktree against code truth, preserve accepted functionality, remove obsolete public-facing GeoAI/AIWorkingHub naming and legacy runtime instructions, align Python and VS Code extension release versions at 0.6.0, finish concise current documentation, CI/repository hygiene and packaging metadata, and prove the installable VSIX plus repository-local multi-repo/task/callback/tooling workflow. Do not commit or push; Codex owns final publication. This task's transition to review is also the first fresh callback-delivery canary after B857, so finish with normal taskctl review.",
+  "allowed_writes": [
+    "tools/geoai-task-mcp/.gitignore",
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/CHANGELOG.md",
+    "tools/geoai-task-mcp/AGENTS.md",
+    "tools/geoai-task-mcp/MVP_ROADMAP.md",
+    "tools/geoai-task-mcp/LICENSE",
+    "tools/geoai-task-mcp/CONTRIBUTING.md",
+    "tools/geoai-task-mcp/CODE_OF_CONDUCT.md",
+    "tools/geoai-task-mcp/SECURITY.md",
+    "tools/geoai-task-mcp/docs/**",
+    "tools/geoai-task-mcp/.github/**",
+    "tools/geoai-task-mcp/pyproject.toml",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/src/aiworkhub/__init__.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_brand_cli_exact_repair_b819_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_public_release_closure_b858_v1.json"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/AGENTS.md",
+    "tools/geoai-task-mcp/MVP_ROADMAP.md",
+    "tools/geoai-task-mcp/pyproject.toml",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/src/aiworkhub/repository_bootstrap.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/docs/PUBLISHING.md",
+    "tools/geoai-task-mcp/LICENSE",
+    "tools/geoai-task-mcp/CONTRIBUTING.md",
+    "tools/geoai-task-mcp/SECURITY.md"
+  ],
+  "acceptance": [
+    "README begins with what AIWorkHub is, the supported workflow and a five-minute install/init/use path; it reflects current code rather than historical task plans.",
+    "Documentation clearly covers VS Code editor-tab dashboard, explicit Init Repo, repository-local .aiworkhub authority, multi-repository isolation, Source Graph, Session Manager, AI Memory, KB, task workers, selected-task Live Output, Codex callback routing and Claude callback capability/limitations.",
+    "Linux, Windows, WSL and Remote-SSH installation/operation boundaries are documented without host-specific paths; the obsolete browser dashboard URL and systemd callback requirement are absent from current setup instructions.",
+    "Public product/runtime/docs use canonical AIWorkHub naming. Historical fixtures may retain old names only when a test explicitly proves migration compatibility, and such exceptions are documented in the release audit.",
+    "Python package and VS Code extension versions are aligned at 0.6.0; package metadata, display names, commands and generated VSIX agree.",
+    "MIT license, contribution, security, code-of-conduct, changelog, architecture, getting-started/publishing documentation and useful GitHub issue/PR/CI metadata are coherent and linked from README.",
+    "Repository ignores runtime databases, logs, credentials, generated caches and local VSIX artifacts. No secret, repository-local .aiworkhub database, developer absolute path or generated runtime state is selected for publication.",
+    "Legacy duplicate Python packages and obsolete service/browser launchers remain removed; current aiworkhub package and VS Code bundled runtime are the only public runtime authority.",
+    "The release audit separates production source/docs/tests from historical task/eval artifacts and recommends the smallest safe publication set without deleting potentially valuable history blindly.",
+    "All current AIWorkHub-focused Python tests pass, extension JavaScript checks pass, VSIX packages successfully, metadata versions match, git diff check passes, and the exact validation evidence is recorded.",
+    "Worker stops at taskctl review with a concise changed-path and validation summary; no commit, push, GitHub rename, release upload or tag is performed by the worker."
+  ],
+  "validation": [
+    "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_*.py tests/test_repository_state.py tests/test_repository_mux.py tests/test_callback_bridge.py tests/test_process_launcher.py tests/test_process_launcher_security.py tests/test_server_runtime_wiring.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "node --check tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 -c \"import json,pathlib,re; p=pathlib.Path('tools/geoai-task-mcp'); assert json.loads((p/'vscode-extension/package.json').read_text())['version']=='0.6.0'; assert re.search(r'^version\\s*=\\s*\\\"0\\.6\\.0\\\"', (p/'pyproject.toml').read_text(), re.M)\"",
+    "git -C tools/geoai-task-mcp diff --check",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/CHANGELOG.md",
+    "tools/geoai-task-mcp/docs/ARCHITECTURE.md",
+    "tools/geoai-task-mcp/docs/GETTING_STARTED.md",
+    "tools/geoai-task-mcp/docs/PUBLISHING.md",
+    "tools/geoai-task-mcp/pyproject.toml",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/eval/aiworkhub_public_release_closure_b858_v1.json"
+  ],
+  "forbidden": [
+    "git_commit",
+    "git_push",
+    "github_repo_rename",
+    "github_release",
+    "runtime_database_commit",
+    "secret_or_credential_commit",
+    "http_dashboard_reintroduction",
+    "systemd_runtime_requirement",
+    "blind_history_deletion",
+    "accepted_feature_reimplementation"
+  ],
+  "commit_contract": "NO_COMMIT. Stop at Codex review.",
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "slice",
+      "bundle_type": "feature",
+      "query": "AIWorkHub public release VS Code Init Repo callback Live Output Source Graph Session Manager AI Memory KB packaging",
+      "budget": 220,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/server.py",
+        "tools/geoai-task-mcp/src/aiworkhub/repository_bootstrap.py",
+        "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+        "tools/geoai-task-mcp/vscode-extension/extension.js",
+        "tools/geoai-task-mcp/README.md"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub public release closure",
+      "limit": 10
+    },
+    "ai_memory": {
+      "query": "AIWorkHub canonical branding release documentation repo-local multi-repo callback",
+      "limit": 4
+    },
+    "kb": {
+      "query": "AIWorkHub architecture installation callback and public release contracts",
+      "limit": 4
+    }
+  }
+}

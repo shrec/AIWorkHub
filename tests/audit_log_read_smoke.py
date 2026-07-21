@@ -2,7 +2,7 @@
 """Smoke test: verify audit log read tool returns correct summaries.
 
 Rules:
-- GEOAI_TASK_MCP_ALLOW_WRITES=0 (default) — reads only.
+- AIWORKHUB_ALLOW_WRITES=0 (default) — reads only.
 - Tool must return structured summary with counts and last entries.
 - Must NOT mutate parent task queue.
 - Must NOT enable writes, workflow switch, or process launch.
@@ -20,20 +20,20 @@ from pathlib import Path
 
 
 def _repo_root() -> Path:
-    return Path(os.environ.get("GEOAI_REPO", str(Path(__file__).resolve().parents[2])))
+    return Path(os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[2])))
 
 
 def main() -> int:
     repo = _repo_root()
 
-    with tempfile.TemporaryDirectory(prefix="geoai_audit_read_smoke_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="aiworkhub_audit_read_smoke_") as tmpdir:
         audit_path = Path(tmpdir) / "audit.jsonl"
-        os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_path)
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ["GEOAI_REPO"] = str(repo)
+        os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_path)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ["AIWORKHUB_REPO"] = str(repo)
 
         # Import core AFTER env is set
-        from geoai_task_mcp import core
+        from aiworkhub import core
 
         # --- 1. Verify writes are off ---
         health = core.health()
@@ -53,11 +53,11 @@ def main() -> int:
 
         # --- 3. Pre-populate audit log with synthetic entries ---
         synthetic_entries = [
-            {"timestamp": "2026-07-04T10:00:00+00:00", "tool_name": "auto-pickup", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 100, "env_vars_checked": {"GEOAI_TASK_MCP_ALLOW_WRITES": "<unset>"}}},
-            {"timestamp": "2026-07-04T10:01:00+00:00", "tool_name": "done", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 101, "env_vars_checked": {"GEOAI_TASK_MCP_ALLOW_WRITES": "<unset>"}}},
-            {"timestamp": "2026-07-04T10:02:00+00:00", "tool_name": "auto-pickup", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 102, "env_vars_checked": {"GEOAI_TASK_MCP_ALLOW_WRITES": "<set>"}}},
-            {"timestamp": "2026-07-04T10:03:00+00:00", "tool_name": "review", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 103, "env_vars_checked": {"GEOAI_TASK_MCP_ALLOW_WRITES": "<unset>"}}},
-            {"timestamp": "2026-07-04T10:04:00+00:00", "tool_name": "export-jsonl", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 104, "env_vars_checked": {"GEOAI_TASK_MCP_ALLOW_WRITES": "<unset>"}}},
+            {"timestamp": "2026-07-04T10:00:00+00:00", "tool_name": "auto-pickup", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 100, "env_vars_checked": {"AIWORKHUB_ALLOW_WRITES": "<unset>"}}},
+            {"timestamp": "2026-07-04T10:01:00+00:00", "tool_name": "done", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 101, "env_vars_checked": {"AIWORKHUB_ALLOW_WRITES": "<unset>"}}},
+            {"timestamp": "2026-07-04T10:02:00+00:00", "tool_name": "auto-pickup", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 102, "env_vars_checked": {"AIWORKHUB_ALLOW_WRITES": "<set>"}}},
+            {"timestamp": "2026-07-04T10:03:00+00:00", "tool_name": "review", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 103, "env_vars_checked": {"AIWORKHUB_ALLOW_WRITES": "<unset>"}}},
+            {"timestamp": "2026-07-04T10:04:00+00:00", "tool_name": "export-jsonl", "action": "blocked_write", "blocked_reason": "write gate off", "caller_info": {"pid": 104, "env_vars_checked": {"AIWORKHUB_ALLOW_WRITES": "<unset>"}}},
         ]
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         with open(audit_path, "w", encoding="utf-8") as fh:
@@ -101,7 +101,7 @@ def main() -> int:
                 )
 
         # --- 7. Verify read_audit_log does NOT enable writes ---
-        assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0") == "0"
+        assert os.environ.get("AIWORKHUB_ALLOW_WRITES", "0") == "0"
         health2 = core.health()
         assert health2["writes_allowed"] is False
 

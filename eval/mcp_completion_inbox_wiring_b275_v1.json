@@ -12,7 +12,7 @@
     "local_docs_sufficient": true,
     "reason": "Pure repo-local wiring: one new module (completion_inbox.py) composing already-existing local read-only helpers (core.list_tasks/core.show_task, mirroring review_summarizer._collect_review_cards) into a new @mcp.tool() on an already-live FastMCP server instance. No external MCP-SDK/API question was open."
   },
-  "summary": "Added tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py, a READ-ONLY module combining 4 facets for Codex orchestration: review_queue (canonical-state 'review' cards), stale_processing (canonical-state 'processing' cards whose updated_at/started_at/claimed_at is older than stale_processing_hours, default 24h -- matching AITools/task_activity_facts.py's STALE_WORKER_HOURS precedent), runner_mismatch_warnings (batch-token mismatches between a runner name and the task_id it claimed, a local pure replica of AITools/taskctl.py::_runner_task_batch_mismatch lines 264-295), and latest_validation_facts (validation_status/validation_error/blocker_reason as currently recorded per task). All data is fetched via core.list_tasks()+core.show_task() -- the SAME read-only taskctl.py 'list'/'show' subcommands taskctl.py itself uses internally (cmd_list/cmd_show -> _load_cards() -> taskdb.load_cards() -> bitnnv2/data/tasking/task_queue_v1.sqlite), never a write command and never a new subprocess/exec path. Wired as one new additive @mcp.tool() geoai_completion_inbox(topic, limit, stale_processing_hours) in server.py; every pre-existing tool (B106/B107 readonly set, B110/B111/B116 review-summarizer set, B08 supervisor-loop, B252 launch-queue readonly set) is untouched.",
+  "summary": "Added tools/aiworkhub/src/aiworkhub/completion_inbox.py, a READ-ONLY module combining 4 facets for Codex orchestration: review_queue (canonical-state 'review' cards), stale_processing (canonical-state 'processing' cards whose updated_at/started_at/claimed_at is older than stale_processing_hours, default 24h -- matching AITools/task_activity_facts.py's STALE_WORKER_HOURS precedent), runner_mismatch_warnings (batch-token mismatches between a runner name and the task_id it claimed, a local pure replica of AITools/taskctl.py::_runner_task_batch_mismatch lines 264-295), and latest_validation_facts (validation_status/validation_error/blocker_reason as currently recorded per task). All data is fetched via core.list_tasks()+core.show_task() -- the SAME read-only taskctl.py 'list'/'show' subcommands taskctl.py itself uses internally (cmd_list/cmd_show -> _load_cards() -> taskdb.load_cards() -> bitnnv2/data/tasking/task_queue_v1.sqlite), never a write command and never a new subprocess/exec path. Wired as one new additive @mcp.tool() aiworkhub_completion_inbox(topic, limit, stale_processing_hours) in server.py; every pre-existing tool (B106/B107 readonly set, B110/B111/B116 review-summarizer set, B08 supervisor-loop, B252 launch-queue readonly set) is untouched.",
   "gates": {
     "readonly_tool_only_no_execute_spawn_subprocess_beyond_taskctl_list_show": true,
     "no_write_command_ever_issued_done_review_start_autopickup_addcard_exportjsonl": true,
@@ -38,9 +38,9 @@
     "batch_mismatch_source_of_truth": "AITools/taskctl.py:264-295 (_runner_batch_token/_task_batch_token/_runner_task_batch_mismatch), replicated locally per the core.py::_lifecycle_state import-light precedent",
     "stale_processing_default_threshold_hours": 24.0
   },
-  "new_readonly_tool": "geoai_completion_inbox",
+  "new_readonly_tool": "aiworkhub_completion_inbox",
   "public_api": {
-    "geoai_completion_inbox(topic=None, limit=200, stale_processing_hours=24.0)": "dict with review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, fetch_errors, authority_flags, mutation; writes nothing"
+    "aiworkhub_completion_inbox(topic=None, limit=200, stale_processing_hours=24.0)": "dict with review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts, counts, fetch_errors, authority_flags, mutation; writes nothing"
   },
   "fields_exposed": {
     "review_queue[]": ["task_id", "runner", "claimed_by", "topic", "priority", "objective", "allowed_writes", "updated_at", "review_at", "validation_status", "runner_task_batch_mismatch"],
@@ -52,20 +52,20 @@
   "read_only_no_agent_launch_property": {
     "asserted_by": "test_mcp_completion_inbox_wiring_b275_v1.sh sections 1, 6, 7",
     "no_launch_code_marker": "server.py and completion_inbox.py contain no process-launch code: no subprocess.Popen, no os-level exec/fork/spawn/system/popen, no shell=True, no pty.spawn -- the only subprocess this module reaches is the pre-existing core.run_taskctl (python3 taskctl.py list/show, both read-only taskctl subcommands, never an agent/model process).",
-    "queue_db_fingerprint_check": "bitnnv2/data/tasking/task_queue_v1.sqlite size+mtime asserted byte-identical before/after a live geoai_completion_inbox MCP call",
-    "authority_flags_forced_on_check": "GEOAI_TASK_MCP_ALLOW_WRITES=1 forced and the tool still reports every write/launch authority flag False"
+    "queue_db_fingerprint_check": "bitnnv2/data/tasking/task_queue_v1.sqlite size+mtime asserted byte-identical before/after a live aiworkhub_completion_inbox MCP call",
+    "authority_flags_forced_on_check": "AIWORKHUB_ALLOW_WRITES=1 forced and the tool still reports every write/launch authority flag False"
   },
   "neural_bridge_note": "This wiring adds no new decision authority: all 4 facets are pure views over already-recorded card fields (status/worker_status/timestamps/validation_status) and a deterministic batch-token string comparison -- a support-boundary correctness check per CLAUDE.md's neural-control-first carve-out, not a learned routing decision. No regex/keyword cue router is introduced for task-type or route selection.",
-  "tooling_gap_note": "tools/geoai-task-mcp/ is not covered by any source_graph indexer (source_graph.py/cgraph.py/source_graph_universal.py project-root maps stop at bitnnv2/*, AITools/, scripts/, tokenizer/, dashboard/) -- see kb bug.tools_geoai_task_mcp_not_indexed (ACTIVE since 2026-07-05). Read taskctl.py via source_graph.py context/body/sql-on-function_bodies (fully indexed, AITools project) as instructed; server.py/core.py/review_summarizer.py under tools/geoai-task-mcp/ required a direct Read per the same documented, pre-existing workaround (fix owed: add tools/geoai-task-mcp to indexer project roots, not attempted here since it is outside this task's allowed_writes).",
+  "tooling_gap_note": "tools/aiworkhub/ is not covered by any source_graph indexer (source_graph.py/cgraph.py/source_graph_universal.py project-root maps stop at bitnnv2/*, AITools/, scripts/, tokenizer/, dashboard/) -- see kb bug.tools_aiworkhub_not_indexed (ACTIVE since 2026-07-05). Read taskctl.py via source_graph.py context/body/sql-on-function_bodies (fully indexed, AITools project) as instructed; server.py/core.py/review_summarizer.py under tools/aiworkhub/ required a direct Read per the same documented, pre-existing workaround (fix owed: add tools/aiworkhub to indexer project roots, not attempted here since it is outside this task's allowed_writes).",
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh",
-    "tools/geoai-task-mcp/eval/mcp_completion_inbox_wiring_b275_v1.json",
-    "tools/geoai-task-mcp/data/tasking/mcp_completion_inbox_wiring_next_wave_b275_v1.json"
+    "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_mcp_completion_inbox_wiring_b275_v1.sh",
+    "tools/aiworkhub/eval/mcp_completion_inbox_wiring_b275_v1.json",
+    "tools/aiworkhub/data/tasking/mcp_completion_inbox_wiring_next_wave_b275_v1.json"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> PASS",
+    "bash tools/aiworkhub/tests/test_mcp_completion_inbox_wiring_b275_v1.sh -> PASS",
     "python3 AITools/taskctl.py verify -> PASS"
   ],
   "commit_contract": "NO_COMMIT",

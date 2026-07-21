@@ -1,0 +1,57 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_DISPATCHER_ORDER_ISOLATION_B875_V1",
+  "schema_id": "aiworkhub.eval.b875.v1",
+  "verdict": "review",
+  "summary": "Resumed this exact claimed task from a prior session. The fix was already present on disk in callback_bridge.py: _dispatcher_registry_state() anchors the (threading.Lock, dict) registry pair on a private attribute of the `sys` module (_DISPATCHER_REGISTRY_ANCHOR_ATTR = '_aiworkhub_callback_dispatcher_registry_v1') instead of on this module's own globals. Root cause confirmed via the exact predecessor fixture: test_aiworkhub_embedded_mcp_runtime_b844_v1.py's fallback_server_module fixture deletes every 'aiworkhub' / 'aiworkhub.*' entry from sys.modules, re-imports aiworkhub.server (and transitively callback_bridge), then deletes them again on teardown. Under a plain module-global dict this forks the registry: any test module that imported callback_bridge before the purge keeps a reference to the stale generation's dict, while core._callback_bridge_module()'s lazy `from . import callback_bridge` after the purge binds a fresh, empty one -- so ensure_dispatcher() in one generation registers into a dict that get_dispatcher() in another generation can never see, and test_dispatcher_ensure_started_converges_then_stop_unregisters (b865) then observes get_dispatcher(root) as None after B844 ran first. Anchoring on `sys` (never reloaded/evicted by the interpreter or by this purge) guarantees every module generation resolves to the identical lock+dict for the life of the process, closing the order dependency without weakening the b865 assertion, without a global cross-repository dispatcher (still keyed per resolved repo_root via _dispatcher_registry_key), and without adding any new fallback/callback-authority surface. No further edits to callback_bridge.py, core.py, or the b865 test were needed this pass -- verified minimal and correct, then re-ran full validation.",
+  "checks": [
+    {
+      "id": "b844_predecessor_fixture_located_via_source_graph",
+      "status": "pass",
+      "evidence": "Source Graph indexed src/aiworkhub/callback_bridge.py under project task-mcp-src after `source_graph.py build -i`; the B875 anchor comment at callback_bridge.py:1969-1982 explicitly names the B844 bundled-runtime fallback harness as the purge fixture. Confirmed by reading tests/test_aiworkhub_embedded_mcp_runtime_b844_v1.py's fallback_server_module fixture (lines 102-133): it does `for name in list(sys.modules): if name == 'aiworkhub' or name.startswith('aiworkhub.'): del sys.modules[name]` both before and after importing aiworkhub.server, exactly the sys.modules-purge/re-import cycle the anchor fix defends against."
+    },
+    {
+      "id": "targeted_b844_then_b865_ordered_run_passes",
+      "status": "pass",
+      "evidence": "`cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_embedded_mcp_runtime_b844_v1.py tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py` -> '28 passed in 2.75s'. This is the exact predecessor-then-target ordering that previously reproduced get_dispatcher(root) returning None; it now converges correctly because every re-import of callback_bridge resolves _DISPATCHER_REGISTRY_LOCK/_DISPATCHER_REGISTRY from the same sys-anchored tuple."
+    },
+    {
+      "id": "registry_still_repository_scoped_no_global_cross_repo_dispatcher",
+      "status": "pass",
+      "evidence": "_dispatcher_registry_key(repo_root) still resolves str(Path(repo_root).resolve()) as the dict key (unchanged); ensure_dispatcher/get_dispatcher/stop_dispatcher/stop_all_dispatchers are the only 4 call sites touching _DISPATCHER_REGISTRY(_LOCK), all still inside callback_bridge.py (confirmed via source_graph.py find on _DISPATCHER_REGISTRY_LOCK and get_dispatcher(). Anchoring only changes WHERE the (lock, dict) pair is stored (sys attribute vs module global), never what it is keyed by or who can read/write it -- no new cross-repository dispatcher sharing, no new fallback/callback-authority path."
+    },
+    {
+      "id": "ensure_started_idempotent_stop_unregisters_exact_dispatcher",
+      "status": "pass",
+      "evidence": "ensure_dispatcher() at callback_bridge.py:2125-2155 remains unchanged: a call matching the currently-registered provider is a no-op (existing.start(), idempotent); a call with a different provider stops the old dispatcher first. stop_dispatcher() removes exactly the entry for the resolved key. b865's test_dispatcher_ensure_started_converges_then_stop_unregisters (part of the 28-test ordered run above) exercises this directly and passes."
+    },
+    {
+      "id": "full_suite_and_extension_tests_green",
+      "status": "pass",
+      "evidence": "Full python suite: 925 passed, 2 skipped in 117.56s (zero failures). npm test --silent: 'AIWorkHub VS Code extension static contract checks passed'. taskctl.py verify: VERIFY: PASS. taskctl.py collision-guard --print: collision_free=true, 1 active card, 0 collisions."
+    },
+    {
+      "id": "diff_minimal_no_debug_prints_no_broad_diagnosis_restart",
+      "status": "pass",
+      "evidence": "This pass added zero code edits (the sys-anchor fix from the prior session already satisfied every acceptance item); the only new artifact this pass produces is this required eval file. No debug prints, no test weakening, no broadened callback authority, no new fallback path -- diff scope is exactly the eval output listed in required_outputs."
+    }
+  ],
+  "tests": [
+    "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_embedded_mcp_runtime_b844_v1.py tests/test_aiworkhub_vscode_repo_binding_lifecycle_b865.py",
+    "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q",
+    "cd tools/geoai-task-mcp/vscode-extension && npm test --silent",
+    "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_dispatcher_order_isolation_b875_v1.json",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "test_results": {
+    "b844_then_b865_ordered": "28 passed in 2.75s",
+    "full_pytest": "925 passed, 2 skipped in 117.56s",
+    "npm_test": "AIWorkHub VS Code extension static contract checks passed",
+    "taskctl_verify": "VERIFY: PASS",
+    "collision_guard": "collision_free=true, active_cards=1, collision_count=0"
+  },
+  "scope_note": "NO_COMMIT per commit_contract. Resumed the exact claimed task/runner (claude_sonnet5_aiworkhub_dispatcher_order_isolation_b875_v1) in the foreground; no subagent delegation. Only allowed_writes path touched this pass: eval/aiworkhub_dispatcher_order_isolation_b875_v1.json (new, required_output). callback_bridge.py, core.py, and the b865 test were read and verified but needed no edits -- the prior session's sys-anchored registry fix already satisfies every acceptance criterion under the exact B844-then-B865 ordering.",
+  "changed_paths": [
+    "tools/geoai-task-mcp/eval/aiworkhub_dispatcher_order_isolation_b875_v1.json"
+  ]
+}

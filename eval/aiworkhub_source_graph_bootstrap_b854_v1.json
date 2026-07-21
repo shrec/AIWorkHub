@@ -1,0 +1,33 @@
+{
+  "schema_id": "aiworkhub.source_graph_bootstrap_eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_SOURCE_GRAPH_BOOTSTRAP_CORRECTNESS_B854_V1",
+  "root_causes": [
+    {
+      "id": "repeated_nested_same_name_definitions",
+      "description": "Two def/class statements with the same name under the same owner scope (e.g. main._avg redefined twice) produced identical qualname, violating entities UNIQUE(file_path, qualname).",
+      "fix": "source_graph_ast.py: _dedupe_qualname() assigns the base qualname to the first occurrence and a stable ~N suffix (deterministic AST traversal order) to each further occurrence, applied to function/method, class, and import entity qualnames."
+    },
+    {
+      "id": "ephemeral_worktree_indexing",
+      "description": ".claude/worktrees held full nested checkouts of the repository, amplifying the entity/edge volume for every active task worktree.",
+      "fix": "source_graph.py: DEFAULT_EXCLUDE_DIR_NAMES now excludes '.claude' (covers worktrees/, agents/, settings), plus '.hg', '.svn', '.cache' for VCS internals/caches, while tools/ and scripts/ remain indexable."
+    }
+  ],
+  "full_build": {
+    "repo_root": "/home/shrek/GeoAI",
+    "incremental": false,
+    "files_seen": 6371,
+    "files_changed": 6371,
+    "files_unchanged": 0,
+    "files_removed": 0,
+    "entities_written": 109893,
+    "edges_written": 3234707,
+    "errors": []
+  },
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py -> 35 passed",
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/shrek/GeoAI build -> clean full build, 0 errors",
+    "python3 AITools/taskctl.py verify -> PASS",
+    "python3 AITools/taskctl.py collision-guard --print -> collision_free=true"
+  ]
+}

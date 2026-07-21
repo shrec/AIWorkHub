@@ -12,22 +12,22 @@
   "mode": "validation_exec_scratch_repair",
   "read_first": [
     "AGENTS.md",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py",
-    "tools/geoai-task-mcp/tests/test_worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_process_launcher.py",
-    "tools/geoai-task-mcp/logs/processes/64165cc7a85949ca88e8106c1d42e176.request.json"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/src/aiworkhub/process_launcher.py",
+    "tools/aiworkhub/tests/test_worker_workspace.py",
+    "tools/aiworkhub/tests/test_process_launcher.py",
+    "tools/aiworkhub/logs/processes/64165cc7a85949ca88e8106c1d42e176.request.json"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_worker_workspace.py",
-    "tools/geoai-task-mcp/tests/test_process_launcher.py",
-    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+    "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+    "tools/aiworkhub/tests/test_worker_workspace.py",
+    "tools/aiworkhub/tests/test_process_launcher.py",
+    "tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/aiworkhub/eval/task_mcp_validation_exec_scratch_b753_v1.json"
   ],
   "required_outputs": [
-    "tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+    "tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
+    "tools/aiworkhub/eval/task_mcp_validation_exec_scratch_b753_v1.json"
   ],
   "acceptance": [
     "Reproduce B751's rc=126 with a validation command that compiles a minimal C executable into inherited TMPDIR and runs it; distinguish noexec from compiler/product failure.",
@@ -38,9 +38,9 @@
     "Do not touch task queue semantics, callback routing, dashboard, model code, roadmap/STATE, commits or remote state. Stop at Codex review."
   ],
   "validation": [
-    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_validation_exec_scratch_b753_v1.py",
-    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_worker_workspace.py tools/geoai-task-mcp/tests/test_process_launcher.py",
-    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_validation_exec_scratch_b753_v1.json"
+    "PYTHONPATH=tools/aiworkhub/src python3 -m pytest -q tools/aiworkhub/tests/test_validation_exec_scratch_b753_v1.py",
+    "PYTHONPATH=tools/aiworkhub/src python3 -m pytest -q tools/aiworkhub/tests/test_worker_workspace.py tools/aiworkhub/tests/test_process_launcher.py",
+    "python3 -m json.tool tools/aiworkhub/eval/task_mcp_validation_exec_scratch_b753_v1.json"
   ],
   "forbidden": [
     "shell_true",
@@ -70,8 +70,8 @@
       "budget": 100,
       "query": "run_validations sanitized_env TMPDIR landlock executable scratch cleanup",
       "targets": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/worker_workspace.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+        "tools/aiworkhub/src/aiworkhub/worker_workspace.py",
+        "tools/aiworkhub/src/aiworkhub/process_launcher.py"
       ]
     },
     "session": {"topic": "Task MCP validation executable scratch B753", "limit": 16},

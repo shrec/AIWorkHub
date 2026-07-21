@@ -20,16 +20,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/geoai_agent_catalog_survey_sh.XXXXXX")"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_agent_catalog_survey_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== DeepSeek Agent Catalog Survey Test B116 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 
 # ── 1. Run survey script ──
 echo ""

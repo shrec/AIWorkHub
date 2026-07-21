@@ -7,7 +7,7 @@
   "status": "mvp_patch_plan_complete",
   "supersedes": {
     "proposed_task_id": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1",
-    "from_file": "tools/geoai-task-mcp/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
+    "from_file": "tools/aiworkhub/data/tasking/task_mcp_autolaunch_queue_dryrun_next_wave_b281_v1.json",
     "reason": "That card proposed a brand-new queue_request.py module and a brand-new mcp_queue_requests_b282_v1.jsonl log. Direct inspection of launch_queue_contract.py + launch_queue_persist.py (B119) shows equivalent dataclasses/persistence already exist and are already wired into server.py as 3 read-only tools. The corrected card below (CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1) extends the existing modules additively instead of duplicating them. Renumbered to B286 to avoid a batch-token collision with this planning task's own B282 id."
   },
   "next_wave_cards": [
@@ -17,11 +17,11 @@
       "topic": "task_mcp",
       "priority": "high",
       "mode": "mcp_queue_request_tool_extend_existing_launch_queue_contract",
-      "objective": "Additively extend launch_queue_contract.py (LaunchRequest: +model, +owner_prompt, +requested_at, +stale_timeout_seconds; +deterministic_request_id helper) and launch_queue_persist.py (+find_open_requests, extended _PROCESS_LOG_KEYS), then register ONE new write-gated MCP tool geoai_task_queue_request in server.py per task_mcp_mvp_patch_plan_b282_v1.json's api_surface_new_tool schema. Reuses the existing append-only log at tools/geoai-task-mcp/logs/launch_queue_audit.jsonl -- no new log file. No process launch; LAUNCH_IMPLEMENTED stays False.",
+      "objective": "Additively extend launch_queue_contract.py (LaunchRequest: +model, +owner_prompt, +requested_at, +stale_timeout_seconds; +deterministic_request_id helper) and launch_queue_persist.py (+find_open_requests, extended _PROCESS_LOG_KEYS), then register ONE new write-gated MCP tool aiworkhub_task_queue_request in server.py per task_mcp_mvp_patch_plan_b282_v1.json's api_surface_new_tool schema. Reuses the existing append-only log at tools/aiworkhub/logs/launch_queue_audit.jsonl -- no new log file. No process launch; LAUNCH_IMPLEMENTED stays False.",
       "acceptance": [
         "LaunchRequest gains exactly 4 new optional fields with safe defaults; no existing field renamed/removed/reordered in a way that breaks as_dict() callers",
         "deterministic_request_id(task_id, runner, requested_at) matches B281 section_1: sha1(f'{task_id}:{runner}:{requested_at}').hexdigest()[:16]",
-        "New tool geoai_task_queue_request registered additively in server.py; existing 24 tools unchanged (list_tools count check: 24 -> 25)",
+        "New tool aiworkhub_task_queue_request registered additively in server.py; existing 24 tools unchanged (list_tools count check: 24 -> 25)",
         "Write-gate-off (default): persisted_entry is null, zero bytes appended to the log",
         "Write-gate-on: exactly one JSONL line appended per non-duplicate, non-idempotent request",
         "Idempotency: same request_id submitted twice while the first is non-terminal returns idempotent_noop=true and appends nothing",
@@ -31,18 +31,18 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_DRYRUN_TO_MVP_PATCH_PLAN_B282_V1 (this plan)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py"
+        "tools/aiworkhub/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/src/aiworkhub/server.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/eval/mcp_queue_request_tool_b286_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_queue_request_tool_b286_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/eval/mcp_queue_request_tool_b286_v1.json",
+        "tools/aiworkhub/tests/test_mcp_queue_request_tool_b286_v1.sh"
       ]
     },
     {
@@ -61,14 +61,14 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1 (shares the extended log schema for evidence)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py"
+        "tools/aiworkhub/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/stale_recovery.py",
-        "tools/geoai-task-mcp/eval/mcp_stale_recovery_orchestrator_b287_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/stale_recovery.py",
+        "tools/aiworkhub/eval/mcp_stale_recovery_orchestrator_b287_v1.json",
+        "tools/aiworkhub/tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh"
       ]
     },
     {
@@ -79,7 +79,7 @@
       "mode": "mcp_cost_ledger_aggregator_readonly_union",
       "objective": "Implement cost_ledger.py: UNIONs launch_queue_persist.read_persisted_log() entries with core.usage_report() into a per-topic/per-runner/per-day cost view, per task_mcp_mvp_patch_plan_b282_v1.json G_USAGE_EXISTING gate. Read-only; no new write path. Note: launch-log side is empty of cost data until token/cost fields are added to ProcessLogEntry (documented gap in B282 plan blockers) -- usage_report() remains the authoritative side until then.",
       "acceptance": [
-        "New tool geoai_task_cost_ledger registered additively in server.py",
+        "New tool aiworkhub_task_cost_ledger registered additively in server.py",
         "UNION of launch_queue_persist entries + core.usage_report() rows, dedup by (task_id, runner, model)",
         "Aggregates: total_cost_usd by topic, by runner, by day; per-task detail on request",
         "No write to any file; pure read-only aggregation",
@@ -87,14 +87,14 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_EXTEND_B286_V1 (needs the extended log to have entries)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+        "tools/aiworkhub/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/src/aiworkhub/core.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cost_ledger.py",
-        "tools/geoai-task-mcp/eval/mcp_cost_ledger_aggregator_b288_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_cost_ledger_aggregator_b288_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/cost_ledger.py",
+        "tools/aiworkhub/eval/mcp_cost_ledger_aggregator_b288_v1.json",
+        "tools/aiworkhub/tests/test_mcp_cost_ledger_aggregator_b288_v1.sh"
       ]
     },
     {
@@ -103,9 +103,9 @@
       "topic": "task_mcp",
       "priority": "critical",
       "mode": "codex_orchestration_loop_queue_integration",
-      "objective": "Wire the full queue flow into Codex's orchestration loop: auto_pickup -> geoai_task_queue_request (if CLAIMED and needs launch) -> completion_inbox polling -> review -> cost ledger recording, using the B286/B287/B288 tools. First task that connects the MCP queue tools into Codex's real cadence; DeepSeek manual adapter unchanged (owner still copies the command block).",
+      "objective": "Wire the full queue flow into Codex's orchestration loop: auto_pickup -> aiworkhub_task_queue_request (if CLAIMED and needs launch) -> completion_inbox polling -> review -> cost ledger recording, using the B286/B287/B288 tools. First task that connects the MCP queue tools into Codex's real cadence; DeepSeek manual adapter unchanged (owner still copies the command block).",
       "acceptance": [
-        "Codex loop: auto_pickup -> detect CLAIMED -> geoai_task_queue_request -> poll completion_inbox -> review -> commit",
+        "Codex loop: auto_pickup -> detect CLAIMED -> aiworkhub_task_queue_request -> poll completion_inbox -> review -> commit",
         "Stale detection integrated via stale_recovery.py recommendations each loop iteration",
         "Cost ledger consulted before queueing a request",
         "Dry-run mode prints what WOULD be queued without calling the write-gated tool"
@@ -116,7 +116,7 @@
         "CLAUDE_TASK_MCP_COST_LEDGER_AGGREGATOR_B288_V1"
       ],
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_mvp_patch_plan_b282_v1.json",
+        "tools/aiworkhub/eval/task_mcp_mvp_patch_plan_b282_v1.json",
         "AITools/taskctl.py"
       ]
     }

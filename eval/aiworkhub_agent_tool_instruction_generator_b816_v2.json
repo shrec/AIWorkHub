@@ -1,0 +1,22 @@
+{
+  "canonical_bytes": 1728,
+  "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae",
+  "projections": {
+    ".github/copilot-instructions.md": {
+      "bytes": 1848,
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae",
+      "sha256": "368b6ccbdeefcff43344c9b5131965ab069c865c57aaf4061de84aedd8f028e1"
+    },
+    "AGENTS.md": {
+      "bytes": 1826,
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae",
+      "sha256": "e0d673002a549d36975929afead922837eeb5806ed7e4a97b776217c0ca45d89"
+    },
+    "CLAUDE.md": {
+      "bytes": 1826,
+      "canonical_sha256": "d9eb3cc697b0c763bac5bae3452e62e0f93ae2e3f8da8950c0759b5b745e35ae",
+      "sha256": "f5ea8f01e56e4994c99ae874fd17c2a90028545921614135e32562fab39bcf0d"
+    }
+  },
+  "schema_id": "aiworkhub.task_mcp.agent_tool_instruction_generator_b816_v2.eval.v1"
+}

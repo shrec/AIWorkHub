@@ -38,10 +38,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "AITools"))
 
-from geoai_task_mcp import app_server_mux  # noqa: E402
-from geoai_task_mcp.callback_bridge import (  # noqa: E402
+from aiworkhub import app_server_mux  # noqa: E402
+from aiworkhub.callback_bridge import (  # noqa: E402
     DEFAULT_MAX_RETRIES,
     AppServerError,
     BusyThreadError,
@@ -51,7 +50,7 @@ from geoai_task_mcp.callback_bridge import (  # noqa: E402
     _is_sideband_turn_start_busy_rejection,
 )
 
-import taskdb  # noqa: E402
+import _taskdb_compat as taskdb  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +196,7 @@ def test_deliver_callback_sends_only_turn_start_never_resume_or_steer():
         client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
         result = client.deliver_callback(
             thread_id, "TASK_B684_IDLE", "review_ready",
-            client_user_message_id="fixed-b684-1", cwd="/home/shrek/GeoAI",
+            client_user_message_id="fixed-b684-1", cwd="/home/shrek/AIWorkHub",
         )
         assert result["result"]["turn"]["status"] == "inProgress"
         assert endpoint.calls == ["turn/start"]
@@ -396,7 +395,7 @@ def test_turn_start_denied_error_is_hard_failure_not_busy_park():
 
 def _seed_review_task(conn, task_id: str, thread_id: str) -> None:
     taskdb.upsert_card(conn, {
-        "schema_id": "geoai.machine_task_card.v1",
+        "schema_id": "aiworkhub.machine_task_card.v1",
         "task_id": task_id,
         "status": "review",
         "worker_status": "review",

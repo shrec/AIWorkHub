@@ -22,7 +22,7 @@
       "reviewer_action": "accept_for_codex_review",
       "checked": {
         "eval_json": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_full_wave_dryrun_harness_b119_v1.json",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/eval/mcp_full_wave_dryrun_harness_b119_v1.json",
           "exists": true,
           "size_bytes": 19961,
           "verdict": "PASS",
@@ -31,13 +31,13 @@
           "reasons": []
         },
         "rows_jsonl": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_full_wave_dryrun_harness_rows_b119_v1.jsonl",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/eval/mcp_full_wave_dryrun_harness_rows_b119_v1.jsonl",
           "exists": true,
           "size_bytes": 20096,
           "reasons": []
         },
         "test_script": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_mcp_full_wave_dryrun_harness_b119_v1.sh",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/tests/test_mcp_full_wave_dryrun_harness_b119_v1.sh",
           "exists": true,
           "size_bytes": 7960,
           "effective_line_count": 133,
@@ -47,7 +47,7 @@
         },
         "extra_scripts": [
           {
-            "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/scripts/build_mcp_full_wave_dryrun_harness_b119_v1.py",
+            "path": "/home/shrek/AIWorkHub/tools/aiworkhub/scripts/build_mcp_full_wave_dryrun_harness_b119_v1.py",
             "exists": true,
             "size_bytes": 22166,
             "effective_line_count": 410,
@@ -66,7 +66,7 @@
       "reviewer_action": "accept_for_codex_review",
       "checked": {
         "eval_json": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/mcp_codex_handoff_markdown_render_b119_v1.json",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/eval/mcp_codex_handoff_markdown_render_b119_v1.json",
           "exists": true,
           "size_bytes": 5241,
           "verdict": "PASS",
@@ -76,7 +76,7 @@
         },
         "rows_jsonl": null,
         "test_script": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/tests/test_mcp_codex_handoff_markdown_render_b119_v1.sh",
           "exists": true,
           "size_bytes": 13928,
           "effective_line_count": 270,
@@ -94,7 +94,7 @@
       "reviewer_action": "accept_for_codex_review",
       "checked": {
         "eval_json": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/eval/launch_queue_persist_audit_b119_v1.json",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/eval/launch_queue_persist_audit_b119_v1.json",
           "exists": true,
           "size_bytes": 5732,
           "verdict": "PASS",
@@ -104,7 +104,7 @@
         },
         "rows_jsonl": null,
         "test_script": {
-          "path": "/home/shrek/GeoAI/tools/geoai-task-mcp/tests/test_launch_queue_persist_audit_b119_v1.sh",
+          "path": "/home/shrek/AIWorkHub/tools/aiworkhub/tests/test_launch_queue_persist_audit_b119_v1.sh",
           "exists": true,
           "size_bytes": 11242,
           "effective_line_count": 201,

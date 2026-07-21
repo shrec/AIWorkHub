@@ -30,10 +30,10 @@ CONTRACT_PATH = (
 )
 
 REQUIRED_TOOLS = (
-    "geoai_agent_launch_task",
-    "geoai_agent_task_status",
-    "geoai_agent_collect_result",
-    "geoai_agent_cancel_task",
+    "aiworkhub_agent_launch_task",
+    "aiworkhub_agent_task_status",
+    "aiworkhub_agent_collect_result",
+    "aiworkhub_agent_cancel_task",
 )
 
 # Patterns that would indicate real process launch / execution capability.
@@ -167,18 +167,18 @@ def main() -> int:
         assert t["response_schema"], f"{name} response_schema must be non-empty"
 
     # launch_task must require task_id/runner/topic/adapter_id
-    launch_req = tools["geoai_agent_launch_task"]["request_schema"]
+    launch_req = tools["aiworkhub_agent_launch_task"]["request_schema"]
     for field in ("task_id", "runner", "topic", "adapter_id"):
         assert launch_req[field]["required"] is True, field
 
     # launch_task response must carry the always-false safety trio
-    launch_resp = tools["geoai_agent_launch_task"]["response_schema"]
+    launch_resp = tools["aiworkhub_agent_launch_task"]["response_schema"]
     assert launch_resp["launch_enabled"]["const"] is False
     assert launch_resp["launch_implemented"]["const"] is False
     assert launch_resp["shell_invocation"]["const"] is False
 
     # collect_result must never claim review_ready in the MVP
-    collect_resp = tools["geoai_agent_collect_result"]["response_schema"]
+    collect_resp = tools["aiworkhub_agent_collect_result"]["response_schema"]
     assert collect_resp["review_ready"]["const"] is False
 
     # --- 4. dry_run_examples exist and are internally consistent ---

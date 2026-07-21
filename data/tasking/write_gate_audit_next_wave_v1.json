@@ -8,7 +8,7 @@
       "task_id": "DEEPSEEK_TASK_MCP_AUDIT_LOG_READ_TOOL_V1",
       "runner": "deepseek_task_mcp_audit_read_v1",
       "topic": "task_mcp",
-      "summary": "Add a read-only MCP tool geoai_task_audit_log that returns the last N audit entries, useful for dashboard/health checks.",
+      "summary": "Add a read-only MCP tool aiworkhub_task_audit_log that returns the last N audit entries, useful for dashboard/health checks.",
       "priority": "low",
       "depends_on": ["DEEPSEEK_TASK_MCP_WRITE_AUDIT_LOG_V1"]
     },

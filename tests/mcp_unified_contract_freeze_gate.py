@@ -27,7 +27,7 @@ router. Adapter/runner/topic SELECTION must become a learned router
 (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this freeze is only the drift-
 protection evidence extractor for that surface.
 
-Read-only. GEOAI_TASK_MCP_ALLOW_WRITES is irrelevant to this gate.
+Read-only. AIWORKHUB_ALLOW_WRITES is irrelevant to this gate.
 """
 from __future__ import annotations
 

@@ -1,0 +1,106 @@
+{
+  "schema_id": "aiworkhub.task_mcp.canonical_cutover_final_b843_v1.eval.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_CANONICAL_CUTOVER_FINAL_B843_V1",
+  "runner": "codex_gpt55_aiworkhub_canonical_cutover_final_b843_v1",
+  "verdict": "PARTIAL_ENV_BLOCKED",
+  "summary": "Canonical AIWorkHub package/runtime authority was tightened: stale geoai_task_mcp public package files and duplicate aiworkinghub tests were removed, fixed /home repository defaults were replaced with bound checkout/cwd resolution, README examples now use AIWorkHub/aiworkhub only, storage registry tests bootstrap repo-local .aiworkhub state, and the fresh task DB cutover test no longer inherits an unrelated BITNN_TASK_QUEUE_DB override.",
+  "canonical_identity": {
+    "package": "aiworkhub",
+    "console_scripts": [
+      "aiworkhub",
+      "awh",
+      "aiworkhub-mcp"
+    ],
+    "state_root": ".aiworkhub",
+    "legacy_public_aliases_retained": false,
+    "geoai_task_mcp_source_dir_present": false
+  },
+  "repo_root_resolution": {
+    "core_repo_root_default": "bound_checkout",
+    "callback_cwd_default": "bound_checkout_or_cwd",
+    "launch_queue_default_repo_root": "AIWORKHUB_REPO_or_cwd",
+    "fixed_home_path_scan": "PASS"
+  },
+  "storage_cutover": {
+    "bootstrap_creates_storage_registry": true,
+    "task_queue_canonical_path": ".aiworkhub/tasking/task_queue.sqlite",
+    "fresh_cutover_does_not_reimport_legacy_jsonl": true,
+    "legacy_jsonl_compatibility": "read_only_migration_candidate_only"
+  },
+  "changed_paths": [
+    "tools/geoai-task-mcp/README.md",
+    "tools/geoai-task-mcp/src/aiworkhub/core.py",
+    "tools/geoai-task-mcp/src/aiworkhub/launch_queue_persist.py",
+    "tools/geoai-task-mcp/src/aiworkhub/callback_bridge.py",
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/src/geoai_task_mcp/**",
+    "tools/geoai-task-mcp/tests/test_aiworkinghub_*.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_storage_registry_b824_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_fresh_taskdb_cutover_b832_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_context_optimization_b829_v1.py",
+    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_canonical_cutover_final_b843_v1.json"
+  ],
+  "validation": [
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/tests/.pytestdeps:tools/geoai-task-mcp/src python3 -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "Diagnostic full run collected after temporary wheel unpack but this filesystem denies chmod/git init temp operations; totals were 641 passed, 1 skipped, 1 xfailed, 102 failed, 18 errors, dominated by host chmod/git-init failures outside this cutover residual."
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/tests/.pytestdeps:tools/geoai-task-mcp/src python3 -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_aiworkhub_canonical_rebrand_b837_v1.py tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_aiworkhub_storage_registry_b824_v1.py tools/geoai-task-mcp/tests/test_aiworkhub_fresh_taskdb_cutover_b832_v1.py",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "135 passed"
+    },
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/tests/.pytestdeps:tools/geoai-task-mcp/src python3 -m pytest -q -p no:cacheprovider tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_callback_bridge.py",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "120 passed"
+    },
+    {
+      "command": "rg -n \"geoai_task_mcp|aiworkinghub|AIWorkingHub|GeoAI|GEOAI|\\\\.aiworkinghub|/home/shrek|tools/aiworkhub\" tools/geoai-task-mcp/src/aiworkhub tools/geoai-task-mcp/tests/test_aiworkhub_* tools/geoai-task-mcp/tests/test_repository_state.py tools/geoai-task-mcp/tests/test_repository_mux.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/README.md tools/geoai-task-mcp/pyproject.toml AITools/taskdb.py AITools/taskctl.py",
+      "exit_code": 1,
+      "status": "PASS",
+      "summary": "No stale canonical-scope matches"
+    },
+    {
+      "command": "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_canonical_cutover_final_b843_v1.json",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "JSON valid"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "exit_code": 2,
+      "status": "ENV_STATE_BLOCKED",
+      "summary": "Inherited BITNN_TASK_QUEUE_DB points at an isolated queue containing pre-existing malformed/superseded GLM52 B842 card state: missing allowed_writes and forbidden."
+    },
+    {
+      "command": "python3 AITools/taskctl.py collision-guard --json",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "collision_free=true; no overlapping allowed_writes (107 active cards)"
+    },
+    {
+      "command": "env -u BITNN_TASK_QUEUE_DB python3 AITools/taskctl.py verify",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "Without the inherited isolated queue override, the sparse checkout lacks writable task DB authority in allowed scope and sqlite cannot open bitnnv2/data/tasking/task_queue_v1.sqlite."
+    }
+  ],
+  "no_commit": true,
+  "notes": [
+    "The exact declared pytest command could not produce passed/xfailed totals in this worker image because pytest is not installed and pip/user-site writes are blocked.",
+    "Temporary pytest wheels were unpacked only under tests/.pytestdeps for diagnostics and are removed before handoff."
+  ]
+}

@@ -133,7 +133,7 @@ with open(rows1_path, "r", encoding="utf-8") as fh:
             rows.append(json.loads(line))
 
 # ---- basic schema / verdict ----
-check(s1.get("schema_id") == "geoai.mcp_handoff_priority_neural_dryrun_eval.v1", "schema_id correct")
+check(s1.get("schema_id") == "aiworkhub.mcp_handoff_priority_neural_dryrun_eval.v1", "schema_id correct")
 check(s1.get("verdict") in ("PASS", "FAIL_DIAGNOSED"), f"verdict is a recognized value: {s1.get('verdict')}")
 for key in (
     "split_counts", "feature_names", "ablation_feature_names", "model", "train_metrics",

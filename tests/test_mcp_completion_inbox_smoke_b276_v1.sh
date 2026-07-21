@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B276 smoke test: validates the B275 geoai_completion_inbox wiring end to end
+# B276 smoke test: validates the B275 aiworkhub_completion_inbox wiring end to end
 # WITHOUT launching any external/paid model or agent process.
 #
 # Sections:
@@ -11,10 +11,10 @@
 #      never a write subcommand (review/done/start/auto-pickup/add-card/
 #      export-jsonl/stage/guard-staged/usage)
 #   4. live task_queue_v1.sqlite fingerprint (size+mtime) byte-identical
-#      before/after a real geoai_completion_inbox-equivalent call
-#   5. server.py additive wiring: geoai_completion_inbox registered AND
-#      pre-existing sentinel tools (geoai_task_review_queue,
-#      geoai_task_mark_done) still present
+#      before/after a real aiworkhub_completion_inbox-equivalent call
+#   5. server.py additive wiring: aiworkhub_completion_inbox registered AND
+#      pre-existing sentinel tools (aiworkhub_task_review_queue,
+#      aiworkhub_task_mark_done) still present
 #
 # Exit 0 = all sections PASS. Exit 1 = any FAIL.
 
@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, "src")
 
-from geoai_task_mcp import completion_inbox, server
+from aiworkhub import completion_inbox, server
 
 QUEUE_DB = sys.argv[1]
 
@@ -265,10 +265,10 @@ async def _list_tool_names():
 
 
 tool_names = asyncio.run(_list_tool_names())
-check("server_registers_completion_inbox_tool", "geoai_completion_inbox" in tool_names)
+check("server_registers_completion_inbox_tool", "aiworkhub_completion_inbox" in tool_names)
 check(
     "server_preexisting_sentinel_tools_intact",
-    {"geoai_task_review_queue", "geoai_task_mark_done"} <= tool_names,
+    {"aiworkhub_task_review_queue", "aiworkhub_task_mark_done"} <= tool_names,
 )
 
 # --- Summary -----------------------------------------------------------------

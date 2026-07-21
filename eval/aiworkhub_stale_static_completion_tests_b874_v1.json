@@ -1,0 +1,41 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_STALE_STATIC_COMPLETION_TESTS_B874_V1",
+  "schema_id": "aiworkhub.stale_static_completion_tests_repair.v1",
+  "summary": "Updated stale tests after accepted 0.6.0 behavior: async deactivate() and canonical in-process task engine (no subprocess.run in core.list_tasks/show_task/usage_report).",
+  "changed_tests": [
+    {
+      "file": "tools/geoai-task-mcp/tests/test_aiworkhub_model_diagnostics_b855.py",
+      "test": "test_glm_never_referenced_from_activation",
+      "fix": "activate()->deactivate() bound now matches optional 'async ' prefix (B865 async deactivate); still asserts activate() never references/launches GLM"
+    },
+    {
+      "file": "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+      "test": "test_scenario_usage",
+      "fix": "rewritten against canonical in-process task engine (task_store + real tmp sqlite repo); asserts exactly one bounded _canonical_connect call and subprocess.run forbidden, instead of monkeypatching core.subprocess.run"
+    },
+    {
+      "file": "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+      "test": "test_scenario_tool_error_current_bounded_fail_closed",
+      "fix": "renamed/rewritten from test_scenario_tool_error_current_raises_uncaught; asserts core.list_tasks catches task_store.TaskStoreError and returns bounded {ok:False, returncode:1, stderr:...} instead of an obsolete uncaught OSError via subprocess.run"
+    },
+    {
+      "file": "tools/geoai-task-mcp/tests/test_completion_inbox_smoke_fixtures_b279_v1.py",
+      "test": "test_scenario_tool_error_show_failure_bounded_fail_closed",
+      "fix": "replaces the strict-xfail test_scenario_tool_error_graceful_degrade_desired_future_contract; the desired bounded fail-closed contract for core.show_task is now current reality, so this is a normal (non-xfail) passing assertion"
+    }
+  ],
+  "unchanged_by_design": [
+    "test_scenario_completion", "test_scenario_blocked", "test_scenario_duplicate_runner",
+    "test_scenario_stale", "test_scenario_tool_error_list_failure_silently_swallowed",
+    "test_scenario_tool_error_show_failure_is_recorded", "test_edge_case_no_pending_task",
+    "test_edge_case_duplicate_runner_cross_reference",
+    "test_completion_inbox_authority_flags_never_grant_write_or_launch"
+  ],
+  "no_production_runtime_change": true,
+  "no_glm_activation": true,
+  "no_test_skip_introduced": true,
+  "validation": {
+    "pytest": "19 passed",
+    "command": "cd tools/geoai-task-mcp && PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_model_diagnostics_b855.py tests/test_completion_inbox_smoke_fixtures_b279_v1.py"
+  }
+}

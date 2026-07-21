@@ -7,9 +7,9 @@
   "verdict": "PASS",
   "summary": "Wired cli_adapter_readonly_tool.register(mcp) into server.py so the three B106 read-only CLI adapter tools (plan/audit_summary/report) are live @mcp.tool()s on the FastMCP instance, additive to the 12 pre-existing queue tools. No other server.py logic changed; no process launch, subprocess, exec, fork, or shell code added. register(mcp) internals untouched (owned by cli_adapter_readonly_tool.py, edited by a parallel task).",
   "tools_registered": [
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_report_readonly"
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_report_readonly"
   ],
   "schema_valid": true,
   "writes_with_allow_unset": 0,
@@ -31,12 +31,12 @@
     "taskctl_verify_passes": true
   },
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_readonly_tool_server_wiring_b107_v1.sh",
-    "tools/geoai-task-mcp/eval/readonly_tool_server_wiring_b107_v1.json"
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_readonly_tool_server_wiring_b107_v1.sh",
+    "tools/aiworkhub/eval/readonly_tool_server_wiring_b107_v1.json"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_readonly_tool_server_wiring_b107_v1.sh -> PASS",
+    "bash tools/aiworkhub/tests/test_readonly_tool_server_wiring_b107_v1.sh -> PASS",
     "python3 AITools/taskctl.py verify -> PASS"
   ],
   "next_wave": "CLAUDE_TASK_MCP_READONLY_COLLISION_PREFLIGHT_B107_V1 (owned by a different parallel task, cli_adapter_readonly_tool.py)"

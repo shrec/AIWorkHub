@@ -8,8 +8,8 @@ Proves:
   * the write gate is OFF by default; parent task queue is not mutated
   * the module contains NO process-launch/exec/shell code
 
-Isolation: writes only to a per-test mktemp audit path; honors GEOAI_REPO /
-GEOAI_TASK_MCP_AUDIT_LOG_PATH env overrides; mutates no shared artifact. Safe
+Isolation: writes only to a per-test mktemp audit path; honors AIWORKHUB_REPO /
+AIWORKHUB_AUDIT_LOG_PATH env overrides; mutates no shared artifact. Safe
 under parallel execution.
 """
 
@@ -45,32 +45,32 @@ _FORBIDDEN_SOURCE_PATTERNS = (
 
 
 def _repo_root() -> Path:
-    return Path(os.environ.get("GEOAI_REPO", str(Path(__file__).resolve().parents[3])))
+    return Path(os.environ.get("AIWORKHUB_REPO", str(Path(__file__).resolve().parents[3])))
 
 
 def main() -> int:
     repo = _repo_root()
 
-    with tempfile.TemporaryDirectory(prefix="geoai_cli_adapter_dryrun_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="aiworkhub_cli_adapter_dryrun_") as tmpdir:
         audit_path = Path(tmpdir) / "audit.jsonl"
-        os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_path)
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ["GEOAI_REPO"] = str(repo)
+        os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_path)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ["AIWORKHUB_REPO"] = str(repo)
 
-        from geoai_task_mcp import cli_adapter_dryrun as mod
-        from geoai_task_mcp import core
+        from aiworkhub import cli_adapter_dryrun as mod
+        from aiworkhub import core
 
         # --- 1. Launch is impossible / not implemented ---
         assert mod.LAUNCH_IMPLEMENTED is False
         assert mod.launch_enabled() is False
         # Even setting a would-be enable flag cannot turn launch on.
-        os.environ["GEOAI_TASK_MCP_ALLOW_LAUNCH"] = "1"
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+        os.environ["AIWORKHUB_ALLOW_LAUNCH"] = "1"
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "1"
         assert mod.launch_enabled() is False, "launch must stay impossible even with flags set"
         assert mod.LAUNCH_IMPLEMENTED is False
         # restore write gate OFF for the rest of the test
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "0"
-        os.environ.pop("GEOAI_TASK_MCP_ALLOW_LAUNCH", None)
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "0"
+        os.environ.pop("AIWORKHUB_ALLOW_LAUNCH", None)
 
         # --- 2. Module imports no launcher into its own namespace ---
         assert not hasattr(mod, "subprocess"), "adapter must not import subprocess"
@@ -108,7 +108,7 @@ def main() -> int:
         # --- 6. Secret redaction: values (incl. secrets) never leak ---
         fake_env = {
             "OPENAI_API_KEY": "sk-SECRET-VALUE-123",
-            "GEOAI_TASK_MCP_TOKEN": "tok-DEADBEEF",
+            "AIWORKHUB_TOKEN": "tok-DEADBEEF",
             "ANTHROPIC_AUTH": "priv-XYZ",
             "PYTHONPATH": "/opt/x",
             "PATH": "/usr/bin",
@@ -119,7 +119,7 @@ def main() -> int:
         for secret_value in ("sk-SECRET-VALUE-123", "tok-DEADBEEF", "priv-XYZ", "/opt/x"):
             assert secret_value not in blob, f"env value leaked: {secret_value!r}"
         assert redacted["OPENAI_API_KEY"] == "<redacted-secret>", redacted
-        assert redacted["GEOAI_TASK_MCP_TOKEN"] == "<redacted-secret>", redacted
+        assert redacted["AIWORKHUB_TOKEN"] == "<redacted-secret>", redacted
         assert redacted["ANTHROPIC_AUTH"] == "<redacted-secret>", redacted
         assert redacted["PYTHONPATH"] == "<set>", redacted
         assert redacted["EMPTYVAR"] == "<unset>", redacted

@@ -44,7 +44,7 @@
     "commands": [
       "python3 -m pytest -q AITools/test_kb_fts_literal_query_repair_b663_v1.py",
       "python3 -m py_compile AITools/kb.py",
-      "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
+      "python3 -m json.tool tools/aiworkhub/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
     ],
     "pytest_result": "24 passed",
     "py_compile_result": "clean"
@@ -62,7 +62,7 @@
   "files_changed": [
     "AITools/kb.py",
     "AITools/test_kb_fts_literal_query_repair_b663_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
+    "tools/aiworkhub/eval/task_mcp_kb_fts_literal_query_repair_b663_v1.json"
   ],
   "forbidden_actions_avoided": {
     "production_kb_mutation": false,

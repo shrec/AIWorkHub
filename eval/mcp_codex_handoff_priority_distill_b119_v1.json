@@ -102,5 +102,5 @@
     "mixed_task_commit"
   ],
   "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
-  "next_wave_task_ref": "tools/geoai-task-mcp/data/tasking/mcp_handoff_priority_distill_real_next_wave_b122_v1.json"
+  "next_wave_task_ref": "tools/aiworkhub/data/tasking/mcp_handoff_priority_distill_real_next_wave_b122_v1.json"
 }

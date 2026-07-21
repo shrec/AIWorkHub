@@ -2,11 +2,11 @@
 set -euo pipefail
 # ---------------------------------------------------------------------------
 # test_mcp_live_client_smoke_b118_v1.sh
-# Live MCP client smoke test: exercises the geoai-task-mcp server over real
+# Live MCP client smoke test: exercises the aiworkhub server over real
 # OS stdio pipes from the local development environment and records whether
 # the server is usable.  Reuses the B109 stdio subprocess smoke as the stdio
 # transport driver, then adds B118-specific live-client checks:
-#   - GEOAI_TASK_MCP_ALLOW_WRITES=0 enforced
+#   - AIWORKHUB_ALLOW_WRITES=0 enforced
 #   - health + all 11 read-only tools exercised over stdio
 #   - parent queue unchanged before/after
 #   - taskctl verify passes
@@ -18,19 +18,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 SMOKE="$MCPROOT/tests/mcp_stdio_client_smoke.py"
-SERVER_SRC="$MCPROOT/src/geoai_task_mcp/server.py"
+SERVER_SRC="$MCPROOT/src/aiworkhub/server.py"
 EVAL_OUT="$MCPROOT/eval/mcp_live_client_smoke_b118_v1.json"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_b118_live_client_smoke.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_b118_live_client_smoke.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES=0
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES=0
 
 echo "=== MCP Live Client Smoke Test B118 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo "TMP=$TMPDIR_STATE"
 
 # --- 0. prerequisite: server.py holds no process-launch code ---------------
@@ -113,7 +113,7 @@ for rk in ("round_allow_unset", "round_allow_set"):
     assert r["state_empty"] is True, (rk, "state dir not empty")
     assert r["queue_verify_intact"] is True, (rk, "queue verify not intact")
 
-assert d["detail"]["server_command_normalized"] == ["<python>", "-m", "geoai_task_mcp.server"]
+assert d["detail"]["server_command_normalized"] == ["<python>", "-m", "aiworkhub.server"]
 assert d["detail"]["launched_agent_or_model_token_hits"] == []
 assert d["detail"]["server_launch_pattern_hits"] == []
 assert d["detail"]["launch_enabled"] is False
@@ -164,8 +164,8 @@ live_result = {
     "live_client_usable": smoke_result["frozen_contract_v1"],
     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     "environment": {
-        "GEOAI_TASK_MCP_ALLOW_WRITES": os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0"),
-        "GEOAI_REPO": os.environ.get("GEOAI_REPO", ""),
+        "AIWORKHUB_ALLOW_WRITES": os.environ.get("AIWORKHUB_ALLOW_WRITES", "0"),
+        "AIWORKHUB_REPO": os.environ.get("AIWORKHUB_REPO", ""),
     },
     "smoke": {
         "frozen_contract_v1": smoke_result["frozen_contract_v1"],
@@ -181,7 +181,7 @@ live_result = {
         "unchanged": True,
     },
     "checks": {
-        "allow_writes_zero": os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "") == "0",
+        "allow_writes_zero": os.environ.get("AIWORKHUB_ALLOW_WRITES", "") == "0",
         "health_readonly_tools_exercised": smoke_result["frozen_contract_v1"],
         "parent_queue_unchanged": True,
         "stdio_transport_live": True,

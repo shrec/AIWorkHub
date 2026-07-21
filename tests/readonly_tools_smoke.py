@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only tool smoke test for geoai-task-mcp.
+"""Read-only tool smoke test for aiworkhub.
 
-Exercises every read-only tool with GEOAI_TASK_MCP_ALLOW_WRITES=0
+Exercises every read-only tool with AIWORKHUB_ALLOW_WRITES=0
 and confirms write-gated tools are blocked without mutating parent queue.
 
 Usage:
-    GEOAI_TASK_MCP_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    GEOAI_REPO=/home/shrek/GeoAI python3 tools/geoai-task-mcp/tests/readonly_tools_smoke.py
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
+    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 tools/geoai-task-mcp/tests/readonly_tools_smoke.py
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sys
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
-from geoai_task_mcp import core
+from aiworkhub import core
 
 
 FAILURES: list[str] = []
@@ -33,10 +33,10 @@ def ok(label: str) -> None:
 
 
 # ── precondition: writes must be disallowed ──────────────────────────
-assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0") == "0", (
-    "GEOAI_TASK_MCP_ALLOW_WRITES must be 0 for this test"
+assert os.environ.get("AIWORKHUB_ALLOW_WRITES", "0") == "0", (
+    "AIWORKHUB_ALLOW_WRITES must be 0 for this test"
 )
-print("precondition: GEOAI_TASK_MCP_ALLOW_WRITES=0  ✓")
+print("precondition: AIWORKHUB_ALLOW_WRITES=0  ✓")
 
 
 # ── 1. health ────────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ else:
     ok("post-read-show.returncode==0 (no mutation)")
 
 # Verify taskctl verify still passes
-from geoai_task_mcp.core import run_taskctl
+from aiworkhub.core import run_taskctl
 v2 = run_taskctl(["verify"])
 if v2.returncode != 0:
     fail("post-read-verify", f"returncode={v2.returncode}")

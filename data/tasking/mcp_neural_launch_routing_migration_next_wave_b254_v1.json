@@ -19,7 +19,7 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B254_V1",
-      "goal": "Unchanged from B108's proposal: wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH AND GEOAI_TASK_MCP_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1). Default stays fully disabled.",
+      "goal": "Unchanged from B108's proposal: wire the gated launch executor behind AIWORKHUB_ALLOW_LAUNCH AND AIWORKHUB_ALLOW_WRITES AND a trained neural router selection AND explicit owner sign-off (CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1). Default stays fully disabled.",
       "mode": "implementation_gated_launch",
       "runner": "claude_coding",
       "topic": "coding",

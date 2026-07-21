@@ -15,8 +15,8 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from geoai_task_mcp import worker_supervisor  # noqa: E402
-from geoai_task_mcp.worker_workspace import write_json_0600  # noqa: E402
+from aiworkhub import worker_supervisor  # noqa: E402
+from aiworkhub.worker_workspace import write_json_0600  # noqa: E402
 
 
 def _spec(tmp_path: Path, argv: list[str], timeout: int = 10) -> tuple[Path, dict]:

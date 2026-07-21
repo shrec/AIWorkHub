@@ -6,18 +6,18 @@
   "runner": "deepseek_task_mcp_review_summarizer_b111",
   "topic": "task_mcp",
   "mode": "mcp_readonly_tool_server_wiring_no_launch_authority",
-  "objective": "Wire the B110 review_summarizer core as a read-only geoai_task_review_summarize MCP tool in server.py, preserving default-off writes and no process/model launch.",
+  "objective": "Wire the B110 review_summarizer core as a read-only aiworkhub_task_review_summarize MCP tool in server.py, preserving default-off writes and no process/model launch.",
   "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_QUEUE_SUMMARIZER_B110_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh",
-  "test_source": "tools/geoai-task-mcp/tests/mcp_review_summarizer_server_wiring_smoke.py",
-  "module_modified": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-  "module_depends_on": "tools/geoai-task-mcp/src/geoai_task_mcp/review_summarizer.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh",
+  "test_source": "tools/aiworkhub/tests/mcp_review_summarizer_server_wiring_smoke.py",
+  "module_modified": "tools/aiworkhub/src/aiworkhub/server.py",
+  "module_depends_on": "tools/aiworkhub/src/aiworkhub/review_summarizer.py",
   "acceptance_criteria": {
-    "tool_visible": "geoai_task_review_summarize appears in MCP tool list with frozen read-only input schema",
+    "tool_visible": "aiworkhub_task_review_summarize appears in MCP tool list with frozen read-only input schema",
     "output_shape": "tool output includes grouped tasks and Codex review checklist shape",
     "no_taskctl_mutation": "must not call taskctl done/start/review/auto-pickup/add-card or mutate queue",
     "no_agent_model_launch": "must not launch agent/model process",
-    "test_passes": "bash tools/geoai-task-mcp/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh passes",
+    "test_passes": "bash tools/aiworkhub/tests/test_mcp_review_summarizer_server_wiring_b111_v1.sh passes",
     "verify_passes": "python3 AITools/taskctl.py verify passes"
   },
   "authority_flags": {
@@ -48,7 +48,7 @@
     "EXISTING_TOOLS_UNTOUCHED": true
   },
   "server_tool_schema": {
-    "tool_name": "geoai_task_review_summarize",
+    "tool_name": "aiworkhub_task_review_summarize",
     "parameters": {
       "task_ids": {
         "type": "list[str] | None",
@@ -84,15 +84,15 @@
   },
   "wiring_details": {
     "import_added": "from . import review_summarizer",
-    "function_added": "geoai_task_review_summarize with @mcp.tool() decorator",
+    "function_added": "aiworkhub_task_review_summarize with @mcp.tool() decorator",
     "existing_tools_preserved": true,
     "cli_adapter_register_preserved": true,
     "main_function_unchanged": true
   },
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_REAL_QUEUE_INTEGRATION_B112_V1"
 }

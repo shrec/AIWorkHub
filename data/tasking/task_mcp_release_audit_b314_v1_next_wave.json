@@ -5,7 +5,7 @@
   "next_wave_tasks": [
     {
       "allowed_writes": [
-        "tools/geoai-task-mcp/data/review/task_mcp_residual_risk_register_b318_v1.json"
+        "tools/aiworkhub/data/review/task_mcp_residual_risk_register_b318_v1.json"
       ],
       "blocks_release": false,
       "objective": "Document and track 8 residual_risk findings (F005, F006, F010, F012-F017): create a risk register with acceptance rationale, monitoring triggers, and conditions that would escalate each risk.",
@@ -23,15 +23,15 @@
       "priority": "normal",
       "proposed_task_id": "DEEPSEEK_TASK_MCP_RESIDUAL_RISK_REGISTER_B318_V1",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b314_v1.json",
-        "tools/geoai-task-mcp/data/review/task_mcp_release_audit_b314_v1_rows.jsonl"
+        "tools/aiworkhub/eval/task_mcp_release_audit_b314_v1.json",
+        "tools/aiworkhub/data/review/task_mcp_release_audit_b314_v1_rows.jsonl"
       ],
       "runner_prefix": "deepseek_task_mcp_",
       "topic": "task_mcp"
     },
     {
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+        "tools/aiworkhub/src/aiworkhub/process_launcher.py"
       ],
       "blocks_release": false,
       "objective": "Address B314_F010: replace daemon=True monitor threads with non-daemon threads + shutdown event, or add atexit handler to signal live processes before exit.",
@@ -41,14 +41,14 @@
       "priority": "low",
       "proposed_task_id": "DEEPSEEK_TASK_MCP_DAEMON_THREAD_HARDEN_B319_V1",
       "read_first": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+        "tools/aiworkhub/src/aiworkhub/process_launcher.py"
       ],
       "runner_prefix": "deepseek_task_mcp_",
       "topic": "task_mcp"
     },
     {
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+        "tools/aiworkhub/src/aiworkhub/process_launcher.py"
       ],
       "blocks_release": false,
       "objective": "Address B314_F014: buffer usage records for replay when write gate reopens, preventing silent loss of token accounting data.",
@@ -58,15 +58,15 @@
       "priority": "low",
       "proposed_task_id": "DEEPSEEK_TASK_MCP_USAGE_BUFFER_REPLAY_B320_V1",
       "read_first": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+        "tools/aiworkhub/src/aiworkhub/process_launcher.py"
       ],
       "runner_prefix": "deepseek_task_mcp_",
       "topic": "task_mcp"
     },
     {
       "allowed_writes": [
-        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b321_v1.json",
-        "tools/geoai-task-mcp/data/review/task_mcp_release_audit_b321_v1_rows.jsonl"
+        "tools/aiworkhub/eval/task_mcp_release_audit_b321_v1.json",
+        "tools/aiworkhub/data/review/task_mcp_release_audit_b321_v1_rows.jsonl"
       ],
       "blocks_release": false,
       "objective": "Re-audit after B318 register created; confirm all residual risks are documented and monitored. Verify no new findings introduced by residual risk remediation.",
@@ -74,8 +74,8 @@
       "priority": "normal",
       "proposed_task_id": "DEEPSEEK_TASK_MCP_REAUDIT_POST_RESIDUAL_B321_V1",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_release_audit_b314_v1.json",
-        "tools/geoai-task-mcp/data/review/task_mcp_residual_risk_register_b318_v1.json"
+        "tools/aiworkhub/eval/task_mcp_release_audit_b314_v1.json",
+        "tools/aiworkhub/data/review/task_mcp_residual_risk_register_b318_v1.json"
       ],
       "runner_prefix": "deepseek_task_mcp_",
       "topic": "task_mcp"

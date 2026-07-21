@@ -1,0 +1,84 @@
+{
+  "schema_id": "aiworkhub.task_mcp.rebrand_regression_repair_b838_v1.eval.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_REBRAND_REGRESSION_REPAIR_B838_V1",
+  "runner": "codex_gpt55_aiworkhub_rebrand_regression_repair_b838_v1",
+  "verdict": "PARTIAL_ENV_BLOCKED",
+  "canonical": {
+    "display_name": "AIWorkHub",
+    "abbreviation": "AWH",
+    "python_package": "aiworkhub",
+    "state_root": ".aiworkhub",
+    "env_prefix": "AIWORKHUB",
+    "mcp_tool_prefix": "aiworkhub"
+  },
+  "before": {
+    "pytest_command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests",
+    "pytest_exit_code": 1,
+    "pytest_failure_count": 1,
+    "pytest_failure_summary": "/usr/bin/python3: No module named pytest"
+  },
+  "after": {
+    "pytest_command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests",
+    "pytest_exit_code": 1,
+    "pytest_failure_count": 1,
+    "pytest_failure_summary": "/usr/bin/python3: No module named pytest",
+    "environment_blocker": "pytest is absent from system Python; pip user install, venv install, and --target install were blocked by the worker filesystem policy"
+  },
+  "repaired_failure_families": [
+    {
+      "family": "root_taskctl_taskdb_authority",
+      "changed_paths": [
+        "AITools/taskctl.py",
+        "AITools/taskdb.py"
+      ],
+      "repair": "Root task DB discovery now resolves canonical .aiworkhub storage registry paths and taskctl imports aiworkhub task-store modules instead of the removed package."
+    },
+    {
+      "family": "canonical_module_exposure_and_import_contracts",
+      "changed_paths": [
+        "tools/geoai-task-mcp/tests/test_aiworkhub_*.py",
+        "tools/geoai-task-mcp/tests/test_aiworkinghub_*.py"
+      ],
+      "repair": "Test imports and monkeypatch targets now use aiworkhub modules without public legacy aliases."
+    },
+    {
+      "family": "canonical_schema_service_fixture_names",
+      "changed_paths": [
+        "tools/geoai-task-mcp/src/aiworkhub",
+        "tools/geoai-task-mcp/tests"
+      ],
+      "repair": "Expected schema IDs, MCP tool names, service paths, and fixture paths now use AIWorkHub/aiworkhub identities and the standalone repository path."
+    }
+  ],
+  "validation": [
+    {
+      "command": "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests",
+      "exit_code": 1,
+      "status": "ENV_BLOCKED",
+      "summary": "No module named pytest"
+    },
+    {
+      "command": "python3 -m compileall -q tools/geoai-task-mcp/src",
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    {
+      "command": "python3 AITools/taskctl.py verify",
+      "exit_code": 0,
+      "status": "PASS",
+      "summary": "VERIFY: PASS"
+    },
+    {
+      "command": "python3 -m compileall -q tools/geoai-task-mcp/tests tools/geoai-task-mcp/src AITools/taskctl.py AITools/taskdb.py",
+      "exit_code": 0,
+      "status": "PASS"
+    },
+    {
+      "command": "rg legacy public identifiers in edited suite/source/root task tools",
+      "exit_code": 1,
+      "status": "PASS",
+      "summary": "No matches for removed package imports, AIWorkingHub names, .aiworkinghub, GeoAI schema IDs, GEOAI env prefix, or tools/aiworkhub fixture paths."
+    }
+  ],
+  "no_live_cutover_or_commit": true
+}

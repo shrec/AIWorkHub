@@ -9,8 +9,8 @@ No queue mutation, no process launch, no write-gate change, no training launch.
 Deterministic given the registry snapshot on disk.
 
 Outputs:
-  tools/geoai-task-mcp/data/review_signal_inventory_b160_v1.jsonl
-  tools/geoai-task-mcp/eval/review_signal_inventory_b160_v1.json
+  tools/aiworkhub/data/review_signal_inventory_b160_v1.jsonl
+  tools/aiworkhub/eval/review_signal_inventory_b160_v1.json
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 TASK_ID = "DEEPSEEK_TASK_MCP_REVIEW_SIGNAL_INVENTORY_B160_V1"
 REGISTRY_PATH = REPO_ROOT / "bitnnv2" / "data" / "tasking" / "machine_task_cards_v1.jsonl"
-OUT_JSONL = REPO_ROOT / "tools" / "geoai-task-mcp" / "data" / "review_signal_inventory_b160_v1.jsonl"
-OUT_EVAL = REPO_ROOT / "tools" / "geoai-task-mcp" / "eval" / "review_signal_inventory_b160_v1.json"
+OUT_JSONL = REPO_ROOT / "tools" / "aiworkhub" / "data" / "review_signal_inventory_b160_v1.jsonl"
+OUT_EVAL = REPO_ROOT / "tools" / "aiworkhub" / "eval" / "review_signal_inventory_b160_v1.json"
 
 # ---------------------------------------------------------------------------
 # Signal category definitions
@@ -236,32 +236,32 @@ def _mcp_tool_coverage() -> dict[str, Any]:
     """Map each signal category to current MCP tool exposure."""
     return {
         "risk": {
-            "exposed_via": ["geoai_task_show", "geoai_task_review_summarize"],
+            "exposed_via": ["aiworkhub_task_show", "aiworkhub_task_review_summarize"],
             "exposed_fields": ["authority_flags", "forbidden", "human_brief.risk", "mode"],
             "gap": "No aggregated risk score across queue; human_brief.risk is optional text, not enumerated.",
         },
         "change_size": {
-            "exposed_via": ["geoai_task_show", "geoai_task_review_summarize"],
+            "exposed_via": ["aiworkhub_task_show", "aiworkhub_task_review_summarize"],
             "exposed_fields": ["allowed_writes", "validation", "acceptance", "read_first"],
             "gap": "No file-type breakdown or scope-warning flag in MCP tool response; counts are implicit.",
         },
         "validation": {
-            "exposed_via": ["geoai_task_show", "geoai_task_health (verify)"],
+            "exposed_via": ["aiworkhub_task_show", "aiworkhub_task_health (verify)"],
             "exposed_fields": ["validation commands", "verify returncode"],
             "gap": "No per-task test-pass/fail state stored; verify is queue-wide, not per-task.",
         },
         "cost": {
-            "exposed_via": ["geoai_task_usage_report"],
+            "exposed_via": ["aiworkhub_task_usage_report"],
             "exposed_fields": ["tokens in/out", "cost_usd", "records"],
             "gap": "Cost not joined into task card view; requires separate call. No cumulative cost per topic.",
         },
         "collision": {
-            "exposed_via": ["geoai_task_collision_guard"],
+            "exposed_via": ["aiworkhub_task_collision_guard"],
             "exposed_fields": ["collision_free", "collision_count", "file_collisions"],
             "gap": "Per-card collision state not surfaced in show/list; requires full guard scan.",
         },
         "staleness": {
-            "exposed_via": ["geoai_task_list (status filter)", "geoai_task_show (timestamps)"],
+            "exposed_via": ["aiworkhub_task_list (status filter)", "aiworkhub_task_show (timestamps)"],
             "exposed_fields": ["status", "worker_status", "created_at", "completed_at"],
             "gap": "No computed staleness score or age-hours in tool response; raw timestamps only.",
         },
@@ -413,7 +413,7 @@ def main() -> int:
 
     # ── Write eval JSON ──
     eval_data: dict[str, Any] = {
-        "schema_id": "geoai.review_signal_inventory.v1",
+        "schema_id": "aiworkhub.review_signal_inventory.v1",
         "task_id": TASK_ID,
         "builder_contract": "B160_v1_review_signal_inventory_no_runtime",
         "generated_at": now.isoformat(),

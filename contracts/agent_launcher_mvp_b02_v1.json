@@ -19,7 +19,7 @@
     "no_shell_execution": true,
     "no_network_launch": true,
     "no_secret_logging": true,
-    "write_gate_independent_flag": "GEOAI_TASK_MCP_ALLOW_LAUNCH (proposed, mirrors GEOAI_TASK_MCP_ALLOW_WRITES); both default '0'",
+    "write_gate_independent_flag": "AIWORKHUB_ALLOW_LAUNCH (proposed, mirrors AIWORKHUB_ALLOW_WRITES); both default '0'",
     "even_if_flag_set": "no launcher code exists yet in the allowed_writes of this task, so no flag value can trigger a spawn",
     "preconditions_reused_from": "phase2_orchestration_contract_b104_v1.launch_preconditions (allow_launch_flag, allow_writes_flag, runner_topic_allowlist, command_allowlist_match, collision_guard_preflight, dry_run_default, cwd_env_sandbox_pin, concurrency_cap, audit_log_entry, adapter_available)"
   },
@@ -31,7 +31,7 @@
     "verdict_result": {"enum": ["pending", "not_applicable_mvp"]}
   },
   "tools": {
-    "geoai_agent_launch_task": {
+    "aiworkhub_agent_launch_task": {
       "summary": "Plan (never execute) a worker launch for a claimed task_id via one of the three adapters. MVP always runs in dryrun mode regardless of the mode field.",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
@@ -54,7 +54,7 @@
         "blocked_reason": {"type": ["string", "null"]}
       }
     },
-    "geoai_agent_task_status": {
+    "aiworkhub_agent_task_status": {
       "summary": "Read-only status lookup that layers on taskctl show; no separate process/job store is created.",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
@@ -69,7 +69,7 @@
         "last_updated": {"type": "string", "description": "ISO-8601 UTC timestamp of this status read"}
       }
     },
-    "geoai_agent_collect_result": {
+    "aiworkhub_agent_collect_result": {
       "summary": "Read-only completion-summary collector. In this MVP there is never a real launched process, so a genuine result is never available; verdict is always not_applicable_mvp or pending.",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
@@ -86,7 +86,7 @@
         "review_ready": {"type": "boolean", "const": false, "description": "MVP never marks a task review-ready via this tool; only taskctl review does"}
       }
     },
-    "geoai_agent_cancel_task": {
+    "aiworkhub_agent_cancel_task": {
       "summary": "Cancel a planned (never a running) launch. Because no process is ever started in this MVP, cancellation only ever clears a local plan record, never a real process.",
       "request_schema": {
         "task_id": {"type": "string", "required": true},
@@ -113,7 +113,7 @@
         "launch_enabled": false,
         "launch_implemented": false,
         "shell_invocation": false,
-        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "audit_ref": "tools/aiworkhub/logs/audit.jsonl",
         "blocked_reason": null
       }
     },
@@ -128,7 +128,7 @@
         "launch_enabled": false,
         "launch_implemented": false,
         "shell_invocation": false,
-        "audit_ref": "tools/geoai-task-mcp/logs/audit.jsonl",
+        "audit_ref": "tools/aiworkhub/logs/audit.jsonl",
         "blocked_reason": "mode 'live' not supported by MVP; launch never implemented"
       }
     },

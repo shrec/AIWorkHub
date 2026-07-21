@@ -1,13 +1,26 @@
-# GeoAI Task MCP
+# AIWorkHub
 
-Single-project MCP orchestrator and local operations dashboard for GeoAI.
+AIWorkHub (AWH) is a repository-bound development brain/control plane for
+AI coding agents. Opened against any Git checkout, it binds task lifecycle,
+Source Graph code discovery, Session Manager continuity, bounded AI Memory,
+KB lookups, isolated worker launch, and Codex/Claude callback routing to
+that exact repository. Every repository owns its own durable state under a
+repository-local `.aiworkhub/` directory (task queue, sessions, memory, KB,
+Source Graph, routing config) -- there is no shared server, no central
+database, and no host-specific path baked into the tool.
 
-The first version intentionally reuses the existing parent-repo task system:
+The primary interface is the **AIWorkHub VS Code extension**: a native
+editor-tab Webview that talks to a repository-scoped Task MCP stdio child
+process. It never opens a browser, binds a port, or exposes a LAN address.
+The same `aiworkhub` Python package is also usable headless as an MCP
+server for any MCP-capable client (Claude Code, Codex, other agent hosts).
 
-- Source of truth: `AITools/taskctl.py`
-- Queue DB: `bitnnv2/data/tasking/task_queue_v1.sqlite`
-- MCP transport: stdio
-- Default mode: read-only and launch-disabled
+- Source of truth: this repository's own `.aiworkhub/tasking/task_queue.sqlite`
+  (created/repaired by **Init Repo**, never a path outside the checkout)
+- MCP transport: stdio (no HTTP listener anywhere in the runtime)
+- Default mode: read-only and launch-disabled until explicitly enabled
+- Multi-repository isolation: one MCP stdio child and one `.aiworkhub/`
+  state directory per opened repository; nothing is shared across repos
 - Local model adapters: Claude Code CLI, Codex CLI, and `deepseek_copilot_cli`
   (official GitHub Copilot CLI driven in BYOK mode against DeepSeek's
   OpenAI-compatible API)
@@ -15,7 +28,40 @@ The first version intentionally reuses the existing parent-repo task system:
   `deepseek_*` runner; `deepseek_manual` remains an explicit non-launchable
   fallback only
 
-## Install For Local Development
+## Five-Minute Quickstart (VS Code)
+
+1. **Install the extension.** Build or download the VSIX (see
+   [Publishing](docs/PUBLISHING.md)) and run
+   `code --install-extension vscode-extension/dist/aiworkhub-<version>.vsix`.
+   Works identically over Remote-SSH -- the extension kind is `workspace`, so
+   the MCP child and Python runtime run on the workspace host.
+2. **Open a repository** in VS Code, then run `AIWorkHub: Open Dashboard`
+   (or `AIWorkHub: Select Repository` first in a multi-root window).
+3. **Init Repo.** On first open the dashboard shows an explicit
+   **Initialize AIWorkHub** action. Click it once -- this creates
+   `.aiworkhub/project.json`, the storage registry, a fresh canonical
+   `.aiworkhub/tasking/task_queue.sqlite`, and the Source Graph directory.
+   Nothing is created before this explicit step, and it is safe to run
+   again (idempotent).
+4. **Work the queue.** The dashboard tab shows pending/processing/review
+   tasks, per-topic/runner summaries, cost/usage, and callback-bridge
+   health, all read live from `.aiworkhub/`. Selecting a task shows its
+   detail and, for a running worker, its live stdout/stderr (**Live
+   Output**).
+5. **Workers close the loop through Codex callback routing** (see
+   [Callback Bridge](#callback-bridge-task-mcp---originating-codex-thread)
+   below): a claimed task's terminal state (review-ready, blocked, failed,
+   timed out) wakes the exact Codex thread that registered it -- no manual
+   polling or copy/paste. Claude callback delivery reuses the same durable
+   outbox/lease/retry machinery through the `claude --resume` CLI transport;
+   see [Callback Bridge](#callback-bridge-task-mcp---originating-codex-thread)
+   for the current Claude-specific transport modes and limitations.
+
+See [Getting Started](docs/GETTING_STARTED.md) for the full walkthrough
+(including headless/CLI-only setup) and [Architecture](docs/ARCHITECTURE.md)
+for how the pieces fit together.
+
+## Install For Local Development (headless / no VS Code)
 
 From this directory:
 
@@ -28,8 +74,13 @@ pip install -e .
 If the parent environment already has `mcp` installed, direct execution also works:
 
 ```bash
-PYTHONPATH=src GEOAI_REPO=/home/shrek/GeoAI python3 -m geoai_task_mcp.server
+PYTHONPATH=src AIWORKHUB_REPO=/path/to/checkout python3 -m aiworkhub.server
 ```
+
+`AIWORKHUB_REPO` selects the target repository; it works the same way on
+Linux, WSL, and native Windows Python -- it is resolved with `Path.resolve()`
+against whatever checkout path the host platform provides, never a
+hardcoded host-specific path.
 
 ## MCP Client Config
 
@@ -38,24 +89,24 @@ Example MCP server entry:
 ```json
 {
   "mcpServers": {
-    "geoai-task-mcp": {
+    "aiworkhub": {
       "command": "python3",
       "args": [
         "-m",
-        "geoai_task_mcp.server"
+        "aiworkhub.server"
       ],
       "env": {
-        "PYTHONPATH": "/home/shrek/GeoAI/tools/geoai-task-mcp/src",
-        "GEOAI_REPO": "/home/shrek/GeoAI",
-        "GEOAI_TASK_MCP_ALLOW_WRITES": "0"
+        "PYTHONPATH": "/path/to/checkout/src",
+        "AIWORKHUB_REPO": "/path/to/checkout",
+        "AIWORKHUB_ALLOW_WRITES": "0"
       }
     }
   }
 }
 ```
 
-Set `GEOAI_TASK_MCP_ALLOW_WRITES=1` only for trusted local automation. A real
-model launch additionally requires `GEOAI_TASK_MCP_ALLOW_LAUNCH=1`; both gates
+Set `AIWORKHUB_ALLOW_WRITES=1` only for trusted local automation. A real
+model launch additionally requires `AIWORKHUB_ALLOW_LAUNCH=1`; both gates
 default to `0`. Launches are local, shell-free, exact-task-bound, process-group
 tracked, timeout-bounded, and collision-checked.
 
@@ -63,37 +114,37 @@ tracked, timeout-bounded, and collision-checked.
 
 Read-only by default:
 
-- `geoai_task_health`
-- `geoai_task_review_queue`
-- `geoai_task_list`
-- `geoai_task_show`
-- `geoai_task_pending_for_runner`
-- `geoai_task_collision_guard`
-- `geoai_task_usage_report`
-- `geoai_task_audit_log_read`
-- `geoai_task_completion_inbox`
-- `geoai_task_stale_recovery_recommend`
-- `geoai_task_cost_ledger`
-- `geoai_agent_task_status`
-- `geoai_agent_collect_result`
-- `geoai_agent_list_processes`
-- `geoai_cli_adapter_plan_readonly`
-- `geoai_cli_adapter_audit_summary_readonly`
-- `geoai_cli_adapter_report_readonly`
+- `aiworkhub_task_health`
+- `aiworkhub_task_review_queue`
+- `aiworkhub_task_list`
+- `aiworkhub_task_show`
+- `aiworkhub_task_pending_for_runner`
+- `aiworkhub_task_collision_guard`
+- `aiworkhub_task_usage_report`
+- `aiworkhub_task_audit_log_read`
+- `aiworkhub_task_completion_inbox`
+- `aiworkhub_task_stale_recovery_recommend`
+- `aiworkhub_task_cost_ledger`
+- `aiworkhub_agent_task_status`
+- `aiworkhub_agent_collect_result`
+- `aiworkhub_agent_list_processes`
+- `aiworkhub_cli_adapter_plan_readonly`
+- `aiworkhub_cli_adapter_audit_summary_readonly`
+- `aiworkhub_cli_adapter_report_readonly`
 
 Write-gated:
 
-- `geoai_task_auto_pickup`
-- `geoai_task_mark_review`
-- `geoai_task_reject_review` (Codex requeues a failed review with feedback)
-- `geoai_task_mark_done`
-- `geoai_task_export_jsonl`
-- `geoai_task_queue_request`
-- `geoai_agent_launch_task` (requires both write and launch gates)
-- `geoai_agent_cancel_task` (requires both gates)
+- `aiworkhub_task_auto_pickup`
+- `aiworkhub_task_mark_review`
+- `aiworkhub_task_reject_review` (Codex requeues a failed review with feedback)
+- `aiworkhub_task_mark_done`
+- `aiworkhub_task_export_jsonl`
+- `aiworkhub_task_queue_request`
+- `aiworkhub_agent_launch_task` (requires both write and launch gates)
+- `aiworkhub_agent_cancel_task` (requires both gates)
 
-`geoai_task_queue_request` is the legacy intent/audit API and still launches
-nothing. `geoai_agent_launch_task` is the real runtime API. It validates the
+`aiworkhub_task_queue_request` is the legacy intent/audit API and still launches
+nothing. `aiworkhub_agent_launch_task` is the real runtime API. It validates the
 exact pending task, runner/topic, allowed-write boundary, collision state,
 adapter, and concurrency cap before starting a process. The worker's first
 operation is exact `taskctl claim-start <task_id>`, and success is not reported
@@ -113,15 +164,15 @@ Supported models: `deepseek-v4-pro` (production coding default) and
 ### One-time secure credential bootstrap
 
 The DeepSeek API key is stored in a mode-0600 file **outside the repository**
-(default `~/.config/geoai-task-mcp/deepseek_copilot_credential.json`, override
-with `GEOAI_TASK_MCP_DEEPSEEK_CREDENTIAL`). The key is read via `getpass` (never
+(default `~/.config/aiworkhub/deepseek_copilot_credential.json`, override
+with `AIWORKHUB_DEEPSEEK_CREDENTIAL`). The key is read via `getpass` (never
 on a command line) and is loaded only on the coordinator side at launch time. It
 enters **only** the launched child process as `COPILOT_PROVIDER_API_KEY` — never
 argv, task cards, logs, audit events, dashboard payloads, or Git.
 
 ```bash
-geoai-task-deepseek-credential set        # prompts for the key (hidden input)
-geoai-task-deepseek-credential status     # secret-free readiness JSON
+aiworkhub-deepseek-credential set        # prompts for the key (hidden input)
+aiworkhub-deepseek-credential status     # secret-free readiness JSON
 ```
 
 The loader rejects symlinks, group/world-accessible files, wrong ownership,
@@ -141,12 +192,12 @@ bubblewrap filesystem sandbox (no `--allow-all-paths`/`--yolo`).
 ### Adapter readiness
 
 Read-only adapter readiness is surfaced in the `adapter_readiness` field of the
-`geoai_completion_inbox` MCP tool output and in the dashboard's
+`aiworkhub_completion_inbox` MCP tool output and in the dashboard's
 `adapter_readiness` snapshot section (folded into existing surfaces so the
 frozen v1 tool contract stays at 33 tools). Per adapter it reports `installed`,
 `credential_present`, `endpoint`, `supported_models`, `launchable`, and the
 exact non-secret `blocker_reason`. Credential contents and hashes are never
-exposed. `geoai-task-deepseek-credential status` prints the same secret-free
+exposed. `aiworkhub-deepseek-credential status` prints the same secret-free
 readiness from the CLI.
 
 ## Callback Bridge (Task MCP -> originating Codex thread)
@@ -242,8 +293,8 @@ covered without a redundant wake.
 **Configurable App Server timeout / lease.** No 60-second implicit timeout
 exists anywhere in the bridge. `--app-server-timeout-seconds` /
 `--lease-seconds` / `--max-batch-members` (or the
-`GEOAI_CALLBACK_APP_SERVER_TIMEOUT_SECONDS` /
-`GEOAI_CALLBACK_LEASE_SECONDS` / `GEOAI_CALLBACK_MAX_BATCH_MEMBERS` env
+`AIWORKHUB_CALLBACK_APP_SERVER_TIMEOUT_SECONDS` /
+`AIWORKHUB_CALLBACK_LEASE_SECONDS` / `AIWORKHUB_CALLBACK_MAX_BATCH_MEMBERS` env
 vars) override the safe defaults (1800s timeout / 2100s lease, sufficient
 for a long CEO review turn). The lease must always exceed the timeout by a
 real margin (default 300s) -- an invalid combination is rejected at startup,
@@ -280,14 +331,14 @@ task(s) via trusted MCP/taskctl tools instead.
 **CLI.**
 
 ```bash
-geoai-task-callback-bridge run-once      # process at most one pending BATCH, then exit
-geoai-task-callback-bridge daemon        # poll continuously (idle polling starts zero
+aiworkhub-callback-bridge run-once      # process at most one pending BATCH, then exit
+aiworkhub-callback-bridge daemon        # poll continuously (idle polling starts zero
                                           #   Codex/model processes and uses zero tokens)
-geoai-task-callback-bridge status        # redacted health: bound/unbound, per-state
+aiworkhub-callback-bridge status        # redacted health: bound/unbound, per-state
                                           #   outbox+batch counts, batch size, oldest
                                           #   pending age, last delivery -- never a full
                                           #   thread id
-geoai-task-callback-bridge dry-run TASK_ID STATE
+aiworkhub-callback-bridge dry-run TASK_ID STATE
                                           # disposable canary: builds the prompt/argv,
                                           # never starts a real App Server subprocess
 
@@ -295,17 +346,17 @@ geoai-task-callback-bridge dry-run TASK_ID STATE
 ```
 
 **systemd (user) example for automatic restart** --
-`~/.config/systemd/user/geoai-task-callback-bridge.service`:
+`~/.config/systemd/user/aiworkhub-callback-bridge.service`:
 
 ```ini
 [Unit]
-Description=GeoAI Task MCP callback bridge (Codex App Server outbox consumer)
+Description=AIWorkHub MCP callback bridge (Codex App Server outbox consumer)
 
 [Service]
 Type=simple
-Environment=GEOAI_REPO=%h/GeoAI
-WorkingDirectory=%h/GeoAI
-ExecStart=%h/GeoAI/.venv/bin/geoai-task-callback-bridge daemon
+Environment=AIWORKHUB_REPO=/path/to/checkout
+WorkingDirectory=/path/to/checkout
+ExecStart=/path/to/checkout/.venv/bin/aiworkhub-callback-bridge daemon
 Restart=on-failure
 RestartSec=5
 
@@ -315,7 +366,7 @@ WantedBy=default.target
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now geoai-task-callback-bridge.service
+systemctl --user enable --now aiworkhub-callback-bridge.service
 ```
 
 Uses the existing local Codex authentication (the `codex` CLI's own login);
@@ -331,7 +382,7 @@ A separately spawned bridge App Server can only ever see the VS Code OpenAI
 extension's owned thread from the outside: the extension spawns and owns its
 own `codex app-server` child over a private stdio pipe, and `thread/resume`/
 `turn/*` are scoped to the App Server INSTANCE that owns the turn, not the
-thread id in the abstract. `geoai_task_mcp/app_server_mux.py` closes this
+thread id in the abstract. `aiworkhub/app_server_mux.py` closes this
 topologically: installed as the extension's `chatgpt.cliExecutable`, it
 transparently `execvp`s the real Codex binary for every non-`app-server`
 invocation (exact argv/exit behavior), and for `app-server` invocations
@@ -369,8 +420,8 @@ only -- it never touches VS Code settings, the installed extension, systemd,
 or the live callback DB:
 
 ```bash
-python3 tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py --check
-python3 tools/geoai-task-mcp/scripts/install_vscode_app_server_mux.py
+python3 scripts/install_vscode_app_server_mux.py --check
+python3 scripts/install_vscode_app_server_mux.py
 ```
 
 Codex owns applying the printed `chatgpt.cliExecutable` value, reloading the
@@ -380,18 +431,36 @@ re-enabling its service.
 
 ## VS Code Dashboard
 
-Use the repository-local **AIWorkingHub** VS Code extension. Its native Webview
+Use the repository-local **AIWorkHub** VS Code extension. Its native Webview
 reads the canonical dashboard snapshot through a repository-local Task MCP
 stdio session. It does not open a browser, expose a LAN address, start an HTTP
 listener, or require port forwarding. Installation and operation are documented
-in `tools/vscode-geoai-task-operations/README.md`.
+in `tools/vscode-aiworkhub-task-operations/README.md`. `aiworkhub/dashboard.py`
+contains only the read-only ``build_snapshot``/``build_task_detail`` builders
+the Webview's bounded MCP tools call -- there is no in-package HTTP server,
+browser launch, or fixed listen port.
+
+The extension packages as a self-contained VSIX
+(`vscode-extension/dist/aiworkhub-<version>.vsix`, built by
+`node vscode-extension/test/package-vsix.js`) that bundles the canonical
+`aiworkhub` Python runtime and Webview assets under an extension-local
+`runtime/` directory, so installing it requires no repository checkout,
+editable install, or network-time package install, and it opens as a normal
+editor tab under Remote-SSH.
+
+The dashboard editor tab has no manual model-probe or canary surface: there
+is no "Model capabilities" panel, no `vscode.lm.selectChatModels` discovery
+action, and no credit-consuming GLM canary prompt anywhere in the extension.
+Model routing and task execution run only through the real autonomous
+worker adapters (`deepseek_copilot_cli` etc., see `deepseek_credentials.py`
+above), never through a manually-triggered diagnostics probe.
 
 Task-bound AI context telemetry is metadata-only. Source Graph, Session
 current-state, AI Memory, and KB sections report requested/executed state, hit
 counts, bytes, hashes, truncation, and degraded reasons. The dashboard shows
 context injected versus worker-acknowledged separately; injected context is not
 treated as consumed unless the worker emits the bounded
-`geoai.task_mcp.worker_context_receipt.v1` receipt. Raw context bundle content
+`aiworkhub.task_mcp.worker_context_receipt.v1` receipt. Raw context bundle content
 is not stored in process events or dashboard payloads.
 
 Context policy is task-type aware. Code tasks require non-empty Source Graph
@@ -404,9 +473,9 @@ not a token or cost claim.
 ## Runtime Gates
 
 ```bash
-export GEOAI_TASK_MCP_ALLOW_WRITES=1
-export GEOAI_TASK_MCP_ALLOW_LAUNCH=1
-export GEOAI_TASK_MCP_MAX_PROCESSES=4
+export AIWORKHUB_ALLOW_WRITES=1
+export AIWORKHUB_ALLOW_LAUNCH=1
+export AIWORKHUB_MAX_PROCESSES=4
 ```
 
 Keep both gates disabled for worker-facing MCP configurations. Enable them only
@@ -417,21 +486,22 @@ launch gate.
 
 Every blocked write attempt is recorded to an append-only JSONL audit log.
 
-**Default path:** `tools/geoai-task-mcp/logs/audit.jsonl` (relative to `GEOAI_REPO` root).
+**Default path:** `.aiworkhub/runtime/process_logs/audit.jsonl` (relative to
+`AIWORKHUB_REPO` root).
 
-**Override path:** set `GEOAI_TASK_MCP_AUDIT_LOG_PATH` to an absolute path.
+**Override path:** set `AIWORKHUB_AUDIT_LOG_PATH` to an absolute path.
 
 **Format:** one JSON object per line:
 
 ```json
-{"timestamp":"2026-07-04T12:00:00+00:00","tool_name":"auto-pickup","action":"blocked_write","blocked_reason":"...","caller_info":{"pid":12345,"env_vars_checked":{"GEOAI_TASK_MCP_ALLOW_WRITES":"<set>","GEOAI_TASK_MCP_AUDIT_LOG_PATH":"<unset>"}}}
+{"timestamp":"2026-07-04T12:00:00+00:00","tool_name":"auto-pickup","action":"blocked_write","blocked_reason":"...","caller_info":{"pid":12345,"env_vars_checked":{"AIWORKHUB_ALLOW_WRITES":"<set>","AIWORKHUB_AUDIT_LOG_PATH":"<unset>"}}}
 ```
 
 **Safety guarantees:**
 - Never logs secret values, tokens, passwords, or environment variable VALUES — only NAMES and `<set>`/`<unset>` status.
 - Append-only — existing entries are never overwritten.
 - Log write failures print a warning to stderr but never crash the server.
-- `GEOAI_TASK_MCP_ALLOW_WRITES` default remains `0` (off) — the audit log does not enable writes.
+- `AIWORKHUB_ALLOW_WRITES` default remains `0` (off) — the audit log does not enable writes.
 
 ## Smoke Test
 
@@ -458,3 +528,19 @@ python3 -m pytest -q ../../AITools/test_taskctl_origin_thread_callback_b366_v1.p
 ```bash
 bash tests/test_write_gate_audit_v1.sh
 ```
+
+## Documentation
+
+- [Getting Started](docs/GETTING_STARTED.md) -- install, Init Repo, first task
+- [Architecture](docs/ARCHITECTURE.md) -- how the pieces fit together
+- [Publishing](docs/PUBLISHING.md) -- release preflight and tag-driven CI release
+- [Changelog](CHANGELOG.md)
+
+## Community
+
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security Policy](SECURITY.md)
+- [License](LICENSE) -- MIT
+- [GitHub Issues](https://github.com/shrec/AIWorkHub/issues) /
+  [Pull Requests](https://github.com/shrec/AIWorkHub/pulls)

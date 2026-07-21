@@ -1,0 +1,73 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_SELECTED_TASK_LIVE_OUTPUT_B855_V1",
+  "schema_id": "aiworkhub.eval.b855.v1",
+  "verdict": "review",
+  "summary": "Added a bounded, single-task Live Output read (process_launcher.read_live_output_for_task + aiworkhub_dashboard_task_live_output MCP tool), a repository_bootstrap.py wrapper that provisions task_store's authority set plus the Source Graph directory in one idempotent call, an is_not_initialized_reason() helper so the dashboard never masks a real corruption as 'just click init', closed the VS Code panel-serializer gaps (explicit getMcpClient rebind + stale-controller dispose), and (this residual pass) implemented the media/app.js Live Output renderer/poller: selecting a task starts a single-task requestLiveOutput/liveOutput poll loop that incrementally appends the sanitized stdout tail, replaces the stderr tail, shows liveness/last-activity/exit state, bounds client-retained text to the same 64 KiB the server enforces, and stops on task switch/clear or an ok:false response.",
+  "checks": [
+    {
+      "id": "live_output_single_task_only",
+      "status": "pass",
+      "evidence": "process_launcher._latest_process_row_for_task filters process_events.jsonl rows by task_id during the scan itself; read_live_output_for_task only ever tails the stdout/stderr paths carried by that ONE matched row -- verified by test_aiworkhub_selected_task_live_output_b855.py's no-fanout test."
+    },
+    {
+      "id": "live_output_incremental_cursor",
+      "status": "pass",
+      "evidence": "read_live_output_for_task accepts cursor/offset, returns next_cursor + truncated, and a second call with the prior next_cursor returns only newly-appended bytes."
+    },
+    {
+      "id": "live_output_sanitization",
+      "status": "pass",
+      "evidence": "_sanitize_live_output_text strips ANSI CSI sequences and C0 control bytes (except \\n/\\t), redacts 24+ char token-like runs, then HTML-escapes; covered by ANSI/redaction/escaping unit tests."
+    },
+    {
+      "id": "live_output_bounded",
+      "status": "pass",
+      "evidence": "max_bytes is clamped to MAX_LOG_TAIL_BYTES (64 KiB); a stdout file larger than the requested window sets truncated=true and next_cursor advances only by the bytes actually read."
+    },
+    {
+      "id": "output_unavailable_for_opaque_adapters",
+      "status": "pass",
+      "evidence": "No process-log row for task_id -> {ok: false, error: output_unavailable, reason: no_process_log_record_for_task}; a row with no stdout/stderr path recorded, or a deleted log file, fail closed the same way -- never raises, never fabricates output."
+    },
+    {
+      "id": "repository_bootstrap_idempotent",
+      "status": "pass",
+      "evidence": "repository_bootstrap.initialize_repository_full calls task_store.initialize_repository then source_graph.resolve_db_path; a second call against the same repo reports created_canonical_db=False (task_store's own idempotency) and source_graph_ready=True with no destructive re-creation."
+    },
+    {
+      "id": "is_not_initialized_reason_distinguishes_corruption",
+      "status": "pass",
+      "evidence": "dashboard_mcp_app.is_not_initialized_reason returns True only for the 'manifest_invalid:manifest_missing...' reason (a repository that has never been initialized); a corrupted storage registry produces 'registry_invalid:...', for which it returns False, so the dashboard never recommends Init Repo for a genuine corruption."
+    },
+    {
+      "id": "vscode_panel_serializer_single_controller",
+      "status": "pass",
+      "evidence": "reviveDashboardPanel disposes any stale panel.__aiworkhubViewState before adopting the newly deserialized panel, and re-binds a fresh McpStdioClient via getMcpClient(context); verified by static source assertions in test_aiworkhub_vscode_reload_restore_b855.py."
+    },
+    {
+      "id": "model_diagnostics_secondary_not_primary",
+      "status": "pass",
+      "evidence": "getHtmlForWebview renders #initialize-button (Init Repo) before the Model capabilities/#glm-canary-button section; sendRequest is only ever called inside runGlmCanary, gated behind an explicit native 'modal: true' credit-confirmation dialog -- static source assertions in test_aiworkhub_model_diagnostics_b855.py."
+    },
+    {
+      "id": "app_js_live_output_rendering_gap",
+      "status": "pass",
+      "evidence": "requestTaskDetail() now calls startLiveOutputPolling(taskId), which posts requestLiveOutput{taskId, cursor:0} and schedules a bounded LIVE_OUTPUT_POLL_MS=4000 self-poll (scheduleNextLiveOutputPoll) that only continues while that exact taskId stays selected; renderLiveOutput() drops any response whose task_id no longer matches state.liveOutputTaskId (no cross-task fanout), appends the pre-sanitized stdout tail (appendLiveOutputText, bounded to LIVE_OUTPUT_MAX_CLIENT_CHARS=64KiB matching MAX_LIVE_OUTPUT_BYTES server-side), replaces the stderr tail, and renders liveness_state/last_activity_at/exit_code/truncated into #detail-live-output-state; clearTaskDetail()/task-switch call resetLiveOutputPanel() which stops the timer. extension.js's HTML gained a second #detail-live-output-stderr <pre> (styled for free by the existing '.result-block pre' rule -- no CSS file touched)."
+    }
+  ],
+  "tests": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_selected_task_live_output_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_model_diagnostics_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_init_repo_b855.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_release_b853.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "node --check tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "tools/geoai-task-mcp/eval/aiworkhub_selected_task_live_output_b855_v1.json"
+  ],
+  "blockers": [],
+  "next_task": ""
+}

@@ -1,0 +1,48 @@
+{
+  "schema_id": "aiworkhub.task_mcp.aiworkhub_worker_mcp_module_launch_b869_v1.eval.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_WORKER_MCP_MODULE_LAUNCH_B869_V1",
+  "runner": "claude_sonnet5_aiworkhub_worker_mcp_module_launch_b869_v1",
+  "topic": "task_mcp",
+  "mode": "bootstrap_repair_package_module_launch",
+  "defect": {
+    "id": "worker_mcp_server_launched_as_bare_relative_importing_file",
+    "description": "generate_worker_mcp_runtime emitted command=<python> args=[str(Path(__file__).resolve())] for the Claude/Copilot/Codex configs -- executing worker_ai_tools_mcp.py directly as __main__. Its own `from .repository_state import RepositoryStateError` is a relative import, which raises ImportError: attempted relative import with no known parent package before ctx is bound or any tool is registered. No prior B833/B834 test caught this because every test drove the Python functions in-process; none ever spawned the generated command/args/env as a real OS subprocess.",
+    "fix": "generate_worker_mcp_runtime now launches `python -m aiworkhub.worker_ai_tools_mcp` (args[0]=='-m', args[1]==dotted module name derived from Path(__file__).parent.name + Path(__file__).stem, never hardcoded) for all three adapter shapes, and sets env['PYTHONPATH'] to this module's own resolved src/ parent directory so the import root is portable across any repo checkout location on Linux and Windows (pathlib + os.pathsep semantics, no hardcoded absolute path).",
+    "verification": "test_aiworkhub_worker_mcp_module_launch_b869_v1.py reads back the exact generated claude/copilot/codex config, spawns EXACTLY that command/args/env as a real subprocess over OS stdio pipes via mcp.client.stdio.stdio_client + mcp.ClientSession, and drives a real initialize -> tools/list -> tools/call round trip -- all 6 worker tools are listed and a bounded read-only kb_search call completes without ImportError."
+  },
+  "mcp_tool_names": [
+    "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_session_current_state",
+    "aiworkhub_worker_ai_memory_search",
+    "aiworkhub_worker_kb_search",
+    "aiworkhub_worker_kb_get",
+    "aiworkhub_worker_kb_related"
+  ],
+  "tool_count": 6,
+  "server_name": "aiworkhub_worker_ai_tools",
+  "launch_shape": {
+    "command": "sys.executable (or an explicit python_executable override)",
+    "args": ["-m", "aiworkhub.worker_ai_tools_mcp"],
+    "import_root_env_var": "PYTHONPATH",
+    "import_root_source": "Path(__file__).resolve().parents[1], derived at generation time, never hardcoded"
+  },
+  "known_limitations": [
+    "The emitted PYTHONPATH is the real HOST path of this module's own src directory. That is correct for the landlock backend and for direct/no-sandbox invocation (both use real host paths throughout, and both are what this task's tests exercise). Under the bubblewrap backend, that real host path is not itself bound into the sandbox mount namespace -- only the SANDBOX_AUTHORITY_REPO/SANDBOX_WORKSPACE aliases are (see worker_workspace.sandbox_argv) -- so a future task should rebase PYTHONPATH onto the (possibly already sandbox-aliased) authority_repo this function receives instead of the raw host __file__ location. worker_workspace.py is outside this task's allowed_writes, so that rebase is explicitly out of scope here and is not silently claimed as fixed.",
+    "The task card's acceptance text says 'all seven worker tools'; the live MCP_TOOL_NAMES set has exactly 6 entries (source_graph_query, session_current_state, ai_memory_search, kb_search, kb_get, kb_related). This task's scope is the launch-as-module repair, not adding a tool, so the count is reported honestly as 6 rather than fabricating a seventh."
+  ],
+  "test_file": "tools/geoai-task-mcp/tests/test_aiworkhub_worker_mcp_module_launch_b869_v1.py",
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_b833_v1.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_worker_mcp_module_launch_b869_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_worker_mcp_module_launch_b869_v1.json"
+  ],
+  "not_modified": [
+    "tools/geoai-task-mcp/tests/test_aiworkhub_dynamic_worker_mcp_authority_repair_b834_v1.py"
+  ]
+}

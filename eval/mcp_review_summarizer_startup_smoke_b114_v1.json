@@ -6,12 +6,12 @@
   "runner": "deepseek_task_mcp_review_summarizer_startup_b114",
   "topic": "task_mcp",
   "mode": "mcp_review_summarizer_startup_smoke_readonly",
-  "objective": "Smoke test that the MCP server module surface exposes geoai_task_review_summarize with readonly flags, write gate default-off, and no queue mutation on tool listing.",
+  "objective": "Smoke test that the MCP server module surface exposes aiworkhub_task_review_summarize with readonly flags, write gate default-off, and no queue mutation on tool listing.",
   "parent_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_PARSER_FIX_B113_V1",
-  "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_startup_smoke_b114_v1.sh",
-  "module_under_test": "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
+  "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_startup_smoke_b114_v1.sh",
+  "module_under_test": "tools/aiworkhub/src/aiworkhub/server.py",
   "acceptance_results": {
-    "tool_registered": "PASS — geoai_task_review_summarize found in mcp._tool_manager._tools (16 tools total)",
+    "tool_registered": "PASS — aiworkhub_task_review_summarize found in mcp._tool_manager._tools (16 tools total)",
     "tool_callable": "PASS — tool.fn is callable, name matches",
     "tool_description_readonly": "PASS — description contains read-only, never mutates, never calls taskctl, never launches",
     "fn_docstring_readonly": "PASS — fn docstring contains read-only",
@@ -32,10 +32,10 @@
     "eval_json_valid": "PASS — JSON valid"
   },
   "acceptance_criteria": [
-    "geoai_task_review_summarize is registered in mcp._tool_manager._tools",
+    "aiworkhub_task_review_summarize is registered in mcp._tool_manager._tools",
     "tool description contains read-only / never-mutates / never-launches invariants",
     "review_summarizer._authority_flags() returns readonly=True, process_launch=False, agent_launch=False",
-    "write gate default-off: core.writes_allowed() returns False when GEOAI_TASK_MCP_ALLOW_WRITES=0",
+    "write gate default-off: core.writes_allowed() returns False when AIWORKHUB_ALLOW_WRITES=0",
     "write_gate_enabled flag is True in authority_flags (gate active = blocking writes = correct default-off)",
     "queue sha256 unchanged before/after importing server module and listing tools",
     "audit log sha256 unchanged before/after tool listing",
@@ -64,9 +64,9 @@
     "mixed_task_commit"
   ],
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "next_wave_task": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
 }

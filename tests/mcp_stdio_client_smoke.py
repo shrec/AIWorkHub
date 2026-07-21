@@ -3,7 +3,7 @@
 
 Extends the B108 in-memory client smoke
 (``mcp_client_smoke_contract_freeze.py``) to a REAL out-of-process stdio
-transport: it launches the ``geoai-task-mcp`` server as its OWN subprocess over
+transport: it launches the ``aiworkhub`` server as its OWN subprocess over
 OS stdio pipes via ``mcp.client.stdio.stdio_client`` +
 ``mcp.StdioServerParameters`` and drives it through a real ``mcp.ClientSession``
 (``initialize`` -> ``tools/list`` -> ``tools/call``) -- the exact path a
@@ -18,15 +18,15 @@ Checks (all must pass for ``frozen_contract_v1`` true):
   C3  the complete 33-tool inventory and every inputSchema are exactly equal
       to the B109 frozen names/fingerprints AND deterministic across two
       independent stdio subprocess sessions;
-  C4  no queue/audit writes with ``GEOAI_TASK_MCP_ALLOW_WRITES`` UNSET: the
+  C4  no queue/audit writes with ``AIWORKHUB_ALLOW_WRITES`` UNSET: the
       MCP-owned audit state dir (passed to the child via env) is byte-identical
       (and empty) before/after every read-only ``tools/call`` and the parent
       queue stays verify-intact;
-  C5  same no-write proof with ``GEOAI_TASK_MCP_ALLOW_WRITES=1`` in the child;
+  C5  same no-write proof with ``AIWORKHUB_ALLOW_WRITES=1`` in the child;
   C6  STDIO transport actually used: two subprocess sessions initialized and
       listed tools over real OS pipes (out-of-process);
   C7  ONLY the MCP server itself is launched: the child command is a python
-      interpreter running ``-m geoai_task_mcp.server`` -- no agent/model
+      interpreter running ``-m aiworkhub.server`` -- no agent/model
       binary, no shell invocation (stdio_client never uses a shell);
   C8  server.py holds no direct subprocess/exec/fork/shell primitive, the
       child launch gate is forced closed, and no launcher state is created.
@@ -34,11 +34,11 @@ Checks (all must pass for ``frozen_contract_v1`` true):
 This harness NEVER enables writes for real, NEVER launches an agent or model,
 makes NO network call, and logs NO secret values. It is isolation-safe: it owns
 a private mktemp audit dir (passed to the child via
-``GEOAI_TASK_MCP_AUDIT_LOG_PATH``) so the byte-identity proof cannot be
+``AIWORKHUB_AUDIT_LOG_PATH``) so the byte-identity proof cannot be
 perturbed by a concurrent worker.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src GEOAI_REPO=/home/shrek/GeoAI \
+    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
     python3 tools/geoai-task-mcp/tests/mcp_stdio_client_smoke.py [--out result.json]
 """
 
@@ -63,33 +63,33 @@ if SRC not in sys.path:
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import get_default_environment, stdio_client  # noqa: E402
 
-from geoai_task_mcp import cli_adapter_readonly_tool as ro  # noqa: E402
-from geoai_task_mcp import core  # noqa: E402
-from geoai_task_mcp import process_launcher  # noqa: E402
+from aiworkhub import cli_adapter_readonly_tool as ro  # noqa: E402
+from aiworkhub import core  # noqa: E402
+from aiworkhub import process_launcher  # noqa: E402
 
 TASK_ID = "CLAUDE_TASK_MCP_STDIO_SUBPROCESS_CLIENT_SMOKE_B109_V1"
 RUNNER = "claude_task_mcp_stdio_smoke_b109"
 
 # --- frozen read-only contract v1 (identical to B108) ---------------------
 READONLY_TOOLS: tuple[str, ...] = (
-    "geoai_task_health",
-    "geoai_task_review_queue",
-    "geoai_task_list",
-    "geoai_task_show",
-    "geoai_task_pending_for_runner",
-    "geoai_task_collision_guard",
-    "geoai_task_usage_report",
-    "geoai_task_audit_log_read",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_report_readonly",
+    "aiworkhub_task_health",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_list",
+    "aiworkhub_task_show",
+    "aiworkhub_task_pending_for_runner",
+    "aiworkhub_task_collision_guard",
+    "aiworkhub_task_usage_report",
+    "aiworkhub_task_audit_log_read",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_report_readonly",
 )
 
 WRITE_GATED_TOOLS: tuple[str, ...] = (
-    "geoai_task_auto_pickup",
-    "geoai_task_mark_review",
-    "geoai_task_mark_done",
-    "geoai_task_export_jsonl",
+    "aiworkhub_task_auto_pickup",
+    "aiworkhub_task_mark_review",
+    "aiworkhub_task_mark_done",
+    "aiworkhub_task_export_jsonl",
 )
 
 # Byte-canonical sha256(inputSchema) values for the complete B109-visible tool
@@ -97,57 +97,57 @@ WRITE_GATED_TOOLS: tuple[str, ...] = (
 # entries freeze the rest of the staged 33-tool server surface. Any added,
 # removed, renamed, or schema-drifted tool flips frozen_contract_v1 to false.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
-    "geoai_agent_cancel_task": "d6dc39018324299f9ca0163985b3b7ea846ea681a5b4c8300bfcfca5992132ed",
-    "geoai_agent_collect_result": "0f18003c33bbfa39a51bd58df9b7199958f654d48be46b22f135eeaac95ebd7e",
-    "geoai_agent_launch_task": "e2df07bb8d3b62ba205ce55a4c6952977bfadcf1b9110a50018383c40264ca8c",
-    "geoai_agent_list_processes": "ef824212a6e23c40e901bcfb3681aa45db69dd8c7a2ff2a0afd1e6c3dff974e1",
-    "geoai_agent_task_status": "ff9aba2f7412aa53948c8f3ba1a83d9bc2e3a4e1886f54bd1306c64b510f31a7",
-    "geoai_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
-    "geoai_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
-    "geoai_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-    "geoai_completion_inbox": "fc015d926f2c5df16a05f81f8da9104398479be855f88a4b503e476e3ddfc5eb",
-    "geoai_launch_queue_audit_summary_readonly": "d69e90ba19ecaf47938bb1d5afaadbbffaf8e7cdc3bd2a850c5963b2a76ad4ea",
-    "geoai_launch_queue_describe_readonly": "f95498863ef4cd023de90327c99b01a2502ead5e42eb637f57399eff2aa13473",
-    "geoai_launch_queue_evaluate_readonly": "edc2a889e2948cda4414a45ca2ea3574bee01c851905d3a49c449ad96f1411ff",
-    "geoai_supervisor_loop_status": "53af2da13ad6d2029abdb0832822908eb19c5d343cf8bab25dc6f6d62a9abc41",
-    "geoai_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-    "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-    "geoai_task_auto_pickup_dryrun": "a4961d4d6e6c8f5b3cc6d81d625f27dd63858b9c7720266cd21fa6115dbf67b4",
-    "geoai_task_codex_handoff": "7b19a7cf66e19bcbb075dd793e34c54c7450c8b55d30a450e35e23cdfe3d43bd",
-    "geoai_task_codex_handoff_markdown": "880b9c601eab1b1024df04987c95957288ae4e6c8b7e82e15f2dab39a6354492",
-    "geoai_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-    "geoai_task_cost_ledger": "e3ca25a6bb80d2f6bb991b99feb194b3c459afaa77bfc7de5ec94055aea62643",
-    "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-    "geoai_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-    "geoai_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-    "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-    "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-    "geoai_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-    "geoai_task_queue_request": "b53127ff1f63327b53557cee43288f710d3965a9907bf71df1fc5ba5937ee7c5",
-    "geoai_task_reject_review": "b63f46acd240e9c485a43898d12dc10a7d9adf63ef60b7884cff1ef7c160e6ac",
-    "geoai_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-    "geoai_task_review_summarize": "6023df30ec17d4326fcc0e2ddd569b1f98976375c31c4f088f26b56bda0863b9",
-    "geoai_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-    "geoai_task_stale_recovery_recommend": "4f423ac0d8e568417fc7a398abae49c57eda8eafa75b356540b0f9787bd38e70",
-    "geoai_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+    "aiworkhub_agent_cancel_task": "d6dc39018324299f9ca0163985b3b7ea846ea681a5b4c8300bfcfca5992132ed",
+    "aiworkhub_agent_collect_result": "0f18003c33bbfa39a51bd58df9b7199958f654d48be46b22f135eeaac95ebd7e",
+    "aiworkhub_agent_launch_task": "e2df07bb8d3b62ba205ce55a4c6952977bfadcf1b9110a50018383c40264ca8c",
+    "aiworkhub_agent_list_processes": "ef824212a6e23c40e901bcfb3681aa45db69dd8c7a2ff2a0afd1e6c3dff974e1",
+    "aiworkhub_agent_task_status": "ff9aba2f7412aa53948c8f3ba1a83d9bc2e3a4e1886f54bd1306c64b510f31a7",
+    "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+    "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+    "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+    "aiworkhub_completion_inbox": "fc015d926f2c5df16a05f81f8da9104398479be855f88a4b503e476e3ddfc5eb",
+    "aiworkhub_launch_queue_audit_summary_readonly": "d69e90ba19ecaf47938bb1d5afaadbbffaf8e7cdc3bd2a850c5963b2a76ad4ea",
+    "aiworkhub_launch_queue_describe_readonly": "f95498863ef4cd023de90327c99b01a2502ead5e42eb637f57399eff2aa13473",
+    "aiworkhub_launch_queue_evaluate_readonly": "edc2a889e2948cda4414a45ca2ea3574bee01c851905d3a49c449ad96f1411ff",
+    "aiworkhub_supervisor_loop_status": "53af2da13ad6d2029abdb0832822908eb19c5d343cf8bab25dc6f6d62a9abc41",
+    "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+    "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+    "aiworkhub_task_auto_pickup_dryrun": "a4961d4d6e6c8f5b3cc6d81d625f27dd63858b9c7720266cd21fa6115dbf67b4",
+    "aiworkhub_task_codex_handoff": "7b19a7cf66e19bcbb075dd793e34c54c7450c8b55d30a450e35e23cdfe3d43bd",
+    "aiworkhub_task_codex_handoff_markdown": "880b9c601eab1b1024df04987c95957288ae4e6c8b7e82e15f2dab39a6354492",
+    "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+    "aiworkhub_task_cost_ledger": "e3ca25a6bb80d2f6bb991b99feb194b3c459afaa77bfc7de5ec94055aea62643",
+    "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+    "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+    "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+    "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+    "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
+    "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+    "aiworkhub_task_queue_request": "b53127ff1f63327b53557cee43288f710d3965a9907bf71df1fc5ba5937ee7c5",
+    "aiworkhub_task_reject_review": "b63f46acd240e9c485a43898d12dc10a7d9adf63ef60b7884cff1ef7c160e6ac",
+    "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+    "aiworkhub_task_review_summarize": "6023df30ec17d4326fcc0e2ddd569b1f98976375c31c4f088f26b56bda0863b9",
+    "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+    "aiworkhub_task_stale_recovery_recommend": "4f423ac0d8e568417fc7a398abae49c57eda8eafa75b356540b0f9787bd38e70",
+    "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
 }
 
 # Read-only tools_call payloads (client path) -- required args supplied.
 READONLY_CALL_ARGS: dict[str, dict[str, Any]] = {
-    "geoai_task_health": {},
-    "geoai_task_review_queue": {},
-    "geoai_task_list": {"status": "pending", "limit": 3},
-    "geoai_task_show": {"task_id": TASK_ID},
-    "geoai_task_pending_for_runner": {"runner": RUNNER},
-    "geoai_task_collision_guard": {"print_json": True},
-    "geoai_task_usage_report": {},
-    "geoai_task_audit_log_read": {"max_entries": 10},
-    "geoai_cli_adapter_plan_readonly": {
+    "aiworkhub_task_health": {},
+    "aiworkhub_task_review_queue": {},
+    "aiworkhub_task_list": {"status": "pending", "limit": 3},
+    "aiworkhub_task_show": {"task_id": TASK_ID},
+    "aiworkhub_task_pending_for_runner": {"runner": RUNNER},
+    "aiworkhub_task_collision_guard": {"print_json": True},
+    "aiworkhub_task_usage_report": {},
+    "aiworkhub_task_audit_log_read": {"max_entries": 10},
+    "aiworkhub_cli_adapter_plan_readonly": {
         "task_id": "B109-PLAN", "runner": "b109_smoke", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["claude", "-p", "hi"],
     },
-    "geoai_cli_adapter_audit_summary_readonly": {"max_entries": 10},
-    "geoai_cli_adapter_report_readonly": {
+    "aiworkhub_cli_adapter_audit_summary_readonly": {"max_entries": 10},
+    "aiworkhub_cli_adapter_report_readonly": {
         "task_id": "B109-REPORT", "runner": "b109_smoke", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["codex", "exec", "review"],
     },
@@ -189,25 +189,25 @@ def _snapshot_dir(d: Path) -> list[tuple[str, int, str]]:
 def _server_params(audit_log: Path, allow_writes: bool | None) -> StdioServerParameters:
     """Build stdio params that launch ONLY the MCP server subprocess.
 
-    command = this python interpreter, args = ``-m geoai_task_mcp.server``.
+    command = this python interpreter, args = ``-m aiworkhub.server``.
     stdio_client spawns it directly over OS pipes (never a shell). The child
     env is a minimal default env plus the paths the server needs and isolated
-    audit/process state paths. ``GEOAI_TASK_MCP_ALLOW_WRITES`` is set/unset per
-    round, while ``GEOAI_TASK_MCP_ALLOW_LAUNCH`` is always forced closed.
+    audit/process state paths. ``AIWORKHUB_ALLOW_WRITES`` is set/unset per
+    round, while ``AIWORKHUB_ALLOW_LAUNCH`` is always forced closed.
     """
     env = get_default_environment()
     env["PYTHONPATH"] = SRC
-    env["GEOAI_REPO"] = str(core.repo_root())
-    env["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(audit_log)
+    env["AIWORKHUB_REPO"] = str(core.repo_root())
+    env["AIWORKHUB_AUDIT_LOG_PATH"] = str(audit_log)
     env[process_launcher.PROCESS_LOG_ENV] = str(audit_log.parent / "process_events.jsonl")
     env[process_launcher.PROCESS_DIR_ENV] = str(audit_log.parent / "processes")
     env[process_launcher.ALLOW_LAUNCH_ENV] = "0"
-    env.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+    env.pop("AIWORKHUB_ALLOW_WRITES", None)
     if allow_writes is True:
-        env["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+        env["AIWORKHUB_ALLOW_WRITES"] = "1"
     return StdioServerParameters(
         command=sys.executable,
-        args=["-m", "geoai_task_mcp.server"],
+        args=["-m", "aiworkhub.server"],
         env=env,
         cwd=str(core.repo_root()),
     )
@@ -259,7 +259,7 @@ def run_smoke() -> dict[str, Any]:
     detail: dict[str, Any] = {}
     failing_check: str | None = None
 
-    state_dir = Path(tempfile.mkdtemp(prefix="geoai_b109_stdio_smoke_"))
+    state_dir = Path(tempfile.mkdtemp(prefix="aiworkhub_b109_stdio_smoke_"))
     audit_log = state_dir / "audit.jsonl"
 
     try:
@@ -268,10 +268,10 @@ def run_smoke() -> dict[str, Any]:
         launched_command = [params.command, *params.args]
         cmd_lower = " ".join(launched_command).lower()
         is_python = os.path.basename(params.command).lower().startswith("python")
-        runs_server_module = params.args[:2] == ["-m", "geoai_task_mcp.server"]
+        runs_server_module = params.args[:2] == ["-m", "aiworkhub.server"]
         # server module string is exempt from the agent-token scan; only flag
         # tokens elsewhere in the command line.
-        scan = cmd_lower.replace("geoai_task_mcp.server", "")
+        scan = cmd_lower.replace("aiworkhub.server", "")
         agent_hits = sorted({t for t in AGENT_MODEL_TOKENS if t in scan})
         checks["only_mcp_server_launched"] = bool(
             is_python and runs_server_module and not agent_hits
@@ -338,7 +338,7 @@ def run_smoke() -> dict[str, Any]:
         detail["round_allow_set"] = r_set
 
         # --- C8 no direct spawn primitive, launch authority, or side effects
-        server_src = (Path(SRC) / "geoai_task_mcp" / "server.py").read_text(encoding="utf-8")
+        server_src = (Path(SRC) / "aiworkhub" / "server.py").read_text(encoding="utf-8")
         launch_hits = [p for p in LAUNCH_PATTERNS if p in server_src]
         runtime_launch_enabled = process_launcher.launch_gates_open()
         checks["server_no_launch_code"] = not launch_hits

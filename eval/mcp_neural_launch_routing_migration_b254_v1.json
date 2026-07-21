@@ -76,7 +76,7 @@
     "eval_jsonl_valid": true,
     "static_allowlist_explicitly_marked_safety_floor": true
   },
-  "neural_bridge_note": "These curriculum rows are TRAINING TARGETS for a learned neural router that selects adapter/runner/topic from task context and abstains when evidence is insufficient (collision, wrong pairing, ambiguous topic, non-trainable mode). adapter_of() and the historical-status/outcome bucketing in this build script are curriculum LABEL GENERATORS only -- NOT runtime launch authority. Production routing must be the neural model's learned dispatch over rows like these, never a regex/keyword cue router promoted to active_default. Deterministic safety gates (COMMAND_ALLOWLIST, LAUNCHABLE_BINARIES, the dual GEOAI_TASK_MCP_ALLOW_LAUNCH/ALLOW_WRITES env-gate contract) remain the safety floor after the neural router selects; this task neither touches nor weakens them.",
+  "neural_bridge_note": "These curriculum rows are TRAINING TARGETS for a learned neural router that selects adapter/runner/topic from task context and abstains when evidence is insufficient (collision, wrong pairing, ambiguous topic, non-trainable mode). adapter_of() and the historical-status/outcome bucketing in this build script are curriculum LABEL GENERATORS only -- NOT runtime launch authority. Production routing must be the neural model's learned dispatch over rows like these, never a regex/keyword cue router promoted to active_default. Deterministic safety gates (COMMAND_ALLOWLIST, LAUNCHABLE_BINARIES, the dual AIWORKHUB_ALLOW_LAUNCH/ALLOW_WRITES env-gate contract) remain the safety floor after the neural router selects; this task neither touches nor weakens them.",
   "authority_flags": {
     "process_launch_authority": false,
     "write_gate_enabled": false,
@@ -92,11 +92,11 @@
   },
   "commit_contract": "NO_COMMIT",
   "codex_review_required": true,
-  "next_wave_pointer": "tools/geoai-task-mcp/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json",
+  "next_wave_pointer": "tools/aiworkhub/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json",
   "files_written": [
     "bitnnv2/data/curriculum/mcp_neural_launch_routing_migration_b254_v1.jsonl",
-    "tools/geoai-task-mcp/eval/mcp_neural_launch_routing_migration_b254_v1.json",
-    "tools/geoai-task-mcp/eval/mcp_neural_launch_routing_migration_rows_b254_v1.jsonl",
-    "tools/geoai-task-mcp/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json"
+    "tools/aiworkhub/eval/mcp_neural_launch_routing_migration_b254_v1.json",
+    "tools/aiworkhub/eval/mcp_neural_launch_routing_migration_rows_b254_v1.jsonl",
+    "tools/aiworkhub/data/tasking/mcp_neural_launch_routing_migration_next_wave_b254_v1.json"
   ]
 }

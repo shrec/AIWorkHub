@@ -3,8 +3,8 @@ import json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")).expanduser().resolve()
-MCP_ROOT = REPO / "tools" / "geoai-task-mcp"
+REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+MCP_ROOT = REPO / "tools" / "aiworkhub"
 EVAL_DIR = MCP_ROOT / "eval"
 DATA_DIR = MCP_ROOT / "data" / "tasking"
 
@@ -101,7 +101,7 @@ next_wave = {
             "task_id": "DEEPSEEK_TASK_MCP_DEEPSEEK_TUI_ADAPTER_DRYRUN_B117_V1",
             "goal": "Register deepseek_tui as DISABLED-BY-DEFAULT local CLI adapter. Read-only shutil.which presence probe. NO process spawn, NO install, NO launch.",
             "mode": "NO_COMMIT", "disabled_by_default": True,
-            "allowed_writes": ["tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py", "tools/geoai-task-mcp/tests/test_deepseek_tui_adapter_dryrun_b117_v1.sh", "tools/geoai-task-mcp/eval/deepseek_tui_adapter_dryrun_b117_v1.json"],
+            "allowed_writes": ["tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py", "tools/aiworkhub/tests/test_deepseek_tui_adapter_dryrun_b117_v1.sh", "tools/aiworkhub/eval/deepseek_tui_adapter_dryrun_b117_v1.json"],
             "acceptance": ["adapter registered disabled_by_default=true", "detect() read-only probe, never spawns", "no launch code added", "launch_enabled() returns False", "ALLOW_LAUNCH has no effect"],
         },
     ],

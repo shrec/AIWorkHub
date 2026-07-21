@@ -32,8 +32,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from geoai_task_mcp import app_server_mux  # noqa: E402
-from geoai_task_mcp.app_server_mux import (  # noqa: E402
+from aiworkhub import app_server_mux  # noqa: E402
+from aiworkhub.app_server_mux import (  # noqa: E402
     SIDEBAND_ALLOWED_METHODS,
     AppServerMux,
     default_sideband_dir,
@@ -42,7 +42,7 @@ from geoai_task_mcp.app_server_mux import (  # noqa: E402
 )
 
 FAKE_SERVER = Path(__file__).resolve().parent / "_fake_app_server.py"
-MUX_MODULE = Path(__file__).resolve().parents[1] / "src" / "geoai_task_mcp" / "app_server_mux.py"
+MUX_MODULE = Path(__file__).resolve().parents[1] / "src" / "aiworkhub" / "app_server_mux.py"
 
 
 def _fake_child_executable(extra_args: list[str] | None = None) -> list[str]:
@@ -82,7 +82,7 @@ def test_resolve_real_executable_env_override(monkeypatch):
 
 def test_resolve_real_executable_default(monkeypatch):
     monkeypatch.delenv(app_server_mux.ENV_REAL_EXECUTABLE, raising=False)
-    monkeypatch.setenv(app_server_mux.ENV_SIDEBAND_DIR, "/nonexistent/geoai-sideband-test")
+    monkeypatch.setenv(app_server_mux.ENV_SIDEBAND_DIR, "/nonexistent/aiworkhub-sideband-test")
     assert resolve_real_executable() == "codex"
 
 
@@ -545,7 +545,7 @@ def test_sideband_response_never_forwarded_to_extension_and_ids_never_collide(ha
 
     assert result_box["result"]["ok"] is True
     sideband_id = result_box["result"]["response"]["id"]
-    assert isinstance(sideband_id, str) and sideband_id.startswith("geoai-sideband-")
+    assert isinstance(sideband_id, str) and sideband_id.startswith("aiworkhub-sideband-")
 
     # The extension's own low-integer id traffic must still route correctly
     # and never receive the sideband's response.

@@ -5,8 +5,8 @@
   "verdict": "PENDING_TEST",
   "runner": "deepseek_task_mcp_readonly_smoke_v1",
   "topic": "task_mcp",
-  "test_harness": "tools/geoai-task-mcp/tests/test_readonly_tools_smoke_v1.sh",
-  "test_source": "tools/geoai-task-mcp/tests/readonly_tools_smoke.py",
+  "test_harness": "tools/aiworkhub/tests/test_readonly_tools_smoke_v1.sh",
+  "test_source": "tools/aiworkhub/tests/readonly_tools_smoke.py",
   "test_targets": {
     "health": {
       "description": "health endpoint with ALLOW_WRITES=0",
@@ -58,9 +58,9 @@
     }
   },
   "environment": {
-    "GEOAI_TASK_MCP_ALLOW_WRITES": "0",
-    "GEOAI_REPO": "/home/shrek/GeoAI",
-    "PYTHONPATH": "tools/geoai-task-mcp/src"
+    "AIWORKHUB_ALLOW_WRITES": "0",
+    "AIWORKHUB_REPO": "/home/shrek/AIWorkHub",
+    "PYTHONPATH": "tools/aiworkhub/src"
   },
   "forbidden_operations": [
     "parent_task_system_migration",

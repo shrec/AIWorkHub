@@ -1,0 +1,78 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_CALLBACK_DISPATCHER_LIFECYCLE_B857_V1",
+  "schema_id": "aiworkhub.eval.b857.v1",
+  "verdict": "review",
+  "summary": "Resumed the rejected-review B857 card in the foreground (no background/subagent delegation). The lifecycle-owned callback dispatcher backend (callback_bridge.CallbackDispatcher/ensure_dispatcher/get_dispatcher/stop_dispatcher/stop_all_dispatchers/dispatcher_health, core.dispatcher_ensure_started/dispatcher_health/dispatcher_stop, server.aiworkhub_dispatcher_ensure_started/health/stop, dashboard_mcp_app.health_view dispatcher surfacing, and the extension.js activation/tab-deserialize/reload/coordinator-target-switch/deactivate wiring) already existed from the prior partial pass and needed no further edits. This pass added the missing required artifacts and closed the one real gap: rebased test_server_runtime_wiring.py's stale mocked-subprocess lifecycle expectation onto the canonical B852 in-process task_store engine (acceptance criterion 10), and authored the new dispatcher-lifecycle test file plus this eval.",
+  "checks": [
+    {
+      "id": "single_dispatcher_per_repo_no_external_daemon",
+      "status": "pass",
+      "evidence": "CallbackDispatcher.start() spawns exactly one daemon thread inside the existing MCP server process; extension.js DISPATCHER_TOOLS comment + McpStdioClient._handshake call aiworkhub_dispatcher_ensure_started after every handshake -- no systemd unit, no HTTP server, no second process."
+    },
+    {
+      "id": "activation_deserialize_reload_converge_idempotently",
+      "status": "pass",
+      "evidence": "ensure_dispatcher() is a no-op (returns the same registered CallbackDispatcher, thread untouched) when called again with the same provider; test_ensure_dispatcher_idempotent_same_provider (new) asserts identity and liveness across two calls. extension.js calls DISPATCHER_TOOLS.ensureStarted from _handshake(), which every activation/tab-deserialize/reload path routes through (getMcpClient -> ensureStarted -> _start -> _handshake)."
+    },
+    {
+      "id": "workspace_switch_and_deactivate_stop_old_dispatcher",
+      "status": "pass",
+      "evidence": "stop_dispatcher()/stop_all_dispatchers() unregister and join the dispatcher thread; test_stop_dispatcher_prevents_cross_repository_state and test_stop_all_dispatchers_stops_every_registered_repo (new) verify get_dispatcher() returns None and is_running() is False afterward. extension.js selectRepositoryCommand() kills the old repo's MCP child (which owns the in-process dispatcher thread) before spawning the new repo's child; deactivate() kills the current child the same way."
+    },
+    {
+      "id": "explicit_target_routes_to_canonical_transport_copilot_fails_closed",
+      "status": "pass",
+      "evidence": "CallbackDispatcher.start() sets transport=subprocess for codex and transport=claude_cli (with bound repo_id/window_id) for claude -- both existing canonical transports, no new transport invented. test_unsupported_provider_fails_closed_no_thread_no_fabricated_delivery (new) confirms provider=copilot yields supported=False, is_running()=False, health.ok=False, health.bridge=None, and last_start_error=unsupported_provider:copilot -- visible, never a fabricated running dispatcher."
+    },
+    {
+      "id": "busy_unavailable_transports_stay_pending_bounded_backoff",
+      "status": "pass",
+      "evidence": "Unchanged pre-existing behavior verified by test_aiworkhub_callback_stale_turn_recovery_b823_v1.py and test_aiworkhub_claude_callback_transport_b856.py (both in this run's validation set, still green) -- dispatcher lifecycle only starts/stops the poller, it does not alter the outbox transition/backoff/dead-letter contract those cover."
+    },
+    {
+      "id": "ack_before_delivered_restart_recovers_leases_no_duplicate",
+      "status": "pass",
+      "evidence": "Unchanged pre-existing lease/ack contract, re-verified green by test_aiworkhub_callback_stale_turn_recovery_b823_v1.py in this run; the dispatcher lifecycle layer added here only owns thread start/stop, not lease/ack semantics."
+    },
+    {
+      "id": "compact_callback_payloads",
+      "status": "pass",
+      "evidence": "Unchanged pre-existing envelope contract (build_callback_prompt et al.), not touched by this lifecycle-only pass; still exercised by test_aiworkhub_claude_callback_transport_b856.py."
+    },
+    {
+      "id": "health_distinguishes_uninitialized_from_broken",
+      "status": "pass",
+      "evidence": "dispatcher_health() for a never-registered repo returns {ok: true, dispatcher_running: false, registered: false} (test_dispatcher_health_unregistered_repo_is_not_degraded, new); core.dispatcher_ensure_started() on an uninitialized repo returns {ok: true, status: uninitialized, dispatcher_started: false} without raising (test_core_dispatcher_ensure_started_uninitialized_repo_not_degraded, new); a live dispatcher's health() reports dispatcher_running/provider/repo_root/pending_count/last_delivery_error (test_dispatcher_health_reports_running_provider_repo_pending_and_error, new); dashboard_mcp_app.health_view wraps core.dispatcher_health() in its own try/except so a dispatcher-side failure never breaks the cheap connection-banner check."
+    },
+    {
+      "id": "public_lifecycle_stays_on_selected_repo_canonical_db",
+      "status": "pass",
+      "evidence": "core.claim_start_exact/mark_review/mark_done/reject_review/release_launch all resolve exclusively through task_store's per-repo .aiworkhub/tasking/task_queue.sqlite (direct sqlite3 UPDATE/INSERT against the canonical connection) -- no AITools/taskctl.py or AITools/taskdb.py subprocess shell-out anywhere in core.py's lifecycle path. Re-verified by test_aiworkhub_canonical_task_engine_b852.py (unchanged, still green) plus the rebased test_server_runtime_wiring.py::test_real_core_lifecycle_calls_scope_identity_and_capability (this pass)."
+    },
+    {
+      "id": "stale_subprocess_test_rebased_to_canonical_engine",
+      "status": "pass",
+      "evidence": "test_server_runtime_wiring.py::test_real_core_lifecycle_calls_scope_identity_and_capability previously monkeypatched core.subprocess.run and core.show_task to assert taskctl.py CLI argv shapes -- stale from before the B852 canonical engine migration, and failing (asserted ok=True against a fabricated card with no real .aiworkhub storage). Rewritten this pass to initialize a real task_store repo, insert real task rows, and drive claim_start_exact -> mark_review -> mark_done on one task plus isolated reject_review/release_launch cases on two more, asserting on the real canonical sqlite rows after each transition. No subprocess mocking remains in this test."
+    }
+  ],
+  "tests": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py tools/geoai-task-mcp/tests/test_aiworkhub_claude_callback_transport_b856.py tools/geoai-task-mcp/tests/test_aiworkhub_callback_stale_turn_recovery_b823_v1.py tools/geoai-task-mcp/tests/test_server_runtime_wiring.py tools/geoai-task-mcp/tests/test_aiworkhub_canonical_task_engine_b852.py tools/geoai-task-mcp/tests/test_aiworkhub_vscode_reload_restore_b855.py",
+    "node --check tools/geoai-task-mcp/vscode-extension/extension.js",
+    "cd tools/geoai-task-mcp/vscode-extension && npm run package",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "test_results": {
+    "pytest": "63 passed",
+    "node_check": "ok",
+    "npm_package": "aiworkhub-0.5.0.vsix built",
+    "taskctl_verify": "PASS",
+    "collision_guard": "collision_free=true"
+  },
+  "scope_note": "No commit made per NO_COMMIT constraint. No background/subagent delegation used -- all inspection and edits performed directly in this foreground session, matching review_feedback for the rejected prior attempt.",
+  "changed_paths": [
+    "tools/geoai-task-mcp/tests/test_server_runtime_wiring.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_callback_dispatcher_lifecycle_b857.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_callback_dispatcher_lifecycle_b857_v1.json"
+  ]
+}

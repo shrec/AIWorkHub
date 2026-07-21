@@ -15,7 +15,7 @@
     },
     {
       "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_MCP_STARTUP_SMOKE_B113_V1",
-      "objective": "Smoke test that the MCP server starts with the new tool registered and list-tools includes geoai_task_review_summarize",
+      "objective": "Smoke test that the MCP server starts with the new tool registered and list-tools includes aiworkhub_task_review_summarize",
       "runner": "deepseek_task_mcp_review_summarizer_b113",
       "topic": "task_mcp",
       "depends_on": ["DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_SERVER_WIRING_B111_V1"],

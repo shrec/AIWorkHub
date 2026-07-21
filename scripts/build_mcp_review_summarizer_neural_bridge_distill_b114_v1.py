@@ -30,7 +30,7 @@ TASK_ID = "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_NEURAL_BRIDGE_DISTILL_B114_V1"
 RUNNER = "deepseek_task_mcp_review_summarizer_neural_b114"
 TOPIC = "task_mcp"
 MODE = "mcp_review_summarizer_neural_distill_no_launch"
-SCHEMA_ID = "geoai.mcp_review_summarizer_neural_bridge_distill_eval.v1"
+SCHEMA_ID = "aiworkhub.mcp_review_summarizer_neural_bridge_distill_eval.v1"
 
 STAGE = "verified"         # verified edge → downstream can promote to distilled_training_target
 PROCESS_LAUNCH_AUTHORITY = False
@@ -372,7 +372,7 @@ def _distill_schema_affordance() -> list[dict[str, Any]]:
             "stage": STAGE,
             "skill": "tool_affordance_reasoning",
             "input_features": {
-                "tool": "geoai_task_review_summarize",
+                "tool": "aiworkhub_task_review_summarize",
                 "output_section": section,
             },
             "target": {
@@ -395,8 +395,8 @@ def _distill_schema_affordance() -> list[dict[str, Any]]:
 
 def build(geoai_root: str | None = None) -> dict[str, Any]:
     """Build all neural bridge distill artifacts."""
-    root = Path(geoai_root) if geoai_root else Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI"))
-    mcp_root = root / "tools" / "geoai-task-mcp"
+    root = Path(geoai_root) if geoai_root else Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub"))
+    mcp_root = root / "tools" / "aiworkhub"
     eval_dir = mcp_root / "eval"
     data_dir = mcp_root / "data" / "tasking"
 
@@ -561,12 +561,12 @@ def build(geoai_root: str | None = None) -> dict[str, Any]:
             "output patterns for learned task review prioritization, without making "
             "the deterministic summarizer a runtime authority."
         ),
-        "build_script": "tools/geoai-task-mcp/scripts/build_mcp_review_summarizer_neural_bridge_distill_b114_v1.py",
-        "test_harness": "tools/geoai-task-mcp/tests/test_mcp_review_summarizer_neural_bridge_distill_b114_v1.sh",
+        "build_script": "tools/aiworkhub/scripts/build_mcp_review_summarizer_neural_bridge_distill_b114_v1.py",
+        "test_harness": "tools/aiworkhub/tests/test_mcp_review_summarizer_neural_bridge_distill_b114_v1.sh",
         "outputs": {
             "distill_rows_jsonl": str(jsonl_path.relative_to(root)),
             "eval_json": str(eval_path.relative_to(root)),
-            "next_wave_json": "tools/geoai-task-mcp/data/tasking/mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json",
+            "next_wave_json": "tools/aiworkhub/data/tasking/mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json",
         },
         "acceptance_results": {
             "curriculum_rows_emitted": total_rows,
@@ -638,9 +638,9 @@ def build(geoai_root: str | None = None) -> dict[str, Any]:
             "mixed_task_commit",
         ],
         "environment": {
-            "GEOAI_TASK_MCP_ALLOW_WRITES": ALLOW_WRITES_OVERRIDE,
-            "GEOAI_REPO": str(root),
-            "PYTHONPATH": "tools/geoai-task-mcp/src",
+            "AIWORKHUB_ALLOW_WRITES": ALLOW_WRITES_OVERRIDE,
+            "AIWORKHUB_REPO": str(root),
+            "PYTHONPATH": "tools/aiworkhub/src",
         },
     }
 
@@ -650,7 +650,7 @@ def build(geoai_root: str | None = None) -> dict[str, Any]:
     # ── Write next_wave JSON ────────────────────────────────────────
     next_wave_path = data_dir / "mcp_review_summarizer_neural_bridge_distill_next_wave_b114_v1.json"
     next_wave: dict[str, Any] = {
-        "schema_id": "geoai.mcp_review_summarizer_neural_bridge_distill_next_wave.v1",
+        "schema_id": "aiworkhub.mcp_review_summarizer_neural_bridge_distill_next_wave.v1",
         "parent_task_id": TASK_ID,
         "runner": RUNNER,
         "topic": TOPIC,
@@ -671,7 +671,7 @@ def build(geoai_root: str | None = None) -> dict[str, Any]:
         "next_wave_tasks": [
             {
                 "task_id": "DEEPSEEK_TASK_MCP_REVIEW_SUMMARIZER_STDIO_SMOKE_B115_V1",
-                "objective": "End-to-end smoke test via MCP stdio transport: start server, call geoai_task_review_summarize via JSON-RPC, verify response shape",
+                "objective": "End-to-end smoke test via MCP stdio transport: start server, call aiworkhub_task_review_summarize via JSON-RPC, verify response shape",
                 "runner": "deepseek_task_mcp_review_summarizer_b115",
                 "topic": "task_mcp",
                 "depends_on": [TASK_ID],

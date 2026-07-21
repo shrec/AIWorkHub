@@ -40,12 +40,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -61,13 +61,13 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import process_launcher, task_reconciler, worker_supervisor  # noqa: E402
-from geoai_task_mcp import worker_workspace  # noqa: E402
+from aiworkhub import process_launcher, task_reconciler, worker_supervisor  # noqa: E402
+from aiworkhub import worker_workspace  # noqa: E402
 
 
 def _chmod_blocked_by_sandbox() -> bool:
@@ -744,7 +744,7 @@ def test_single_instance_lock_rejects_a_concurrent_holder(tmp_path):
 
 def test_run_once_cli_is_bounded_json_and_idempotent_on_an_empty_repo(tmp_path, capsys):
     repo = tmp_path / "repo"
-    (repo / "tools/geoai-task-mcp/logs").mkdir(parents=True)
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
     rc = task_reconciler.main(["run-once", "--repo", str(repo)])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
@@ -769,7 +769,7 @@ def test_status_cli_reports_lock_presence_read_only(tmp_path, capsys):
 
 def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
     repo = tmp_path / "repo"
-    (repo / "tools/geoai-task-mcp/logs").mkdir(parents=True)
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
     scans = []
     rc = task_reconciler.run_daemon(
         repo=repo,
@@ -782,11 +782,52 @@ def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
     assert all(scan["ok"] for scan in scans)
 
 
-def test_service_can_write_lifecycle_and_see_isolated_worktrees():
-    unit = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "geoai-task-reconciler.service"
-    ).read_text(encoding="utf-8")
-    assert "Environment=GEOAI_TASK_MCP_ALLOW_WRITES=1" in unit
-    assert "PrivateTmp=false" in unit
+def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monkeypatch):
+    """The reconciler daemon itself (not a never-shipped systemd unit file)
+    is what must be able to write lifecycle transitions and see isolated
+    worktrees: with AIWORKHUB_ALLOW_WRITES=1 set, a scan drives a terminal
+    request through to review_ready exactly as task_reconciler.run_scan
+    already proves above."""
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    card = _card()
+    card.update({"status": "processing", "worker_status": "in_progress"})
+    manager = _build_manager(tmp_path, card)
+    monkeypatch.setattr(process_launcher, "enforce_scope", lambda workspace: ["out/result.txt"])
+    monkeypatch.setattr(
+        process_launcher, "run_validations", lambda workspace, commands, **_kw: [
+            {"command": c, "returncode": 0} for c in commands
+        ],
+    )
+    monkeypatch.setattr(process_launcher, "promote", lambda workspace, changed: list(changed))
+    monkeypatch.setattr(
+        process_launcher.core, "mark_review",
+        lambda task_id, runner=None, topic=None: (
+            card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
+            or {"ok": True}
+        ),
+    )
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
+
+    dead_pid = 2_147_483_002
+    _seed_request(
+        manager, tmp_path, card,
+        request_id="req-daemon-writes-lifecycle",
+        supervisor_pid=dead_pid,
+        supervisor_ticks=999_999_996,
+        supervisor_status={
+            "state": "exited",
+            "exit_code": 0,
+            "child_pid": dead_pid,
+            "child_pid_start_ticks": 999_999_996,
+            "started_at_epoch": time.time() - 60,
+            "finished_at_epoch": time.time() - 10,
+            "heartbeat_seq": 2,
+            "heartbeat_at_epoch": time.time() - 10,
+        },
+    )
+
+    result = task_reconciler.run_scan(manager)
+    assert result["ok"] is True
+    events = manager._request_events("req-daemon-writes-lifecycle")
+    assert events[-1]["state"] == "review_ready"
+    assert card["status"] == "review"

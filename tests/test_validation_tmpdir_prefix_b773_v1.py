@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from geoai_task_mcp.worker_workspace import (
+from aiworkhub.worker_workspace import (
     WorkspaceError,
     _parse_validation_command_detailed,
     parse_validation_command,

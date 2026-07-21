@@ -13,30 +13,30 @@
     "select_steer_target_signal": "ActiveThreadSteerDeferralError(inprogress_turn_count:45)",
     "incorrect_outcome_at_20_48_50": "dead_letter",
     "root_cause": "CallbackBridge._process_batch treated every BusyThreadError (including ActiveThreadSteerDeferralError/SidebandUnavailableError) identically to a genuine AppServerError: both shared the same batch.attempts counter and both dead-lettered once attempts >= DEFAULT_MAX_RETRIES=5. A temporary active/busy Codex thread therefore exhausted the SAME bounded failure budget meant for real transport/protocol failures. _process_batch also blocked the whole poll loop with an in-process time.sleep(retry_delay) (up to DEFAULT_RETRY_BACKOFF_MAX=300s) before each retried delivery attempt, so one busy thread could stall processing of every other thread's due work.",
-    "repro_test": "tools/geoai-task-mcp/tests/test_callback_bridge.py::test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_letter (8 claims against a fake thread reporting inprogress_turn_count:45, far more than DEFAULT_MAX_RETRIES=5)"
+    "repro_test": "tools/aiworkhub/tests/test_callback_bridge.py::test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_letter (8 claims against a fake thread reporting inprogress_turn_count:45, far more than DEFAULT_MAX_RETRIES=5)"
   },
   "context7_usage": {
     "context7_used": false,
     "context7_unavailable": false,
-    "reason": "Pure repo-local bugfix inside already-read local modules (AITools/taskdb.py, tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py) plus their existing pytest suites; no new external library/framework/API/CLI/service surface was introduced."
+    "reason": "Pure repo-local bugfix inside already-read local modules (AITools/taskdb.py, tools/aiworkhub/src/aiworkhub/callback_bridge.py) plus their existing pytest suites; no new external library/framework/API/CLI/service surface was introduced."
   },
   "environment_gaps_used": {
     "stale_isolated_worktree_taskctl_py": {
-      "gap": "This isolated task worktree's git-tracked AITools/taskctl.py (3148 lines) lacks review/release-launch/recover-stale/callback-recover-dead-letter -- the live /home/shrek/GeoAI repo has these as ~316 lines of UNCOMMITTED local changes (3464 lines) never captured by any git worktree checkout (worktrees only reflect committed tree state). taskctl.py is out of this task's allowed_writes, so it was not modified.",
-      "workaround": "Re-ran the exact required command `python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py AITools/test_taskctl_origin_thread_callback_b384_v1.py` against a read-only scratch copy (under $TMPDIR, outside the repo, never staged/committed) combining this task's edited AITools/taskdb.py + AITools/test_taskctl_origin_thread_callback_b384_v1.py with the live repo's current AITools/taskctl.py: 37/37 passed (33 pre-existing B384 tests + 4 new B416 taskdb-level tests). In-worktree, the identical command fails 18 pre-existing (not newly broken) subprocess-level tests purely on 'unknown command: review/release-launch/...' -- none of the 4 new B416 tests are among those 18 failures.",
-      "unaffected_files": "tools/geoai-task-mcp/tests/test_callback_bridge.py does not depend on the missing taskctl.py subcommands (it drives taskdb.py and CallbackBridge directly) and passes cleanly using the worktree's own files."
+      "gap": "This isolated task worktree's git-tracked AITools/taskctl.py (3148 lines) lacks review/release-launch/recover-stale/callback-recover-dead-letter -- the live /home/shrek/AIWorkHub repo has these as ~316 lines of UNCOMMITTED local changes (3464 lines) never captured by any git worktree checkout (worktrees only reflect committed tree state). taskctl.py is out of this task's allowed_writes, so it was not modified.",
+      "workaround": "Re-ran the exact required command `python3 -m pytest -q tools/aiworkhub/tests/test_callback_bridge.py AITools/test_taskctl_origin_thread_callback_b384_v1.py` against a read-only scratch copy (under $TMPDIR, outside the repo, never staged/committed) combining this task's edited AITools/taskdb.py + AITools/test_taskctl_origin_thread_callback_b384_v1.py with the live repo's current AITools/taskctl.py: 37/37 passed (33 pre-existing B384 tests + 4 new B416 taskdb-level tests). In-worktree, the identical command fails 18 pre-existing (not newly broken) subprocess-level tests purely on 'unknown command: review/release-launch/...' -- none of the 4 new B416 tests are among those 18 failures.",
+      "unaffected_files": "tools/aiworkhub/tests/test_callback_bridge.py does not depend on the missing taskctl.py subcommands (it drives taskdb.py and CallbackBridge directly) and passes cleanly using the worktree's own files."
     },
     "sandboxed_fchmod_denial": {
       "gap": "app_server_mux.py::write_capability_token calls os.fchmod(fd, 0o600) after os.open(..., 0o600); this sandboxed execution environment returns PermissionError: [Errno 1] Operation not permitted for fchmod, unrelated to file ownership/mode logic.",
-      "verified_preexisting": "Reproduced identically against the live /home/shrek/GeoAI repo's own unmodified app_server_mux.py/test_callback_bridge.py -- confirms an environment sandboxing limitation, not a regression from this task's changes.",
-      "affected_tests": "The 8 B409 sideband-mux tests in tools/geoai-task-mcp/tests/test_callback_bridge.py (test_sideband_client_* and test_callback_bridge_sideband_transport_uses_sideband_client_not_subprocess) -- all pre-existing, none touched by this task's diff.",
+      "verified_preexisting": "Reproduced identically against the live /home/shrek/AIWorkHub repo's own unmodified app_server_mux.py/test_callback_bridge.py -- confirms an environment sandboxing limitation, not a regression from this task's changes.",
+      "affected_tests": "The 8 B409 sideband-mux tests in tools/aiworkhub/tests/test_callback_bridge.py (test_sideband_client_* and test_callback_bridge_sideband_transport_uses_sideband_client_not_subprocess) -- all pre-existing, none touched by this task's diff.",
       "note": "app_server_mux.py is not in this task's allowed_writes and was not modified; a temporary read-only copy was used locally to make the pre-staged callback_bridge.py importable for validation, then removed before finishing -- it is not part of this task's changed-files set."
     }
   },
   "implementation": {
     "files": [
       "AITools/taskdb.py",
-      "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py"
+      "tools/aiworkhub/src/aiworkhub/callback_bridge.py"
     ],
     "changes": [
       "AITools/taskdb.py: callback_batches gains three idempotently-migrated columns -- not_before_at (earliest re-claim time; empty = due now), hard_failure_count (the bounded dead-letter budget for GENUINE failures only), last_failure_kind ('busy'|'transient_error'|'', redacted-safe signal for status).",
@@ -53,7 +53,7 @@
     "no_regex_or_table_cognition": "Pure deterministic queue/lease bookkeeping (SQL state transitions on callback_batches/callback_outbox) -- no learned decision, no keyword/cue router; N/A to the neural-control-first doctrine."
   },
   "tests_run": [
-    "/home/shrek/GeoAI/.venv/bin/python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py -> 84 passed, 8 pre-existing failed (sandboxed fchmod denial in B409 sideband-mux tests, reproduced identically against the live unmodified repo; none touched by this task's diff)",
+    "/home/shrek/AIWorkHub/.venv/bin/python3 -m pytest -q tools/aiworkhub/tests/test_callback_bridge.py -> 84 passed, 8 pre-existing failed (sandboxed fchmod denial in B409 sideband-mux tests, reproduced identically against the live unmodified repo; none touched by this task's diff)",
     "read-only scratch validation (AITools/taskdb.py + AITools/test_taskctl_origin_thread_callback_b384_v1.py from this task, combined with the live repo's current AITools/taskctl.py, under $TMPDIR, never staged/committed): python3 -m pytest -q AITools/test_taskctl_origin_thread_callback_b384_v1.py -> 37 passed (33 pre-existing + 4 new)",
     "python3 AITools/taskctl.py verify -> VERIFY: PASS",
     "python3 AITools/taskctl.py collision-guard -> collision_free=true (112 active cards)"
@@ -72,7 +72,7 @@
     "natural_live_canary": "next terminal Task MCP callback"
   },
   "new_test_coverage": {
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py": [
+    "tools/aiworkhub/tests/test_callback_bridge.py": [
       "test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_letter -- exact production defect repro: 8 claims (> DEFAULT_MAX_RETRIES=5) against a fake thread reporting inprogress_turn_count:45; asserts dead_letter==0, hard_failure_count==0, attempts==8, last_failure_kind=='busy'",
       "test_claim_pending_callback_batch_skips_not_due_thread_and_serves_other_due_thread -- non-blocking progress: a not-due busy-parked thread is skipped in <1s while a different thread's due work is claimed",
       "test_claim_pending_callback_batch_never_forms_second_batch_for_thread_with_not_due_pending_batch -- FIFO/thread-exclusivity: a later event on the same not-yet-due thread never spawns a competing second batch",
@@ -131,10 +131,10 @@
   "files_changed": [
     "AITools/taskdb.py",
     "AITools/test_taskctl_origin_thread_callback_b384_v1.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/_fake_app_server.py",
-    "tools/geoai-task-mcp/README.md",
-    "tools/geoai-task-mcp/eval/task_mcp_busy_callback_durable_park_b416_v1.json"
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/_fake_app_server.py",
+    "tools/aiworkhub/README.md",
+    "tools/aiworkhub/eval/task_mcp_busy_callback_durable_park_b416_v1.json"
   ]
 }

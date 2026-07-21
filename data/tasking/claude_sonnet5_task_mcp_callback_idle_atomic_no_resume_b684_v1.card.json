@@ -15,22 +15,22 @@
   "objective": "Fix the measured B683 callback stall: sideband thread/resume on the very large owner thread repeatedly reaches the mux's 45-second response timeout, so the durable event survives but never delivers. For sideband callbacks only, use an atomic idle-only turn/start acknowledgement against the already extension-owned thread, park active/busy rejections durably, and remove the expensive thread/resume dependency without weakening exact-thread, dedup or fail-closed guarantees.",
   "read_first": [
     "AGENTS.md",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/src/aiworkhub/app_server_mux.py",
     "AITools/taskdb.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_app_server_mux.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_app_server_mux.py",
+    "tools/aiworkhub/eval/task_mcp_callback_not_ready_durable_park_b682_v1.json"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_bridge.py",
-    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+    "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_bridge.py",
+    "tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
   ],
   "required_outputs": [
-    "tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
-    "tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+    "tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "tools/aiworkhub/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
   ],
   "acceptance": [
     "Reproduce the production evidence exactly: B683 batch de917c12b5b849308db7ae562fa59a17 reached attempts>=8, hard_failure_count=1, last_failure_kind=busy/not_ready while every sideband thread/resume waited for the 45-second mux deadline; the event remained durable but undelivered.",
@@ -41,9 +41,9 @@
     "Document service-reload and live-canary procedure. Do not rewrite historical dead letters or mark B683 delivered synthetically."
   ],
   "validation": [
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
-    "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py tools/geoai-task-mcp/tests/test_app_server_mux.py",
-    "python3 -m json.tool tools/geoai-task-mcp/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
+    "python3 -m pytest -q tools/aiworkhub/tests/test_callback_idle_atomic_no_resume_b684_v1.py",
+    "python3 -m pytest -q tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py tools/aiworkhub/tests/test_app_server_mux.py",
+    "python3 -m json.tool tools/aiworkhub/eval/task_mcp_callback_idle_atomic_no_resume_b684_v1.json"
   ],
   "forbidden": [
     "sideband_thread_resume",
@@ -68,10 +68,10 @@
       "budget": 160,
       "query": "callback sideband thread resume timeout direct turn start atomic idle busy durable park exact once",
       "targets": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/callback_bridge.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/app_server_mux.py",
+        "tools/aiworkhub/src/aiworkhub/callback_bridge.py",
+        "tools/aiworkhub/src/aiworkhub/app_server_mux.py",
         "AITools/taskdb.py",
-        "tools/geoai-task-mcp/tests"
+        "tools/aiworkhub/tests"
       ]
     },
     "session": {"topic": "B683 callback long-thread resume stall", "limit": 18},

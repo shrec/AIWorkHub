@@ -10,16 +10,16 @@
   "mode": "mcp_supervisor_contract_no_launch_no_source_patch",
   "objective": "Define the minimal safe MCP supervisor loop contract for Codex-managed worker pickup/review/result reporting, without enabling real process launch or touching task statuses.",
   "read_first": [
-    "tools/geoai-task-mcp/data/tasking/runner_topic_allowlist_patch_next_wave_b06_v1.json",
-    "tools/geoai-task-mcp/eval/runner_topic_allowlist_patch_b06_v1.json",
-    "tools/geoai-task-mcp/contracts/agent_launcher_mvp_b02_v1.json",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+    "tools/aiworkhub/data/tasking/runner_topic_allowlist_patch_next_wave_b06_v1.json",
+    "tools/aiworkhub/eval/runner_topic_allowlist_patch_b06_v1.json",
+    "tools/aiworkhub/contracts/agent_launcher_mvp_b02_v1.json",
+    "tools/aiworkhub/src/aiworkhub/core.py"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
-    "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
+    "tools/aiworkhub/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/aiworkhub/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
   ],
   "acceptance": [
     "Must specify MCP request/response schema for Codex -> MCP -> worker CLI -> MCP -> Codex flow.",
@@ -27,11 +27,11 @@
     "Must include safety boundaries: no credential read, no daemon start, no real process launch, no writes unless explicit future gate.",
     "Must include error taxonomy for collision, stale task, runner/topic mismatch, missing artifact, and failed validation.",
     "Must not patch source code in this task.",
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh passes.",
+    "bash tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh passes.",
     "python3 AITools/taskctl.py verify passes."
   ],
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "forbidden": [

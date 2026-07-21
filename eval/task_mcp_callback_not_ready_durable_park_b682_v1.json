@@ -6,7 +6,7 @@
   "permanent_failure_policy_unchanged": true,
   "historical_dead_letters_rewritten": false,
   "coordinator_validation": {
-    "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_callback_not_ready_durable_park_b682_v1.py tools/geoai-task-mcp/tests/test_callback_bridge.py tools/geoai-task-mcp/tests/test_callback_bridge_compact_b435_v1.py",
+    "command": "python3 -m pytest -q tools/aiworkhub/tests/test_callback_not_ready_durable_park_b682_v1.py tools/aiworkhub/tests/test_callback_bridge.py tools/aiworkhub/tests/test_callback_bridge_compact_b435_v1.py",
     "passed": 121,
     "failed": 0
   },

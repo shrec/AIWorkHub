@@ -1,0 +1,81 @@
+{
+  "schema_id": "geoai.machine_task_card.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_SOURCE_GRAPH_BOOTSTRAP_CORRECTNESS_B854_V1",
+  "title": "Repair canonical Source Graph bootstrap correctness",
+  "topic": "task_mcp",
+  "runner": "claude_sonnet5_aiworkhub_source_graph_bootstrap_correctness_b854_v1",
+  "recommended_model": "claude-sonnet-5",
+  "priority": "critical",
+  "queue_order": 1,
+  "status": "pending",
+  "worker_status": "unclaimed",
+  "objective": "Repair the canonical repo-local AIWorkHub Source Graph so a clean full build of /home/shrek/GeoAI completes without UNIQUE(file_path, qualname) crashes. The current failures are proven on repeated nested definitions such as main._avg and are amplified by indexing .claude/worktrees. Preserve distinct definitions instead of silently overwriting them, exclude ephemeral nested worktrees and generated state, keep legitimate canonical source trees indexable, and add regression coverage. This is a bootstrap repair only; do not modify the VS Code extension yet.",
+  "acceptance": [
+    "A clean canonical Source Graph build for the current repository completes successfully.",
+    "Repeated same-name nested definitions in one lexical scope receive stable distinct identities and remain queryable.",
+    ".claude/worktrees, .aiworkhub, VCS internals, caches and generated build state are excluded without excluding the canonical scripts or tools trees.",
+    "Incremental rebuild is idempotent and does not duplicate entities or edges.",
+    "Existing AIWorkHub Source Graph tests and the new focused regression tests pass.",
+    "No legacy AITools/source_graph.db becomes a write authority."
+  ],
+  "allowed_writes": [
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph_ast.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_source_graph_bootstrap_b854_v1.json"
+  ],
+  "forbidden": [
+    "vscode_extension_changes",
+    "dashboard_changes",
+    "task_database_changes",
+    "legacy_source_graph_write_authority",
+    "git_commit",
+    "git_push"
+  ],
+  "read_first": [
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph_ast.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py"
+  ],
+  "required_outputs": [
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+    "tools/geoai-task-mcp/src/aiworkhub/source_graph_ast.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_source_graph_bootstrap_b854_v1.json"
+  ],
+  "validation": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_bootstrap_b854.py",
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m aiworkhub.source_graph --repo /home/shrek/GeoAI build",
+    "python3 AITools/taskctl.py verify",
+    "python3 AITools/taskctl.py collision-guard --print"
+  ],
+  "project_context": {
+    "required": true,
+    "task_type": "code",
+    "source_graph": {
+      "required": true,
+      "mode": "focus",
+      "bundle_type": "bugfix",
+      "query": "aiworkhub canonical source graph build_index entity qualname uniqueness generated worktree exclusion",
+      "budget": 100,
+      "targets": [
+        "tools/geoai-task-mcp/src/aiworkhub/source_graph.py",
+        "tools/geoai-task-mcp/src/aiworkhub/source_graph_ast.py",
+        "tools/geoai-task-mcp/tests/test_aiworkhub_source_graph_b849.py"
+      ]
+    },
+    "session": {
+      "topic": "AIWorkHub canonical Source Graph bootstrap repair",
+      "limit": 6
+    },
+    "ai_memory": {
+      "query": "AIWorkHub Source Graph canonical storage and duplicate entity identity",
+      "limit": 2
+    },
+    "kb": {
+      "query": "AIWorkHub Source Graph repository-local contract",
+      "limit": 2
+    }
+  },
+  "commit_contract": "NO_COMMIT. Stop at Codex review."
+}

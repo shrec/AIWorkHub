@@ -1,0 +1,119 @@
+{
+  "schema_id": "geoai.task_mcp.worker_evidence.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_VSCODE_BUNDLED_RUNTIME_B844_V2",
+  "objective": "Package the canonical aiworkhub Python MCP runtime (including dashboard_static assets) inside the VS Code extension VSIX under an extension-local runtime/ directory, launch it via python -m aiworkhub.server with an extension-local import path (never a repository checkout, editable install, user site-packages, network install, HTTP dashboard, or fixed host path), and provide a bounded stdlib stdio JSON-RPC/MCP fallback for when the optional mcp package is absent.",
+  "commit_policy": "NO_COMMIT",
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/server.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/test/package-vsix.js",
+    "tools/geoai-task-mcp/vscode-extension/test/extension-static.test.js",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_embedded_mcp_runtime_b844_v1.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_vscode_bundled_runtime_b844_v1.json"
+  ],
+  "design": {
+    "bundled_runtime": {
+      "source_of_truth": "tools/geoai-task-mcp/src/aiworkhub",
+      "packaged_at": "extension/runtime/aiworkhub (inside the .vsix)",
+      "packager": "tools/geoai-task-mcp/vscode-extension/test/package-vsix.js",
+      "copy_excludes": ["__pycache__", ".pytest_cache", "*.pyc", "*.pyo", ".DS_Store"],
+      "includes_dashboard_static": true,
+      "bundled_py_file_count": 37,
+      "vsix_runtime_entry_count": 42,
+      "vsix_path": "tools/geoai-task-mcp/vscode-extension/dist/aiworkhub-0.4.0.vsix",
+      "vsix_size_bytes": 338537,
+      "vsix_sha256": "fc696e8cbd3a804f1a01b0946d65a6cd8fa30b94821dd9d1dabf03bf01ba11a0"
+    },
+    "extension_local_import_path": {
+      "mechanism": "extension.js activate() sets extensionRuntimeDir = path.join(context.extensionUri.fsPath, \"runtime\"); McpStdioClient._start() spawns python -m aiworkhub.server with cwd=runtimeDir and env.PYTHONPATH prefixed with runtimeDir.",
+      "why_both_cwd_and_pythonpath": "python -m prepends the process cwd to sys.path[0] ahead of PYTHONPATH entries, so cwd is the authoritative determinant of which aiworkhub package is imported; PYTHONPATH is defense-in-depth for interpreter configurations that alter that ordering.",
+      "repository_data_authority_unchanged": "AIWORKHUB_REPO_ROOT / AIWORKHUB_REPO / AIWORKHUB_REPO_ID / AIWORKHUB_WINDOW_ID / AIWORKHUB_CLAIM_EPISODE env vars still carry the selected workspace repository -- confirmed safe to decouple from cwd because core.repo_root(), launch_queue_persist.default_repo_root(), and repository_state.resolve_repository_root() all resolve the repository from these env vars first, falling back to cwd only when the env var is absent (never the case here); core.run_taskctl() also passes an explicit cwd=root to its own child subprocess.run call, independent of the parent process's cwd.",
+      "remote_ssh": "extensionKind stays [\"workspace\"], so context.extensionUri (and therefore extensionRuntimeDir) resolves on the remote/workspace host, not the UI host -- no code change needed for Remote-SSH.",
+      "editor_tab_and_repository_selection_contracts": "unchanged: single-folder auto-bind, multi-root explicit QuickPick selection, .aiworkhub project.json bootstrap/manifest, write/launch gate env var deletion before spawn -- all preserved verbatim from B839/B840."
+    },
+    "stdlib_mcp_fallback": {
+      "module": "tools/geoai-task-mcp/src/aiworkhub/server.py",
+      "trigger": "ModuleNotFoundError on `from mcp.server.fastmcp import FastMCP` (e.g. bundled runtime run with -S / no site-packages)",
+      "previous_behavior": "FastMCP.run() raised RuntimeError(\"mcp package is required...\") immediately -- the fallback could not actually serve MCP at all.",
+      "new_behavior": "FastMCP.run() drives a bounded, dependency-free stdio JSON-RPC 2.0 loop implementing initialize / notifications/initialized / tools/list / tools/call, dispatching only through the fixed name->callable map each @mcp.tool() decorator populated at import time.",
+      "bounds": {
+        "max_request_line_bytes": 8388608,
+        "max_response_bytes": 8388608,
+        "framing": "newline-delimited JSON-RPC 2.0, matching extension.js's McpStdioClient and this repo's own mcp_stdio_client_smoke.py",
+        "oversized_request": "structured JSON-RPC error (code -32600), read loop continues",
+        "malformed_json": "structured JSON-RPC error (code -32700), read loop continues",
+        "unknown_method": "structured JSON-RPC error (code -32601)",
+        "unknown_tool_or_bad_arguments": "structured JSON-RPC error (code -32602); unexpected argument names (not in the tool function's own signature) are rejected before the tool is ever called",
+        "tool_level_exception": "returned as MCP isError content, never crashes the read loop or the process"
+      },
+      "no_dynamic_eval_or_import": "tool dispatch is exclusively via the tools dict built at @mcp.tool() decoration time; no eval/exec/importlib.import_module/getattr-by-client-string anywhere in the fallback."
+    }
+  },
+  "acceptance_evidence": [
+    {
+      "acceptance": "VSIX contains canonical aiworkhub package + dashboard assets under an extension-local runtime dir",
+      "evidence": "unzip -l dist/aiworkhub-0.4.0.vsix shows extension/runtime/aiworkhub/{__init__,server,core,dashboard,dashboard_mcp_app}.py and extension/runtime/aiworkhub/dashboard_static/{index.html,dashboard.js,dashboard.css}; 0 __pycache__ entries; asserted in test_vsix_bundles_canonical_aiworkhub_package_with_dashboard_assets"
+    },
+    {
+      "acceptance": "extension launches python -m aiworkhub.server with an extension-local import path, never repo/editable-install/host-path/network-install",
+      "evidence": "extension.js McpStdioClient._start(): cwd: runtimeDir || root, env.PYTHONPATH = [runtimeDir, ...]; static test extension-static.test.js asserts these strings plus absence of \"pip install\"/\"--editable\"/\"site-packages\"; pytest test_extension_js_never_derives_import_from_repo_or_fixed_host_path re-checks the extracted VSIX copy of extension.js"
+    },
+    {
+      "acceptance": "isolated smoke: unpack VSIX, initialize/notifications-initialized/tools-list/aiworkhub_dashboard_snapshot with user/site-packages disabled and a fresh repo with no checkout/venv",
+      "evidence": "test_isolated_vsix_runtime_smoke_no_site_packages_fresh_repo spawns [sys.executable, \"-S\", \"-m\", \"aiworkhub.server\"] against the actual zipfile-extracted VSIX runtime dir, cwd/PYTHONPATH pointed at it, AIWORKHUB_REPO_ROOT/AIWORKHUB_REPO pointed at a pytest tmp_path with no .git/.venv/AITools -- passes; verified against a venv that DOES have the real mcp package installed (proving -S, not mcp's absence, forces the fallback path)"
+    },
+    {
+      "acceptance": "stdlib fallback is bounded and fail-closed",
+      "evidence": "test_isolated_vsix_runtime_bounded_protocol_errors_never_crash: oversized 9MiB line -> -32600, malformed JSON -> -32700, unknown tool -> -32602, and the same live process still answers aiworkhub_dashboard_snapshot afterward; test_stdlib_fallback_rejects_unexpected_tool_arguments_no_dynamic_eval covers unexpected argument names"
+    },
+    {
+      "acceptance": "existing editor-tab / multi-root / repository-identity / Remote-SSH / no-HTTP contracts unchanged",
+      "evidence": "extension-static.test.js contract checks (createWebviewPanel count, registerWebviewPanelSerializer, bootstrapRepository, workspaceState repo selection, defaultCoordinatorTargets, absent(dashboardUrl/openExternal/simpleBrowser/192.168./127.0.0.1/:8765/...)) all still pass unmodified in behavior; only the spawn cwd/PYTHONPATH and the FastMCP fallback changed"
+    },
+    {
+      "acceptance": "write/launch gate env vars deleted before spawn",
+      "evidence": "extension.js still runs delete env.AIWORKHUB_ALLOW_WRITES; delete env.AIWORKHUB_ALLOW_LAUNCH; unconditionally in _start(), unchanged"
+    }
+  ],
+  "validation": {
+    "npm_test": {
+      "command": "npm --prefix tools/geoai-task-mcp/vscode-extension test",
+      "result": "pass",
+      "output": "AIWorkHub VS Code extension static contract checks passed"
+    },
+    "npm_package": {
+      "command": "npm --prefix tools/geoai-task-mcp/vscode-extension run package",
+      "result": "pass",
+      "output_path": "tools/geoai-task-mcp/vscode-extension/dist/aiworkhub-0.4.0.vsix"
+    },
+    "pytest": {
+      "command": "python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_embedded_mcp_runtime_b844_v1.py",
+      "result": "pass",
+      "tests_passed": 9,
+      "tests_failed": 0,
+      "note": "run with a python3 exposing pytest + the real mcp package installed in site-packages (/home/shrek/GeoAI/.venv); the isolated smoke still forces and exercises the bundled stdlib fallback via -S, proving the fallback path independent of whether mcp happens to be installed on the host interpreter"
+    },
+    "json_tool": {
+      "command": "python3 -m json.tool tools/geoai-task-mcp/eval/aiworkhub_vscode_bundled_runtime_b844_v1.json",
+      "result": "pass"
+    }
+  },
+  "forbidden_confirmed_absent": [
+    "repository_checkout_runtime_dependency",
+    "editable_install_dependency",
+    "activation_time_pip_install",
+    "network_runtime_install",
+    "host_absolute_source_path",
+    "unbounded_jsonrpc",
+    "http_dashboard_dependency",
+    "fixed_port",
+    "lan_ip",
+    "legacy_product_alias",
+    "git_commit",
+    "git_push",
+    "github_release",
+    "history_rewrite",
+    "taskctl_done_by_worker"
+  ],
+  "worker_notes": "No git commit/push/history-rewrite performed. No taskctl lifecycle commands run. Worker stops here for Codex review per commit_contract."
+}

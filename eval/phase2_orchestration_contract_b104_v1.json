@@ -24,19 +24,19 @@
   "no_arbitrary_command": true
  },
  "sandbox": {
-  "cwd_pin": "GEOAI_REPO",
+  "cwd_pin": "AIWORKHUB_REPO",
   "argv_list_only": true,
   "no_shell": true,
-  "env_scrub": "Pass only PYTHONPATH, GEOAI_REPO, PATH, and allowlisted GEOAI_TASK_MCP_* flags; drop all secret-bearing variables. Values are never copied into logs.",
+  "env_scrub": "Pass only PYTHONPATH, AIWORKHUB_REPO, PATH, and allowlisted AIWORKHUB_* flags; drop all secret-bearing variables. Values are never copied into logs.",
   "bounded_timeout_seconds_default": 3600,
   "concurrency_cap_default": 1,
   "network_policy": "Orchestrator opens no new listeners; a launched worker inherits host network only.",
-  "filesystem_scope": "A launched worker is confined to the GEOAI_REPO working tree; allowed_writes are enforced by taskctl, not by the orchestrator.",
-  "rollback": "Unsetting GEOAI_TASK_MCP_ALLOW_LAUNCH restores the fully-disabled default."
+  "filesystem_scope": "A launched worker is confined to the AIWORKHUB_REPO working tree; allowed_writes are enforced by taskctl, not by the orchestrator.",
+  "rollback": "Unsetting AIWORKHUB_ALLOW_LAUNCH restores the fully-disabled default."
  },
  "logging": {
-  "audit_log_path_default": "tools/geoai-task-mcp/logs/audit.jsonl",
-  "audit_log_path_override_env": "GEOAI_TASK_MCP_AUDIT_LOG_PATH",
+  "audit_log_path_default": "tools/aiworkhub/logs/audit.jsonl",
+  "audit_log_path_override_env": "AIWORKHUB_AUDIT_LOG_PATH",
   "append_only": true,
   "never_logs_secret_values": true,
   "reuse": "core.write_audit_entry",
@@ -84,7 +84,7 @@
    "disabled_by_default": true,
    "human_in_the_loop": false,
    "detect": "read-only PATH presence probe (shutil.which style); absence => adapter unavailable, never launched",
-   "invocation_template_not_wired": "argv-list template ['claude','-p','<prompt>','--cwd','<GEOAI_REPO>'] prepared only; NOT executed by this contract",
+   "invocation_template_not_wired": "argv-list template ['claude','-p','<prompt>','--cwd','<AIWORKHUB_REPO>'] prepared only; NOT executed by this contract",
    "review_role": "worker",
    "boundary": "A launched Claude CLI instance is a heavy implementation/integration WORKER only: it runs exactly one claimed task inside allowed_writes, runs validation, calls taskctl review, and never finalizes done."
   },
@@ -94,7 +94,7 @@
    "disabled_by_default": true,
    "human_in_the_loop": false,
    "detect": "read-only PATH presence probe (shutil.which style); absence => adapter unavailable, never launched",
-   "invocation_template_not_wired": "argv-list template ['codex','exec','<prompt>','--cwd','<GEOAI_REPO>'] prepared only; NOT executed by this contract",
+   "invocation_template_not_wired": "argv-list template ['codex','exec','<prompt>','--cwd','<AIWORKHUB_REPO>'] prepared only; NOT executed by this contract",
    "review_role": "reviewer_finalizer",
    "boundary": "Codex is the orchestrator/reviewer/finalizer. A launched Codex WORKER instance must NOT self-review or finalize a task it executed; separation-of-duties keeps executor and reviewer distinct."
   },
@@ -134,11 +134,11 @@
  "launch_preconditions": [
   {
    "id": "allow_launch_flag",
-   "requirement": "GEOAI_TASK_MCP_ALLOW_LAUNCH=1 (default '0'); without it every request terminates blocked_launch_disabled."
+   "requirement": "AIWORKHUB_ALLOW_LAUNCH=1 (default '0'); without it every request terminates blocked_launch_disabled."
   },
   {
    "id": "allow_writes_flag",
-   "requirement": "GEOAI_TASK_MCP_ALLOW_WRITES=1 (default '0'); write-gate parity is required in addition to the launch flag."
+   "requirement": "AIWORKHUB_ALLOW_WRITES=1 (default '0'); write-gate parity is required in addition to the launch flag."
   },
   {
    "id": "runner_topic_allowlist",
@@ -158,7 +158,7 @@
   },
   {
    "id": "cwd_env_sandbox_pin",
-   "requirement": "cwd pinned to GEOAI_REPO, scrubbed env, argv-list-only with no shell invocation, and a bounded timeout."
+   "requirement": "cwd pinned to AIWORKHUB_REPO, scrubbed env, argv-list-only with no shell invocation, and a bounded timeout."
   },
   {
    "id": "concurrency_cap",
@@ -178,11 +178,11 @@
   "launch_actions_enabled": false,
   "launch_code_added": false,
   "write_gate_disabled": false,
-  "proposed_enable_flag": "GEOAI_TASK_MCP_ALLOW_LAUNCH",
-  "requires_also": "GEOAI_TASK_MCP_ALLOW_WRITES=1",
+  "proposed_enable_flag": "AIWORKHUB_ALLOW_LAUNCH",
+  "requires_also": "AIWORKHUB_ALLOW_WRITES=1",
   "default": "0"
  },
- "neural_bridge_note": "Per GeoAI neural-control-first doctrine, the FUTURE selection of adapter/runner/topic (which agent to launch for which task) must be a LEARNED routing decision, not a regex/keyword cue router. This contract adds NO cue router and NO runtime keyword branch: the command allowlist and runner/topic allowlist are static human-configured safety boundaries, and adapter availability is a read-only presence probe. The intelligence layer (learned launch/route/abstain policy) is deferred to trainable targets tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, so no hidden regex/table cognition becomes launch authority.",
+ "neural_bridge_note": "Per AIWorkHub neural-control-first doctrine, the FUTURE selection of adapter/runner/topic (which agent to launch for which task) must be a LEARNED routing decision, not a regex/keyword cue router. This contract adds NO cue router and NO runtime keyword branch: the command allowlist and runner/topic allowlist are static human-configured safety boundaries, and adapter availability is a read-only presence probe. The intelligence layer (learned launch/route/abstain policy) is deferred to trainable targets tracked as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1, so no hidden regex/table cognition becomes launch authority.",
  "acceptance": {
   "launch_preconditions_defined_no_launch_code": "pass",
   "three_adapter_boundaries": "pass",

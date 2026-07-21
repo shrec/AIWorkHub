@@ -9,47 +9,47 @@
   "next_wave_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_LAUNCH_QUEUE_READONLY_WIRING_B252_V1",
-      "objective": "Wire the disabled launch_queue_contract.py (describe/evaluate helpers) and launch_queue_persist.py (read-only summary of the append-only JSONL audit log) as READ-ONLY @mcp.tool()s in server.py, mirroring the B106 cli_adapter_readonly_tool pattern. Must keep launch_enabled()==False and LAUNCH_IMPLEMENTED==False untouched; add no new write path (persist's existing append-only log write stays out of the exposed tool -- expose only a read/summarize view, same shape as geoai_task_audit_log_read).",
+      "objective": "Wire the disabled launch_queue_contract.py (describe/evaluate helpers) and launch_queue_persist.py (read-only summary of the append-only JSONL audit log) as READ-ONLY @mcp.tool()s in server.py, mirroring the B106 cli_adapter_readonly_tool pattern. Must keep launch_enabled()==False and LAUNCH_IMPLEMENTED==False untouched; add no new write path (persist's existing append-only log write stays out of the exposed tool -- expose only a read/summarize view, same shape as aiworkhub_task_audit_log_read).",
       "runner": "claude_task_mcp_launch_queue_readonly_wiring_b252",
       "topic": "task_mcp",
       "depends_on": ["CLAUDE_TASK_MCP_CLAUDE_RUNNER_ORCHESTRATION_REVIEW_B251_V1"],
       "priority": "task_mcp_b252_launch_queue_readonly_wiring",
       "read_first": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_readonly_tool.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_readonly_tool.py",
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
       ],
       "ready": true
     },
     {
       "task_id": "CLAUDE_TASK_MCP_ORCH_GATED_ENABLEMENT_DESIGN_B253_V1",
-      "objective": "Owner-reviewed DESIGN ONLY (no implementation) for the first module in the chain ever permitted to spawn a process: must require BOTH GEOAI_TASK_MCP_ALLOW_LAUNCH=1 AND GEOAI_TASK_MCP_ALLOW_WRITES=1, reuse the existing static LAUNCHABLE_BINARIES=(claude,codex) allowlist (deepseek_manual stays manual-only permanently), write to the existing append-only launch_queue_persist audit log, enforce a runner/topic/task_id identity-guard echo against the dispatched worker's own WORKER_CONTRACT_JSON, and explicitly exclude git stage/guard-staged/commit from its own responsibility (that remains the dispatched worker's CLI-only step). Requires explicit owner sign-off before any code is written; this card is design/spec only.",
+      "objective": "Owner-reviewed DESIGN ONLY (no implementation) for the first module in the chain ever permitted to spawn a process: must require BOTH AIWORKHUB_ALLOW_LAUNCH=1 AND AIWORKHUB_ALLOW_WRITES=1, reuse the existing static LAUNCHABLE_BINARIES=(claude,codex) allowlist (deepseek_manual stays manual-only permanently), write to the existing append-only launch_queue_persist audit log, enforce a runner/topic/task_id identity-guard echo against the dispatched worker's own WORKER_CONTRACT_JSON, and explicitly exclude git stage/guard-staged/commit from its own responsibility (that remains the dispatched worker's CLI-only step). Requires explicit owner sign-off before any code is written; this card is design/spec only.",
       "runner": "claude_task_mcp_orch_gated_enablement_design_b253",
       "topic": "task_mcp",
       "depends_on": ["CLAUDE_TASK_MCP_CLAUDE_RUNNER_ORCHESTRATION_REVIEW_B251_V1"],
       "priority": "task_mcp_b253_gated_enablement_design",
       "read_first": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_persist.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_persist.py",
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
       ],
       "ready": false,
       "blocked_reason": "requires explicit owner sign-off on dual-env-gate process-launch enablement before scoping any implementation writes"
     },
     {
       "task_id": "CLAUDE_TASK_MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_B254_V1",
-      "objective": "Per GeoAI neural-control-first doctrine, replace the static adapter/runner/topic selection (currently taskctl auto-pickup claim FIFO + the static LAUNCHABLE_BINARIES/KNOWN_ADAPTERS allowlists already named in cli_adapter_dryrun.py/launch_queue_contract.py comments as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1) with a learned routing + abstain policy. Emit neural curriculum rows / feature axes from historical auto_pickup + review-queue outcomes as a first step; the static allowlist remains the safety-boundary floor underneath the learned policy, never removed.",
+      "objective": "Per AIWorkHub neural-control-first doctrine, replace the static adapter/runner/topic selection (currently taskctl auto-pickup claim FIFO + the static LAUNCHABLE_BINARIES/KNOWN_ADAPTERS allowlists already named in cli_adapter_dryrun.py/launch_queue_contract.py comments as MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1) with a learned routing + abstain policy. Emit neural curriculum rows / feature axes from historical auto_pickup + review-queue outcomes as a first step; the static allowlist remains the safety-boundary floor underneath the learned policy, never removed.",
       "runner": "claude_task_mcp_neural_launch_routing_migration_b254",
       "topic": "task_mcp",
       "depends_on": ["CLAUDE_TASK_MCP_CLAUDE_RUNNER_ORCHESTRATION_REVIEW_B251_V1"],
       "priority": "task_mcp_b254_neural_launch_routing_migration",
       "read_first": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
-        "tools/geoai-task-mcp/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
+        "tools/aiworkhub/eval/mcp_claude_runner_orchestration_review_b251_v1.json"
       ],
       "ready": true
     }

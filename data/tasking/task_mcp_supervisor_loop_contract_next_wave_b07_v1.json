@@ -6,15 +6,15 @@
 
   "this_task_scope": {
     "artifacts_added": [
-      "tools/geoai-task-mcp/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
-      "tools/geoai-task-mcp/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
-      "tools/geoai-task-mcp/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
-      "tools/geoai-task-mcp/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
+      "tools/aiworkhub/contracts/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/aiworkhub/eval/task_mcp_supervisor_loop_contract_b07_v1.json",
+      "tools/aiworkhub/data/tasking/task_mcp_supervisor_loop_contract_next_wave_b07_v1.json",
+      "tools/aiworkhub/tests/test_task_mcp_supervisor_loop_contract_b07_v1.sh"
     ],
     "source_code_changed": false,
     "process_launch": false,
     "task_status_mutated": false,
-    "write_gate": "off (GEOAI_TASK_MCP_ALLOW_WRITES unset/0; this task does not read, set, or touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST anywhere)"
+    "write_gate": "off (AIWORKHUB_ALLOW_WRITES unset/0; this task does not read, set, or touch writes_allowed(), WRITE_COMMANDS, RUNNER_TOPIC_ALLOWLIST, or PER_WAVE_RUNNER_TOPIC_ALLOWLIST anywhere)"
   },
 
   "not_applied_generalization_next_wave": {
@@ -22,7 +22,7 @@
     "proposed_next_wave_tasks": [
       {
         "task_id_suggestion": "CLAUDE_TASK_MCP_SUPERVISOR_LOOP_STATUS_TOOL_B08_V1",
-        "summary": "Wire a NEW read-only geoai_supervisor_loop_status MCP tool in server.py that implements this contract's leg-4 observation schema over the LIVE queue: composes taskctl show (core.show_task), the B119 collision guard, and core.check_runner_topic_allowlist to report supervisor_state + error (if any) for a given task_id. Zero writes, zero launch -- a pure read/derive tool, same authority profile as the existing geoai_task_codex_handoff (B116).",
+        "summary": "Wire a NEW read-only aiworkhub_supervisor_loop_status MCP tool in server.py that implements this contract's leg-4 observation schema over the LIVE queue: composes taskctl show (core.show_task), the B119 collision guard, and core.check_runner_topic_allowlist to report supervisor_state + error (if any) for a given task_id. Zero writes, zero launch -- a pure read/derive tool, same authority profile as the existing aiworkhub_task_codex_handoff (B116).",
         "owner": "future coder task, not created by this worker",
         "requires_source_patch": true
       },
@@ -51,8 +51,8 @@
     "runner_topic_mismatch example reasons cross-validated LIVE against unmodified core.check_runner_topic_allowlist (read-only call, no source patch)",
     "eval JSON parses and required top-level sections present",
     "next_wave (this file) JSON parses and required top-level sections present",
-    "this task's own allowed_writes contains zero paths under tools/geoai-task-mcp/src/",
-    "python3 AITools/taskctl.py verify (parent GeoAI repo) passes"
+    "this task's own allowed_writes contains zero paths under tools/aiworkhub/src/",
+    "python3 AITools/taskctl.py verify (parent AIWorkHub repo) passes"
   ],
 
   "rollback": {

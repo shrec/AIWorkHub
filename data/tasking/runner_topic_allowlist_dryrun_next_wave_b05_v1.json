@@ -5,8 +5,8 @@
   "source_task": "CLAUDE_TASK_MCP_RUNNER_TOPIC_ALLOWLIST_DRYRUN_B05_V1",
   "not_applied_in_this_task": true,
   "process_launch": false,
-  "write_gate_default": "off (GEOAI_TASK_MCP_ALLOW_WRITES unset/0; this proposal does not read, set, or touch writes_allowed() or WRITE_COMMANDS anywhere)",
-  "target_file": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+  "write_gate_default": "off (AIWORKHUB_ALLOW_WRITES unset/0; this proposal does not read, set, or touch writes_allowed() or WRITE_COMMANDS anywhere)",
+  "target_file": "tools/aiworkhub/src/aiworkhub/core.py",
   "target_function": "check_runner_topic_allowlist(runner, topic, action)",
   "current_behavior_measured": "RUNNER_TOPIC_ALLOWLIST is a static dict keyed by exact (runner, topic) tuples for 11 stable topic-continuous workers, plus one hardcoded codex-runner wildcard (any topic). There is no entry and no prefix/pattern mechanism for topic=='task_mcp'. Any per-wave runner name like 'claude_task_mcp_allowlist_dryrun_b05' is rejected with reason=unknown_runner_topic_pair even though it is a well-formed identity token that already passed _is_malformed_identity_token.",
   "proposed_change": {

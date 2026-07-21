@@ -10,7 +10,7 @@
   ],
   "purpose": "Apply the B05 proposed bounded per-wave task_mcp prefix allowlist patch to core.check_runner_topic_allowlist / core.RUNNER_TOPIC_ALLOWLIST scope, additively, with existing 11 static (runner, topic) pairs and the codex wildcard byte-identical before/after, write gate still off, and process launch still disabled.",
   "applied_patch": {
-    "target_file": "tools/geoai-task-mcp/src/geoai_task_mcp/core.py",
+    "target_file": "tools/aiworkhub/src/aiworkhub/core.py",
     "target_function": "check_runner_topic_allowlist(runner, topic, action)",
     "new_module_constant": "PER_WAVE_RUNNER_TOPIC_ALLOWLIST = {\"task_mcp\": {\"runner_prefix\": \"claude_task_mcp_\", \"actions\": frozenset({\"auto-pickup\", \"review\", \"usage\"})}}",
     "diff_summary": "After the existing RUNNER_TOPIC_ALLOWLIST.get((runner, topic)) lookup returns None, look up PER_WAVE_RUNNER_TOPIC_ALLOWLIST.get(topic); if the rule exists and runner.startswith(rule['runner_prefix']), return allowed=True/reason=per_wave_prefix_allowlisted when action is in rule['actions'], else allowed=False/reason=per_wave_action_not_allowed:<action>. If the prefix rule does not apply, fall through unchanged to allowed=False/reason=unknown_runner_topic_pair.",
@@ -51,7 +51,7 @@
   ],
   "write_gate_status_measured": {
     "core.writes_allowed()": false,
-    "GEOAI_TASK_MCP_ALLOW_WRITES_env": null,
+    "AIWORKHUB_ALLOW_WRITES_env": null,
     "note": "Default-off write gate unchanged; this patch only widens the allowlist decision function, never touches writes_allowed() or WRITE_COMMANDS."
   },
   "launch_status_measured": {

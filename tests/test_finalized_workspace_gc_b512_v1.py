@@ -51,12 +51,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -72,7 +72,7 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 def _ensure_project_context_stub() -> None:
@@ -87,12 +87,12 @@ def _ensure_project_context_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.project_context")
+        importlib.import_module("aiworkhub.project_context")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.project_context")
+    stub = types.ModuleType("aiworkhub.project_context")
 
     class ProjectContextError(Exception):
         pass
@@ -108,14 +108,14 @@ def _ensure_project_context_stub() -> None:
     stub.ProjectContextError = ProjectContextError
     stub.ProjectContextResult = ProjectContextResult
     stub.collect_project_context = collect_project_context
-    stub.RECEIPT_SCHEMA_ID = "geoai.task_mcp.project_context_receipt.v1"
-    sys.modules["geoai_task_mcp.project_context"] = stub
+    stub.RECEIPT_SCHEMA_ID = "aiworkhub.task_mcp.project_context_receipt.v1"
+    sys.modules["aiworkhub.project_context"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 _ensure_project_context_stub()
 
-from geoai_task_mcp import process_launcher, worker_workspace  # noqa: E402
+from aiworkhub import process_launcher, worker_workspace  # noqa: E402
 
 
 def _chmod_blocked_by_sandbox() -> bool:

@@ -1,13 +1,13 @@
 {"kind":"adapter","id":"claude_cli","adapter_kind":"local_cli","separate_model":true,"disabled_by_default":true,"human_in_the_loop":false,"review_role":"worker","boundary":"heavy implementation WORKER; runs one claimed task in allowed_writes, validates, calls taskctl review, never finalizes done"}
 {"kind":"adapter","id":"codex_cli","adapter_kind":"local_cli","separate_model":true,"disabled_by_default":true,"human_in_the_loop":false,"review_role":"reviewer_finalizer","boundary":"orchestrator/reviewer/finalizer; a launched Codex worker must NOT self-review or finalize a task it executed"}
 {"kind":"adapter","id":"deepseek_manual","adapter_kind":"manual_external","separate_model":true,"disabled_by_default":true,"human_in_the_loop":true,"review_role":"worker","boundary":"no local process and no API key held by orchestrator; human is executor and gate; renders a handoff packet only"}
-{"kind":"precondition","id":"allow_launch_flag","requirement":"GEOAI_TASK_MCP_ALLOW_LAUNCH=1 (default '0'); without it every request terminates blocked_launch_disabled"}
-{"kind":"precondition","id":"allow_writes_flag","requirement":"GEOAI_TASK_MCP_ALLOW_WRITES=1 (default '0'); write-gate parity required in addition to the launch flag"}
+{"kind":"precondition","id":"allow_launch_flag","requirement":"AIWORKHUB_ALLOW_LAUNCH=1 (default '0'); without it every request terminates blocked_launch_disabled"}
+{"kind":"precondition","id":"allow_writes_flag","requirement":"AIWORKHUB_ALLOW_WRITES=1 (default '0'); write-gate parity required in addition to the launch flag"}
 {"kind":"precondition","id":"runner_topic_allowlist","requirement":"runner/topic pair on an explicit static allowlist; unknown/off-topic pair blocked and audited"}
 {"kind":"precondition","id":"command_allowlist_match","requirement":"launchable binary on command_allowlist ('claude' or 'codex'); no arbitrary command prepared or run"}
 {"kind":"precondition","id":"collision_guard_preflight","requirement":"taskctl collision-guard passes immediately before launch; stale/conflicting claim blocks it"}
 {"kind":"precondition","id":"dry_run_default","requirement":"plan-only (dry-run) is the default; a real launch needs an explicit opt-in beyond the gate flags, never the default path"}
-{"kind":"precondition","id":"cwd_env_sandbox_pin","requirement":"cwd pinned to GEOAI_REPO, scrubbed env, argv-list-only with no shell invocation, bounded timeout"}
+{"kind":"precondition","id":"cwd_env_sandbox_pin","requirement":"cwd pinned to AIWORKHUB_REPO, scrubbed env, argv-list-only with no shell invocation, bounded timeout"}
 {"kind":"precondition","id":"concurrency_cap","requirement":"concurrency cap (default 1) not exceeded; over-cap requests blocked to protect workstation and shared queue"}
 {"kind":"precondition","id":"audit_log_entry","requirement":"append-only audit entry written for the launch decision; secret env values never logged"}
 {"kind":"precondition","id":"adapter_available","requirement":"adapter available: read-only presence probe for local_cli, human-confirmed presence for manual_external"}

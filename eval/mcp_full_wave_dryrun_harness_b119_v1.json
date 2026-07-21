@@ -9,11 +9,11 @@
   "checks_passed": 6,
   "checks_failed": 0,
   "queue_source": {
-    "db_path": "/home/shrek/GeoAI/bitnnv2/data/tasking/task_queue_v1.sqlite",
+    "db_path": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/task_queue_v1.sqlite",
     "db_exists": true,
-    "cards_jsonl_path": "/home/shrek/GeoAI/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
+    "cards_jsonl_path": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_v1.jsonl",
     "cards_jsonl_exists": true,
-    "manifest_path": "/home/shrek/GeoAI/bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
+    "manifest_path": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
     "manifest_exists": true,
     "loaded_from": "sqlite_readonly",
     "total_cards_loaded": 3445,
@@ -577,7 +577,7 @@
     "collision_prevented": true
   },
   "stale_manifest_fixture": {
-    "manifest_path": "/home/shrek/GeoAI/bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
+    "manifest_path": "/home/shrek/AIWorkHub/bitnnv2/data/tasking/machine_task_cards_manifest_v1.json",
     "manifest_exists": true,
     "on_disk_total_cards": 3445,
     "live_total_cards": 3445,

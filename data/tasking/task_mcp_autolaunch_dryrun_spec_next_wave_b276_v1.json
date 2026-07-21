@@ -23,13 +23,13 @@
       ],
       "depends_on": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (this spec)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py"
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/autolaunch_gate.py",
-        "tools/geoai-task-mcp/eval/mcp_autolaunch_implement_gates_b277_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_autolaunch_implement_gates_b277_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/autolaunch_gate.py",
+        "tools/aiworkhub/eval/mcp_autolaunch_implement_gates_b277_v1.json",
+        "tools/aiworkhub/tests/test_mcp_autolaunch_implement_gates_b277_v1.sh"
       ]
     },
     {
@@ -40,15 +40,15 @@
       "mode": "mcp_autolaunch_log_accounting_append_only",
       "objective": "Implement the 15-field append-only JSONL launch log from the B276 spec. Wire log entries on gate-check and (future) process-completion events. No process launch.",
       "acceptance": [
-        "JSONL append-only log at tools/geoai-task-mcp/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
+        "JSONL append-only log at tools/aiworkhub/data/audit/mcp_autolaunch_log_b276_v1.jsonl",
         "All 15 fields populated for gate-check entries",
         "Log reader function returns entries filtered by task_id/adapter/date",
         "Shell test validates log schema, append behavior, and reader"
       ],
       "depends_on": "CLAUDE_TASK_MCP_AUTOLAUNCH_IMPLEMENT_GATES_B277_V1",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/autolaunch_gate.py"
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/src/aiworkhub/autolaunch_gate.py"
       ]
     },
     {
@@ -69,8 +69,8 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_AUTOLAUNCH_LOG_ACCOUNTING_B278_V1",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/launch_queue_contract.py",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/src/aiworkhub/launch_queue_contract.py",
         "AITools/taskctl.py"
       ]
     }

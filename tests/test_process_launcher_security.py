@@ -28,12 +28,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -49,12 +49,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import process_launcher, worker_workspace  # noqa: E402
+from aiworkhub import process_launcher, worker_workspace  # noqa: E402
 
 
 def _chmod_blocked_by_sandbox() -> bool:
@@ -163,7 +163,7 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
     calls: list[tuple] = []
 
     def claim(
-        task_id: str, runner: str, topic: str, *, request_id: str | None = None
+        repo, task_id: str, runner: str, topic: str, *, request_id: str | None = None
     ) -> dict:
         assert request_id
         calls.append(("claim", task_id, runner, topic))
@@ -201,7 +201,7 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "claim_start_exact", claim)
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
     monkeypatch.setattr(process_launcher.core, "mark_review", review)
     monkeypatch.setattr(process_launcher.core, "release_launch", release)
     return calls
@@ -461,7 +461,12 @@ def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(
     assert result["state"] == "finalize_failed"
     assert "claim_ownership_lost" in result["latest_event"]["error"]
     assert release_calls == []
-    assert not workspace.path.exists()
+    # B860/B863: a claim_ownership_lost read is not reliable proof of a
+    # legitimate different owner -- it can be a false positive from a
+    # launcher/finalizer authority disagreement, so the isolated workspace
+    # is retained as evidence instead of being deleted here. Deletion is
+    # deferred to the canonical-status-gated GC sweep.
+    assert workspace.path.exists()
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 

@@ -7,12 +7,12 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_POLL_DIFF_CURSOR_V1",
-      "goal": "Close the NO_DELTA_CURSOR gap: add an optional read-only 'since_task_ids' or 'last_seen_snapshot_hash' parameter to geoai_completion_inbox (or a thin wrapper tool) that returns only review_queue/stale_processing/runner_mismatch_warnings entries NOT present in the caller-supplied prior snapshot -- still a pure function over the same list/show data, no new state persisted server-side (caller owns the cursor).",
+      "goal": "Close the NO_DELTA_CURSOR gap: add an optional read-only 'since_task_ids' or 'last_seen_snapshot_hash' parameter to aiworkhub_completion_inbox (or a thin wrapper tool) that returns only review_queue/stale_processing/runner_mismatch_warnings entries NOT present in the caller-supplied prior snapshot -- still a pure function over the same list/show data, no new state persisted server-side (caller owns the cursor).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_poll_diff_cursor_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_poll_diff_cursor_v1.json"
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+        "tools/aiworkhub/tests/test_mcp_completion_inbox_poll_diff_cursor_v1.sh",
+        "tools/aiworkhub/eval/mcp_completion_inbox_poll_diff_cursor_v1.json"
       ],
       "acceptance": [
         "caller-supplied prior task_id set correctly excludes already-seen review cards",
@@ -25,9 +25,9 @@
       "goal": "Close the NO_ARTIFACT_BODY_READ gap: for each review_queue entry, read-only os.stat + bounded json.load (size-capped, e.g. <=64KB) of the FIRST file in the card's allowed_writes if it is a .json eval artifact, and surface a short (<=200 char) 'artifact_verdict_hint' (e.g. the artifact's own 'verdict'/'checks_failed' field if present) alongside the existing objective/allowed_writes fields -- still read-only, no code-file content read (json/jsonl artifacts only).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py",
-        "tools/geoai-task-mcp/tests/test_mcp_completion_inbox_artifact_body_summary_v1.sh",
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_artifact_body_summary_v1.json"
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py",
+        "tools/aiworkhub/tests/test_mcp_completion_inbox_artifact_body_summary_v1.sh",
+        "tools/aiworkhub/eval/mcp_completion_inbox_artifact_body_summary_v1.json"
       ],
       "acceptance": [
         "artifact_verdict_hint populated when a JSON eval artifact exists and parses",
@@ -37,10 +37,10 @@
     },
     {
       "task_id": "CLAUDE_TASK_MCP_COMPLETION_INBOX_OWNER_DELIVERY_DESIGN_V1",
-      "goal": "Design (not implement) the NO_OWNER_DELIVERY_CHANNEL gap: a design-only MD-budgeted note evaluating options for an owner-facing push channel (local desktop notify, append-only log tail the owner already watches, or a scheduled `/loop`-style poll-and-diff routine per the 'schedule'/'loop' skills already available in this environment) that calls geoai_completion_inbox on an interval and surfaces only NEW review_queue entries since the prior run. No server-side mutation surface, no new write authority -- evaluate against the existing NO_ACK_OR_DEDUP_MARKER gap too (an interval-based external poller naturally solves dedup by keeping its own last-seen set).",
+      "goal": "Design (not implement) the NO_OWNER_DELIVERY_CHANNEL gap: a design-only MD-budgeted note evaluating options for an owner-facing push channel (local desktop notify, append-only log tail the owner already watches, or a scheduled `/loop`-style poll-and-diff routine per the 'schedule'/'loop' skills already available in this environment) that calls aiworkhub_completion_inbox on an interval and surfaces only NEW review_queue entries since the prior run. No server-side mutation surface, no new write authority -- evaluate against the existing NO_ACK_OR_DEDUP_MARKER gap too (an interval-based external poller naturally solves dedup by keeping its own last-seen set).",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/eval/mcp_completion_inbox_owner_delivery_design_v1.json"
+        "tools/aiworkhub/eval/mcp_completion_inbox_owner_delivery_design_v1.json"
       ],
       "acceptance": [
         "at least 2 concrete delivery-channel options compared on cost/latency/complexity",
@@ -52,6 +52,6 @@
   "blockers": [],
   "follow_up_actions": [
     "Codex to run taskctl.py review CLAUDE_TASK_MCP_COMPLETION_INBOX_SMOKE_B276_V1 and finalize (NO_COMMIT from worker).",
-    "kb bug.tools_geoai_task_mcp_not_indexed remains ACTIVE (unchanged by this task; see B275's CLAUDE_TASK_MCP_COMPLETION_INBOX_ADD_INDEXER_COVERAGE_V1 proposal for the fix, still not enqueued)."
+    "kb bug.tools_aiworkhub_not_indexed remains ACTIVE (unchanged by this task; see B275's CLAUDE_TASK_MCP_COMPLETION_INBOX_ADD_INDEXER_COVERAGE_V1 proposal for the fix, still not enqueued)."
   ]
 }

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from geoai_task_mcp.callback_bridge import (  # noqa: E402
+from aiworkhub.callback_bridge import (  # noqa: E402
     BusyThreadError,
     SidebandNotReadyError,
     SidebandUnavailableError,

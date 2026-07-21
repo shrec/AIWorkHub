@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """B108 real MCP-client smoke + read-only tool contract freeze (v1).
 
-Drives the geoai-task-mcp FastMCP server through a REAL MCP ``ClientSession``
+Drives the aiworkhub FastMCP server through a REAL MCP ``ClientSession``
 over in-memory streams (``mcp.shared.memory.create_connected_server_and_client_
 session``) -- i.e. the same client path a VS Code / Claude / Codex stdio MCP
 client uses (``initialize`` -> ``tools/list`` -> ``tools/call``), not a direct
@@ -14,10 +14,10 @@ It freezes the read-only tool contract v1 by asserting, over the client path:
   C3  every tool's inputSchema is a STABLE JSON schema -- byte-canonical
       sha256 matches the frozen fingerprint AND is deterministic across two
       independent client sessions;
-  C4  no queue/audit writes occur with ``GEOAI_TASK_MCP_ALLOW_WRITES`` UNSET:
+  C4  no queue/audit writes occur with ``AIWORKHUB_ALLOW_WRITES`` UNSET:
       the MCP-owned audit state dir is byte-identical (and empty) before/after
       every read-only ``tools/call`` and the parent queue stays verify-intact;
-  C5  same no-write proof with ``GEOAI_TASK_MCP_ALLOW_WRITES=1``;
+  C5  same no-write proof with ``AIWORKHUB_ALLOW_WRITES=1``;
   C6  NO process launch: no launcher is enabled and server.py holds no
       subprocess/exec/fork/shell launch code.
 
@@ -25,12 +25,12 @@ It freezes the read-only tool contract v1 by asserting, over the client path:
 false with ``failing_check`` naming the first failure. This harness NEVER
 enables writes for real, NEVER launches a process/agent, makes NO network
 call, and logs NO secret values. It is isolation-safe: it owns a private
-mktemp audit dir (overriding ``GEOAI_TASK_MCP_AUDIT_LOG_PATH``) so the
+mktemp audit dir (overriding ``AIWORKHUB_AUDIT_LOG_PATH``) so the
 byte-identity proof can never be perturbed by another worker, and it restores
 process env on exit.
 
 Usage:
-    PYTHONPATH=tools/geoai-task-mcp/src GEOAI_REPO=/home/shrek/GeoAI \
+    PYTHONPATH=tools/geoai-task-mcp/src AIWORKHUB_REPO=/home/shrek/AIWorkHub \
     python3 tools/geoai-task-mcp/tests/mcp_client_smoke_contract_freeze.py \
         [--out result.json]
 """
@@ -56,69 +56,69 @@ from mcp.shared.memory import (  # noqa: E402
     create_connected_server_and_client_session as connect_client,
 )
 
-from geoai_task_mcp import cli_adapter_readonly_tool as ro  # noqa: E402
-from geoai_task_mcp import core  # noqa: E402
-from geoai_task_mcp import server  # noqa: E402
+from aiworkhub import cli_adapter_readonly_tool as ro  # noqa: E402
+from aiworkhub import core  # noqa: E402
+from aiworkhub import server  # noqa: E402
 
 
 # --- frozen read-only contract v1 -----------------------------------------
 READONLY_TOOLS: tuple[str, ...] = (
-    "geoai_task_health",
-    "geoai_task_review_queue",
-    "geoai_task_list",
-    "geoai_task_show",
-    "geoai_task_pending_for_runner",
-    "geoai_task_collision_guard",
-    "geoai_task_usage_report",
-    "geoai_task_audit_log_read",
-    "geoai_cli_adapter_plan_readonly",
-    "geoai_cli_adapter_audit_summary_readonly",
-    "geoai_cli_adapter_report_readonly",
+    "aiworkhub_task_health",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_list",
+    "aiworkhub_task_show",
+    "aiworkhub_task_pending_for_runner",
+    "aiworkhub_task_collision_guard",
+    "aiworkhub_task_usage_report",
+    "aiworkhub_task_audit_log_read",
+    "aiworkhub_cli_adapter_plan_readonly",
+    "aiworkhub_cli_adapter_audit_summary_readonly",
+    "aiworkhub_cli_adapter_report_readonly",
 )
 
 WRITE_GATED_TOOLS: tuple[str, ...] = (
-    "geoai_task_auto_pickup",
-    "geoai_task_mark_review",
-    "geoai_task_mark_done",
-    "geoai_task_export_jsonl",
+    "aiworkhub_task_auto_pickup",
+    "aiworkhub_task_mark_review",
+    "aiworkhub_task_mark_done",
+    "aiworkhub_task_export_jsonl",
 )
 
 # Byte-canonical sha256(inputSchema) frozen at B108. A drift in ANY tool's
 # input schema flips frozen_contract_v1 to false -> this is the freeze.
 FROZEN_SCHEMA_FINGERPRINTS: dict[str, str] = {
-    "geoai_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
-    "geoai_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
-    "geoai_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
-    "geoai_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
-    "geoai_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
-    "geoai_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
-    "geoai_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
-    "geoai_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
-    "geoai_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
-    "geoai_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
-    "geoai_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
-    "geoai_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
-    "geoai_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
-    "geoai_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
-    "geoai_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
+    "aiworkhub_cli_adapter_audit_summary_readonly": "6ab96b247924a28d5d793064a61e50c59f46a771c53459ec1197e3acca973fee",
+    "aiworkhub_cli_adapter_plan_readonly": "7a79866fe17cd414929fc7e59898311436ce102d826637f7bac3df870cc49c9e",
+    "aiworkhub_cli_adapter_report_readonly": "f80f2283b05d851f6fe1a405930efb9f65e39e7f2d501dc70ed5635ab5ca538c",
+    "aiworkhub_task_audit_log_read": "74c684c110e619ef2e3c8c01e59beb938438df93b3c4a0de9c661bc9fd93203d",
+    "aiworkhub_task_auto_pickup": "fff78a02b8d8a49a54a9d7c5ea8fabdda817fd3bffdcd12bc560cdc5f7051866",
+    "aiworkhub_task_collision_guard": "acfe0038d2537d852cd25d46d0021a0e38a8227a8ab0f8cce9deaef2b8feaf36",
+    "aiworkhub_task_export_jsonl": "bef633b8f2ef490b50629465aaad568676cd573cdd12e642875b19d9a3c02579",
+    "aiworkhub_task_health": "091219a847dddf8926f5a41e7deb3ad33704df05434e23409bceab171e305aeb",
+    "aiworkhub_task_list": "eb3d9dcce2e6679c3f9f77cd0a9b689d6e553a0119d944cf8e9f7dde3170fef9",
+    "aiworkhub_task_mark_done": "571fa3749c5713a752de7557b3ad5f5520fc6d0a2c0bc56d0de89632e0b76cd2",
+    "aiworkhub_task_mark_review": "f108d09c8f51dab3dfe79808e34fa7df610141b0992c0b4ac7abe660cc016344",
+    "aiworkhub_task_pending_for_runner": "37de6b3d912cfa4d5deab2f1ae2c1e03eeac9e552de7678604d4309c33227a13",
+    "aiworkhub_task_review_queue": "3db01bcd01ceec23a2caf5d7df6b28c5a452c03ac9a482eeeb5a48c5dd2142fc",
+    "aiworkhub_task_show": "197d2041187737888044d493380cb4d2a233d2195557a52b6a275cb914977dd0",
+    "aiworkhub_task_usage_report": "9aeda83460cd1edb99761473dd1aebbd6ddedfa3f96f02b5e2aeae702425168a",
 }
 
 # Read-only tools_call payloads (client path) -- required args supplied.
 READONLY_CALL_ARGS: dict[str, dict[str, Any]] = {
-    "geoai_task_health": {},
-    "geoai_task_review_queue": {},
-    "geoai_task_list": {"status": "pending", "limit": 3},
-    "geoai_task_show": {"task_id": "CLAUDE_TASK_MCP_CLIENT_SMOKE_CONTRACT_FREEZE_B108_V1"},
-    "geoai_task_pending_for_runner": {"runner": "claude_task_mcp_client_smoke_b108"},
-    "geoai_task_collision_guard": {"print_json": True},
-    "geoai_task_usage_report": {},
-    "geoai_task_audit_log_read": {"max_entries": 10},
-    "geoai_cli_adapter_plan_readonly": {
+    "aiworkhub_task_health": {},
+    "aiworkhub_task_review_queue": {},
+    "aiworkhub_task_list": {"status": "pending", "limit": 3},
+    "aiworkhub_task_show": {"task_id": "CLAUDE_TASK_MCP_CLIENT_SMOKE_CONTRACT_FREEZE_B108_V1"},
+    "aiworkhub_task_pending_for_runner": {"runner": "claude_task_mcp_client_smoke_b108"},
+    "aiworkhub_task_collision_guard": {"print_json": True},
+    "aiworkhub_task_usage_report": {},
+    "aiworkhub_task_audit_log_read": {"max_entries": 10},
+    "aiworkhub_cli_adapter_plan_readonly": {
         "task_id": "B108-PLAN", "runner": "b108_smoke", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["claude", "-p", "hi"],
     },
-    "geoai_cli_adapter_audit_summary_readonly": {"max_entries": 10},
-    "geoai_cli_adapter_report_readonly": {
+    "aiworkhub_cli_adapter_audit_summary_readonly": {"max_entries": 10},
+    "aiworkhub_cli_adapter_report_readonly": {
         "task_id": "B108-REPORT", "runner": "b108_smoke", "topic": "task_mcp",
         "adapter_id": "claude_cli", "argv": ["codex", "exec", "review"],
     },
@@ -185,10 +185,10 @@ def run_smoke() -> dict[str, Any]:
 
     # Isolate the MCP-owned audit state dir so byte-identity cannot be
     # perturbed by a concurrent worker. Restore env on exit.
-    prev_audit = os.environ.get("GEOAI_TASK_MCP_AUDIT_LOG_PATH")
-    prev_allow = os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES")
-    state_dir = Path(tempfile.mkdtemp(prefix="geoai_b108_smoke_"))
-    os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = str(state_dir / "audit.jsonl")
+    prev_audit = os.environ.get("AIWORKHUB_AUDIT_LOG_PATH")
+    prev_allow = os.environ.get("AIWORKHUB_ALLOW_WRITES")
+    state_dir = Path(tempfile.mkdtemp(prefix="aiworkhub_b108_smoke_"))
+    os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = str(state_dir / "audit.jsonl")
 
     try:
         # --- C1/C2 visibility + C3 schema stability (two client sessions) --
@@ -217,7 +217,7 @@ def run_smoke() -> dict[str, Any]:
         detail["frozen_schema_fingerprints"] = FROZEN_SCHEMA_FINGERPRINTS
 
         # --- C4 no-write with ALLOW_WRITES unset ---------------------------
-        os.environ.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+        os.environ.pop("AIWORKHUB_ALLOW_WRITES", None)
         r_unset = asyncio.run(_run_readonly_round_via_client(state_dir))
         checks["no_write_allow_unset"] = bool(
             r_unset.get("ok") and r_unset.get("state_byte_identical")
@@ -226,7 +226,7 @@ def run_smoke() -> dict[str, Any]:
         detail["round_allow_unset"] = r_unset
 
         # --- C5 no-write with ALLOW_WRITES=1 -------------------------------
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = "1"
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = "1"
         r_set = asyncio.run(_run_readonly_round_via_client(state_dir))
         checks["no_write_allow_set"] = bool(
             r_set.get("ok") and r_set.get("state_byte_identical")
@@ -235,7 +235,7 @@ def run_smoke() -> dict[str, Any]:
         detail["round_allow_set"] = r_set
 
         # --- C6 no process launch ------------------------------------------
-        server_src = (Path(SRC) / "geoai_task_mcp" / "server.py").read_text(encoding="utf-8")
+        server_src = (Path(SRC) / "aiworkhub" / "server.py").read_text(encoding="utf-8")
         launch_hits = [p for p in LAUNCH_PATTERNS if p in server_src]
         checks["no_process_launch"] = (
             not launch_hits
@@ -248,13 +248,13 @@ def run_smoke() -> dict[str, Any]:
     finally:
         # Restore env; drop the private state dir.
         if prev_audit is None:
-            os.environ.pop("GEOAI_TASK_MCP_AUDIT_LOG_PATH", None)
+            os.environ.pop("AIWORKHUB_AUDIT_LOG_PATH", None)
         else:
-            os.environ["GEOAI_TASK_MCP_AUDIT_LOG_PATH"] = prev_audit
+            os.environ["AIWORKHUB_AUDIT_LOG_PATH"] = prev_audit
         if prev_allow is None:
-            os.environ.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+            os.environ.pop("AIWORKHUB_ALLOW_WRITES", None)
         else:
-            os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = prev_allow
+            os.environ["AIWORKHUB_ALLOW_WRITES"] = prev_allow
         shutil.rmtree(state_dir, ignore_errors=True)
 
     for name, passed in checks.items():

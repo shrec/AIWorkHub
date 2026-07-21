@@ -19,12 +19,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     import types
 
     try:
-        importlib.import_module("geoai_task_mcp.deepseek_credentials")
+        importlib.import_module("aiworkhub.deepseek_credentials")
         return
     except ImportError:
         pass
 
-    stub = types.ModuleType("geoai_task_mcp.deepseek_credentials")
+    stub = types.ModuleType("aiworkhub.deepseek_credentials")
 
     class CredentialError(Exception):
         def __init__(self, reason: str = "deepseek_credential_stub_environment") -> None:
@@ -40,12 +40,12 @@ def _ensure_deepseek_credentials_stub() -> None:
     stub.CredentialError = CredentialError
     stub.load_credential = load_credential
     stub.adapter_readiness = adapter_readiness
-    sys.modules["geoai_task_mcp.deepseek_credentials"] = stub
+    sys.modules["aiworkhub.deepseek_credentials"] = stub
 
 
 _ensure_deepseek_credentials_stub()
 
-from geoai_task_mcp import dashboard, process_launcher, project_context  # noqa: E402
+from aiworkhub import dashboard, process_launcher, project_context  # noqa: E402
 
 
 def _write_tool(path: Path, body: str) -> None:
@@ -57,18 +57,71 @@ def _write_tool(path: Path, body: str) -> None:
         pass
 
 
-def _repo(tmp_path: Path, *, source_payload: str) -> Path:
+def _stub_source_graph_direct(
+    monkeypatch: pytest.MonkeyPatch, payload: str, *, capture: dict | None = None
+) -> None:
+    """Deterministic in-process Source Graph stub (B849 canonical authority).
+
+    Since B849, ``collect_project_context`` calls
+    ``aiworkhub.source_graph`` directly in-process -- no subprocess, no
+    ``AITools/source_graph.py`` dependency. B866 proved the fixture
+    pattern: monkeypatch ``project_context._source_graph_direct`` rather
+    than shelling out to a fake script.
+    """
+
+    def fake_direct(repo: Path, contract: dict) -> tuple[str, bool]:
+        if capture is not None:
+            capture["contract"] = contract
+        return payload, False
+
+    monkeypatch.setattr(project_context, "_source_graph_direct", fake_direct)
+
+
+def _stub_worker_tools_direct(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_hit: bool = True,
+    memory_hit: bool = True,
+    kb_hit: bool = True,
+) -> None:
+    """Deterministic in-process Session Manager / AI Memory / KB stub
+    (B879 canonical authority). ``collect_project_context`` calls
+    ``worker_ai_tools_mcp.session_current_state`` / ``ai_memory_search`` /
+    ``kb_search`` in-process against the repository's canonical
+    ``.aiworkhub`` SQLite authority -- no subprocess, no ``AITools/*.py``
+    dependency. Monkeypatching these call sites directly mirrors the
+    accepted ``_stub_source_graph_direct`` pattern for Source Graph.
+    """
+
+    def fake_session(ctx, *, limit: int = 12):
+        evidence = (
+            [{"source_id": "1", "timestamp": "2026-01-01T00:00:00Z", "kind": "progress", "snippet": "bounded"}]
+            if session_hit else []
+        )
+        content = json.dumps(
+            {"state": "partial_state" if session_hit else "unknown", "topic": ctx.session_topic, "evidence": evidence},
+            sort_keys=True,
+        )
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(evidence)}
+
+    def fake_memory(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "ctx", "value": "bounded", "tags": "decision"}] if memory_hit else []
+        content = json.dumps({"count": len(results), "results": results}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    def fake_kb(ctx, *, query: str, limit: int = 8):
+        results = [{"key": "module.task_mcp_context", "title": "task_mcp_context", "category": "module"}] if kb_hit else []
+        content = json.dumps({"results": results, "count": len(results)}, sort_keys=True)
+        return {"ok": True, "content": content, "truncated": False, "hit_count": len(results)}
+
+    monkeypatch.setattr(project_context._worker_tools, "session_current_state", fake_session)
+    monkeypatch.setattr(project_context._worker_tools, "ai_memory_search", fake_memory)
+    monkeypatch.setattr(project_context._worker_tools, "kb_search", fake_kb)
+
+
+def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "AITools" / "ai_memory").mkdir(parents=True)
-    _write_tool(
-        repo / "AITools/source_graph.py",
-        f"""
-import json, sys
-(open('source_args.json', 'w')).write(json.dumps(sys.argv))
-print('[*] Language: python (python)')
-print({source_payload!r})
-""",
-    )
     _write_tool(
         repo / "AITools/transcript_graph.py",
         """
@@ -98,7 +151,7 @@ def _card(*, task_type: str = "code", source_required: bool | None = None) -> di
         "mode": "bundle",
         "bundle_type": "feature",
         "query": "Natural language fallback",
-        "targets": ["tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"],
+        "targets": ["tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"],
         "budget": 32,
     }
     if source_required is not None:
@@ -112,7 +165,7 @@ def _card(*, task_type: str = "code", source_required: bool | None = None) -> di
         "claimed_by": "",
         "mode": "data_classification" if task_type == "data_classification" else "code",
         "immutable_input_shard": "lexicon/shards/immutable-001.jsonl",
-        "read_first": ["tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"],
+        "read_first": ["tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"],
         "allowed_writes": ["tools/geoai-task-mcp/eval/out.json"],
         "project_context": {
             "required": True,
@@ -125,16 +178,25 @@ def _card(*, task_type: str = "code", source_required: bool | None = None) -> di
     }
 
 
-def test_exact_source_graph_targets_policy_and_metadata_are_bounded(tmp_path: Path) -> None:
-    repo = _repo(tmp_path, source_payload=json.dumps({"sections": [{"items": [{"file": "process_launcher.py"}]}]}))
+def test_exact_source_graph_targets_policy_and_metadata_are_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    captured: dict = {}
+    _stub_source_graph_direct(
+        monkeypatch,
+        json.dumps({"sections": [{"items": [{"file": "process_launcher.py"}]}]}),
+        capture=captured,
+    )
+    _stub_worker_tools_direct(monkeypatch)
     result = project_context.collect_project_context(repo, _card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
     source = next(section for section in payload["sections"] if section["name"] == "source_graph")
-    assert source["target"] == "tools/geoai-task-mcp/src/geoai_task_mcp/process_launcher.py"
+    assert source["target"] == "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"
     assert source["hit_count"] > 0
-    args = json.loads((repo / "source_args.json").read_text(encoding="utf-8"))
-    assert "Natural language fallback" not in args
+    assert captured["contract"]["source_graph"]["targets_origin"] == "declared"
+    assert captured["contract"]["source_graph"]["targets"][0] == "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"
     assert result.metadata["sections"][0]["requested"] is True
     assert result.metadata["sections"][0]["hit_count"] > 0
     assert "process_launcher.py" not in json.dumps(result.metadata)
@@ -146,7 +208,8 @@ def test_required_empty_code_source_graph_fails_before_claim(monkeypatch: pytest
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setattr(os, "chmod", lambda *args, **kwargs: None)
     monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
-    repo = _repo(tmp_path, source_payload="{}")
+    repo = _repo(tmp_path)
+    _stub_source_graph_direct(monkeypatch, "{}")
     claims: list[tuple] = []
     monkeypatch.setattr(process_launcher.core, "claim_start_exact", lambda *args: claims.append(args) or {"ok": True})
     manager = process_launcher.ProcessManager(
@@ -170,8 +233,12 @@ def test_required_empty_code_source_graph_fails_before_claim(monkeypatch: pytest
     assert claims == []
 
 
-def test_data_classification_source_graph_can_be_non_gating_with_input_shard(tmp_path: Path) -> None:
-    repo = _repo(tmp_path, source_payload="{}")
+def test_data_classification_source_graph_can_be_non_gating_with_input_shard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    _stub_source_graph_direct(monkeypatch, "{}")
+    _stub_worker_tools_direct(monkeypatch)
     result = project_context.collect_project_context(
         repo,
         _card(task_type="data_classification", source_required=False),
@@ -183,8 +250,14 @@ def test_data_classification_source_graph_can_be_non_gating_with_input_shard(tmp
     assert result.metadata["task_context_policy"]["source_graph_required"] is False
 
 
-def test_common_prompt_delivery_and_receipt_are_distinct(tmp_path: Path) -> None:
-    repo = _repo(tmp_path, source_payload=json.dumps({"sections": [{"items": [{"symbol": "ProcessManager"}]}]}))
+def test_common_prompt_delivery_and_receipt_are_distinct(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _repo(tmp_path)
+    _stub_source_graph_direct(
+        monkeypatch, json.dumps({"sections": [{"items": [{"symbol": "ProcessManager"}]}]})
+    )
+    _stub_worker_tools_direct(monkeypatch)
     context_result = project_context.collect_project_context(repo, _card())
     assert context_result is not None
     prompts = [
@@ -251,7 +324,7 @@ def test_common_prompt_delivery_and_receipt_are_distinct(tmp_path: Path) -> None
 def test_dashboard_exposes_compact_ai_infra_without_raw_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     process_log = tmp_path / "events.jsonl"
     event = {
-        "schema_id": "geoai.task_mcp.process_event.v1",
+        "schema_id": "aiworkhub.task_mcp.process_event.v1",
         "timestamp": "2026-07-16T00:00:00+00:00",
         "request_id": "run-b437",
         "task_id": "TASK_B437",

@@ -1,0 +1,119 @@
+{
+  "schema_id": "geoai.task_mcp.public_release_packaging.v2",
+  "task_id": "DEEPSEEK_V4FLASH_AIWORKHUB_PUBLIC_RELEASE_PACKAGING_B842_V2",
+  "runner": "codex",
+  "topic": "task_mcp",
+  "generated_at": "2026-07-21T08:48:03Z",
+  "verdict": "PASS",
+  "release_readiness": "BLOCKED_UNTIL_VERSION_SYNC",
+  "verdict_detail": "The standalone packaging files now fail closed for tests, Python and VSIX package creation, exact artifact presence, workflow artifact upload, and GitHub Release attachment. Manual dispatch checks out the selected tag. The canonical extension scripts npm test and npm run package run in CI and release jobs. Optional registry publication is secret-gated, while configured publication failures remain fatal. The current 0.2.0 Python and 0.5.0 extension versions intentionally fail the new release version gate until package metadata is synchronized by a separately authorized change.",
+  "head_commit": "db89f0ecc88334c33c1be6e3b132cc41e556fdf4",
+  "head_commit_message": "Add repository-authoritative worker tools",
+  "audit_scope": {
+    "standalone_root": ".",
+    "prepared_paths": [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+      "CONTRIBUTING.md",
+      "SECURITY.md",
+      "CODE_OF_CONDUCT.md",
+      "docs/PUBLISHING.md",
+      "eval/aiworkhub_public_release_packaging_b842_v2.json"
+    ],
+    "content_sha256": {
+      ".github/workflows/ci.yml": "1afc19b3d6c2e1727164e70984e7f39397a79445dfecd8940ce2117af8683b45",
+      ".github/workflows/release.yml": "e52dd6ac222f0d102cd3d239f04de98dbced27cbc67c1e6320f7baaa2dfbd9e5",
+      "CONTRIBUTING.md": "962ecce682d1c255a93824a4ee115a89dfaad38e2ca34558c08078bd281f8afe",
+      "SECURITY.md": "5d01a610b90bc8706239ab50b78ca8d755d5a87025a5f571ac10d887ee8b8c95",
+      "CODE_OF_CONDUCT.md": "9bda18c283a017a82e59d9900d284c7721893a286ba371b6ec2a70590a4e785e",
+      "docs/PUBLISHING.md": "4cc7851f9c32f704d865e22557eed2bbc4ffe6a44b15e5f1437671fdf7d8a1ed"
+    },
+    "paths_documented_root_relative": true,
+    "no_fixed_host_paths_in_prepared_files": true,
+    "no_embedded_credentials_in_prepared_files": true,
+    "no_legacy_product_identity_in_prepared_files": true,
+    "no_consumer_project_paths_in_prepared_files": true,
+    "no_tools_geoai_task_mcp_prefix_in_prepared_files": true
+  },
+  "source_graph_evidence": {
+    "incremental_refresh": "python3 AITools/source_graph.py build -i -> No files changed. Nothing to do.",
+    "first_focus": "python3 AITools/source_graph.py focus public_release_packaging 32 --core -> no focus results",
+    "first_slice": "python3 AITools/source_graph.py slice geoai-task-mcp 40 --core -> no slice found",
+    "coverage_note": "The active graph indexes AIWorkHub Python sources but not the workflow and Markdown packaging surface. Exact task-named paths were read after the graph queries; source_graph.toml was not edited because it is outside allowed_writes."
+  },
+  "parallel_review": {
+    "subagents_completed": 3,
+    "mode": "read-only",
+    "converged_findings": [
+      "upload-artifact required explicit if-no-files-found: error",
+      "GitHub Release required exact asset checks and fail_on_unmatched_files: true",
+      "manual workflow dispatch required checkout of inputs.tag",
+      "release workflow required Python tests/build plus npm test before npm run package",
+      "Python and extension versions are currently inconsistent and require a fail-closed release gate"
+    ]
+  },
+  "acceptance_checks": [
+    {
+      "id": "AC_01",
+      "status": "PASS",
+      "description": "CI uses standalone paths, runs Python tests, builds Python distributions, runs canonical extension scripts, and uploads exact artifacts fail closed.",
+      "evidence": ".github/workflows/ci.yml uses pyproject.toml through pip install -e ., tests/, dist/aiworkhub-* distributions, npm test, npm run package, and vscode-extension/dist/aiworkhub-*.vsix. Exact-one and non-empty assertions precede uploads; both upload actions set if-no-files-found: error."
+    },
+    {
+      "id": "AC_02",
+      "status": "PASS",
+      "description": "Release tests and builds both products from the selected tag before release creation.",
+      "evidence": ".github/workflows/release.yml checks out inputs.tag for manual dispatch, compares the tag to pyproject.toml and vscode-extension/package.json, runs pytest, builds wheel/sdist in dist/, runs npm test, and runs npm run package."
+    },
+    {
+      "id": "AC_03",
+      "status": "PASS",
+      "description": "Artifact upload and GitHub Release attachment fail closed.",
+      "evidence": "Build and release jobs assert exactly one non-empty wheel, sdist, and VSIX. upload-artifact uses if-no-files-found: error. softprops/action-gh-release uses fail_on_unmatched_files: true and attaches both Python distributions plus release-assets/vscode/aiworkhub-*.vsix."
+    },
+    {
+      "id": "AC_04",
+      "status": "PASS",
+      "description": "Optional registry jobs are secret-gated and configured failures remain fatal.",
+      "evidence": "Download and publish steps are skipped only when their registry token is absent. When configured, each job checks exactly one non-empty VSIX and runs its publication command without continue-on-error or error suppression."
+    },
+    {
+      "id": "AC_05",
+      "status": "PASS",
+      "description": "Publishing and contribution docs use standalone root-relative package, test, extension, and distribution paths.",
+      "evidence": "docs/PUBLISHING.md and CONTRIBUTING.md use pyproject.toml, tests/, dist/, vscode-extension/, and vscode-extension/dist/aiworkhub-*.vsix without a tools/geoai-task-mcp prefix or fixed host path."
+    },
+    {
+      "id": "AC_06",
+      "status": "PASS",
+      "description": "The repair stayed within the explicit file-preparation write scope.",
+      "evidence": "No runtime source, test, extension implementation, package manifest, Git history, tag, remote, publication, or release was changed by this repair."
+    }
+  ],
+  "validation": {
+    "commands": [
+      "PYTHONDONTWRITEBYTECODE=1 python3 -c '<ruamel.yaml structural workflow validation>'",
+      "PYTHONDONTWRITEBYTECODE=1 python3 -c '<fail-closed and forbidden-path assertions>'",
+      "python3 -m json.tool eval/aiworkhub_public_release_packaging_b842_v2.json",
+      "git diff --check -- .github CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md docs/PUBLISHING.md eval/aiworkhub_public_release_packaging_b842_v2.json"
+    ],
+    "yaml_parser": "ruamel.yaml safe loader with YAML 1.2 on-key semantics",
+    "runtime_tests_run": false,
+    "local_packages_created": false,
+    "reason_packages_not_created": "Local package creation would write dist/ and vscode-extension/dist/, which are outside the task's allowed_writes. The workflows invoke the canonical build scripts and guard their outputs instead.",
+    "no_commit": true,
+    "no_push": true,
+    "no_tag": true,
+    "no_release": true,
+    "no_publication": true
+  },
+  "remaining_risks": [
+    "pyproject.toml is version 0.2.0 while vscode-extension/package.json is 0.5.0. The release workflow now fails before build/publication until an authorized metadata change synchronizes them with the tag.",
+    "README.md still contains monorepo-era tools/geoai-task-mcp paths and vscode-extension/README.md names a 0.4.0 VSIX. Both inputs are outside this task's allowed_writes and remain for Codex review.",
+    "The canonical npm test script currently runs only test/extension-static.test.js. Expanding that script or extension tests is outside allowed_writes.",
+    "No package-lock.json is present and optional npx publisher CLIs are not version-pinned; those files or metadata are outside the permitted repair scope.",
+    "actionlint is unavailable. YAML was structurally validated with ruamel.yaml, but GitHub expression and third-party action schemas were not executed on GitHub.",
+    "The rejected eval/aiworkhub_public_release_packaging_b842_v1.json remains in the worktree because only the v2 eval path is writable for this repair. This v2 record supersedes its overstated PASS evidence.",
+    "The prepared public-release files are untracked relative to the current repository HEAD and require Codex review; this task intentionally made no commit."
+  ]
+}

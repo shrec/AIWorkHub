@@ -26,7 +26,7 @@ Hard invariants:
     (done/review/auto-pickup/export-jsonl/usage/stage/guard-staged) is
     ever invoked.
   * NO QUEUE I/O: this module never imports or calls taskctl in any form;
-    it only reads eval/tests/scripts paths under tools/geoai-task-mcp/.
+    it only reads eval/tests/scripts paths under tools/aiworkhub/.
   * Every audit result carries machine-readable ``invalid_reasons`` and a
     ``reviewer_action`` in {"accept_for_codex_review",
     "reject_return_to_worker"}.
@@ -52,8 +52,8 @@ LAUNCH_IMPLEMENTED: bool = False
 SUBPROCESS_LAUNCH_TRIPWIRE: int = 0
 QUEUE_MUTATION_TRIPWIRE: int = 0
 
-REPO = Path(os.environ.get("GEOAI_REPO", "/home/shrek/GeoAI")).expanduser().resolve()
-MCP_ROOT = REPO / "tools" / "geoai-task-mcp"
+REPO = Path(os.environ.get("AIWORKHUB_REPO", "/home/shrek/AIWorkHub")).expanduser().resolve()
+MCP_ROOT = REPO / "tools" / "aiworkhub"
 EVAL_DIR = MCP_ROOT / "eval"
 DATA_DIR = MCP_ROOT / "data" / "tasking"
 
@@ -420,7 +420,7 @@ def build_report(waves: list[dict[str, Any]] | None = None,
     verdict = "PASS" if checks_failed == 0 else "FAIL"
 
     report: dict[str, Any] = {
-        "schema_id": "geoai.review_artifact_strictness_guard_eval.v1",
+        "schema_id": "aiworkhub.review_artifact_strictness_guard_eval.v1",
         "contract": CONTRACT,
         "task_id": "CLAUDE_TASK_MCP_REVIEW_ARTIFACT_STRICTNESS_GUARD_B120_V1",
         "runner": "claude_task_mcp_review_strict_b120",
@@ -453,7 +453,7 @@ def build_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for res in report["wave_results"]:
         rows.append({
-            "schema_id": "geoai.review_artifact_strictness_guard_row.v1",
+            "schema_id": "aiworkhub.review_artifact_strictness_guard_row.v1",
             "wave": res["wave"],
             "invalid": res["invalid"],
             "invalid_reasons": res["invalid_reasons"],

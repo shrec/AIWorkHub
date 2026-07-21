@@ -6,7 +6,7 @@ set -euo pipefail
 # Runs the Python harness that:
 #   - builds a TEMP fixture review queue (per-test mktemp dir)
 #   - invokes review_summarizer.build_codex_handoff_report + the registered
-#     server tool geoai_task_codex_handoff
+#     server tool aiworkhub_task_codex_handoff
 #   - asserts all handoff fields present (task_id, allowed_writes, validation,
 #     risks, commit_hygiene, recommended stage list)
 #   - asserts ZERO mutation of the queue (fixture dir hash unchanged +
@@ -17,25 +17,25 @@ set -euo pipefail
 # wrapper writes no fixed shared path and performs no real parent-queue write.
 #
 # Usage:
-#   GEOAI_TASK_MCP_ALLOW_WRITES=0 bash \
+#   AIWORKHUB_ALLOW_WRITES=0 bash \
 #     tools/geoai-task-mcp/tests/test_mcp_codex_handoff_e2e_b116_v1.sh
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_ALLOW_WRITES="${GEOAI_TASK_MCP_ALLOW_WRITES:-0}"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_ALLOW_WRITES="${AIWORKHUB_ALLOW_WRITES:-0}"
 
 echo "=== B116 MCP Codex Handoff E2E Test ==="
 echo "ROOT=$ROOT"
 echo "PYTHONPATH=$PYTHONPATH"
-echo "GEOAI_TASK_MCP_ALLOW_WRITES=$GEOAI_TASK_MCP_ALLOW_WRITES"
+echo "AIWORKHUB_ALLOW_WRITES=$AIWORKHUB_ALLOW_WRITES"
 echo ""
 
 # ── Validate ALLOW_WRITES is off (write gate must stay default-off) ─────
-if [ "$GEOAI_TASK_MCP_ALLOW_WRITES" != "0" ]; then
-    echo "FATAL: GEOAI_TASK_MCP_ALLOW_WRITES must be 0, got '$GEOAI_TASK_MCP_ALLOW_WRITES'"
+if [ "$AIWORKHUB_ALLOW_WRITES" != "0" ]; then
+    echo "FATAL: AIWORKHUB_ALLOW_WRITES must be 0, got '$AIWORKHUB_ALLOW_WRITES'"
     exit 2
 fi
 

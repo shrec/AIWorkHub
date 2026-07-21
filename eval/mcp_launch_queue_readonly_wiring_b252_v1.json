@@ -12,7 +12,7 @@
     "local_docs_sufficient": true,
     "reason": "Pure repo-local wiring of two already-existing local contract modules (launch_queue_contract.py, launch_queue_persist.py) into an already-live FastMCP server instance, mirroring an already-implemented local pattern (cli_adapter_readonly_tool.py). No external MCP-SDK/API question was open."
   },
-  "summary": "Wired launch_queue_contract.py's describe_intent/evaluate_launch and launch_queue_persist.py's read_persisted_log as 3 new READ-ONLY @mcp.tool()s in server.py: geoai_launch_queue_describe_readonly, geoai_launch_queue_evaluate_readonly, geoai_launch_queue_audit_summary_readonly. Neither source module was modified (both excluded from this task's allowed_writes) -- server.py imports them directly and calls their existing pure functions, mirroring the B106 cli_adapter_readonly_tool read-only-view pattern without adding a register()-style helper to either module. describe_intent is always called with audit=False (its only write-refusing path); evaluate_launch and read_persisted_log have no write path in the first place. launch_enabled()/LAUNCH_IMPLEMENTED stay hardcoded False, unchanged and unread as toggles by these tools.",
+  "summary": "Wired launch_queue_contract.py's describe_intent/evaluate_launch and launch_queue_persist.py's read_persisted_log as 3 new READ-ONLY @mcp.tool()s in server.py: aiworkhub_launch_queue_describe_readonly, aiworkhub_launch_queue_evaluate_readonly, aiworkhub_launch_queue_audit_summary_readonly. Neither source module was modified (both excluded from this task's allowed_writes) -- server.py imports them directly and calls their existing pure functions, mirroring the B106 cli_adapter_readonly_tool read-only-view pattern without adding a register()-style helper to either module. describe_intent is always called with audit=False (its only write-refusing path); evaluate_launch and read_persisted_log have no write path in the first place. launch_enabled()/LAUNCH_IMPLEMENTED stay hardcoded False, unchanged and unread as toggles by these tools.",
   "gates": {
     "readonly_tools_only_no_execute_spawn_subprocess": true,
     "launch_enabled_false_unchanged": true,
@@ -37,28 +37,28 @@
     "launch_enabled_by_default": false,
     "launch_queue_contract_launch_queue_persist_unmodified": true,
     "audit_summary_delegates_to": "launch_queue_persist.read_persisted_log (plain file read, never creates the log)",
-    "audit_log_path_override_env": "GEOAI_TASK_MCP_LAUNCH_QUEUE_LOG_PATH"
+    "audit_log_path_override_env": "AIWORKHUB_LAUNCH_QUEUE_LOG_PATH"
   },
   "new_readonly_tools": [
-    "geoai_launch_queue_describe_readonly",
-    "geoai_launch_queue_evaluate_readonly",
-    "geoai_launch_queue_audit_summary_readonly"
+    "aiworkhub_launch_queue_describe_readonly",
+    "aiworkhub_launch_queue_evaluate_readonly",
+    "aiworkhub_launch_queue_audit_summary_readonly"
   ],
   "public_api": {
-    "geoai_launch_queue_describe_readonly(task_id, runner, topic, adapter_id, argv_template=None, priority='normal')": "dry-run intent+decision dict via launch_queue_contract.describe_intent(audit=False); writes nothing",
-    "geoai_launch_queue_evaluate_readonly(task_id, runner, topic, adapter_id, argv_template=None, priority='normal')": "LaunchDecision dict via launch_queue_contract.evaluate_launch; permitted always False",
-    "geoai_launch_queue_audit_summary_readonly(max_entries=100)": "read-only summary via launch_queue_persist.read_persisted_log; counts + last N entries"
+    "aiworkhub_launch_queue_describe_readonly(task_id, runner, topic, adapter_id, argv_template=None, priority='normal')": "dry-run intent+decision dict via launch_queue_contract.describe_intent(audit=False); writes nothing",
+    "aiworkhub_launch_queue_evaluate_readonly(task_id, runner, topic, adapter_id, argv_template=None, priority='normal')": "LaunchDecision dict via launch_queue_contract.evaluate_launch; permitted always False",
+    "aiworkhub_launch_queue_audit_summary_readonly(max_entries=100)": "read-only summary via launch_queue_persist.read_persisted_log; counts + last N entries"
   },
   "neural_bridge_note": "This wiring adds no new decision authority: describe/evaluate/audit_summary are pure views over an already-disabled contract (launch_enabled() hardcoded False). The eventual adapter/runner/topic SELECTION for any future launcher remains scoped to MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1 (a learned routing + abstain policy), never a regex/keyword cue router; the static LAUNCHABLE_BINARIES/KNOWN_ADAPTERS allowlist stays a human-configured safety boundary underneath it.",
   "no_launch_code_marker": "server.py, launch_queue_contract.py, and launch_queue_persist.py contain no process-launch code: no subprocess import, no child-process spawn, no os-level exec/fork/spawn/system/popen, no shell invocation, no network/API call.",
   "files_changed": [
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-    "tools/geoai-task-mcp/tests/test_mcp_launch_queue_readonly_wiring_b252_v1.sh",
-    "tools/geoai-task-mcp/eval/mcp_launch_queue_readonly_wiring_b252_v1.json",
-    "tools/geoai-task-mcp/data/tasking/mcp_launch_queue_readonly_wiring_next_wave_b252_v1.json"
+    "tools/aiworkhub/src/aiworkhub/server.py",
+    "tools/aiworkhub/tests/test_mcp_launch_queue_readonly_wiring_b252_v1.sh",
+    "tools/aiworkhub/eval/mcp_launch_queue_readonly_wiring_b252_v1.json",
+    "tools/aiworkhub/data/tasking/mcp_launch_queue_readonly_wiring_next_wave_b252_v1.json"
   ],
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_launch_queue_readonly_wiring_b252_v1.sh -> PASS",
+    "bash tools/aiworkhub/tests/test_mcp_launch_queue_readonly_wiring_b252_v1.sh -> PASS",
     "python3 AITools/taskctl.py verify -> PASS"
   ],
   "commit_contract": "NO_COMMIT",

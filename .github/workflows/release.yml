@@ -1,0 +1,231 @@
+# Tag-driven AIWorkHub release - Python distributions and VSIX
+# Marketplace and Open VSX publication are optional, gated on
+# explicit repository secrets (OVSX_TOKEN / MARKETPLACE_TOKEN).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v<x.y.z> tag to release"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build VSIX and Python package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify release versions
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"release tag must start with v: {tag}")
+
+          with pathlib.Path("pyproject.toml").open("rb") as stream:
+              python_version = tomllib.load(stream)["project"]["version"]
+          extension_version = json.loads(
+              pathlib.Path("vscode-extension/package.json").read_text()
+          )["version"]
+          expected = tag[1:]
+
+          if python_version != expected or extension_version != expected:
+              raise SystemExit(
+                  "release version mismatch: "
+                  f"tag={expected}, pyproject.toml={python_version}, "
+                  f"vscode-extension/package.json={extension_version}"
+              )
+          PY
+
+      - name: Install Python test and build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel build
+          python -m pip install -e .
+          python -m pip install "pytest>=8,<10"
+
+      - name: Run Python tests
+        run: python -m pytest tests/ -v --tb=short -x
+
+      - name: Build Python distributions
+        run: python -m build --outdir dist
+
+      - name: Verify Python distributions
+        run: |
+          shopt -s nullglob
+          wheels=(dist/aiworkhub-*.whl)
+          sdists=(dist/aiworkhub-*.tar.gz)
+          (( ${#wheels[@]} == 1 ))
+          (( ${#sdists[@]} == 1 ))
+          test -s "${wheels[0]}"
+          test -s "${sdists[0]}"
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiworkhub-python-dist
+          path: |
+            dist/aiworkhub-*.whl
+            dist/aiworkhub-*.tar.gz
+          if-no-files-found: error
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: vscode-extension
+
+      - name: Run extension tests
+        run: npm test
+        working-directory: vscode-extension
+
+      - name: Package VSIX
+        run: npm run package
+        working-directory: vscode-extension
+
+      - name: Verify VSIX
+        run: |
+          shopt -s nullglob
+          vsix=(vscode-extension/dist/aiworkhub-*.vsix)
+          (( ${#vsix[@]} == 1 ))
+          test -s "${vsix[0]}"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiworkhub-vsix
+          path: vscode-extension/dist/aiworkhub-*.vsix
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Python distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: aiworkhub-python-dist
+          path: release-assets/python/
+
+      - name: Download VSIX
+        uses: actions/download-artifact@v4
+        with:
+          name: aiworkhub-vsix
+          path: release-assets/vscode/
+
+      - name: Verify release assets
+        run: |
+          shopt -s nullglob
+          wheels=(release-assets/python/aiworkhub-*.whl)
+          sdists=(release-assets/python/aiworkhub-*.tar.gz)
+          vsix=(release-assets/vscode/aiworkhub-*.vsix)
+          (( ${#wheels[@]} == 1 ))
+          (( ${#sdists[@]} == 1 ))
+          (( ${#vsix[@]} == 1 ))
+          test -s "${wheels[0]}"
+          test -s "${sdists[0]}"
+          test -s "${vsix[0]}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: AIWorkHub ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          body: |
+            ## AIWorkHub Release
+
+            See the repository commit history for details.
+
+            ### Installation
+
+            ```bash
+            # VS Code / Cursor / Windsurf
+            code --install-extension aiworkhub-*.vsix
+
+            # Remote-SSH: install on the remote host workspace
+            ```
+          draft: true
+          prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/python/aiworkhub-*.whl
+            release-assets/python/aiworkhub-*.tar.gz
+            release-assets/vscode/aiworkhub-*.vsix
+
+  publish-open-vsx:
+    name: Publish to Open VSX Registry
+    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+
+    steps:
+      - name: Download VSIX
+        if: env.OVSX_TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: aiworkhub-vsix
+          path: registry-assets/
+
+      - name: Publish to Open VSX
+        if: env.OVSX_TOKEN != ''
+        run: |
+          shopt -s nullglob
+          vsix=(registry-assets/aiworkhub-*.vsix)
+          (( ${#vsix[@]} == 1 ))
+          test -s "${vsix[0]}"
+          npx --yes ovsx publish "${vsix[0]}" -p "$OVSX_TOKEN" --skip-duplicate
+
+  publish-marketplace:
+    name: Publish to VS Code Marketplace
+    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
+
+    steps:
+      - name: Download VSIX
+        if: env.MARKETPLACE_TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: aiworkhub-vsix
+          path: registry-assets/
+
+      - name: Publish to Marketplace
+        if: env.MARKETPLACE_TOKEN != ''
+        run: |
+          shopt -s nullglob
+          vsix=(registry-assets/aiworkhub-*.vsix)
+          (( ${#vsix[@]} == 1 ))
+          test -s "${vsix[0]}"
+          npx --yes @vscode/vsce publish --packagePath "${vsix[0]}" -p "$MARKETPLACE_TOKEN"

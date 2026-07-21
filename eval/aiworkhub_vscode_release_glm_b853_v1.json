@@ -1,0 +1,41 @@
+{
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_VSCODE_RELEASE_GLM_B853_V1",
+  "schema_id": "geoai.task_mcp.worker_eval.v1",
+  "verdict": "review",
+  "summary": "Removed the HTTP/browser/port-8765 runtime from aiworkhub/dashboard.py while keeping build_snapshot/build_task_detail; added bounded, user-triggered VS Code Language Model API capability discovery and a GLM canary (explicit credit-confirmation modal, single fixed prompt, cancellable, output-capped, no tools, no repo writes, never automatic); packaged VSIX 0.5.0.",
+  "acceptance_checks": [
+    {"id": "no_http_runtime", "status": "pass", "evidence": "src/aiworkhub/dashboard.py has no http.server/HTTPServer/serve_forever/webbrowser/argparse/socket import, no create_server/main, no literal 8765; verified by tests/test_aiworkhub_vscode_release_b853.py::test_dashboard_has_no_http_runtime[*]"},
+    {"id": "builders_functional", "status": "pass", "evidence": "build_snapshot/build_task_detail exercised against a fake provider in test_build_snapshot_is_functional / test_build_task_detail_is_functional / test_build_snapshot_fails_closed_when_storage_not_ready"},
+    {"id": "init_button_refresh_timer_preserved", "status": "pass", "evidence": "extension.js retains getHtmlForWebview's single #initialize-button, ViewState.reschedule()/setInterval refresh timer, and the editor-tab createWebviewPanel path unchanged"},
+    {"id": "lm_capability_discovery_bounded", "status": "pass", "evidence": "refreshModelCapabilities() calls vscode.lm.selectChatModels only from the 'refreshModelCapabilities' inbound message case; reports AVAILABLE/NOT_VISIBLE/ACCESS_DENIED/REQUEST_FAILED with sanitized vendor/family/version/id/name/maxInputTokens; never referenced from ViewState.reschedule or activation"},
+    {"id": "glm_canary_bounded", "status": "pass", "evidence": "runGlmCanary() requires a native modal 'Send Prompt' confirmation every run, sends exactly GLM_CANARY_FIXED_PROMPT once via sendRequest with no tools option, supports cancellation via CancellationTokenSource, caps kept output at GLM_CANARY_MAX_OUTPUT_CHARS, and writes nothing to the repository; never invoked outside handleInboundMessage"},
+    {"id": "glm_not_advertised_as_worker", "status": "pass", "evidence": "extension.js comments and README document the GLM canary as a bounded discovery/canary check, explicitly not an autonomous Task MCP worker; BYOK subprocess adapters (deepseek_copilot_cli) remain separately documented in README.md"},
+    {"id": "vsix_self_contained_editor_tab", "status": "blocked_by_environment_gap", "evidence": "package-vsix.js requires the full aiworkhub Python package (__init__.py, server.py, dashboard_static/index.html, task_store.py, core.py, etc.) at ../src/aiworkhub; this isolated worktree was seeded with only dashboard.py and dashboard_mcp_app.py (matching this task's read_first/allowed_writes), so those sibling files are absent here and outside this task's allowed_writes -- see blockers"},
+    {"id": "fresh_repo_zero_task_counts", "status": "pass_by_design", "evidence": "dashboard.build_snapshot fails closed to zero task counts / empty rows whenever storage.ready is false (test_build_snapshot_fails_closed_when_storage_not_ready); unchanged from the accepted B850 behavior"}
+  ],
+  "tests": [
+    "PYTHONPATH=tools/geoai-task-mcp/src python3 -m pytest -q tools/geoai-task-mcp/tests/test_aiworkhub_vscode_release_b853.py",
+    "node tools/geoai-task-mcp/vscode-extension/test/extension-static.test.js",
+    "node tools/geoai-task-mcp/vscode-extension/test/explicit-init-no-fallback.test.js",
+    "node tools/geoai-task-mcp/vscode-extension/test/vscode-lm-glm.test.js",
+    "node tools/geoai-task-mcp/vscode-extension/test/package-vsix.js"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/dashboard.py",
+    "tools/geoai-task-mcp/vscode-extension/extension.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.js",
+    "tools/geoai-task-mcp/vscode-extension/media/app.css",
+    "tools/geoai-task-mcp/vscode-extension/package.json",
+    "tools/geoai-task-mcp/vscode-extension/test/extension-static.test.js",
+    "tools/geoai-task-mcp/vscode-extension/test/vscode-lm-glm.test.js",
+    "tools/geoai-task-mcp/vscode-extension/dist/aiworkhub-0.5.0.vsix",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_vscode_release_b853.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_vscode_release_glm_b853_v1.json",
+    "tools/geoai-task-mcp/README.md"
+  ],
+  "blockers": [
+    "This isolated worktree only contains tools/geoai-task-mcp/src/aiworkhub/{dashboard.py,dashboard_mcp_app.py} -- every sibling module (core, task_store, completion_inbox, cost_ledger, deepseek_credentials, process_launcher, repository_state, server, __init__, dashboard_static assets) is absent, and none are in this task's allowed_writes. This blocks a real VSIX build (package-vsix.js requires the full package tree) and blocks explicit-init-no-fallback.test.js (reads task_store.py source directly). tests/test_aiworkhub_vscode_release_b853.py works around the gap the same way tests/test_dashboard.py's _ensure_deepseek_credentials_stub does: install a minimal stub only when a sibling module is genuinely unimportable.",
+    "The host's shared Python environment (/home/shrek/GeoAI/.venv) resolves the aiworkhub package through an editable-install finder pointed at a different (possibly concurrently-edited) checkout, which can shadow PYTHONPATH ordering for plain `import aiworkhub.dashboard`; the eval/test therefore loads dashboard.py/dashboard_mcp_app.py directly by file path to guarantee this worktree's exact files are what get verified."
+  ],
+  "next_task": "coordinator: reconcile this worktree's partial aiworkhub package against the full accepted tree (task_store.py/core.py/server.py/__init__.py/dashboard_static/*), then re-run package-vsix.js and explicit-init-no-fallback.test.js in an environment where those files are present."
+}

@@ -33,7 +33,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 EVAL_JSON="$ROOT/tools/geoai-task-mcp/eval/mcp_autolaunch_protocol_spec_b275_v1.json"
 NEXT_WAVE="$ROOT/tools/geoai-task-mcp/data/tasking/mcp_autolaunch_protocol_spec_next_wave_b275_v1.json"
 
-TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/geoai_mcp_autolaunch_spec_b275_sh.XXXXXX")"
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_mcp_autolaunch_spec_b275_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 PASS=0

@@ -11,8 +11,8 @@ backend to confirm:
   - Never mutate queue/audit state
 
 Usage:
-    GEOAI_TASK_MCP_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
-    GEOAI_REPO=/home/shrek/GeoAI python3 \
+    AIWORKHUB_ALLOW_WRITES=0 PYTHONPATH=tools/geoai-task-mcp/src \
+    AIWORKHUB_REPO=/home/shrek/AIWorkHub python3 \
     tools/geoai-task-mcp/tests/mcp_review_queue_summarizer_smoke.py
 """
 
@@ -27,8 +27,8 @@ from typing import Any
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, os.path.abspath(SRC))
 
-from geoai_task_mcp import review_summarizer
-from geoai_task_mcp.core import TaskCtlResult
+from aiworkhub import review_summarizer
+from aiworkhub.core import TaskCtlResult
 
 
 FAILURES: list[str] = []
@@ -162,10 +162,10 @@ def stub_show_task(task_id: str) -> dict[str, Any]:
 print("=== B110 Review Queue Summarizer Smoke Test ===\n")
 
 # Precondition
-assert os.environ.get("GEOAI_TASK_MCP_ALLOW_WRITES", "0") == "0", (
-    "GEOAI_TASK_MCP_ALLOW_WRITES must be 0"
+assert os.environ.get("AIWORKHUB_ALLOW_WRITES", "0") == "0", (
+    "AIWORKHUB_ALLOW_WRITES must be 0"
 )
-print("precondition: GEOAI_TASK_MCP_ALLOW_WRITES=0  ✓")
+print("precondition: AIWORKHUB_ALLOW_WRITES=0  ✓")
 
 # 1. Module invariants
 if review_summarizer.READONLY is not True:

@@ -3,8 +3,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # test_mcp_completion_inbox_wiring_b275_v1.sh
 # Verifies live @mcp.tool() wiring of the B275 read-only completion-inbox
-# view (geoai_completion_inbox) into the FastMCP server instance in
-# server.py, backed by tools/geoai-task-mcp/src/geoai_task_mcp/
+# view (aiworkhub_completion_inbox) into the FastMCP server instance in
+# server.py, backed by tools/geoai-task-mcp/src/aiworkhub/
 # completion_inbox.py.
 #
 # Checks:
@@ -22,7 +22,7 @@ set -euo pipefail
 #   6. Calling the live MCP tool (real taskctl subprocess) never mutates the
 #      parent queue DB (bitnnv2/data/tasking/task_queue_v1.sqlite) -- byte
 #      size + mtime identical before/after, even with
-#      GEOAI_TASK_MCP_ALLOW_WRITES=1 forced on.
+#      AIWORKHUB_ALLOW_WRITES=1 forced on.
 #   7. authority_flags / mutation block report every write/launch flag as
 #      False regardless of the ALLOW_WRITES env state.
 #   8. Parent task queue integrity via `taskctl.py verify`.
@@ -35,19 +35,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 MCPROOT="$ROOT/tools/geoai-task-mcp"
 
-TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/geoai_completion_inbox_wiring_sh.XXXXXX")"
+TMPDIR_STATE="$(mktemp -d "${TMPDIR:-/tmp}/aiworkhub_completion_inbox_wiring_sh.XXXXXX")"
 trap 'rm -rf "$TMPDIR_STATE"' EXIT
 
 export PYTHONPATH="$MCPROOT/src"
-export GEOAI_REPO="$ROOT"
-export GEOAI_TASK_MCP_AUDIT_LOG_PATH="$TMPDIR_STATE/task_audit.jsonl"
+export AIWORKHUB_REPO="$ROOT"
+export AIWORKHUB_AUDIT_LOG_PATH="$TMPDIR_STATE/task_audit.jsonl"
 
 echo "=== MCP Completion-Inbox Wiring Test B275 v1 ==="
-echo "GEOAI_REPO=$GEOAI_REPO"
+echo "AIWORKHUB_REPO=$AIWORKHUB_REPO"
 echo "STATE_DIR=$TMPDIR_STATE"
 
 # --- 1. server.py / completion_inbox.py source: no launch/exec/shell code --
-for SRC in "$MCPROOT/src/geoai_task_mcp/server.py" "$MCPROOT/src/geoai_task_mcp/completion_inbox.py"; do
+for SRC in "$MCPROOT/src/aiworkhub/server.py" "$MCPROOT/src/aiworkhub/completion_inbox.py"; do
     for pat in "subprocess.Popen" "os.system" "os.popen" "os.exec" "os.fork" "os.spawn" "Popen(" "shell=True" "pty.spawn"; do
         if grep -Fq -- "$pat" "$SRC"; then
             echo "FAIL: forbidden launch pattern '$pat' found in $SRC"
@@ -77,11 +77,11 @@ import os
 
 import jsonschema
 
-from geoai_task_mcp import server
-from geoai_task_mcp import completion_inbox as ci
-from geoai_task_mcp import cli_adapter_readonly_tool as ro
+from aiworkhub import server
+from aiworkhub import completion_inbox as ci
+from aiworkhub import cli_adapter_readonly_tool as ro
 
-NEW_TOOL_NAME = "geoai_completion_inbox"
+NEW_TOOL_NAME = "aiworkhub_completion_inbox"
 
 
 def _call(name, args):
@@ -101,18 +101,18 @@ print(f"PASS: {NEW_TOOL_NAME} registered")
 
 # pre-existing tools (B106/B107 + core + B252 launch-queue) survive.
 PRE_EXISTING = [
-    "geoai_task_health",
-    "geoai_task_review_queue",
-    "geoai_task_list",
-    "geoai_task_show",
-    "geoai_task_audit_log_read",
-    "geoai_task_review_summarize",
-    "geoai_task_codex_handoff",
-    "geoai_task_codex_handoff_markdown",
-    "geoai_supervisor_loop_status",
-    "geoai_launch_queue_describe_readonly",
-    "geoai_launch_queue_evaluate_readonly",
-    "geoai_launch_queue_audit_summary_readonly",
+    "aiworkhub_task_health",
+    "aiworkhub_task_review_queue",
+    "aiworkhub_task_list",
+    "aiworkhub_task_show",
+    "aiworkhub_task_audit_log_read",
+    "aiworkhub_task_review_summarize",
+    "aiworkhub_task_codex_handoff",
+    "aiworkhub_task_codex_handoff_markdown",
+    "aiworkhub_supervisor_loop_status",
+    "aiworkhub_launch_queue_describe_readonly",
+    "aiworkhub_launch_queue_evaluate_readonly",
+    "aiworkhub_launch_queue_audit_summary_readonly",
 ]
 for n in PRE_EXISTING:
     assert n in tools_by_name, n
@@ -128,7 +128,7 @@ assert schema.get("type") == "object", schema
 assert isinstance(schema.get("properties"), dict), schema
 validator_cls = jsonschema.validators.validator_for(schema, default=jsonschema.Draft7Validator)
 validator_cls.check_schema(schema)
-print("PASS: geoai_completion_inbox input schema is valid JSON schema")
+print("PASS: aiworkhub_completion_inbox input schema is valid JSON schema")
 
 # --- 4. build_completion_inbox() with stubbed taskctl I/O -------------------
 NOW_ISO = ci._now().isoformat()
@@ -171,7 +171,7 @@ def _stub_show_task(task_id):
             "updated_at": NOW_ISO,
             "review_at": NOW_ISO,
             "objective": "synthetic review-queue fixture",
-            "allowed_writes": ["tools/geoai-task-mcp/src/geoai_task_mcp/server.py"],
+            "allowed_writes": ["tools/geoai-task-mcp/src/aiworkhub/server.py"],
             "validation_status": "passed",
         },
     }
@@ -188,7 +188,7 @@ facts = ci.build_completion_inbox(
 )
 
 assert facts["readonly"] is True, facts
-assert facts["tool"] == "geoai_completion_inbox", facts
+assert facts["tool"] == "aiworkhub_completion_inbox", facts
 for key in ("review_queue", "stale_processing", "runner_mismatch_warnings", "latest_validation_facts"):
     assert key in facts and isinstance(facts[key], list), (key, facts)
 
@@ -236,9 +236,9 @@ print("PASS: _runner_task_batch_mismatch fires only on a genuine batch-token mis
 # --- 7. authority_flags / mutation block always report no write/launch -----
 for allow_writes in (None, "1"):
     if allow_writes is None:
-        os.environ.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+        os.environ.pop("AIWORKHUB_ALLOW_WRITES", None)
     else:
-        os.environ["GEOAI_TASK_MCP_ALLOW_WRITES"] = allow_writes
+        os.environ["AIWORKHUB_ALLOW_WRITES"] = allow_writes
 
     facts2 = ci.build_completion_inbox(
         topic="task_mcp",
@@ -255,16 +255,16 @@ for allow_writes in (None, "1"):
     assert mut["queue_mutated"] is False, mut
     assert mut["write_command_invoked"] is False, mut
     assert mut["agent_or_process_launched"] is False, mut
-    print(f"PASS: authority_flags/mutation all-False with GEOAI_TASK_MCP_ALLOW_WRITES={allow_writes}")
+    print(f"PASS: authority_flags/mutation all-False with AIWORKHUB_ALLOW_WRITES={allow_writes}")
 
-os.environ.pop("GEOAI_TASK_MCP_ALLOW_WRITES", None)
+os.environ.pop("AIWORKHUB_ALLOW_WRITES", None)
 
 # --- live MCP tool call (real taskctl subprocess) still returns the shape --
 _content, live = _call(NEW_TOOL_NAME, {"topic": "task_mcp", "limit": 50})
 assert live["readonly"] is True, live
 for key in ("review_queue", "stale_processing", "runner_mismatch_warnings", "latest_validation_facts", "counts"):
     assert key in live, (key, live)
-print("PASS: live geoai_completion_inbox MCP tool call returns the full facet shape")
+print("PASS: live aiworkhub_completion_inbox MCP tool call returns the full facet shape")
 
 print("ALL PYTHON CHECKS PASSED")
 PYEOF

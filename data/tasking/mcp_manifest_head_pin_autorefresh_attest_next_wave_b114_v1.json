@@ -6,9 +6,9 @@
   "enqueued": false,
   "notes": "PROPOSAL only, NOT enqueued (worker does NOT create/mutate tasks via taskctl). B114 hardens the B112 git-HEAD pin and the B113 stale-commit guard with a cross-eval AUTOREFRESH ATTESTATION: the whole committed head-pin eval SET (mcp_manifest_git_head_pin_b112_v1.json + mcp_manifest_head_pin_ci_stale_commit_guard_b113_v1.json + this B114 eval) must be UNANIMOUS on one committed_sha256 == the live nested-repo HEAD blob of the B110 manifest (git show HEAD:eval/mcp_unified_contract_freeze_manifest_b110_v1.json). When the manifest HEAD blob legitimately advances, a single canonical refresh path must update ALL of these evals atomically so no committed eval can lag the others. Added to test_mcp_manifest_git_head_pin_b112_v1.sh as section 9 (six checks): 9a asserts the whole eval set shares committed_sha256 == live HEAD blob and recomputes a deterministic attestation signature over the sorted '<eval_rel>:<committed_sha256>' lines; 9b IDEMPOTENCE -- re-running the attestation yields an identical stable signature; 9c LAGGING-EVAL TEETH -- a controlled temp-copy of the set with exactly ONE eval's committed_sha256 frozen to 0*64 is REJECTED non-zero (set no longer unanimous / no longer == HEAD); 9d GIT-CLEAN FALSE-FAIL TRAP -- in a private mktemp git repo the manifest working copy is ADDITIVELY patched (dirty) yet the attestation reads `git show HEAD:<rel>`, so the HEAD blob sha (== eval set) is unchanged and the attestation PASSES while a naive git-clean check would false-FAIL; 9e read-only re-assert; 9f cross-check the committed B114 eval evidence (committed_sha256, eval_set_unanimous, eval_set_matches_head, per_eval map, recorded attestation_signature) against the recomputed attestation. Verified: live HEAD blob sha256=e84445b7f70534be4a5a75a796e8a047808dbbebdd6bed31c4b53dedbf8a6708 == the unanimous eval-set committed_sha256; attestation_signature=380595b8b5748370fd713e5efc65d271bddac276ad74c006729a19b3b8934f41 recomputes and is stable across re-runs; zero drift. READ-ONLY: mutates no tracked file (before/after sha256 of manifest + B114 eval unchanged), launches no agent/model/server, makes no network call, does not enable any write gate; authority_flags all FALSE at worker scope; parent taskctl queue intact (verify PASS). Adapter/runner/topic launch SELECTION remains a LEARNED-router target (MCP_NEURAL_LAUNCH_ROUTING_MIGRATION_V1); this is an ABCR/validator drift-protection tooth over the executor surface, never a runtime cognitive router.",
   "produced_artifacts": [
-    "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
-    "tools/geoai-task-mcp/eval/mcp_manifest_head_pin_autorefresh_attest_b114_v1.json",
-    "tools/geoai-task-mcp/data/tasking/mcp_manifest_head_pin_autorefresh_attest_next_wave_b114_v1.json"
+    "tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh",
+    "tools/aiworkhub/eval/mcp_manifest_head_pin_autorefresh_attest_b114_v1.json",
+    "tools/aiworkhub/data/tasking/mcp_manifest_head_pin_autorefresh_attest_next_wave_b114_v1.json"
   ],
   "attested_eval_set": [
     "eval/mcp_manifest_git_head_pin_b112_v1.json",
@@ -35,7 +35,7 @@
       "goal": "Provide a single canonical refresh tool that, given a new committed B110 manifest HEAD blob sha, rewrites committed_sha256 + the attestation signature across the whole head-pin eval set atomically (all-or-nothing) and re-emits the B114 attestation; prove that a partial refresh (any eval left behind) is rejected non-zero by the B114 attestation.",
       "mode": "NO_COMMIT",
       "allowed_writes": [
-        "tools/geoai-task-mcp/tests/test_mcp_manifest_git_head_pin_b112_v1.sh"
+        "tools/aiworkhub/tests/test_mcp_manifest_git_head_pin_b112_v1.sh"
       ],
       "acceptance": [
         "one refresh path updates ALL head-pin evals atomically to the new HEAD blob sha",

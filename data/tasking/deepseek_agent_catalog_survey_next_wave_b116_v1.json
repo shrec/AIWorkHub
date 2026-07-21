@@ -19,9 +19,9 @@
       "mode": "NO_COMMIT",
       "disabled_by_default": true,
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cli_adapter_dryrun.py",
-        "tools/geoai-task-mcp/tests/test_deepseek_tui_adapter_dryrun_b117_v1.sh",
-        "tools/geoai-task-mcp/eval/deepseek_tui_adapter_dryrun_b117_v1.json"
+        "tools/aiworkhub/src/aiworkhub/cli_adapter_dryrun.py",
+        "tools/aiworkhub/tests/test_deepseek_tui_adapter_dryrun_b117_v1.sh",
+        "tools/aiworkhub/eval/deepseek_tui_adapter_dryrun_b117_v1.json"
       ],
       "acceptance": [
         "adapter registered disabled_by_default=true",

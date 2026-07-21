@@ -59,9 +59,9 @@
     "tools/vscode-geoai-task-operations/extension.js": "86996d9adb79dad2fe3cc5817882a1944bfbd9da7b30fa2e5749f7b7fceb189a",
     "tools/vscode-geoai-task-operations/test_extension_smoke.sh": "42bc99e1eb2cba6023d7447b67bde663d796cd00ec4e92ed09da18ac0bb31f09",
     "tools/vscode-geoai-task-operations/media/app.js": "708e533b5b1ca2d6b6f7e5003288475a9fce4d81c22eca41acbbc8a392e48edd",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py": "00d8e996bb51fbc2d9ec63dd2f394ba8e0087b43872fc39d1ab57cc1f650bc44",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/dashboard_mcp_app.py": "57dbfa7a351da91b3e72da64e94fd68f8eccba1fe8fb2be9ae5a5f32c46d3d8b",
-    "tools/geoai-task-mcp/tests/test_dashboard_mcp_app.py": "9af7b3184fa5a8e3d4433e72fae9d682b25dffaa30a2719e444bb137baa54f8a"
+    "tools/aiworkhub/src/aiworkhub/server.py": "00d8e996bb51fbc2d9ec63dd2f394ba8e0087b43872fc39d1ab57cc1f650bc44",
+    "tools/aiworkhub/src/aiworkhub/dashboard_mcp_app.py": "57dbfa7a351da91b3e72da64e94fd68f8eccba1fe8fb2be9ae5a5f32c46d3d8b",
+    "tools/aiworkhub/tests/test_dashboard_mcp_app.py": "9af7b3184fa5a8e3d4433e72fae9d682b25dffaa30a2719e444bb137baa54f8a"
   },
   "score_effect": "Task MCP operator UX improved; no Signal Atlas score change.",
   "remaining_boundary": "This first native app is intentionally read-only; lifecycle mutations require a separate capability-gated review."

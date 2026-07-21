@@ -12,9 +12,9 @@
       "topic": "task_mcp",
       "priority": "high",
       "mode": "mcp_queue_request_tool_implement_readonly_envelope",
-      "objective": "Implement the geoai_task_queue_request MCP tool in server.py per B281 section_1 queue_request_envelope schema. The tool accepts a queue_request JSON, validates it against the schema, checks idempotency (same request_id = no-op if still live), and returns the request status. No process launch -- the tool is a write-through to a new queue_requests JSONL append-only log at tools/geoai-task-mcp/data/audit/mcp_queue_requests_b282_v1.jsonl.",
+      "objective": "Implement the aiworkhub_task_queue_request MCP tool in server.py per B281 section_1 queue_request_envelope schema. The tool accepts a queue_request JSON, validates it against the schema, checks idempotency (same request_id = no-op if still live), and returns the request status. No process launch -- the tool is a write-through to a new queue_requests JSONL append-only log at tools/aiworkhub/data/audit/mcp_queue_requests_b282_v1.jsonl.",
       "acceptance": [
-        "New tool geoai_task_queue_request registered additively in server.py; existing tools unchanged (list_tools count check)",
+        "New tool aiworkhub_task_queue_request registered additively in server.py; existing tools unchanged (list_tools count check)",
         "queue_request JSON validated against B281 section_1 schema; rejects malformed requests",
         "Idempotency: same request_id submitted twice returns {status: 'duplicate', original_status: <current_state>}",
         "Valid requests appended to mcp_queue_requests_b282_v1.jsonl with all envelope fields",
@@ -24,15 +24,15 @@
       ],
       "depends_on": "DEEPSEEK_TASK_MCP_AUTOLAUNCH_QUEUE_DRYRUN_B281_V1 (this spec)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/server.py",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+        "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/src/aiworkhub/server.py",
+        "tools/aiworkhub/src/aiworkhub/core.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/queue_request.py",
-        "tools/geoai-task-mcp/eval/mcp_queue_request_tool_b282_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_queue_request_tool_b282_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/queue_request.py",
+        "tools/aiworkhub/eval/mcp_queue_request_tool_b282_v1.json",
+        "tools/aiworkhub/tests/test_mcp_queue_request_tool_b282_v1.sh"
       ]
     },
     {
@@ -52,13 +52,13 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 (needs queue_request log for PID tracking)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/completion_inbox.py"
+        "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/aiworkhub/src/aiworkhub/completion_inbox.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/stale_recovery.py",
-        "tools/geoai-task-mcp/eval/mcp_stale_recovery_orchestrator_b283_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_stale_recovery_orchestrator_b283_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/stale_recovery.py",
+        "tools/aiworkhub/eval/mcp_stale_recovery_orchestrator_b283_v1.json",
+        "tools/aiworkhub/tests/test_mcp_stale_recovery_orchestrator_b283_v1.sh"
       ]
     },
     {
@@ -67,9 +67,9 @@
       "topic": "task_mcp",
       "priority": "medium",
       "mode": "mcp_cost_ledger_aggregator_readonly_union",
-      "objective": "Implement geoai_task_cost_ledger MCP tool that UNIONs the 15-field launch log (B276 section_3) and geoai_task_usage_report (existing tool) into a unified per-topic/per-runner/per-day cost view per B281 section_3 reconciliation_rules. Read-only: consumes two existing read paths, produces aggregates. No new write path.",
+      "objective": "Implement aiworkhub_task_cost_ledger MCP tool that UNIONs the 15-field launch log (B276 section_3) and aiworkhub_task_usage_report (existing tool) into a unified per-topic/per-runner/per-day cost view per B281 section_3 reconciliation_rules. Read-only: consumes two existing read paths, produces aggregates. No new write path.",
       "acceptance": [
-        "New tool geoai_task_cost_ledger registered additively in server.py",
+        "New tool aiworkhub_task_cost_ledger registered additively in server.py",
         "UNION of launch_log + taskctl_usage with dedup by (task_id, runner, model)",
         "Aggregates: total_cost_usd by topic, by runner, by day; per-task detail on request",
         "Reconciliation rule: launch_log wins for gate events, taskctl_usage wins for final token counts",
@@ -78,14 +78,14 @@
       ],
       "depends_on": "CLAUDE_TASK_MCP_QUEUE_REQUEST_TOOL_B282_V1 (needs launch log to have entries)",
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/src/geoai_task_mcp/core.py"
+        "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/src/aiworkhub/core.py"
       ],
       "allowed_writes": [
-        "tools/geoai-task-mcp/src/geoai_task_mcp/cost_ledger.py",
-        "tools/geoai-task-mcp/eval/mcp_cost_ledger_aggregator_b284_v1.json",
-        "tools/geoai-task-mcp/tests/test_mcp_cost_ledger_aggregator_b284_v1.sh"
+        "tools/aiworkhub/src/aiworkhub/cost_ledger.py",
+        "tools/aiworkhub/eval/mcp_cost_ledger_aggregator_b284_v1.json",
+        "tools/aiworkhub/tests/test_mcp_cost_ledger_aggregator_b284_v1.sh"
       ]
     },
     {
@@ -109,9 +109,9 @@
         "CLAUDE_TASK_MCP_COMPLETION_INBOX_DELTA_TOOL_B278_V1 (B277 next_wave, for delta polling)"
       ],
       "read_first": [
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
-        "tools/geoai-task-mcp/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
-        "tools/geoai-task-mcp/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_queue_dryrun_b281_v1.json",
+        "tools/aiworkhub/eval/task_mcp_autolaunch_dryrun_spec_b276_v1.json",
+        "tools/aiworkhub/eval/task_mcp_owner_notification_loop_spec_b277_v1.json",
         "AITools/taskctl.py",
         ".github/copilot-instructions.md"
       ]

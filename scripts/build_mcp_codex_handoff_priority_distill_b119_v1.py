@@ -63,11 +63,11 @@ from typing import Any
 # Path bootstrap: import review_summarizer's REAL functions (not reimplemented)
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MCP_SRC = REPO_ROOT / "tools" / "geoai-task-mcp" / "src"
+MCP_SRC = REPO_ROOT / "tools" / "aiworkhub" / "src"
 if str(MCP_SRC) not in sys.path:
     sys.path.insert(0, str(MCP_SRC))
 
-from geoai_task_mcp.review_summarizer import (  # noqa: E402
+from aiworkhub.review_summarizer import (  # noqa: E402
     _commit_hygiene,
     _derive_risks,
     _risk_level,
@@ -79,12 +79,12 @@ BUILDER_CONTRACT = "B122_v1_handoff_priority_distill_real_rows_no_runtime"
 
 DEFAULT_SOURCE = REPO_ROOT / "bitnnv2" / "data" / "tasking" / "machine_task_cards_v1.jsonl"
 DEFAULT_EVAL_JSON = (
-    REPO_ROOT / "tools" / "geoai-task-mcp" / "eval" / "mcp_codex_handoff_priority_distill_b119_v1.json"
+    REPO_ROOT / "tools" / "aiworkhub" / "eval" / "mcp_codex_handoff_priority_distill_b119_v1.json"
 )
 DEFAULT_EVAL_ROWS = (
     REPO_ROOT
     / "tools"
-    / "geoai-task-mcp"
+    / "aiworkhub"
     / "eval"
     / "mcp_codex_handoff_priority_distill_rows_b119_v1.jsonl"
 )
@@ -94,7 +94,7 @@ DEFAULT_CURRICULUM = (
 DEFAULT_NEXT_WAVE = (
     REPO_ROOT
     / "tools"
-    / "geoai-task-mcp"
+    / "aiworkhub"
     / "data"
     / "tasking"
     / "mcp_handoff_priority_distill_real_next_wave_b122_v1.json"
@@ -301,7 +301,7 @@ def build(
 
         row = {
             "row_id": f"handoff_priority_{i:04d}",
-            "schema": "geoai.mcp_codex_handoff_priority_distill_row.v1",
+            "schema": "aiworkhub.mcp_codex_handoff_priority_distill_row.v1",
             "task_id": tid,
             "runner": card.get("runner", "unknown"),
             "topic": card.get("topic", "unknown"),
@@ -328,7 +328,7 @@ def build(
         curriculum_rows.append(
             {
                 "curriculum_id": f"mcp_handoff_priority_{i:04d}",
-                "schema": "geoai.mcp_codex_handoff_priority_target.v1",
+                "schema": "aiworkhub.mcp_codex_handoff_priority_target.v1",
                 "task_context": {
                     "task_id": tid,
                     "objective_snippet": str(card.get("objective", ""))[:160],
@@ -455,7 +455,7 @@ def build(
     }
 
     summary = {
-        "schema_id": "geoai.mcp_codex_handoff_priority_distill_eval.v1",
+        "schema_id": "aiworkhub.mcp_codex_handoff_priority_distill_eval.v1",
         "task_id": TASK_ID,
         "timestamp": now.isoformat(),
         "verdict": "PASS" if total > 0 and len(set(label_counts.values())) > 1 and all(v > 0 for v in label_counts.values()) else "FAIL",
@@ -495,7 +495,7 @@ def build(
             "mixed_task_commit",
         ],
         "commit_contract": "NO_COMMIT preferred for worker; Codex finalizes explicit allowed_writes only.",
-        "next_wave_task_ref": "tools/geoai-task-mcp/data/tasking/mcp_handoff_priority_distill_real_next_wave_b122_v1.json",
+        "next_wave_task_ref": "tools/aiworkhub/data/tasking/mcp_handoff_priority_distill_real_next_wave_b122_v1.json",
     }
 
     return {"summary": summary, "rows": rows, "curriculum_rows": curriculum_rows}
@@ -510,7 +510,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _write_next_wave(path: Path, summary: dict[str, Any]) -> None:
     payload = {
-        "schema_id": "geoai.mcp_codex_handoff_priority_distill_next_wave.v1",
+        "schema_id": "aiworkhub.mcp_codex_handoff_priority_distill_next_wave.v1",
         "parent_task_id": TASK_ID,
         "runner": "claude_task_mcp_handoff_distill_b122",
         "topic": "task_mcp",

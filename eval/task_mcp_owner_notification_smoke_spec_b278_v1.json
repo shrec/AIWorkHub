@@ -16,7 +16,7 @@
   "builds_on": [
     "CLAUDE_TASK_MCP_OWNER_NOTIFICATION_LOOP_SPEC_B277_V1 (task_mcp_owner_notification_loop_spec_b277_v1.json -- 5-kind event taxonomy: completion, failure, stale, usage, duplicate_runner; envelope schema; caller-owned delta-cursor design; honest pull-not-push framing)",
     "DEEPSEEK_TASK_MCP_AUTOLAUNCH_DRYRUN_SPEC_B276_V1 (task_mcp_autolaunch_dryrun_spec_b276_v1.json -- 4-gate safety model, dryrun-only launch templates, LAUNCH_IMPLEMENTED=false invariant reused here to justify 'no subprocess model launch')",
-    "tools/geoai-task-mcp/src/geoai_task_mcp/server.py (current tool surface: geoai_completion_inbox returns exactly 4 facets -- review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts; no error/exception facet exists today, confirmed by direct reading of the tool's docstring; unmodified by this task)"
+    "tools/aiworkhub/src/aiworkhub/server.py (current tool surface: aiworkhub_completion_inbox returns exactly 4 facets -- review_queue, stale_processing, runner_mismatch_warnings, latest_validation_facts; no error/exception facet exists today, confirmed by direct reading of the tool's docstring; unmodified by this task)"
   ],
   "summary": "This is a SPEC-ONLY smoke-test artifact (no code changes to server.py, completion_inbox.py, or any _.py module; no subprocess launches a model CLI; no live SQLite write). It turns B277's 5-kind event taxonomy into 6 fixture-driven smoke scenarios (completion, blocked, duplicate-runner, stale, usage, error) plus 2 edge cases (no-pending-task, tool_error-vs-failure disambiguation), each with an exact synthetic fixture, the expected classified event_kind, the exact envelope+payload the classifier should produce, and a deterministic owner-facing one-line summary template. Every scenario is a pure in-memory dict fed to the ALREADY-DEFINED B277 classification rule (lifecycle_state / validation_status / stale threshold / usage-record presence / collision_guard output) -- no new tool is registered, no live queue row is read or written, and no claude/codex/deepseek process is spawned anywhere in this spec.",
   "protocol_sections": {
@@ -33,7 +33,7 @@
       },
       "no_new_mcp_tool_registered": true,
       "server_py_modified": false,
-      "no_overclaim_note": "This spec does not implement geoai_completion_inbox_delta (still proposed-only per B277 section_2b) and does not add a 6th value to the event_kind enum in any executable code. 'error' is a smoke-test scenario category only, describing a required degrade-gracefully behavior for a FUTURE implementation task."
+      "no_overclaim_note": "This spec does not implement aiworkhub_completion_inbox_delta (still proposed-only per B277 section_2b) and does not add a 6th value to the event_kind enum in any executable code. 'error' is a smoke-test scenario category only, describing a required degrade-gracefully behavior for a FUTURE implementation task."
     },
     "section_1_smoke_scenarios": {
       "title": "6 fixture-driven smoke scenarios, no live queue mutation, no model launch",
@@ -206,7 +206,7 @@
           "usage_records": [],
           "collision_guard_conflicts": []
         },
-        "expected_behavior": "Zero events emitted. The (future) geoai_completion_inbox_delta call returns {events: [], next_cursor: <unchanged-or-advanced-per-B277-section_2b>, counts: {by_kind: {}}, truncated: false, authority_flags: {...all false...}}. This is NOT an error condition and must NOT be classified as tool_error -- an empty queue is a valid, successfully-read state with no notifications to raise.",
+        "expected_behavior": "Zero events emitted. The (future) aiworkhub_completion_inbox_delta call returns {events: [], next_cursor: <unchanged-or-advanced-per-B277-section_2b>, counts: {by_kind: {}}, truncated: false, authority_flags: {...all false...}}. This is NOT an error condition and must NOT be classified as tool_error -- an empty queue is a valid, successfully-read state with no notifications to raise.",
         "owner_facing_summary_rendered": "No pending task-notification events for this topic/cursor."
       },
       "duplicate_runner_conflict_detail": {
@@ -280,13 +280,13 @@
   },
   "neural_bridge_note": "This spec introduces no learned decision authority and no regex/keyword cue router: every scenario's event_kind is a fixed 1:1 mapping from an already-recorded fixture field state (mirroring the B277 deterministic mapping) to one of 6 taxonomy labels -- a deterministic support-boundary/evidence-extraction mapping used only to validate a future read-only tool's classification correctness, not a routing or intelligence decision. Owner-facing summary rendering (section_4) is plain str.format(), explicitly not an LLM call, so it introduces no new neural surface either. If a future task teaches a controller to PRIORITIZE, DEDUP, or NATURAL-LANGUAGE-SUMMARIZE these events beyond the fixed templates, that becomes a neural curriculum target per neural_bridge_priority; this task only defines the deterministic smoke-test shape.",
   "files_changed": [
-    "tools/geoai-task-mcp/eval/task_mcp_owner_notification_smoke_spec_b278_v1.json",
-    "tools/geoai-task-mcp/data/tasking/task_mcp_owner_notification_smoke_spec_next_wave_b278_v1.json",
-    "tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh"
+    "tools/aiworkhub/eval/task_mcp_owner_notification_smoke_spec_b278_v1.json",
+    "tools/aiworkhub/data/tasking/task_mcp_owner_notification_smoke_spec_next_wave_b278_v1.json",
+    "tools/aiworkhub/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh"
   ],
   "production_mcp_server_api_altered": false,
   "tests_run": [
-    "bash tools/geoai-task-mcp/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh",
+    "bash tools/aiworkhub/tests/test_task_mcp_owner_notification_smoke_spec_b278_v1.sh",
     "python3 AITools/taskctl.py verify"
   ],
   "commit_contract": "NO_COMMIT",

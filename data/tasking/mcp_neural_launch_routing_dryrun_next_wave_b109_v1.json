@@ -7,7 +7,7 @@
   "follow_up_tasks": [
     {
       "task_id": "CLAUDE_TASK_MCP_GATED_LAUNCH_EXECUTOR_B108_V1",
-      "goal": "Wire the gated launch executor behind GEOAI_TASK_MCP_ALLOW_LAUNCH; real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass AND the neural router (once trained) selects the adapter. Default stays fully disabled.",
+      "goal": "Wire the gated launch executor behind AIWORKHUB_ALLOW_LAUNCH; real launch runs ONLY when ALLOW_LAUNCH=1 AND ALLOW_WRITES=1 AND all launch_preconditions pass AND the neural router (once trained) selects the adapter. Default stays fully disabled.",
       "mode": "implementation_gated_launch",
       "runner": "claude_coding",
       "topic": "coding",

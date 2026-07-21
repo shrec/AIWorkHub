@@ -14,16 +14,16 @@
     "bitnnv2/eval/task_mcp_stale_recovery_review_b03_v1.json",
     "bitnnv2/eval/task_mcp_stale_recovery_review_rows_b03_v1.jsonl",
     "bitnnv2/data/tasking/task_mcp_stale_recovery_review_next_wave_b03_v1.json",
-    "tools/geoai-task-mcp/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
-    "tools/geoai-task-mcp/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
-    "tools/geoai-task-mcp/tests/test_mvp_contract_audit_v1.sh"
+    "tools/aiworkhub/tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh",
+    "tools/aiworkhub/tests/test_mcp_stdio_concurrent_client_smoke_b110_v1.sh",
+    "tools/aiworkhub/tests/test_mvp_contract_audit_v1.sh"
   ],
   "allowed_writes": [
-    "tools/geoai-task-mcp/scripts/review_mcp_stale_smoke_partial_b04_v1.py",
-    "tools/geoai-task-mcp/eval/mcp_stale_smoke_partial_review_b04_v1.json",
-    "tools/geoai-task-mcp/eval/mcp_stale_smoke_partial_review_rows_b04_v1.jsonl",
-    "tools/geoai-task-mcp/data/tasking/mcp_stale_smoke_partial_review_next_wave_b04_v1.json",
-    "tools/geoai-task-mcp/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh"
+    "tools/aiworkhub/scripts/review_mcp_stale_smoke_partial_b04_v1.py",
+    "tools/aiworkhub/eval/mcp_stale_smoke_partial_review_b04_v1.json",
+    "tools/aiworkhub/eval/mcp_stale_smoke_partial_review_rows_b04_v1.jsonl",
+    "tools/aiworkhub/data/tasking/mcp_stale_smoke_partial_review_next_wave_b04_v1.json",
+    "tools/aiworkhub/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh"
   ],
   "acceptance": [
     "Do not mutate task status; output Codex-only recommendation: recover, force-recover, mark done after validation, or leave processing.",
@@ -46,7 +46,7 @@
     "write_gate_enabled": false
   },
   "validation": [
-    "bash tools/geoai-task-mcp/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh",
+    "bash tools/aiworkhub/tests/test_mcp_stale_smoke_partial_review_b04_v1.sh",
     "python3 AITools/taskctl.py verify"
   ]
 }
