@@ -36,6 +36,7 @@ paid model call.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -311,6 +312,10 @@ def git_task_repo(tmp_path, monkeypatch):
 @pytest.mark.skipif(
     worker_workspace.landlock_abi_version() < 1,
     reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners SIGSEGV in nested Landlock execution",
 )
 def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
     monkeypatch, tmp_path, git_task_repo
