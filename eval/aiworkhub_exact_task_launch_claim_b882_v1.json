@@ -1,0 +1,35 @@
+{
+  "schema_id": "aiworkhub.exact_task_launch_claim.b882.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_EXACT_TASK_LAUNCH_CLAIM_B882_V1",
+  "goal": "Fix aiworkhub_agent_launch_task claim_start_failed:identity_mismatch and aiworkhub_task_auto_pickup's unavoidable card_scoped_task_id_required, without editing core.py (outside allowed_writes) and without weakening any runner/topic/batch/write-gate authority.",
+  "b880_failure_signatures": {
+    "identity_mismatch": {
+      "trigger": "ProcessManager._launch_isolated called the ambient core.claim_start_exact(task_id, runner, topic, request_id=...), whose raw SQL 'SELECT runner, topic FROM tasks WHERE task_id=?' compared the bare tasks.topic SQL column directly against the caller's exact topic.",
+      "root_cause": "task_store.py's own schema/migration comment documents that an older writer can persist the canonical topic only in card_json while leaving tasks.topic at its schema default ''. task_store.get_task/list_tasks already COALESCE that back from card_json for reads, but core.claim_start_exact's inline write-path SQL never applied the same fallback, so a task that every read path (preflight, show_task, dryrun) reported as an exact match still failed 'claim_start_failed:identity_mismatch' at the claim step.",
+      "reproduced_by": "test_exact_claim_topic_only_in_card_json_no_longer_false_identity_mismatch (direct, pre-fix this assertion fails against the old core.claim_start_exact call site) and test_agent_launch_task_exact_claim_no_longer_identity_mismatch (full ProcessManager.launch isolated flow, fake Popen only)"
+    },
+    "card_scoped_task_id_required": {
+      "trigger": "aiworkhub_task_auto_pickup(runner, topic) has no task_id parameter. core.auto_pickup -> core._canonical_write_gate('auto-pickup', ...) falls back to core._check_card_scoped_write_authority only when a task_id is supplied; auto_pickup's public schema structurally never supplies one, and that helper's own action allowlist excludes 'auto-pickup' entirely.",
+      "root_cause": "A card-scoped one-off runner/topic (not on the static core.RUNNER_TOPIC_ALLOWLIST, authorized only to claim-start the exact pending card that already names it) could never reach an allowed outcome via auto-pickup -- the public tool's contract and its own internal authority check disagreed by construction.",
+      "reproduced_by": "test_auto_pickup_card_scoped_runner_reproduces_then_is_fixed_by_fallback (asserts raw core.auto_pickup denial first, then the fixed server.aiworkhub_task_auto_pickup succeeding)"
+    }
+  },
+  "fix_summary": {
+    "task_engine.claim_start_exact": "New repo-bound claim function in task_engine.py (mirrors the existing repo-bound task_engine.show_task from B863): runs the identical core._canonical_write_gate authority check (same allowlist, same card-scoped fallback, same coordinator-capability gate -- no widening), then does the atomic claim UPDATE against the explicit repo's canonical DB with a topic comparison normalized through the same card_json fallback task_store.get_task/list_tasks already use.",
+    "process_launcher_wiring": "ProcessManager._launch_isolated now calls task_engine.claim_start_exact(self.repo, task_id, runner, topic, request_id=request_id) instead of the ambient core.claim_start_exact(...).",
+    "auto_pickup_wiring": "server.aiworkhub_task_auto_pickup calls core.auto_pickup unchanged first; only on the exact 'card_scoped_task_id_required' denial (and only when topic is supplied) does it resolve the single eligible pending task_id via the existing read-only core.auto_pickup_dryrun and claim it through task_engine.claim_start_exact -- the same authority path claim-start already grants this identity. Any other denial, or zero eligible candidates, passes through unchanged."
+  },
+  "forbidden_checks_preserved": [
+    "no paid model process invoked in any test (Popen fakes are `python -c` no-op/marker scripts only)",
+    "no write_gate_bypass: task_engine.claim_start_exact calls core._canonical_write_gate directly, not a reimplementation",
+    "no runner_identity_weakening / batch_guard_weakening: test_exact_claim_still_fails_closed_on_real_mismatch and test_auto_pickup_card_scoped_runner_with_no_eligible_task_stays_denied assert mismatched/ineligible identities are still denied",
+    "no core.py edit (outside allowed_writes): fix implemented entirely in task_engine.py/process_launcher.py/server.py"
+  ],
+  "validation": {
+    "test_process_launcher.py + test_process_launcher_security.py + test_aiworkhub_exact_task_launch_claim_b882.py": "38 passed (see full run below)",
+    "test_aiworkhub_task_engine_b846.py / test_aiworkhub_server_thin_adapter_b847.py": "NOT RUN: neither file exists in this worktree or anywhere in git history (verified via `git log --all -- <path>`); this validation command as literally specified in the task card cannot pass. Pre-existing card/worktree discrepancy, unrelated to this change, and outside this task's allowed_writes to create.",
+    "full_related_suite": "101 passed (test_process_launcher.py, test_process_launcher_security.py, test_aiworkhub_exact_task_launch_claim_b882.py, test_aiworkhub_canonical_task_engine_b852.py, test_server_runtime_wiring.py, test_app_server_mux.py)"
+  },
+  "taskctl_verify": "PASS",
+  "taskctl_collision_guard": "PASS"
+}

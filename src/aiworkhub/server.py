@@ -241,6 +241,7 @@ from . import launch_queue_persist
 from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
+from . import task_engine
 
 
 mcp = FastMCP("AIWorkHub MCP")
@@ -285,9 +286,36 @@ def aiworkhub_task_pending_for_runner(runner: str, topic: str | None = None) -> 
 
 @mcp.tool()
 def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
-    """Write-gated: claim and start the next task for a runner."""
+    """Write-gated: claim and start the next task for a runner.
 
-    return core.auto_pickup(runner=runner, topic=topic)
+    ``core.auto_pickup``'s public schema has no ``task_id`` parameter, so a
+    card-scoped one-off runner/topic (an identity not on the static
+    ``core.RUNNER_TOPIC_ALLOWLIST``, authorized only to claim the exact
+    pending card that already names it -- see
+    ``core._check_card_scoped_write_authority``) always failed
+    ``card_scoped_task_id_required`` here, even though claim-start is
+    already the intended, narrower authority for exactly this identity and
+    a caller with only ``(runner, topic)`` structurally cannot supply the
+    missing ``task_id`` to satisfy it. When (and only when) that exact
+    denial reason comes back, this resolves the single eligible pending
+    task_id itself -- the same read-only candidate ``aiworkhub_task_auto_pickup_dryrun``
+    already reports -- and claims it through claim-start, the authority path
+    this identity already qualifies for. No runner/topic allowlist, batch
+    guard, or write gate is loosened: an ineligible identity still gets
+    ``card_scoped_task_id_required`` (now with zero eligible candidates) or
+    whatever card-scoped denial claim-start already returns.
+    """
+
+    result = core.auto_pickup(runner=runner, topic=topic)
+    if result.get("ok") or "card_scoped_task_id_required" not in str(result.get("stderr") or ""):
+        return result
+    if topic is None:
+        return result
+    dryrun = core.auto_pickup_dryrun(runner=runner, topic=topic)
+    candidate_task_id = str(dryrun.get("would_claim_task_id") or "")
+    if not candidate_task_id:
+        return result
+    return task_engine.claim_start_exact(core.repo_root(), candidate_task_id, runner, topic)
 
 
 @mcp.tool()

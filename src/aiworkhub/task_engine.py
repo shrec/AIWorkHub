@@ -25,10 +25,100 @@ whose canonical SQLite row always wins over any stale ``card_json`` copy.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import core
 from . import task_store
+
+
+def _effective_topic(row: Any) -> str:
+    """Same fallback ``task_store.get_task``/``list_tasks`` already apply:
+    an older writer could persist the canonical topic only in ``card_json``
+    while leaving the ``tasks.topic`` SQL column at its schema default of
+    ``''`` (see ``task_store.py``'s own migration comment for this exact
+    class of task). A raw ``row["topic"]`` compare would then read as a
+    mismatch for a task every read path already reports correctly."""
+    topic = str(row["topic"] or "")
+    if topic:
+        return topic
+    try:
+        card_json = json.loads(row["card_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return topic
+    return str(card_json.get("topic") or "") if isinstance(card_json, dict) else topic
+
+
+def claim_start_exact(
+    repo: Path, task_id: str, runner: str, topic: str, request_id: str = ""
+) -> dict[str, Any]:
+    """Same wire contract and authority as ``core.claim_start_exact`` --
+    same write gate, same fail-closed identity/collision behavior -- but
+    bound to an explicit ``repo`` (see module docstring) instead of an
+    ambiently re-resolved one, and normalized against the same topic
+    fallback ``_effective_topic``/``task_store.get_task`` already tolerate
+    for reads. This is the one place a caller that already knows its exact
+    bound repository (``ProcessManager.repo``) claims a task; it never
+    widens the write gate -- ``core._canonical_write_gate`` (the same
+    runner/topic allowlist plus card-scoped authority check
+    ``core.claim_start_exact`` itself uses) still runs unchanged first.
+    """
+    command = ["claim-start", task_id, "--runner", runner, "--topic", topic]
+    if request_id:
+        command.extend(["--request-id", request_id])
+    blocked = core._canonical_write_gate(
+        "claim-start", runner=runner, topic=topic, task_id=task_id
+    )
+    if blocked is not None:
+        return blocked
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        conn = task_store._connect(db_path)
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    try:
+        row = conn.execute(
+            "SELECT runner, topic, card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"task_not_found:{task_id}",
+            }
+        if row["runner"] != runner or _effective_topic(row) != topic:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"identity_mismatch:task_id={task_id}",
+            }
+        cur = conn.execute(
+            "UPDATE tasks SET worker_status='claimed', status='processing', claimed_by=?, "
+            "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
+            (runner, now, now, now, task_id),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"claim_conflict:task_id={task_id}",
+            }
+        conn.execute(
+            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id, "claim_start", runner,
+                json.dumps({"runner": runner, "topic": topic, "request_id": request_id}, ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    card = task_store.get_task(repo, task_id)
+    stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
+    return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
 
 
 def show_task(repo: Path, task_id: str) -> dict[str, Any]:
@@ -52,4 +142,4 @@ def show_task(repo: Path, task_id: str) -> dict[str, Any]:
     return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
 
 
-__all__ = ["show_task"]
+__all__ = ["show_task", "claim_start_exact"]

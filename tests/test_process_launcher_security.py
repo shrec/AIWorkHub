@@ -163,7 +163,7 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
     calls: list[tuple] = []
 
     def claim(
-        task_id: str, runner: str, topic: str, *, request_id: str | None = None
+        repo, task_id: str, runner: str, topic: str, *, request_id: str | None = None
     ) -> dict:
         assert request_id
         calls.append(("claim", task_id, runner, topic))
@@ -201,7 +201,7 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "claim_start_exact", claim)
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
     monkeypatch.setattr(process_launcher.core, "mark_review", review)
     monkeypatch.setattr(process_launcher.core, "release_launch", release)
     return calls

@@ -1608,8 +1608,8 @@ class ProcessManager:
                     package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
                 )
 
-                claim = core.claim_start_exact(
-                    task_id, runner, topic, request_id=request_id
+                claim = task_engine.claim_start_exact(
+                    self.repo, task_id, runner, topic, request_id=request_id
                 )
                 if not claim.get("ok"):
                     raise LaunchRejected(

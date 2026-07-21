@@ -557,7 +557,8 @@ def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_
     card = _card()
     calls: list[tuple] = []
 
-    def claim(task_id, runner, topic, *, request_id=None):
+    def claim(repo_root, task_id, runner, topic, *, request_id=None):
+        assert repo_root == repo
         assert request_id
         calls.append(("claim", task_id, runner, topic))
         card.update({"status": "processing", "worker_status": "in_progress", "claimed_by": runner})
@@ -568,7 +569,7 @@ def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_
         card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "claim_start_exact", claim)
+    monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
     monkeypatch.setattr(process_launcher.core, "mark_review", review)
 
     # The worker writes the key it received into its single allowed output.
