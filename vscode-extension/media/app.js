@@ -104,6 +104,8 @@ const elements = {
   detailLiveOutputState: document.querySelector("#detail-live-output-state"),
   detailLiveOutputContainer: document.querySelector("#detail-live-output-container"),
   detailLiveOutputStderr: document.querySelector("#detail-live-output-stderr"),
+  detailLiveOutputRaw: document.querySelector("#detail-live-output-raw"),
+  detailLiveOutputRawContent: document.querySelector("#detail-live-output-raw-content"),
   toast: document.querySelector("#toast"),
   extensionVersion: document.querySelector("#extension-version"),
   mcpRuntimeVersion: document.querySelector("#mcp-runtime-version"),
@@ -895,9 +897,12 @@ function resetLiveOutputPanel() {
   elements.detailLiveOutputBlock.hidden = true;
   elements.detailLiveOutputState.textContent = "";
   elements.detailLiveOutputState.className = "validation-label";
-  elements.detailLiveOutputContainer.innerHTML = "";
+  elements.detailLiveOutputContainer.replaceChildren();
   elements.detailLiveOutputStderr.hidden = true;
-  elements.detailLiveOutputStderr.innerHTML = "";
+  elements.detailLiveOutputStderr.textContent = "";
+  elements.detailLiveOutputRaw.hidden = true;
+  elements.detailLiveOutputRaw.open = false;
+  elements.detailLiveOutputRawContent.textContent = "";
 }
 
 function startLiveOutputPolling(taskId) {
@@ -908,9 +913,12 @@ function startLiveOutputPolling(taskId) {
   elements.detailLiveOutputBlock.hidden = false;
   elements.detailLiveOutputState.textContent = "Loading";
   elements.detailLiveOutputState.className = "validation-label";
-  elements.detailLiveOutputContainer.innerHTML = "";
+  elements.detailLiveOutputContainer.replaceChildren();
   elements.detailLiveOutputStderr.hidden = true;
-  elements.detailLiveOutputStderr.innerHTML = "";
+  elements.detailLiveOutputStderr.textContent = "";
+  elements.detailLiveOutputRaw.hidden = true;
+  elements.detailLiveOutputRaw.open = false;
+  elements.detailLiveOutputRawContent.textContent = "";
   vscode.postMessage({ type: "requestLiveOutput", taskId, cursor: 0 });
 }
 
@@ -932,6 +940,112 @@ function scheduleNextLiveOutputPoll(taskId) {
 // the literal characters they represent. The client-side buffer is trimmed
 // from the front at a newline boundary once it exceeds
 // LIVE_OUTPUT_MAX_CLIENT_CHARS, matching the server's own bound.
+function decodeLiveOutput(text) {
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = String(text || "");
+  return textarea.value;
+}
+
+function resultEnvelope(text) {
+  const lines = String(text || "").split(/\r?\n/).filter((line) => line.trim());
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      const parsed = JSON.parse(lines[index]);
+      if (parsed && typeof parsed === "object" &&
+          (parsed.type === "result" || parsed.result !== undefined || parsed.terminal_reason)) {
+        return parsed;
+      }
+    } catch (_error) {
+      // Streaming providers may emit non-JSON progress lines before the
+      // terminal result. Keep walking backwards to the last result envelope.
+    }
+  }
+  return null;
+}
+
+function formatDuration(milliseconds) {
+  const value = numberValue(milliseconds);
+  if (!value) return "—";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  const seconds = value / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+function addLiveOutputSection(parent, title, content, className = "") {
+  if (content === undefined || content === null || content === "") return;
+  const section = createElement("section", `live-output-section ${className}`.trim());
+  section.append(createElement("h4", "", title));
+  const body = createElement("div", "live-output-section-body");
+  body.textContent = String(content);
+  section.appendChild(body);
+  parent.appendChild(section);
+}
+
+function renderFormattedLiveOutput(decoded) {
+  const envelope = resultEnvelope(decoded);
+  const fragment = document.createDocumentFragment();
+  if (!envelope) {
+    const stream = createElement("pre", "live-output-stream");
+    stream.textContent = decoded || "Waiting for model output…";
+    fragment.appendChild(stream);
+    elements.detailLiveOutputContainer.replaceChildren(fragment);
+    return;
+  }
+
+  const resultText = String(envelope.result || "").trim();
+  const isBlocked = /(^|\n)\s*(verdict|status)\s*:\s*blocked\b/i.test(resultText);
+  const isError = Boolean(envelope.is_error) || envelope.subtype === "error";
+  const status = isError ? "Failed" : isBlocked ? "Blocked" : "Completed";
+  const header = createElement("div", "live-output-result-header");
+  header.append(
+    createElement("strong", `live-output-verdict ${isError || isBlocked ? "fail" : "pass"}`, status),
+    createElement("span", "cell-secondary", envelope.stop_reason || envelope.terminal_reason || "result"),
+  );
+  fragment.appendChild(header);
+  addLiveOutputSection(fragment, "Result", resultText || "No result summary returned", isError || isBlocked ? "is-problem" : "");
+
+  const metrics = createElement("div", "live-output-metrics");
+  const usage = envelope.usage && typeof envelope.usage === "object" ? envelope.usage : {};
+  const cacheCreation = usage.cache_creation && typeof usage.cache_creation === "object"
+    ? usage.cache_creation
+    : {};
+  const cacheCreated = numberValue(usage.cache_creation_input_tokens) +
+    Object.values(cacheCreation).reduce((total, value) => total + numberValue(value), 0);
+  const metricValues = [
+    ["Duration", formatDuration(envelope.duration_ms)],
+    ["First token", formatDuration(envelope.ttft_ms)],
+    ["Turns", numberValue(envelope.num_turns)],
+    ["Input", formatCount(usage.input_tokens)],
+    ["Output", formatCount(usage.output_tokens)],
+    ["Cache read", formatCount(usage.cache_read_input_tokens)],
+    ["Cache write", formatCount(cacheCreated)],
+    ["Cost", formatMoney(envelope.total_cost_usd)],
+  ];
+  for (const [label, value] of metricValues) {
+    const item = createElement("div", "live-output-metric");
+    item.append(createElement("span", "", label), createElement("strong", "", value));
+    metrics.appendChild(item);
+  }
+  fragment.appendChild(metrics);
+
+  const models = envelope.modelUsage && typeof envelope.modelUsage === "object"
+    ? Object.entries(envelope.modelUsage)
+    : [];
+  if (models.length) {
+    const modelLines = models.map(([name, values]) => {
+      const item = values && typeof values === "object" ? values : {};
+      return `${name}: ${formatCount(item.inputTokens)} in · ${formatCount(item.outputTokens)} out · ${formatCount(item.cacheReadInputTokens)} cache · ${formatMoney(item.costUSD)}`;
+    });
+    addLiveOutputSection(fragment, "Model usage", modelLines.join("\n"));
+  }
+  if (asArray(envelope.permission_denials).length) {
+    addLiveOutputSection(fragment, "Permission denials", asArray(envelope.permission_denials).join("\n"), "is-problem");
+  }
+  elements.detailLiveOutputContainer.replaceChildren(fragment);
+}
+
 function appendLiveOutputText(chunk) {
   if (!chunk) {
     return;
@@ -942,8 +1056,10 @@ function appendLiveOutputText(chunk) {
     const newlineIndex = state.liveOutputText.indexOf("\n", excess);
     state.liveOutputText = state.liveOutputText.slice(newlineIndex !== -1 ? newlineIndex + 1 : excess);
   }
-  elements.detailLiveOutputContainer.innerHTML = state.liveOutputText;
-  elements.detailLiveOutputContainer.scrollTop = elements.detailLiveOutputContainer.scrollHeight;
+  const decoded = decodeLiveOutput(state.liveOutputText);
+  renderFormattedLiveOutput(decoded);
+  elements.detailLiveOutputRaw.hidden = decoded.length === 0;
+  elements.detailLiveOutputRawContent.textContent = decoded;
 }
 
 function renderLiveOutput(payload) {
@@ -969,7 +1085,7 @@ function renderLiveOutput(payload) {
   const stderrTail = String(info.stderr_tail || "");
   elements.detailLiveOutputStderr.hidden = stderrTail.length === 0;
   if (stderrTail) {
-    elements.detailLiveOutputStderr.innerHTML = stderrTail;
+    elements.detailLiveOutputStderr.textContent = decodeLiveOutput(stderrTail);
   }
 
   const liveness = String(info.liveness_state || info.state || "unknown");

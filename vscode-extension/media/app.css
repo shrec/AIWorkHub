@@ -43,6 +43,103 @@ body {
   line-height: 1.45;
 }
 
+.live-output-summary {
+  display: grid;
+  gap: 10px;
+  max-height: 560px;
+  overflow: auto;
+}
+
+.live-output-result-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.live-output-verdict {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.live-output-verdict.pass {
+  color: var(--review);
+  background: var(--review-soft);
+}
+
+.live-output-verdict.fail {
+  color: var(--blocked);
+  background: var(--blocked-soft);
+}
+
+.live-output-section {
+  padding: 9px 10px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.live-output-section.is-problem {
+  border-color: var(--blocked);
+}
+
+.live-output-section h4 {
+  margin: 0 0 6px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.live-output-section-body,
+.live-output-stream {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.live-output-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
+  gap: 6px;
+}
+
+.live-output-metric {
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.live-output-metric span {
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.live-output-raw {
+  margin-top: 10px;
+  color: var(--ink-soft);
+}
+
+.live-output-raw summary {
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.live-output-raw pre,
+#detail-live-output-stderr {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 button,
 input,
 select {

@@ -8,7 +8,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.8";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.9";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -1331,8 +1331,12 @@ function getHtmlForWebview(webview, extensionUri) {
                 <h3>Live Output</h3>
                 <span id="detail-live-output-state" class="validation-label"></span>
               </div>
-              <pre id="detail-live-output-container"></pre>
+              <div id="detail-live-output-container" class="live-output-summary"></div>
               <pre id="detail-live-output-stderr" hidden></pre>
+              <details id="detail-live-output-raw" class="live-output-raw" hidden>
+                <summary>Raw provider output</summary>
+                <pre id="detail-live-output-raw-content"></pre>
+              </details>
             </div>
             <div class="result-block" id="detail-ai-infra-block" hidden>
               <h3>AI context</h3>

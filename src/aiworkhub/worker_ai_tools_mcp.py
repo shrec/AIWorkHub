@@ -1252,7 +1252,10 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
 
 
 def build_server(ctx: WorkerToolContext) -> Any:
-    from mcp.server.fastmcp import FastMCP
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ModuleNotFoundError:
+        from .stdio_fastmcp import FallbackFastMCP as FastMCP
 
     mcp = FastMCP("AIWorkHub Worker AI Tools")
     register_tools(mcp, ctx)

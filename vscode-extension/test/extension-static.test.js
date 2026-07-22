@@ -146,6 +146,16 @@ assert.ok(ext.includes("notify_and_open_chat"));
 assert.ok(app.includes('case "coordinatorTargets"'));
 assert.ok(app.includes('type: "selectCoordinatorTarget"'));
 
+// v0.6.9: Live Output presents the provider's terminal envelope as readable
+// sections and metrics. The opaque JSON is retained only in a collapsed raw
+// disclosure for diagnostics.
+assert.ok(app.includes("function renderFormattedLiveOutput"));
+assert.ok(app.includes('"Result"'));
+assert.ok(app.includes('"Model usage"'));
+assert.ok(app.includes("detailLiveOutputRawContent"));
+assert.ok(ext.includes("Raw provider output"));
+assert.ok(css.includes(".live-output-metrics"));
+
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-icon.png")));
 assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-icon.png")).size > 1000);
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));

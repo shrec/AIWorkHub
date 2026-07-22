@@ -4,6 +4,20 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.9] - 2026-07-22
+
+### Added
+
+- Render selected-task Live Output as readable result, status, timing, token,
+  cache, model and cost sections; retain the full provider JSON only inside a
+  collapsed diagnostic disclosure.
+
+### Fixed
+
+- Start the task-scoped worker AI-tools MCP inside the self-contained VSIX
+  runtime even when the optional Python `mcp` package is unavailable, using a
+  bounded standard-library JSON-RPC fallback with complete tool schemas.
+
 ## [0.6.8] - 2026-07-22
 
 ### Fixed
