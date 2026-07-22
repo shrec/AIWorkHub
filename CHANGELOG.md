@@ -4,6 +4,15 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.10] - 2026-07-22
+
+### Fixed
+
+- Make every task created through the public manager MCP carry a required,
+  task-type-aware project-context contract. Code tasks now fail closed when
+  Source Graph evidence is empty; Session Manager is mandatory and AI Memory
+  plus KB are requested adaptively for every new task.
+
 ## [0.6.9] - 2026-07-22
 
 ### Added

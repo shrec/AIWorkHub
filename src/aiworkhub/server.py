@@ -321,6 +321,7 @@ def aiworkhub_task_create(
     validation: list[str] | None = None,
     priority: str = "normal",
     callback_required: bool = True,
+    task_type: str = "code",
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -341,6 +342,7 @@ def aiworkhub_task_create(
         validation=validation,
         priority=priority,
         callback_required=callback_required,
+        task_type=task_type,
     )
 
 

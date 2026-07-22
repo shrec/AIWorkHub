@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -65,3 +66,56 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_manager_kb_related",
     ):
         assert callable(getattr(server, name))
+
+
+def test_task_create_public_schema_requires_automatic_project_context():
+    import inspect
+
+    server_signature = inspect.signature(server.aiworkhub_task_create)
+    core_signature = inspect.signature(core.create_task)
+    assert server_signature.parameters["task_type"].default == "code"
+    assert core_signature.parameters["task_type"].default == "code"
+    source = inspect.getsource(core.create_task)
+    assert '"project_context"' in source
+    assert '"required": True' in source
+    assert '"source_graph"' in source
+    assert '"session"' in source
+    assert '"ai_memory"' in source
+    assert '"kb"' in source
+
+
+def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    session_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex", "session_id": session_id, "thread_id": session_id,
+    })
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda runner: (True, "ok"))
+
+    result = core.create_task(
+        task_id="TASK_CONTEXT_DEFAULT",
+        title="Strict task context",
+        runner="claude_context_default",
+        topic="task_mcp",
+        objective="Prove every manager-created code task receives mandatory AI context.",
+        acceptance=["Context is persisted."],
+        allowed_writes=["research/context_default.json"],
+    )
+    assert result["ok"] is True, result
+    card = json.loads(result["stdout"])
+    context = card["project_context"]
+    assert context["required"] is True
+    assert context["task_type"] == "code"
+    assert context["source_graph"]["required"] is True
+    assert context["source_graph"]["query"] == "task"
+    assert context["session"]["topic"] == "Strict task context"
+    assert context["ai_memory"]["query"]
+    assert context["kb"]["query"]
+    stored = task_store.get_task(root, "TASK_CONTEXT_DEFAULT")
+    assert stored is not None
+    assert stored["project_context"] == context

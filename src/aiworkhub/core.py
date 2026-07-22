@@ -1843,6 +1843,7 @@ def create_task(
     validation: list[str] | None = None,
     priority: str = "normal",
     callback_required: bool = True,
+    task_type: str = "code",
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -1869,6 +1870,7 @@ def create_task(
     title = str(title or "").strip()
     objective = str(objective or "").strip()
     priority = str(priority or "normal").strip().lower()
+    task_type = str(task_type or "code").strip().lower()
     if not _TASK_ID_RE.fullmatch(task_id):
         return _lifecycle_error("invalid_task_id", 2)
     if not _TASK_IDENTITY_RE.fullmatch(runner) or not _TASK_IDENTITY_RE.fullmatch(topic):
@@ -1877,6 +1879,8 @@ def create_task(
         return _lifecycle_error("invalid_title_or_objective", 2)
     if priority not in ("low", "normal", "high", "critical"):
         return _lifecycle_error("invalid_priority", 2)
+    if task_type not in ("code", "data_classification", "research"):
+        return _lifecycle_error("invalid_task_type", 2)
 
     def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
         if not isinstance(value, list) or (required and not value) or len(value) > 128:
@@ -1907,6 +1911,14 @@ def create_task(
         return _lifecycle_error("manager_route_has_no_valid_origin_thread", 126)
     provider = str(identity["provider"])
     now = datetime.now(timezone.utc).isoformat()
+    context_query = next(
+        (part for part in re.split(r"[^A-Za-z0-9]+", topic) if part),
+        "task",
+    )
+    session_topic = title.encode("utf-8")[:128].decode("utf-8", errors="ignore").strip() or topic
+    semantic_query = f"{title} {topic}".encode("utf-8")[:512].decode(
+        "utf-8", errors="ignore"
+    ).strip()
     card = {
         "schema_id": "aiworkhub.task_card.v1",
         "task_id": task_id,
@@ -1926,6 +1938,20 @@ def create_task(
         "forbidden": forbidden2,
         "required_outputs": outputs2,
         "validation": validation2,
+        "project_context": {
+            "required": True,
+            "task_type": task_type,
+            "source_graph": {
+                "mode": "focus",
+                "query": context_query,
+                "budget": 48,
+                "bundle_type": "explore",
+                "required": task_type == "code",
+            },
+            "session": {"topic": session_topic, "limit": 8},
+            "ai_memory": {"query": semantic_query, "limit": 5},
+            "kb": {"query": semantic_query, "limit": 5},
+        },
     }
     command = ["add-card", task_id]
     try:
