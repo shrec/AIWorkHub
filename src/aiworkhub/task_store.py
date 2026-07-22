@@ -51,6 +51,7 @@ from .storage_registry import (
     load_storage_registry,
     resolve_database_path,
 )
+from .provider_tool_guards import ProviderGuardError, apply_repository_guards
 
 
 SCHEMA_ID = "aiworkhub.task_store.v1"
@@ -846,6 +847,11 @@ def initialize_repository(
 
     auxiliary = _reconcile_auxiliary_databases(repo, registry_path)
 
+    try:
+        provider_guards = apply_repository_guards(repo.root)
+    except ProviderGuardError as exc:
+        raise InitializationRefusedError(f"provider_guard_install_failed:{exc}") from exc
+
     readiness = storage_readiness(repo.root)
     return {
         "ok": readiness.ready,
@@ -858,6 +864,7 @@ def initialize_repository(
         "legacy_imported": bool(auxiliary["migrated"]),
         "legacy_deleted": False,
         "auxiliary_storage": auxiliary,
+        "provider_guards": provider_guards,
         "storage": readiness.as_dict(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
