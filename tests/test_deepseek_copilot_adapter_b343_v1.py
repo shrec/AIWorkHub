@@ -573,13 +573,14 @@ def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_
         card.update({"status": "processing", "worker_status": "in_progress", "claimed_by": runner})
         return {"ok": True}
 
-    def review(task_id, *, runner, topic):
-        calls.append(("review", task_id, runner, topic))
+    def review(repo_root, task_id, runner, substatus, *, evidence=None):
+        assert repo_root == repo
+        calls.append(("review", task_id, runner, substatus))
         card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
         return {"ok": True}
 
     monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
-    monkeypatch.setattr(process_launcher.core, "mark_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
 
     # The worker writes the key it received into its single allowed output.
     script = (
@@ -604,8 +605,14 @@ def test_isolated_launch_claims_and_passes_key_through_sandbox(monkeypatch, tmp_
     result = _wait_terminal(manager, launched["request_id"])
     assert result["state"] == "review_ready"
     assert [c[0] for c in calls] == ["claim", "review"]
-    # The sandboxed child received the key and wrote it into the promoted file.
-    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == FAKE_KEY
+    # The sandboxed child received the key, but review-first keeps it in the
+    # retained isolated workspace until coordinator acceptance.
+    metadata = json.loads(
+        Path(result["latest_event"]["metadata_path"]).read_text(encoding="utf-8")
+    )
+    isolated = Path(metadata["workspace"]["path"]) / "out" / "result.txt"
+    assert isolated.read_text(encoding="utf-8") == FAKE_KEY
+    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
 # ---------------------------------------------------------------------------

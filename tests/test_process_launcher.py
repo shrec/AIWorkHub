@@ -615,19 +615,19 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
 
     review_calls = []
 
-    def fake_mark_terminal_review(repo_arg, task_id, runner, substatus, *, evidence=None):
+    def fake_review_terminal_exact(metadata_arg, substatus, *, request_id, error="", evidence=None):
         review_calls.append(
             {
-                "repo": repo_arg,
-                "task_id": task_id,
-                "runner": runner,
+                "repo": repo,
+                "task_id": metadata_arg["task_id"],
+                "runner": metadata_arg["runner"],
                 "substatus": substatus,
                 "evidence": evidence or {},
             }
         )
         return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
 
-    monkeypatch.setattr(task_engine, "mark_terminal_review", fake_mark_terminal_review)
+    monkeypatch.setattr(manager, "_review_terminal_exact", fake_review_terminal_exact)
 
     promote_calls = []
     monkeypatch.setattr(

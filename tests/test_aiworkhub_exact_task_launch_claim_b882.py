@@ -367,6 +367,15 @@ def test_agent_launch_task_exact_claim_no_longer_identity_mismatch(
     assert deadline_result["state"] == "review_ready", json.dumps(
         deadline_result, sort_keys=True, default=str
     )
+    # Worker success only validates in the isolated workspace and transitions
+    # the canonical task to review_ready -- the canonical file must stay
+    # byte-unchanged until the coordinator explicitly accepts the review.
+    assert (git_task_repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
+    review_row = _row(git_task_repo, "TASK_B882J")
+    assert review_row["worker_status"] == "review"
+
+    accepted = manager.accept_review(launched["request_id"], "TASK_B882J")
+    assert accepted["ok"] is True, accepted
     assert (git_task_repo / "out" / "result.txt").read_text(encoding="utf-8") == "worker-result\n"
     final_row = _row(git_task_repo, "TASK_B882J")
-    assert final_row["worker_status"] == "review"
+    assert final_row["worker_status"] == "done"

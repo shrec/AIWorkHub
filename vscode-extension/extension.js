@@ -920,8 +920,22 @@ async function ensureCodexMuxConfigured(context) {
 }
 
 // ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
-function codexConfigTomlPath() {
+// 0.6.20 compatibility: resolves ~/.codex/config.toml's location, honoring
+// CODEX_HOME when set (matching Codex CLI's own resolution) and otherwise
+// falling back to the current user's homedir. Never a hardcoded/global
+// repo-relative fallback -- `env` defaults to process.env only so callers
+// (and tests) can override it deterministically.
+function resolveCodexConfigTomlPath(env) {
+  const source = env || process.env || {};
+  const codexHome = source.CODEX_HOME;
+  if (codexHome) {
+    return path.join(codexHome, "config.toml");
+  }
   return path.join(os.homedir(), ".codex", "config.toml");
+}
+
+function codexConfigTomlPath() {
+  return resolveCodexConfigTomlPath(process.env);
 }
 
 // Matches only extension-versioned AIWorkHub runtime paths this extension
@@ -945,6 +959,12 @@ const AIWORKHUB_RUNTIME_PATH_RE = /(?<![A-Za-z0-9_])(?:[A-Za-z]:)?[^\s"';:]*[\\/
 // repairCodexConfigTomlText intentionally keeps using the strict shrec-only
 // AIWORKHUB_RUNTIME_PATH_RE above.
 const MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE = /(?<![A-Za-z0-9_])(?:[A-Za-z]:)?[^\s"';:]*(?:\\\\|\\|\/)[A-Za-z0-9][A-Za-z0-9-]*\.aiworkhub-[^\s"';:\\/]+(?:\\\\|\\|\/)runtime/g;
+
+// 0.6.20 compatibility alias: current-main callers/tests refer to this
+// pattern as "the AIWorkHub-owned runtime path segment this extension is
+// allowed to migrate." Reuses MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE directly
+// rather than duplicating its (unsafe-to-drift) matching logic.
+const CODEX_OWNED_RUNTIME_SEGMENT_RE = MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE;
 
 // TOML table header, e.g. "[mcp_servers.aiworkhub.env]" or
 // "[mcp_servers.AIWorkHub_Ultrafast]".
@@ -1143,6 +1163,38 @@ function ensureCodexConfigTomlRepaired(context) {
     return true;
   } catch (err) {
     outputChannel.appendLine(`[codex] failed to repair ~/.codex/config.toml: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+}
+
+/** 0.6.20 compatibility: activation-time counterpart to
+ *  ensureCodexConfigTomlRepaired that additionally covers the broader,
+ *  custom-server-name migration case handled by migrateCodexConfigTomlText
+ *  (any safe publisher prefix, not just the strict shrec-only repair path).
+ *  Resolves the config.toml location via resolveCodexConfigTomlPath (honors
+ *  CODEX_HOME) rather than the hardcoded homedir join, reuses
+ *  migrateCodexConfigTomlText for the actual text transform, and is
+ *  best-effort: a missing/unreadable/unwritable config.toml is left alone.
+ */
+function migrateCodexConfigTomlRuntimePath(context) {
+  const configPath = resolveCodexConfigTomlPath(process.env);
+  let original;
+  try {
+    original = fs.readFileSync(configPath, "utf8");
+  } catch (_err) {
+    return false;
+  }
+  const currentRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
+  const { content, changed } = migrateCodexConfigTomlText(original, currentRuntimeDir);
+  if (!changed) {
+    return false;
+  }
+  try {
+    fs.writeFileSync(configPath, content, "utf8");
+    outputChannel.appendLine("[codex] migrated AIWorkHub runtime PYTHONPATH entry in config.toml");
+    return true;
+  } catch (err) {
+    outputChannel.appendLine(`[codex] failed to migrate config.toml: ${sanitizeErrorMessage(err)}`);
     return false;
   }
 }
@@ -2253,6 +2305,7 @@ async function activate(context) {
   context.subscriptions.push(outputChannel);
   await ensureCodexMuxConfigured(context);
   ensureCodexConfigTomlRepaired(context);
+  migrateCodexConfigTomlRuntimePath(context);
 
   // Resolve the initial active repository and label.
   try {
@@ -2331,10 +2384,13 @@ module.exports = {
     sanitizeErrorMessage,
     shouldRepairCodexMuxSetting,
     codexConfigTomlPath,
+    resolveCodexConfigTomlPath,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
+    migrateCodexConfigTomlRuntimePath,
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
+    CODEX_OWNED_RUNTIME_SEGMENT_RE,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,

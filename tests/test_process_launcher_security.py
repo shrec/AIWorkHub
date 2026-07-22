@@ -179,8 +179,8 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
-    def review(repo, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
-        calls.append(("review" if substatus == "review_ready" else "release", task_id, runner, card["topic"]))
+    def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
+        calls.append(("review", task_id, runner, substatus))
         assert card["claimed_by"] == runner
         card.update({
             "status": "review",
@@ -189,20 +189,19 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
-    def release(task_id: str, claimed_by: str, reason: str) -> dict:
-        calls.append(("release", task_id, claimed_by, reason))
+    def release(repo_root, task_id: str, claimed_by: str, substatus: str, *, evidence=None) -> dict:
+        calls.append(("release", task_id, claimed_by, substatus))
         assert card["claimed_by"] == claimed_by
         card.update({
             "status": "review",
             "worker_status": "review",
             "terminal_worker": claimed_by,
-            "terminal_outcome": reason,
+            "terminal_outcome": substatus,
         })
         return {"ok": True}
 
     monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
     monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
-    monkeypatch.setattr(process_launcher.core, "release_launch", release)
     return calls
 
 
@@ -254,9 +253,10 @@ def test_production_launch_owns_exact_claim_promotion_and_review(
 
     result = _wait_terminal(manager, launched["request_id"])
     assert result["state"] == "review_ready"
-    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "worker-result\n"
+    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
     assert [call[0] for call in calls] == ["claim", "review"]
-    assert result["latest_event"]["promoted_paths"] == ["out/result.txt"]
+    assert result["latest_event"]["promoted_paths"] == []
+    assert result["latest_event"]["workspace_retained"] is True
     assert stat.S_IMODE((tmp_path / "events.jsonl").stat().st_mode) == 0o600
     assert stat.S_IMODE(Path(launched["stdout_path"]).stat().st_mode) == 0o600
     assert not list((tmp_path / "processes").glob("*.supervisor-spec.json"))
@@ -309,7 +309,7 @@ def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     result = _wait_terminal(restarted, launched["request_id"])
     assert result["state"] == "cancelled"
     assert card["status"] == "review"
-    assert [call[0] for call in calls] == ["claim", "release"]
+    assert [call[0] for call in calls] == ["claim", "review"]
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
@@ -396,14 +396,14 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
 
     def release(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
         nonlocal release_enabled
+        assert repo_root == repo
         release_calls.append((task_id, runner, substatus))
         if not release_enabled:
             return {"ok": False, "stderr": "write gate temporarily unavailable"}
         card.update({
             "status": "review",
-            "worker_status": "review_ready",
-            "claimed_by": "",
-            "launch_released_by": process_launcher.core.CODEX_RUNNER,
+            "worker_status": "review",
+            "claimed_by": runner,
         })
         return {"ok": True}
 
@@ -500,7 +500,8 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
     reviews: list[tuple[str, str, str]] = []
 
     def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
-        reviews.append((task_id, runner, card["topic"]))
+        assert repo_root == repo
+        reviews.append((task_id, runner, substatus))
         card.update({
             "status": "review",
             "worker_status": "review",
@@ -525,9 +526,9 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     result = restarted.status(request_id)
     assert result["state"] == "review_ready"
-    assert reviews == [(card["task_id"], card["runner"], card["topic"])]
-    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "untrusted-worker-output\n"
-    assert not workspace.path.exists()
+    assert reviews == [(card["task_id"], card["runner"], "review_ready")]
+    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
+    assert workspace.path.exists()
 
 
 @pytest.mark.parametrize(
@@ -676,7 +677,8 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
     reviews: list[tuple[str, str, str]] = []
 
     def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
-        reviews.append((task_id, runner, card["topic"]))
+        assert repo_root == repo
+        reviews.append((task_id, runner, substatus))
         card.update({
             "status": "review",
             "worker_status": "review",
@@ -715,16 +717,18 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
 
     result = manager.status(request_id)
     assert result["state"] == "review_ready"
-    assert result["latest_event"]["promoted_paths"] is not None
-    assert "out/data.bin" in result["latest_event"]["promoted_paths"], (
-        "gitignored required output must appear in promoted_paths"
+    assert result["latest_event"]["promoted_paths"] == []
+    assert "out/data.bin" in result["latest_event"]["changed_paths"], (
+        "gitignored required output must appear in the review candidate"
     )
-    assert "out/result.txt" in result["latest_event"]["promoted_paths"]
+    assert "out/result.txt" in result["latest_event"]["changed_paths"]
     assert len(result["latest_event"]["required_outputs"]) == 1
     assert result["latest_event"]["required_outputs"][0]["path"] == "out/data.bin"
 
-    # Verify the binary was actually promoted to the parent repo.
-    assert (repo / "out" / "data.bin").read_bytes() == b"\x11\x22\x33\x44\x55\x66\x77\x88"
-    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "worker-result\n"
-    assert reviews == [(card["task_id"], card["runner"], card["topic"])]
-    assert not workspace.path.exists()
+    # Review-first keeps the validated binary in the isolated candidate until
+    # coordinator acceptance; the canonical repo remains unchanged.
+    assert (workspace.path / "out" / "data.bin").read_bytes() == b"\x11\x22\x33\x44\x55\x66\x77\x88"
+    assert not (repo / "out" / "data.bin").exists()
+    assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
+    assert reviews == [(card["task_id"], card["runner"], "review_ready")]
+    assert workspace.path.exists()
