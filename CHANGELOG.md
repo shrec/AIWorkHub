@@ -4,6 +4,48 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.20] - 2026-07-22
+
+### Fixed
+
+- Route every non-exited terminal supervisor state to `review` and never back
+  to `pending`, enqueueing exactly one release
+  (`test_non_exited_terminal_states_route_to_review_never_pending_and_enqueue_one_release`).
+- Treat a detached, shell-free worker process that exits cleanly as reaching
+  `review_ready` on its own exact terminal authority, and make workspace GC
+  wait for a confirmed canonical terminal status before reclaiming a
+  finalized worktree (`test_real_shell_free_process_reaches_review_ready`,
+  `test_gc_still_waits_for_confirmed_canonical_terminal_status_after_retain`).
+- Resolve the validation-time `PYTHONPATH`/cwd strictly beneath the worker's
+  own worktree and scope any override to the single validation subprocess it
+  was requested for, instead of leaking a broader or parent-repo path
+  (`resolve_validation_pythonpath`,
+  `test_validation_pythonpath_resolution_is_beneath_worktree`,
+  `test_validation_pythonpath_override_is_scoped_to_one_subprocess`).
+- Repair the embedded/bundled MCP runtime and the VS Code dashboard panel
+  controller without requiring a window reload: the bundled runtime spawns
+  cleanly on its own, and panel revival disposes the stale controller before
+  adopting the new one (`_spawn_bundled_runtime`,
+  `test_revive_dashboard_panel_disposes_stale_controller_first`).
+- Migrate the Copilot and Codex worker MCP configs to launch the packaged
+  runtime as a Python module with a dedicated, portability-safe `PYTHONPATH`
+  alias, selectively (not a blanket rewrite of every adapter config)
+  (`test_worker_mcp_server_copilot_and_codex_configs_also_launch_as_module`,
+  `test_pythonpath_uses_dedicated_bubblewrap_package_alias_not_authority_repo`).
+- Confirmed the cost/usage surfaces (`cost_ledger.py`'s `build_cost_ledger`,
+  `aiworkhub_task_cost_ledger`, `aiworkhub_task_usage_report`) remain
+  read-only telemetry: no per-model or per-task cost ceiling gates a launch
+  or a review transition anywhere in the launch/callback path.
+
+### Changed
+
+- Python package (`aiworkhub`), MCP runtime, and VS Code extension
+  (`vscode-extension/package.json`) versions aligned at `0.6.20`.
+- README documents the three-layer dispatch/validation/acceptance model
+  (worker self-validation, independent coordinator re-validation, and the
+  audit-ledger acceptance gate) and records Kimi-Atlas-inspired roadmap
+  concepts as explicitly unimplemented design ideas.
+
 ## [0.6.10] - 2026-07-22
 
 ### Fixed

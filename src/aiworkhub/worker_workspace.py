@@ -1343,10 +1343,20 @@ def sandbox_argv(
     validation_readonly_dirs: tuple[Path, ...] = (),
     validation_exec_scratch: Path | None = None,
     package_import_root: Path | None = None,
+    validation_cwd: str | None = None,
 ) -> list[str]:
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
     selected = backend or select_sandbox_backend()
+    # B892: resolve the validated ``cd`` prefix target once, against the real
+    # workspace filesystem, before either backend's argv is built -- so
+    # Landlock and bubblewrap bind/chdir into the exact same
+    # repository-relative directory rather than each re-deriving it.
+    resolved_cwd_relative = (
+        _resolve_validation_cwd(workspace, validation_cwd)
+        if validation_cwd is not None
+        else None
+    )
     if selected == "landlock":
         for pattern in workspace.allowed_writes:
             if any(ch in pattern for ch in "*?["):
@@ -1359,6 +1369,9 @@ def sandbox_argv(
             if validation_exec_scratch is not None
             else []
         )
+        cwd_flags = (
+            ["--cwd", resolved_cwd_relative] if resolved_cwd_relative is not None else []
+        )
         return [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -1367,6 +1380,7 @@ def sandbox_argv(
             "--home", str(workspace.home),
             *(value for pattern in workspace.allowed_writes for value in ("--allow", pattern)),
             *exec_scratch_flags,
+            *cwd_flags,
             "--",
             *adapter_argv,
         ]
@@ -1425,7 +1439,12 @@ def sandbox_argv(
         # workspace.repo (a bundled/installed package), so it cannot be
         # expressed as a path beneath that alias.
         argv.extend(("--ro-bind", str(package_import_root), SANDBOX_PACKAGE_IMPORT_ROOT))
-    argv.extend(("--chdir", SANDBOX_WORKSPACE))
+    sandbox_chdir = (
+        f"{SANDBOX_WORKSPACE}/{resolved_cwd_relative}"
+        if resolved_cwd_relative is not None
+        else SANDBOX_WORKSPACE
+    )
+    argv.extend(("--chdir", sandbox_chdir))
     node_root = _node_install_root(adapter_argv[0])
     if node_root is not None:
         relative = node_root.relative_to(host_home)
@@ -1564,6 +1583,7 @@ def _landlock_exec(argv: list[str]) -> int:
     parser.add_argument("--home", required=True)
     parser.add_argument("--allow", action="append", default=[])
     parser.add_argument("--exec-scratch", default=None)
+    parser.add_argument("--cwd", default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -1576,7 +1596,17 @@ def _landlock_exec(argv: list[str]) -> int:
     exec_scratch = Path(args.exec_scratch).resolve() if args.exec_scratch else None
     _apply_landlock(workspace, home, args.allow, exec_scratch)
     _apply_metadata_seccomp()
-    os.chdir(workspace)
+    if args.cwd is not None:
+        # Re-validate against this exec'd child's own view of the workspace
+        # (fail closed rather than trusting the parent-provided flag) --
+        # traversal/absolute paths are already rejected before this argv is
+        # built, so only symlink-escape/existence can differ here.
+        chdir_target = _require_beneath(workspace, workspace / args.cwd)
+        if chdir_target.is_symlink() or not chdir_target.is_dir():
+            raise WorkspaceError(f"landlock_cwd_not_directory:{args.cwd}")
+    else:
+        chdir_target = workspace
+    os.chdir(chdir_target)
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 
@@ -1593,6 +1623,57 @@ def _tokenize_validation_command(command: str) -> list[str]:
     if not argv:
         raise WorkspaceError("validation_argv_empty")
     return argv
+
+
+# B892: a card validation command shaped exactly ``cd <relative-repo-path> &&
+# <argv...>`` used to tokenize with ``cd`` as argv[0] -- an unresolvable
+# executable (``cd`` is a shell builtin, not a binary), so the command failed
+# with ENOENT (B891). ``_split_validation_cd_prefix`` recognizes and strips
+# at most one such leading prefix, shell-free (no ``shell=True``, no
+# ``bash -c``/``sh -c`` wrapping): it operates purely on the already
+# shlex-tokenized argv and returns the validated relative path separately so
+# the sandbox builders below can bind the same cwd into both backends.
+# Every other control-operator token (bare ``&`` or a second ``&&`` anywhere,
+# including a second chained ``cd``) fails closed -- ``|``, ``;``, backtick,
+# ``>`` and ``<`` are already rejected at the character level above, so only
+# ``&``-based tokens need a token-level check here.
+_CD_TOKEN = "cd"
+_AND_OPERATOR_TOKEN = "&&"
+_CONTROL_OPERATOR_TOKEN_RE = re.compile(r"^&{1,2}$")
+_CD_PATH_FORBIDDEN_CHARS = frozenset("$`*?[]~{}()|;&<>\n\r\t")
+
+
+def _split_validation_cd_prefix(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Extract at most one leading ``cd <relative-repo-path> &&`` prefix.
+
+    Returns ``(None, argv)`` unchanged when the command does not open with a
+    ``cd`` prefix, after confirming no stray control-operator token slipped
+    through tokenization. Returns ``(relative_path, rest_argv)`` for the exact
+    supported shape. Absolute paths, parent traversal, and forbidden
+    characters in the path are rejected here (syntax only); symlink escape
+    and existence are checked later against the real workspace filesystem by
+    ``_resolve_validation_cwd``.
+    """
+    if not argv or argv[0] != _CD_TOKEN:
+        for token in argv:
+            if _CONTROL_OPERATOR_TOKEN_RE.match(token):
+                raise WorkspaceError(f"validation_shell_syntax_forbidden:{token}")
+        return None, argv
+    if len(argv) < 3 or argv[2] != _AND_OPERATOR_TOKEN:
+        raise WorkspaceError("validation_cd_prefix_malformed")
+    relative_raw = argv[1]
+    if any(ch in _CD_PATH_FORBIDDEN_CHARS for ch in relative_raw):
+        raise WorkspaceError(f"validation_cd_path_forbidden_char:{relative_raw}")
+    relative = _relative_repo_path(relative_raw)
+    rest = argv[3:]
+    if not rest:
+        raise WorkspaceError("validation_cd_prefix_without_executable")
+    if rest[0] == _CD_TOKEN:
+        raise WorkspaceError("validation_multiple_cd_prefix_forbidden")
+    for token in rest:
+        if _CONTROL_OPERATOR_TOKEN_RE.match(token):
+            raise WorkspaceError(f"validation_shell_syntax_forbidden:{token}")
+    return relative, rest
 
 
 _ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
@@ -1639,14 +1720,19 @@ def _validate_pythonpath_value(raw_value: str) -> tuple[str, ...]:
 
 def _parse_validation_command_detailed(
     command: str,
-) -> tuple[list[str], tuple[str, ...], str | None]:
-    """Parse the private validation-only environment channel.
+) -> tuple[list[str], tuple[str, ...], str | None, str | None]:
+    """Parse the private validation-only environment and cwd-prefix channel.
 
     The public ``parse_validation_command`` API intentionally remains a
     two-tuple.  TMPDIR is accepted only for the one canonical value used by
     task cards; arbitrary assignments and alternate paths stay fail-closed.
+    The leading ``cd <relative-repo-path> &&`` prefix, if present, is parsed
+    before the environment-assignment prefix so an existing
+    ``PYTHONPATH=``/``TMPDIR=`` prefix still works unchanged immediately
+    after it (e.g. ``cd sub && PYTHONPATH=. python3 -m pytest``).
     """
     argv = _tokenize_validation_command(command)
+    cd_relative, argv = _split_validation_cd_prefix(argv)
     env, rest = _split_validation_env_prefix(argv)
     components: tuple[str, ...] = ()
     tmpdir_override: str | None = None
@@ -1657,12 +1743,14 @@ def _parse_validation_command_detailed(
         if raw_value != _SUPPORTED_VALIDATION_TMPDIR_VALUE:
             raise WorkspaceError(f"validation_tmpdir_value_not_supported:{raw_value}")
         tmpdir_override = raw_value
-    return rest, components, tmpdir_override
+    return rest, components, tmpdir_override, cd_relative
 
 
 def parse_validation_command(command: str) -> tuple[list[str], tuple[str, ...]]:
     """Return executable argv plus an optional bounded PYTHONPATH component list."""
-    argv, components, _tmpdir_override = _parse_validation_command_detailed(command)
+    argv, components, _tmpdir_override, _cd_relative = _parse_validation_command_detailed(
+        command
+    )
     return argv, components
 
 
@@ -1700,6 +1788,21 @@ def resolve_validation_pythonpath(
             raise WorkspaceError(f"validation_pythonpath_not_directory:{component}")
         resolved.append(f"{base}/{PurePosixPath(component).as_posix()}")
     return os.pathsep.join(resolved)
+
+
+def _resolve_validation_cwd(workspace: WorkerWorkspace, relative: str) -> str:
+    """Fail-closed resolution of a ``cd`` prefix's target against the real
+    workspace filesystem: rejects a symlinked path component or escape
+    (``_require_beneath``, shared with every other workspace-relative
+    resolution) and requires the resolved target to actually be a directory,
+    not a symlink itself. Returns the workspace-relative POSIX path so
+    callers can bind/chdir into the identical location under either sandbox
+    backend.
+    """
+    target = _require_beneath(workspace.path, workspace.path / relative)
+    if target.is_symlink() or not target.is_dir():
+        raise WorkspaceError(f"validation_cwd_not_directory:{relative}")
+    return target.relative_to(workspace.path).as_posix()
 
 
 def _is_pytest_validation_command(argv: list[str]) -> bool:
@@ -1793,9 +1896,12 @@ def run_validations(
     )
     try:
         for command in rows:
-            tokens, pythonpath_components, tmpdir_override = _parse_validation_command_detailed(
-                command
-            )
+            (
+                tokens,
+                pythonpath_components,
+                tmpdir_override,
+                cd_relative,
+            ) = _parse_validation_command_detailed(command)
             effective_components = pythonpath_components
             if _is_pytest_validation_command(tokens):
                 # B755: bind and prepend the one trusted pytest package root
@@ -1815,6 +1921,7 @@ def run_validations(
                     effective_components
                 ),
                 validation_exec_scratch=scratch_dir,
+                validation_cwd=cd_relative,
             )
             env = sanitized_env(
                 "validation", home=validation_home, isolated_task_queue_db=True
@@ -1855,6 +1962,7 @@ def run_validations(
             record = {
                 "command": command,
                 "argv": tokens,
+                "cwd": cd_relative,
                 "env_override": env_override_evidence,
                 "returncode": result.returncode,
                 "stdout_tail": result.stdout[-8_192:],

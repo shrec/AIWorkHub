@@ -609,15 +609,15 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
         calls["promote"] += 1
         return list(changed)
 
-    def fake_mark_review(task_id, runner=None, topic=None):
+    def fake_mark_review(repo, task_id, runner, substatus, *, evidence=None):
         calls["mark_review"] += 1
         card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
-        return {"ok": True}
+        return {"ok": True, "substatus": substatus, "evidence": evidence}
 
     monkeypatch.setattr(process_launcher, "enforce_scope", fake_enforce_scope)
     monkeypatch.setattr(process_launcher, "run_validations", fake_run_validations)
     monkeypatch.setattr(process_launcher, "promote", fake_promote)
-    monkeypatch.setattr(process_launcher.core, "mark_review", fake_mark_review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", fake_mark_review)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
 
     dead_pid = 2_147_483_001
@@ -806,8 +806,8 @@ def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monke
     )
     monkeypatch.setattr(process_launcher, "promote", lambda workspace, changed: list(changed))
     monkeypatch.setattr(
-        process_launcher.core, "mark_review",
-        lambda task_id, runner=None, topic=None: (
+        process_launcher.task_engine, "mark_terminal_review",
+        lambda repo, task_id, runner, substatus, evidence=None: (
             card.update({"status": "review", "worker_status": "review", "review_requested_by": runner})
             or {"ok": True}
         ),

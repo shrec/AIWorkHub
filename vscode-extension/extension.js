@@ -2,6 +2,7 @@ const vscode = require("vscode");
 const childProcess = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const EXT_ID = "aiworkhub";
@@ -88,6 +89,15 @@ const MCP_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MCP_MAX_STDERR_LOG_BYTES = 4096;
 const MCP_MAX_RESTART_ATTEMPTS = 1;
 const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 1;
+// B893: bounded self-repair budget for a DETECTED runtime version/capability
+// mismatch (a stale bundled runtime after a VSIX update or an in-place
+// runtime repair). Separate from MCP_MAX_RESTART_ATTEMPTS, which bounds
+// restarts after an unexpected child *exit* -- this bounds restarts of a
+// still-running, still-healthy child that simply reports the wrong version,
+// so a persistently broken runtime degrades visibly instead of respawning
+// forever. Repairing means restarting only THIS client's own child; it never
+// rebinds to a different repository.
+const MCP_MAX_RUNTIME_REPAIR_ATTEMPTS = 1;
 
 // ── Active repository resolution ──────────────────────────────────────────
 // Single-folder workspace: auto-bind to folders[0].
@@ -455,6 +465,11 @@ class McpStdioClient {
     // inferred from the absence of a transport error; only ever set by
     // _recordDispatcherEnsureResult().
     this.dispatcherReady = false;
+    // B893: how many bounded runtime-repair restarts this client has spent
+    // on the CURRENT mismatch episode. Reset to 0 whenever a health check
+    // finds the runtime healthy (see pushRuntimeInfo), so a later, distinct
+    // mismatch (e.g. a subsequent runtime repair) gets its own fresh budget.
+    this.runtimeRepairAttempts = 0;
   }
 
   // B859: the ONE place that decides whether a dispatcher_ensure_started
@@ -815,6 +830,31 @@ class McpStdioClient {
     }
     this.stop({ restart });
   }
+
+  // B893: the ONE reloadless repair path. A detected runtime version or
+  // capability mismatch is fixed in place -- one bounded restart of THIS
+  // repository's own child, spawned with the exact same
+  // repositoryRoot/repositoryIdentity/claimEpisode this client was
+  // constructed with (see getMcpClient/_start) -- never a different
+  // repository, never a host-global runtime, never a manual "Developer:
+  // Reload Window" instruction. Bounded by MCP_MAX_RUNTIME_REPAIR_ATTEMPTS
+  // so a persistently broken runtime degrades visibly instead of respawning
+  // forever; the caller (pushRuntimeInfo) resets the budget once a
+  // subsequent health check reports a genuine match.
+  async attemptRuntimeRepair(reason) {
+    if (this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS) {
+      return { attempted: false, repaired: false, reason: "runtime_repair_budget_exhausted" };
+    }
+    this.runtimeRepairAttempts += 1;
+    this.outputChannel.appendLine(`[mcp] runtime mismatch (${reason}) -- attempting one bounded child restart`);
+    this.stop({ restart: true });
+    try {
+      await this.ensureStarted();
+    } catch (err) {
+      return { attempted: true, repaired: false, reason: sanitizeErrorMessage(err) };
+    }
+    return { attempted: true, repaired: true, reason };
+  }
 }
 
 let outputChannel = null;
@@ -877,6 +917,226 @@ async function ensureCodexMuxConfigured(context) {
   await config.update("cliExecutable", muxPath, vscode.ConfigurationTarget.Global);
   outputChannel.appendLine("[callback] repaired chatgpt.cliExecutable to bundled AIWorkHub mux; reload once");
   return true;
+}
+
+// ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
+// A real Codex CLI `config.toml` may already contain one or more
+// `[mcp_servers.<name>]` tables this extension itself wrote in a previous
+// install -- `<name>` is arbitrary (AIWorkHub, AIWorkHub_Ultrafast, any other
+// casing a user or an older installer chose). After a VSIX update the
+// bundled runtime moves to a new versioned extension directory, leaving the
+// table's `env.PYTHONPATH` pointing at a stale, no-longer-installed path.
+// This migrates ONLY that PYTHONPATH value, and ONLY for a table that is
+// unambiguously AIWorkHub-owned: its `args` must invoke `-m aiworkhub.server`
+// AND its current PYTHONPATH must already be a recognizable, versioned VS
+// Code AIWorkHub extension runtime path (never a user's own custom path).
+// The table name, `command`, `args`, comments, ordering, AIWORKHUB_REPO/
+// ROOT/ID, and every other key are never touched -- and a table that fails
+// either check is a custom/unrelated block and is left fully byte-identical.
+// No process is ever killed here and no manual VS Code/Codex reload is ever
+// required -- this only rewrites a static file the next Codex CLI launch
+// will read.
+const CODEX_MCP_TABLE_HEADER_RE = /^\[mcp_servers\.((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^.\]"'\s]+))\]\s*$/;
+const CODEX_MCP_ENV_TABLE_HEADER_RE = /^\[mcp_servers\.((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^.\]"'\s]+))\.env\]\s*$/;
+const CODEX_ANY_TABLE_HEADER_RE = /^\[[^\]]*\]\s*$/;
+const CODEX_MCP_ARGS_INVOKES_SERVER_RE = /args\s*=\s*\[[\s\S]*?["']-m["']\s*,\s*["']aiworkhub\.server["'][\s\S]*?\]/;
+const CODEX_PYTHONPATH_LINE_RE = /^(\s*PYTHONPATH\s*=\s*)(["'])((?:\\.|(?!\2).)*)\2(.*)$/;
+// Matches a VS Code extension-install-layout runtime directory for this
+// extension: `.../extensions/<publisher>.<name with "aiworkhub">-<version>/
+// runtime`, on any platform's separator, any casing, any publisher/version.
+// Never matches a bare/custom path a user configured by hand.
+const CODEX_OWNED_RUNTIME_SEGMENT_RE = /^.*[\\/]extensions[\\/][^\\/]*aiworkhub[^\\/]*-\d+(?:\.\d+){1,3}[^\\/]*[\\/]runtime[\\/]?$/i;
+
+function codexTomlTableName(rawToken) {
+  const token = String(rawToken || "").trim();
+  if (
+    token.length >= 2 &&
+    ((token[0] === '"' && token[token.length - 1] === '"') || (token[0] === "'" && token[token.length - 1] === "'"))
+  ) {
+    return token.slice(1, -1);
+  }
+  return token;
+}
+
+function decodeCodexTomlQuotedValue(quoteChar, rawValue) {
+  if (quoteChar === "'") {
+    return rawValue;
+  }
+  return rawValue.replace(/\\(.)/g, (match, ch) => (ch === "\\" || ch === '"' ? ch : match));
+}
+
+function encodeCodexTomlQuotedValue(quoteChar, value) {
+  if (quoteChar === "'" && !value.includes("'")) {
+    return { quoteChar: "'", text: value };
+  }
+  return { quoteChar: '"', text: value.replace(/\\/g, "\\\\").replace(/"/g, '\\"') };
+}
+
+// Splits a raw PYTHONPATH value into platform-delimited entries without ever
+// mis-splitting a Windows drive letter's own colon (`C:\...`) when no real
+// `;` delimiter is present.
+function splitCodexPythonPathValue(value) {
+  const raw = String(value || "");
+  if (raw.includes(";")) {
+    return raw.split(";");
+  }
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    return [raw];
+  }
+  if (raw.includes(":")) {
+    return raw.split(":");
+  }
+  return [raw];
+}
+
+// Splits `content` into alternating {text, eol} records so every line this
+// function does not modify reproduces its EXACT original bytes, including
+// mixed/CRLF line endings and a final line with no trailing newline.
+function splitCodexTomlKeepingLineEndings(content) {
+  const pieces = content.split(/(\r\n|\r|\n)/);
+  const lines = [];
+  for (let i = 0; i < pieces.length; i += 2) {
+    lines.push({ text: pieces[i], eol: pieces[i + 1] || "" });
+  }
+  return lines;
+}
+
+function joinCodexTomlLines(lines) {
+  return lines.map((line) => line.text + line.eol).join("");
+}
+
+/** Pure text transform -- never throws on malformed/unrecognized input (an
+ *  unparsed or ambiguous table is left untouched, failing closed toward
+ *  "leave it alone" rather than toward "rewrite it"). Returns
+ *  {content, changed, migrated: [name, ...]}.
+ */
+function migrateCodexConfigTomlText(originalText, newRuntimeDir) {
+  const lines = splitCodexTomlKeepingLineEndings(String(originalText || ""));
+  const migrated = [];
+
+  // Pass 1: every top-level [mcp_servers.<name>] table span, and whether its
+  // own args invoke this server (multi-line arrays are handled by matching
+  // against the whole joined span text).
+  const mainTables = [];
+  let current = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].text.trim();
+    const envMatch = trimmed.match(CODEX_MCP_ENV_TABLE_HEADER_RE);
+    const mainMatch = !envMatch && trimmed.match(CODEX_MCP_TABLE_HEADER_RE);
+    if (mainMatch) {
+      if (current) current.endIdx = i;
+      current = { name: codexTomlTableName(mainMatch[1]), argsInvoke: false, startIdx: i + 1, endIdx: lines.length };
+      mainTables.push(current);
+      continue;
+    }
+    if (CODEX_ANY_TABLE_HEADER_RE.test(trimmed)) {
+      if (current) current.endIdx = i;
+      current = null;
+    }
+  }
+  for (const table of mainTables) {
+    const spanText = lines
+      .slice(table.startIdx, table.endIdx)
+      .map((l) => l.text)
+      .join("\n");
+    table.argsInvoke = CODEX_MCP_ARGS_INVOKES_SERVER_RE.test(spanText);
+  }
+  const ownedNames = new Set(mainTables.filter((t) => t.argsInvoke).map((t) => t.name));
+
+  // Pass 2: every [mcp_servers.<name>.env] table span belonging to an owned
+  // name; rewrite its PYTHONPATH line only if its current value already
+  // resolves to a recognizable, versioned AIWorkHub extension runtime path.
+  let currentEnvName = null;
+  let currentEnvStart = -1;
+  const envSpans = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].text.trim();
+    const envMatch = trimmed.match(CODEX_MCP_ENV_TABLE_HEADER_RE);
+    if (envMatch) {
+      if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: i });
+      currentEnvName = codexTomlTableName(envMatch[1]);
+      currentEnvStart = i + 1;
+      continue;
+    }
+    if (CODEX_ANY_TABLE_HEADER_RE.test(trimmed)) {
+      if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: i });
+      currentEnvName = null;
+    }
+  }
+  if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: lines.length });
+
+  for (const span of envSpans) {
+    if (!ownedNames.has(span.name)) continue;
+    for (let i = span.startIdx; i < span.endIdx; i += 1) {
+      const m = lines[i].text.match(CODEX_PYTHONPATH_LINE_RE);
+      if (!m) continue;
+      const [, prefix, quoteChar, rawValue, suffix] = m;
+      const decoded = decodeCodexTomlQuotedValue(quoteChar, rawValue);
+      const parts = splitCodexPythonPathValue(decoded);
+      const isOwnedRuntimePath = parts.some((part) => CODEX_OWNED_RUNTIME_SEGMENT_RE.test(part.trim()));
+      if (!isOwnedRuntimePath || decoded === newRuntimeDir) {
+        break;
+      }
+      const encoded = encodeCodexTomlQuotedValue(quoteChar, newRuntimeDir);
+      lines[i] = {
+        text: `${prefix}${encoded.quoteChar}${encoded.text}${encoded.quoteChar}${suffix}`,
+        eol: lines[i].eol,
+      };
+      migrated.push(span.name);
+      break;
+    }
+  }
+
+  return { content: joinCodexTomlLines(lines), changed: migrated.length > 0, migrated };
+}
+
+// CODEX_HOME is the Codex CLI's own override for its config directory;
+// absent that, the real Codex CLI default is `~/.codex/config.toml` on
+// Linux/macOS/Windows alike (Windows home is os.homedir(), never a guessed
+// repo-relative or global fallback path).
+function resolveCodexConfigTomlPath(env) {
+  const environment = env || process.env;
+  const codexHome = String((environment && environment.CODEX_HOME) || "").trim();
+  const base = codexHome || path.join(os.homedir(), ".codex");
+  return path.join(base, "config.toml");
+}
+
+function atomicWriteText(file, text) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, text, "utf8");
+  fs.renameSync(tmp, file);
+}
+
+// Best-effort, silent, bounded migration run once at activation. Never
+// throws into the caller; a missing config.toml, an unreadable file, or a
+// file with no owned/stale blocks is simply a no-op -- never invents a
+// config.toml, never touches a different repository's state, never kills a
+// process, and never asks for a manual reload.
+async function migrateCodexConfigTomlRuntimePath(context) {
+  try {
+    const configPath = resolveCodexConfigTomlPath(process.env);
+    if (!fs.existsSync(configPath)) {
+      return { attempted: false, reason: "config_toml_missing" };
+    }
+    const original = fs.readFileSync(configPath, "utf8");
+    const runtimeDir = path.join(context.extensionUri.fsPath, "runtime");
+    const result = migrateCodexConfigTomlText(original, runtimeDir);
+    if (!result.changed) {
+      return { attempted: true, changed: false, migrated: [] };
+    }
+    atomicWriteText(configPath, result.content);
+    if (outputChannel) {
+      outputChannel.appendLine(
+        `[codex] migrated PYTHONPATH for mcp_servers: ${result.migrated.join(", ")}`,
+      );
+    }
+    return { attempted: true, changed: true, migrated: result.migrated };
+  } catch (err) {
+    if (outputChannel) {
+      outputChannel.appendLine(`[codex] config.toml runtime migration skipped: ${sanitizeErrorMessage(err)}`);
+    }
+    return { attempted: true, changed: false, error: sanitizeErrorMessage(err) };
+  }
 }
 
 function installedExtensionVersion() {
@@ -942,52 +1202,120 @@ function pushCoordinatorTargets(view) {
   }
 }
 
-function runtimeMismatchPayload(reason, runtimeVersion) {
+// B893: `reloadRequired` is retained in the payload shape for backward
+// compatibility but is NEVER set true anymore -- this extension must never
+// instruct a manual window/extension-host reload. A mismatch that cannot be
+// repaired within the bounded budget is reported as `degraded` with a
+// readable `reason` instead.
+function runtimeStatusPayload({ runtimeVersion, degraded, repaired, repairAttempted, reason }) {
   return {
     extensionVersion: installedExtensionVersion(),
     expectedMcpVersion: EXPECTED_MCP_PACKAGE_VERSION,
     runtimeVersion: runtimeVersion || "unavailable",
-    reloadRequired: true,
-    reason,
+    reloadRequired: false,
+    degraded: Boolean(degraded),
+    repaired: Boolean(repaired),
+    repairAttempted: Boolean(repairAttempted),
+    reason: reason || "ok",
   };
 }
 
-async function pushRuntimeInfo(view) {
+// One bounded tools/list + health round trip against `client`. Never mutates
+// client state; callers decide what to do with the result.
+async function checkRuntimeHealth(client) {
+  const tools = await client.listTools();
+  const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
+  const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));
+  let health = null;
   try {
-    const client = getMcpClient();
-    const tools = await client.listTools();
-    const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
-    const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));
-    let health = null;
-    try {
-      health = await client.callTool(DASHBOARD_TOOLS.health, {});
-    } catch (_err) {
-      health = null;
-    }
-    const runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
-    if (missing.length || runtimeVersion !== EXPECTED_MCP_PACKAGE_VERSION) {
-      view.postMessage({
-        type: OUTBOUND_TYPES.runtimeInfo,
-        payload: runtimeMismatchPayload(missing.length ? "mcp_capability_mismatch" : "mcp_version_mismatch", runtimeVersion),
-      });
-      return;
-    }
-    view.postMessage({
-      type: OUTBOUND_TYPES.runtimeInfo,
-      payload: {
-        extensionVersion: installedExtensionVersion(),
-        expectedMcpVersion: EXPECTED_MCP_PACKAGE_VERSION,
-        runtimeVersion,
-        reloadRequired: false,
-        reason: "ok",
-      },
-    });
+    health = await client.callTool(DASHBOARD_TOOLS.health, {});
+  } catch (_err) {
+    health = null;
+  }
+  const runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
+  return { matches: missing.length === 0 && runtimeVersion === EXPECTED_MCP_PACKAGE_VERSION, missing, runtimeVersion };
+}
+
+// B893: the reloadless runtime-repair path. A detected version/capability
+// mismatch is fixed by restarting ONLY this window's own repo-bound MCP
+// child (client.attemptRuntimeRepair) -- bounded, never a different
+// repository, never a manual reload instruction -- and, on success, the
+// already-open dashboard reconnects on its own via an immediate pushSnapshot
+// (no user action required). A repair that fails or exhausts its bounded
+// budget surfaces a readable `degraded`/`reason` pair instead of silently
+// attaching another repository or looping forever.
+async function pushRuntimeInfo(view) {
+  let client;
+  try {
+    client = getMcpClient();
   } catch (err) {
     view.postMessage({
       type: OUTBOUND_TYPES.runtimeInfo,
-      payload: runtimeMismatchPayload(sanitizeErrorMessage(err), "unavailable"),
+      payload: runtimeStatusPayload({ degraded: true, reason: sanitizeErrorMessage(err) }),
     });
+    return;
   }
+
+  let status;
+  try {
+    status = await checkRuntimeHealth(client);
+  } catch (err) {
+    status = { matches: false, missing: [], runtimeVersion: "unavailable" };
+  }
+
+  if (status.matches) {
+    client.runtimeRepairAttempts = 0;
+    view.postMessage({
+      type: OUTBOUND_TYPES.runtimeInfo,
+      payload: runtimeStatusPayload({ runtimeVersion: status.runtimeVersion }),
+    });
+    return;
+  }
+
+  const mismatchReason = status.missing.length ? "mcp_capability_mismatch" : "mcp_version_mismatch";
+  const repair = await client.attemptRuntimeRepair(mismatchReason);
+  if (!repair.repaired) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.runtimeInfo,
+      payload: runtimeStatusPayload({
+        runtimeVersion: status.runtimeVersion,
+        degraded: true,
+        repairAttempted: repair.attempted,
+        reason: repair.attempted ? `runtime_repair_failed: ${repair.reason}` : repair.reason,
+      }),
+    });
+    return;
+  }
+
+  let recheck;
+  try {
+    recheck = await checkRuntimeHealth(client);
+  } catch (err) {
+    recheck = { matches: false, missing: [], runtimeVersion: "unavailable" };
+  }
+  if (!recheck.matches) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.runtimeInfo,
+      payload: runtimeStatusPayload({
+        runtimeVersion: recheck.runtimeVersion,
+        degraded: true,
+        repairAttempted: true,
+        reason: recheck.missing.length ? "mcp_capability_mismatch_after_repair" : "mcp_version_mismatch_after_repair",
+      }),
+    });
+    return;
+  }
+
+  client.runtimeRepairAttempts = 0;
+  view.postMessage({
+    type: OUTBOUND_TYPES.runtimeInfo,
+    payload: runtimeStatusPayload({ runtimeVersion: recheck.runtimeVersion, repaired: true, repairAttempted: true }),
+  });
+  // The dashboard tab reconnects on its own -- no manual retry/refresh/
+  // reload needed after a successful bounded repair. pushSnapshot never
+  // rejects (its own errors surface as an "offline" message), so this is
+  // safe to await directly.
+  await pushSnapshot(view);
 }
 
 function readConfiguredRefreshIntervalMs() {
@@ -1401,7 +1729,7 @@ function getHtmlForWebview(webview, extensionUri) {
     </section>
 
     <section class="source-alert reload-alert" id="reload-alert" aria-live="polite" hidden>
-      <strong>Reload/Restart required</strong>
+      <strong>Runtime repair in progress</strong>
       <span id="reload-alert-message"></span>
     </section>
 
@@ -1916,6 +2244,7 @@ async function activate(context) {
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
   await ensureCodexMuxConfigured(context);
+  await migrateCodexConfigTomlRuntimePath(context);
 
   // Resolve the initial active repository and label.
   try {
@@ -1988,12 +2317,21 @@ module.exports = {
     ViewState,
     pushSnapshot,
     pushSnapshotNoRetry,
+    pushRuntimeInfo,
+    findPythonCommand,
+    getMcpClient,
     sanitizeErrorMessage,
     shouldRepairCodexMuxSetting,
+    migrateCodexConfigTomlText,
+    resolveCodexConfigTomlPath,
+    migrateCodexConfigTomlRuntimePath,
+    splitCodexPythonPathValue,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
+      MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       EXPECTED_MCP_PACKAGE_VERSION,
+      CODEX_OWNED_RUNTIME_SEGMENT_RE,
     },
   },
 };

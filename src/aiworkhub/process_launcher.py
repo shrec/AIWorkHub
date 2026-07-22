@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import hmac
 import html
 import inspect
 import json
@@ -164,6 +165,16 @@ MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_RECEIPT_SCAN_BYTES = 2 * 1024 * 1024
 LAUNCH_IMPLEMENTED = True
 SUPERVISOR_GRACE_SECONDS = 90
+# B894: narrowly scoped, one-task terminal-transition authority. Minted at
+# launch time (the one moment launch_gates_open() is known true) and
+# consumed by whichever process later reconciles this exact request's
+# terminal outcome -- possibly a different process than the one that
+# launched it, since the detached supervisor outlives the initiating MCP
+# request. Never a substitute for general AIWORKHUB_ALLOW_WRITES: it is
+# bound to one exact (repo, task_id, runner, topic, request_id) tuple and is
+# consumed (deleted) on first use, whether or not it validates.
+TERMINAL_AUTHORITY_SCHEMA_ID = "aiworkhub.task_mcp.terminal_authority.v1"
+TERMINAL_AUTHORITY_KEY_FILENAME = ".terminal_authority_hmac.key"
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
 FINALIZATION_PENDING_STATES = {"release_pending", "review_pending", "reconcile_pending"}
 TERMINAL_PROCESS_STATES = {
@@ -327,6 +338,115 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
     or insecure permission bits -- a reused PID or tampered status must never
     be trusted silently. The terminal write from ``worker_supervisor.py``
     remains authoritative; this is a bounded, defensive read of it."""
+    try:
+        st = path.lstat()
+    except OSError:
+        return {}
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return {}
+    if st.st_uid != os.getuid():
+        return {}
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        return {}
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            payload = json.loads(fh.read())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _terminal_authority_signing_material(
+    *, repo: Path, task_id: str, runner: str, topic: str, request_id: str,
+) -> bytes:
+    return "|".join(
+        [TERMINAL_AUTHORITY_SCHEMA_ID, str(repo), task_id, runner, topic, request_id]
+    ).encode("utf-8")
+
+
+def _load_or_create_terminal_authority_key(key_path: Path) -> bytes:
+    """Owner-only, symlink-refusing HMAC key backing every terminal-
+    authority grant issued under one ``process_dir``. Persisted (not
+    per-process) so a grant minted by the process that performed the launch
+    can still be verified by a different, later process reconciling this
+    exact request's terminal outcome after the launcher has exited."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(key_path, flags)
+    except OSError:
+        fd = None
+    if fd is not None:
+        try:
+            st = os.fstat(fd)
+            if (
+                stat.S_ISREG(st.st_mode)
+                and stat.S_IMODE(st.st_mode) == 0o600
+                and st.st_uid == os.getuid()
+            ):
+                with os.fdopen(fd, "rb") as fh:
+                    data = fh.read()
+                if len(data) == 32:
+                    return data
+            else:
+                os.close(fd)
+        except OSError:
+            pass
+    key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(key_path.parent, 0o700)
+    key = os.urandom(32)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        new_fd = os.open(key_path, flags, 0o600)
+    except FileExistsError:
+        # Lost the create race to another process/thread -- read back
+        # whatever it wrote instead of minting a second, divergent key.
+        return _load_or_create_terminal_authority_key(key_path)
+    os.fchmod(new_fd, 0o600)
+    with os.fdopen(new_fd, "wb") as fh:
+        fh.write(key)
+    return key
+
+
+def _write_terminal_authority_grant(
+    path: Path,
+    key: bytes,
+    *,
+    repo: Path,
+    task_id: str,
+    runner: str,
+    topic: str,
+    request_id: str,
+) -> None:
+    material = _terminal_authority_signing_material(
+        repo=repo, task_id=task_id, runner=runner, topic=topic, request_id=request_id,
+    )
+    write_json_0600(path, {
+        "schema_id": TERMINAL_AUTHORITY_SCHEMA_ID,
+        "repo": str(repo),
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "request_id": request_id,
+        "issued_at": _utcnow(),
+        "signature": hmac.new(key, material, hashlib.sha256).hexdigest(),
+    })
+
+
+def _read_terminal_authority_grant(path: Path) -> dict[str, Any]:
+    """Same fail-closed owner-only/symlink/permission/JSON contract as
+    ``read_supervisor_status`` -- a tampered, foreign-owned, world-readable,
+    or malformed grant is never trusted."""
     try:
         st = path.lstat()
     except OSError:
@@ -1386,6 +1506,7 @@ class ProcessManager:
         self._live: dict[str, _LiveProcess] = {}
         self._cancelled: set[str] = set()
         self._watching: set[str] = set()
+        self._authority_key: bytes | None = None
         if self.isolation_enabled and self.process_log_path.is_file():
             self._reconcile_persisted_requests()
 
@@ -1619,6 +1740,7 @@ class ProcessManager:
         request_id: str | None = None
         workspace: WorkerWorkspace | None = None
         spec_path: Path | None = None
+        authority_path: Path | None = None
         claimed = False
         provider_env: dict[str, str] | None = None
         try:
@@ -1771,6 +1893,16 @@ class ProcessManager:
                     "workspace": workspace.as_metadata(),
                 }
                 write_json_0600(metadata_path, metadata)
+                authority_path = self._terminal_authority_grant_path(request_id)
+                _write_terminal_authority_grant(
+                    authority_path,
+                    self._terminal_authority_key(),
+                    repo=self.repo,
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                    request_id=request_id,
+                )
                 write_json_0600(spec_path, {
                     "argv": worker_argv,
                     "cwd": "/",
@@ -1915,6 +2047,8 @@ class ProcessManager:
                     reason += f":cleanup_failed:{cleanup_exc}"
             if spec_path is not None:
                 unlink_if_regular(spec_path)
+            if authority_path is not None:
+                unlink_if_regular(authority_path)
             return self._blocked(
                 task_id,
                 runner,
@@ -2357,6 +2491,55 @@ class ProcessManager:
             pass
         return core.release_launch(task_id, runner, reason[:300])
 
+    def _terminal_authority_key(self) -> bytes:
+        if self._authority_key is None:
+            self._authority_key = _load_or_create_terminal_authority_key(
+                self.process_dir / TERMINAL_AUTHORITY_KEY_FILENAME
+            )
+        return self._authority_key
+
+    def _terminal_authority_grant_path(self, request_id: str) -> Path:
+        return self.process_dir / f"{request_id}.terminal-authority.json"
+
+    def _consume_terminal_authority_grant(
+        self,
+        request_id: str,
+        *,
+        repo: Path,
+        task_id: str,
+        runner: str,
+        topic: str,
+    ) -> bool:
+        """One-shot verify-and-consume of the exact-scoped grant minted at
+        launch time. The grant file is removed on this call regardless of
+        whether it validates -- a tampered, wrong-task, wrong-repo, or
+        otherwise mismatched artifact is rejected and can never be
+        presented again (B894: replay/cross-task/cross-repo fail closed)."""
+        path = self._terminal_authority_grant_path(request_id)
+        payload = _read_terminal_authority_grant(path)
+        unlink_if_regular(path)
+        if not payload or payload.get("schema_id") != TERMINAL_AUTHORITY_SCHEMA_ID:
+            return False
+        if (
+            str(payload.get("repo") or "") != str(repo)
+            or str(payload.get("task_id") or "") != task_id
+            or str(payload.get("runner") or "") != runner
+            or str(payload.get("topic") or "") != topic
+            or str(payload.get("request_id") or "") != request_id
+        ):
+            return False
+        signature = str(payload.get("signature") or "")
+        if not signature:
+            return False
+        expected = hmac.new(
+            self._terminal_authority_key(),
+            _terminal_authority_signing_material(
+                repo=repo, task_id=task_id, runner=runner, topic=topic, request_id=request_id,
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected)
+
     def _review_terminal_exact(
         self,
         metadata: dict[str, Any],
@@ -2672,6 +2855,12 @@ class ProcessManager:
                     # logs until Codex's accept/reject decision instead of
                     # deleting the only evidence of what the worker did.
                     cleanup = False
+                    # A non-exited terminal outcome never promotes/writes and
+                    # so never needs the one-task authority grant -- remove
+                    # it now so it cannot linger as a stale, unconsumed
+                    # artifact for a request that will never reach the
+                    # success branch below.
+                    unlink_if_regular(self._terminal_authority_grant_path(request_id))
                     release_result = self._review_terminal_exact(
                         metadata,
                         terminal_state,
@@ -2695,7 +2884,26 @@ class ProcessManager:
                         )
                 else:
                     claim_state = self._exact_claim_state(metadata)
-                    if not core.writes_allowed():
+                    # B894: the ambient AIWORKHUB_ALLOW_WRITES flag is only
+                    # ever set in the process that is actively handling an
+                    # MCP request -- it is gone by the time a detached
+                    # reconciliation scan (a different, later process)
+                    # observes a clean exit. Fall back to the narrowly
+                    # scoped, single-use grant this exact launch minted while
+                    # the ambient gate WAS open, rather than stalling every
+                    # successful outcome at review_pending forever. Both
+                    # checks always run (never short-circuited) so the grant
+                    # is consumed -- and thus can never be replayed -- even
+                    # when the ambient gate alone already authorized this.
+                    ambient_writes_allowed = core.writes_allowed()
+                    granted = self._consume_terminal_authority_grant(
+                        request_id,
+                        repo=self.repo,
+                        task_id=str(metadata["task_id"]),
+                        runner=str(metadata["runner"]),
+                        topic=str(metadata["topic"]),
+                    )
+                    if not (ambient_writes_allowed or granted):
                         cleanup = False
                         terminal_state = "review_pending"
                         error = "write_gate_closed_during_reconciliation"
@@ -2739,10 +2947,30 @@ class ProcessManager:
                             raise WorkspaceError("no_effect")
                         promoted = promote(workspace, changed)
                         if claim_state == "processing":
-                            review_result = core.mark_review(
-                                str(metadata["task_id"]),
-                                runner=str(metadata["runner"]),
-                                topic=str(metadata["topic"]),
+                            # B895: core.mark_review's _canonical_write_gate
+                            # re-checks the ambient AIWORKHUB_ALLOW_WRITES
+                            # flag -- gone by the time a detached reconciler
+                            # (not the process that launched this request)
+                            # observes the clean exit, so it always rejects
+                            # here and stalls at review_pending even though
+                            # the one-shot grant above already authorized
+                            # this exact (repo, task_id, runner, topic,
+                            # request_id) tuple. Route the success terminal
+                            # transition through the same repository-bound,
+                            # non-ambient task_engine.mark_terminal_review
+                            # path the failure branch already uses, carrying
+                            # full changed/promoted/validation evidence.
+                            review_result = self._review_terminal_exact(
+                                metadata,
+                                "review_ready",
+                                request_id=request_id,
+                                evidence={
+                                    "changed_paths": changed,
+                                    "promoted_paths": promoted,
+                                    "required_outputs": required_output_records,
+                                    "validation": validations,
+                                    "worker_mcp_gate": worker_mcp_gate,
+                                },
                             )
                         else:
                             review_result = {"ok": True, "idempotent_noop": True}

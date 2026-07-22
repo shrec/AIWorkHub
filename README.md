@@ -150,6 +150,40 @@ adapter, and concurrency cap before starting a process. The worker's first
 operation is exact `taskctl claim-start <task_id>`, and success is not reported
 as complete until the task reaches `review`.
 
+## Task Dispatch, Validation & Acceptance
+
+**Dispatch.** Tasks are claimed, never pushed: `aiworkhub_task_auto_pickup`
+matches an exact `runner`/`topic` pair against the pending queue in
+`.aiworkhub/tasking/task_queue.sqlite` and hands the worker one task card
+carrying its `allowed_writes`, `forbidden` actions, and `required_outputs`. A
+worker never picks a task from another topic. `aiworkhub_agent_launch_task`
+independently re-validates the exact pending task, runner/topic, adapter,
+allowed-write boundary, and collision state before starting a process.
+
+Every task then passes through three independent verification layers before
+it can be accepted:
+
+1. **Worker self-validation.** Inside its own isolated worktree, the worker
+   runs the exact validation commands its task card lists (tests,
+   `python3 -m json.tool`, etc.) before calling
+   `aiworkhub_task_mark_review`/`taskctl review`. This is the worker's own
+   claim -- not yet trusted by the coordinator.
+2. **Independent coordinator review.** The coordinator does not take the
+   worker's claim on faith: it independently reruns the same validation
+   commands against the worker's actual changed files, confirms the diff
+   stays inside `allowed_writes`, and confirms nothing in `forbidden` was
+   touched -- before promoting any file out of the worker's isolated
+   workspace.
+3. **Audit-ledger acceptance gate.** Every required tool call a worker makes
+   (Source Graph, Session Manager, AI Memory, KB) is recorded to an
+   HMAC-authenticated MCP audit ledger. A worker's textual claim that it used
+   a required tool is not sufficient by itself -- the coordinator checks the
+   ledger for the actual call before accepting a code task.
+
+A task only reaches accepted/`done` after all three layers pass: worker
+validation -> independent coordinator re-validation -> audit-ledger receipt
+check. Workers stop at `review`; only the coordinator finalizes `done`.
+
 ## DeepSeek (`deepseek_copilot_cli`) Adapter
 
 `deepseek_copilot_cli` launches the installed official GitHub Copilot CLI in
@@ -528,6 +562,35 @@ python3 -m pytest -q ../../AITools/test_taskctl_origin_thread_callback_b366_v1.p
 ```bash
 bash tests/test_write_gate_audit_v1.sh
 ```
+
+## Roadmap: Concepts Under Consideration (Kimi-Atlas-Inspired)
+
+These are **design ideas only** -- none of them exist in the codebase yet.
+They are recorded here as a named future target, not as a claim of current
+behavior:
+
+- **Deterministic lifecycle FSM** -- replace today's status-string
+  transitions (`pending` -> `processing` -> `review` -> `done`/`blocked`)
+  with an explicit, exhaustively enumerated finite-state machine so every
+  transition is provably reachable and every non-transition is provably
+  rejected.
+- **Combined-tree differential gate** -- diff the worker's full changed-file
+  tree against `allowed_writes` in a single pass, instead of today's
+  per-file allowlist check, to catch cross-file leakage in one shot.
+- **Deterministic verification lenses** -- named, composable verification
+  passes (schema lens, ownership lens, forbidden-path lens, test lens) that
+  each produce an independent pass/fail verdict, instead of one monolithic
+  validation script.
+- **Read-time context graph** -- build the Source Graph/KB/session context
+  bundle lazily at the moment a worker actually requests it, rather than
+  precomputing and freezing a snapshot at dispatch time.
+- **Forward-only recovery** -- when a worker's task is interrupted (crash,
+  stale lease), recover by replaying forward from the last confirmed
+  checkpoint instead of rewinding task state, so a partially completed
+  worktree is never silently discarded.
+
+None of the above is scheduled or gated; they are candidates to evaluate
+against the existing dispatch/validation/acceptance model described above.
 
 ## Documentation
 
