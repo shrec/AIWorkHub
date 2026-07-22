@@ -1069,23 +1069,78 @@ function lifecycleFromType(type, event) {
 function resultTextFrom(event) {
   const result = event.result && typeof event.result === "object" ? event.result : {};
   const message = event.message && typeof event.message === "object" ? event.message : {};
+  const item = event.item && typeof event.item === "object" ? event.item : {};
   return redactDisplayText(firstText(
     event.error,
     event.warning,
-    event.result,
     event.verdict,
+    event.output,
+    event.summary,
     event.stop_reason,
     event.terminal_reason,
+    event.result,
     result.error,
     result.verdict,
     result.output,
     result.summary,
     message.error,
     message.content,
+    item.error,
+    item.output,
+    item.message,
   ), 180);
 }
 
+function parseNestedJson(value, depth = 0) {
+  if (depth > 3) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return value;
+  }
+  const text = value.trim();
+  if (!text || !["{", "[", "\""].includes(text[0])) {
+    return value;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return parsed === value ? value : parseNestedJson(parsed, depth + 1);
+  } catch (_error) {
+    return value;
+  }
+}
+
+function safeRawEvent(value) {
+  let text;
+  try {
+    text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  } catch (_error) {
+    text = String(value || "");
+  }
+  return redactDisplayText(text, 2000);
+}
+
+function jsonSummary(value) {
+  const parsed = parseNestedJson(value);
+  if (Array.isArray(parsed)) {
+    return `${parsed.length} structured item${parsed.length === 1 ? "" : "s"}`;
+  }
+  if (parsed && typeof parsed === "object") {
+    const keys = Object.keys(parsed).slice(0, 6);
+    return keys.length ? `Structured event: ${keys.join(", ")}` : "Structured event";
+  }
+  return redactDisplayText(parsed, 180);
+}
+
 function timelineEventFromObject(event, rawLine) {
+  const nestedResult = parseNestedJson(event.result);
+  if (nestedResult && typeof nestedResult === "object" && !Array.isArray(nestedResult)) {
+    event = {
+      ...nestedResult,
+      ...event,
+      result: nestedResult.result ?? nestedResult.output ?? nestedResult.summary ?? nestedResult.verdict ?? "",
+    };
+  }
   const type = firstText(event.type, event.event, event.kind, event.subtype) || "json";
   const normalized = type.toLowerCase();
   const isResult = normalized === "result" || event.result !== undefined || event.terminal_reason;
@@ -1102,9 +1157,9 @@ function timelineEventFromObject(event, rawLine) {
     title,
     label: commandLabelFrom(event),
     state: lifecycleFromType(type, event),
-    message: resultTextFrom(event),
+    message: resultTextFrom(event) || jsonSummary(nestedResult || event),
     metrics: eventUsage(event),
-    raw: rawLine,
+    raw: safeRawEvent(rawLine),
   };
 }
 
@@ -1116,27 +1171,34 @@ function timelineEventsFromText(decoded) {
       continue;
     }
     try {
-      const parsed = JSON.parse(line);
+      const parsed = parseNestedJson(line);
       if (parsed && typeof parsed === "object") {
-        const key = JSON.stringify(parsed);
-        if (seenJsonLines.has(key)) {
-          continue;
+        const parsedEvents = Array.isArray(parsed) ? parsed : [parsed];
+        for (const parsedEvent of parsedEvents) {
+          if (!parsedEvent || typeof parsedEvent !== "object") {
+            continue;
+          }
+          const key = JSON.stringify(parsedEvent);
+          if (seenJsonLines.has(key)) {
+            continue;
+          }
+          seenJsonLines.add(key);
+          events.push(timelineEventFromObject(parsedEvent, parsedEvent));
         }
-        seenJsonLines.add(key);
-        events.push(timelineEventFromObject(parsed, line));
         continue;
       }
     } catch (_error) {
       // Malformed provider output degrades to a text-only row.
     }
+    const looksStructured = /^[\s]*[\[{]/.test(line) || /\\"(?:type|event|result)\\"\s*:/.test(line);
     events.push({
       kind: "text",
-      title: "Output",
-      label: "plain text",
+      title: looksStructured ? "Unrecognized event" : "Output",
+      label: looksStructured ? "structured output" : "plain text",
       state: "line",
-      message: redactDisplayText(line, 220),
+      message: looksStructured ? "Provider emitted an unsupported event shape; open Raw event for details." : redactDisplayText(line, 220),
       metrics: [],
-      raw: line,
+      raw: safeRawEvent(line),
     });
   }
   return events;

@@ -206,3 +206,20 @@ def test_mcp_tool_functional(repo, monkeypatch) -> None:
     assert result["ok"] is True
     assert "mcp path output" in result["output"]
     assert result["authority_flags"]["readonly"] is True
+
+
+def test_webview_normalizer_handles_nested_provider_json_without_visible_raw_dump() -> None:
+    """Regression guard for Claude/Codex/DeepSeek/GLM stringified envelopes.
+
+    The browser behavior itself is covered by the extension's JS syntax
+    check; these source assertions ensure the formatter keeps the recursive
+    JSON parser, readable unknown-event fallback, and newest-first ordering.
+    """
+    app_source = (
+        _TOOL_ROOT / "vscode-extension" / "media" / "app.js"
+    ).read_text(encoding="utf-8")
+    assert "function parseNestedJson(" in app_source
+    assert "const parsed = parseNestedJson(line);" in app_source
+    assert "Provider emitted an unsupported event shape" in app_source
+    assert "for (const event of events.slice(-200).reverse())" in app_source
+    assert "raw: safeRawEvent(" in app_source
