@@ -177,7 +177,11 @@ def test_heartbeat_refreshes_during_silent_child_and_tracks_output_activity(tmp_
                 except json.JSONDecodeError:
                     payload = {}
                 if payload.get("state") == "running" and payload.get("heartbeat_seq"):
-                    silent_snapshots.append(payload)
+                    if (
+                        not silent_snapshots
+                        or payload["heartbeat_seq"] != silent_snapshots[-1]["heartbeat_seq"]
+                    ):
+                        silent_snapshots.append(payload)
             time.sleep(0.08)
 
         assert len(silent_snapshots) >= 2, "expected multiple heartbeats while child was silent"
