@@ -652,11 +652,11 @@ def test_inject_worker_mcp_config_copilot_gets_additional_mcp_config_flag(tmp_pa
     plan = _launchable_plan(runtime_adapters.DEEPSEEK_COPILOT_ADAPTER, repo)
     config = _config_file(tmp_path)
     injected = runtime_adapters.inject_worker_mcp_config(plan, config)
-    assert injected.argv[-2:] == ["--additional-mcp-config", str(config.resolve())]
+    assert injected.argv[-2:] == ["--additional-mcp-config", f"@{config.resolve()}"]
 
     glm_plan = _launchable_plan(runtime_adapters.GLM_COPILOT_ADAPTER, repo)
     glm_injected = runtime_adapters.inject_worker_mcp_config(glm_plan, config)
-    assert glm_injected.argv[-2:] == ["--additional-mcp-config", str(config.resolve())]
+    assert glm_injected.argv[-2:] == ["--additional-mcp-config", f"@{config.resolve()}"]
 
 
 def test_inject_worker_mcp_config_codex_argv_unchanged(tmp_path: Path) -> None:

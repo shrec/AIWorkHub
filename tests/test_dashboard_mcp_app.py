@@ -11,7 +11,7 @@ _SRC = _TOOL_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, dashboard, dashboard_mcp_app  # noqa: E402
+from aiworkhub import core, dashboard, dashboard_mcp_app, task_store  # noqa: E402
 
 
 FAKE_SNAPSHOT: dict[str, Any] = {
@@ -204,6 +204,12 @@ def test_health_view_reads_repo_root_env_and_never_calls_build_snapshot(monkeypa
     # so the connection banner never depends on a repository shipping
     # AITools/taskctl.py and polling stays cheap.
     monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setattr(
+        dashboard_mcp_app.core,
+        "repo_root",
+        lambda: (_ for _ in ()).throw(RuntimeError("repository_root_not_found")),
+    )
 
     def _boom_snapshot():
         raise AssertionError("health_view must never call dashboard.build_snapshot")
@@ -216,6 +222,21 @@ def test_health_view_reads_repo_root_env_and_never_calls_build_snapshot(monkeypa
     assert result["server_tool"] == "aiworkhub_dashboard_health"
     assert result["server_version"]
     assert result["authority_flags"]["agent_launch"] is False
+
+
+def test_health_view_falls_back_to_process_local_core_repo_root(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+
+    result = dashboard_mcp_app.health_view()
+
+    assert result["ok"] is True
+    assert result["repo"] == str(repo)
+    assert result["storage"]["ready"] is True
 
 
 # ---------------------------------------------------------------------------

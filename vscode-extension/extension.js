@@ -1002,17 +1002,38 @@ function repairCodexConfigTomlText(text, currentRuntimeDir) {
       currentSection = sectionMatch[1];
       return line;
     }
+    // A Codex MCP entry is application-global, while repository authority is
+    // chat/process-local. Persisting a repository path here makes the last
+    // reloaded VS Code window steal every other window's AIWorkHub binding.
+    // Remove only AIWorkHub-owned repository bindings; the MCP process will
+    // resolve its repository from its own cwd, while the dashboard child is
+    // still explicitly bound by McpStdioClient._start().
+    if (
+      isOwnedMcpSection(currentSection)
+      && /^\s*AIWORKHUB_REPO(?:_ROOT)?\s*=/.test(line)
+    ) {
+      changed = true;
+      return null;
+    }
     if (!line.includes("PYTHONPATH") || !isOwnedMcpSection(currentSection)) {
       return line;
     }
-    return line.replace(AIWORKHUB_RUNTIME_PATH_RE, (match) => {
+    if (line.includes(currentRuntimeDir)) return line;
+    const migratedLine = line.replace(AIWORKHUB_RUNTIME_PATH_RE, (match) => {
       if (match === currentRuntimeDir) {
         return match;
       }
       changed = true;
       return currentRuntimeDir;
     });
-  });
+    if (migratedLine !== line) return migratedLine;
+    const pythonPathAssignment = line.match(/^(\s*PYTHONPATH\s*=\s*)"(?:[^"\\]|\\.)*"(\s*(?:#.*)?)$/);
+    if (pythonPathAssignment) {
+      changed = true;
+      return `${pythonPathAssignment[1]}"${currentRuntimeDir}"${pythonPathAssignment[2]}`;
+    }
+    return line;
+  }).filter((line) => line !== null);
   return { text: nextLines.join("\n"), changed };
 }
 

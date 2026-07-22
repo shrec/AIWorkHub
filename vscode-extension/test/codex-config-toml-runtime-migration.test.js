@@ -48,7 +48,7 @@ try {
   Module._load = originalLoad;
 }
 const { __testInternals } = extensionModule;
-const { migrateCodexConfigTomlText, splitCodexPythonPathValue } = __testInternals;
+const { repairCodexConfigTomlText, migrateCodexConfigTomlText, splitCodexPythonPathValue } = __testInternals;
 
 const NEW_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.20/runtime";
 const OLD_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.19/runtime";
@@ -66,6 +66,32 @@ function assertUnchangedOutsideTargetLine(original, migrated, changedLineSubstri
     const touchesTarget = changedLineSubstrings.some((needle) => originalLines[i].includes(needle));
     assert.ok(touchesTarget, `unexpected line drift at line ${i}: ${JSON.stringify(originalLines[i])} -> ${JSON.stringify(migratedLines[i])}`);
   }
+}
+
+// Application-global Codex MCP configuration must never retain a workspace
+// repository binding. Each Codex chat resolves its own cwd; extension-local
+// dashboard children receive their explicit workspace binding at spawn time.
+{
+  const oldOwnedRuntime = "/home/dev/.vscode-server/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const newOwnedRuntime = "/home/dev/.vscode-server/extensions/shrec.aiworkhub-0.6.20/runtime";
+  const original = [
+    "[mcp_servers.AIWorkHub]",
+    'command = "python3"',
+    'args = ["-m", "aiworkhub.server"]',
+    "",
+    "[mcp_servers.AIWorkHub.env]",
+    `PYTHONPATH = "${oldOwnedRuntime}"`,
+    'AIWORKHUB_REPO = "/repo/last-window-wins"',
+    'AIWORKHUB_REPO_ROOT = "/repo/last-window-wins"',
+    'AIWORKHUB_ALLOW_WRITES = "1"',
+    "",
+  ].join("\n");
+  const result = repairCodexConfigTomlText(original, newOwnedRuntime);
+  assert.strictEqual(result.changed, true);
+  assert.ok(!result.text.includes("AIWORKHUB_REPO ="));
+  assert.ok(!result.text.includes("AIWORKHUB_REPO_ROOT ="));
+  assert.ok(result.text.includes('AIWORKHUB_ALLOW_WRITES = "1"'));
+  assert.ok(result.text.includes(`PYTHONPATH = "${newOwnedRuntime}"`));
 }
 
 // ── 1. Real AIWorkHub and AIWorkHub_Ultrafast blocks both migrate, distinct

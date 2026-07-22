@@ -567,7 +567,7 @@ def inject_worker_mcp_config(
     if plan.adapter_id == "claude_cli":
         argv = [*plan.argv, "--mcp-config", str(resolved), "--strict-mcp-config"]
     else:
-        argv = [*plan.argv, "--additional-mcp-config", str(resolved)]
+        argv = [*plan.argv, "--additional-mcp-config", f"@{resolved}"]
 
     return RuntimeAdapterPlan(
         adapter_id=plan.adapter_id,

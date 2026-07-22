@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import callback_store
 from . import core
 from . import task_store
 
@@ -161,12 +162,39 @@ def mark_terminal_review(
         )
     except task_store.TaskStoreError as exc:
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    callback_enqueued = False
+    if ok:
+        card = task_store.get_task(repo, task_id) or {}
+        if bool(card.get("callback_required", True)):
+            try:
+                _readiness, db_path = task_store._require_ready(repo)
+                conn = task_store._connect(db_path)
+                try:
+                    callback_store.init_db(conn)
+                    origin_thread_id = (
+                        callback_store.read_origin_thread(conn, task_id)
+                        or str(card.get("origin_thread_id") or "").strip()
+                    )
+                    provider = str(card.get("coordinator_provider") or "").strip().lower()
+                    callback_enqueued = callback_store.enqueue_callback(
+                        conn,
+                        task_id,
+                        origin_thread_id,
+                        "review_ready",
+                        provider=provider,
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            except task_store.TaskStoreError:
+                callback_enqueued = False
     return {
         "ok": ok,
         "returncode": 0 if ok else 1,
         "command": command,
         "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
         "stderr": "" if ok else state,
+        "callback_enqueued": callback_enqueued,
     }
 
 

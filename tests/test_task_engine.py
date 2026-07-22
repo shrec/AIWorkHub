@@ -25,13 +25,16 @@ def _repo_with_task(tmp_path: Path, *, status: str = "processing") -> Path:
         "runner": "codex_worker_b891",
         "topic": "task_mcp",
         "allowed_writes": ["out.txt"],
+        "callback_required": True,
+        "coordinator_provider": "codex",
+        "origin_thread_id": "thread-b891",
     }
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
-            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, started_at) "
-            "VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?)",
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, started_at, origin_thread_id) "
+            "VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?)",
             (
                 "TASK_B891",
                 "codex_worker_b891",
@@ -44,6 +47,7 @@ def _repo_with_task(tmp_path: Path, *, status: str = "processing") -> Path:
                 "codex_worker_b891" if status == "processing" else "",
                 now if status == "processing" else "",
                 now if status == "processing" else "",
+                "thread-b891",
             ),
         )
         conn.commit()
@@ -74,6 +78,7 @@ def test_terminal_outcomes_route_to_review_with_exact_substatus(tmp_path: Path, 
         evidence={"error": substatus, "request_id": "req-b891"},
     )
     assert result["ok"] is True
+    assert result["callback_enqueued"] is True
 
     card = task_store.get_task(repo, "TASK_B891")
     assert card is not None
@@ -82,7 +87,7 @@ def test_terminal_outcomes_route_to_review_with_exact_substatus(tmp_path: Path, 
     assert card["terminal_substatus"] == substatus
     assert card["terminal_review"]["evidence"]["error"] == substatus
     events = task_store.get_task_events(repo, "TASK_B891")
-    assert events[0]["event"] == "terminal_review"
+    assert [event["event"] for event in events] == ["callback_enqueued", "terminal_review"]
 
 
 def _repo_with_review_ready_task(tmp_path: Path, *, request_id: str = "req-accept-b1") -> Path:
