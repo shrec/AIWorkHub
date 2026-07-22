@@ -179,8 +179,8 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
-    def review(task_id: str, *, runner: str, topic: str) -> dict:
-        calls.append(("review", task_id, runner, topic))
+    def review(repo, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
+        calls.append(("review" if substatus == "review_ready" else "release", task_id, runner, card["topic"]))
         assert card["claimed_by"] == runner
         card.update({
             "status": "review",
@@ -201,7 +201,7 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         return {"ok": True}
 
     monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
-    monkeypatch.setattr(process_launcher.core, "mark_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
     monkeypatch.setattr(process_launcher.core, "release_launch", release)
     return calls
 
@@ -394,9 +394,9 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     release_enabled = False
     release_calls: list[tuple[str, str, str]] = []
 
-    def release(task_id: str, runner: str, reason: str) -> dict:
+    def release(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
         nonlocal release_enabled
-        release_calls.append((task_id, runner, reason))
+        release_calls.append((task_id, runner, substatus))
         if not release_enabled:
             return {"ok": False, "stderr": "write gate temporarily unavailable"}
         card.update({
@@ -407,7 +407,7 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "release_launch", release)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", release)
     restarted = process_launcher.ProcessManager(
         repo=repo,
         process_log_path=tmp_path / "events.jsonl",
@@ -499,8 +499,8 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
     )
     reviews: list[tuple[str, str, str]] = []
 
-    def review(task_id: str, *, runner: str, topic: str) -> dict:
-        reviews.append((task_id, runner, topic))
+    def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
+        reviews.append((task_id, runner, card["topic"]))
         card.update({
             "status": "review",
             "worker_status": "review",
@@ -508,7 +508,7 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "mark_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
     restarted = process_launcher.ProcessManager(
         repo=repo,
         process_log_path=tmp_path / "events.jsonl",
@@ -675,8 +675,8 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
 
     reviews: list[tuple[str, str, str]] = []
 
-    def review(task_id: str, *, runner: str, topic: str) -> dict:
-        reviews.append((task_id, runner, topic))
+    def review(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
+        reviews.append((task_id, runner, card["topic"]))
         card.update({
             "status": "review",
             "worker_status": "review",
@@ -684,7 +684,7 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.core, "mark_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
 
     def show(task_id: str) -> dict:
         assert task_id == card["task_id"]
