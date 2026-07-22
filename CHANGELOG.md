@@ -4,6 +4,14 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.26] - 2026-07-22
+
+### Fixed
+
+- Aligned the repository-binding runtime-version regression contract with the
+  packaged release so CI and tag-driven VSIX publication validate the same
+  canonical version.
+
 ## [0.6.25] - 2026-07-22
 
 ### Added
