@@ -19,6 +19,7 @@ def test_exact_tmpdir_prefix_preserves_public_api() -> None:
         ["bash", "bitnnv2/tests/smoke.sh"],
         (),
         "/dev/shm",
+        None,
     )
 
 
