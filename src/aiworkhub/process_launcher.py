@@ -172,6 +172,7 @@ TERMINAL_PROCESS_STATES = {
     "exited_without_review",
     "timed_out",
     "cancelled",
+    "launch_failed",
     "worker_failed",
     "scope_rejected",
     "validation_failed",
@@ -1898,9 +1899,15 @@ class ProcessManager:
                         terminal_claim.get("stderr") or terminal_claim.get("stdout") or ""
                     )[:200]
             if claimed:
-                released = core.release_launch(task_id, runner, reason[:300])
-                if not released.get("ok"):
-                    reason += ":release_failed:" + str(released.get("stderr") or "")[:200]
+                reviewed = task_engine.mark_terminal_review(
+                    self.repo,
+                    task_id,
+                    runner,
+                    "launch_failed",
+                    evidence={"request_id": request_id, "error": reason[:500]},
+                )
+                if not reviewed.get("ok"):
+                    reason += ":terminal_review_failed:" + str(reviewed.get("stderr") or "")[:200]
             if workspace is not None:
                 try:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)
@@ -1909,7 +1916,13 @@ class ProcessManager:
             if spec_path is not None:
                 unlink_if_regular(spec_path)
             return self._blocked(
-                task_id, runner, topic, adapter_id, reason, request_id=request_id
+                task_id,
+                runner,
+                topic,
+                adapter_id,
+                reason,
+                request_id=request_id,
+                state="launch_failed" if claimed else "blocked",
             )
 
     def _assert_no_duplicate_task(self, task_id: str) -> None:
@@ -2115,6 +2128,7 @@ class ProcessManager:
         reason: str,
         *,
         request_id: str | None = None,
+        state: str = "blocked",
     ) -> dict[str, Any]:
         event = self._append_event({
             "request_id": request_id or uuid.uuid4().hex,
@@ -2122,7 +2136,7 @@ class ProcessManager:
             "runner": runner,
             "topic": topic,
             "adapter_id": adapter_id,
-            "state": "blocked",
+            "state": state,
             "blocked_reason": reason[:500],
         })
         return {
@@ -2131,7 +2145,7 @@ class ProcessManager:
             "launch_enabled": launch_gates_open(),
             "request_id": event["request_id"],
             "task_id": task_id,
-            "state": "blocked",
+            "state": state,
             "blocked_reason": reason[:500],
             "shell": False,
         }
@@ -2342,6 +2356,32 @@ class ProcessManager:
         except Exception:
             pass
         return core.release_launch(task_id, runner, reason[:300])
+
+    def _review_terminal_exact(
+        self,
+        metadata: dict[str, Any],
+        substatus: str,
+        *,
+        request_id: str,
+        error: str = "",
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        task_id = str(metadata["task_id"])
+        runner = str(metadata["runner"])
+        payload = {
+            "request_id": request_id,
+            "adapter_id": metadata.get("adapter_id"),
+            "model": metadata.get("model"),
+            "error": error[:500],
+            **(evidence or {}),
+        }
+        return task_engine.mark_terminal_review(
+            self.repo,
+            task_id,
+            runner,
+            substatus,
+            evidence=payload,
+        )
 
     @staticmethod
     def _read_supervisor_status(path: Path) -> dict[str, Any]:
@@ -2627,16 +2667,26 @@ class ProcessManager:
                 if terminal_state != "exited":
                     # Coordinator review-first: timed_out/cancelled/
                     # worker_failed are terminal outcomes that move to
-                    # review/blocked (see cmd_release_launch), never a silent
+                    # review, never a silent
                     # pending. Retain the isolated worktree/candidate and
                     # logs until Codex's accept/reject decision instead of
                     # deleting the only evidence of what the worker did.
                     cleanup = False
-                    release_result = self._release_exact(metadata, terminal_state)
+                    release_result = self._review_terminal_exact(
+                        metadata,
+                        terminal_state,
+                        request_id=request_id,
+                        error=error,
+                        evidence={
+                            "supervisor_state": supervisor_state,
+                            "exit_code": exit_code,
+                            "liveness_lost": liveness_lost,
+                        },
+                    )
                     if not release_result.get("ok"):
                         terminal_state = "release_pending"
                         error = error or (
-                            "release_transition_failed:"
+                            "terminal_review_transition_failed:"
                             + str(
                                 release_result.get("stderr")
                                 or release_result.get("stdout")
@@ -2739,14 +2789,19 @@ class ProcessManager:
                 ownership_lost = error.startswith("claim_ownership_lost")
                 cleanup = False
                 if not ownership_lost and not promoted:
-                    # release-launch must see the clean, normalized
-                    # terminal_state (not the raw, worker-controlled error
-                    # text) so it can correctly route the terminal outbox
-                    # transition (validation_failed/scope_rejected/
-                    # promotion_conflict-as-blocked/finalize_failed-as-blocked)
-                    # instead of silently falling through to "blocked" for an
-                    # unrecognized string.
-                    release_result = self._release_exact(metadata, terminal_state)
+                    release_result = self._review_terminal_exact(
+                        metadata,
+                        terminal_state,
+                        request_id=request_id,
+                        error=error,
+                        evidence={
+                            "changed_paths": changed,
+                            "promoted_paths": promoted,
+                            "required_outputs": required_output_records,
+                            "validation": validations,
+                            "worker_mcp_gate": worker_mcp_gate,
+                        },
+                    )
                     if not release_result.get("ok"):
                         cleanup = False
                         terminal_state = "release_pending"
@@ -2757,13 +2812,17 @@ class ProcessManager:
                     terminal_state = "review_pending"
                 else:
                     terminal_state = "finalize_failed"
-                    # See the WorkspaceError branch above: retain the
-                    # candidate for coordinator diagnosis on every terminal
-                    # failure, and pass the clean terminal_state (not the raw
-                    # error text) to release-launch for correct outbox
-                    # routing.
                     cleanup = False
-                    release_result = self._release_exact(metadata, terminal_state)
+                    release_result = self._review_terminal_exact(
+                        metadata,
+                        terminal_state,
+                        request_id=request_id,
+                        error=error,
+                        evidence={
+                            "changed_paths": changed,
+                            "promoted_paths": promoted,
+                        },
+                    )
                     if not release_result.get("ok"):
                         cleanup = False
                         terminal_state = "release_pending"

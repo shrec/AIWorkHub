@@ -457,6 +457,42 @@ def aiworkhub_task_reject_review(
 
 
 @mcp.tool()
+def aiworkhub_manager_task_archive(
+    task_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: archive a non-processing card without deleting audit history."""
+
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "task_id": task_id}
+    return task_engine.archive_task(
+        core.repo_root(),
+        task_id,
+        actor=core.CODEX_RUNNER,
+        reason=reason,
+        supersede=False,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_task_supersede(
+    task_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: supersede an orphaned active card while preserving audit history."""
+
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "task_id": task_id}
+    return task_engine.archive_task(
+        core.repo_root(),
+        task_id,
+        actor=core.CODEX_RUNNER,
+        reason=reason,
+        supersede=True,
+    )
+
+
+@mcp.tool()
 def aiworkhub_task_collision_guard(print_json: bool = True) -> dict[str, Any]:
     """Run the task collision guard for active cards."""
 

@@ -654,8 +654,10 @@ def archive_task(
     *,
     actor: str = "dashboard",
     reason: str = "",
+    allow_processing: bool = False,
+    operation: str = "archived",
 ) -> tuple[bool, str]:
-    """Archive one non-processing task in the bound canonical queue."""
+    """Archive one task in the bound canonical queue without deleting audit history."""
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
     try:
@@ -667,7 +669,7 @@ def archive_task(
             return False, "task_not_found"
         if str(row["archived_at"] or "").strip():
             return True, "already_archived"
-        if canonical_status(dict(row)) == "processing":
+        if canonical_status(dict(row)) == "processing" and not allow_processing:
             return False, "archive_processing_forbidden"
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -677,17 +679,78 @@ def archive_task(
         if not isinstance(card, dict):
             card = {}
         card["archived_at"] = now
+        card["archive_operation"] = operation
+        card["archive_reason"] = reason[:200]
         conn.execute(
             "UPDATE tasks SET archived_at=?, updated_at=?, card_json=? WHERE task_id=?",
             (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
         )
         conn.execute(
             "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
-            "VALUES (?, 'archived', ?, ?, ?)",
-            (task_id, actor, json.dumps({"reason": reason[:200]}, sort_keys=True), now),
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                task_id,
+                operation,
+                actor,
+                json.dumps({"reason": reason[:200]}, sort_keys=True),
+                now,
+            ),
         )
         conn.commit()
-        return True, "archived"
+        return True, operation
+    finally:
+        conn.close()
+
+
+def mark_terminal_review(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    substatus: str,
+    evidence: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Route a launched terminal outcome to Codex review, preserving evidence."""
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        terminal = {
+            "substatus": substatus[:120],
+            "evidence": dict(evidence or {}),
+            "recorded_at": now,
+            "runner": runner,
+        }
+        card["terminal_review"] = terminal
+        card["terminal_substatus"] = terminal["substatus"]
+        card["review_requested_by"] = runner
+        conn.execute(
+            "UPDATE tasks SET status='review', worker_status='review', claimed_by=?, "
+            "completed_at=COALESCE(NULLIF(completed_at, ''), ?), updated_at=?, card_json=? "
+            "WHERE task_id=?",
+            (runner, now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_review', ?, ?, ?)",
+            (task_id, runner, json.dumps(terminal, ensure_ascii=False, sort_keys=True), now),
+        )
+        conn.commit()
+        return True, "review"
     finally:
         conn.close()
 
@@ -888,6 +951,7 @@ __all__ = [
     "get_task",
     "initialize_repository",
     "list_tasks",
+    "mark_terminal_review",
     "quick_check",
     "restore_task",
     "sha256_file",

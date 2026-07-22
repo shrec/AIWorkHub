@@ -142,4 +142,62 @@ def show_task(repo: Path, task_id: str) -> dict[str, Any]:
     return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
 
 
-__all__ = ["show_task", "claim_start_exact"]
+def mark_terminal_review(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    substatus: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    command = ["terminal-review", task_id, "--runner", runner, "--substatus", substatus]
+    try:
+        ok, state = task_store.mark_terminal_review(
+            repo,
+            task_id,
+            runner=runner,
+            substatus=substatus,
+            evidence=evidence or {},
+        )
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+    }
+
+
+def archive_task(
+    repo: Path,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str = "",
+    supersede: bool = False,
+) -> dict[str, Any]:
+    operation = "superseded" if supersede else "archived"
+    command = [operation, task_id, "--actor", actor]
+    try:
+        ok, state = task_store.archive_task(
+            repo,
+            task_id,
+            actor=actor,
+            reason=reason,
+            allow_processing=supersede,
+            operation=operation,
+        )
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+    }
+
+
+__all__ = ["show_task", "claim_start_exact", "mark_terminal_review", "archive_task"]
