@@ -4,7 +4,7 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
-## [0.6.20] - 2026-07-22
+## [0.6.21] - 2026-07-22
 
 ### Fixed
 
@@ -40,7 +40,7 @@ noted by package/extension version and release tag.
 ### Changed
 
 - Python package (`aiworkhub`), MCP runtime, and VS Code extension
-  (`vscode-extension/package.json`) versions aligned at `0.6.20`.
+  (`vscode-extension/package.json`) versions aligned at `0.6.21`.
 - README documents the three-layer dispatch/validation/acceptance model
   (worker self-validation, independent coordinator re-validation, and the
   audit-ledger acceptance gate) and records Kimi-Atlas-inspired roadmap

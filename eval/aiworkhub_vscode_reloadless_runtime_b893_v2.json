@@ -1,0 +1,24 @@
+{
+  "schema_id": "aiworkhub.task_mcp.vscode_reloadless_runtime_evidence.v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_RELOADLESS_MULTIREPO_RUNTIME_B893_V2",
+  "verdict": "PASS",
+  "changed_paths": [
+    "vscode-extension/extension.js",
+    "vscode-extension/package.json",
+    "vscode-extension/test/reloadless-runtime-repair.test.js",
+    "tests/test_aiworkhub_vscode_reloadless_runtime_b893.py"
+  ],
+  "claims": {
+    "bounded_same_repo_runtime_restart": true,
+    "manual_reload_required": false,
+    "cross_repo_child_reuse": false,
+    "linux_macos_windows_python_resolution": true,
+    "shell_spawn": false
+  },
+  "validation": [
+    "node vscode-extension/test/reloadless-runtime-repair.test.js",
+    "node vscode-extension/test/multirepo-connecting.test.js",
+    "npm --prefix vscode-extension test",
+    "PYTHONPATH=src python3 -m pytest -q tests/test_aiworkhub_vscode_reloadless_runtime_b893.py"
+  ]
+}
