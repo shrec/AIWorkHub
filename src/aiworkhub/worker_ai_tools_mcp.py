@@ -77,6 +77,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import errno
 import os
 import re
 import secrets
@@ -405,7 +406,19 @@ def _append_line_0600(path: Path, line: str) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        # The worker sandbox deliberately blocks metadata-changing syscalls
+        # (including fchmod) after launch.  The coordinator pre-creates this
+        # request-private ledger as 0600 before entering the sandbox, so an
+        # EPERM/EACCES here is safe only when fstat proves that the invariant
+        # already holds.  Previously the denied fchmod aborted before write;
+        # _append_audit swallowed that OSError and every genuine MCP call left
+        # an empty ledger.
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError as exc:
+            mode = os.fstat(fd).st_mode & 0o777
+            if exc.errno not in {errno.EPERM, errno.EACCES} or mode != 0o600:
+                raise
         os.write(fd, line.encode("utf-8"))
     finally:
         os.close(fd)
@@ -462,6 +475,7 @@ def _append_audit(
         "violation": violation[:160],
         "authority_source": authority_source[:32],
         "authority_state": authority_state[:64],
+        "authority_repo": str(ctx.authority_repo),
     }
     digest = _hmac_entry(entry, key)
     line = json.dumps({**entry, "hmac_sha256": digest}, ensure_ascii=False, sort_keys=True) + "\n"
@@ -516,7 +530,7 @@ def verify_audit_ledger(
 
     call_count: dict[str, int] = {}
     successful_call_count: dict[str, int] = {}
-    authority_seen: set[tuple[str, str, str]] = set()
+    authority_seen: set[tuple[str, str, str, str]] = set()
     for raw_line in lines:
         raw_line = raw_line.strip()
         if not raw_line:
@@ -552,6 +566,7 @@ def verify_audit_ledger(
             result["policy_violations"] += 1
         authority_source = str(entry.get("authority_source") or "")
         authority_state = str(entry.get("authority_state") or "")
+        authority_repo = str(entry.get("authority_repo") or "")
         if (
             entry.get("ok")
             and not entry.get("violation")
@@ -560,7 +575,7 @@ def verify_audit_ledger(
         ):
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
         if authority_source or authority_state:
-            authority_seen.add((tool, authority_source, authority_state))
+            authority_seen.add((tool, authority_source, authority_state, authority_repo))
         # A "live" source_graph call must be a genuinely fresh, non-empty,
         # successful authoritative lookup -- a cache hit or a zero-hit
         # response is real telemetry but must NOT satisfy the completion
@@ -576,7 +591,7 @@ def verify_audit_ledger(
     result["call_count_by_tool"] = call_count
     result["successful_call_count_by_tool"] = successful_call_count
     result["authority_index_identity"] = sorted(
-        f"{t}:{src}:{state}" for t, src, state in authority_seen
+        f"{t}:{src}:{state}:{repo}" for t, src, state, repo in authority_seen
     )
     result["ok"] = True
     return result
@@ -741,6 +756,7 @@ def source_graph_query(
         "cache_hit": False,
         "authority_source": binding.authority_source,
         "authority_state": binding.authority_state,
+        "authority_repo": str(ctx.authority_repo),
     }
     _CACHE[cache_key] = {
         "result": result, "hit_count": hit_count, "bytes": bytes_returned,

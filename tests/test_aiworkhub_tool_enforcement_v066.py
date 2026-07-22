@@ -53,13 +53,13 @@ def test_completion_gate_requires_every_requested_aiworkhub_surface(monkeypatch)
     assert result["reason"] == "required_aiworkhub_mcp_calls_missing:kb"
 
 
-def test_completion_gate_accepts_zero_hit_but_successful_optional_calls(monkeypatch) -> None:
+def test_completion_gate_rejects_zero_hit_source_graph_for_code_tasks(monkeypatch) -> None:
     monkeypatch.setattr(
         process_launcher.worker_ai_tools_mcp,
         "verify_audit_ledger",
         lambda *args, **kwargs: {
             "ok": True,
-            "live_source_graph_calls": 1,
+            "live_source_graph_calls": 0,
             "successful_call_count_by_tool": {
                 "source_graph": 1,
                 "session_current_state": 1,
@@ -71,8 +71,9 @@ def test_completion_gate_accepts_zero_hit_but_successful_optional_calls(monkeypa
 
     result = process_launcher._worker_mcp_live_call_gate(_metadata(), "request-1")
 
-    assert result["satisfied"] is True
-    assert result["missing_tools"] == []
+    assert result["satisfied"] is False
+    assert result["missing_tools"] == ["source_graph"]
+    assert result["reason"] == "required_aiworkhub_mcp_calls_missing:source_graph"
 
 
 def test_worker_prompt_explains_runtime_enforcement() -> None:

@@ -8,7 +8,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.10";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.14";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -87,6 +87,7 @@ const MCP_MAX_PENDING_REQUESTS = 16;
 const MCP_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MCP_MAX_STDERR_LOG_BYTES = 4096;
 const MCP_MAX_RESTART_ATTEMPTS = 1;
+const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 1;
 
 // ── Active repository resolution ──────────────────────────────────────────
 // Single-folder workspace: auto-bind to folders[0].
@@ -124,6 +125,14 @@ function readRepositoryManifestInfo(root, label) {
   }
 }
 
+function canonicalRepositoryRoot(root) {
+  try {
+    return fs.realpathSync.native(root);
+  } catch (_err) {
+    return root;
+  }
+}
+
 function atomicWriteJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
@@ -147,12 +156,13 @@ function getActiveRepositoryRoot(context) {
   // Single-folder: auto-bind, persist for consistency.
   if (folders.length === 1) {
     const folder = folders[0];
+    const root = canonicalRepositoryRoot(folder.uri.fsPath);
     context.workspaceState.update(WSP_STATE_KEY_REPO_URI, folder.uri.toString());
     return {
-      root: folder.uri.fsPath,
+      root,
       label: folder.name,
       uriStr: folder.uri.toString(),
-      ...readRepositoryManifestInfo(folder.uri.fsPath, folder.name),
+      ...readRepositoryManifestInfo(root, folder.name),
     };
   }
   // Multi-root: explicit selection required.
@@ -167,10 +177,10 @@ function getActiveRepositoryRoot(context) {
     throw new Error("invalid_repository_selection");
   }
   return {
-    root: match.uri.fsPath,
+    root: canonicalRepositoryRoot(match.uri.fsPath),
     label: match.name,
     uriStr: match.uri.toString(),
-    ...readRepositoryManifestInfo(match.uri.fsPath, match.name),
+    ...readRepositoryManifestInfo(canonicalRepositoryRoot(match.uri.fsPath), match.name),
   };
 }
 
@@ -196,16 +206,31 @@ function repositoryLabel(folders, uriStr) {
   return match.name;
 }
 
-function findPythonExecutable(root) {
+function findPythonCommand(root) {
   const configured = vscode.workspace.getConfiguration("aiworkhub").get("pythonPath");
+  const venvCandidates = process.platform === "win32"
+    ? [
+        path.join(root, ".venv", "Scripts", "python.exe"),
+        path.join(root, "venv", "Scripts", "python.exe"),
+      ]
+    : [
+        path.join(root, ".venv", "bin", "python3"),
+        path.join(root, ".venv", "bin", "python"),
+        path.join(root, "venv", "bin", "python3"),
+        path.join(root, "venv", "bin", "python"),
+      ];
   const candidates = [
     typeof configured === "string" ? configured.trim() : "",
-    path.join(root, ".venv", "bin", "python3"),
+    ...venvCandidates,
   ];
   for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) return candidate;
+    if (candidate && fs.existsSync(candidate)) {
+      return { command: candidate, argsPrefix: [] };
+    }
   }
-  return "python3";
+  return process.platform === "win32"
+    ? { command: "py", argsPrefix: ["-3"] }
+    : { command: "python3", argsPrefix: [] };
 }
 
 function ensureRepositoryCoordinatorCapability(root) {
@@ -217,7 +242,13 @@ function ensureRepositoryCoordinatorCapability(root) {
   const runtimeDir = path.join(root, ".aiworkhub", "runtime");
   fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") {
-    fs.chmodSync(runtimeDir, 0o700);
+    try {
+      fs.chmodSync(runtimeDir, 0o700);
+    } catch (_err) {
+      // Some Remote-SSH/sandboxed filesystems reject chmod even when mkdir
+      // created the directory with the requested private mode. The token file
+      // itself is still exclusive-created and content-validated below.
+    }
   }
   const tokenFile = path.join(runtimeDir, "coordinator.token");
   try {
@@ -226,7 +257,12 @@ function ensureRepositoryCoordinatorCapability(root) {
       throw new Error("repository coordinator capability is not a regular file");
     }
     if (process.platform !== "win32" && (stat.mode & 0o777) !== 0o600) {
-      fs.chmodSync(tokenFile, 0o600);
+      try {
+        fs.chmodSync(tokenFile, 0o600);
+      } catch (_err) {
+        // Best-effort only; do not rotate or replace an existing repo-local
+        // capability just because chmod is unavailable on this filesystem.
+      }
     }
     const token = fs.readFileSync(tokenFile, "utf8").trim();
     if (!/^[a-f0-9]{64}$/.test(token)) {
@@ -242,7 +278,13 @@ function ensureRepositoryCoordinatorCapability(root) {
     const fd = fs.openSync(tokenFile, "wx", 0o600);
     try {
       fs.writeFileSync(fd, token, { encoding: "utf8" });
-      if (process.platform !== "win32") fs.fchmodSync(fd, 0o600);
+      if (process.platform !== "win32") {
+        try {
+          fs.fchmodSync(fd, 0o600);
+        } catch (_err) {
+          // The fd was opened with 0600; fchmod is defense in depth.
+        }
+      }
     } finally {
       fs.closeSync(fd);
     }
@@ -379,6 +421,7 @@ class McpStdioClient {
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
+    this.pendingChildren = new Map();
     this.initialized = false;
     this.startingPromise = null;
     this.restartAttempts = 0;
@@ -430,8 +473,18 @@ class McpStdioClient {
   }
 
   async _start() {
+    const previousChild = this.child;
+    if (previousChild && !previousChild.killed) {
+      this.outputChannel.appendLine("[mcp] replacing non-ready child before reconnect");
+      this._failPendingForChild(previousChild, new Error("mcp_reconnect_replaced_non_ready_child"));
+      try {
+        previousChild.kill();
+      } catch (_err) {
+        /* ignore */
+      }
+    }
     const root = this.repositoryRoot;
-    const python = findPythonExecutable(root);
+    const python = findPythonCommand(root);
     const runtimeDir = extensionRuntimeDir;
     const env = {
       ...process.env,
@@ -477,8 +530,10 @@ class McpStdioClient {
     this.initialized = false;
     this.buffer = "";
     this.nextId = 1;
+    this.pending.clear();
+    this.pendingChildren.clear();
 
-    const child = childProcess.spawn(python, ["-m", "aiworkhub.server"], {
+    const child = childProcess.spawn(python.command, [...python.argsPrefix, "-m", "aiworkhub.server"], {
       cwd: runtimeDir || root,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -492,7 +547,23 @@ class McpStdioClient {
     child.on("exit", (code, signal) => this._onExit(child, code, signal, null));
     child.on("error", (err) => this._onExit(child, null, null, err));
 
-    await this._handshake();
+    try {
+      await this._handshake();
+    } catch (err) {
+      if (this.child === child) {
+        this.child = null;
+        this.initialized = false;
+      }
+      this._failPendingForChild(child, err);
+      if (!child.killed) {
+        try {
+          child.kill();
+        } catch (_killErr) {
+          /* ignore */
+        }
+      }
+      throw err;
+    }
   }
 
   async _handshake() {
@@ -563,6 +634,7 @@ class McpStdioClient {
       return;
     }
     this.pending.delete(message.id);
+    this.pendingChildren.delete(message.id);
     clearTimeout(pending.timer);
     if (message.error) {
       pending.reject(new Error((message.error && message.error.message) || "mcp_error"));
@@ -581,7 +653,7 @@ class McpStdioClient {
     this.child = null;
     this.initialized = false;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
-    this._failPending(failure);
+    this._failPendingForChild(exitedChild, failure);
     if (this.intentionalStop) {
       return;
     }
@@ -602,6 +674,22 @@ class McpStdioClient {
       pending.reject(err);
     }
     this.pending.clear();
+    this.pendingChildren.clear();
+  }
+
+  _failPendingForChild(child, err) {
+    for (const [id, pendingChild] of this.pendingChildren.entries()) {
+      if (pendingChild !== child) {
+        continue;
+      }
+      const pending = this.pending.get(id);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.reject(err);
+        this.pending.delete(id);
+      }
+      this.pendingChildren.delete(id);
+    }
   }
 
   request(method, params, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
@@ -613,16 +701,30 @@ class McpStdioClient {
     }
     const id = this.nextId;
     this.nextId += 1;
+    const requestChild = this.child;
     const payload = `${JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} })}\n`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.pendingChildren.delete(id);
+        if (this.child === requestChild && !this.initialized) {
+          this.child = null;
+          if (requestChild && !requestChild.killed) {
+            try {
+              requestChild.kill();
+            } catch (_err) {
+              /* ignore */
+            }
+          }
+        }
         reject(new Error("mcp_request_timeout"));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(payload, (err) => {
+      this.pendingChildren.set(id, requestChild);
+      requestChild.stdin.write(payload, (err) => {
         if (err) {
           this.pending.delete(id);
+          this.pendingChildren.delete(id);
           clearTimeout(timer);
           reject(err);
         }
@@ -658,6 +760,7 @@ class McpStdioClient {
     const child = this.child;
     this.child = null;
     this.initialized = false;
+    this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
     if (child && !child.killed) {
       try {
         child.kill();
@@ -883,6 +986,11 @@ class ViewState {
     this.repoId = "";
     this.claimEpisode = "";
     this.snapshotRequestSeq = 0;
+    // Coalesce refresh ticks while one repository snapshot is in flight.
+    // A slow first snapshot must still be allowed to render; previously each
+    // timer tick advanced snapshotRequestSeq, making every eventual response
+    // look stale and leaving the Webview on "Connecting" forever.
+    this.snapshotInFlight = null;
   }
 
   bindClient(client) {
@@ -926,7 +1034,49 @@ class ViewState {
   }
 }
 
-async function pushSnapshot(view) {
+function pushSnapshot(view) {
+  if (view.snapshotInFlight) {
+    return view.snapshotInFlight;
+  }
+  const inFlight = pushSnapshotOnce(view).finally(() => {
+    if (view.snapshotInFlight === inFlight) {
+      view.snapshotInFlight = null;
+    }
+  });
+  view.snapshotInFlight = inFlight;
+  return inFlight;
+}
+
+async function pushSnapshotOnce(view) {
+  const requestSeq = ++view.snapshotRequestSeq;
+  let lastError = null;
+  for (let attempt = 0; attempt <= MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) {
+      const retryClient = mcpClient;
+      if (retryClient) {
+        retryClient.stop({ restart: true });
+      }
+    }
+    try {
+      const client = getMcpClient();
+      view.bindClient(client);
+      const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
+      if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
+        view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
+      } else if (!payload && requestSeq === view.snapshotRequestSeq) {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
+      }
+      return;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  if (requestSeq === view.snapshotRequestSeq) {
+    view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(lastError) });
+  }
+}
+
+async function pushSnapshotNoRetry(view) {
   const requestSeq = ++view.snapshotRequestSeq;
   try {
     const client = getMcpClient();
@@ -1796,4 +1946,19 @@ async function deactivate() {
   extensionContext = null;
 }
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  __testInternals: {
+    McpStdioClient,
+    ViewState,
+    pushSnapshot,
+    pushSnapshotNoRetry,
+    sanitizeErrorMessage,
+    constants: {
+      MCP_REQUEST_TIMEOUT_MS,
+      MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
+      EXPECTED_MCP_PACKAGE_VERSION,
+    },
+  },
+};

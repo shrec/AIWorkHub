@@ -1,0 +1,28 @@
+{
+  "schema_id": "aiworkhub.multirepo_connecting_repair_evidence.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_MULTIREPO_CONNECTING_REPAIR_B812_V1",
+  "version": "0.6.12-unreleased",
+  "root_cause": {
+    "summary": "A failed MCP initialize/request handshake could leave a child process assigned to the extension-host singleton with initialized=false and child still non-null. A later dashboard snapshot or restored tab reused that stale identity path without child-scoped pending cleanup, so the webview stayed in Connecting/Not synced until manual lifecycle disruption.",
+    "repair": "Pending JSON-RPC requests are now associated with the exact child that owns them; child exit, stop, timeout, and reconnect replace or drain only that child's requests. Snapshot refresh performs one bounded reconnect and posts Live only after a real aiworkhub_dashboard_snapshot payload arrives."
+  },
+  "regression": {
+    "scenario": "Two initialized repositories are opened through two independent simulated VS Code extension-host module instances. Repo A's child handshakes normally. Repo B's first child dies before initialize and its restored/refresh snapshot must reconnect without tab close/reopen.",
+    "isolation_assertions": [
+      "distinct WINDOW_SCOPE_ID values",
+      "distinct AIWORKHUB_REPO_ROOT and AIWORKHUB_REPO_ID child environments",
+      "repo-local coordinator token files under each repository root",
+      "repo A snapshot contains no repo B identity",
+      "repo B snapshot contains no repo A identity"
+    ],
+    "required_test": "tools/geoai-task-mcp/vscode-extension/test/multirepo-connecting.test.js"
+  },
+  "forbidden_regressions_absent": [
+    "fake_live_status",
+    "global_shared_repository_state",
+    "cross_repo_fallback",
+    "http_dashboard_reintroduction",
+    "manual_reload_as_fix",
+    "unbounded_retry_loop"
+  ]
+}

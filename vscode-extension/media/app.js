@@ -963,6 +963,185 @@ function resultEnvelope(text) {
   return null;
 }
 
+function limitText(value, maxLength = 120) {
+  const text = String(value === undefined || value === null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function redactDisplayText(value, maxLength = 120) {
+  return limitText(value, maxLength)
+    .replace(/\b(?:[A-Za-z]:)?\/(?:[\w .:@-]+\/){1,}[\w .:@-]+/g, "[path]")
+    .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs]|ya29|hf)_[A-Za-z0-9._-]{12,}\b/g, "[token]")
+    .replace(/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, "[token]");
+}
+
+function firstText(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      const text = String(value).trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return "";
+}
+
+function eventDuration(event) {
+  return firstText(
+    event.duration_ms,
+    event.elapsed_ms,
+    event.durationMs,
+    event.duration,
+    event.result && event.result.duration_ms,
+    event.metrics && event.metrics.duration_ms,
+  );
+}
+
+function eventUsage(event) {
+  const modelUsageLabel = "Model usage";
+  const usage = event.usage && typeof event.usage === "object" ? event.usage : {};
+  const metrics = event.metrics && typeof event.metrics === "object" ? event.metrics : {};
+  const modelUsage = event.modelUsage && typeof event.modelUsage === "object" ? event.modelUsage : {};
+  const turns = firstText(event.num_turns, event.turns, metrics.turns);
+  const cost = firstText(event.total_cost_usd, event.cost_usd, metrics.cost_usd);
+  const totalTokens = firstText(
+    usage.total_tokens,
+    usage.totalTokens,
+    metrics.total_tokens,
+    event.total_tokens,
+    numberValue(usage.input_tokens) + numberValue(usage.output_tokens),
+  );
+  const modelUsageSummary = Object.entries(modelUsage).slice(0, 4).map(([name, values]) => {
+    const item = values && typeof values === "object" ? values : {};
+    return `${redactDisplayText(name, 40)} ${formatCount(item.inputTokens)} in/${formatCount(item.outputTokens)} out/${formatMoney(item.costUSD)}`;
+  }).join(", ");
+  return [
+    eventDuration(event) !== "" ? `duration ${formatDuration(eventDuration(event))}` : "",
+    turns !== "" ? `${turns} turns` : "",
+    numberValue(totalTokens) ? `${formatCount(totalTokens)} tokens` : "",
+    cost !== "" ? formatMoney(cost) : "",
+    modelUsageSummary ? `${modelUsageLabel}: ${modelUsageSummary}` : "",
+  ].filter(Boolean);
+}
+
+function commandLabelFrom(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const input = source.input && typeof source.input === "object" ? source.input : {};
+  const result = source.result && typeof source.result === "object" ? source.result : {};
+  const item = source.item && typeof source.item === "object" ? source.item : {};
+  const itemInput = item.input && typeof item.input === "object" ? item.input : {};
+  return redactDisplayText(firstText(
+    source.command,
+    source.cmd,
+    source.tool_name,
+    source.tool,
+    source.name,
+    source.subtype,
+    input.command,
+    input.cmd,
+    result.command,
+    item.command,
+    item.name,
+    item.tool_name,
+    itemInput.command,
+  ) || "event", 80);
+}
+
+function lifecycleFromType(type, event) {
+  const normalized = String(type || "").toLowerCase();
+  if (normalized.includes("started") || normalized.includes("start") || normalized.includes("delta")) return "running";
+  if (normalized.includes("completed") || normalized.includes("finish") || normalized.includes("result")) return "completed";
+  if (normalized.includes("error") || normalized.includes("failed") || event.is_error) return "error";
+  if (normalized.includes("warning")) return "warning";
+  return firstText(event.status, event.state, event.lifecycle) || "event";
+}
+
+function resultTextFrom(event) {
+  const result = event.result && typeof event.result === "object" ? event.result : {};
+  const message = event.message && typeof event.message === "object" ? event.message : {};
+  return redactDisplayText(firstText(
+    event.error,
+    event.warning,
+    event.result,
+    event.verdict,
+    event.stop_reason,
+    event.terminal_reason,
+    result.error,
+    result.verdict,
+    result.output,
+    result.summary,
+    message.error,
+    message.content,
+  ), 180);
+}
+
+function timelineEventFromObject(event, rawLine) {
+  const type = firstText(event.type, event.event, event.kind, event.subtype) || "json";
+  const normalized = type.toLowerCase();
+  const isResult = normalized === "result" || event.result !== undefined || event.terminal_reason;
+  const isWarning = normalized.includes("warning") || event.warning;
+  const isError = Boolean(event.is_error || event.error) || normalized.includes("error") || normalized.includes("failed");
+  const item = event.item && typeof event.item === "object" ? event.item : {};
+  const itemType = firstText(item.type, item.kind);
+  let title = isResult ? "Result" : limitText(type.replace(/[._-]+/g, " "), 48);
+  if (itemType) {
+    title = limitText(`${title} | ${itemType.replace(/[._-]+/g, " ")}`, 64);
+  }
+  return {
+    kind: isError ? "error" : isWarning ? "warning" : isResult ? "result" : "event",
+    title,
+    label: commandLabelFrom(event),
+    state: lifecycleFromType(type, event),
+    message: resultTextFrom(event),
+    metrics: eventUsage(event),
+    raw: rawLine,
+  };
+}
+
+function timelineEventsFromText(decoded) {
+  const events = [];
+  const seenJsonLines = new Set();
+  for (const line of String(decoded || "").split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object") {
+        const key = JSON.stringify(parsed);
+        if (seenJsonLines.has(key)) {
+          continue;
+        }
+        seenJsonLines.add(key);
+        events.push(timelineEventFromObject(parsed, line));
+        continue;
+      }
+    } catch (_error) {
+      // Malformed provider output degrades to a text-only row.
+    }
+    events.push({
+      kind: "text",
+      title: "Output",
+      label: "plain text",
+      state: "line",
+      message: redactDisplayText(line, 220),
+      metrics: [],
+      raw: line,
+    });
+  }
+  return events;
+}
+
 function formatDuration(milliseconds) {
   const value = numberValue(milliseconds);
   if (!value) return "—";
@@ -984,65 +1163,36 @@ function addLiveOutputSection(parent, title, content, className = "") {
 }
 
 function renderFormattedLiveOutput(decoded) {
-  const envelope = resultEnvelope(decoded);
   const fragment = document.createDocumentFragment();
-  if (!envelope) {
-    const stream = createElement("pre", "live-output-stream");
-    stream.textContent = decoded || "Waiting for model output…";
-    fragment.appendChild(stream);
+  const events = timelineEventsFromText(decoded);
+  if (!events.length) {
+    fragment.appendChild(createElement("div", "panel-list-empty compact", "Waiting for model output..."));
     elements.detailLiveOutputContainer.replaceChildren(fragment);
     return;
   }
 
-  const resultText = String(envelope.result || "").trim();
-  const isBlocked = /(^|\n)\s*(verdict|status)\s*:\s*blocked\b/i.test(resultText);
-  const isError = Boolean(envelope.is_error) || envelope.subtype === "error";
-  const status = isError ? "Failed" : isBlocked ? "Blocked" : "Completed";
-  const header = createElement("div", "live-output-result-header");
-  header.append(
-    createElement("strong", `live-output-verdict ${isError || isBlocked ? "fail" : "pass"}`, status),
-    createElement("span", "cell-secondary", envelope.stop_reason || envelope.terminal_reason || "result"),
-  );
-  fragment.appendChild(header);
-  addLiveOutputSection(fragment, "Result", resultText || "No result summary returned", isError || isBlocked ? "is-problem" : "");
-
-  const metrics = createElement("div", "live-output-metrics");
-  const usage = envelope.usage && typeof envelope.usage === "object" ? envelope.usage : {};
-  const cacheCreation = usage.cache_creation && typeof usage.cache_creation === "object"
-    ? usage.cache_creation
-    : {};
-  const cacheCreated = numberValue(usage.cache_creation_input_tokens) +
-    Object.values(cacheCreation).reduce((total, value) => total + numberValue(value), 0);
-  const metricValues = [
-    ["Duration", formatDuration(envelope.duration_ms)],
-    ["First token", formatDuration(envelope.ttft_ms)],
-    ["Turns", numberValue(envelope.num_turns)],
-    ["Input", formatCount(usage.input_tokens)],
-    ["Output", formatCount(usage.output_tokens)],
-    ["Cache read", formatCount(usage.cache_read_input_tokens)],
-    ["Cache write", formatCount(cacheCreated)],
-    ["Cost", formatMoney(envelope.total_cost_usd)],
-  ];
-  for (const [label, value] of metricValues) {
-    const item = createElement("div", "live-output-metric");
-    item.append(createElement("span", "", label), createElement("strong", "", value));
-    metrics.appendChild(item);
+  const timeline = createElement("div", "live-output-timeline");
+  for (const event of events.slice(-200)) {
+    const row = createElement("article", `live-output-row is-${event.kind}`);
+    const head = createElement("div", "live-output-row-head");
+    head.append(
+      createElement("strong", "live-output-row-title", event.title),
+      createElement("span", "live-output-row-state", event.state),
+    );
+    row.append(
+      head,
+      createElement("div", "live-output-row-label", event.label),
+      createElement("div", "live-output-row-message", event.message || "No message"),
+    );
+    if (event.metrics.length) {
+      row.appendChild(createElement("div", "live-output-row-meta", event.metrics.join(" | ")));
+    }
+    const raw = createElement("details", "live-output-row-raw");
+    raw.append(createElement("summary", "", "Raw event"), createElement("pre", "", event.raw));
+    row.appendChild(raw);
+    timeline.appendChild(row);
   }
-  fragment.appendChild(metrics);
-
-  const models = envelope.modelUsage && typeof envelope.modelUsage === "object"
-    ? Object.entries(envelope.modelUsage)
-    : [];
-  if (models.length) {
-    const modelLines = models.map(([name, values]) => {
-      const item = values && typeof values === "object" ? values : {};
-      return `${name}: ${formatCount(item.inputTokens)} in · ${formatCount(item.outputTokens)} out · ${formatCount(item.cacheReadInputTokens)} cache · ${formatMoney(item.costUSD)}`;
-    });
-    addLiveOutputSection(fragment, "Model usage", modelLines.join("\n"));
-  }
-  if (asArray(envelope.permission_denials).length) {
-    addLiveOutputSection(fragment, "Permission denials", asArray(envelope.permission_denials).join("\n"), "is-problem");
-  }
+  fragment.appendChild(timeline);
   elements.detailLiveOutputContainer.replaceChildren(fragment);
 }
 
@@ -1096,6 +1246,18 @@ function renderLiveOutput(payload) {
   elements.detailLiveOutputState.className = `validation-label ${["exited", "completed"].includes(liveness) ? "pass" : ""}`;
 
   scheduleNextLiveOutputPoll(taskId);
+}
+
+if (typeof globalThis !== "undefined") {
+  globalThis.__AIWORKHUB_LIVE_OUTPUT_FORMATTING__ = {
+    decodeLiveOutput,
+    redactDisplayText,
+    timelineEventsFromText,
+    renderFormattedLiveOutput,
+    appendLiveOutputText,
+    startLiveOutputPolling,
+    renderLiveOutput,
+  };
 }
 
 function clearTaskDetail() {

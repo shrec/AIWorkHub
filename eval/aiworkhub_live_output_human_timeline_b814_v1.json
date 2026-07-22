@@ -1,0 +1,31 @@
+{
+  "schema_id": "aiworkhub.eval.live_output_human_timeline_b814_v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_LIVE_OUTPUT_HUMAN_TIMELINE_B814_V1",
+  "runner": "codex_gpt55_aiworkhub_live_output_human_timeline_b814_v1",
+  "evidence": {
+    "changed_paths": [
+      "tools/geoai-task-mcp/vscode-extension/media/app.js",
+      "tools/geoai-task-mcp/vscode-extension/media/styles.css",
+      "tools/geoai-task-mcp/vscode-extension/test/live-output-formatting.test.js",
+      "tools/geoai-task-mcp/eval/aiworkhub_live_output_human_timeline_b814_v1.json"
+    ],
+    "behaviors": [
+      "jsonl_streams_render_as_timeline_rows",
+      "command_lifecycle_labels_are_bounded",
+      "result_metrics_show_duration_turns_tokens_cost_when_present",
+      "warnings_and_errors_have_distinct_row_classes",
+      "duplicate_json_event_lines_are_suppressed",
+      "raw_event_json_is_available_only_inside_closed_details",
+      "malformed_plain_text_degrades_to_text_only_rows",
+      "display_text_redacts_paths_and_token_like_values"
+    ],
+    "fixtures": [
+      "codex_item_started_completed_result",
+      "claude_tool_use_tool_result_warning",
+      "malformed_json_and_plain_text_xss_string",
+      "stderr_tail_text_only_rendering",
+      "repeated_json_line_dedupe",
+      "incremental_append"
+    ]
+  }
+}

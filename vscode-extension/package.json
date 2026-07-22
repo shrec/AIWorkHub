@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
-  "version": "0.6.10",
+  "version": "0.6.14",
   "publisher": "shrec",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",
@@ -94,7 +94,7 @@
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "Optional Python executable containing the installed aiworkhub package. Empty uses the selected repository's .venv/bin/python3 or python3 from PATH."
+          "description": "Optional Python executable. Empty uses the selected repository virtual environment when present, otherwise Python from the system PATH."
         }
       }
     }

@@ -1,0 +1,26 @@
+{
+  "schema_id": "aiworkhub.eval.nested_repo_source_graph_authority_b816.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_NESTED_REPO_SOURCE_GRAPH_AUTHORITY_B816_V1",
+  "objective": "Route code-task project context and worker Source Graph authority to the single nested git repository that owns all scoped writes.",
+  "covered_behaviors": [
+    "outer root plus nested standalone git fixture resolves project context to tools/geoai-task-mcp",
+    "rebased nested Source Graph targets are relative to the nested repository",
+    "ordinary root-repository write scope remains bound to the outer repository",
+    "mixed outer and nested repository write scope fails closed with task_repo_scope_ambiguous",
+    "non-empty nested Source Graph worker call records task/request/repo authority in the HMAC audit ledger",
+    "zero-hit Source Graph calls do not satisfy the code-task completion gate"
+  ],
+  "changed_paths": [
+    "tools/geoai-task-mcp/src/aiworkhub/project_context.py",
+    "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py",
+    "tools/geoai-task-mcp/src/aiworkhub/worker_ai_tools_mcp.py",
+    "tools/geoai-task-mcp/tests/test_nested_repo_source_graph_authority.py",
+    "tools/geoai-task-mcp/tests/test_aiworkhub_tool_enforcement_v066.py",
+    "tools/geoai-task-mcp/eval/aiworkhub_nested_repo_source_graph_authority_b816_v1.json"
+  ],
+  "validation": [
+    "cd tools/geoai-task-mcp && python3 -m pytest -q tests/test_nested_repo_source_graph_authority.py",
+    "cd tools/geoai-task-mcp && python3 -m pytest -q tests/test_aiworkhub_tool_enforcement_v066.py",
+    "cd tools/geoai-task-mcp && python3 -m json.tool eval/aiworkhub_nested_repo_source_graph_authority_b816_v1.json"
+  ]
+}

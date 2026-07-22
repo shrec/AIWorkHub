@@ -156,8 +156,6 @@ def _resolve_existing_dir(path: Path) -> Path:
         resolved = path.expanduser().resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise RepositoryNotFoundError(f"repository_root_unavailable:{path}") from exc
-    if _has_symlink_component(path.expanduser()):
-        raise PathEscapeError(f"repository_root_symlink_component:{path}")
     if not resolved.is_dir():
         raise RepositoryNotFoundError(f"repository_root_not_directory:{path}")
     return resolved

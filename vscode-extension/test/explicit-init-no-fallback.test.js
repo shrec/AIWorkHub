@@ -136,7 +136,7 @@ assertPresent(
   [
     'INITIALIZE_TOOL_NAME = "aiworkhub_dashboard_initialize"',
     "def initialize_view(",
-    "task_store.initialize_repository(",
+    "repository_bootstrap.initialize_repository_full(",
   ],
   "dashboard_mcp_app.py initialize tool wiring",
 );
@@ -155,7 +155,7 @@ assertPresent(
     "def storage_readiness(",
     "def initialize_repository(",
     "Directory existence alone is never sufficient",
-    "Never imports or deletes legacy data",
+    "legacy files are never deleted",
   ],
   "task_store.py canonical authority + fail-closed init",
 );

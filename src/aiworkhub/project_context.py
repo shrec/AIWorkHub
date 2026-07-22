@@ -126,6 +126,93 @@ def _derive_targets(card: dict[str, Any]) -> list[str]:
     return targets
 
 
+def _scope_values(card: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("read_first", "allowed_writes"):
+        raw = card.get(key)
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                values.append(item.strip().replace("\\", "/"))
+    return values
+
+
+def _static_scope_prefix(raw: str) -> str | None:
+    if "\x00" in raw or raw.startswith("/") or raw == ".git" or raw.startswith(".git/"):
+        return None
+    parts = raw.split("/")
+    if ".." in parts:
+        return None
+    wildcard_indexes = [raw.find(ch) for ch in ("*", "?", "[") if raw.find(ch) >= 0]
+    wildcard_at = min(wildcard_indexes) if wildcard_indexes else -1
+    prefix = raw[:wildcard_at] if wildcard_at >= 0 else raw
+    if wildcard_at >= 0 and "/" in prefix:
+        prefix = prefix.rsplit("/", 1)[0]
+    return prefix.strip("/") or "."
+
+
+def _git_boundary_for_scope(repo: Path, raw: str) -> Path | None:
+    prefix = _static_scope_prefix(raw)
+    if prefix is None:
+        return None
+    root = repo.resolve()
+    candidate = (root / prefix).resolve()
+    if candidate != root and root not in candidate.parents:
+        return None
+    search = candidate if candidate.suffix == "" else candidate.parent
+    for current in (search, *search.parents):
+        if current == root or root in current.parents:
+            if (current / ".git").exists():
+                return current
+        if current == root:
+            break
+    return root
+
+
+def resolve_task_repository_root(repo: Path, card: dict[str, Any]) -> Path:
+    """Resolve the one git repository boundary owned by this task scope."""
+
+    root = repo.resolve()
+    boundaries: set[Path] = set()
+    for raw in _scope_values(card):
+        boundary = _git_boundary_for_scope(root, raw)
+        if boundary is not None:
+            boundaries.add(boundary.resolve())
+    if not boundaries:
+        return root
+    if len(boundaries) > 1:
+        labels = ",".join(
+            sorted(str(path.relative_to(root) if path != root else Path(".")) for path in boundaries)
+        )
+        raise ProjectContextError(f"task_repo_scope_ambiguous:{labels}")
+    return next(iter(boundaries))
+
+
+def _rebase_targets(repo: Path, authority_repo: Path, targets: list[str]) -> list[str]:
+    root = repo.resolve()
+    authority = authority_repo.resolve()
+    if authority == root:
+        return targets
+    rebased: list[str] = []
+    seen: set[str] = set()
+    for raw in targets:
+        prefix = _static_scope_prefix(raw)
+        if prefix is None:
+            continue
+        candidate = (root / prefix).resolve()
+        if candidate == authority:
+            rel = "."
+        elif authority in candidate.parents:
+            rel = candidate.relative_to(authority).as_posix()
+        else:
+            continue
+        if rel not in seen:
+            seen.add(rel)
+            rebased.append(rel)
+    return rebased
+
+
 def _safe_tool_result(name: str, payload: str, *, truncated: bool, degraded: str = "") -> dict[str, Any]:
     return {
         "tool": name,
@@ -503,13 +590,17 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     contract = _validate_contract(card)
     if contract is None:
         return None
+    authority_repo = resolve_task_repository_root(repo, card)
+    contract["source_graph"]["targets"] = _rebase_targets(
+        repo, authority_repo, contract["source_graph"]["targets"]
+    )
     required = bool(contract["required"])
-    ctx = _worker_tool_context(repo, card, contract)
+    ctx = _worker_tool_context(authority_repo, card, contract)
 
     sections: list[dict[str, Any]] = []
 
     try:
-        source_text, source_truncated = _source_graph_direct(repo, contract)
+        source_text, source_truncated = _source_graph_direct(authority_repo, contract)
         source_text, json_truncated = _canonical_json_output(
             "source_graph",
             source_text,
@@ -629,7 +720,17 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         if contract.get("input_shard"):
             policy["immutable_input_shard"] = contract["input_shard"]
         prompt_payload["task_context_policy"] = policy
-    prompt_payload["source_graph"] = {"mode": contract["source_graph"]["mode"]}
+    prompt_payload["source_graph"] = {
+        "mode": contract["source_graph"]["mode"],
+        "targets": contract["source_graph"]["targets"],
+    }
+    prompt_payload["repo_identity"] = {
+        "scope_root": (
+            "."
+            if authority_repo == repo
+            else authority_repo.relative_to(repo).as_posix()
+        ),
+    }
 
     prompt_sections: list[dict[str, Any]] = []
     for section in sections:
@@ -681,6 +782,14 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         },
         "bundle_sha256": _sha256_text(bundle),
         "bundle_bytes": len(bundle.encode("utf-8")),
+        "repo_identity": {
+            "repo_root": str(authority_repo),
+            "scope_root": (
+                "."
+                if authority_repo == repo
+                else authority_repo.relative_to(repo).as_posix()
+            ),
+        },
         "estimated_raw_context_bytes": sum(section["bytes"] for section in raw_sections),
         "optimized_context_bytes": sum(section["bytes"] for section in sections),
         "optimization": {
@@ -733,4 +842,5 @@ __all__ = [
     "ProjectContextResult",
     "SCHEMA_ID",
     "collect_project_context",
+    "resolve_task_repository_root",
 ]

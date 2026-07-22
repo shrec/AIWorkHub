@@ -45,7 +45,7 @@ def _ensure_deepseek_credentials_stub() -> None:
 
 _ensure_deepseek_credentials_stub()
 
-from aiworkhub import dashboard, process_launcher, project_context  # noqa: E402
+from aiworkhub import dashboard, process_launcher, project_context, worker_ai_tools_mcp  # noqa: E402
 
 
 def _write_tool(path: Path, body: str) -> None:
@@ -319,6 +319,42 @@ def test_common_prompt_delivery_and_receipt_are_distinct(
     )
     assert mismatch["acknowledged"] is False
     assert mismatch["reason"] == "receipt_bundle_sha256_mismatch"
+
+
+def test_receipt_survives_long_stream_suffix(tmp_path: Path) -> None:
+    output = tmp_path / "long.stdout.log"
+    bundle_sha = "a" * 64
+    receipt = {
+        "schema_id": project_context.RECEIPT_SCHEMA_ID,
+        "acknowledged": True,
+        "bundle_sha256": bundle_sha,
+        "prompt_sha256": "b" * 64,
+        "section_count": 4,
+    }
+    output.write_text(
+        "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt) + "\n" + ("x" * (128 * 1024)),
+        encoding="utf-8",
+    )
+    parsed = process_launcher._project_context_receipt_from_output(
+        output, expected_bundle_sha256=bundle_sha,
+    )
+    assert parsed["acknowledged"] is True
+    assert parsed["section_count"] == 4
+
+
+def test_audit_append_accepts_seccomp_denied_fchmod_on_existing_0600_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ledger = tmp_path / "audit.jsonl"
+    ledger.touch(mode=0o600)
+
+    def denied(_fd: int, _mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchmod", denied)
+    worker_ai_tools_mcp._append_line_0600(ledger, '{"ok":true}\n')
+    assert ledger.read_text(encoding="utf-8") == '{"ok":true}\n'
+    assert ledger.stat().st_mode & 0o777 == 0o600
 
 
 def test_dashboard_exposes_compact_ai_infra_without_raw_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

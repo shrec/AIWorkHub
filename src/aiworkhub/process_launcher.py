@@ -11,6 +11,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import html
+import inspect
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -160,6 +161,7 @@ PROCESS_DIR_DEFAULT_REL = Path(".aiworkhub/runtime/process_logs/processes")
 DEFAULT_MAX_PROCESSES = 4
 MAX_CONFIGURED_PROCESSES = 32
 MAX_LOG_TAIL_BYTES = 64 * 1024
+MAX_RECEIPT_SCAN_BYTES = 2 * 1024 * 1024
 LAUNCH_IMPLEMENTED = True
 SUPERVISOR_GRACE_SECONDS = 90
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
@@ -817,7 +819,20 @@ def _project_context_receipt_from_output(
         "section_count": 0,
         "reason": "receipt_not_found",
     }
-    text = _safe_tail(path, max_bytes=16 * 1024)
+    # A receipt is normally emitted near the beginning of a streaming JSONL
+    # run.  Reading only the final 16 KiB loses it as soon as tool results make
+    # the stream larger (the 0.6.11 live canary produced 135 KiB).  Scan a
+    # bounded whole log; for unusually large logs keep symmetric head/tail
+    # windows so early receipts and late adapter summaries remain visible.
+    try:
+        size = path.stat().st_size if path.is_file() and not path.is_symlink() else 0
+    except OSError:
+        size = 0
+    if size <= MAX_RECEIPT_SCAN_BYTES:
+        text = _read_byte_range(path, 0, size)
+    else:
+        half = MAX_RECEIPT_SCAN_BYTES // 2
+        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(path, size - half, half)
     prefix = "PROJECT_CONTEXT_RECEIPT:"
     expected = expected_bundle_sha256.strip().lower()
     for line in reversed(text.splitlines()):
@@ -1107,6 +1122,48 @@ def _worker_mcp_session_topic(
     payload = _worker_mcp_bundle_payload(context_result)
     topic = (payload.get("session") or {}).get("topic")
     return str(topic) if isinstance(topic, str) and topic.strip() else fallback_topic
+
+
+def _task_authority_repo(repo: Path, card: dict[str, Any]) -> Path:
+    resolver = getattr(project_context, "resolve_task_repository_root", None)
+    if resolver is None:
+        return repo.resolve()
+    return resolver(repo, card)
+
+
+def _provision_worker_mcp_runtime_for_authority(
+    workspace: WorkerWorkspace,
+    *,
+    request_id: str,
+    task_id: str,
+    runner: str,
+    topic: str,
+    backend: str,
+    authority_repo: Path,
+    source_graph_targets: list[str],
+    session_topic: str,
+) -> worker_ai_tools_mcp.WorkerMcpRuntime:
+    kwargs: dict[str, Any] = {
+        "request_id": request_id,
+        "task_id": task_id,
+        "runner": runner,
+        "topic": topic,
+        "backend": backend,
+        "source_graph_targets": source_graph_targets,
+        "session_topic": session_topic,
+    }
+    try:
+        signature = inspect.signature(provision_worker_mcp_runtime)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None and "authority_repo" in signature.parameters:
+        kwargs["authority_repo"] = authority_repo
+        return provision_worker_mcp_runtime(workspace, **kwargs)
+    try:
+        workspace = replace(workspace, repo=authority_repo)
+    except TypeError:
+        pass
+    return provision_worker_mcp_runtime(workspace, **kwargs)
 
 
 def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -1559,6 +1616,7 @@ class ProcessManager:
             _validate_adapter_identity(runner, adapter_id)
             card = self._preflight_card(task_id, runner, topic)
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
+            authority_repo = _task_authority_repo(self.repo, card)
             context_result = project_context.collect_project_context(self.repo, card)
             # Load the BYOK credential (deepseek_copilot_cli) BEFORE claim-start.
             # A missing/invalid credential raises here, leaving the task
@@ -1602,13 +1660,14 @@ class ProcessManager:
                 })
 
                 workspace = create_workspace(self.repo, request_id, card, adapter_id)
-                worker_mcp_runtime = provision_worker_mcp_runtime(
+                worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
                     workspace,
                     request_id=request_id,
                     task_id=task_id,
                     runner=runner,
                     topic=topic,
                     backend=sandbox_backend,
+                    authority_repo=authority_repo,
                     source_graph_targets=_worker_mcp_source_graph_targets(context_result),
                     session_topic=_worker_mcp_session_topic(context_result, topic),
                 )
@@ -1688,6 +1747,7 @@ class ProcessManager:
                         "claude_mcp_config_path": str(worker_mcp_runtime.claude_mcp_config_path),
                         "copilot_mcp_config_path": str(worker_mcp_runtime.copilot_mcp_config_path),
                         "codex_config_toml_path": str(worker_mcp_runtime.codex_config_toml_path),
+                        "authority_repo": str(authority_repo),
                     },
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
