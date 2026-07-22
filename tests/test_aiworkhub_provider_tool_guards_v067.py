@@ -19,7 +19,18 @@ def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: P
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
     settings_path.write_text(
-        json.dumps({"model": "sonnet", "permissions": {"allow": ["Read"]}}),
+        json.dumps({
+            "model": "sonnet",
+            "permissions": {
+                "allow": ["Read", "Bash(python3 AITools/source_graph.py find x)"],
+            },
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "python3 AITools/cgraph.py find x"}],
+                }],
+            },
+        }),
         encoding="utf-8",
     )
 
@@ -37,6 +48,7 @@ def test_repository_guards_preserve_owner_content_and_are_idempotent(tmp_path: P
     assert settings["model"] == "sonnet"
     assert settings["permissions"]["allow"] == ["Read"]
     assert tuple(settings["permissions"]["deny"]) == CLAUDE_RAW_DISCOVERY_DENIES
+    assert "hooks" not in settings
 
 
 def test_corrupt_claude_settings_fail_closed(tmp_path: Path) -> None:

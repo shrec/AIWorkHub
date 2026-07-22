@@ -19,6 +19,41 @@ class ProviderGuardError(RuntimeError):
     pass
 
 
+def _is_legacy_ai_tool_command(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return "AITools/source_graph.py" in value or "AITools/cgraph.py" in value
+
+
+def _remove_legacy_pretool_hooks(payload: dict[str, Any]) -> bool:
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    rows = hooks.get("PreToolUse")
+    if not isinstance(rows, list):
+        return False
+    kept: list[Any] = []
+    changed = False
+    for row in rows:
+        nested = row.get("hooks") if isinstance(row, dict) else None
+        legacy = isinstance(nested, list) and any(
+            isinstance(item, dict) and _is_legacy_ai_tool_command(item.get("command"))
+            for item in nested
+        )
+        if legacy:
+            changed = True
+        else:
+            kept.append(row)
+    if changed:
+        if kept:
+            hooks["PreToolUse"] = kept
+        else:
+            hooks.pop("PreToolUse", None)
+        if not hooks:
+            payload.pop("hooks", None)
+    return changed
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -46,6 +81,15 @@ def _merge_claude_settings(path: Path) -> tuple[dict[str, Any], bool]:
     permissions = payload.setdefault("permissions", {})
     if not isinstance(permissions, dict):
         raise ProviderGuardError("claude_permissions_object_required")
+    changed = _remove_legacy_pretool_hooks(payload)
+    allow = permissions.get("allow")
+    if allow is not None:
+        if not isinstance(allow, list) or any(not isinstance(item, str) for item in allow):
+            raise ProviderGuardError("claude_permissions_allow_string_list_required")
+        filtered_allow = [item for item in allow if not _is_legacy_ai_tool_command(item)]
+        if filtered_allow != allow:
+            permissions["allow"] = filtered_allow
+            changed = True
     deny = permissions.setdefault("deny", [])
     if not isinstance(deny, list) or any(not isinstance(item, str) for item in deny):
         raise ProviderGuardError("claude_permissions_deny_string_list_required")
@@ -53,7 +97,7 @@ def _merge_claude_settings(path: Path) -> tuple[dict[str, Any], bool]:
     for item in CLAUDE_RAW_DISCOVERY_DENIES:
         if item not in merged:
             merged.append(item)
-    changed = merged != deny
+    changed = changed or merged != deny
     permissions["deny"] = merged
     return payload, changed
 
