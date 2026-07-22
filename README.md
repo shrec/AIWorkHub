@@ -159,6 +159,12 @@ carrying its `allowed_writes`, `forbidden` actions, and `required_outputs`. A
 worker never picks a task from another topic. `aiworkhub_agent_launch_task`
 independently re-validates the exact pending task, runner/topic, adapter,
 allowed-write boundary, and collision state before starting a process.
+A task's `depends_on` edges gate its readiness: it is not eligible for
+dispatch while a declared dependency is outstanding or while its
+`allowed_writes` overlaps an in-flight dependency's own write set. The
+resolved dependency/readiness state is captured in an immutable plan
+snapshot at dispatch time, so a worker's card reflects the exact Plan-DAG
+state it was cleared against.
 
 Every task then passes through three independent verification layers before
 it can be accepted:
@@ -565,32 +571,49 @@ bash tests/test_write_gate_audit_v1.sh
 
 ## Roadmap: Concepts Under Consideration (Kimi-Atlas-Inspired)
 
-These are **design ideas only** -- none of them exist in the codebase yet.
-They are recorded here as a named future target, not as a claim of current
-behavior:
+This section tracks a set of Kimi-Atlas-inspired design ideas against the
+current codebase. Not all of them are done -- each item below is marked
+explicitly as implemented or still roadmap-only; absence of a mark elsewhere
+in this document is not a claim of completion.
 
-- **Deterministic lifecycle FSM** -- replace today's status-string
-  transitions (`pending` -> `processing` -> `review` -> `done`/`blocked`)
-  with an explicit, exhaustively enumerated finite-state machine so every
-  transition is provably reachable and every non-transition is provably
-  rejected.
+**Implemented:**
+
+- **Deterministic lifecycle FSM** -- today's status transitions
+  (`pending` -> `processing` -> `review` -> `done`/`blocked`) run through an
+  explicit, exhaustively enumerated finite-state machine so every transition
+  is provably reachable and every non-transition is provably rejected.
+- **Plan-DAG dependencies/readiness** -- `depends_on` edges gate task
+  readiness, with write-overlap blocker detection against in-flight
+  dependencies and an immutable plan snapshot captured at dispatch time (see
+  [Task Dispatch, Validation & Acceptance](#task-dispatch-validation--acceptance)
+  above).
+- **Deterministic verification lenses** -- named, composable verification
+  passes produce independent pass/fail verdicts as part of the coordinator's
+  independent re-validation, instead of one monolithic validation script.
+- **Independent coordinator accept** -- the coordinator re-validates and
+  hash-gates a worker's changed files against its own rerun, independent of
+  the worker's self-reported validation, before promoting any file out of
+  the worker's isolated workspace.
+
+**Still roadmap -- design ideas only, not implemented:**
+
 - **Combined-tree differential gate** -- diff the worker's full changed-file
   tree against `allowed_writes` in a single pass, instead of today's
   per-file allowlist check, to catch cross-file leakage in one shot.
-- **Deterministic verification lenses** -- named, composable verification
-  passes (schema lens, ownership lens, forbidden-path lens, test lens) that
-  each produce an independent pass/fail verdict, instead of one monolithic
-  validation script.
 - **Read-time context graph** -- build the Source Graph/KB/session context
   bundle lazily at the moment a worker actually requests it, rather than
   precomputing and freezing a snapshot at dispatch time.
+- **SAFE untrusted-output wrapper** -- wrap worker/model output in a
+  structured, explicitly-untrusted envelope before any coordinator surface
+  consumes it, instead of treating worker text as directly actionable.
 - **Forward-only recovery** -- when a worker's task is interrupted (crash,
   stale lease), recover by replaying forward from the last confirmed
   checkpoint instead of rewinding task state, so a partially completed
   worktree is never silently discarded.
 
-None of the above is scheduled or gated; they are candidates to evaluate
-against the existing dispatch/validation/acceptance model described above.
+The still-roadmap items above are not scheduled or gated; they remain
+candidates to evaluate against the existing dispatch/validation/acceptance
+model described above.
 
 ## Documentation
 

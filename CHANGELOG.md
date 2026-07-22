@@ -4,6 +4,46 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.25] - 2026-07-22
+
+### Added
+
+- Deterministic task lifecycle finite-state machine: every status transition
+  is now explicit and exhaustively enumerated, so a non-transition is
+  provably rejected rather than falling through a status-string comparison.
+- Plan-DAG task dependencies: `depends_on` edges, readiness computation, and
+  write-overlap blocker detection so a task cannot become claimable while a
+  dependency is outstanding or while its `allowed_writes` collides with an
+  in-flight dependency's.
+- Review-before-promotion retained workspaces: a worker's isolated worktree
+  is retained through `review` and only reclaimed after a confirmed
+  coordinator disposition, instead of being torn down at worker exit.
+- Independent coordinator accept path: the coordinator re-validates and
+  hash-gates a worker's changed files against its own rerun before
+  promotion, independent of the worker's self-reported validation.
+
+### Fixed
+
+- Safe validation cwd compatibility: validation subprocess working directory
+  resolution stays compatible with the worker's own worktree across the
+  supported cwd/PYTHONPATH combinations.
+- Cross-platform Codex runtime migration compatibility: the bundled/embedded
+  MCP runtime migration path launches consistently across the supported
+  platforms.
+
+### Changed
+
+- Python package (`aiworkhub`), MCP runtime, and VS Code extension
+  (`vscode-extension/package.json`) versions aligned at `0.6.25`.
+- README dispatch/verification section now documents Plan-DAG `depends_on`
+  dependencies and the plan snapshot alongside the existing three-layer
+  validation/acceptance model.
+- README Kimi-Atlas-inspired roadmap section now distinguishes implemented
+  concepts (deterministic lifecycle FSM, Plan-DAG dependencies/readiness,
+  deterministic verification lenses, independent coordinator accept) from
+  concepts still on the roadmap (combined-tree differential gate, read-time
+  context graph, SAFE untrusted-output wrapper, forward-recovery expansion).
+
 ## [0.6.24] - 2026-07-22
 
 ### Fixed
