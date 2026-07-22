@@ -77,7 +77,7 @@ def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch
     assert result["repo"] == str(root)
     assert result["storage"]["ready"] is True
     assert _REPO_ID_RE.match(result["storage"]["repo_id"])
-    assert result["server_version"] == "0.6.26"
+    assert result["server_version"] == "0.6.29"
 
 
 def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):
@@ -98,6 +98,7 @@ def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):
 
 def test_health_view_reports_repo_root_not_selected_before_any_bind(monkeypatch):
     monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
     result = dashboard_mcp_app.health_view()
     assert result["ok"] is False
     assert result["error"] == "repo_root_not_selected"

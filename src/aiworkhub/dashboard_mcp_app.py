@@ -210,11 +210,6 @@ def health_view() -> dict[str, Any]:
         or ""
     ).strip()
     if not root_raw:
-        try:
-            root_raw = str(core.repo_root())
-        except (RuntimeError, task_store.TaskStoreError):
-            root_raw = ""
-    if not root_raw:
         result: dict[str, Any] = {
             "ok": False,
             "repo": "",
