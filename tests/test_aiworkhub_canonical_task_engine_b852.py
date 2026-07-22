@@ -187,6 +187,33 @@ def test_collision_guard_no_active_cards(repo):
     assert result["stdout"] == "No cards to scan."
 
 
+def test_collision_guard_uses_native_aiworkhub_store_not_repo_scripts(repo):
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    poison = scripts / "build_tasking_parallel_group_collision_guard_v1.py"
+    poison.write_text(
+        "def scan_collisions(cards):\n"
+        "    raise RuntimeError('repo script must not be imported')\n",
+        encoding="utf-8",
+    )
+    _insert_task(
+        repo,
+        "TASK_NATIVE_COLLISION",
+        "claude_sonnet5",
+        "aiworkhub_canary",
+        card_extra={"allowed_writes": ["research/native_collision.json"]},
+    )
+
+    result = core.collision_guard(print_json=True)
+
+    assert result["ok"] is True
+    payload = json.loads(result["stdout"].split("\n\n", 1)[1])
+    assert payload["schema_id"] == "aiworkhub.task_collision_report.v1"
+    assert payload["source"] == "canonical_task_store"
+    assert payload["cards_source"].endswith("/.aiworkhub/tasking/task_queue.sqlite")
+    assert "bitnnv2/data/tasking" not in payload["cards_source"]
+
+
 # ---------------------------------------------------------------------------
 # Write gate
 # ---------------------------------------------------------------------------

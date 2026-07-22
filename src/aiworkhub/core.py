@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2294,6 +2295,64 @@ def _active_cards_for_collision_guard() -> list[dict[str, Any]]:
     return active
 
 
+def _normalize_allowed_write_path(path: str) -> str:
+    return str(path or "").replace("\\", "/").lstrip("./")
+
+
+def _allowed_write_paths_overlap(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if any(ch in left + right for ch in "*?[]"):
+        # Glob semantics are intentionally fail-safe but non-expansive here:
+        # exact glob-vs-glob overlap is undecidable without a filesystem walk,
+        # and collision guard must remain repo-local, cheap, and deterministic.
+        return False
+    left_dir = left.endswith("/")
+    right_dir = right.endswith("/")
+    if left_dir and right.startswith(left):
+        return True
+    if right_dir and left.startswith(right):
+        return True
+    return False
+
+
+def _scan_aiworkhub_collisions(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    entries: list[tuple[str, str]] = []
+    for card in cards:
+        task_id = str(card.get("task_id") or "?")
+        for raw_path in card.get("allowed_writes") or []:
+            normalized = _normalize_allowed_write_path(str(raw_path))
+            if normalized:
+                entries.append((normalized, task_id))
+
+    collisions: dict[str, set[str]] = defaultdict(set)
+    for idx, (path_a, task_a) in enumerate(entries):
+        for path_b, task_b in entries[idx + 1 :]:
+            if task_a == task_b:
+                continue
+            if _allowed_write_paths_overlap(path_a, path_b):
+                key = path_a if path_a == path_b else f"{path_a} <-> {path_b}"
+                collisions[key].update((task_a, task_b))
+
+    file_collisions = [
+        {"file": path, "conflicting_tasks": sorted(tasks)}
+        for path, tasks in sorted(collisions.items())
+    ]
+    root = repo_root()
+    storage = task_store.storage_readiness(root)
+    return {
+        "schema_id": "aiworkhub.task_collision_report.v1",
+        "source": "canonical_task_store",
+        "repo": str(root),
+        "cards_source": storage.canonical_db,
+        "collision_free": not file_collisions,
+        "active_cards": len(cards),
+        "collision_count": len(file_collisions),
+        "file_collisions": file_collisions,
+        "coordination_commands": [],
+    }
+
+
 def collision_guard(print_json: bool = True) -> dict[str, Any]:
     command = ["collision-guard"]
     if print_json:
@@ -2305,17 +2364,7 @@ def collision_guard(print_json: bool = True) -> dict[str, Any]:
     if not cards:
         return _canonical_result(ok=True, returncode=0, stdout="No cards to scan.", command=command)
 
-    root_str = str(repo_root())
-    if root_str not in sys.path:
-        sys.path.insert(0, root_str)
-    try:
-        from scripts.build_tasking_parallel_group_collision_guard_v1 import scan_collisions
-    except ImportError as exc:
-        return _canonical_result(
-            ok=False, returncode=1, stderr=f"collision_guard_import_failed:{exc}", command=command
-        )
-
-    result = scan_collisions(cards)
+    result = _scan_aiworkhub_collisions(cards)
     lines: list[str] = []
     if result["collision_free"]:
         lines.append(
