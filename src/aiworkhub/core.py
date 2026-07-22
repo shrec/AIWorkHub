@@ -2259,10 +2259,24 @@ def release_launch(
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
+        callback_store.init_db(conn)
+        try:
+            persisted_card = json.loads(str(card.get("card_json") or "{}"))
+        except json.JSONDecodeError:
+            persisted_card = {}
+        if not isinstance(persisted_card, dict):
+            persisted_card = {}
+        persisted_card.update(
+            {
+                "terminal_outcome": reason,
+                "terminal_review_reason": reason,
+                "terminal_worker": claimed_by,
+            }
+        )
         cur = conn.execute(
-            "UPDATE tasks SET worker_status='unclaimed', status='pending', claimed_by=NULL, updated_at=? "
-            "WHERE task_id=? AND claimed_by=?",
-            (now, task_id, claimed_by),
+            "UPDATE tasks SET worker_status='review', status='review', card_json=?, updated_at=? "
+            "WHERE task_id=? AND claimed_by=? AND worker_status IN ('claimed','in_progress')",
+            (json.dumps(persisted_card, ensure_ascii=False, sort_keys=True), now, task_id, claimed_by),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -2276,18 +2290,46 @@ def release_launch(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (
                 task_id,
-                "release_launch",
+                "terminal_review",
                 CODEX_RUNNER,
-                json.dumps({"topic": live_topic, "claimed_by": claimed_by, "reason": reason}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "topic": live_topic,
+                        "claimed_by": claimed_by,
+                        "terminal_outcome": reason,
+                    },
+                    ensure_ascii=False,
+                ),
                 now,
             ),
+        )
+        origin_thread_id = callback_store.read_origin_thread(conn, task_id)
+        if not origin_thread_id:
+            origin_thread_id = str(card.get("origin_thread_id") or "").strip()
+        callback_provider = _current_chat_provider(card)
+        claude_route = _claude_manager_identity() if callback_provider == "claude" else None
+        if claude_route is not None:
+            origin_thread_id = claude_route["session_id"]
+            conn.execute(
+                "UPDATE tasks SET origin_thread_id=? WHERE task_id=?",
+                (origin_thread_id, task_id),
+            )
+        callback_enqueued = callback_store.enqueue_callback(
+            conn,
+            task_id,
+            origin_thread_id or "",
+            "review_ready",
+            provider=callback_provider,
         )
         conn.commit()
     finally:
         conn.close()
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["callback_enqueued"] = callback_enqueued
+    result["terminal_outcome"] = reason
+    return result
 
 
 def _active_cards_for_collision_guard() -> list[dict[str, Any]]:

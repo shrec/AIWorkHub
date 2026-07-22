@@ -49,8 +49,6 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--max-budget-usd",
-        f"{runtime_adapters.CLAUDE_DEFAULT_MAX_BUDGET_USD:.2f}",
         "--permission-mode",
         "auto",
         "--no-session-persistence",
@@ -87,8 +85,6 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--max-budget-usd",
-        f"{runtime_adapters.CLAUDE_DEFAULT_MAX_BUDGET_USD:.2f}",
         "--permission-mode",
         "auto",
         "--no-session-persistence",
@@ -109,23 +105,14 @@ def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
     assert tuple(plan.argv[start:]) == runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES
 
 
-def test_claude_max_budget_is_bounded(monkeypatch, tmp_path):
+def test_claude_has_no_automatic_monetary_budget_cap(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     executable = _executable(tmp_path, "claude")
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
 
-    monkeypatch.setenv(runtime_adapters.CLAUDE_MAX_BUDGET_USD_ENV, "9999")
     plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
-    assert plan.argv[plan.argv.index("--max-budget-usd") + 1] == (
-        f"{runtime_adapters.CLAUDE_MAX_MAX_BUDGET_USD:.2f}"
-    )
-
-    monkeypatch.setenv(runtime_adapters.CLAUDE_MAX_BUDGET_USD_ENV, "not-a-float")
-    plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
-    assert plan.argv[plan.argv.index("--max-budget-usd") + 1] == (
-        f"{runtime_adapters.CLAUDE_DEFAULT_MAX_BUDGET_USD:.2f}"
-    )
+    assert "--max-budget-usd" not in plan.argv
 
 
 def test_codex_argv_preserves_spaces_and_unicode(monkeypatch, tmp_path):

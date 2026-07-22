@@ -1882,6 +1882,21 @@ class ProcessManager:
             }
         except (LaunchRejected, project_context.ProjectContextError, WorkspaceError, OSError, ValueError) as exc:
             reason = str(exc)
+            # Once the public launch path has accepted an exact task identity,
+            # every outcome belongs to the manager review ledger.  Some
+            # failures (context collection, credential resolution, worktree
+            # creation, adapter planning) happen before the normal claim
+            # point; claim the still-pending exact card here so the canonical
+            # terminal transition cannot silently leave it in Pending.
+            if not claimed:
+                terminal_claim = task_engine.claim_start_exact(
+                    self.repo, task_id, runner, topic, request_id=request_id
+                )
+                claimed = bool(terminal_claim.get("ok"))
+                if not claimed:
+                    reason += ":terminal_claim_failed:" + str(
+                        terminal_claim.get("stderr") or terminal_claim.get("stdout") or ""
+                    )[:200]
             if claimed:
                 released = core.release_launch(task_id, runner, reason[:300])
                 if not released.get("ok"):

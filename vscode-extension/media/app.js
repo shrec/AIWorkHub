@@ -1172,7 +1172,8 @@ function renderFormattedLiveOutput(decoded) {
   }
 
   const timeline = createElement("div", "live-output-timeline");
-  for (const event of events.slice(-200)) {
+  // Newest-first: current activity must be visible without scrolling.
+  for (const event of events.slice(-200).reverse()) {
     const row = createElement("article", `live-output-row is-${event.kind}`);
     const head = createElement("div", "live-output-row-head");
     head.append(

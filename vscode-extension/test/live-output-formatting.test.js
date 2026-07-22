@@ -190,6 +190,7 @@ function lines(...events) {
   assert(rendered.includes("item started"));
   assert(rendered.includes("Raw event"));
   assert(rendered.includes("done"));
+  assert(rendered.indexOf("done") < rendered.indexOf("echo hi"), "newest event renders first");
 }
 
 {

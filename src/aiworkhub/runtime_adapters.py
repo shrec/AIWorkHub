@@ -80,10 +80,6 @@ CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
     "Bash(find *)",
     "Bash(tree *)",
 )
-CLAUDE_MAX_BUDGET_USD_ENV = "AIWORKHUB_CLAUDE_MAX_BUDGET_USD"
-CLAUDE_DEFAULT_MAX_BUDGET_USD = 1.0
-CLAUDE_MIN_MAX_BUDGET_USD = 0.05
-CLAUDE_MAX_MAX_BUDGET_USD = 10.0
 COPILOT_RAW_DISCOVERY_EXCLUDES = "grep,glob"
 COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
     "shell(grep:*)",
@@ -437,19 +433,6 @@ def build_runtime_command(
 
     executable = resolution.executable
     if adapter_id == "claude_cli":
-        try:
-            claude_max_budget_usd = float(
-                os.environ.get(
-                    CLAUDE_MAX_BUDGET_USD_ENV,
-                    str(CLAUDE_DEFAULT_MAX_BUDGET_USD),
-                )
-            )
-        except ValueError:
-            claude_max_budget_usd = CLAUDE_DEFAULT_MAX_BUDGET_USD
-        claude_max_budget_usd = max(
-            CLAUDE_MIN_MAX_BUDGET_USD,
-            min(claude_max_budget_usd, CLAUDE_MAX_MAX_BUDGET_USD),
-        )
         argv = [
             executable,
             "-p",
@@ -458,8 +441,6 @@ def build_runtime_command(
             "stream-json",
             "--verbose",
             "--include-partial-messages",
-            "--max-budget-usd",
-            f"{claude_max_budget_usd:.2f}",
             "--permission-mode",
             "auto",
             "--no-session-persistence",
@@ -625,8 +606,6 @@ def build_adapter_command(
 
 __all__ = [
     "ADAPTER_EXECUTABLES",
-    "CLAUDE_DEFAULT_MAX_BUDGET_USD",
-    "CLAUDE_MAX_BUDGET_USD_ENV",
     "DEEPSEEK_COPILOT_ADAPTER",
     "DEEPSEEK_DEFAULT_MODEL",
     "DEEPSEEK_SECRET_ENV_VAR",

@@ -33,9 +33,11 @@ def _insert_lifecycle_task(root: Path, task_id: str, runner: str, topic: str) ->
     try:
         conn.execute(
             "INSERT INTO tasks (task_id, runner, topic, mode, status, worker_status, priority, "
-            "objective, card_json, created_at, updated_at, claimed_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "objective, card_json, created_at, updated_at, claimed_by, origin_thread_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, runner, topic, "solo", "pending", "unclaimed", "normal", "objective",
-             json.dumps({}), _NOW, _NOW, None),
+             json.dumps({"origin_thread_id": "runtime-wiring-thread"}), _NOW, _NOW, None,
+             "runtime-wiring-thread"),
         )
         conn.commit()
     finally:
@@ -194,16 +196,21 @@ def test_real_core_lifecycle_calls_scope_identity_and_capability(monkeypatch, tm
     assert row["worker_status"] == "unclaimed"
     assert row["status"] == "pending"
 
-    # release-launch requires its own claim-start precondition (the exact
-    # processing owner), so it is exercised on a third task.
+    # A failed launch/finalization still requires manager review.  The exact
+    # processing owner and terminal reason are preserved; only an explicit
+    # manager reject-review may return the card to pending.
     release_task_id = "RUNTIME_WIRING_TASK_RELEASE"
     _insert_lifecycle_task(root, release_task_id, runner, topic)
     assert core.claim_start_exact(release_task_id, runner, topic)["ok"] is True
     released = core.release_launch(release_task_id, runner, "spawn failed", topic=topic)
     assert released["ok"] is True, released
     row = _lifecycle_row(root, release_task_id)
-    assert row["worker_status"] == "unclaimed"
-    assert row["status"] == "pending"
+    assert row["worker_status"] == "review"
+    assert row["status"] == "review"
+    card = task_store.get_task(root, release_task_id)
+    assert card is not None
+    assert card["terminal_outcome"] == "spawn failed"
+    assert released["callback_enqueued"] is True
 
     # mark_done/reject_review/release_launch are coordinator-only (require
     # the scrubbed coordinator token); claim_start_exact/mark_review are

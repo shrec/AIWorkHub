@@ -193,11 +193,10 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         calls.append(("release", task_id, claimed_by, reason))
         assert card["claimed_by"] == claimed_by
         card.update({
-            "status": "pending",
-            "worker_status": "unclaimed",
-            "claimed_by": "",
-            "launch_released_by": process_launcher.core.CODEX_RUNNER,
-            "launch_release_reason": reason,
+            "status": "review",
+            "worker_status": "review",
+            "terminal_worker": claimed_by,
+            "terminal_outcome": reason,
         })
         return {"ok": True}
 
@@ -309,7 +308,7 @@ def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     assert cancel["state"] == "cancel_requested"
     result = _wait_terminal(restarted, launched["request_id"])
     assert result["state"] == "cancelled"
-    assert card["status"] == "pending"
+    assert card["status"] == "review"
     assert [call[0] for call in calls] == ["claim", "release"]
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
