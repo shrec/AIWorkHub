@@ -111,6 +111,11 @@ _EXEC_PROBE_SCRIPT = b"#!/bin/sh\nexit 0\n"
 TASK_QUEUE_ISOLATED_RELATIVE = Path("task_mcp_isolated_queue/task_queue_isolated.sqlite")
 _ISOLATED_QUEUE_PLACEHOLDER_TASK_ID = "AIWORKHUB_ISOLATED_QUEUE_PLACEHOLDER_B328"
 
+# Large production repositories can legitimately need several minutes to
+# materialize a detached worktree on cold storage.  The generic command
+# timeout is intentionally shorter; provisioning gets its own bounded budget.
+WORKTREE_CREATE_TIMEOUT_SECONDS = 600
+
 # Landlock uses the generic syscall numbers on the Linux architectures Python
 # supports in this deployment. Unsupported kernels return ENOSYS and launch is
 # rejected instead of silently running without confinement.
@@ -772,10 +777,13 @@ def create_workspace(
     result = _run(
         ["git", "worktree", "add", "--detach", str(path), "HEAD"],
         cwd=repo,
+        timeout=WORKTREE_CREATE_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         shutil.rmtree(path.parent, ignore_errors=True)
-        raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[:300]}")
+        # Git reports the actionable cause (for example ENOSPC) at the end,
+        # after a long checkout progress stream. Preserve that tail.
+        raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
     declared = list(card.get("read_first") or []) + list(allowed)
     try:
         seeded = _expand_declared(repo, declared)
