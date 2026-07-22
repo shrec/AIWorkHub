@@ -4,6 +4,24 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.6] - 2026-07-22
+
+### Added
+
+- Exposed the canonical Source Graph, Session Manager, AI Memory and KB as
+  role-bound manager MCP tools as well as isolated worker MCP tools.
+- Added provider-native raw-discovery denies for Claude and Copilot workers;
+  `Grep`/`Glob` and shell `grep`/`rg`/`find`/`tree` cannot replace Source Graph.
+- Extended the authenticated completion gate to require Session Manager and
+  every requested Memory/KB surface in addition to a fresh non-empty Source
+  Graph lookup for code tasks.
+
+### Changed
+
+- Generated agent instructions are role-aware and permit raw discovery only
+  through a new exact coordinator-authorized fallback card after Source Graph
+  reports a target unsupported or unindexed.
+
 ## [0.6.5] - 2026-07-21
 
 ### Fixed

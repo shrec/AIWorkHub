@@ -66,6 +66,28 @@ GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 CODEX_INNER_SANDBOX_MODE_ENV = "AIWORKHUB_CODEX_INNER_SANDBOX_MODE"
 CODEX_INNER_SANDBOX_MODES: tuple[str, ...] = ("workspace-write", "danger-full-access")
 
+# Autonomous workers discover code through the injected AIWorkHub Source
+# Graph. These provider-native denies leave exact Read/Edit and card-declared
+# validation available, but prevent raw repository search from silently
+# replacing Source Graph. Unsupported/unindexed targets are handled by a new,
+# exact coordinator-authorized fallback card rather than by weakening a live
+# worker run.
+CLAUDE_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
+    "Grep",
+    "Glob",
+    "Bash(grep *)",
+    "Bash(rg *)",
+    "Bash(find *)",
+    "Bash(tree *)",
+)
+COPILOT_RAW_DISCOVERY_EXCLUDES = "grep,glob"
+COPILOT_RAW_DISCOVERY_DENIES: tuple[str, ...] = (
+    "shell(grep:*)",
+    "shell(rg:*)",
+    "shell(find:*)",
+    "shell(tree:*)",
+)
+
 PathValue = str | os.PathLike[str]
 ExecutableOverrides = Mapping[str, PathValue]
 
@@ -420,6 +442,8 @@ def build_runtime_command(
             "--permission-mode",
             "auto",
             "--no-session-persistence",
+            "--disallowedTools",
+            *CLAUDE_RAW_DISCOVERY_DENIES,
         ]
         if model is not None:
             argv.extend(("--model", model))
@@ -474,6 +498,7 @@ def build_runtime_command(
             "--output-format",
             "json",
             "--allow-all-tools",
+            f"--excluded-tools={COPILOT_RAW_DISCOVERY_EXCLUDES}",
             "--no-ask-user",
             "--no-remote",
             "--no-remote-export",
@@ -483,6 +508,8 @@ def build_runtime_command(
             "--secret-env-vars",
             secret_env_var,
         ]
+        for denied_tool in COPILOT_RAW_DISCOVERY_DENIES:
+            argv.append(f"--deny-tool={denied_tool}")
         for directory in readonly_dirs:
             argv.extend(("--add-dir", directory))
         argv.extend(("-C", cwd, "--model", resolved_model))

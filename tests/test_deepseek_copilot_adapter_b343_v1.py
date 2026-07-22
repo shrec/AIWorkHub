@@ -148,6 +148,7 @@ def test_deepseek_argv_is_noninteractive_byok_shape(monkeypatch, tmp_path):
         "-p", "Implement change",
         "--output-format", "json",
         "--allow-all-tools",
+        "--excluded-tools=grep,glob",
         "--no-ask-user",
         "--no-remote",
         "--no-remote-export",
@@ -155,6 +156,10 @@ def test_deepseek_argv_is_noninteractive_byok_shape(monkeypatch, tmp_path):
         "--no-color",
         "--no-auto-update",
         "--secret-env-vars", "COPILOT_PROVIDER_API_KEY",
+        "--deny-tool=shell(grep:*)",
+        "--deny-tool=shell(rg:*)",
+        "--deny-tool=shell(find:*)",
+        "--deny-tool=shell(tree:*)",
         "-C", str(repo.resolve()),
         "--model", "deepseek-v4-pro",  # production coding default
     ]

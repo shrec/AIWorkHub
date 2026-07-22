@@ -18,10 +18,10 @@ def test_canonical_order_is_exact_and_compact() -> None:
     expected = [
         "1. validate the injected AIWorkHub Task MCP receipt, identity and scope.",
         "2. consume and acknowledge the injected project-context receipt.",
-        "3. call aiworkhub_worker_source_graph_query for code discovery, slicing, impact and exact read targets.",
-        "4. call aiworkhub_worker_session_current_state for non-trivial continuity.",
-        "5. call aiworkhub_worker_ai_memory_search for one bounded task-specific memory query.",
-        "6. call aiworkhub_worker_kb_search/get/related for unresolved authoritative project facts.",
+        "3. manager uses aiworkhub_manager_source_graph_query; worker uses aiworkhub_worker_source_graph_query.",
+        "4. manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state.",
+        "5. manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search.",
+        "6. manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related.",
         "7. execute exact card action and validation.",
     ]
     positions = [text.index(item) for item in expected]
@@ -31,7 +31,7 @@ def test_canonical_order_is_exact_and_compact() -> None:
 
 def test_adaptive_invocation_without_empty_ceremony() -> None:
     text = instr.render_canonical()
-    assert "AIWorkHub MCP is the only authority for project AI tools" in text
+    assert "Role-specific AIWorkHub MCP tools are mandatory for managers and workers" in text
     assert "Task MCP receipt is always required; Source Graph is required for code tasks." in text
     assert "run only when the card requests them or the task is non-trivial" in text
     assert "Do not make empty irrelevant calls" in text
@@ -43,7 +43,9 @@ def test_source_graph_required_blocks_raw_discovery_fallback() -> None:
     assert "stop if its bundle is unavailable, empty, stale or unacknowledged" in text
     for forbidden in ("grep", "rg", "find", "tree", "broad cat/sed", "recursive listing"):
         assert forbidden in text
-    assert "manual full-repository parsing" in text
+    assert "while Source Graph can index/process the target" in text
+    assert "only after Source Graph reports that target unsupported or unindexed" in text
+    assert "record that reason" in text
 
 
 def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:

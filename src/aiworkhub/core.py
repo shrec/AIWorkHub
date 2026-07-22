@@ -1809,6 +1809,7 @@ def manager_bootstrap() -> dict[str, Any]:
         "repo": str(repo_root()),
         "manager_route": identity or {},
         "workflow": [
+            "aiworkhub_manager_source_graph_query / session_current_state / ai_memory_search / kb_*",
             "aiworkhub_task_create",
             "aiworkhub_task_auto_pickup or aiworkhub_agent_launch_task",
             "aiworkhub_task_mark_review",
@@ -1820,6 +1821,7 @@ def manager_bootstrap() -> dict[str, Any]:
             "claude": "call aiworkhub_dispatcher_ensure_started, then aiworkhub_claude_callback_wait and immediately ack",
         },
         "rules": [
+            "Managers use AIWorkHub manager AI tools before repository discovery, review, rebase, and planning.",
             "Create tasks through aiworkhub_task_create; never require repository-local AITools/taskctl.py.",
             "Use the returned task_id exactly and never fabricate callback batch/lease ids.",
             "Workers stop at review; a verified manager finalizes or rejects review.",

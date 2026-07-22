@@ -50,6 +50,8 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--permission-mode",
         "auto",
         "--no-session-persistence",
+        "--disallowedTools",
+        *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
         "--model",
         "claude-sonnet-current",
     ]
@@ -82,7 +84,21 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--permission-mode",
         "auto",
         "--no-session-persistence",
+        "--disallowedTools",
+        *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
     ]
+
+
+def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
+
+    plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
+
+    start = plan.argv.index("--disallowedTools") + 1
+    assert tuple(plan.argv[start:]) == runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES
 
 
 def test_codex_argv_preserves_spaces_and_unicode(monkeypatch, tmp_path):

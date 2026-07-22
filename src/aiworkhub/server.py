@@ -238,6 +238,7 @@ from . import dashboard_mcp_app
 from . import deepseek_credentials
 from . import launch_queue_contract
 from . import launch_queue_persist
+from . import manager_ai_tools
 from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
@@ -252,6 +253,58 @@ def aiworkhub_manager_bootstrap() -> dict[str, Any]:
     """READ-ONLY: explain this repository's manager workflow and callback lanes."""
 
     return core.manager_bootstrap()
+
+
+@mcp.tool()
+def aiworkhub_manager_source_graph_query(
+    mode: str,
+    query: str,
+    budget: int = 64,
+    target: str | None = None,
+    bundle_type: str = "explore",
+) -> dict[str, Any]:
+    """MANAGER READ: bounded canonical Source Graph query for this repository."""
+
+    return manager_ai_tools.source_graph_query(
+        mode=mode, query=query, budget=budget, target=target, bundle_type=bundle_type
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_session_current_state(
+    topic: str = "management", limit: int = 12
+) -> dict[str, Any]:
+    """MANAGER READ: bounded canonical Session Manager current state."""
+
+    return manager_ai_tools.session_current_state(topic=topic, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_ai_memory_search(query: str, limit: int = 8) -> dict[str, Any]:
+    """MANAGER READ: bounded canonical AI Memory search."""
+
+    return manager_ai_tools.ai_memory_search(query=query, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_kb_search(query: str, limit: int = 8) -> dict[str, Any]:
+    """MANAGER READ: bounded canonical KB search."""
+
+    return manager_ai_tools.kb_search(query=query, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_kb_get(key: str) -> dict[str, Any]:
+    """MANAGER READ: exact canonical KB entry lookup."""
+
+    return manager_ai_tools.kb_get(key=key)
+
+
+@mcp.tool()
+def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
+    """MANAGER READ: bounded canonical KB relation lookup."""
+
+    return manager_ai_tools.kb_related(key=key)
 
 
 @mcp.tool()

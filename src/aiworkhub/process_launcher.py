@@ -1119,7 +1119,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     keep whatever policy already applied to them (e.g. the immutable input
     shard for data tasks). Fails CLOSED on a gated task: a missing worker_mcp
     runtime record, an unreadable ledger, or zero verified live
-    ``source_graph`` calls all resolve to ``satisfied: False``. A tampered or
+    ``source_graph`` calls all resolve to ``satisfied: False``. Source Graph
+    must be fresh and non-empty; Session Manager and requested Memory/KB
+    sections must have a successful canonical call. A tampered or
     forged ledger line is dropped by ``verify_audit_ledger`` before it ever
     reaches this count, so a worker cannot satisfy the gate by writing text
     that merely looks like an audit entry.
@@ -1129,7 +1131,22 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     )
     worker_mcp_meta = metadata.get("worker_mcp") or {}
     gated = task_type == "code"
-    result: dict[str, Any] = {"gated": gated, "task_type": task_type, "satisfied": True, "reason": ""}
+    sections = (metadata.get("project_context") or {}).get("sections") or []
+    required_tools = ["source_graph"]
+    for section in sections:
+        if not isinstance(section, dict) or not section.get("requested", True):
+            continue
+        name = str(section.get("name") or "")
+        if name in {"session_current_state", "ai_memory", "kb"} and name not in required_tools:
+            required_tools.append(name)
+    result: dict[str, Any] = {
+        "gated": gated,
+        "task_type": task_type,
+        "required_tools": required_tools if gated else [],
+        "missing_tools": [],
+        "satisfied": True,
+        "reason": "",
+    }
     if not gated:
         return result
     ledger_path = worker_mcp_meta.get("audit_ledger_path")
@@ -1149,9 +1166,19 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # Bounded/redacted by construction: verify_audit_ledger never returns raw
     # paths, prompts, or database contents -- only counts and a short reason.
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
-    if not verification.get("ok") or verification.get("live_source_graph_calls", 0) <= 0:
+    successful = verification.get("successful_call_count_by_tool") or {}
+    missing: list[str] = []
+    if verification.get("live_source_graph_calls", 0) <= 0:
+        missing.append("source_graph")
+    for tool in required_tools:
+        if tool != "source_graph" and int(successful.get(tool) or 0) <= 0:
+            missing.append(tool)
+    result["missing_tools"] = missing
+    if not verification.get("ok") or missing:
         result["satisfied"] = False
-        result["reason"] = verification.get("reason") or "no_live_source_graph_mcp_call_recorded"
+        result["reason"] = verification.get("reason") or (
+            "required_aiworkhub_mcp_calls_missing:" + ",".join(missing)
+        )
     return result
 
 
@@ -1220,7 +1247,20 @@ TASK_CONTRACT_JSON:
 
 Read every read_first path before editing. Create the required evidence and run
 the listed validation commands. Never use git add -A or git add . and never
-touch paths outside allowed_writes.{context_block} Your final message must be at most 12 lines
+touch paths outside allowed_writes.
+
+MANDATORY_AIWORKHUB_TOOLS:
+- For code discovery call aiworkhub_worker_source_graph_query first. Raw Grep,
+  Glob, grep, rg, find and tree discovery are provider-blocked.
+- Call aiworkhub_worker_session_current_state for continuity. If the contract
+  requests AI Memory or KB, call their injected worker tools once with one
+  bounded task-specific query.
+- The coordinator verifies an HMAC-authenticated MCP audit ledger and rejects
+  completion when a required call is missing. Text claims cannot satisfy it.
+- If Source Graph reports an exact target unsupported/unindexed, stop and
+  report that target. Only a new coordinator-authorized fallback card may use
+  raw discovery for it.
+{context_block} Your final message must be at most 12 lines
 and name tests plus changed paths.{suffix}"""
 
 
@@ -2541,7 +2581,7 @@ class ProcessManager:
                         worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
                         if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
                             raise WorkspaceError(
-                                "validation_live_source_graph_mcp_call_missing:"
+                                "validation_required_aiworkhub_mcp_call_missing:"
                                 + str(worker_mcp_gate.get("reason") or "")
                             )
                         validations = run_validations(

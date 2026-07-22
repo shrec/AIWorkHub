@@ -495,6 +495,7 @@ def verify_audit_ledger(
         "entries_verified": 0,
         "entries_tampered": 0,
         "call_count_by_tool": {},
+        "successful_call_count_by_tool": {},
         "bounded_bytes_returned": 0,
         "cache_hits": 0,
         "policy_violations": 0,
@@ -514,6 +515,7 @@ def verify_audit_ledger(
         return result
 
     call_count: dict[str, int] = {}
+    successful_call_count: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str]] = set()
     for raw_line in lines:
         raw_line = raw_line.strip()
@@ -550,6 +552,13 @@ def verify_audit_ledger(
             result["policy_violations"] += 1
         authority_source = str(entry.get("authority_source") or "")
         authority_state = str(entry.get("authority_state") or "")
+        if (
+            entry.get("ok")
+            and not entry.get("violation")
+            and authority_source == "canonical"
+            and authority_state in {"canonical_active", "sole_authority"}
+        ):
+            successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
         if authority_source or authority_state:
             authority_seen.add((tool, authority_source, authority_state))
         # A "live" source_graph call must be a genuinely fresh, non-empty,
@@ -565,6 +574,7 @@ def verify_audit_ledger(
         ):
             result["live_source_graph_calls"] += 1
     result["call_count_by_tool"] = call_count
+    result["successful_call_count_by_tool"] = successful_call_count
     result["authority_index_identity"] = sorted(
         f"{t}:{src}:{state}" for t, src, state in authority_seen
     )

@@ -419,7 +419,8 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     result = core.manager_bootstrap()
     assert result["role"] == "manager"
-    assert result["workflow"][0] == "aiworkhub_task_create"
+    assert result["workflow"][0].startswith("aiworkhub_manager_source_graph_query")
+    assert "aiworkhub_task_create" in result["workflow"]
     assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]
 
 

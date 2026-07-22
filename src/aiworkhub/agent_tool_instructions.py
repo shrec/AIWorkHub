@@ -40,21 +40,22 @@ POLICY = ToolPolicy(
     order=(
         "validate the injected AIWorkHub Task MCP receipt, identity and scope",
         "consume and acknowledge the injected project-context receipt",
-        "call aiworkhub_worker_source_graph_query for code discovery, slicing, impact and exact read targets",
-        "call aiworkhub_worker_session_current_state for non-trivial continuity",
-        "call aiworkhub_worker_ai_memory_search for one bounded task-specific memory query",
-        "call aiworkhub_worker_kb_search/get/related for unresolved authoritative project facts",
+        "manager uses aiworkhub_manager_source_graph_query; worker uses aiworkhub_worker_source_graph_query",
+        "manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state",
+        "manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search",
+        "manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related",
         "execute exact card action and validation",
     ),
     adaptive=(
-        "The injected AIWorkHub MCP is the only authority for project AI tools; legacy AITools scripts/databases are not worker interfaces.",
+        "Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.",
         "Task MCP receipt is always required; Source Graph is required for code tasks.",
         "Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.",
         "Do not make empty irrelevant calls to satisfy ceremony.",
     ),
     source_graph=(
         "When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.",
-        "Do not bypass AIWorkHub with AITools/*.py, direct database reads, grep, rg, find, tree, broad cat/sed, recursive listing or manual full-repository parsing.",
+        "Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.",
+        "A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.",
     ),
     validation=(
         "Exact validation/build/test commands named by the card are allowed.",

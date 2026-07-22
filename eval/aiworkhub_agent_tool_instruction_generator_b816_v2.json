@@ -1,21 +1,21 @@
 {
-  "canonical_bytes": 1991,
-  "canonical_sha256": "3af6aa5ce8706fd93d08e1a5aed1af437ea25736e21049abbd57ecbcf71ead3e",
+  "canonical_bytes": 2152,
+  "canonical_sha256": "7600c8335d85b4b7fc43c0a93b0d76e3bd294300771f60d44acbbee59d7d241f",
   "projections": {
     ".github/copilot-instructions.md": {
-      "bytes": 2111,
-      "canonical_sha256": "3af6aa5ce8706fd93d08e1a5aed1af437ea25736e21049abbd57ecbcf71ead3e",
-      "sha256": "fba56a1d04e617bf7a4001518b12c7c0c88d9579ed2fd940f6d859493b0198a3"
+      "bytes": 2272,
+      "canonical_sha256": "7600c8335d85b4b7fc43c0a93b0d76e3bd294300771f60d44acbbee59d7d241f",
+      "sha256": "5848adf6da38ac40e0608cc3a293802381d8fc0c8f82d913aee2e03482272441"
     },
     "AGENTS.md": {
-      "bytes": 2089,
-      "canonical_sha256": "3af6aa5ce8706fd93d08e1a5aed1af437ea25736e21049abbd57ecbcf71ead3e",
-      "sha256": "816a0d33eb06792890aa1ed1806810e0677b352be04885bded01d1b3f9540e7c"
+      "bytes": 2250,
+      "canonical_sha256": "7600c8335d85b4b7fc43c0a93b0d76e3bd294300771f60d44acbbee59d7d241f",
+      "sha256": "e0f5d4f0b518ac929765ba2bdab0aa0fc7a77acee8d4cf88380bbaa8d887f24e"
     },
     "CLAUDE.md": {
-      "bytes": 2089,
-      "canonical_sha256": "3af6aa5ce8706fd93d08e1a5aed1af437ea25736e21049abbd57ecbcf71ead3e",
-      "sha256": "3d0716a59ee8e35c6c8678aed228e85f3cc9e51185c3ba9024fc75849618ea40"
+      "bytes": 2250,
+      "canonical_sha256": "7600c8335d85b4b7fc43c0a93b0d76e3bd294300771f60d44acbbee59d7d241f",
+      "sha256": "725b77d2b1f89c29ab5ec01f1768e316906c9d13681e982e7f1ab5478100de2c"
     }
   },
   "schema_id": "aiworkhub.task_mcp.agent_tool_instruction_generator_b816_v2.eval.v1"
