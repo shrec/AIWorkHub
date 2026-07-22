@@ -920,222 +920,230 @@ async function ensureCodexMuxConfigured(context) {
 }
 
 // ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
-// A real Codex CLI `config.toml` may already contain one or more
-// `[mcp_servers.<name>]` tables this extension itself wrote in a previous
-// install -- `<name>` is arbitrary (AIWorkHub, AIWorkHub_Ultrafast, any other
-// casing a user or an older installer chose). After a VSIX update the
-// bundled runtime moves to a new versioned extension directory, leaving the
-// table's `env.PYTHONPATH` pointing at a stale, no-longer-installed path.
-// This migrates ONLY that PYTHONPATH value, and ONLY for a table that is
-// unambiguously AIWorkHub-owned: its `args` must invoke `-m aiworkhub.server`
-// AND its current PYTHONPATH must already be a recognizable, versioned VS
-// Code AIWorkHub extension runtime path (never a user's own custom path).
-// The table name, `command`, `args`, comments, ordering, AIWORKHUB_REPO/
-// ROOT/ID, and every other key are never touched -- and a table that fails
-// either check is a custom/unrelated block and is left fully byte-identical.
-// No process is ever killed here and no manual VS Code/Codex reload is ever
-// required -- this only rewrites a static file the next Codex CLI launch
-// will read.
-const CODEX_MCP_TABLE_HEADER_RE = /^\[mcp_servers\.((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^.\]"'\s]+))\]\s*$/;
-const CODEX_MCP_ENV_TABLE_HEADER_RE = /^\[mcp_servers\.((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^.\]"'\s]+))\.env\]\s*$/;
-const CODEX_ANY_TABLE_HEADER_RE = /^\[[^\]]*\]\s*$/;
-const CODEX_MCP_ARGS_INVOKES_SERVER_RE = /args\s*=\s*\[[\s\S]*?["']-m["']\s*,\s*["']aiworkhub\.server["'][\s\S]*?\]/;
-const CODEX_PYTHONPATH_LINE_RE = /^(\s*PYTHONPATH\s*=\s*)(["'])((?:\\.|(?!\2).)*)\2(.*)$/;
-// Matches a VS Code extension-install-layout runtime directory for this
-// extension: `.../extensions/<publisher>.<name with "aiworkhub">-<version>/
-// runtime`, on any platform's separator, any casing, any publisher/version.
-// Never matches a bare/custom path a user configured by hand.
-const CODEX_OWNED_RUNTIME_SEGMENT_RE = /^.*[\\/]extensions[\\/][^\\/]*aiworkhub[^\\/]*-\d+(?:\.\d+){1,3}[^\\/]*[\\/]runtime[\\/]?$/i;
-
-function codexTomlTableName(rawToken) {
-  const token = String(rawToken || "").trim();
-  if (
-    token.length >= 2 &&
-    ((token[0] === '"' && token[token.length - 1] === '"') || (token[0] === "'" && token[token.length - 1] === "'"))
-  ) {
-    return token.slice(1, -1);
-  }
-  return token;
+function codexConfigTomlPath() {
+  return path.join(os.homedir(), ".codex", "config.toml");
 }
 
-function decodeCodexTomlQuotedValue(quoteChar, rawValue) {
-  if (quoteChar === "'") {
-    return rawValue;
+// Matches only extension-versioned AIWorkHub runtime paths this extension
+// itself ever writes into PYTHONPATH (`.../shrec.aiworkhub-<version>/runtime`),
+// on any OS path separator. An optional leading Windows drive letter (e.g.
+// `C:`) is captured as part of the match so it is never left behind when the
+// match is replaced -- omitting it would duplicate the drive prefix (see
+// repairCodexConfigTomlText tests). A custom/non-AIWorkHub MCP entry's
+// PYTHONPATH value never matches this shape, so it is left untouched.
+const AIWORKHUB_RUNTIME_PATH_RE = /(?<![A-Za-z0-9_])(?:[A-Za-z]:)?[^\s"';:]*[\\/]shrec\.aiworkhub-[^\s"';:\\/]+[\\/]runtime/g;
+
+// Broader match used ONLY by migrateCodexConfigTomlText: any safe VS Code
+// extension-publisher prefix (marketplace publisher ids are
+// lowercase-alphanumeric-and-hyphen, never a dot) ending in
+// `.aiworkhub-<version>/runtime`, on any OS path separator -- a single
+// backslash, a TOML-escaped doubled backslash (B894b: a Windows fixture path
+// stored as `C:\\Users...publisher.aiworkhub-...\\runtime` in TOML's escaped
+// string form), or POSIX `/`. This recognizes a versioned runtime installed
+// under a publisher other than `shrec` (e.g. `publisher.aiworkhub-0.6.19/runtime`)
+// without broadening to an arbitrary, non-versioned path.
+// repairCodexConfigTomlText intentionally keeps using the strict shrec-only
+// AIWORKHUB_RUNTIME_PATH_RE above.
+const MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE = /(?<![A-Za-z0-9_])(?:[A-Za-z]:)?[^\s"';:]*(?:\\\\|\\|\/)[A-Za-z0-9][A-Za-z0-9-]*\.aiworkhub-[^\s"';:\\/]+(?:\\\\|\\|\/)runtime/g;
+
+// TOML table header, e.g. "[mcp_servers.aiworkhub.env]" or
+// "[mcp_servers.AIWorkHub_Ultrafast]".
+const TOML_SECTION_RE = /^\s*\[([^\]]+)\]\s*$/;
+
+// Canonical AIWorkHub-owned MCP server names this extension is allowed to
+// repair PYTHONPATH for. Case-insensitive to tolerate existing config
+// casing conventions.
+const OWNED_MCP_SERVER_NAMES = new Set(["aiworkhub", "aiworkhub_ultrafast"]);
+
+function isOwnedMcpSection(sectionPath) {
+  const segments = String(sectionPath || "").trim().split(".");
+  if (segments.length < 2 || segments[0].toLowerCase() !== "mcp_servers") {
+    return false;
   }
-  return rawValue.replace(/\\(.)/g, (match, ch) => (ch === "\\" || ch === '"' ? ch : match));
+  return OWNED_MCP_SERVER_NAMES.has(segments[1].toLowerCase());
 }
 
-function encodeCodexTomlQuotedValue(quoteChar, value) {
-  if (quoteChar === "'" && !value.includes("'")) {
-    return { quoteChar: "'", text: value };
-  }
-  return { quoteChar: '"', text: value.replace(/\\/g, "\\\\").replace(/"/g, '\\"') };
-}
-
-// Splits a raw PYTHONPATH value into platform-delimited entries without ever
-// mis-splitting a Windows drive letter's own colon (`C:\...`) when no real
-// `;` delimiter is present.
-function splitCodexPythonPathValue(value) {
-  const raw = String(value || "");
-  if (raw.includes(";")) {
-    return raw.split(";");
-  }
-  if (/^[A-Za-z]:[\\/]/.test(raw)) {
-    return [raw];
-  }
-  if (raw.includes(":")) {
-    return raw.split(":");
-  }
-  return [raw];
-}
-
-// Splits `content` into alternating {text, eol} records so every line this
-// function does not modify reproduces its EXACT original bytes, including
-// mixed/CRLF line endings and a final line with no trailing newline.
-function splitCodexTomlKeepingLineEndings(content) {
-  const pieces = content.split(/(\r\n|\r|\n)/);
-  const lines = [];
-  for (let i = 0; i < pieces.length; i += 2) {
-    lines.push({ text: pieces[i], eol: pieces[i + 1] || "" });
-  }
-  return lines;
-}
-
-function joinCodexTomlLines(lines) {
-  return lines.map((line) => line.text + line.eol).join("");
-}
-
-/** Pure text transform -- never throws on malformed/unrecognized input (an
- *  unparsed or ambiguous table is left untouched, failing closed toward
- *  "leave it alone" rather than toward "rewrite it"). Returns
- *  {content, changed, migrated: [name, ...]}.
+/** Pure text repair: replace every AIWorkHub-owned runtime path segment on a
+ *  PYTHONPATH line with currentRuntimeDir, but only inside a canonical
+ *  AIWorkHub-owned MCP section (`[mcp_servers.aiworkhub...]` or
+ *  `[mcp_servers.aiworkhub_ultrafast...]`, case-insensitive). Leaves
+ *  non-PYTHONPATH lines, non-AIWorkHub-owned entries, and PYTHONPATH lines
+ *  in custom sections (even ones that happen to point at a
+ *  shrec.aiworkhub-<version>/runtime path) untouched. Idempotent -- a path already
+ *  equal to currentRuntimeDir is left as-is, so re-running never rewrites a
+ *  file that is already current.
  */
-function migrateCodexConfigTomlText(originalText, newRuntimeDir) {
-  const lines = splitCodexTomlKeepingLineEndings(String(originalText || ""));
-  const migrated = [];
-
-  // Pass 1: every top-level [mcp_servers.<name>] table span, and whether its
-  // own args invoke this server (multi-line arrays are handled by matching
-  // against the whole joined span text).
-  const mainTables = [];
-  let current = null;
-  for (let i = 0; i < lines.length; i += 1) {
-    const trimmed = lines[i].text.trim();
-    const envMatch = trimmed.match(CODEX_MCP_ENV_TABLE_HEADER_RE);
-    const mainMatch = !envMatch && trimmed.match(CODEX_MCP_TABLE_HEADER_RE);
-    if (mainMatch) {
-      if (current) current.endIdx = i;
-      current = { name: codexTomlTableName(mainMatch[1]), argsInvoke: false, startIdx: i + 1, endIdx: lines.length };
-      mainTables.push(current);
-      continue;
+function repairCodexConfigTomlText(text, currentRuntimeDir) {
+  let changed = false;
+  let currentSection = "";
+  const nextLines = String(text || "").split("\n").map((line) => {
+    const sectionMatch = line.match(TOML_SECTION_RE);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1];
+      return line;
     }
-    if (CODEX_ANY_TABLE_HEADER_RE.test(trimmed)) {
-      if (current) current.endIdx = i;
-      current = null;
+    if (!line.includes("PYTHONPATH") || !isOwnedMcpSection(currentSection)) {
+      return line;
     }
-  }
-  for (const table of mainTables) {
-    const spanText = lines
-      .slice(table.startIdx, table.endIdx)
-      .map((l) => l.text)
-      .join("\n");
-    table.argsInvoke = CODEX_MCP_ARGS_INVOKES_SERVER_RE.test(spanText);
-  }
-  const ownedNames = new Set(mainTables.filter((t) => t.argsInvoke).map((t) => t.name));
-
-  // Pass 2: every [mcp_servers.<name>.env] table span belonging to an owned
-  // name; rewrite its PYTHONPATH line only if its current value already
-  // resolves to a recognizable, versioned AIWorkHub extension runtime path.
-  let currentEnvName = null;
-  let currentEnvStart = -1;
-  const envSpans = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    const trimmed = lines[i].text.trim();
-    const envMatch = trimmed.match(CODEX_MCP_ENV_TABLE_HEADER_RE);
-    if (envMatch) {
-      if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: i });
-      currentEnvName = codexTomlTableName(envMatch[1]);
-      currentEnvStart = i + 1;
-      continue;
-    }
-    if (CODEX_ANY_TABLE_HEADER_RE.test(trimmed)) {
-      if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: i });
-      currentEnvName = null;
-    }
-  }
-  if (currentEnvName !== null) envSpans.push({ name: currentEnvName, startIdx: currentEnvStart, endIdx: lines.length });
-
-  for (const span of envSpans) {
-    if (!ownedNames.has(span.name)) continue;
-    for (let i = span.startIdx; i < span.endIdx; i += 1) {
-      const m = lines[i].text.match(CODEX_PYTHONPATH_LINE_RE);
-      if (!m) continue;
-      const [, prefix, quoteChar, rawValue, suffix] = m;
-      const decoded = decodeCodexTomlQuotedValue(quoteChar, rawValue);
-      const parts = splitCodexPythonPathValue(decoded);
-      const isOwnedRuntimePath = parts.some((part) => CODEX_OWNED_RUNTIME_SEGMENT_RE.test(part.trim()));
-      if (!isOwnedRuntimePath || decoded === newRuntimeDir) {
-        break;
+    return line.replace(AIWORKHUB_RUNTIME_PATH_RE, (match) => {
+      if (match === currentRuntimeDir) {
+        return match;
       }
-      const encoded = encodeCodexTomlQuotedValue(quoteChar, newRuntimeDir);
-      lines[i] = {
-        text: `${prefix}${encoded.quoteChar}${encoded.text}${encoded.quoteChar}${suffix}`,
-        eol: lines[i].eol,
-      };
-      migrated.push(span.name);
-      break;
+      changed = true;
+      return currentRuntimeDir;
+    });
+  });
+  return { text: nextLines.join("\n"), changed };
+}
+
+/** B894a backward-compatible pure helper: like repairCodexConfigTomlText, but
+ *  also migrates a custom-named MCP server table when (and only when) that
+ *  table's own `args` line (in its top-level `[mcp_servers.<name>]` section,
+ *  never a subsection) declares both `-m` and `aiworkhub.server`, and its
+ *  current PYTHONPATH already points at a versioned
+ *  `<publisher>.aiworkhub-<version>/runtime` path
+ *  (MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE, any safe VS Code extension
+ *  publisher prefix, not just `shrec`). A
+ *  custom table without that args signature, or whose PYTHONPATH is some
+ *  other non-versioned/unrelated path, is left byte-for-byte untouched.
+ *  Preserves every byte outside the migrated PYTHONPATH values, including
+ *  original line endings (splitting/joining on "\n" alone keeps a trailing
+ *  "\r" attached to its own line). Returns {content, changed, migrated}
+ *  where migrated is the sorted list of server names actually rewritten.
+ */
+function migrateCodexConfigTomlText(text, currentRuntimeDir) {
+  const lines = String(text || "").split("\n");
+
+  function serverNameForSection(sectionPath) {
+    const segments = String(sectionPath || "").trim().split(".");
+    if (segments.length < 2 || segments[0].toLowerCase() !== "mcp_servers") {
+      return null;
+    }
+    return segments[1];
+  }
+
+  // Pass 1: find custom (non-canonical) server names whose OWN top-level
+  // table (not a subsection like `.env`) declares an aiworkhub.server args
+  // invocation.
+  const customAiworkhubServerNames = new Set();
+  {
+    let currentSection = "";
+    for (const line of lines) {
+      const sectionMatch = line.match(TOML_SECTION_RE);
+      if (sectionMatch) {
+        currentSection = sectionMatch[1];
+        continue;
+      }
+      const serverName = serverNameForSection(currentSection);
+      if (!serverName) {
+        continue;
+      }
+      const segments = currentSection.trim().split(".");
+      const isTopLevelServerSection = segments.length === 2;
+      if (
+        isTopLevelServerSection
+        && !OWNED_MCP_SERVER_NAMES.has(serverName.toLowerCase())
+        && /\bargs\b/.test(line)
+        && line.includes("-m")
+        && line.includes("aiworkhub.server")
+      ) {
+        customAiworkhubServerNames.add(serverName.toLowerCase());
+      }
     }
   }
 
-  return { content: joinCodexTomlLines(lines), changed: migrated.length > 0, migrated };
+  // Pass 2: rewrite PYTHONPATH lines within a canonical OR permitted custom
+  // server's env subsection.
+  let changed = false;
+  const migrated = new Set();
+  let currentSection = "";
+  const nextLines = lines.map((line) => {
+    const sectionMatch = line.match(TOML_SECTION_RE);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1];
+      return line;
+    }
+    const serverName = serverNameForSection(currentSection);
+    if (!serverName || !line.includes("PYTHONPATH")) {
+      return line;
+    }
+    const lowerName = serverName.toLowerCase();
+    const permitted = OWNED_MCP_SERVER_NAMES.has(lowerName) || customAiworkhubServerNames.has(lowerName);
+    if (!permitted) {
+      return line;
+    }
+    return line.replace(MIGRATABLE_AIWORKHUB_RUNTIME_PATH_RE, (match) => {
+      if (match === currentRuntimeDir) {
+        return match;
+      }
+      changed = true;
+      migrated.add(serverName);
+      return currentRuntimeDir;
+    });
+  });
+
+  return { content: nextLines.join("\n"), changed, migrated: Array.from(migrated).sort() };
 }
 
-// CODEX_HOME is the Codex CLI's own override for its config directory;
-// absent that, the real Codex CLI default is `~/.codex/config.toml` on
-// Linux/macOS/Windows alike (Windows home is os.homedir(), never a guessed
-// repo-relative or global fallback path).
-function resolveCodexConfigTomlPath(env) {
-  const environment = env || process.env;
-  const codexHome = String((environment && environment.CODEX_HOME) || "").trim();
-  const base = codexHome || path.join(os.homedir(), ".codex");
-  return path.join(base, "config.toml");
+// B894a backward-compatible pure helper: splits a PYTHONPATH-style value on
+// the platform-appropriate delimiter without ever splitting a Windows drive
+// letter's own colon (e.g. "C:\foo\runtime" must stay one entry, not become
+// ["C", "\foo\runtime"]). A value containing ";" is treated as a
+// Windows-style list and split on ";"; otherwise it is treated as a POSIX
+// colon-delimited list, with any lone single-letter segment produced by that
+// split re-joined onto the following segment (that lone letter is a drive
+// letter, never a genuine POSIX path entry).
+function splitCodexPythonPathValue(value) {
+  const str = String(value || "");
+  if (!str) {
+    return [];
+  }
+  if (str.includes(";")) {
+    return str.split(";").filter(Boolean);
+  }
+  const rawParts = str.split(":");
+  const parts = [];
+  for (let i = 0; i < rawParts.length; i += 1) {
+    const part = rawParts[i];
+    if (/^[A-Za-z]$/.test(part) && i + 1 < rawParts.length) {
+      parts.push(`${part}:${rawParts[i + 1]}`);
+      i += 1;
+    } else {
+      parts.push(part);
+    }
+  }
+  return parts.filter(Boolean);
 }
 
-function atomicWriteText(file, text) {
-  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, text, "utf8");
-  fs.renameSync(tmp, file);
-}
-
-// Best-effort, silent, bounded migration run once at activation. Never
-// throws into the caller; a missing config.toml, an unreadable file, or a
-// file with no owned/stale blocks is simply a no-op -- never invents a
-// config.toml, never touches a different repository's state, never kills a
-// process, and never asks for a manual reload.
-async function migrateCodexConfigTomlRuntimePath(context) {
+/** Activation-time repair of ~/.codex/config.toml: when an AIWorkHub-owned
+ *  MCP entry's PYTHONPATH still points at an older versioned
+ *  shrec.aiworkhub-{version}/runtime directory (e.g. after an extension
+ *  upgrade changed the install directory name), rewrite only that runtime path
+ *  segment to point at the currently installed extension's runtime/
+ *  directory. Never touches a custom/non-AIWorkHub MCP entry, and never
+ *  creates or otherwise mutates the file beyond that one substitution.
+ *  Best-effort: a missing/unreadable/unwritable config.toml is left alone.
+ */
+function ensureCodexConfigTomlRepaired(context) {
+  const configPath = codexConfigTomlPath();
+  let original;
   try {
-    const configPath = resolveCodexConfigTomlPath(process.env);
-    if (!fs.existsSync(configPath)) {
-      return { attempted: false, reason: "config_toml_missing" };
-    }
-    const original = fs.readFileSync(configPath, "utf8");
-    const runtimeDir = path.join(context.extensionUri.fsPath, "runtime");
-    const result = migrateCodexConfigTomlText(original, runtimeDir);
-    if (!result.changed) {
-      return { attempted: true, changed: false, migrated: [] };
-    }
-    atomicWriteText(configPath, result.content);
-    if (outputChannel) {
-      outputChannel.appendLine(
-        `[codex] migrated PYTHONPATH for mcp_servers: ${result.migrated.join(", ")}`,
-      );
-    }
-    return { attempted: true, changed: true, migrated: result.migrated };
+    original = fs.readFileSync(configPath, "utf8");
+  } catch (_err) {
+    return false;
+  }
+  const currentRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
+  const { text, changed } = repairCodexConfigTomlText(original, currentRuntimeDir);
+  if (!changed) {
+    return false;
+  }
+  try {
+    fs.writeFileSync(configPath, text, "utf8");
+    outputChannel.appendLine("[codex] repaired stale AIWorkHub runtime PYTHONPATH entry in ~/.codex/config.toml");
+    return true;
   } catch (err) {
-    if (outputChannel) {
-      outputChannel.appendLine(`[codex] config.toml runtime migration skipped: ${sanitizeErrorMessage(err)}`);
-    }
-    return { attempted: true, changed: false, error: sanitizeErrorMessage(err) };
+    outputChannel.appendLine(`[codex] failed to repair ~/.codex/config.toml: ${sanitizeErrorMessage(err)}`);
+    return false;
   }
 }
 
@@ -2244,7 +2252,7 @@ async function activate(context) {
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
   await ensureCodexMuxConfigured(context);
-  await migrateCodexConfigTomlRuntimePath(context);
+  ensureCodexConfigTomlRepaired(context);
 
   // Resolve the initial active repository and label.
   try {
@@ -2322,16 +2330,16 @@ module.exports = {
     getMcpClient,
     sanitizeErrorMessage,
     shouldRepairCodexMuxSetting,
+    codexConfigTomlPath,
+    repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
-    resolveCodexConfigTomlPath,
-    migrateCodexConfigTomlRuntimePath,
     splitCodexPythonPathValue,
+    ensureCodexConfigTomlRepaired,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
       MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       EXPECTED_MCP_PACKAGE_VERSION,
-      CODEX_OWNED_RUNTIME_SEGMENT_RE,
     },
   },
 };

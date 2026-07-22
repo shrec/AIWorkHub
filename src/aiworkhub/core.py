@@ -25,6 +25,7 @@ from . import (
 from . import repository_state
 from . import task_store
 from . import callback_store
+from . import task_plan
 
 
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
@@ -1389,10 +1390,11 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
     if blocked is not None:
         return blocked
     try:
-        rows = task_store.list_tasks(repo_root(), status=None, limit=5000)
+        cards = _full_cards_for_plan()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
-    eligible = eligible_dryrun_candidates(rows, runner, topic)
+    ready_ids = set(task_plan.build_snapshot(cards)["ready"])
+    eligible = eligible_dryrun_candidates(cards, runner, topic, ready_ids=ready_ids)
     if not eligible:
         return _canonical_result(
             ok=False, returncode=1, stderr=f"no_eligible_task:runner={runner}:topic={topic}", command=command
@@ -1560,6 +1562,8 @@ def eligible_dryrun_candidates(
     rows: list[dict[str, Any]],
     runner: str,
     topic: str | None = None,
+    *,
+    ready_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Ordered list of cards ``auto_pickup`` would consider claimable, mirroring
     the ``taskctl.cmd_auto_pickup`` predicate. Pure: no IO, no mutation.
@@ -1569,6 +1573,12 @@ def eligible_dryrun_candidates(
       * lifecycle state == 'pending'
       * runner matches exactly
       * topic matches (``topic is None`` -> any topic)
+      * ``ready_ids is None`` (no Plan-DAG filtering requested) OR the card's
+        task_id is in ``ready_ids`` -- i.e. every ``depends_on`` entry has
+        reached the ``finished`` lifecycle state and its ``allowed_writes``
+        does not overlap a processing/review card's, per
+        ``task_plan.build_snapshot``. Cards with no ``depends_on`` and no
+        overlapping writes behave identically to before this filter existed.
 
     Order is preserved; ``auto_pickup`` claims element ``[0]``.
     """
@@ -1583,13 +1593,45 @@ def eligible_dryrun_candidates(
             continue
         if topic is not None and c.get("topic") != topic:
             continue
+        if ready_ids is not None and str(c.get("task_id")) not in ready_ids:
+            continue
         out.append(c)
     return out
 
 
-def _compact_card(card: dict[str, Any]) -> dict[str, Any]:
-    """Token-bounded summary of a card for the dry-run report."""
+def _full_cards_for_plan() -> list[dict[str, Any]]:
+    """Every canonical card in this repo, merged with its ``card_json`` (so
+    ``allowed_writes``/``depends_on`` are present) -- the input ``task_plan``
+    needs to build a DAG snapshot."""
+    rows = task_store.list_tasks(repo_root(), status=None, limit=5000)
+    cards: list[dict[str, Any]] = []
+    for row in rows:
+        full = task_store.get_task(repo_root(), str(row["task_id"]))
+        if full is not None:
+            cards.append(full)
+    return cards
+
+
+def task_plan_snapshot() -> dict[str, Any]:
+    """Read-only Plan-DAG snapshot: dependencies, blockers, write-scope
+    overlaps, and the deterministic set of task_ids ready to be claimed."""
+    cards = _full_cards_for_plan()
+    snapshot = task_plan.build_snapshot(cards)
     return {
+        "ok": True,
+        "schema_id": "aiworkhub.task_plan_snapshot.v1",
+        **snapshot,
+    }
+
+
+def _compact_card(
+    card: dict[str, Any],
+    *,
+    depends_on: list[str] | None = None,
+    blockers: list[str] | None = None,
+) -> dict[str, Any]:
+    """Token-bounded summary of a card for the dry-run report."""
+    out = {
         "task_id": card.get("task_id"),
         "runner": card.get("runner"),
         "topic": card.get("topic"),
@@ -1597,7 +1639,11 @@ def _compact_card(card: dict[str, Any]) -> dict[str, Any]:
         "worker_status": card.get("worker_status", "unclaimed"),
         "priority": card.get("priority"),
         "objective": str(card.get("objective", ""))[:160],
+        "depends_on": depends_on if depends_on is not None else (card.get("depends_on") or []),
     }
+    if blockers:
+        out["blockers"] = blockers
+    return out
 
 
 def auto_pickup_dryrun(runner: str, topic: str | None = None) -> dict[str, Any]:
@@ -1616,8 +1662,27 @@ def auto_pickup_dryrun(runner: str, topic: str | None = None) -> dict[str, Any]:
     export_result = pending_for_runner(runner=runner, topic=topic)
     rows = export_result.get("jsonl_rows", []) or []
 
-    eligible = eligible_dryrun_candidates(rows, runner, topic)
+    dag_error: str | None = None
+    snapshot: dict[str, Any] | None = None
+    try:
+        cards = _full_cards_for_plan()
+        snapshot = task_plan.build_snapshot(cards)
+        ready_ids = set(snapshot["ready"])
+    except task_store.TaskStoreError as exc:
+        # Fail closed: if the DAG snapshot cannot be built, report zero
+        # ready tasks rather than falling back to an unfiltered (DAG-blind)
+        # eligibility check.
+        dag_error = str(exc)
+        ready_ids: set[str] = set()
+
+    eligible = eligible_dryrun_candidates(rows, runner, topic, ready_ids=ready_ids)
     candidate = eligible[0] if eligible else None
+    candidate_blockers = None
+    candidate_depends_on = None
+    if candidate is not None and snapshot is not None:
+        candidate_tid = str(candidate.get("task_id"))
+        candidate_blockers = snapshot.get("blockers", {}).get(candidate_tid)
+        candidate_depends_on = snapshot.get("dependencies", {}).get(candidate_tid)
     excluded_claimed = sum(
         1
         for c in rows
@@ -1632,13 +1697,18 @@ def auto_pickup_dryrun(runner: str, topic: str | None = None) -> dict[str, Any]:
         "runner": runner,
         "topic": topic,
         "would_claim_task_id": candidate.get("task_id") if candidate else None,
-        "candidate": _compact_card(candidate) if candidate else None,
+        "candidate": (
+            _compact_card(candidate, depends_on=candidate_depends_on, blockers=candidate_blockers)
+            if candidate
+            else None
+        ),
         "filtering": {
             "runner_filter": runner,
             "topic_filter": topic,
             "pending_for_runner_topic": len(rows),
             "eligible_unclaimed": len(eligible),
             "excluded_already_claimed": excluded_claimed,
+            "dag_snapshot_error": dag_error,
         },
         "mutation": {
             "queue_mutated": False,
@@ -1891,12 +1961,18 @@ def create_task(
     priority: str = "normal",
     callback_required: bool = True,
     task_type: str = "code",
+    depends_on: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
     Identity, callback provider, and origin thread are derived from the live
     manager route.  They are intentionally not caller-controlled parameters.
     Existing task ids are never overwritten.
+
+    ``depends_on`` (optional) names other task_ids in the same repo that must
+    reach the ``finished`` lifecycle state before this card is DAG-ready (see
+    ``task_plan.py``). Omitting it (the default, ``None``) is identical to the
+    pre-DAG behavior: an empty dependency list that never blocks readiness.
     """
     identity = _claude_manager_identity() or _codex_manager_identity()
     if identity is None:
@@ -1952,6 +2028,10 @@ def create_task(
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:
             return _lifecycle_error("invalid_allowed_write_path", 2)
+    try:
+        depends_on2 = task_plan.normalize_depends_on(depends_on)
+    except task_plan.TaskPlanError as exc:
+        return _lifecycle_error(str(exc), 2)
 
     origin_thread_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
     if not _UUID_RE.fullmatch(origin_thread_id):
@@ -1985,6 +2065,7 @@ def create_task(
         "forbidden": forbidden2,
         "required_outputs": outputs2,
         "validation": validation2,
+        "depends_on": depends_on2,
         "project_context": {
             "required": True,
             "task_type": task_type,
@@ -2011,6 +2092,24 @@ def create_task(
             return _canonical_result(
                 ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
             )
+        if depends_on2:
+            existing_cards: dict[str, dict[str, Any]] = {}
+            for row in conn.execute("SELECT task_id, card_json FROM tasks"):
+                try:
+                    existing_card = json.loads(row["card_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    existing_card = {}
+                if not isinstance(existing_card, dict):
+                    existing_card = {}
+                existing_cards[row["task_id"]] = existing_card
+            existing_edges, invalid_ids = task_plan.existing_edges_from_cards(existing_cards)
+            try:
+                task_plan.validate_new_dependency_edge(
+                    task_id, depends_on2, existing_edges, invalid_ids=invalid_ids
+                )
+            except task_plan.TaskPlanError as exc:
+                conn.rollback()
+                return _canonical_result(ok=False, returncode=2, stderr=str(exc), command=command)
         conn.execute(
             "INSERT INTO tasks(task_id,runner,topic,mode,status,worker_status,priority,objective,card_json,created_at,updated_at,origin_thread_id,archived_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '')",

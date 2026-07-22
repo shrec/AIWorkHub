@@ -1253,6 +1253,22 @@ def _worker_mcp_session_topic(
     return str(topic) if isinstance(topic, str) and topic.strip() else fallback_topic
 
 
+def _changed_path_hashes(
+    workspace: WorkerWorkspace, changed: list[str]
+) -> dict[str, str | None]:
+    """Bounded sha256 evidence for each declared-changed path, read from the
+    isolated workspace only -- never the canonical repo. ``None`` records a
+    declared deletion (the path no longer exists in the workspace)."""
+    hashes: dict[str, str | None] = {}
+    for relative in changed:
+        source = workspace.path / relative
+        if source.is_symlink() or not source.is_file():
+            hashes[relative] = None
+            continue
+        hashes[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+    return hashes
+
+
 def _task_authority_repo(repo: Path, card: dict[str, Any]) -> Path:
     resolver = getattr(project_context, "resolve_task_repository_root", None)
     if resolver is None:
@@ -2930,13 +2946,9 @@ class ProcessManager:
                         )
                         changed = enforce_scope(workspace)
                         # B561: union validated required-output exact paths into
-                        # the promotion candidate set.  validate_required_outputs
+                        # the review candidate set.  validate_required_outputs
                         # finds gitignored files that changed_paths (git-diff /
-                        # git-ls-files --exclude-standard) silently omits.  Every
-                        # path is already authorised (passed allowed_writes +
-                        # non-empty + changed-from-baseline checks), and
-                        # promote() re-checks scope / parent-baseline / symlink
-                        # guards independently -- no guard weakening.
+                        # git-ls-files --exclude-standard) silently omits.
                         validated_required_paths = {
                             rec["path"]
                             for rec in required_output_records
@@ -2945,45 +2957,47 @@ class ProcessManager:
                         changed = sorted(set(changed) | validated_required_paths)
                         if not changed:
                             raise WorkspaceError("no_effect")
-                        promoted = promote(workspace, changed)
-                        if claim_state == "processing":
-                            # B895: core.mark_review's _canonical_write_gate
-                            # re-checks the ambient AIWORKHUB_ALLOW_WRITES
-                            # flag -- gone by the time a detached reconciler
-                            # (not the process that launched this request)
-                            # observes the clean exit, so it always rejects
-                            # here and stalls at review_pending even though
-                            # the one-shot grant above already authorized
-                            # this exact (repo, task_id, runner, topic,
-                            # request_id) tuple. Route the success terminal
-                            # transition through the same repository-bound,
-                            # non-ambient task_engine.mark_terminal_review
-                            # path the failure branch already uses, carrying
-                            # full changed/promoted/validation evidence.
-                            review_result = self._review_terminal_exact(
-                                metadata,
-                                "review_ready",
-                                request_id=request_id,
-                                evidence={
-                                    "changed_paths": changed,
-                                    "promoted_paths": promoted,
-                                    "required_outputs": required_output_records,
-                                    "validation": validations,
-                                    "worker_mcp_gate": worker_mcp_gate,
+                        # Phase 1 review-first reconcile: a successful worker
+                        # exit no longer promotes into the canonical repo nor
+                        # marks review via core.mark_review directly. The
+                        # isolated workspace is retained and the coordinator's
+                        # review ledger receives every check's evidence
+                        # (validation, required outputs, the MCP gate, changed
+                        # paths + their hashes, and the exact request/workspace
+                        # identity) so a later coordinator-accept step is the
+                        # only path that can ever touch the canonical repo.
+                        changed_path_hashes = _changed_path_hashes(workspace, changed)
+                        cleanup = False
+                        terminal_state = "review_ready"
+                        review_result = {"ok": True, "idempotent_noop": True}
+                        release_result = self._review_terminal_exact(
+                            metadata,
+                            "review_ready",
+                            request_id=request_id,
+                            evidence={
+                                "changed_paths": changed,
+                                "changed_path_hashes": changed_path_hashes,
+                                "required_outputs": required_output_records,
+                                "validation": validations,
+                                "worker_mcp_gate": worker_mcp_gate,
+                                "claim_state": claim_state,
+                                "workspace": workspace.as_metadata(),
+                                "request_identity": {
+                                    "request_id": request_id,
+                                    "task_id": str(metadata["task_id"]),
+                                    "runner": str(metadata["runner"]),
+                                    "topic": str(metadata["topic"]),
                                 },
-                            )
-                        else:
-                            review_result = {"ok": True, "idempotent_noop": True}
-                        if not review_result.get("ok"):
+                            },
+                        )
+                        if not release_result.get("ok"):
                             cleanup = False
                             terminal_state = "review_pending"
                             error = "review_transition_failed:" + str(
-                                review_result.get("stderr")
-                                or review_result.get("stdout")
+                                release_result.get("stderr")
+                                or release_result.get("stdout")
                                 or ""
                             )[:300]
-                        else:
-                            terminal_state = "review_ready"
             except WorkspaceError as exc:
                 error = str(exc)
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
@@ -3372,6 +3386,288 @@ class ProcessManager:
                 "blocked_reason": "supervisor_not_alive",
             }
         return {"ok": True, "request_id": request_id, "state": event["state"]}
+
+    def accept_review(self, request_id: str, task_id: str) -> dict[str, Any]:
+        """Coordinator/write-gated acceptance of one ``review_ready`` request.
+
+        This is Phase 2 of the review-first lifecycle: ``_finalize_isolated_request``
+        already retained the isolated worktree and recorded every check's
+        evidence on the canonical card's ``terminal_review`` (changed paths +
+        hashes, required outputs, validation, the worker MCP gate, and the
+        exact request/task/runner/topic identity). Nothing before this method
+        may ever touch the canonical repo for a review-first request.  Every
+        precondition below is required; any failure leaves the canonical repo
+        untouched and the task in ``review`` with the reason returned as
+        ``error``.  A retry after this method already promoted and finished
+        the exact same request returns ``already_accepted`` instead of
+        re-promoting or re-validating anything.
+        """
+        with self._registry_lock():
+            events = self._request_events(request_id)
+            if not events:
+                return {"ok": False, "error": "request_not_found", "request_id": request_id}
+            latest = events[-1]
+            if str(latest.get("task_id") or "") != task_id:
+                return {
+                    "ok": False,
+                    "error": "request_task_identity_mismatch",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            runner = str(latest.get("runner") or "")
+            topic = str(latest.get("topic") or "")
+            if not runner or not topic:
+                return {
+                    "ok": False,
+                    "error": "request_identity_incomplete",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            try:
+                card = _parse_card(self._show_task(task_id), task_id)
+            except LaunchRejected as exc:
+                return {
+                    "ok": False,
+                    "error": f"task_lookup_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            canonical = _canonical_task_status(card)
+            if canonical == "finished":
+                already = str(card.get("accepted_request_id") or "") == request_id
+                return {
+                    "ok": already,
+                    "already_accepted": already,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "" if already else "task_already_finished_by_other_request",
+                }
+            if canonical != "review":
+                return {
+                    "ok": False,
+                    "error": f"task_not_in_review:{canonical}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            if card.get("runner") != runner or card.get("topic") != topic:
+                return {
+                    "ok": False,
+                    "error": "task_identity_mismatch",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            if card.get("claimed_by") != runner:
+                return {
+                    "ok": False,
+                    "error": "claim_ownership_mismatch",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            terminal_review = card.get("terminal_review") or {}
+            if str(terminal_review.get("substatus") or "") != "review_ready":
+                return {
+                    "ok": False,
+                    "error": (
+                        "terminal_substatus_not_review_ready:"
+                        + str(terminal_review.get("substatus") or "")
+                    ),
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            deterministic = card.get("deterministic_verification") or {}
+            if deterministic.get("applicable") and not deterministic.get("pass"):
+                return {
+                    "ok": False,
+                    "error": "deterministic_verification_failed",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            evidence = terminal_review.get("evidence") or {}
+            request_identity = evidence.get("request_identity") or {}
+            if (
+                str(request_identity.get("request_id") or "") != request_id
+                or str(request_identity.get("task_id") or "") != task_id
+                or str(request_identity.get("runner") or "") != runner
+                or str(request_identity.get("topic") or "") != topic
+            ):
+                return {
+                    "ok": False,
+                    "error": "evidence_request_identity_mismatch",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            workspace_meta = evidence.get("workspace")
+            if not isinstance(workspace_meta, dict):
+                return {
+                    "ok": False,
+                    "error": "evidence_workspace_missing",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            try:
+                workspace = WorkerWorkspace.from_metadata(workspace_meta)
+            except (KeyError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "error": f"evidence_workspace_invalid:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            if workspace.repo != self.repo or workspace.request_id != request_id:
+                return {
+                    "ok": False,
+                    "error": "workspace_identity_mismatch",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            try:
+                assert_gc_safe_workspace_shape(request_id, workspace.path, workspace.home)
+            except WorkspaceError as exc:
+                return {
+                    "ok": False,
+                    "error": f"unsafe_workspace_shape:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            if workspace.path.is_symlink() or not workspace.path.is_dir():
+                return {
+                    "ok": False,
+                    "error": "workspace_missing",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            stored_hashes = evidence.get("changed_path_hashes")
+            if not isinstance(stored_hashes, dict) or not stored_hashes:
+                return {
+                    "ok": False,
+                    "error": "evidence_changed_hashes_missing",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            if not core.writes_allowed():
+                return {
+                    "ok": False,
+                    "error": "write_gate_closed",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            try:
+                changed = enforce_scope(workspace)
+                required_output_records = validate_required_outputs(
+                    workspace,
+                    card.get("required_outputs") or [],
+                    allow_empty=tuple(card.get("allow_empty_required_outputs") or []),
+                    allow_unchanged=tuple(card.get("allow_unchanged_required_outputs") or []),
+                )
+                validated_required_paths = {
+                    rec["path"]
+                    for rec in required_output_records
+                    if not rec.get("unchanged_allowed")
+                }
+                changed = sorted(set(changed) | validated_required_paths)
+                if not changed:
+                    raise WorkspaceError("no_effect")
+                worker_mcp_gate = evidence.get("worker_mcp_gate")
+                if (
+                    isinstance(worker_mcp_gate, dict)
+                    and worker_mcp_gate.get("gated")
+                    and not worker_mcp_gate.get("satisfied", True)
+                ):
+                    raise WorkspaceError(
+                        "validation_required_aiworkhub_mcp_call_missing:"
+                        + str(worker_mcp_gate.get("reason") or "")
+                    )
+                validations = run_validations(workspace, card.get("validation") or [])
+                current_hashes = _changed_path_hashes(workspace, changed)
+                if set(current_hashes) != set(stored_hashes) or any(
+                    current_hashes[relative] != stored_hashes.get(relative)
+                    for relative in current_hashes
+                ):
+                    raise WorkspaceError("stored_hash_mismatch")
+            except WorkspaceError as exc:
+                return {
+                    "ok": False,
+                    "error": f"revalidation_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+
+            promoted = promote(workspace, changed)
+
+            accept_result = task_engine.accept_review(
+                self.repo,
+                task_id,
+                runner=runner,
+                topic=topic,
+                request_id=request_id,
+                evidence={
+                    "promoted_paths": promoted,
+                    "validation": validations,
+                    "required_outputs": required_output_records,
+                },
+            )
+            if not accept_result.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (
+                        "promotion_finalize_failed:"
+                        + str(accept_result.get("stderr") or accept_result.get("stdout") or "")
+                    )[:500],
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": promoted,
+                }
+
+            try:
+                cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+            except WorkspaceError as exc:
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": latest.get("adapter_id"),
+                    "state": "accepted",
+                    "accepted": True,
+                    "promoted_paths": promoted,
+                    "workspace_retained": True,
+                    "cleanup_error": str(exc)[:500],
+                    "finished_at": _utcnow(),
+                })
+                return {
+                    "ok": True,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": promoted,
+                    "cleanup_error": str(exc)[:500],
+                }
+
+            self._append_event({
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": latest.get("adapter_id"),
+                "state": "accepted",
+                "accepted": True,
+                "promoted_paths": promoted,
+                "workspace_retained": False,
+                "finished_at": _utcnow(),
+            })
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "task_id": task_id,
+                "promoted_paths": promoted,
+            }
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:
         self._reconcile_persisted_requests()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -504,6 +505,197 @@ def test_safe_tail_refuses_to_follow_a_symlinked_log_path(tmp_path):
     regular = tmp_path / "regular.stdout.log"
     regular.write_text("normal worker output\n", encoding="utf-8")
     assert process_launcher._safe_tail(regular) == "normal worker output\n"
+
+
+def test_successful_isolated_reconcile_enters_review_without_promoting(
+    monkeypatch, tmp_path
+):
+    """Phase 1 review-first reconcile regression: a successful worker exit
+    must never call ``promote()`` or ``core.mark_review`` directly. It must
+    retain the isolated workspace, leave the canonical repo byte-unchanged,
+    and hand the coordinator's review ledger every check's evidence
+    (validation, required outputs, the worker-MCP gate, changed paths + their
+    hashes, and the exact workspace/request identity) via
+    ``_review_terminal_exact`` with substatus ``review_ready``.
+    """
+    _open_gates(monkeypatch)
+    from aiworkhub import worker_workspace, task_engine
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "out").mkdir(parents=True)
+    canonical_file = repo / "out" / "result.json"
+    canonical_file.write_text("canonical-v1", encoding="utf-8")
+    canonical_before = canonical_file.read_bytes()
+
+    workspace_dir = tmp_path / "workspace"
+    (workspace_dir / "out").mkdir(parents=True)
+    worked_file = workspace_dir / "out" / "result.json"
+    worked_file.write_text("canonical-v1", encoding="utf-8")
+
+    import subprocess
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=workspace_dir, text=True, capture_output=True, check=True
+        )
+
+    _git("init", "-q")
+    _git("config", "user.email", "tests@example.invalid")
+    _git("config", "user.name", "Task MCP Tests")
+    _git("add", "out/result.json")
+    _git("commit", "-qm", "baseline")
+    worked_file.write_text("worker-output-v2", encoding="utf-8")  # uncommitted change
+
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="req-review-first-1",
+        repo=repo,
+        path=workspace_dir,
+        home=home_dir,
+        allowed_writes=("out/result.json",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    def _processing_card():
+        card = _card()
+        card["status"] = "processing"
+        card["worker_status"] = "claimed"
+        card["claimed_by"] = "claude_worker_b1"
+        return card
+
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(_processing_card),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], repo),
+        isolation_enabled=False,
+    )
+
+    stdout_path = tmp_path / "req-review-first-1.stdout.log"
+    stderr_path = tmp_path / "req-review-first-1.stderr.log"
+    stdout_path.write_text("worker complete\n", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    status_path = tmp_path / "req-review-first-1.supervisor.json"
+    metadata_path = tmp_path / "req-review-first-1.request.json"
+
+    worker_workspace.write_json_0600(
+        status_path,
+        {"state": "exited", "exit_code": 0},
+    )
+    metadata = {
+        "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+        "request_id": "req-review-first-1",
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": "claude_cli",
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "cancel_path": str(tmp_path / "req-review-first-1.cancel.json"),
+        "prompt_sha256": "0" * 64,
+        "project_context": None,
+        "project_context_delivery": {"injected": False},
+        "sandbox_backend": "landlock",
+        "validation": [],
+        "required_outputs": [],
+        "allow_empty_required_outputs": [],
+        "allow_unchanged_required_outputs": [],
+        "external_readonly_dirs": [],
+        "workspace": workspace.as_metadata(),
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    review_calls = []
+
+    def fake_mark_terminal_review(repo_arg, task_id, runner, substatus, *, evidence=None):
+        review_calls.append(
+            {
+                "repo": repo_arg,
+                "task_id": task_id,
+                "runner": runner,
+                "substatus": substatus,
+                "evidence": evidence or {},
+            }
+        )
+        return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(task_engine, "mark_terminal_review", fake_mark_terminal_review)
+
+    promote_calls = []
+    monkeypatch.setattr(
+        process_launcher,
+        "promote",
+        lambda *a, **k: promote_calls.append((a, k)) or [],
+        raising=False,
+    )
+    mark_review_calls = []
+    monkeypatch.setattr(
+        process_launcher.core,
+        "mark_review",
+        lambda *a, **k: mark_review_calls.append((a, k)) or {"ok": True},
+    )
+
+    manager._append_event({
+        "request_id": "req-review-first-1",
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": "claude_cli",
+        "state": "running",
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+    })
+
+    event = manager._finalize_isolated_request("req-review-first-1", supervisor_returncode=0)
+
+    assert event["state"] == "review_ready"
+    assert event["workspace_retained"] is True
+    assert event["promoted_paths"] == []
+    assert "out/result.json" in event["changed_paths"]
+
+    # No promotion or direct mark_review call ever happened.
+    assert promote_calls == []
+    assert mark_review_calls == []
+
+    # The canonical repo is byte-unchanged; the isolated workspace is intact.
+    assert canonical_file.read_bytes() == canonical_before
+    assert worked_file.read_text(encoding="utf-8") == "worker-output-v2"
+    assert workspace_dir.is_dir()
+
+    # The coordinator's review ledger received review_ready plus full evidence.
+    assert len(review_calls) == 1
+    call = review_calls[0]
+    assert call["substatus"] == "review_ready"
+    assert call["task_id"] == "TASK_B1"
+    assert call["runner"] == "claude_worker_b1"
+    evidence = call["evidence"]
+    assert "out/result.json" in evidence["changed_paths"]
+    assert evidence["changed_path_hashes"]["out/result.json"] == hashlib.sha256(
+        b"worker-output-v2"
+    ).hexdigest()
+    assert evidence["validation"] == []
+    assert evidence["worker_mcp_gate"]["gated"] is False
+    assert evidence["request_identity"] == {
+        "request_id": "req-review-first-1",
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+    }
+    assert evidence["workspace"]["request_id"] == "req-review-first-1"
+    assert evidence["workspace"]["path"] == str(workspace_dir)
 
 
 def test_usage_parser_reads_claude_result_json(tmp_path):

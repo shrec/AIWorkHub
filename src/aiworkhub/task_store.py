@@ -52,6 +52,7 @@ from .storage_registry import (
     resolve_database_path,
 )
 from .provider_tool_guards import ProviderGuardError, apply_repository_guards
+from . import task_fsm
 
 
 SCHEMA_ID = "aiworkhub.task_store.v1"
@@ -715,7 +716,8 @@ def mark_terminal_review(
     conn = _connect(db_path)
     try:
         row = conn.execute(
-            "SELECT runner, status, worker_status, claimed_by, card_json FROM tasks WHERE task_id=?",
+            "SELECT runner, status, worker_status, archived_at, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -723,20 +725,51 @@ def mark_terminal_review(
         if str(row["runner"] or "") != runner:
             return False, "runner_mismatch"
         now = datetime.now(timezone.utc).isoformat()
+        current_status = canonical_status(dict(row))
+        legal, fsm_reason = task_fsm.check_terminal_review_transition(current_status, substatus)
+        if not legal:
+            conn.execute(
+                "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                "VALUES (?, 'illegal_transition_rejected', ?, ?, ?)",
+                (
+                    task_id,
+                    runner,
+                    json.dumps(
+                        {
+                            "attempted_substatus": substatus[:120],
+                            "current_status": current_status,
+                            "reason": fsm_reason,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            conn.commit()
+            return False, fsm_reason
         try:
             card = json.loads(str(row["card_json"] or "{}"))
         except json.JSONDecodeError:
             card = {}
         if not isinstance(card, dict):
             card = {}
+        evidence_payload = dict(evidence or {})
+        deterministic_verification = task_fsm.deterministic_verification(
+            substatus,
+            evidence_payload.get("validation"),
+            evidence_payload.get("required_outputs"),
+        )
         terminal = {
             "substatus": substatus[:120],
-            "evidence": dict(evidence or {}),
+            "evidence": evidence_payload,
+            "deterministic_verification": deterministic_verification,
             "recorded_at": now,
             "runner": runner,
         }
         card["terminal_review"] = terminal
         card["terminal_substatus"] = terminal["substatus"]
+        card["deterministic_verification"] = deterministic_verification
         card["review_requested_by"] = runner
         conn.execute(
             "UPDATE tasks SET status='review', worker_status='review', claimed_by=?, "

@@ -177,4 +177,176 @@ assert.ok(fs.existsSync(path.join(root, "..", "src", "aiworkhub", "dashboard_sta
 assert.ok(packageVsix.includes("MUX_LAUNCHER_SRC"));
 assert.ok(packageVsix.includes("chmodSync(MUX_LAUNCHER_DEST, 0o755)"));
 
+// Codex config.toml runtime-path repair: activation must fix a stale
+// AIWorkHub-owned PYTHONPATH entry (an older versioned
+// shrec.aiworkhub-*/runtime install dir) without touching custom entries.
+assert.ok(ext.includes("codexConfigTomlPath"));
+assert.ok(ext.includes("repairCodexConfigTomlText"));
+assert.ok(ext.includes("ensureCodexConfigTomlRepaired"));
+assert.ok(ext.includes('".codex", "config.toml"'));
+assert.ok(ext.includes("ensureCodexConfigTomlRepaired(context)"));
+
+// repairCodexConfigTomlText is a pure string-in/string-out helper, but
+// extension.js requires "vscode" at module scope; stub it (same pattern as
+// test/multirepo-connecting.test.js) only long enough to load the module and
+// grab __testInternals.
+const Module = require("module");
+const extensionPath = path.join(root, "extension.js");
+const { repairCodexConfigTomlText } = (() => {
+  delete require.cache[extensionPath];
+  const originalLoad = Module._load;
+  Module._load = function patchedLoad(request, parent, isMain) {
+    if (request === "vscode") return {};
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    return require(extensionPath).__testInternals;
+  } finally {
+    Module._load = originalLoad;
+  }
+})();
+
+{
+  // Linux/macOS style old versioned path -> repaired to current runtime dir.
+  const currentRuntimeDir = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.aiworkhub]",
+    'command = "python3"',
+    "[mcp_servers.aiworkhub.env]",
+    'PYTHONPATH = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.17/runtime"',
+  ].join("\n");
+  const expected = [
+    "[mcp_servers.aiworkhub]",
+    'command = "python3"',
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = "${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(text, expected);
+}
+
+{
+  // Windows-style path with backslashes and a drive letter: the drive
+  // prefix must not be duplicated (regression for the "C:C:\..." bug).
+  const currentRuntimeDir = "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.19\\runtime";
+  const before = [
+    "[mcp_servers.aiworkhub.env]",
+    'PYTHONPATH = "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.10\\runtime"',
+  ].join("\n");
+  const expected = [
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = "${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(text, expected);
+  assert.ok(!text.includes("C:C:"));
+}
+
+{
+  // Windows path with a case-insensitive "AIWorkHub_Ultrafast" section name.
+  const currentRuntimeDir = "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.19\\runtime";
+  const before = [
+    "[mcp_servers.AIWorkHub_Ultrafast.env]",
+    'PYTHONPATH = "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.10\\runtime"',
+  ].join("\n");
+  const expected = [
+    "[mcp_servers.AIWorkHub_Ultrafast.env]",
+    `PYTHONPATH = "${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(text, expected);
+  assert.ok(!text.includes("C:C:"));
+}
+
+{
+  // Already current: idempotent, no rewrite.
+  const currentRuntimeDir = "/Users/dev/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = "${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, false);
+  assert.strictEqual(text, before);
+}
+
+{
+  // A custom/non-AIWorkHub MCP entry's PYTHONPATH must never be altered.
+  const currentRuntimeDir = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.custom_tool]",
+    'command = "node"',
+    "[mcp_servers.custom_tool.env]",
+    'PYTHONPATH = "/opt/some/other/vendor/runtime"',
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, false);
+  assert.strictEqual(text, before);
+}
+
+{
+  // Section-aware ownership: a custom section whose PYTHONPATH happens to
+  // point at a shrec.aiworkhub-*/runtime shaped path (e.g. pointing at a
+  // shrec.aiworkhub runtime for its own reasons) must never be rewritten --
+  // only canonical [mcp_servers.aiworkhub...] / [mcp_servers.aiworkhub_ultrafast...]
+  // sections are owned.
+  const currentRuntimeDir = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.my_custom_aiworkhub_fork.env]",
+    'PYTHONPATH = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.5/runtime"',
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, false);
+  assert.strictEqual(text, before);
+}
+
+{
+  // Multi-entry PYTHONPATH (POSIX ':' delimiter): only the AIWorkHub segment
+  // is replaced, the unrelated sibling entry is preserved untouched.
+  const currentRuntimeDir = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.aiworkhub.env]",
+    'PYTHONPATH = "/opt/some/other/vendor/runtime:/home/user/.vscode/extensions/shrec.aiworkhub-0.6.5/runtime"',
+  ].join("\n");
+  const expected = [
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = "/opt/some/other/vendor/runtime:${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(text, expected);
+}
+
+{
+  // Windows semicolon-delimited PYTHONPATH list: only the AIWorkHub segment
+  // is replaced, the unrelated sibling entry is preserved untouched.
+  const currentRuntimeDir = "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.19\\runtime";
+  const before = [
+    "[mcp_servers.aiworkhub.env]",
+    'PYTHONPATH = "C:\\opt\\vendor\\runtime;C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.5\\runtime"',
+  ].join("\n");
+  const expected = [
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = "C:\\opt\\vendor\\runtime;${currentRuntimeDir}"`,
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(text, expected);
+}
+
+{
+  // Non-PYTHONPATH lines referencing a stale path must never be touched.
+  const currentRuntimeDir = "/home/user/.vscode/extensions/shrec.aiworkhub-0.6.19/runtime";
+  const before = [
+    "[mcp_servers.aiworkhub.env]",
+    "# see /home/user/.vscode/extensions/shrec.aiworkhub-0.6.5/runtime for details",
+  ].join("\n");
+  const { text, changed } = repairCodexConfigTomlText(before, currentRuntimeDir);
+  assert.strictEqual(changed, false);
+  assert.strictEqual(text, before);
+}
+
 console.log("AIWorkHub VS Code extension static contract checks passed");

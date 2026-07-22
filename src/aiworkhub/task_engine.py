@@ -170,6 +170,135 @@ def mark_terminal_review(
     }
 
 
+def accept_review(
+    repo: Path,
+    task_id: str,
+    *,
+    runner: str,
+    topic: str,
+    request_id: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Coordinator-only promotion finalize: ``review`` -> ``finished``.
+
+    This is the sole authority that may move a review-first request's task
+    out of ``review`` after ``ProcessManager.accept_review`` has already
+    re-run scope/required-output/validation gates and promoted the exact,
+    hash-verified changed paths into this bound ``repo``. Every identity
+    check here re-derives from the canonical row read under the same write
+    transaction (never a stale caller-supplied copy), so a concurrent
+    accept-review call for a different request can never race this one into
+    finishing the task twice. Idempotent: retrying the exact same
+    already-finished request returns ``ok: True`` with ``already_accepted``;
+    a different request retried against an already-finished task fails
+    closed instead of silently re-finishing it.
+    """
+    command = [
+        "accept-review", task_id, "--runner", runner, "--topic", topic,
+        "--request-id", request_id,
+    ]
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        conn = task_store._connect(db_path)
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    try:
+        row = conn.execute(
+            "SELECT runner, topic, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"task_not_found:{task_id}",
+            }
+        if row["runner"] != runner or _effective_topic(row) != topic:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"identity_mismatch:task_id={task_id}",
+            }
+        if row["claimed_by"] != runner:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"claim_mismatch:claimed_by={row['claimed_by']}",
+            }
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        status = str(row["status"] or "")
+        worker_status = str(row["worker_status"] or "")
+        if status == "finished" or worker_status == "done":
+            already = str(card.get("accepted_request_id") or "") == request_id
+            conn.rollback()
+            return {
+                "ok": already,
+                "returncode": 0 if already else 1,
+                "command": command,
+                "stdout": json.dumps(
+                    {"task_id": task_id, "already_accepted": already}, ensure_ascii=False
+                ),
+                "stderr": "" if already else "task_already_finished_by_other_request",
+            }
+        terminal_review = card.get("terminal_review") or {}
+        if str(terminal_review.get("substatus") or "") != "review_ready":
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": (
+                    "terminal_substatus_not_review_ready:"
+                    + str(terminal_review.get("substatus") or "")
+                ),
+            }
+        request_identity = (terminal_review.get("evidence") or {}).get("request_identity") or {}
+        if str(request_identity.get("request_id") or "") != request_id:
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": "request_identity_mismatch",
+            }
+        if status != "review" or worker_status != "review":
+            conn.rollback()
+            return {
+                "ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": f"task_not_reviewable:status={status}:worker_status={worker_status}",
+            }
+        card["accepted_request_id"] = request_id
+        card["accepted_by"] = runner
+        card["accepted_at"] = now
+        card["accept_evidence"] = dict(evidence or {})
+        conn.execute(
+            "UPDATE tasks SET status='finished', worker_status='done', "
+            "completed_at=COALESCE(NULLIF(completed_at, ''), ?), updated_at=?, card_json=? "
+            "WHERE task_id=?",
+            (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id, "accept_review", runner,
+                json.dumps(
+                    {"request_id": request_id, **(evidence or {})},
+                    ensure_ascii=False, default=str, sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    card2 = task_store.get_task(repo, task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
+
+
 def archive_task(
     repo: Path,
     task_id: str,
@@ -200,4 +329,7 @@ def archive_task(
     }
 
 
-__all__ = ["show_task", "claim_start_exact", "mark_terminal_review", "archive_task"]
+__all__ = [
+    "show_task", "claim_start_exact", "mark_terminal_review", "accept_review",
+    "archive_task",
+]

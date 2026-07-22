@@ -1625,57 +1625,6 @@ def _tokenize_validation_command(command: str) -> list[str]:
     return argv
 
 
-# B892: a card validation command shaped exactly ``cd <relative-repo-path> &&
-# <argv...>`` used to tokenize with ``cd`` as argv[0] -- an unresolvable
-# executable (``cd`` is a shell builtin, not a binary), so the command failed
-# with ENOENT (B891). ``_split_validation_cd_prefix`` recognizes and strips
-# at most one such leading prefix, shell-free (no ``shell=True``, no
-# ``bash -c``/``sh -c`` wrapping): it operates purely on the already
-# shlex-tokenized argv and returns the validated relative path separately so
-# the sandbox builders below can bind the same cwd into both backends.
-# Every other control-operator token (bare ``&`` or a second ``&&`` anywhere,
-# including a second chained ``cd``) fails closed -- ``|``, ``;``, backtick,
-# ``>`` and ``<`` are already rejected at the character level above, so only
-# ``&``-based tokens need a token-level check here.
-_CD_TOKEN = "cd"
-_AND_OPERATOR_TOKEN = "&&"
-_CONTROL_OPERATOR_TOKEN_RE = re.compile(r"^&{1,2}$")
-_CD_PATH_FORBIDDEN_CHARS = frozenset("$`*?[]~{}()|;&<>\n\r\t")
-
-
-def _split_validation_cd_prefix(argv: list[str]) -> tuple[str | None, list[str]]:
-    """Extract at most one leading ``cd <relative-repo-path> &&`` prefix.
-
-    Returns ``(None, argv)`` unchanged when the command does not open with a
-    ``cd`` prefix, after confirming no stray control-operator token slipped
-    through tokenization. Returns ``(relative_path, rest_argv)`` for the exact
-    supported shape. Absolute paths, parent traversal, and forbidden
-    characters in the path are rejected here (syntax only); symlink escape
-    and existence are checked later against the real workspace filesystem by
-    ``_resolve_validation_cwd``.
-    """
-    if not argv or argv[0] != _CD_TOKEN:
-        for token in argv:
-            if _CONTROL_OPERATOR_TOKEN_RE.match(token):
-                raise WorkspaceError(f"validation_shell_syntax_forbidden:{token}")
-        return None, argv
-    if len(argv) < 3 or argv[2] != _AND_OPERATOR_TOKEN:
-        raise WorkspaceError("validation_cd_prefix_malformed")
-    relative_raw = argv[1]
-    if any(ch in _CD_PATH_FORBIDDEN_CHARS for ch in relative_raw):
-        raise WorkspaceError(f"validation_cd_path_forbidden_char:{relative_raw}")
-    relative = _relative_repo_path(relative_raw)
-    rest = argv[3:]
-    if not rest:
-        raise WorkspaceError("validation_cd_prefix_without_executable")
-    if rest[0] == _CD_TOKEN:
-        raise WorkspaceError("validation_multiple_cd_prefix_forbidden")
-    for token in rest:
-        if _CONTROL_OPERATOR_TOKEN_RE.match(token):
-            raise WorkspaceError(f"validation_shell_syntax_forbidden:{token}")
-    return relative, rest
-
-
 _ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _SUPPORTED_VALIDATION_ENV_ASSIGNMENTS = frozenset({"PYTHONPATH", "TMPDIR"})
 _PYTHONPATH_FORBIDDEN_VALUE_CHARS = frozenset("$`*?[]~{}()|;&<>\n\r\t ")
@@ -1718,6 +1667,56 @@ def _validate_pythonpath_value(raw_value: str) -> tuple[str, ...]:
     return tuple(components)
 
 
+_VALIDATION_CD_TOKEN = "cd"
+_VALIDATION_CHAIN_TOKENS = frozenset({"&&", "&"})
+_CD_PATH_FORBIDDEN_CHARS = frozenset("&$()`;|<>\n\r\t")
+
+
+def _validate_cd_path_chars(raw: str) -> None:
+    if any(ch in _CD_PATH_FORBIDDEN_CHARS for ch in raw):
+        raise WorkspaceError(f"validation_cd_path_forbidden_char:{raw}")
+
+
+def _split_validation_cwd_prefix(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Extract an optional leading ``cd RELATIVE_DIR &&`` prefix.
+
+    Only the exact three-token form ``cd``, a single relative directory
+    argument, then a literal ``&&`` is accepted immediately before the
+    remaining command argv (which may itself still carry a leading env
+    assignment -- merged by the caller). Anything else that looks like a
+    shell chain (a bare ``&&``/``&`` anywhere, a ``cd`` missing its ``&&``,
+    a second ``cd`` prefix, or a ``cd`` with nothing left to run) is
+    rejected fail-closed rather than silently reinterpreted.
+    """
+    if not argv:
+        return None, argv
+    if argv[0] != _VALIDATION_CD_TOKEN:
+        if any(token in _VALIDATION_CHAIN_TOKENS for token in argv):
+            raise WorkspaceError(
+                f"validation_shell_syntax_forbidden:chain:validation_shell_chain_forbidden:{argv}"
+            )
+        return None, argv
+    if len(argv) < 3 or argv[2] != "&&":
+        raise WorkspaceError("validation_cd_prefix_malformed")
+    raw_path = argv[1]
+    _validate_cd_path_chars(raw_path)
+    if raw_path == ".":
+        raise WorkspaceError(f"unsafe_repo_path:{raw_path}")
+    relative = _relative_repo_path(raw_path)
+    rest = argv[3:]
+    if not rest:
+        raise WorkspaceError(
+            "validation_cd_command_empty:validation_cd_prefix_without_executable"
+        )
+    if rest[0] == _VALIDATION_CD_TOKEN:
+        raise WorkspaceError("validation_multiple_cd_prefix_forbidden")
+    if any(token in _VALIDATION_CHAIN_TOKENS for token in rest):
+        raise WorkspaceError(
+            f"validation_shell_syntax_forbidden:chain:validation_shell_chain_forbidden:{rest}"
+        )
+    return relative, rest
+
+
 def _parse_validation_command_detailed(
     command: str,
 ) -> tuple[list[str], tuple[str, ...], str | None, str | None]:
@@ -1726,14 +1725,19 @@ def _parse_validation_command_detailed(
     The public ``parse_validation_command`` API intentionally remains a
     two-tuple.  TMPDIR is accepted only for the one canonical value used by
     task cards; arbitrary assignments and alternate paths stay fail-closed.
-    The leading ``cd <relative-repo-path> &&`` prefix, if present, is parsed
-    before the environment-assignment prefix so an existing
-    ``PYTHONPATH=``/``TMPDIR=`` prefix still works unchanged immediately
-    after it (e.g. ``cd sub && PYTHONPATH=. python3 -m pytest``).
+    An optional environment-assignment prefix (``PYTHONPATH=``/``TMPDIR=``)
+    is accepted in EITHER of two positions -- never both -- so a command
+    shaped either ``PYTHONPATH=. cd sub && python3 -m pytest`` (env before
+    ``cd``) or ``cd sub && PYTHONPATH=. python3 -m pytest`` (env immediately
+    after the ``cd RELATIVE_DIR &&`` prefix) strips exactly one supported
+    assignment and merges it into the same ``components``/``tmpdir_override``
+    result.
     """
     argv = _tokenize_validation_command(command)
-    cd_relative, argv = _split_validation_cd_prefix(argv)
-    env, rest = _split_validation_env_prefix(argv)
+    env, argv = _split_validation_env_prefix(argv)
+    cd_relative, rest = _split_validation_cwd_prefix(argv)
+    if not env and cd_relative is not None:
+        env, rest = _split_validation_env_prefix(rest)
     components: tuple[str, ...] = ()
     tmpdir_override: str | None = None
     if "PYTHONPATH" in env:

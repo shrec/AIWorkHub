@@ -289,7 +289,9 @@ def test_valid_one_task_grant_reaches_review_without_ambient_writes(tmp_path, mo
     result = manager._finalize_isolated_request(request_id)
 
     assert result["state"] == "review_ready"
-    assert calls == {"promote": 1, "mark_review": 1}
+    # Canonical promotion now happens only in the coordinator's
+    # accept_review path, not during finalize.
+    assert calls == {"promote": 0, "mark_review": 1}
     assert card["status"] == "review"
     # Single-use: the grant is consumed (deleted) on first use.
     assert not grant_path.is_file()
@@ -336,11 +338,11 @@ def test_second_finalize_scan_after_authority_consumption_is_a_pure_noop(tmp_pat
 
     first = manager._finalize_isolated_request(request_id)
     assert first["state"] == "review_ready"
-    assert calls == {"promote": 1, "mark_review": 1}
+    assert calls == {"promote": 0, "mark_review": 1}
 
     second = manager._finalize_isolated_request(request_id)
     assert second["state"] == "review_ready"
-    assert calls == {"promote": 1, "mark_review": 1}
+    assert calls == {"promote": 0, "mark_review": 1}
 
 
 # --- hostile replay: wrong task / wrong repo / tampered signature ----------
@@ -546,5 +548,5 @@ def test_ambient_writes_alone_still_authorizes_and_consumes_any_stray_grant(tmp_
     result = manager._finalize_isolated_request(request_id)
 
     assert result["state"] == "review_ready"
-    assert calls == {"promote": 1, "mark_review": 1}
+    assert calls == {"promote": 0, "mark_review": 1}
     assert not grant_path.is_file()

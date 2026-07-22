@@ -322,11 +322,15 @@ def aiworkhub_task_create(
     priority: str = "normal",
     callback_required: bool = True,
     task_type: str = "code",
+    depends_on: list[str] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
     The live manager session supplies callback provider/origin identity;
     callers cannot route a task into another chat or overwrite an existing id.
+    ``depends_on`` (optional) names other task_ids in this repo that must
+    finish before this card is Plan-DAG ready; omit it for the pre-DAG
+    behavior.
     """
 
     return core.create_task(
@@ -343,7 +347,23 @@ def aiworkhub_task_create(
         priority=priority,
         callback_required=callback_required,
         task_type=task_type,
+        depends_on=depends_on,
     )
+
+
+@mcp.tool()
+def aiworkhub_task_plan_snapshot() -> dict[str, Any]:
+    """READ-ONLY: Plan-DAG snapshot for dashboard/explanation use.
+
+    Reports, for every canonical card in this repo: its dependencies,
+    unmet blockers, write-scope overlaps with processing/review cards, and
+    the deterministic set of task_ids ready to be claimed right now. Never
+    computes readiness/pass-fail for the model to act on directly -- it is a
+    read-only report; ``aiworkhub_task_auto_pickup``/``_dryrun`` are the only
+    tools that claim work.
+    """
+
+    return core.task_plan_snapshot()
 
 
 @mcp.tool()
@@ -991,6 +1011,22 @@ def aiworkhub_agent_cancel_task(
     """DUAL-GATED: terminate one exact process group recorded by this server."""
 
     return process_launcher.default_manager().cancel(request_id, reason=reason)
+
+
+@mcp.tool()
+def aiworkhub_agent_accept_review(request_id: str, task_id: str) -> dict[str, Any]:
+    """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
+
+    Re-runs scope, required-output, and validation gates against the
+    retained isolated worktree, compares every changed path's hash against
+    the ones recorded when the request first reached review, and only then
+    promotes into the canonical repo and finalizes the task as done. Any
+    precondition or revalidation failure leaves the canonical repo untouched
+    and the task in review. Idempotent: accepting the same already-finished
+    request again returns ``already_accepted`` instead of re-promoting.
+    """
+
+    return process_launcher.default_manager().accept_review(request_id, task_id)
 
 
 @mcp.tool()

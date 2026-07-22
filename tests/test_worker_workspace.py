@@ -759,3 +759,122 @@ def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
         assert "PYTHONPATH" not in os.environ
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_cd_prefix_is_removed_from_executable_argv() -> None:
+    argv, components, tmpdir_override, cwd = worker_workspace._parse_validation_command_detailed(
+        "cd read && python3 x.py"
+    )
+    assert argv == ["python3", "x.py"]
+    assert components == ()
+    assert tmpdir_override is None
+    assert cwd == "read"
+    assert worker_workspace.parse_validation_command("cd read && python3 x.py") == (
+        ["python3", "x.py"], ()
+    )
+
+
+def test_validation_cd_prefix_combines_with_env_assignment() -> None:
+    argv, components, tmpdir_override, cwd = worker_workspace._parse_validation_command_detailed(
+        "PYTHONPATH=tools/src cd sub/dir && python3 -m pytest -q x_test.py"
+    )
+    assert argv == ["python3", "-m", "pytest", "-q", "x_test.py"]
+    assert components == ("tools/src",)
+    assert tmpdir_override is None
+    assert cwd == "sub/dir"
+
+
+@pytest.mark.parametrize(
+    "command,match",
+    [
+        ("cd /abs && python3 x.py", "invalid_repo_path"),
+        ("cd ../escape && python3 x.py", "unsafe_repo_path"),
+        ("cd . && python3 x.py", "unsafe_repo_path"),
+        ("cd sub &&", "validation_cd_command_empty"),
+        ("cd sub python3 x.py", "validation_cd_prefix_malformed"),
+        ("cd && python3 x.py", "validation_cd_prefix_malformed"),
+        ("python3 x.py && python3 y.py", "validation_shell_chain_forbidden"),
+        ("cd sub && python3 x.py && python3 y.py", "validation_shell_chain_forbidden"),
+    ],
+)
+def test_validation_cd_prefix_rejects_unsafe_forms(command: str, match: str) -> None:
+    with pytest.raises(worker_workspace.WorkspaceError, match=match):
+        worker_workspace._parse_validation_command_detailed(command)
+
+
+def test_validation_cd_prefix_rejects_symlink_escape_at_sandbox_argv_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "cd-symlink")
+    try:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (workspace.path / "escape-link").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(worker_workspace.WorkspaceError, match="symlink_path_component_forbidden"):
+            worker_workspace.sandbox_argv(
+                workspace,
+                "validation",
+                ["python3", "x.py"],
+                backend="landlock",
+                validation_cwd="escape-link",
+            )
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_cd_prefix_rejects_non_directory_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "cd-not-dir")
+    try:
+        with pytest.raises(worker_workspace.WorkspaceError, match="validation_cwd_not_directory"):
+            worker_workspace.sandbox_argv(
+                workspace,
+                "validation",
+                ["python3", "x.py"],
+                backend="landlock",
+                validation_cwd="out/result.txt",
+            )
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_cd_prefix_sets_bubblewrap_chdir_beneath_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "cd-bwrap-chdir")
+    try:
+        argv = worker_workspace.sandbox_argv(
+            workspace,
+            "validation",
+            ["python3", "x.py"],
+            backend="bubblewrap",
+            validation_cwd="read",
+        )
+        assert "--chdir" in argv
+        assert argv[argv.index("--chdir") + 1] == f"{worker_workspace.SANDBOX_WORKSPACE}/read"
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock validations",
+)
+def test_validation_cd_prefix_changes_child_cwd_under_landlock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "cd-landlock-exec")
+    try:
+        result, = worker_workspace.run_validations(
+            workspace,
+            ["cd read && python3 -c \"print(__import__('os').getcwd())\""],
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["stdout_tail"].strip() == str((workspace.path / "read").resolve())
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)

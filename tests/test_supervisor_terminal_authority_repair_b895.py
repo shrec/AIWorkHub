@@ -279,7 +279,10 @@ def test_valid_exact_grant_reaches_review_ready_via_task_engine_not_core_mark_re
 
     assert result["state"] == "review_ready"
     assert card["status"] == "review"
-    assert promote_calls == [["out/result.txt"]]
+    # Review-before-promotion: a successful worker exit reaches review_ready
+    # purely on evidence collected from the isolated workspace -- it never
+    # promotes into the canonical repo itself, so promote() is never called.
+    assert promote_calls == []
     # Exactly one non-ambient terminal-review transition, scoped to this task.
     assert len(terminal_calls) == 1
     call = terminal_calls[0]
@@ -287,12 +290,17 @@ def test_valid_exact_grant_reaches_review_ready_via_task_engine_not_core_mark_re
     assert call["task_id"] == card["task_id"]
     assert call["runner"] == card["runner"]
     assert call["substatus"] == "review_ready"
-    # Successful review evidence includes changed/promoted/validation records.
+    # Successful review evidence includes changed-path and validation records.
     evidence = call["evidence"]
     assert evidence["changed_paths"] == ["out/result.txt"]
-    assert evidence["promoted_paths"] == ["out/result.txt"]
     assert evidence["validation"] == []
     assert evidence["required_outputs"] == []
+    assert evidence["request_identity"] == {
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+    }
     # No environment write-flag mutation: the ambient gate is still closed.
     assert os.environ.get(process_launcher.ALLOW_WRITES_ENV) is None
     assert not grant_path.is_file()
