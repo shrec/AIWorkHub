@@ -201,28 +201,50 @@ def _codex_manager_identity() -> dict[str, str] | None:
         pid = parent_pid
     if not saw_codex_app_server or not mux_pid:
         return None
+    # VS Code extension hosts normally start Codex from a neutral cwd, so cwd
+    # cannot identify the owning repository.  Bind the mux to the exact
+    # extension-host PID persisted by this repository's AIWorkHub extension.
+    # This prevents a globally visible MCP from accepting repo-B writes from
+    # repo-A's chat and then returning repo-B callbacks to repo A.
+    resolved = _repo_bound_codex_mux(mux_pid)
+    if resolved is None:
+        return None
+    mux_instance, target = resolved
     identity = {
         "provider": "codex",
         "session_id": f"codex_mux_{mux_pid}",
-        "window_id": f"codex_vscode_{mux_pid}",
+        "window_id": str(target.get("window_id") or f"codex_vscode_{mux_pid}"),
     }
+    if mux_instance.owned_thread_ids:
+        thread_id = mux_instance.owned_thread_ids[-1]
+        if _UUID_RE.fullmatch(thread_id):
+            identity["thread_id"] = thread_id
+            identity["session_id"] = thread_id
+    return identity
+
+
+def _repo_bound_codex_mux(mux_pid: int) -> tuple[Any, dict[str, Any]] | None:
+    """Resolve one mux only through this repo's extension-host ownership."""
     try:
         from . import app_server_mux
 
+        target = read_selected_coordinator_target(repo_root())
+        extension_host_pid = int(target.get("extension_host_pid") or 0)
         matches = [
-            instance for instance in app_server_mux.list_live_sideband_instances(
+            instance
+            for instance in app_server_mux.list_live_sideband_instances(
                 app_server_mux.default_sideband_dir()
             )
-            if instance.pid == mux_pid and instance.owned_thread_ids
+            if instance.pid == mux_pid
+            and instance.parent_pid == extension_host_pid
+            and instance.is_owner_fresh
+            and instance.ready
         ]
-        if len(matches) == 1:
-            thread_id = matches[0].owned_thread_ids[-1]
-            if _UUID_RE.fullmatch(thread_id):
-                identity["thread_id"] = thread_id
-                identity["session_id"] = thread_id
-    except (OSError, RuntimeError):
-        pass
-    return identity
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if extension_host_pid <= 1 or len(matches) != 1:
+        return None
+    return matches[0], target
 
 
 def _current_chat_provider(card: dict[str, Any] | None = None) -> str:

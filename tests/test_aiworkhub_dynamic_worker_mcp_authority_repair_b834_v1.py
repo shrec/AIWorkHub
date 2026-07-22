@@ -411,7 +411,9 @@ def test_cache_hit_call_does_not_satisfy_the_live_call_gate(
     # Only the first (live, non-cached) call counts toward the gate.
     assert verification["live_source_graph_calls"] == 1
     # Source Graph is the sole authority since B849 -- never legacy/shadow.
-    assert verification["authority_index_identity"] == ["source_graph:canonical:sole_authority"]
+    assert verification["authority_index_identity"] == [
+        f"source_graph:canonical:sole_authority:{authority}"
+    ]
 
 
 def test_process_launcher_live_call_gate_rejects_a_cache_only_ledger(tmp_path: Path) -> None:

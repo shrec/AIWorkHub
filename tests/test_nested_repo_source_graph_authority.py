@@ -91,7 +91,8 @@ def test_project_context_uses_nested_repo_authority_and_rebased_targets(tmp_path
     }
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
     assert payload["repo_identity"]["scope_root"] == "tools/geoai-task-mcp"
-    assert payload["source_graph"]["targets"][0] == "src/aiworkhub/project_context.py"
+    assert set(payload["source_graph"]) == {"mode"}
+    assert result.worker_source_graph_targets[0] == "src/aiworkhub/project_context.py"
 
 
 def test_root_repo_task_stays_on_outer_root(tmp_path) -> None:

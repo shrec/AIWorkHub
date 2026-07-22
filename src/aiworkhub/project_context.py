@@ -46,6 +46,8 @@ class ProjectContextError(RuntimeError):
 class ProjectContextResult:
     prompt_bundle: str
     metadata: dict[str, Any]
+    worker_source_graph_targets: tuple[str, ...] = ()
+    worker_session_topic: str = ""
 
 
 def _sha256_text(value: str) -> str:
@@ -722,7 +724,6 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         prompt_payload["task_context_policy"] = policy
     prompt_payload["source_graph"] = {
         "mode": contract["source_graph"]["mode"],
-        "targets": contract["source_graph"]["targets"],
     }
     prompt_payload["repo_identity"] = {
         "scope_root": (
@@ -834,7 +835,12 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             for section in sections
         ],
     }
-    return ProjectContextResult(prompt_bundle=bundle, metadata=metadata)
+    return ProjectContextResult(
+        prompt_bundle=bundle,
+        metadata=metadata,
+        worker_source_graph_targets=tuple(contract["source_graph"]["targets"]),
+        worker_session_topic=contract["session"]["topic"],
+    )
 
 
 __all__ = [

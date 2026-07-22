@@ -203,7 +203,11 @@ def _run_isolated(tmp_path: Path, driver_src: str) -> dict:
     proc = subprocess.run(
         [sys.executable, str(driver_path)],
         cwd=str(import_root),
-        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(import_root)},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(import_root),
+            "AIWORKHUB_REPO_ROOT": str(repo),
+        },
         capture_output=True,
         text=True,
         timeout=60,

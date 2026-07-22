@@ -8,7 +8,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.16";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.17";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -315,6 +315,7 @@ function defaultCoordinatorTargets(repoInfo) {
     repo_id: repoInfo.repoId,
     window_id: WINDOW_SCOPE_ID,
     claim_episode: activeClaimEpisode,
+    extension_host_pid: process.pid,
     updated_at: new Date().toISOString(),
     selected_provider: "codex",
     targets: {
@@ -348,6 +349,23 @@ function readCoordinatorTargets(repoInfo) {
   }
 }
 
+function refreshCoordinatorRouteOwnership(repoInfo) {
+  const next = readCoordinatorTargets(repoInfo);
+  next.repo_id = repoInfo.repoId;
+  next.window_id = WINDOW_SCOPE_ID;
+  next.claim_episode = activeClaimEpisode;
+  next.extension_host_pid = process.pid;
+  next.updated_at = new Date().toISOString();
+  const defaults = defaultCoordinatorTargets(repoInfo);
+  for (const provider of ["codex", "claude"]) {
+    const target = { ...defaults.targets[provider], ...((next.targets || {})[provider] || {}) };
+    target.route = { ...defaults.targets[provider].route };
+    next.targets = { ...(next.targets || {}), [provider]: target };
+  }
+  atomicWriteJson(routeStatePath(repoInfo.root), next);
+  return next;
+}
+
 function setCoordinatorTarget(provider) {
   if (!TARGET_PROVIDERS.includes(provider)) {
     return null;
@@ -358,6 +376,7 @@ function setCoordinatorTarget(provider) {
   next.repo_id = repoInfo.repoId;
   next.window_id = WINDOW_SCOPE_ID;
   next.claim_episode = activeClaimEpisode;
+  next.extension_host_pid = process.pid;
   next.updated_at = new Date().toISOString();
   atomicWriteJson(routeStatePath(repoInfo.root), next);
   return next;
@@ -819,7 +838,11 @@ function shouldRepairCodexMuxSetting(currentValue) {
   const current = String(currentValue || "").trim();
   if (!current) return true;
   if (current.includes("geoai-app-server-mux")) return true;
-  if (current.includes("aiworkhub-app-server-mux") && !fs.existsSync(current)) return true;
+  // Any AIWorkHub-owned mux path is managed by this extension. The exact
+  // current-version path is handled by ensureCodexMuxConfigured before this
+  // helper is called; reaching here means it is stale and must be replaced,
+  // even when the old extension directory still exists on disk.
+  if (current.includes("aiworkhub-app-server-mux")) return true;
   return !fs.existsSync(current);
 }
 
@@ -876,6 +899,13 @@ function getMcpClient(context) {
     activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
     activeRepoIdentity = identity;
     activeRepoLabel = displayLabel;
+    // Manifest identity is enough to persist routing ownership. The Python
+    // child remains the sole authority for DB/storage readiness, but waiting
+    // for a dashboard snapshot here would leave callbacks unbound during
+    // startup -- exactly when the dispatcher needs this window identity.
+    if (REPO_ID_RE.test(identity.repoId)) {
+      refreshCoordinatorRouteOwnership(identity);
+    }
     mcpClient = new McpStdioClient(root, outputChannel, identity, activeClaimEpisode);
   } else {
     activeRepoIdentity = identity;
@@ -1959,6 +1989,7 @@ module.exports = {
     pushSnapshot,
     pushSnapshotNoRetry,
     sanitizeErrorMessage,
+    shouldRepairCodexMuxSetting,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,

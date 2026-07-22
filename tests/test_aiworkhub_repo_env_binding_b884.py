@@ -46,7 +46,7 @@ def test_callback_bridge_uses_same_canonical_repo_binding(tmp_path, monkeypatch)
 
     # CALLBACK_CWD is computed at import time; reload proves new bridge
     # processes bind to the canonical root instead of a stale legacy alias.
-    module = importlib.reload(callback_bridge)
+    module = importlib.reload(importlib.import_module("aiworkhub.callback_bridge"))
     assert module.CALLBACK_CWD == str(real.resolve())
 
 
@@ -60,7 +60,7 @@ def test_callback_bridge_refuses_mismatched_legacy_binding(tmp_path, monkeypatch
     monkeypatch.setenv("AIWORKHUB_REPO", str(legacy))
 
     with pytest.raises(RuntimeError, match="repo_root_env_mismatch"):
-        importlib.reload(callback_bridge)
+        importlib.reload(importlib.import_module("aiworkhub.callback_bridge"))
 
     monkeypatch.setenv("AIWORKHUB_REPO", str(canonical))
-    importlib.reload(callback_bridge)
+    importlib.reload(importlib.import_module("aiworkhub.callback_bridge"))

@@ -80,7 +80,7 @@ class FakeChild extends EventEmitter {
       }
     } else if (tool === "aiworkhub_dashboard_health") {
       this._send({
-        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.16" }) }],
+        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.17" }) }],
       }, message.id);
     } else if (tool === "aiworkhub_dispatcher_ensure_started") {
       this._send({
@@ -126,7 +126,7 @@ function loadExtensionHost(repoRoot) {
     const extension = require(extensionPath);
     const context = {
       extensionUri: { fsPath: path.resolve(__dirname, "..") },
-      extension: { packageJSON: { version: "0.6.16" } },
+      extension: { packageJSON: { version: "0.6.17" } },
       subscriptions: [],
       workspaceState: { update: () => {}, get: () => undefined },
     };
@@ -179,6 +179,21 @@ async function snapshotFor(host) {
   try {
     await hostA.extension.activate(hostA.context);
     await hostB.extension.activate(hostB.context);
+    for (const repoRoot of [repoA, repoB]) {
+      const route = JSON.parse(fs.readFileSync(
+        path.join(repoRoot, ".aiworkhub", "config", "routing", "coordinator-targets.json"),
+        "utf8",
+      ));
+      assert.strictEqual(route.extension_host_pid, process.pid);
+      assert.ok(route.window_id.startsWith("window_"));
+    }
+    const managedOldMux = path.join(tmp, "shrec.aiworkhub-0.6.2", "bin", "aiworkhub-app-server-mux");
+    fs.mkdirSync(path.dirname(managedOldMux), { recursive: true });
+    fs.writeFileSync(managedOldMux, "old");
+    assert.strictEqual(hostA.extension.__testInternals.shouldRepairCodexMuxSetting(managedOldMux), true);
+    const customMux = path.join(tmp, "custom-codex-wrapper");
+    fs.writeFileSync(customMux, "custom");
+    assert.strictEqual(hostA.extension.__testInternals.shouldRepairCodexMuxSetting(customMux), false);
     const firstMessages = [];
     const coalescedView = new hostA.extension.__testInternals.ViewState((message) => firstMessages.push(message));
     const slowFirst = hostA.extension.__testInternals.pushSnapshot(coalescedView);

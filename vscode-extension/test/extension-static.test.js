@@ -142,6 +142,7 @@ assert.ok(deactivateBody.includes("stopDispatcherThenTerminate"));
 assert.ok(ext.includes("defaultCoordinatorTargets"));
 assert.ok(ext.includes("selected_provider"));
 assert.ok(ext.includes("claim_episode"));
+assert.ok(ext.includes("extension_host_pid"));
 assert.ok(ext.includes("thread_id"));
 assert.ok(ext.includes("session_id"));
 assert.ok(ext.includes("callback_required"));

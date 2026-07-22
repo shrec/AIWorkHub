@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import callback_bridge, callback_store, core, task_store  # noqa: E402
+from aiworkhub import app_server_mux  # noqa: E402
 
 
 def _outbox_kwargs(tmp_path: Path, name: str = "outbox") -> dict:
@@ -270,6 +272,38 @@ def test_codex_manager_ancestry_grants_coordinator_capability(monkeypatch):
         True,
         "trusted_codex_manager_route",
     )
+
+
+def test_codex_mux_binding_requires_exact_repo_extension_host(monkeypatch):
+    target = {
+        "repo_id": "repo_window_a",
+        "window_id": "window_a",
+        "extension_host_pid": 4100,
+    }
+    instance = SimpleNamespace(
+        pid=5100,
+        parent_pid=4100,
+        is_owner_fresh=True,
+        ready=True,
+        owned_thread_ids=("5be44029-03da-4683-aae3-c68ecb07b1a4",),
+    )
+    monkeypatch.setattr(core, "read_selected_coordinator_target", lambda _root=None: target)
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
+    resolved = core._repo_bound_codex_mux(5100)
+    assert resolved is not None
+    assert resolved[0] is instance
+
+    foreign = SimpleNamespace(**{**instance.__dict__, "parent_pid": 4200})
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [foreign])
+    assert core._repo_bound_codex_mux(5100) is None
+
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {**target, "extension_host_pid": 0},
+    )
+    assert core._repo_bound_codex_mux(5100) is None
 
 
 def test_claude_manager_wait_and_ack_is_two_phase(tmp_path, monkeypatch):

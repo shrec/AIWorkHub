@@ -330,6 +330,7 @@ class SidebandInstance:
     socket_path: Path
     capability_path: Path
     owned_thread_ids: tuple[str, ...]
+    parent_pid: int = 0
     generation_id: str = ""
     heartbeat_at: float = 0.0
     owner_lease_seconds: float = SIDEBAND_OWNER_LEASE_SECONDS
@@ -376,6 +377,7 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
     socket_path = obj.get("socket_path")
     capability_path = obj.get("capability_path")
     owned = obj.get("owned_thread_ids")
+    parent_pid = obj.get("parent_pid")
     generation_id = obj.get("generation_id")
     heartbeat_at = obj.get("heartbeat_at")
     owner_lease_seconds = obj.get("owner_lease_seconds")
@@ -406,6 +408,7 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         socket_path=Path(socket_path),
         capability_path=Path(capability_path),
         owned_thread_ids=tuple(owned),
+        parent_pid=parent_pid if isinstance(parent_pid, int) and parent_pid > 1 else 0,
         generation_id=generation_id,
         heartbeat_at=float(heartbeat_at),
         owner_lease_seconds=float(owner_lease_seconds),
@@ -648,6 +651,7 @@ class AppServerMux:
         self._capability_token = secrets.token_hex(CAPABILITY_TOKEN_BYTES)
         self._instances_dir = sideband_instances_dir(self._sideband_dir)
         self._pid = os.getpid()
+        self._parent_pid = os.getppid()
         self._pid_start_time = _proc_start_time(self._pid)
         self._instance_id = ""
         self._generation_id = uuid.uuid4().hex
@@ -845,6 +849,7 @@ class AppServerMux:
             "instance_id": self._instance_id,
             "generation_id": self._generation_id,
             "pid": self._pid,
+            "parent_pid": self._parent_pid,
             "pid_start_time": self._pid_start_time,
             "socket_path": str(self._socket_path),
             "capability_path": str(self._capability_path),

@@ -77,7 +77,7 @@ def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch
     assert result["repo"] == str(root)
     assert result["storage"]["ready"] is True
     assert _REPO_ID_RE.match(result["storage"]["repo_id"])
-    assert result["server_version"] == "0.6.16"
+    assert result["server_version"] == "0.6.17"
 
 
 def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):

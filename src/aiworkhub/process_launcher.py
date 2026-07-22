@@ -1110,6 +1110,10 @@ def _worker_mcp_bundle_payload(
 def _worker_mcp_source_graph_targets(
     context_result: project_context.ProjectContextResult | None,
 ) -> list[str]:
+    if context_result is not None:
+        targets = getattr(context_result, "worker_source_graph_targets", ())
+        if isinstance(targets, (list, tuple)) and targets:
+            return [str(t) for t in targets]
     payload = _worker_mcp_bundle_payload(context_result)
     targets = (payload.get("source_graph") or {}).get("targets")
     return [str(t) for t in targets] if isinstance(targets, list) else []
@@ -1119,6 +1123,10 @@ def _worker_mcp_session_topic(
     context_result: project_context.ProjectContextResult | None,
     fallback_topic: str,
 ) -> str:
+    if context_result is not None:
+        topic = getattr(context_result, "worker_session_topic", "")
+        if isinstance(topic, str) and topic.strip():
+            return topic
     payload = _worker_mcp_bundle_payload(context_result)
     topic = (payload.get("session") or {}).get("topic")
     return str(topic) if isinstance(topic, str) and topic.strip() else fallback_topic
