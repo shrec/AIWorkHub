@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import callback_store
+from . import repository_state
 from .app_server_mux import (
     SIDEBAND_REQUEST_DEADLINE_SECONDS as DEFAULT_SIDEBAND_TIMEOUT,
     SIDEBAND_RESPONSE_MAX_BYTES,
@@ -94,7 +95,28 @@ DEFAULT_APP_SERVER_TIMEOUT = 1800.0
 # site takes an explicit timeout, defaulting to DEFAULT_APP_SERVER_TIMEOUT.
 DEFAULT_LEASE_MARGIN_SECONDS = 300.0
 REDACTED_SUFFIX_LENGTH = 4
-CALLBACK_CWD = str(Path(os.environ.get("AIWORKHUB_REPO", str(Path.cwd()))).expanduser().resolve())
+
+
+def _bound_repo_from_env_or_cwd() -> Path:
+    canonical_raw = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+    legacy_raw = os.environ.get("AIWORKHUB_REPO", "").strip()
+    if canonical_raw:
+        canonical = Path(canonical_raw).expanduser().resolve()
+        if legacy_raw:
+            legacy = Path(legacy_raw).expanduser().resolve()
+            if legacy != canonical:
+                raise RuntimeError(
+                    "repo_root_env_mismatch:"
+                    f"AIWORKHUB_REPO_ROOT={canonical}:"
+                    f"AIWORKHUB_REPO={legacy}"
+                )
+        return canonical
+    if legacy_raw:
+        return Path(legacy_raw).expanduser().resolve()
+    return repository_state.resolve_repository_root(require_manifest=False)
+
+
+CALLBACK_CWD = str(_bound_repo_from_env_or_cwd())
 
 # Env var overrides for CLI-configurable timeout/lease (see main()/
 # resolve_bridge_settings()). CLI flags take precedence over these.
@@ -1556,9 +1578,7 @@ class CallbackBridge:
                 "claude_cli transport requires claude_repo_id and claude_window_id"
             )
         self._callback_store = callback_store
-        self._repo = Path(repo) if repo else Path(
-            os.environ.get("AIWORKHUB_REPO", str(Path.cwd()))
-        ).expanduser().resolve()
+        self._repo = Path(repo).expanduser().resolve() if repo else _bound_repo_from_env_or_cwd()
         self._db_path = Path(db_path) if db_path else self._callback_store.resolve_db_path(self._repo)
         self._state_path = Path(state_path) if state_path else (
             self._repo / "tools" / "aiworkhub" / "logs" / "callback_bridge_state.json"

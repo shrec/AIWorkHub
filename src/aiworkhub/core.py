@@ -894,10 +894,34 @@ class TaskCtlResult:
         }
 
 
+def _resolve_repo_root_env(raw: str) -> Path:
+    return Path(raw).expanduser().resolve()
+
+
 def repo_root() -> Path:
-    env_override = os.environ.get("AIWORKHUB_REPO", "")
-    if env_override:
-        return Path(env_override).expanduser().resolve()
+    """Return the canonical repository binding for this MCP process.
+
+    ``AIWORKHUB_REPO_ROOT`` is the installable extension's canonical binding.
+    ``AIWORKHUB_REPO`` remains a legacy alias for old scripts and tests, but it
+    must never silently override the canonical root.  If both are present and
+    resolve to different directories, fail closed: otherwise a manager/worker
+    opened from repository B can accidentally operate on repository A.
+    """
+    canonical_raw = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+    legacy_raw = os.environ.get("AIWORKHUB_REPO", "").strip()
+    if canonical_raw:
+        canonical = _resolve_repo_root_env(canonical_raw)
+        if legacy_raw:
+            legacy = _resolve_repo_root_env(legacy_raw)
+            if legacy != canonical:
+                raise RuntimeError(
+                    "repo_root_env_mismatch:"
+                    f"AIWORKHUB_REPO_ROOT={canonical}:"
+                    f"AIWORKHUB_REPO={legacy}"
+                )
+        return canonical
+    if legacy_raw:
+        return _resolve_repo_root_env(legacy_raw)
     return repository_state.resolve_repository_root(require_manifest=False)
 
 
