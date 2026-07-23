@@ -367,20 +367,26 @@ function testPlatformPythonResolution(tmp) {
   const findPythonCommand = host.extension.__testInternals.findPythonCommand;
 
   // Windows: prefers the venv's Scripts\python.exe when present.
-  withPlatform("win32", () => {
-    const winVenvPython = path.join(repoRoot, ".venv", "Scripts", "python.exe");
-    withExistsSyncStub(new Set([winVenvPython]), () => {
-      const resolved = findPythonCommand(repoRoot);
-      assert.strictEqual(resolved.command, winVenvPython);
-      assert.deepStrictEqual(resolved.argsPrefix, []);
+  const originalSpawnSync = childProcess.spawnSync;
+  childProcess.spawnSync = () => ({ status: 0, stderr: "", signal: null });
+  try {
+    withPlatform("win32", () => {
+      const winVenvPython = path.join(repoRoot, ".venv", "Scripts", "python.exe");
+      withExistsSyncStub(new Set([winVenvPython]), () => {
+        const resolved = findPythonCommand(repoRoot);
+        assert.strictEqual(resolved.command, winVenvPython);
+        assert.deepStrictEqual(resolved.argsPrefix, []);
+      });
+      // No venv present: deterministic `py -3` fallback, never a bare `python`.
+      withExistsSyncStub(new Set(), () => {
+        const resolved = findPythonCommand(repoRoot);
+        assert.strictEqual(resolved.command, "py");
+        assert.deepStrictEqual(resolved.argsPrefix, ["-3"]);
+      });
     });
-    // No venv present: deterministic `py -3` fallback, never a bare `python`.
-    withExistsSyncStub(new Set(), () => {
-      const resolved = findPythonCommand(repoRoot);
-      assert.strictEqual(resolved.command, "py");
-      assert.deepStrictEqual(resolved.argsPrefix, ["-3"]);
-    });
-  });
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+  }
 
   // macOS and Linux share the same POSIX venv layout and fallback.
   for (const platform of ["darwin", "linux"]) {
