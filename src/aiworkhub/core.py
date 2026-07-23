@@ -26,6 +26,7 @@ from . import repository_state
 from . import task_store
 from . import callback_store
 from . import task_plan
+from . import dependency_autolaunch
 
 
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("AIWORKHUB_TIMEOUT", "60"))
@@ -224,28 +225,86 @@ def _codex_manager_identity() -> dict[str, str] | None:
     return identity
 
 
+WINDOW_ROUTE_DIR_REL = Path("config") / "routing" / "windows"
+
+
+def _window_route_dir(root: Path | None = None) -> Path:
+    return (root or repo_root()) / ".aiworkhub" / WINDOW_ROUTE_DIR_REL
+
+
+def _read_live_window_route_records(root: Path | None = None) -> list[dict[str, Any]]:
+    """Enumerate non-expired per-window routing records for this repo.
+
+    Each VS Code window persists its own routing authority at
+    ``.aiworkhub/config/routing/windows/<window_id>.json`` instead of the
+    single shared last-writer-wins ``coordinator-targets.json``, so opening a
+    second window for the same repo can never silently steal a first
+    window's active route. Expired leases and malformed records are skipped
+    rather than treated as candidates.
+    """
+    directory = _window_route_dir(root)
+    records: list[dict[str, Any]] = []
+    try:
+        entries = sorted(directory.glob("*.json"))
+    except OSError:
+        return records
+    now = datetime.now(timezone.utc)
+    for entry in entries:
+        try:
+            payload = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        lease_expires_at = str(payload.get("lease_expires_at") or "").strip()
+        try:
+            expires = datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= now:
+            continue
+        records.append(payload)
+    return records
+
+
 def _repo_bound_codex_mux(mux_pid: int) -> tuple[Any, dict[str, Any]] | None:
-    """Resolve one mux only through this repo's extension-host ownership."""
+    """Resolve one mux only through a live, non-expired per-window route
+    record bound to both this repo_id and the exact mux parent PID.
+
+    Fails closed (returns ``None``) on zero matching window records and on
+    ambiguity (more than one live window record claiming the same mux
+    parent PID) -- it never falls back to guessing among candidates.
+    """
     try:
         from . import app_server_mux
 
-        target = read_selected_coordinator_target(repo_root())
-        extension_host_pid = int(target.get("extension_host_pid") or 0)
-        matches = [
-            instance
-            for instance in app_server_mux.list_live_sideband_instances(
-                app_server_mux.default_sideband_dir()
-            )
-            if instance.pid == mux_pid
-            and instance.parent_pid == extension_host_pid
-            and instance.is_owner_fresh
-            and instance.ready
-        ]
-    except (OSError, RuntimeError, TypeError, ValueError):
+        root = repo_root()
+        repo_id = task_store.storage_readiness(root).repo_id
+        instances = app_server_mux.list_live_sideband_instances(app_server_mux.default_sideband_dir())
+        matches: list[tuple[Any, dict[str, Any]]] = []
+        for record in _read_live_window_route_records(root):
+            if str(record.get("repo_id") or "") != repo_id:
+                continue
+            extension_host_pid = int(record.get("extension_host_pid") or 0)
+            if extension_host_pid <= 1:
+                continue
+            mux_hits = [
+                instance
+                for instance in instances
+                if instance.pid == mux_pid
+                and instance.parent_pid == extension_host_pid
+                and instance.is_owner_fresh
+                and instance.ready
+            ]
+            if len(mux_hits) == 1:
+                matches.append((mux_hits[0], record))
+    except (OSError, RuntimeError, TypeError, ValueError, task_store.TaskStoreError):
         return None
-    if extension_host_pid <= 1 or len(matches) != 1:
+    if len(matches) != 1:
         return None
-    return matches[0], target
+    return matches[0]
 
 
 def _current_chat_provider(card: dict[str, Any] | None = None) -> str:
@@ -2195,21 +2254,15 @@ def mark_review(task_id: str, runner: str | None = None, topic: str | None = Non
                 now,
             ),
         )
+        # The task's persisted origin_thread_id is immutable: it identifies
+        # the chat that authored/owns the task, never the chat that happens
+        # to be reviewing it. Overwriting it with the reviewing manager's own
+        # session let a second window/manager silently steal callback
+        # ownership of a task it did not create.
         origin_thread_id = callback_store.read_origin_thread(conn, task_id)
         if not origin_thread_id:
             origin_thread_id = str(card.get("origin_thread_id") or "").strip()
         callback_provider = _current_chat_provider(card)
-        claude_route = _claude_manager_identity() if callback_provider == "claude" else None
-        if claude_route is not None:
-            # The reviewing Claude manager's live session is the callback
-            # authority. Repair a legacy/missing origin that may have been
-            # stamped by the task authoring chat before provider-aware
-            # routing existed.
-            origin_thread_id = claude_route["session_id"]
-            conn.execute(
-                "UPDATE tasks SET origin_thread_id=? WHERE task_id=?",
-                (origin_thread_id, task_id),
-            )
         callback_enqueued = callback_store.enqueue_callback(
             conn,
             task_id,
@@ -2273,7 +2326,11 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         conn.close()
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["dependency_autolaunch"] = dependency_autolaunch.reconcile_after_accept(
+        repo_root(), task_id, claim_start_exact
+    )
+    return result
 
 
 def reject_review(task_id: str, reason: str, topic: str | None = None) -> dict[str, Any]:
@@ -2402,17 +2459,13 @@ def release_launch(
                 now,
             ),
         )
+        # Immutable task origin -- see the matching comment in the review
+        # transition above. The releasing manager's own session must never
+        # overwrite the task's persisted callback owner.
         origin_thread_id = callback_store.read_origin_thread(conn, task_id)
         if not origin_thread_id:
             origin_thread_id = str(card.get("origin_thread_id") or "").strip()
         callback_provider = _current_chat_provider(card)
-        claude_route = _claude_manager_identity() if callback_provider == "claude" else None
-        if claude_route is not None:
-            origin_thread_id = claude_route["session_id"]
-            conn.execute(
-                "UPDATE tasks SET origin_thread_id=? WHERE task_id=?",
-                (origin_thread_id, task_id),
-            )
         callback_enqueued = callback_store.enqueue_callback(
             conn,
             task_id,
@@ -3258,4 +3311,95 @@ def dispatcher_stop() -> dict[str, Any]:
     root = repo_root()
     bridge = _callback_bridge_module()
     stopped = bridge.stop_dispatcher(root)
+    return {"ok": True, "stopped": stopped, "repo": str(root)}
+
+
+# ---------------------------------------------------------------------------
+# 0.6.30: Source Graph automatic indexing lifecycle (repo-bound, one daemon
+# per canonical repository -- see source_graph_daemon.py). Mirrors the
+# dispatcher_ensure_started/health/stop shape above.
+# ---------------------------------------------------------------------------
+
+_SOURCE_GRAPH_REFRESH_SECONDS_ENV = "AIWORKHUB_SOURCE_GRAPH_REFRESH_SECONDS"
+
+
+def _source_graph_daemon_module():
+    from . import source_graph_daemon
+
+    return source_graph_daemon
+
+
+def _configured_source_graph_refresh_seconds():
+    module = _source_graph_daemon_module()
+    raw = os.environ.get(_SOURCE_GRAPH_REFRESH_SECONDS_ENV, "").strip()
+    if not raw:
+        return module.DEFAULT_REFRESH_INTERVAL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        return module.DEFAULT_REFRESH_INTERVAL_SECONDS
+
+
+def source_graph_ensure_started() -> dict[str, Any]:
+    """Idempotently ensure exactly one Source Graph indexing daemon is
+    running for the active repository. Safe to call repeatedly (InitRepo,
+    activation, tab-deserialization, reload) -- never starts a second
+    thread and never fabricates a running daemon for an uninitialized
+    repository."""
+    root = repo_root()
+    readiness = task_store.storage_readiness(root)
+    if not readiness.ready:
+        return {
+            "ok": True,
+            "status": "uninitialized",
+            "daemon_started": False,
+            "reason": readiness.reason,
+            "repo": str(root),
+        }
+    module = _source_graph_daemon_module()
+    daemon = module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
+    health = daemon.health()
+    return {
+        "ok": True,
+        "status": "started" if health.get("running") else "start_failed",
+        "daemon_started": bool(health.get("running")),
+        "repo": str(root),
+        **health,
+    }
+
+
+def source_graph_health() -> dict[str, Any]:
+    """READ-ONLY: Source Graph indexing daemon health for the active
+    repository (indexing/ready/degraded, last report/error/time)."""
+    root = repo_root()
+    return _source_graph_daemon_module().daemon_health(root)
+
+
+def source_graph_refresh_now() -> dict[str, Any]:
+    """Force one bounded incremental (or first-ever full) build now,
+    non-overlapping with the periodic loop. Starts the daemon first if it
+    is not registered yet, but only for an already-initialized repository."""
+    root = repo_root()
+    readiness = task_store.storage_readiness(root)
+    if not readiness.ready:
+        return {
+            "ok": True,
+            "status": "uninitialized",
+            "triggered": False,
+            "reason": readiness.reason,
+            "repo": str(root),
+        }
+    module = _source_graph_daemon_module()
+    daemon = module.get_daemon(root)
+    if daemon is None:
+        daemon = module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
+    return daemon.refresh_now()
+
+
+def source_graph_stop() -> dict[str, Any]:
+    """Stop and unregister the active repository's Source Graph indexing
+    daemon, if any. Called on workspace/repository switch and extension
+    deactivation."""
+    root = repo_root()
+    stopped = _source_graph_daemon_module().stop_daemon(root)
     return {"ok": True, "stopped": stopped, "repo": str(root)}

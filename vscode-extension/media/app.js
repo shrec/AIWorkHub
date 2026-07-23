@@ -1132,7 +1132,46 @@ function jsonSummary(value) {
   return redactDisplayText(parsed, 180);
 }
 
+// Claude CLI --output-format stream-json wraps each provider-level SDK event
+// as {type:"stream_event", event:{type:"content_block_delta", delta:{...}}}.
+// delta.type "signature_delta" carries an opaque cryptographic signature over
+// prior "thinking" content -- internal protocol bookkeeping a human never
+// reads -- so callers must treat it as supported, ignorable metadata, never
+// as an unrecognized shape. delta.type "text_delta" carries user-visible
+// assistant text and must keep rendering normally.
+function claudeStreamContentBlockDelta(event) {
+  if (!event || typeof event !== "object" || event.type !== "stream_event") {
+    return null;
+  }
+  const inner = event.event && typeof event.event === "object" ? event.event : null;
+  if (!inner || inner.type !== "content_block_delta") {
+    return null;
+  }
+  return inner.delta && typeof inner.delta === "object" ? inner.delta : null;
+}
+
 function timelineEventFromObject(event, rawLine) {
+  const streamDelta = claudeStreamContentBlockDelta(event);
+  if (streamDelta && streamDelta.type === "signature_delta") {
+    // Internal protocol metadata -- silently dropped from the human-readable
+    // feed. Returning null (not a placeholder row) keeps the signature
+    // payload out of every rendered surface, including the per-row "Raw
+    // event" details; the full unredacted provider stream is still available
+    // behind the existing top-level "Raw provider output" details affordance
+    // (see appendLiveOutputText/detailLiveOutputRawContent).
+    return null;
+  }
+  if (streamDelta && streamDelta.type === "text_delta") {
+    return {
+      kind: "event",
+      title: "Text",
+      label: "text delta",
+      state: "running",
+      message: redactDisplayText(firstText(streamDelta.text), 180) || "(empty text delta)",
+      metrics: [],
+      raw: safeRawEvent(rawLine),
+    };
+  }
   const nestedResult = parseNestedJson(event.result);
   if (nestedResult && typeof nestedResult === "object" && !Array.isArray(nestedResult)) {
     event = {
@@ -1183,7 +1222,10 @@ function timelineEventsFromText(decoded) {
             continue;
           }
           seenJsonLines.add(key);
-          events.push(timelineEventFromObject(parsedEvent, parsedEvent));
+          const timelineEvent = timelineEventFromObject(parsedEvent, parsedEvent);
+          if (timelineEvent) {
+            events.push(timelineEvent);
+          }
         }
         continue;
       }

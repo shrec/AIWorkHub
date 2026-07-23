@@ -274,12 +274,35 @@ def test_codex_manager_ancestry_grants_coordinator_capability(monkeypatch):
     )
 
 
-def test_codex_mux_binding_requires_exact_repo_extension_host(monkeypatch):
-    target = {
-        "repo_id": "repo_window_a",
-        "window_id": "window_a",
-        "extension_host_pid": 4100,
+def _write_window_route_record(root, window_id, repo_id, extension_host_pid, *, expired=False):
+    from datetime import datetime, timedelta, timezone
+
+    directory = root / ".aiworkhub" / "config" / "routing" / "windows"
+    directory.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    lease_expires_at = now - timedelta(minutes=1) if expired else now + timedelta(minutes=15)
+    record = {
+        "schema_id": "aiworkhub.window_route.v1",
+        "repo_id": repo_id,
+        "window_id": window_id,
+        "extension_host_pid": extension_host_pid,
+        "selected_provider": "codex",
+        "targets": {},
+        "updated_at": now.isoformat(),
+        "lease_expires_at": lease_expires_at.isoformat(),
     }
+    (directory / f"{window_id}.json").write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
+def test_codex_mux_binding_requires_exact_repo_extension_host(tmp_path, monkeypatch):
+    root = tmp_path / "repo_window_a"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    repo_id = task_store.storage_readiness(root).repo_id
+    _write_window_route_record(root, "window_a", repo_id, 4100)
+
     instance = SimpleNamespace(
         pid=5100,
         parent_pid=4100,
@@ -287,22 +310,121 @@ def test_codex_mux_binding_requires_exact_repo_extension_host(monkeypatch):
         ready=True,
         owned_thread_ids=("5be44029-03da-4683-aae3-c68ecb07b1a4",),
     )
-    monkeypatch.setattr(core, "read_selected_coordinator_target", lambda _root=None: target)
     monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
     monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
     resolved = core._repo_bound_codex_mux(5100)
     assert resolved is not None
     assert resolved[0] is instance
 
+    # A different extension-host PID (foreign parent) never matches this
+    # window's record -- fails closed, not a guess.
     foreign = SimpleNamespace(**{**instance.__dict__, "parent_pid": 4200})
     monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [foreign])
     assert core._repo_bound_codex_mux(5100) is None
 
+    # Zero live window records for this repo -> fail closed.
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
+    for entry in (root / ".aiworkhub" / "config" / "routing" / "windows").glob("*.json"):
+        entry.unlink()
+    assert core._repo_bound_codex_mux(5100) is None
+
+
+def test_two_repo_window_records_never_cross_route(tmp_path, monkeypatch):
+    """Two distinct repo/window routing records must never resolve to each
+    other's mux -- this is the exact cross-routing regression the per-window
+    record file replaced the single last-writer-wins coordinator-targets.json
+    to prevent."""
+    root_a = tmp_path / "repo_a"
+    root_a.mkdir()
+    assert task_store.initialize_repository(root_a)["ok"]
+    repo_id_a = task_store.storage_readiness(root_a).repo_id
+    _write_window_route_record(root_a, "window_a", repo_id_a, 4100)
+
+    root_b = tmp_path / "repo_b"
+    root_b.mkdir()
+    assert task_store.initialize_repository(root_b)["ok"]
+    repo_id_b = task_store.storage_readiness(root_b).repo_id
+    _write_window_route_record(root_b, "window_b", repo_id_b, 4200)
+
+    instance_a = SimpleNamespace(pid=5100, parent_pid=4100, is_owner_fresh=True, ready=True, owned_thread_ids=())
+    instance_b = SimpleNamespace(pid=5200, parent_pid=4200, is_owner_fresh=True, ready=True, owned_thread_ids=())
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
     monkeypatch.setattr(
-        core,
-        "read_selected_coordinator_target",
-        lambda _root=None: {**target, "extension_host_pid": 0},
+        app_server_mux, "list_live_sideband_instances", lambda _root: [instance_a, instance_b]
     )
+
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root_a))
+    resolved_a = core._repo_bound_codex_mux(5100)
+    assert resolved_a is not None and resolved_a[0] is instance_a
+    # Repo A's manager route discovery must never resolve repo B's mux, even
+    # though both instances are visible on the host.
+    assert core._repo_bound_codex_mux(5200) is None
+
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root_b))
+    resolved_b = core._repo_bound_codex_mux(5200)
+    assert resolved_b is not None and resolved_b[0] is instance_b
+    assert core._repo_bound_codex_mux(5100) is None
+
+
+def test_expired_window_route_record_is_not_a_candidate(tmp_path, monkeypatch):
+    root = tmp_path / "repo_expired"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    repo_id = task_store.storage_readiness(root).repo_id
+    _write_window_route_record(root, "window_stale", repo_id, 4100, expired=True)
+
+    instance = SimpleNamespace(pid=5100, parent_pid=4100, is_owner_fresh=True, ready=True, owned_thread_ids=())
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
+    assert core._repo_bound_codex_mux(5100) is None
+
+
+def test_ambiguous_window_route_records_fail_closed(tmp_path, monkeypatch):
+    """Two live window records for the same repo both claiming the same
+    extension-host PID is ambiguous -- never pick one by guessing."""
+    root = tmp_path / "repo_ambiguous"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    repo_id = task_store.storage_readiness(root).repo_id
+    _write_window_route_record(root, "window_1", repo_id, 4100)
+    _write_window_route_record(root, "window_2", repo_id, 4100)
+
+    instance = SimpleNamespace(pid=5100, parent_pid=4100, is_owner_fresh=True, ready=True, owned_thread_ids=())
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
+    assert core._repo_bound_codex_mux(5100) is None
+
+
+def test_legacy_coordinator_targets_file_cannot_become_active_authority(tmp_path, monkeypatch):
+    """A stray/foreign legacy coordinator-targets.json must never grant mux
+    resolution on its own -- only a live per-window record does."""
+    root = tmp_path / "repo_legacy_only"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    repo_id = task_store.storage_readiness(root).repo_id
+
+    legacy_path = root / ".aiworkhub" / "config" / "routing" / "coordinator-targets.json"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "schema_id": "aiworkhub.coordinator_targets.v1",
+                "repo_id": repo_id,
+                "selected_provider": "codex",
+                "extension_host_pid": 4100,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    instance = SimpleNamespace(pid=5100, parent_pid=4100, is_owner_fresh=True, ready=True, owned_thread_ids=())
+    monkeypatch.setattr(app_server_mux, "default_sideband_dir", lambda: Path("/unused"))
+    monkeypatch.setattr(app_server_mux, "list_live_sideband_instances", lambda _root: [instance])
+    # No per-window record exists -- the legacy shared file alone must not
+    # resolve a mux, even though it names a matching repo_id/pid.
     assert core._repo_bound_codex_mux(5100) is None
 
 

@@ -224,13 +224,12 @@ def test_health_view_reads_repo_root_env_and_never_calls_build_snapshot(monkeypa
     assert result["authority_flags"]["agent_launch"] is False
 
 
-def test_health_view_falls_back_to_process_local_core_repo_root(tmp_path, monkeypatch):
+def test_health_view_uses_explicit_repo_binding(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     task_store.initialize_repository(repo)
-    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
-    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
-    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: repo)
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(repo))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(repo))
 
     result = dashboard_mcp_app.health_view()
 

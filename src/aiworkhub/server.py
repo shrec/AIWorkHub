@@ -243,6 +243,8 @@ from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
 from . import task_engine
+from . import dependency_autolaunch
+from . import quality_evidence
 
 
 mcp = FastMCP("AIWorkHub MCP")
@@ -464,6 +466,17 @@ def aiworkhub_task_mark_done(task_id: str) -> dict[str, Any]:
     """Write-gated: finalize a reviewed task as done."""
 
     return core.mark_done(task_id=task_id)
+
+
+@mcp.tool()
+def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) -> dict[str, Any]:
+    """MANAGER WRITE: bounded startup reconciliation for dependency-ready children."""
+
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
+    return dependency_autolaunch.reconcile_startup(
+        core.repo_root(), core.claim_start_exact, capacity=capacity
+    )
 
 
 @mcp.tool()
@@ -1065,6 +1078,51 @@ def aiworkhub_dispatcher_stop() -> dict[str, Any]:
     return core.dispatcher_stop()
 
 
+# ---------------------------------------------------------------------------
+# 0.6.30: Source Graph automatic indexing lifecycle. Repo-bound (one daemon
+# per canonical repository, no global cross-repo DB, no legacy AITools).
+# Called by the VS Code extension after every MCP handshake (activation,
+# tab-deserialization, reload) and before child termination/repo switch --
+# same convention as the dispatcher tools above.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def aiworkhub_source_graph_ensure_started() -> dict[str, Any]:
+    """Idempotently ensure exactly one Source Graph indexing daemon is
+    running for the active repository. Safe to call repeatedly (InitRepo,
+    activation, tab-deserialization, reload) -- never starts a second
+    thread and never fabricates a running daemon for an uninitialized
+    repository."""
+
+    return core.source_graph_ensure_started()
+
+
+@mcp.tool()
+def aiworkhub_source_graph_health() -> dict[str, Any]:
+    """READ-ONLY: Source Graph indexing daemon health for the active
+    repository -- indexing/ready/degraded status, last report/error/time."""
+
+    return core.source_graph_health()
+
+
+@mcp.tool()
+def aiworkhub_source_graph_refresh_now() -> dict[str, Any]:
+    """Force one bounded incremental (or first-ever full) Source Graph
+    build now, non-overlapping with the periodic background refresh."""
+
+    return core.source_graph_refresh_now()
+
+
+@mcp.tool()
+def aiworkhub_source_graph_stop() -> dict[str, Any]:
+    """Stop and unregister the active repository's Source Graph indexing
+    daemon, if any. Called on workspace/repository switch and extension
+    deactivation so no cross-repository indexing thread survives."""
+
+    return core.source_graph_stop()
+
+
 @mcp.tool()
 def aiworkhub_claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
     """BLOCKING READ/CLAIM: wait for a callback for this verified Claude
@@ -1080,6 +1138,44 @@ def aiworkhub_claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any
     verified Claude manager session."""
 
     return core.claude_callback_ack(batch_id, lease_id)
+
+
+# ---------------------------------------------------------------------------
+# 0.6.30: Quality Evidence Engine -- read-only detection/profile/evidence
+# tools plus one bounded run tool that only ever executes repo-declared
+# argv-array commands (shell=False). Never installs tools; absence of an
+# optional gate reports not_available, never a silent pass.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def aiworkhub_quality_profile() -> dict[str, Any]:
+    """READ-ONLY: zero-config detected languages/declared/installed tools."""
+
+    return quality_evidence.build_zero_config_profile(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict[str, Any]:
+    """Run repo-declared .aiworkhub/quality.json build/test/lint/typecheck
+    commands (argv arrays only, shell=False). Fails closed on malformed
+    config. Diff/new-code-first: pass ``changed_paths`` to scope evidence."""
+
+    root = core.repo_root()
+    try:
+        checks = quality_evidence.run_declared_checks(root, changed_paths=changed_paths)
+    except quality_evidence.MalformedConfigError as exc:
+        return {"ok": False, "error": str(exc), "schema_id": quality_evidence.SCHEMA_ID}
+    return {"ok": True, "schema_id": quality_evidence.SCHEMA_ID, "checks": [c.to_dict() for c in checks]}
+
+
+@mcp.tool()
+def aiworkhub_quality_evidence_packet(changed_paths: list[str] | None = None) -> dict[str, Any]:
+    """READ-ONLY: full canonical evidence packet -- profile, declared
+    checks, risk-based optional-gate policy metadata (not_available !=
+    passed), and the cross-provider read-only quality_reviewer contract."""
+
+    return quality_evidence.build_evidence_packet(core.repo_root(), changed_paths=changed_paths)
 
 
 def main() -> None:

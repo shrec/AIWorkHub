@@ -48,6 +48,7 @@ KNOWN_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
         "process_lost",
         "required_output_unchanged",
         "blocked",
+        "dependency_blocked",
         "liveness_lost",
     }
 )

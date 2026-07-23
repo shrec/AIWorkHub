@@ -1,0 +1,545 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+# ---------------------------------------------------------------------------
+# 0.6.30 Quality Evidence Engine foundation.
+#
+# Detects repo languages/tools from known manifests/configs using bounded
+# exact paths, builds a zero-config deterministic profile from
+# already-installed/declared commands only, and never installs anything.
+# Every check normalizes into one canonical evidence schema so downstream
+# adapters (SARIF/JUnit/coverage/benchmark/AI-reviewer) and the risk-based
+# optional-gate policy share one shape. Fail-closed on malformed config;
+# commands only ever run as argv arrays (shell=False), never as strings.
+# ---------------------------------------------------------------------------
+
+SCHEMA_ID = "aiworkhub.quality_evidence.v1"
+
+STATUS_PASSED = "passed"
+STATUS_FAILED = "failed"
+STATUS_NOT_AVAILABLE = "not_available"
+STATUS_SKIPPED = "skipped"
+VALID_STATUSES = frozenset({STATUS_PASSED, STATUS_FAILED, STATUS_NOT_AVAILABLE, STATUS_SKIPPED})
+
+CONFIG_RELATIVE_PATH = ".aiworkhub/quality.json"
+MAX_AFFECTED_PATHS = 200
+MAX_SUMMARY_CHARS = 2000
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+
+# Bounded, exact manifest/config paths used for language/tool detection.
+# No globbing, no directory walks -- every entry is an exact repo-relative path.
+_LANGUAGE_MANIFESTS: dict[str, tuple[str, ...]] = {
+    "python": ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"),
+    "node": ("package.json",),
+    "rust": ("Cargo.toml",),
+    "go": ("go.mod",),
+    "java": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    "c_cpp": ("CMakeLists.txt", "Makefile"),
+    "dotnet": tuple(),  # detected via extension-free glob is out of scope; exact only
+}
+
+# Bounded, exact tool-config paths -- presence implies the tool is "declared"
+# even if the binary itself must still be probed for availability.
+_TOOL_CONFIGS: dict[str, tuple[str, ...]] = {
+    "pytest": ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"),
+    "ruff": ("ruff.toml", ".ruff.toml", "pyproject.toml"),
+    "mypy": ("mypy.ini", ".mypy.ini", "pyproject.toml", "setup.cfg"),
+    "eslint": (".eslintrc.json", ".eslintrc.js", ".eslintrc", "eslint.config.js", "package.json"),
+    "jest": ("jest.config.js", "jest.config.ts", "package.json"),
+    "tsc": ("tsconfig.json",),
+    "cargo": ("Cargo.toml",),
+    "semgrep": (".semgrep.yml", ".semgrep.yaml"),
+    "gitleaks": (".gitleaks.toml",),
+}
+
+# Risk-based policy metadata for optional gates. Absence of the underlying
+# tool/config is reported as not_available -- never counted as a pass.
+OPTIONAL_GATES: dict[str, dict[str, Any]] = {
+    "semgrep": {"category": "static_analysis", "risk_tier": "medium", "blocking_by_default": False},
+    "osv": {"category": "dependency_vulnerability", "risk_tier": "high", "blocking_by_default": False},
+    "gitleaks": {"category": "secret_scan", "risk_tier": "high", "blocking_by_default": False},
+    "codeql": {"category": "static_analysis", "risk_tier": "medium", "blocking_by_default": False},
+    "mutation": {"category": "test_quality", "risk_tier": "low", "blocking_by_default": False},
+    "sanitizer": {"category": "memory_safety", "risk_tier": "high", "blocking_by_default": False},
+    "fuzz": {"category": "robustness", "risk_tier": "medium", "blocking_by_default": False},
+}
+
+
+class MalformedConfigError(ValueError):
+    """Raised when repo-local .aiworkhub/quality.json fails closed."""
+
+
+@dataclass(frozen=True)
+class EvidenceCheck:
+    """One canonical evidence-schema entry."""
+
+    check_id: str
+    kind: str
+    status: str
+    command: tuple[str, ...] = field(default_factory=tuple)
+    duration_seconds: float = 0.0
+    affected_paths: tuple[str, ...] = field(default_factory=tuple)
+    summary: str = ""
+    provenance: str = ""
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in VALID_STATUSES:
+            raise MalformedConfigError(f"invalid status: {self.status!r}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_id": SCHEMA_ID,
+            "check_id": self.check_id,
+            "kind": self.kind,
+            "status": self.status,
+            "command": list(self.command),
+            "command_identity": " ".join(self.command) if self.command else "",
+            "duration_seconds": round(self.duration_seconds, 6),
+            "affected_paths": list(self.affected_paths[:MAX_AFFECTED_PATHS]),
+            "summary": self.summary[:MAX_SUMMARY_CHARS],
+            "provenance": self.provenance,
+            "error": self.error,
+        }
+
+
+def _exact_exists(repo_root: Path, relative: str) -> bool:
+    candidate = repo_root / relative
+    return candidate.is_file()
+
+
+def detect_languages(repo_root: Path | str) -> dict[str, bool]:
+    """Bounded exact-path detection of declared languages. No globbing."""
+
+    root = Path(repo_root)
+    return {
+        lang: any(_exact_exists(root, rel) for rel in manifests)
+        for lang, manifests in _LANGUAGE_MANIFESTS.items()
+        if manifests
+    }
+
+
+def detect_declared_tools(repo_root: Path | str) -> dict[str, bool]:
+    """Bounded exact-path detection of declared tool configs."""
+
+    root = Path(repo_root)
+    return {
+        tool: any(_exact_exists(root, rel) for rel in relatives)
+        for tool, relatives in _TOOL_CONFIGS.items()
+    }
+
+
+def _which(executable: str) -> str | None:
+    return shutil.which(executable)
+
+
+def detect_installed_tools(tools: Iterable[str]) -> dict[str, bool]:
+    """Zero-config probe of already-installed commands. Never installs."""
+
+    return {tool: _which(tool) is not None for tool in tools}
+
+
+def build_zero_config_profile(repo_root: Path | str) -> dict[str, Any]:
+    """Deterministic, zero-config, fast profile from installed/declared state only."""
+
+    root = Path(repo_root)
+    languages = detect_languages(root)
+    declared_tools = detect_declared_tools(root)
+    installed_tools = detect_installed_tools(sorted(declared_tools.keys()))
+    return {
+        "schema_id": SCHEMA_ID,
+        "repo_root": str(root),
+        "languages": languages,
+        "declared_tools": declared_tools,
+        "installed_tools": installed_tools,
+        "runnable_tools": sorted(
+            tool
+            for tool in declared_tools
+            if declared_tools[tool] and installed_tools.get(tool, False)
+        ),
+    }
+
+
+def load_repo_config(repo_root: Path | str) -> dict[str, Any]:
+    """Load repo-local .aiworkhub/quality.json. Fail closed on malformed config."""
+
+    root = Path(repo_root)
+    path = root / CONFIG_RELATIVE_PATH
+    if not path.is_file():
+        return {"checks": []}
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MalformedConfigError(f"unreadable config: {exc}") from exc
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise MalformedConfigError(f"invalid JSON in {CONFIG_RELATIVE_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise MalformedConfigError(f"{CONFIG_RELATIVE_PATH} must be a JSON object")
+    checks = data.get("checks", [])
+    if not isinstance(checks, list):
+        raise MalformedConfigError("'checks' must be a JSON array")
+    for entry in checks:
+        _validate_declared_check(entry)
+    return data
+
+
+def _validate_declared_check(entry: Any) -> None:
+    if not isinstance(entry, dict):
+        raise MalformedConfigError("each declared check must be a JSON object")
+    check_id = entry.get("id")
+    if not isinstance(check_id, str) or not check_id.strip():
+        raise MalformedConfigError("declared check missing non-empty 'id'")
+    kind = entry.get("kind")
+    if kind not in {"build", "test", "lint", "typecheck"}:
+        raise MalformedConfigError(f"declared check {check_id!r} has invalid 'kind': {kind!r}")
+    command = entry.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+        raise MalformedConfigError(
+            f"declared check {check_id!r} 'command' must be a non-empty array of strings (shell=False only)"
+        )
+
+
+def _run_command_array(
+    command: Iterable[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+) -> tuple[str, str, str, float]:
+    """Run one exact argv array, shell=False. Returns (status, stdout, stderr, duration)."""
+
+    argv = list(command)
+    start = time.monotonic()
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        return STATUS_NOT_AVAILABLE, "", "command_not_found", time.monotonic() - start
+    except subprocess.TimeoutExpired:
+        return STATUS_FAILED, "", "timeout", time.monotonic() - start
+    duration = time.monotonic() - start
+    status = STATUS_PASSED if completed.returncode == 0 else STATUS_FAILED
+    return status, completed.stdout, completed.stderr, duration
+
+
+def declared_check_descriptors(
+    repo_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
+) -> list[EvidenceCheck]:
+    """Validated, read-only descriptors for repo-declared checks.
+
+    Loads and validates .aiworkhub/quality.json (fail-closed on malformed
+    config, same as run_declared_checks) but never executes a command --
+    every descriptor is reported as ``skipped`` with the declared argv
+    preserved for display. Only aiworkhub_quality_run_checks/
+    run_declared_checks may actually invoke subprocess.run.
+    """
+
+    root = Path(repo_root)
+    config = load_repo_config(root)
+    affected = tuple(sorted(str(p) for p in (changed_paths or ())))
+    results: list[EvidenceCheck] = []
+    for entry in config.get("checks", []):
+        command = tuple(str(part) for part in entry["command"])
+        results.append(
+            EvidenceCheck(
+                check_id=str(entry["id"]),
+                kind=str(entry["kind"]),
+                status=STATUS_SKIPPED,
+                command=command,
+                affected_paths=affected,
+                summary="declared, not executed (read-only evidence packet)",
+                provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:declared_only",
+            )
+        )
+    return results
+
+
+def run_declared_checks(
+    repo_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
+    timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> list[EvidenceCheck]:
+    """Diff/new-code-first execution of repo-local declared build/test/lint/typecheck commands.
+
+    Fails closed (raises MalformedConfigError) on a malformed config instead
+    of silently skipping or partially running it. Commands only ever run as
+    argv arrays -- never a shell string.
+    """
+
+    root = Path(repo_root)
+    config = load_repo_config(root)
+    affected = tuple(sorted(str(p) for p in (changed_paths or ())))
+    results: list[EvidenceCheck] = []
+    for entry in config.get("checks", []):
+        check_id = str(entry["id"])
+        kind = str(entry["kind"])
+        command = tuple(str(part) for part in entry["command"])
+        status, stdout, stderr, duration = _run_command_array(
+            command, cwd=root, timeout_seconds=timeout_seconds
+        )
+        summary = (stdout or "") + (("\n" + stderr) if stderr else "")
+        results.append(
+            EvidenceCheck(
+                check_id=check_id,
+                kind=kind,
+                status=status,
+                command=command,
+                duration_seconds=duration,
+                affected_paths=affected,
+                summary=summary.strip(),
+                provenance=f"repo_config:{CONFIG_RELATIVE_PATH}",
+                error="" if status != STATUS_NOT_AVAILABLE else stderr,
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Adapters: normalize third-party report formats into EvidenceCheck without
+# requiring the producing tool to exist. Each adapter is a pure function over
+# already-produced report content (never runs anything itself).
+# ---------------------------------------------------------------------------
+
+
+def adapt_sarif(check_id: str, sarif_doc: Mapping[str, Any]) -> EvidenceCheck:
+    runs = sarif_doc.get("runs", []) if isinstance(sarif_doc, Mapping) else []
+    results: list[Any] = []
+    for run in runs if isinstance(runs, list) else []:
+        if isinstance(run, Mapping):
+            run_results = run.get("results", [])
+            if isinstance(run_results, list):
+                results.extend(run_results)
+    affected: list[str] = []
+    for result in results:
+        if not isinstance(result, Mapping):
+            continue
+        for loc in result.get("locations", []) if isinstance(result.get("locations"), list) else []:
+            uri = (
+                loc.get("physicalLocation", {})
+                .get("artifactLocation", {})
+                .get("uri")
+                if isinstance(loc, Mapping)
+                else None
+            )
+            if isinstance(uri, str):
+                affected.append(uri)
+    status = STATUS_FAILED if results else STATUS_PASSED
+    return EvidenceCheck(
+        check_id=check_id,
+        kind="static_analysis",
+        status=status,
+        affected_paths=tuple(dict.fromkeys(affected)),
+        summary=f"{len(results)} SARIF result(s)",
+        provenance="adapter:sarif",
+    )
+
+
+def adapt_junit_xml(check_id: str, junit_text: str) -> EvidenceCheck:
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(junit_text)
+    except ET.ParseError as exc:
+        return EvidenceCheck(
+            check_id=check_id,
+            kind="test",
+            status=STATUS_FAILED,
+            summary=f"malformed JUnit XML: {exc}",
+            provenance="adapter:junit_xml",
+            error=str(exc),
+        )
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    total_failures = 0
+    total_errors = 0
+    total_tests = 0
+    affected: list[str] = []
+    for suite in suites:
+        total_failures += int(suite.attrib.get("failures", 0) or 0)
+        total_errors += int(suite.attrib.get("errors", 0) or 0)
+        total_tests += int(suite.attrib.get("tests", 0) or 0)
+        for case in suite.findall("testcase"):
+            if case.find("failure") is not None or case.find("error") is not None:
+                classname = case.attrib.get("classname", "")
+                if classname:
+                    affected.append(classname)
+    if total_tests == 0:
+        status = STATUS_SKIPPED
+    elif total_failures or total_errors:
+        status = STATUS_FAILED
+    else:
+        status = STATUS_PASSED
+    return EvidenceCheck(
+        check_id=check_id,
+        kind="test",
+        status=status,
+        affected_paths=tuple(dict.fromkeys(affected)),
+        summary=f"{total_tests} test(s), {total_failures} failure(s), {total_errors} error(s)",
+        provenance="adapter:junit_xml",
+    )
+
+
+def adapt_coverage_summary(
+    check_id: str,
+    coverage_doc: Mapping[str, Any],
+    *,
+    min_percent: float = 0.0,
+) -> EvidenceCheck:
+    total = coverage_doc.get("total") if isinstance(coverage_doc, Mapping) else None
+    percent = None
+    if isinstance(total, Mapping):
+        lines = total.get("lines")
+        if isinstance(lines, Mapping):
+            percent = lines.get("pct")
+    if percent is None:
+        return EvidenceCheck(
+            check_id=check_id,
+            kind="coverage",
+            status=STATUS_NOT_AVAILABLE,
+            summary="coverage summary missing total.lines.pct",
+            provenance="adapter:coverage_summary",
+        )
+    try:
+        percent_value = float(percent)
+    except (TypeError, ValueError):
+        return EvidenceCheck(
+            check_id=check_id,
+            kind="coverage",
+            status=STATUS_FAILED,
+            summary=f"non-numeric coverage percent: {percent!r}",
+            provenance="adapter:coverage_summary",
+        )
+    status = STATUS_PASSED if percent_value >= min_percent else STATUS_FAILED
+    return EvidenceCheck(
+        check_id=check_id,
+        kind="coverage",
+        status=status,
+        summary=f"line coverage {percent_value}% (threshold {min_percent}%)",
+        provenance="adapter:coverage_summary",
+    )
+
+
+def adapt_benchmark_json(
+    check_id: str,
+    benchmark_doc: Mapping[str, Any],
+) -> EvidenceCheck:
+    benchmarks = benchmark_doc.get("benchmarks") if isinstance(benchmark_doc, Mapping) else None
+    if not isinstance(benchmarks, list):
+        return EvidenceCheck(
+            check_id=check_id,
+            kind="benchmark",
+            status=STATUS_NOT_AVAILABLE,
+            summary="benchmark JSON missing 'benchmarks' array",
+            provenance="adapter:benchmark_json",
+        )
+    return EvidenceCheck(
+        check_id=check_id,
+        kind="benchmark",
+        status=STATUS_PASSED if benchmarks else STATUS_SKIPPED,
+        summary=f"{len(benchmarks)} benchmark(s) recorded",
+        provenance="adapter:benchmark_json",
+    )
+
+
+def adapt_ai_reviewer_findings(
+    check_id: str,
+    findings: Iterable[Mapping[str, Any]],
+    *,
+    max_findings: int = 50,
+) -> EvidenceCheck:
+    bounded = list(findings)[:max_findings]
+    affected = tuple(
+        dict.fromkeys(str(f.get("file")) for f in bounded if isinstance(f, Mapping) and f.get("file"))
+    )
+    status = STATUS_FAILED if bounded else STATUS_PASSED
+    return EvidenceCheck(
+        check_id=check_id,
+        kind="ai_review",
+        status=status,
+        affected_paths=affected,
+        summary=f"{len(bounded)} bounded AI reviewer finding(s)",
+        provenance="adapter:ai_reviewer_findings",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional-gate policy metadata: risk-based, read-only. Absence of a tool is
+# not_available, never a silent pass and never a hard failure by default.
+# ---------------------------------------------------------------------------
+
+
+def optional_gate_status(repo_root: Path | str, gate: str) -> EvidenceCheck:
+    if gate not in OPTIONAL_GATES:
+        raise MalformedConfigError(f"unknown optional gate: {gate!r}")
+    binary_name = "osv-scanner" if gate == "osv" else gate
+    available = _which(binary_name) is not None
+    meta = OPTIONAL_GATES[gate]
+    return EvidenceCheck(
+        check_id=f"optional_gate:{gate}",
+        kind=str(meta["category"]),
+        status=STATUS_NOT_AVAILABLE if not available else STATUS_SKIPPED,
+        summary=f"risk_tier={meta['risk_tier']} blocking_by_default={meta['blocking_by_default']}",
+        provenance=f"policy:optional_gate:{gate}",
+    )
+
+
+def quality_reviewer_contract() -> dict[str, Any]:
+    """Cross-provider read-only quality_reviewer contract descriptor.
+
+    Represented in evidence only -- this contract can never mutate the repo.
+    """
+
+    return {
+        "schema_id": SCHEMA_ID,
+        "role": "quality_reviewer",
+        "read_only": True,
+        "can_mutate_repo": False,
+        "cross_provider": True,
+    }
+
+
+def build_evidence_packet(
+    repo_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Assemble the full canonical evidence packet: profile + declared checks
+    + optional-gate policy metadata + the read-only reviewer contract."""
+
+    root = Path(repo_root)
+    try:
+        declared_checks = [
+            c.to_dict() for c in declared_check_descriptors(root, changed_paths=changed_paths)
+        ]
+        config_error = ""
+    except MalformedConfigError as exc:
+        declared_checks = []
+        config_error = str(exc)
+    optional_gates = [
+        optional_gate_status(root, gate).to_dict() for gate in sorted(OPTIONAL_GATES.keys())
+    ]
+    return {
+        "schema_id": SCHEMA_ID,
+        "repo_root": str(root),
+        "profile": build_zero_config_profile(root),
+        "declared_checks": declared_checks,
+        "config_error": config_error,
+        "optional_gates": optional_gates,
+        "quality_reviewer_contract": quality_reviewer_contract(),
+    }

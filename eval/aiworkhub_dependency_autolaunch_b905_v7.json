@@ -1,0 +1,26 @@
+{
+  "schema_id": "aiworkhub.task_eval.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_DEPENDENCY_AUTOLAUNCH_B905_V7",
+  "outcome_schema_id": "aiworkhub.dependency_autolaunch_outcome.v1",
+  "implementation": {
+    "hook": "core.mark_done -> dependency_autolaunch.reconcile_after_accept(repo_root(), task_id, claim_start_exact)",
+    "startup_reconcile_tool": "aiworkhub_task_dependency_autolaunch_reconcile",
+    "canonical_launch_path": "core.claim_start_exact"
+  },
+  "coverage": [
+    "no_dependents",
+    "chain",
+    "fan_in",
+    "fan_out",
+    "diamond",
+    "duplicate_restart_exact_once",
+    "concurrent_exact_once",
+    "capacity_delay_retry",
+    "failed_cancelled_dependency_blocked",
+    "startup_recovery",
+    "adapter_families",
+    "manual_launch_preservation",
+    "stable_outcome_schema",
+    "two_repository_isolation"
+  ]
+}

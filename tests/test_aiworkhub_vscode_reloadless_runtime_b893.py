@@ -142,7 +142,8 @@ def test_platform_python_resolution_branches_present() -> None:
     for marker in [
         'path.join(root, ".venv", "Scripts", "python.exe")',
         'path.join(root, ".venv", "bin", "python3")',
-        '{ command: "py", argsPrefix: ["-3"] }',
+        'command: "py"',
+        'argsPrefix: ["-3"]',
         '{ command: "python3", argsPrefix: [] }',
         'process.platform === "win32"',
     ]:

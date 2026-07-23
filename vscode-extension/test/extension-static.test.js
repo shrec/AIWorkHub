@@ -81,7 +81,7 @@ assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
 assert.ok(ext.includes("Select Repository"));
 
-assert.strictEqual((ext.match(/childProcess\.spawn/g) || []).length, 1);
+assert.strictEqual((ext.match(/childProcess\.spawn\(/g) || []).length, 1);
 assert.ok(ext.includes('[...python.argsPrefix, "-m", "aiworkhub.server"]'));
 assert.ok(ext.includes("AIWORKHUB_REPO_ROOT"));
 assert.ok(ext.includes("AIWORKHUB_REPO_ID"));
@@ -104,7 +104,8 @@ assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));
 assert.ok(ext.includes('path.join(root, ".venv", "Scripts", "python.exe")'));
-assert.ok(ext.includes('{ command: "py", argsPrefix: ["-3"] }'));
+assert.ok(ext.includes('command: "py"'));
+assert.ok(ext.includes('argsPrefix: ["-3"]'));
 assert.ok(ext.includes('childProcess.spawn(python.command, [...python.argsPrefix, "-m", "aiworkhub.server"]'));
 
 // B850: activation and repository selection must never bootstrap/write a

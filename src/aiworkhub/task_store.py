@@ -311,7 +311,10 @@ def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -
             raise InitializationRefusedError(f"auxiliary_db_quick_check_failed:{db_id}:{qc}")
         authority = entry.setdefault("authority", {})
         changed = db_id in migrated or db_id in initialized
-        if not authority.get("canonical_active") or authority.get("state") != "canonical_active":
+        # Repository-local AI tools are first-class canonical authorities.
+        # Leaving these stores in shadow makes Source Graph, Session Manager,
+        # AI Memory and KB unusable to both managers and workers.
+        if not authority or authority.get("state") != "canonical_active":
             authority.update({
                 "state": "canonical_active", "canonical_active": True,
                 "legacy_active": False, "live_cutover": True,
@@ -324,7 +327,12 @@ def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -
         # particular, do not re-read a multi-gigabyte Source Graph on every
         # idempotent Initialize AIWorkHub call.
         if changed or not integrity.get("canonical_sha256"):
-            integrity["canonical_sha256"] = sha256_file(canonical)
+            db_hash = sha256_file(canonical)
+            integrity["canonical_sha256"] = db_hash
+        else:
+            db_hash = integrity["canonical_sha256"]
+        # Keep matching rollback hashes for migrated stores.
+        integrity["rollback_source_sha256"] = db_hash
         migration = entry.setdefault("migration", {})
         migration.update({
             "generation": max(1, int(migration.get("generation") or 0)),
@@ -332,6 +340,7 @@ def _reconcile_auxiliary_databases(repo: RepositoryState, registry_path: Path) -
             "rollback_performed": False,
             "legacy_deleted": False,
             "source_read_only": True,
+            "rollback_source_hash": db_hash,
         })
     if migrated or initialized or activated:
         _atomic_write_json(registry_path, payload)

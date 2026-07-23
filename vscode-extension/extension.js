@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.29";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.30";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -47,6 +47,13 @@ const DEFAULT_REFRESH_INTERVAL_MS = 30000;
 const REPO_ID_RE = /^repo_[a-f0-9]{32}$|^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
 const TARGET_PROVIDERS = Object.freeze(["codex", "claude"]);
 const TARGET_ROUTE_KEY = "routing/coordinator-targets.json";
+const WINDOW_ROUTE_DIR_KEY = "routing/windows";
+const WINDOW_ROUTE_LEASE_TTL_MS = 15 * 60 * 1000;
+// B905 lease renewal: substantially shorter than the 15-minute TTL so a
+// window's route record never expires while the extension host is alive --
+// a slow tick or a single missed renewal still leaves multiple retries
+// before the lease would lapse.
+const WINDOW_ROUTE_RENEWAL_INTERVAL_MS = 4 * 60 * 1000;
 
 // ── The exact, narrow, read-only MCP tool allowlist this extension may call.
 // Nothing else is ever sent as a tools/call `name`. See
@@ -68,6 +75,16 @@ const DISPATCHER_TOOLS = Object.freeze({
   ensureStarted: "aiworkhub_dispatcher_ensure_started",
   health: "aiworkhub_dispatcher_health",
   stop: "aiworkhub_dispatcher_stop",
+});
+// 0.6.30: Source Graph automatic indexing lifecycle -- same start/health/stop
+// shape as DISPATCHER_TOOLS above, but for the repo-bound background index
+// daemon (source_graph_daemon.py) instead of the callback dispatcher. Never
+// spawns a shell process or installs anything; only starts/stops/inspects
+// the in-process background indexing thread.
+const SOURCE_GRAPH_DAEMON_TOOLS = Object.freeze({
+  ensureStarted: "aiworkhub_source_graph_ensure_started",
+  health: "aiworkhub_source_graph_health",
+  stop: "aiworkhub_source_graph_stop",
 });
 // The one bounded write-capable tool -- kept out of DASHBOARD_TOOLS /
 // EXPECTED_DASHBOARD_TOOL_NAMES (the read-only contract check in
@@ -216,9 +233,87 @@ function repositoryLabel(folders, uriStr) {
   return match.name;
 }
 
+// B916: on Windows, each candidate Python is preflight-validated by actually
+// importing and starting the bundled aiworkhub.server runtime before selection.
+// A broken or incompatible repo-local .venv/venv Python is skipped and the
+// validated fallback chain continues to py -3 then system python. On
+// Linux/macOS the existing behaviour (existence check, no preflight) is
+// unchanged.  shell=false everywhere; paths with spaces and Windows separators
+// are handled without quoting bugs.  If no candidate works, diagnostics
+// include attempted candidate names and a bounded stderr tail, never secrets.
+
+// Bounded sanitised stderr for diagnostic inclusion: never secrets, never
+// paths, limited to 500 chars.
+function _sanitisePreflightStderr(raw) {
+  const text = String(raw || "").slice(0, 500);
+  return text.replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]").trim() || "(no stderr output)";
+}
+
+// Run a single candidate Python through the preflight gate: "import
+// aiworkhub.server". Returns {ok, candidate, ...diagnosticFields}. Never
+// leaks secrets or host-absolute paths into diagnostic strings.
+function _preflightPythonCandidate(command, extraArgs) {
+  const args = [...(Array.isArray(extraArgs) ? extraArgs : []), "-c", "import aiworkhub.server"];
+  try {
+    const result = childProcess.spawnSync(command, args, {
+      timeout: 15000,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+    });
+    // spawnSync returns result.error for ENOENT / spawn failures without throwing.
+    if (result.error) {
+      return {
+        ok: false,
+        candidate: command,
+        error: String((result.error && result.error.message) || "spawn_failed").slice(0, 200),
+      };
+    }
+    if (result.status === 0) {
+      return { ok: true, candidate: command };
+    }
+    return {
+      ok: false,
+      candidate: command,
+      exitCode: result.status,
+      stderrTail: _sanitisePreflightStderr(result.stderr),
+      signal: result.signal || null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      candidate: command,
+      error: String((err && err.message) || "spawn_failed").slice(0, 200),
+    };
+  }
+}
+
+// Build a bounded human-readable diagnostic string from an ordered list of
+// per-candidate preflight results. Only failed candidates appear; successful
+// ones are omitted. Limited to 1200 total chars.
+function _buildPreflightDiagnostic(diagnostics) {
+  if (!diagnostics || diagnostics.length === 0) return "";
+  const failed = diagnostics.filter((d) => !d.ok);
+  if (failed.length === 0) return "";
+  const parts = ["Python interpreter preflight diagnostics:"];
+  let total = parts[0].length;
+  for (const d of failed) {
+    const tail = d.stderrTail || d.error || (d.exitCode != null ? `exit_code=${d.exitCode}` : "unknown");
+    const line = `  ${d.candidate}: ${String(tail).slice(0, 200)}`;
+    if (total + line.length > 1200) {
+      parts.push("  ... (diagnostic truncated)");
+      break;
+    }
+    total += line.length;
+    parts.push(line);
+  }
+  return parts.join("\n");
+}
+
 function findPythonCommand(root) {
   const configured = vscode.workspace.getConfiguration("aiworkhub").get("pythonPath");
-  const venvCandidates = process.platform === "win32"
+  const isWindows = process.platform === "win32";
+  const venvCandidates = isWindows
     ? [
         path.join(root, ".venv", "Scripts", "python.exe"),
         path.join(root, "venv", "Scripts", "python.exe"),
@@ -229,22 +324,74 @@ function findPythonCommand(root) {
         path.join(root, "venv", "bin", "python3"),
         path.join(root, "venv", "bin", "python"),
       ];
+
   const candidates = [
-    typeof configured === "string" ? configured.trim() : "",
+    typeof configured === "string" && configured.trim() ? configured.trim() : null,
     ...venvCandidates,
-  ];
-  for (const candidate of candidates) {
-    if (!candidate) {
-      continue;
+  ].filter(Boolean);
+
+  // ── Windows: preflight-validate each candidate ─────────────────────────
+  if (isWindows) {
+    const diagnostics = [];
+    for (const candidate of candidates) {
+      const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+      if (!looksLikePath) {
+        diagnostics.push({ ok: false, candidate, reason: "not_a_path" });
+        continue;
+      }
+      if (!fs.existsSync(candidate)) {
+        diagnostics.push({ ok: false, candidate, reason: "not_found" });
+        continue;
+      }
+      const preflight = _preflightPythonCandidate(candidate);
+      diagnostics.push(preflight);
+      if (preflight.ok) {
+        return {
+          command: candidate,
+          argsPrefix: [],
+          preflightDiagnostic: null,
+        };
+      }
     }
+    // All repo-local candidates failed. Try py -3 then system python.
+    for (const fallback of [{ cmd: "py", args: ["-3"] }, { cmd: "python", args: [] }]) {
+      const pf = _preflightPythonCandidate(fallback.cmd, fallback.args);
+      diagnostics.push(pf);
+      if (pf.ok) {
+        return {
+          command: fallback.cmd,
+          argsPrefix: fallback.args,
+          preflightDiagnostic: null,
+        };
+      }
+    }
+    // No candidate works: return the first that at least exists on disk
+    // but attach a bounded diagnostic for the output channel.
+    for (const candidate of candidates) {
+      const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+      if (looksLikePath && fs.existsSync(candidate)) {
+        return {
+          command: candidate,
+          argsPrefix: [],
+          preflightDiagnostic: _buildPreflightDiagnostic(diagnostics),
+        };
+      }
+    }
+    return {
+      command: "py",
+      argsPrefix: ["-3"],
+      preflightDiagnostic: _buildPreflightDiagnostic(diagnostics),
+    };
+  }
+
+  // ── Linux/macOS: unchanged existence-based selection ───────────────────
+  for (const candidate of candidates) {
     const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
     if (!looksLikePath || fs.existsSync(candidate)) {
       return { command: candidate, argsPrefix: [] };
     }
   }
-  return process.platform === "win32"
-    ? { command: "py", argsPrefix: ["-3"] }
-    : { command: "python3", argsPrefix: [] };
+  return { command: "python3", argsPrefix: [] };
 }
 
 function ensureRepositoryCoordinatorCapability(root) {
@@ -319,6 +466,87 @@ function routeStatePath(root) {
   return path.join(root, ".aiworkhub", "config", TARGET_ROUTE_KEY);
 }
 
+function windowRouteStatePath(root, windowId) {
+  return path.join(root, ".aiworkhub", "config", WINDOW_ROUTE_DIR_KEY, `${windowId}.json`);
+}
+
+// B905/isolation: each window owns exactly one routing record file, keyed by
+// its own WINDOW_SCOPE_ID, instead of every window in the repo racing to
+// overwrite the same coordinator-targets.json ("last writer wins"). Two
+// windows on the same repo can never steal each other's active route this
+// way -- each reads/refreshes only the file it created. The legacy shared
+// file is still written for backward-compatible UI/migration reads, but it
+// is never treated as routing authority by manager route discovery.
+function writeWindowRouteRecord(repoInfo, targets) {
+  const now = new Date();
+  const record = {
+    schema_id: "aiworkhub.window_route.v1",
+    repo_id: repoInfo.repoId,
+    window_id: WINDOW_SCOPE_ID,
+    extension_host_pid: process.pid,
+    selected_provider: targets.selected_provider,
+    targets: targets.targets,
+    updated_at: now.toISOString(),
+    lease_expires_at: new Date(now.getTime() + WINDOW_ROUTE_LEASE_TTL_MS).toISOString(),
+  };
+  const recordPath = windowRouteStatePath(repoInfo.root, WINDOW_SCOPE_ID);
+  fs.mkdirSync(path.dirname(recordPath), { recursive: true, mode: 0o700 });
+  atomicWriteJson(recordPath, record);
+  return record;
+}
+
+// B905 isolation cleanup: remove ONLY this window's own routing record file
+// -- never another window's file, and never the legacy shared
+// coordinator-targets.json, which other windows still read for migration.
+// Best-effort: a missing file (already cleaned up, never written, or an
+// unavailable filesystem) is silently ignored.
+function removeWindowRouteRecord(repoInfo) {
+  if (!repoInfo || !repoInfo.root) {
+    return;
+  }
+  try {
+    fs.unlinkSync(windowRouteStatePath(repoInfo.root, WINDOW_SCOPE_ID));
+  } catch (_err) {
+    // ENOENT or an unavailable filesystem -- nothing to clean up.
+  }
+}
+
+// One process-wide interval that keeps renewing THIS window's own route
+// lease (never another window's) while the extension host is alive. Bounded
+// to activeRepoIdentity, so a window with no bound repository yet simply
+// skips a tick instead of writing a bogus record.
+let windowRouteRenewalTimer = null;
+
+function renewWindowRouteLease() {
+  if (!activeRepoIdentity || !REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))) {
+    return;
+  }
+  try {
+    refreshCoordinatorRouteOwnership(activeRepoIdentity);
+  } catch (_err) {
+    // Best-effort -- a failed renewal just lets this tick lapse; the next
+    // scheduled tick tries again well before the 15-minute TTL expires.
+  }
+}
+
+function startWindowRouteRenewalTimer() {
+  stopWindowRouteRenewalTimer();
+  windowRouteRenewalTimer = setInterval(renewWindowRouteLease, WINDOW_ROUTE_RENEWAL_INTERVAL_MS);
+  if (windowRouteRenewalTimer && typeof windowRouteRenewalTimer.unref === "function") {
+    windowRouteRenewalTimer.unref();
+  }
+}
+
+// Safe to call from any state (including when no timer is running) --
+// activate()/deactivate() and a reload cycle always route through this
+// single stop point so a reload never leaves two live intervals ticking.
+function stopWindowRouteRenewalTimer() {
+  if (windowRouteRenewalTimer) {
+    clearInterval(windowRouteRenewalTimer);
+    windowRouteRenewalTimer = null;
+  }
+}
+
 function defaultCoordinatorTargets(repoInfo) {
   return {
     schema_id: "aiworkhub.coordinator_targets.v1",
@@ -373,6 +601,7 @@ function refreshCoordinatorRouteOwnership(repoInfo) {
     next.targets = { ...(next.targets || {}), [provider]: target };
   }
   atomicWriteJson(routeStatePath(repoInfo.root), next);
+  writeWindowRouteRecord(repoInfo, next);
   return next;
 }
 
@@ -389,6 +618,7 @@ function setCoordinatorTarget(provider) {
   next.extension_host_pid = process.pid;
   next.updated_at = new Date().toISOString();
   atomicWriteJson(routeStatePath(repoInfo.root), next);
+  writeWindowRouteRecord(repoInfo, next);
   return next;
 }
 
@@ -523,6 +753,7 @@ class McpStdioClient {
     }
     const root = this.repositoryRoot;
     const python = findPythonCommand(root);
+    this._lastPythonResult = python;
     const runtimeDir = extensionRuntimeDir;
     const env = {
       ...process.env,
@@ -629,6 +860,17 @@ class McpStdioClient {
       this.dispatcherReady = false;
       this.outputChannel.appendLine(`[mcp] dispatcher ensure-started failed: ${sanitizeErrorMessage(err)}`);
     }
+    // 0.6.30: converge on exactly one repo-bound Source Graph indexing
+    // daemon right after every successful handshake too (activation, tab-
+    // deserialization, and reload). Idempotent server-side
+    // (aiworkhub.core.source_graph_ensure_started); best-effort -- a
+    // failure here must never fail the MCP connection or the dispatcher
+    // convergence above.
+    try {
+      await this.callTool(SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted, {});
+    } catch (err) {
+      this.outputChannel.appendLine(`[mcp] source graph ensure-started failed: ${sanitizeErrorMessage(err)}`);
+    }
   }
 
   _onStdout(chunk) {
@@ -692,6 +934,14 @@ class McpStdioClient {
     this.initialized = false;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
     this._failPendingForChild(exitedChild, failure);
+
+    // B916: when a Windows child exits non-zero, include the interpreter
+    // preflight diagnostic (if any) so the user can see WHY the selected
+    // Python failed -- bounded, sanitised, never secrets or paths.
+    if (code !== 0 && this._lastPythonResult && this._lastPythonResult.preflightDiagnostic) {
+      this.outputChannel.appendLine(this._lastPythonResult.preflightDiagnostic);
+    }
+
     if (this.intentionalStop) {
       return;
     }
@@ -824,6 +1074,15 @@ class McpStdioClient {
     if (this.running && this.initialized) {
       try {
         await this.request("tools/call", { name: DISPATCHER_TOOLS.stop, arguments: {} }, MCP_REQUEST_TIMEOUT_MS);
+      } catch (_err) {
+        // Best-effort -- proceed to terminate the child regardless.
+      }
+      try {
+        await this.request(
+          "tools/call",
+          { name: SOURCE_GRAPH_DAEMON_TOOLS.stop, arguments: {} },
+          MCP_REQUEST_TIMEOUT_MS,
+        );
       } catch (_err) {
         // Best-effort -- proceed to terminate the child regardless.
       }
@@ -1556,11 +1815,14 @@ async function pushTaskDetail(view, taskId) {
 // unchanged so a repeat call only requests bytes new since the last one; the
 // server (aiworkhub.process_launcher.read_live_output_for_task) already
 // strips ANSI/control sequences, redacts long token-like runs, and
-// HTML-escapes before this ever reaches the Webview. NOTE: the Webview-side
-// renderer for this message (media/app.js) is a follow-up -- this function
-// and its message-contract entries (ALLOWED_INBOUND_MESSAGE_TYPES,
-// OUTBOUND_TYPES.liveOutput, DASHBOARD_TOOLS.liveOutput) are the host-side
-// half of the wiring.
+// HTML-escapes before this ever reaches the Webview. The Webview-side
+// renderer for this message (media/app.js: timelineEventFromObject /
+// claudeStreamContentBlockDelta) formats each structured provider event --
+// including recognizing a Claude CLI stream_event/content_block_delta whose
+// delta.type is "signature_delta" as internal protocol metadata that is
+// never shown -- this function and its message-contract entries
+// (ALLOWED_INBOUND_MESSAGE_TYPES, OUTBOUND_TYPES.liveOutput,
+// DASHBOARD_TOOLS.liveOutput) are only the host-side half of the wiring.
 async function pushLiveOutput(view, taskId, cursor) {
   try {
     const client = getMcpClient();
@@ -2282,12 +2544,16 @@ async function selectRepositoryCommand() {
   ctx.workspaceState.update(WSP_STATE_KEY_REPO_URI, choice.uriStr);
 
   // Stop the old dispatcher (never orphaning a nested app-server
-  // subprocess) and the old MCP child, then clear state.
+  // subprocess) and the old MCP child, then clear state. Remove ONLY this
+  // window's own route record for the repository being left -- another
+  // window still bound to that repository keeps its own file untouched.
+  const previousRepoIdentity = activeRepoIdentity;
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
+  removeWindowRouteRecord(previousRepoIdentity);
   activeRepoIdentity = null;
   activeRepoLabel = "Switching repository";
 
@@ -2376,9 +2642,16 @@ async function activate(context) {
       );
     });
   }
+
+  // B905: start the bounded lease-renewal timer once activation has settled
+  // -- disposed in deactivate() and always restarted (never doubled) here,
+  // so a reload cycle (deactivate -> activate) never leaves two intervals
+  // ticking and never leaves the current window's lease to lapse silently.
+  startWindowRouteRenewalTimer();
 }
 
 async function deactivate() {
+  stopWindowRouteRenewalTimer();
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
@@ -2388,6 +2661,9 @@ async function deactivate() {
     // orphan (see stopDispatcherThenTerminate).
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
+  // Remove ONLY this window's own route record -- never another window's.
+  removeWindowRouteRecord(activeRepoIdentity);
+  activeRepoIdentity = null;
   extensionContext = null;
 }
 
@@ -2401,6 +2677,8 @@ module.exports = {
     pushSnapshotNoRetry,
     pushRuntimeInfo,
     findPythonCommand,
+    _preflightPythonCandidate,
+    _buildPreflightDiagnostic,
     getMcpClient,
     sanitizeErrorMessage,
     shouldRepairCodexMuxSetting,
@@ -2412,11 +2690,19 @@ module.exports = {
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
     CODEX_OWNED_RUNTIME_SEGMENT_RE,
+    windowRouteStatePath,
+    removeWindowRouteRecord,
+    renewWindowRouteLease,
+    startWindowRouteRenewalTimer,
+    stopWindowRouteRenewalTimer,
+    isWindowRouteRenewalTimerActive: () => Boolean(windowRouteRenewalTimer),
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
       MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       EXPECTED_MCP_PACKAGE_VERSION,
+      WINDOW_ROUTE_LEASE_TTL_MS,
+      WINDOW_ROUTE_RENEWAL_INTERVAL_MS,
     },
   },
 };

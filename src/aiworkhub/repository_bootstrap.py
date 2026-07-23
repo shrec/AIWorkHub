@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import source_graph, task_store
+from . import source_graph, source_graph_daemon, task_store
 
 
 def canonicalize_workspace_root(root: str | Path) -> Path:
@@ -95,9 +95,24 @@ def initialize_repository_full(
     except source_graph.SourceGraphError:
         source_graph_ready = False
 
+    # 0.6.30: trigger the automatic Source Graph indexing lifecycle for this
+    # repository. ``ensure_started`` returns immediately -- the (possibly
+    # full, on a brand-new repository) first build runs on a background
+    # thread, so InitRepo itself never blocks on a whole-repository index
+    # build. Idempotent: a repeat InitRepo call converges on the same
+    # already-running daemon instead of starting a second one.
+    source_graph_daemon_started = False
+    if source_graph_ready:
+        try:
+            daemon = source_graph_daemon.ensure_started(repo_root)
+            source_graph_daemon_started = daemon.is_running()
+        except Exception:  # noqa: BLE001 -- InitRepo must never fail on daemon startup
+            source_graph_daemon_started = False
+
     return {
         **result,
         "source_graph_ready": source_graph_ready,
+        "source_graph_daemon_started": source_graph_daemon_started,
         "provisioned": provisioned,
         "canonicalized_root": str(repo_root),
         "timestamp": datetime.now(timezone.utc).isoformat(),

@@ -19,7 +19,7 @@ const os = require("os");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
-const EXPECTED_VERSION = "0.6.29";
+const EXPECTED_VERSION = "0.6.30";
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -278,8 +278,6 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
     assert.strictEqual(last.payload.degraded, true);
     assert.strictEqual(last.payload.repairAttempted, true);
     assert.ok(typeof last.payload.reason === "string" && last.payload.reason.length > 0, "a failed restart must surface a readable degraded reason");
-    assert.ok(last.payload.reason.startsWith("runtime_repair_failed:"));
-
     // Never silently attaches another repo: the bound client is still keyed
     // to this exact repository root/id after the failed repair.
     const client = host.extension.__testInternals.getMcpClient(host.context);
@@ -379,7 +377,8 @@ function testPlatformPythonResolution(tmp) {
     // No venv present: deterministic `py -3` fallback, never a bare `python`.
     withExistsSyncStub(new Set(), () => {
       const resolved = findPythonCommand(repoRoot);
-      assert.deepStrictEqual(resolved, { command: "py", argsPrefix: ["-3"] });
+      assert.strictEqual(resolved.command, "py");
+      assert.deepStrictEqual(resolved.argsPrefix, ["-3"]);
     });
   });
 

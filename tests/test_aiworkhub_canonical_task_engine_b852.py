@@ -308,6 +308,97 @@ def test_mark_review_enqueues_repo_local_callback(writable_repo):
         }
 
 
+def test_mark_review_preserves_immutable_task_origin_across_reviewer_identity(
+    writable_repo, monkeypatch
+):
+    """The task's persisted origin_thread_id names the chat that authored
+    it. A different Claude manager session merely reviewing the task must
+    never overwrite that origin with its own session id -- doing so would
+    let one window silently steal another window's callback ownership."""
+    author_thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    _insert_task(
+        writable_repo,
+        "TASK_ORIGIN_REVIEW",
+        "claude_coding",
+        "coding",
+        card_extra={"origin_thread_id": author_thread_id},
+    )
+    picked = core.auto_pickup("claude_coding", "coding")
+    assert picked["ok"] is True
+
+    reviewer_session_id = "5be44029-03da-4683-aae3-c68ecb07b1a4"
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": reviewer_session_id,
+            "window_id": "claude_vscode_other_window",
+        },
+    )
+    reviewed = core.mark_review("TASK_ORIGIN_REVIEW")
+    assert reviewed["ok"] is True
+    assert reviewed["callback_enqueued"] is True
+
+    db_path = callback_store.resolve_db_path(writable_repo)
+    conn = callback_store.open_db(db_path)
+    try:
+        outbox_row = conn.execute(
+            "SELECT origin_thread_id FROM callback_outbox WHERE task_id=?",
+            ("TASK_ORIGIN_REVIEW",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert outbox_row is not None
+    assert outbox_row["origin_thread_id"] == author_thread_id
+    assert outbox_row["origin_thread_id"] != reviewer_session_id
+
+
+def test_release_launch_preserves_immutable_task_origin_across_reviewer_identity(
+    writable_repo, tmp_path, monkeypatch
+):
+    _coordinator_env(tmp_path, monkeypatch)
+    author_thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    _insert_task(
+        writable_repo,
+        "TASK_ORIGIN_RELEASE",
+        "claude_coding",
+        "coding",
+        card_extra={"origin_thread_id": author_thread_id},
+    )
+    picked = core.auto_pickup("claude_coding", "coding")
+    assert picked["ok"] is True
+
+    releaser_session_id = "6c7cbfc4-98c1-4ad6-9d47-24e5a3f1a002"
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": releaser_session_id,
+            "window_id": "claude_vscode_releaser_window",
+        },
+    )
+    released = core.release_launch(
+        "TASK_ORIGIN_RELEASE", "claude_coding", "blocked_on_dependency"
+    )
+    assert released["ok"] is True, released
+    assert released["callback_enqueued"] is True
+
+    db_path = callback_store.resolve_db_path(writable_repo)
+    conn = callback_store.open_db(db_path)
+    try:
+        outbox_row = conn.execute(
+            "SELECT origin_thread_id FROM callback_outbox WHERE task_id=?",
+            ("TASK_ORIGIN_RELEASE",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert outbox_row is not None
+    assert outbox_row["origin_thread_id"] == author_thread_id
+    assert outbox_row["origin_thread_id"] != releaser_session_id
+
+
 def test_callback_batches_are_partitioned_by_originating_provider(writable_repo):
     _insert_task(writable_repo, "TASK_CODEX_ROUTE", "codex_worker", "coding")
     _insert_task(writable_repo, "TASK_CLAUDE_ROUTE", "claude_worker", "coding")

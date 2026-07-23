@@ -40,7 +40,9 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
 3. **Init Repo.** On first open the dashboard shows an explicit
    **Initialize AIWorkHub** action. Click it once -- this creates
    `.aiworkhub/project.json`, the storage registry, a fresh canonical
-   `.aiworkhub/tasking/task_queue.sqlite`, and the Source Graph directory.
+   `.aiworkhub/tasking/task_queue.sqlite`, and the Source Graph store. The
+   initial Source Graph index starts asynchronously; one repo-bound daemon
+   then keeps it fresh with non-overlapping incremental refreshes.
    Nothing is created before this explicit step, and it is safe to run
    again (idempotent).
 4. **Work the queue.** The dashboard tab shows pending/processing/review
@@ -60,6 +62,21 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
 See [Getting Started](docs/GETTING_STARTED.md) for the full walkthrough
 (including headless/CLI-only setup) and [Architecture](docs/ARCHITECTURE.md)
 for how the pieces fit together.
+
+## 0.6.30 reliability and quality foundation
+
+- Callback delivery is authorized by an expiring per-window, per-repository
+  route lease. A window renews and removes only its own record; ambiguous,
+  expired, or foreign-repository routes fail closed.
+- Windows MCP launch preflights repository virtual environments and safely
+  falls back through `py -3` and `python`, with `shell=false` and support for
+  paths containing spaces.
+- Source Graph, Session Manager, AI Memory, and KB are canonical repo-local
+  authorities and are available to both managers and workers.
+- The Quality Evidence Engine detects declared project tooling without
+  installing dependencies and normalizes test, SARIF, coverage, benchmark,
+  and read-only AI-review evidence. `not_available` is never treated as
+  `passed`.
 
 ## Install For Local Development (headless / no VS Code)
 

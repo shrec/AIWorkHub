@@ -220,4 +220,59 @@ function lines(...events) {
   assert(stderr.textContent.includes("stderr <b>tail</b>"));
 }
 
+{
+  // B896: a Claude CLI stream_event/content_block_delta signature_delta is
+  // internal protocol metadata -- it must never appear as a timeline row
+  // (not even an "Unrecognized event" placeholder), and its signature
+  // payload must never reach the formatted output.
+  const events = api.timelineEventsFromText(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SUPER_SECRET_SIGNATURE_PAYLOAD_ABCDEF0123456789" } } },
+  ));
+  assert.strictEqual(events.length, 0, "signature_delta produces no timeline row");
+}
+
+{
+  // Adjacent text_delta must still render as readable text.
+  const events = api.timelineEventsFromText(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello from the model" } } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].kind, "event");
+  assert.strictEqual(events[0].message, "Hello from the model");
+  assert.notStrictEqual(events[0].title, "Unrecognized event");
+}
+
+{
+  // signature_delta interleaved with text_delta, result, and error events:
+  // only the signature_delta row is dropped; ordering/newest-first and the
+  // other rows' formatting are unaffected.
+  const events = api.timelineEventsFromText(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "thinking out loud" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SECRET_SIG_PAYLOAD_ZZZZZZZZZZZZZZZZZZZZZZZZ" } } },
+    { type: "error", error: "boom" },
+    { type: "result", result: "verdict: pass", duration_ms: 5 },
+  ));
+  assert.strictEqual(events.length, 3, "only the signature_delta row is omitted");
+  assert(events.some((event) => event.message === "thinking out loud"));
+  assert(events.some((event) => event.kind === "error" && event.message === "boom"));
+  assert(events.some((event) => event.kind === "result"));
+  assert(!events.some((event) => event.title === "Unrecognized event"));
+  for (const event of events) {
+    assert(!JSON.stringify(event).includes("SECRET_SIG_PAYLOAD"), "signature payload never leaks into another row");
+  }
+
+  api.renderFormattedLiveOutput(lines(
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "thinking out loud" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SECRET_SIG_PAYLOAD_ZZZZZZZZZZZZZZZZZZZZZZZZ" } } },
+    { type: "result", result: "verdict: pass", duration_ms: 5 },
+  ));
+  const rendered = document.querySelector("#detail-live-output-container").textContent;
+  assert(rendered.includes("thinking out loud"));
+  assert(rendered.includes("verdict: pass"));
+  assert(!rendered.includes("SECRET_SIG_PAYLOAD"), "signature payload absent from the formatted feed");
+  assert(!rendered.includes("Unrecognized event"));
+  // Newest-first: the later "result" row still renders above the earlier text row.
+  assert(rendered.indexOf("verdict: pass") < rendered.indexOf("thinking out loud"), "newest event renders first");
+}
+
 console.log("live-output-formatting.test.js: ok");

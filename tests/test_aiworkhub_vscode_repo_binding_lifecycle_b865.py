@@ -77,7 +77,7 @@ def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch
     assert result["repo"] == str(root)
     assert result["storage"]["ready"] is True
     assert _REPO_ID_RE.match(result["storage"]["repo_id"])
-    assert result["server_version"] == "0.6.29"
+    assert result["server_version"] == "0.6.30"
 
 
 def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):
@@ -196,7 +196,7 @@ def test_extension_repo_switch_stops_old_client_dispatcher_before_rebinding():
     get_client_body = _slice(_EXTENSION_JS, "function getMcpClient(context)", 900)
     assert "stopDispatcherThenTerminate" in get_client_body
 
-    select_repo_body = _slice(_EXTENSION_JS, "async function selectRepositoryCommand()", 1700)
+    select_repo_body = _slice(_EXTENSION_JS, "async function selectRepositoryCommand()", 2400)
     assert "stopDispatcherThenTerminate" in select_repo_body
 
 
