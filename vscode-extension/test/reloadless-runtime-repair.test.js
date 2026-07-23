@@ -406,14 +406,22 @@ function testPlatformPythonResolution(tmp) {
 
   // An explicit aiworkhub.pythonPath setting wins on every platform when it
   // resolves to a real file -- deterministic across all three.
-  for (const platform of ["win32", "darwin", "linux"]) {
-    withPlatform(platform, () => {
-      const configuredHost = loadExtensionHost(repoRoot, "/opt/custom/python");
-      withExistsSyncStub(new Set(["/opt/custom/python"]), () => {
-        const resolved = configuredHost.extension.__testInternals.findPythonCommand(repoRoot);
-        assert.strictEqual(resolved.command, "/opt/custom/python");
+  childProcess.spawnSync = () => ({ status: 0, stderr: "", signal: null });
+  try {
+    for (const platform of ["win32", "darwin", "linux"]) {
+      withPlatform(platform, () => {
+        // Load while spawnSync is stubbed because extension.js captures the
+        // function at module evaluation time. This keeps the Windows branch
+        // independent of the host runner's actual Python installation.
+        const configuredHost = loadExtensionHost(repoRoot, "/opt/custom/python");
+        withExistsSyncStub(new Set(["/opt/custom/python"]), () => {
+          const resolved = configuredHost.extension.__testInternals.findPythonCommand(repoRoot);
+          assert.strictEqual(resolved.command, "/opt/custom/python");
+        });
       });
-    });
+    }
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
   }
 }
 
