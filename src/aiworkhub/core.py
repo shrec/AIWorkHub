@@ -2363,9 +2363,17 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
     # dependents, so a child does not query a stale index and falsely report
     # this task's just-produced artifact missing (the measured B954->B955 false
     # blocker). Best-effort and non-overlapping: an index refresh must never
-    # fail the finalization itself.
+    # fail the finalization itself. Only refresh an ALREADY-running daemon (the
+    # production case -- Init Repo starts one per repo); never START a daemon or
+    # run a first-ever full build as a side effect of mark_done, which would
+    # otherwise spawn an indexing thread on every finalize (e.g. across a whole
+    # test suite, where no daemon is running).
     try:
-        result["source_graph_refresh"] = source_graph_refresh_now()
+        sg = _source_graph_daemon_module()
+        if sg.get_daemon(repo_root()) is not None:
+            result["source_graph_refresh"] = source_graph_refresh_now()
+        else:
+            result["source_graph_refresh"] = {"ok": True, "triggered": False, "reason": "no_running_daemon"}
     except Exception as exc:  # noqa: BLE001 -- refresh must never fail mark_done
         result["source_graph_refresh"] = {"ok": False, "error": f"{type(exc).__name__}:{exc}"[:200]}
     result["dependency_autolaunch"] = dependency_autolaunch.reconcile_after_accept(
