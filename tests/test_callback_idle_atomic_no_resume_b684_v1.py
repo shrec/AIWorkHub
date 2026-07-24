@@ -57,6 +57,12 @@ import _taskdb_compat as taskdb  # noqa: E402
 # Self-contained fake sideband endpoint (no AppServerMux, no subprocess)
 # ---------------------------------------------------------------------------
 
+# B925: sideband instances/clients are repository-bound; one valid repo_id
+# shared by the fake endpoint's registry and every client/bridge so ownership
+# resolution matches.
+_REPO_ID = "repo_b684_test"
+
+
 class _FakeSidebandEndpoint:
     """A real ``AF_UNIX`` socket server registering itself as one live mux
     instance owning ``thread_id`` -- lets a test script exactly what each
@@ -105,6 +111,7 @@ class _FakeSidebandEndpoint:
             "socket_path": str(self.socket_path),
             "capability_path": str(self.capability_path),
             "owned_thread_ids": [self.thread_id],
+            "repo_id": _REPO_ID,
         }
         fd = os.open(str(self.registry_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -193,7 +200,7 @@ def test_deliver_callback_sends_only_turn_start_never_resume_or_steer():
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _idle_turn_start_ok())
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         result = client.deliver_callback(
             thread_id, "TASK_B684_IDLE", "review_ready",
             client_user_message_id="fixed-b684-1", cwd="/home/shrek/AIWorkHub",
@@ -212,7 +219,7 @@ def test_deliver_callback_batch_sends_only_turn_start_never_resume_or_steer():
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _idle_turn_start_ok())
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         members = [
             {"task_id": "T1", "state": "review_ready", "event_id": "e1", "request_id": "r1"},
             {"task_id": "T2", "state": "blocked", "event_id": "e2", "request_id": "r2"},
@@ -257,7 +264,7 @@ def test_delivery_never_waits_on_a_slow_thread_resume_the_b683_defect():
         # if the old resume-then-decide path were still in effect, this
         # call would itself time out (SidebandUnavailableError/socket
         # timeout) well before returning.
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=1.0)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=1.0)
         started = time.monotonic()
         result = client.deliver_callback(thread_id, "TASK_B684_FAST", "review_ready")
         elapsed = time.monotonic() - started
@@ -293,7 +300,7 @@ def test_turn_start_active_busy_message_variants_durably_park(message):
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _respond)
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         with pytest.raises(SidebandThreadBusyError):
             client.deliver_callback(thread_id, "TASK_B684_BUSY", "review_ready")
     finally:
@@ -325,7 +332,7 @@ def test_turn_start_active_turn_not_steerable_structured_data_durably_parks():
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _respond)
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         with pytest.raises(SidebandThreadBusyError):
             client.deliver_callback(thread_id, "TASK_B684_NOT_STEERABLE", "review_ready")
     finally:
@@ -360,7 +367,7 @@ def test_turn_start_malformed_response_is_hard_failure_not_busy_park():
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _respond)
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         with pytest.raises(AppServerError) as excinfo:
             client.deliver_callback(thread_id, "TASK_B684_MALFORMED", "review_ready")
         assert not isinstance(excinfo.value, BusyThreadError)
@@ -379,7 +386,7 @@ def test_turn_start_denied_error_is_hard_failure_not_busy_park():
     endpoint = _FakeSidebandEndpoint(sideband_dir, thread_id, _respond)
     endpoint.start()
     try:
-        client = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=5)
         with pytest.raises(AppServerError) as excinfo:
             client.deliver_callback(thread_id, "TASK_B684_DENIED", "review_ready")
         assert not isinstance(excinfo.value, BusyThreadError)
@@ -446,7 +453,7 @@ def test_run_once_reproduces_b683_shape_durable_park_never_dead_letters():
         try:
             bridge = CallbackBridge(
                 repo=repo, db_path=db_path, state_path=repo / "state.json",
-                transport="sideband", sideband_dir=sideband_dir,
+                transport="sideband", sideband_dir=sideband_dir, sideband_repo_id=_REPO_ID,
                 lease_seconds=30, app_server_timeout=5, lease_margin_seconds=1,
             )
             for _ in range(8):
@@ -501,7 +508,7 @@ def test_run_once_delivers_once_thread_goes_idle_same_durable_batch():
         try:
             bridge = CallbackBridge(
                 repo=repo, db_path=db_path, state_path=repo / "state.json",
-                transport="sideband", sideband_dir=sideband_dir,
+                transport="sideband", sideband_dir=sideband_dir, sideband_repo_id=_REPO_ID,
                 lease_seconds=30, app_server_timeout=5, lease_margin_seconds=1,
             )
             first = bridge.run_once()
@@ -546,7 +553,7 @@ def test_run_once_genuine_protocol_failure_still_bounded_dead_letters():
         try:
             bridge = CallbackBridge(
                 repo=repo, db_path=db_path, state_path=repo / "state.json",
-                transport="sideband", sideband_dir=sideband_dir,
+                transport="sideband", sideband_dir=sideband_dir, sideband_repo_id=_REPO_ID,
                 lease_seconds=30, app_server_timeout=5, lease_margin_seconds=1,
             )
             for _ in range(DEFAULT_MAX_RETRIES):

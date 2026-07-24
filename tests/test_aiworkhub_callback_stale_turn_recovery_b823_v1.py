@@ -32,6 +32,11 @@ from aiworkhub.callback_bridge import (  # noqa: E402
 )
 
 
+# B925: sideband instances/clients are repository-bound; one valid repo_id
+# shared by the fake endpoint's registry and the client so ownership resolves.
+_REPO_ID = "repo_b823_test"
+
+
 class _Endpoint:
     def __init__(self, sideband_dir: Path, thread_id: str, responder, *, heartbeat_age: float = 0.0):
         self.sideband_dir = sideband_dir
@@ -74,6 +79,7 @@ class _Endpoint:
             "socket_path": str(self.socket_path),
             "capability_path": str(self.capability_path),
             "owned_thread_ids": [self.thread_id],
+            "repo_id": _REPO_ID,
             "heartbeat_at": time.time() - self._heartbeat_age,
             "owner_lease_seconds": SIDEBAND_OWNER_LEASE_SECONDS,
             "ready": True,
@@ -138,9 +144,9 @@ def test_stale_generation_is_ignored_and_reconnect_generation_receives_exactly_o
     stale.start()
     fresh.start()
     try:
-        owners = find_owning_sideband_instances(sideband_dir, thread_id)
+        owners = find_owning_sideband_instances(sideband_dir, thread_id, _REPO_ID)
         assert [owner.generation_id for owner in owners] == [fresh.generation_id]
-        result = SidebandCallbackClient(sideband_dir=sideband_dir, timeout=2).deliver_callback(
+        result = SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=2).deliver_callback(
             thread_id, "TASK_B823_RECOVER", "review_ready"
         )
         assert result["result"]["turn"]["id"] == "turn-fresh"
@@ -158,11 +164,11 @@ def test_only_stale_owner_parks_durable_callback_without_hard_failure() -> None:
     stale.start()
     try:
         with pytest.raises(SidebandOwnerNotFoundError):
-            SidebandCallbackClient(sideband_dir=sideband_dir, timeout=1).deliver_callback(
+            SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=1).deliver_callback(
                 thread_id, "TASK_B823_STALE_ONLY", "review_ready"
             )
         assert stale.calls == []
-        freshness = describe_sideband_owner_freshness(sideband_dir, thread_id)
+        freshness = describe_sideband_owner_freshness(sideband_dir, thread_id, _REPO_ID)
         assert freshness["owner_count"] == 1
         assert freshness["fresh_owner_count"] == 0
         assert freshness["owners"][0]["fresh"] is False
@@ -181,11 +187,11 @@ def test_genuine_fresh_active_owner_remains_parked_and_is_not_double_delivered()
     endpoint.start()
     try:
         with pytest.raises(SidebandThreadBusyError):
-            SidebandCallbackClient(sideband_dir=sideband_dir, timeout=2).deliver_callback(
+            SidebandCallbackClient(repo_id=_REPO_ID, sideband_dir=sideband_dir, timeout=2).deliver_callback(
                 thread_id, "TASK_B823_ACTIVE", "review_ready"
             )
         assert [call["method"] for call in endpoint.calls] == ["turn/start"]
-        assert find_owning_sideband_instances(sideband_dir, thread_id)[0].is_owner_fresh is True
+        assert find_owning_sideband_instances(sideband_dir, thread_id, _REPO_ID)[0].is_owner_fresh is True
     finally:
         endpoint.stop()
 
@@ -210,6 +216,7 @@ def test_status_exposes_redacted_parked_age_and_owner_generation_freshness() -> 
         )
         bridge = CallbackBridge.__new__(CallbackBridge)
         bridge._sideband_dir = sideband_dir
+        bridge._sideband_repo_id = _REPO_ID
         status = bridge._sideband_owner_freshness_status(conn)
         parked = status["parked_batches"][0]
         assert parked["origin_thread_id"].endswith(thread_id[-4:])
