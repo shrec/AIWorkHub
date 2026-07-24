@@ -152,3 +152,29 @@ def test_scan_missing_base_is_empty_not_error(tmp_path) -> None:
     # cleanup on a missing base is a clean no-op.
     result = ws.execute_cleanup(base=tmp_path / "does-not-exist", confirm=True)
     assert result["removed"] == [] and result["ok"] is True
+
+
+def test_format_report_names_classes_and_repo(worktrees) -> None:
+    text = ws.format_report(ws.scan_worktrees(worktrees["base"]))
+    assert "retained worktrees" in text
+    assert "4 worktrees" in text
+    assert ws.CLASS_REMOVABLE_SAFE in text and ws.CLASS_ORPHANED in text
+
+
+def test_cli_report_then_dry_run_then_confirm(worktrees, capsys) -> None:
+    base = str(worktrees["base"])
+    # report mode: read-only, exit 0
+    assert ws.main(["--base", base]) == 0
+    assert "retained worktrees" in capsys.readouterr().out
+
+    # dry run: deletes nothing
+    assert ws.main(["--base", base, "--cleanup"]) == 0
+    assert "DRY RUN" in capsys.readouterr().out
+    assert (worktrees["base"] / "W_SAFE").exists()
+
+    # confirm: removes only the safe worktree
+    assert ws.main(["--base", base, "--cleanup", "--confirm"]) == 0
+    assert "removed 1" in capsys.readouterr().out
+    assert not (worktrees["base"] / "W_SAFE").exists()
+    assert (worktrees["base"] / "W_DIRTY").exists()
+    assert (worktrees["base"] / "W_UNPUSHED").exists()

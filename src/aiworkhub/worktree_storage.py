@@ -33,6 +33,8 @@ and deletes nothing unless the caller passes ``confirm=True``.
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -294,3 +296,75 @@ def execute_cleanup(
         "reclaimed_bytes": reclaimed,
         "kept": [wt["id"] for wt in plan["would_keep"]],
     }
+
+
+def _human_bytes(num: int | None) -> str:
+    value = float(num or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def format_report(scan: dict[str, Any]) -> str:
+    """Human-readable summary of a :func:`scan_worktrees` result."""
+    s = scan["summary"]
+    lines = [
+        f"AIWorkHub retained worktrees: {scan['base']}",
+        f"  total: {s['count']} worktrees, {_human_bytes(s['total_bytes'])}"
+        f"  (reclaimable now: {_human_bytes(s['removable_safe_bytes'])})",
+    ]
+    if s["by_class"]:
+        lines.append("  by safety class:")
+        for cls, agg in sorted(s["by_class"].items()):
+            lines.append(f"    {cls:18s} {agg['count']:4d}  {_human_bytes(agg['bytes'])}")
+    if s["by_repo"]:
+        lines.append("  by repository:")
+        for repo, agg in sorted(s["by_repo"].items(), key=lambda kv: -kv[1]["bytes"]):
+            lines.append(f"    {repo:24s} {agg['count']:4d}  {_human_bytes(agg['bytes'])}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: report retained-worktree storage, or safely clean it.
+
+    Default prints a read-only report. ``--cleanup`` shows what a cleanup WOULD
+    remove (dry run); adding ``--confirm`` actually deletes the data-loss-proof
+    (git-clean + fully pushed) worktrees. ``--include-orphaned`` extends cleanup
+    to worktrees with broken git metadata. Nothing is ever deleted without
+    ``--confirm``.
+    """
+    parser = argparse.ArgumentParser(
+        prog="aiworkhub.worktree_storage",
+        description="Visibility and data-loss-proof cleanup for retained task worktrees.",
+    )
+    parser.add_argument("--base", default=None, help="worktree base dir (default: configured root)")
+    parser.add_argument("--cleanup", action="store_true", help="plan/execute cleanup instead of just reporting")
+    parser.add_argument("--confirm", action="store_true", help="actually delete (with --cleanup); default is a dry run")
+    parser.add_argument("--include-orphaned", action="store_true", help="also remove orphaned (broken-git) worktrees")
+    parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    args = parser.parse_args(argv)
+
+    base = Path(args.base) if args.base else None
+    if not args.cleanup:
+        scan = scan_worktrees(base)
+        print(json.dumps(scan, indent=2) if args.json else format_report(scan))
+        return 0
+
+    result = execute_cleanup(base=base, include_orphaned=args.include_orphaned, confirm=args.confirm)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    elif result["dry_run"]:
+        print(f"DRY RUN — would remove {len(result['would_remove'])} worktree(s), "
+              f"reclaim {_human_bytes(result['reclaim_bytes'])}; keep {len(result['would_keep'])}. "
+              f"Re-run with --confirm to delete.")
+    else:
+        print(f"removed {len(result['removed'])} worktree(s), reclaimed "
+              f"{_human_bytes(result['reclaimed_bytes'])}; kept {len(result['kept'])}"
+              + (f"; {len(result['errors'])} error(s)" if result["errors"] else ""))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
