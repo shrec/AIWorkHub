@@ -25,7 +25,7 @@ aiworkhub-reconciler = "aiworkhub.task_reconciler:main"
 aiworkhub-callback-channel = "aiworkhub.callback_channel:main"
 
 [tool.setuptools.package-data]
-aiworkhub = ["dashboard_static/*"]
+aiworkhub = ["dashboard_static/*", "py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
