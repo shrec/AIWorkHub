@@ -1269,6 +1269,75 @@ def _changed_path_hashes(
     return hashes
 
 
+def _path_manifest(base: Path, declared: list[str]) -> dict[str, dict[str, Any]]:
+    """Bounded, deterministic manifest for declared repo-relative paths.
+
+    Used to detect canonical input/dependency drift between the review
+    evidence captured at claim time (``base`` == the canonical repo, read
+    just before ``task_engine.claim_start_exact``) and the state read again
+    immediately before promotion in ``ProcessManager.accept_review`` (B919,
+    closing the B914 race: a retained-worktree validation had passed against
+    a 29-row dependency snapshot while the canonical dependency had already
+    advanced to 3,522 rows by promotion time). A directory entry never
+    content-hashes its children -- only ``entry_count`` plus a
+    ``listing_sha256`` over each immediate child's name/size -- so cost stays
+    proportional to the declared path count, never a broad repository walk.
+    """
+    try:
+        base_resolved = base.resolve()
+    except OSError:
+        base_resolved = base
+    manifest: dict[str, dict[str, Any]] = {}
+    for relative in declared:
+        relative = str(relative)
+        target = base / relative
+        if target.is_symlink():
+            manifest[relative] = {"kind": "missing"}
+            continue
+        try:
+            resolved = target.resolve()
+        except OSError:
+            manifest[relative] = {"kind": "missing"}
+            continue
+        if resolved != base_resolved and base_resolved not in resolved.parents:
+            manifest[relative] = {"kind": "missing"}
+            continue
+        if resolved.is_dir():
+            try:
+                names = sorted(p.name for p in resolved.iterdir())
+            except OSError:
+                manifest[relative] = {"kind": "missing"}
+                continue
+            digest = hashlib.sha256()
+            for name in names:
+                child = resolved / name
+                try:
+                    size = child.stat().st_size if child.is_file() else -1
+                except OSError:
+                    size = -1
+                digest.update(f"{name}:{size}\n".encode("utf-8"))
+            manifest[relative] = {
+                "kind": "dir",
+                "entry_count": len(names),
+                "listing_sha256": digest.hexdigest(),
+            }
+        elif resolved.is_file():
+            try:
+                data = resolved.read_bytes()
+            except OSError:
+                manifest[relative] = {"kind": "missing"}
+                continue
+            manifest[relative] = {
+                "kind": "file",
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+                "line_count": data.count(b"\n"),
+            }
+        else:
+            manifest[relative] = {"kind": "missing"}
+    return manifest
+
+
 def _task_authority_repo(repo: Path, card: dict[str, Any]) -> Path:
     resolver = getattr(project_context, "resolve_task_repository_root", None)
     if resolver is None:
@@ -1538,6 +1607,82 @@ class ProcessManager:
         worker's workspace."""
         return task_engine.show_task(self.repo, task_id)
 
+    def _load_dependency_card(self, dep_id: str) -> dict[str, Any]:
+        """Best-effort read of an arbitrary dependency card by task_id alone.
+
+        Unlike ``_preflight_card`` this never raises and never checks
+        runner/topic/lifecycle: a missing, archived, or malformed dependency
+        simply yields ``{}`` so input enrichment degrades to "add nothing".
+        Goes through the same repo-bound ``self._show_task`` binding so it can
+        never disagree about which task store is canonical for this launcher.
+        """
+        try:
+            envelope = self._show_task(dep_id)
+        except Exception:  # noqa: BLE001 -- a dep lookup must never break a launch
+            return {}
+        if not isinstance(envelope, dict) or envelope.get("returncode") not in (0, None):
+            return {}
+        stdout = envelope.get("stdout")
+        if isinstance(stdout, dict):
+            card = stdout
+        elif isinstance(stdout, str) and stdout.strip():
+            try:
+                card = json.loads(stdout)
+            except json.JSONDecodeError:
+                return {}
+        else:
+            return {}
+        return card if isinstance(card, dict) else {}
+
+    def _with_dependency_inputs(self, card: dict[str, Any]) -> dict[str, Any]:
+        """Materialize a dependent's ``depends_on`` outputs into its worktree.
+
+        A completed dependency's artifacts are promoted into the canonical
+        working tree UNCOMMITTED (``worker_workspace.promote`` -- no git add /
+        commit), and ``create_workspace`` seeds a new worktree from git
+        ``HEAD`` and then overlays only DECLARED paths from that canonical
+        working tree. So a dependency's outputs are invisible to a dependent
+        unless the dependent declares them -- the measured defect where a
+        promoted-but-uncommitted dependency artifact never reached a dependent's
+        isolated worktree (a completed B948 output unseen by B951).
+
+        This returns a copy of ``card`` whose ``immutable_inputs`` is extended
+        with each ``depends_on`` dependency's declared write scope
+        (``allowed_writes`` plus any ``required_outputs``), so both the seed
+        copy in ``create_workspace`` and the B919 input-drift manifest cover
+        them. Paths the dependent already declares (its own ``immutable_inputs``
+        or ``allowed_writes``) are not re-added. Not-yet-produced paths are
+        harmless: ``_copy_one`` silently skips a missing source. The added set
+        is recorded under ``dependency_materialized_inputs`` for audit.
+        """
+        deps = card.get("depends_on")
+        if not isinstance(deps, list) or not deps:
+            return card
+        existing = [str(p) for p in (card.get("immutable_inputs") or [])]
+        own_writes = {str(p).strip() for p in (card.get("allowed_writes") or [])}
+        have = set(existing)
+        added: list[str] = []
+        for raw_dep in deps:
+            dep_id = str(raw_dep or "").strip()
+            if not dep_id:
+                continue
+            dep_card = self._load_dependency_card(dep_id)
+            for key in ("allowed_writes", "required_outputs"):
+                values = dep_card.get(key)
+                if not isinstance(values, list):
+                    continue
+                for raw in values:
+                    pattern = str(raw or "").strip()
+                    if pattern and pattern not in have and pattern not in own_writes:
+                        have.add(pattern)
+                        added.append(pattern)
+        if not added:
+            return card
+        enriched = dict(card)
+        enriched["immutable_inputs"] = existing + added
+        enriched["dependency_materialized_inputs"] = added
+        return enriched
+
     @contextmanager
     def _registry_lock(self):
         """Serialize duplicate-check + spawn across MCP server processes."""
@@ -1761,7 +1906,11 @@ class ProcessManager:
         provider_env: dict[str, str] | None = None
         try:
             _validate_adapter_identity(runner, adapter_id)
-            card = self._preflight_card(task_id, runner, topic)
+            # Materialize completed dependencies' promoted (accepted-but-not-yet-
+            # committed) outputs into this dependent's isolated worktree by
+            # declaring them as immutable inputs before create_workspace and the
+            # B919 input-drift snapshot see the card.
+            card = self._with_dependency_inputs(self._preflight_card(task_id, runner, topic))
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = project_context.collect_project_context(self.repo, card)
@@ -1855,6 +2004,19 @@ class ProcessManager:
                     package_import_root=worker_ai_tools_mcp.resolve_host_package_import_root(),
                 )
 
+                # B919: snapshot every declared immutable/dependency input from
+                # the canonical repo *before* claim_start_exact, while it is
+                # still exactly the input state this launch will validate
+                # against. accept_review re-reads the same declared paths
+                # from the canonical repo immediately before promotion and
+                # fails closed on any drift (B914).
+                declared_immutable_inputs = [
+                    str(p) for p in (card.get("immutable_inputs") or [])
+                ]
+                immutable_input_manifest = _path_manifest(
+                    self.repo, declared_immutable_inputs
+                )
+
                 claim = task_engine.claim_start_exact(
                     self.repo, task_id, runner, topic, request_id=request_id
                 )
@@ -1905,6 +2067,8 @@ class ProcessManager:
                     "allow_unchanged_required_outputs": list(
                         card.get("allow_unchanged_required_outputs") or []
                     ),
+                    "immutable_inputs": declared_immutable_inputs,
+                    "immutable_input_manifest": immutable_input_manifest,
                     "external_readonly_dirs": external_readonly_dirs,
                     "workspace": workspace.as_metadata(),
                 }
@@ -2981,6 +3145,10 @@ class ProcessManager:
                                 "validation": validations,
                                 "worker_mcp_gate": worker_mcp_gate,
                                 "claim_state": claim_state,
+                                "immutable_inputs": metadata.get("immutable_inputs") or [],
+                                "immutable_input_manifest": (
+                                    metadata.get("immutable_input_manifest") or {}
+                                ),
                                 "workspace": workspace.as_metadata(),
                                 "request_identity": {
                                     "request_id": request_id,
@@ -3550,6 +3718,39 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                 }
+
+            # B919: fail closed before copying any output whenever a declared
+            # immutable/dependency input has drifted since the claim-time
+            # snapshot (B914 -- a retained-worktree validation had passed
+            # against a stale dependency population). Untouched when a task
+            # declares no ``immutable_inputs`` at all.
+            declared_immutable_inputs = [
+                str(p) for p in (evidence.get("immutable_inputs") or [])
+            ]
+            if declared_immutable_inputs:
+                stored_input_manifest = evidence.get("immutable_input_manifest")
+                if not isinstance(stored_input_manifest, dict):
+                    return {
+                        "ok": False,
+                        "error": "stale_input:dependency_manifest_missing",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
+                current_input_manifest = _path_manifest(self.repo, declared_immutable_inputs)
+                changed_inputs = sorted(
+                    relative
+                    for relative in declared_immutable_inputs
+                    if current_input_manifest.get(relative) != stored_input_manifest.get(relative)
+                )
+                if changed_inputs:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "stale_input:dependency_changed:" + ",".join(changed_inputs)
+                        )[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
 
             if not core.writes_allowed():
                 return {

@@ -784,7 +784,7 @@ def create_workspace(
         # Git reports the actionable cause (for example ENOSPC) at the end,
         # after a long checkout progress stream. Preserve that tail.
         raise WorkspaceError(f"git_worktree_add_failed:{result.stderr[-1000:]}")
-    declared = list(card.get("read_first") or []) + list(allowed)
+    declared = list(card.get("read_first") or []) + list(card.get("immutable_inputs") or []) + list(allowed)
     try:
         seeded = _expand_declared(repo, declared)
         seeded = _resolve_local_quoted_includes(repo, seeded)
