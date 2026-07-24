@@ -483,10 +483,41 @@ def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) 
 def aiworkhub_task_reject_review(
     task_id: str,
     reason: str,
+    to: str = "pending",
 ) -> dict[str, Any]:
-    """Write-gated Codex action: requeue a reviewed task with exact feedback."""
+    """Write-gated Codex action: reject a reviewed task with exact feedback and
+    an explicit disposition. ``to`` = pending (rework, default) | blocked |
+    archived | superseded -- so a task whose real next step is a dependency-
+    gated replacement is not silently requeued to pending."""
 
-    return core.reject_review(task_id=task_id, reason=reason)
+    return core.reject_review(task_id=task_id, reason=reason, to=to)
+
+
+@mcp.tool()
+def aiworkhub_task_archive(
+    task_id: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """COORDINATOR WRITE: archive a stale non-processing task atomically
+    (archived_at + card_json + an ``archived`` task_events row). Runs the full
+    coordinator-capability write gate -- use this instead of patching SQLite.
+    For an active/orphaned card use supersede."""
+
+    return core.archive_task(task_id=task_id, reason=reason)
+
+
+@mcp.tool()
+def aiworkhub_task_supersede(
+    task_id: str,
+    reason: str = "",
+    by: str = "",
+) -> dict[str, Any]:
+    """COORDINATOR WRITE: supersede a stale/active task with a replacement.
+    Archives the card as ``superseded`` (allowed even from processing) and
+    records the optional replacement task id via ``by``. Full coordinator-
+    capability gate; atomic; no direct SQLite patching."""
+
+    return core.supersede_task(task_id=task_id, reason=reason, by=by)
 
 
 @mcp.tool()

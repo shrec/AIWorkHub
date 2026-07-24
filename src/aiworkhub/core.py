@@ -2327,13 +2327,26 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
     result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    # Issue 5 (stale Source Graph false blocker): this task's outputs were
+    # promoted into the canonical working tree (uncommitted) before this
+    # finalize. Refresh the Source Graph index BEFORE launching any depends_on
+    # dependents, so a child does not query a stale index and falsely report
+    # this task's just-produced artifact missing (the measured B954->B955 false
+    # blocker). Best-effort and non-overlapping: an index refresh must never
+    # fail the finalization itself.
+    try:
+        result["source_graph_refresh"] = source_graph_refresh_now()
+    except Exception as exc:  # noqa: BLE001 -- refresh must never fail mark_done
+        result["source_graph_refresh"] = {"ok": False, "error": f"{type(exc).__name__}:{exc}"[:200]}
     result["dependency_autolaunch"] = dependency_autolaunch.reconcile_after_accept(
         repo_root(), task_id, claim_start_exact
     )
     return result
 
 
-def reject_review(task_id: str, reason: str, topic: str | None = None) -> dict[str, Any]:
+def reject_review(
+    task_id: str, reason: str, topic: str | None = None, to: str = "pending"
+) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
         return error
@@ -2343,23 +2356,58 @@ def reject_review(task_id: str, reason: str, topic: str | None = None) -> dict[s
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    # Issue 4: reject-review supports an explicit target disposition. Default
+    # "pending" (rework, unchanged). "blocked" parks the task as a coordinator-
+    # blocked outcome; "archived"/"superseded" retire it through the atomic
+    # archive backend instead of silently requeuing a task whose real next step
+    # is dependency-gated replacement.
+    disposition = str(to or "pending").strip().lower()
+    if disposition not in ("pending", "blocked", "archived", "superseded"):
+        return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
     command = [
-        "reject-review", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic), "--reason", reason,
+        "reject-review", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic),
+        "--reason", reason, "--to", disposition,
     ]
     blocked = _canonical_write_gate(
         "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
     )
     if blocked is not None:
         return blocked
+
+    # archived / superseded retire the card atomically (archived_at + card_json
+    # + task_events) via the shared archive backend. Only a card actually in
+    # review may be rejected.
+    if disposition in ("archived", "superseded"):
+        if str(card.get("worker_status") or "").strip().lower() != "review":
+            return _canonical_result(
+                ok=False, returncode=1, stderr=f"reject_not_reviewable:task_id={task_id}", command=command
+            )
+        ok, state = task_store.archive_task(
+            repo_root(), task_id,
+            actor=CODEX_RUNNER, reason=f"reject_review:{reason}"[:200],
+            allow_processing=(disposition == "superseded"),
+            operation=disposition,
+        )
+        if not ok:
+            return _canonical_result(
+                ok=False, returncode=1, stderr=f"reject_{disposition}_failed:{state}", command=command
+            )
+        card2 = task_store.get_task(repo_root(), task_id)
+        stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+        return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
     now = datetime.now(timezone.utc).isoformat()
+    if disposition == "blocked":
+        set_clause = "worker_status='blocked', status='blocked', updated_at=?"
+    else:  # "pending" -- rework, requeue for a fresh claim
+        set_clause = "worker_status='unclaimed', status='pending', claimed_by=NULL, updated_at=?"
     try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
         cur = conn.execute(
-            "UPDATE tasks SET worker_status='unclaimed', status='pending', claimed_by=NULL, updated_at=? "
-            "WHERE task_id=? AND worker_status='review'",
+            f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review'",
             (now, task_id),
         )
         if cur.rowcount != 1:
@@ -2373,13 +2421,81 @@ def reject_review(task_id: str, reason: str, topic: str | None = None) -> dict[s
                 task_id,
                 "reject_review",
                 CODEX_RUNNER,
-                json.dumps({"topic": live_topic, "reason": reason}, ensure_ascii=False),
+                json.dumps({"topic": live_topic, "reason": reason, "to": disposition}, ensure_ascii=False),
                 now,
             ),
         )
         conn.commit()
     finally:
         conn.close()
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
+
+def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> dict[str, Any]:
+    """Coordinator-only: archive a stale task (Issue 3).
+
+    Atomically sets ``archived_at`` + mirrors it into ``card_json`` and writes
+    an ``archived`` ``task_events`` row through ``task_store.archive_task`` --
+    no direct SQLite patching. Runs the FULL coordinator-capability write gate
+    (unlike the bare ``writes_allowed()`` manager tool). A ``processing`` card
+    is refused here (use ``supersede_task`` for an active/orphaned card)."""
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = str(card.get("topic") or "")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    command = ["archive", task_id, "--runner", CODEX_RUNNER, "--reason", reason]
+    gate = _canonical_write_gate(
+        "archive", runner=CODEX_RUNNER, topic=live_topic, coordinator_capability=True
+    )
+    if gate is not None:
+        return gate
+    ok, state = task_store.archive_task(
+        repo_root(), task_id, actor=CODEX_RUNNER, reason=str(reason)[:200], operation="archived"
+    )
+    if not ok:
+        return _canonical_result(ok=False, returncode=1, stderr=f"archive_failed:{state}", command=command)
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+
+
+def supersede_task(
+    task_id: str, reason: str = "", by: str = "", topic: str | None = None
+) -> dict[str, Any]:
+    """Coordinator-only: supersede a stale/active task with a replacement (Issue 3).
+
+    Archives the card as ``superseded`` (allowed even from ``processing``, for a
+    stale/orphaned card) and records the optional replacement ``--by`` task id
+    in the audit reason. Same atomic archive backend + coordinator-capability
+    gate as ``archive_task``; no direct SQLite patching."""
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = str(card.get("topic") or "")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    by = str(by or "").strip()
+    command = ["supersede", task_id, "--runner", CODEX_RUNNER, "--reason", reason]
+    if by:
+        command += ["--by", by]
+    gate = _canonical_write_gate(
+        "archive", runner=CODEX_RUNNER, topic=live_topic, coordinator_capability=True
+    )
+    if gate is not None:
+        return gate
+    full_reason = (f"superseded_by:{by}; {reason}" if by else str(reason))[:200]
+    ok, state = task_store.archive_task(
+        repo_root(), task_id, actor=CODEX_RUNNER, reason=full_reason,
+        allow_processing=True, operation="superseded",
+    )
+    if not ok:
+        return _canonical_result(ok=False, returncode=1, stderr=f"supersede_failed:{state}", command=command)
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
     return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)

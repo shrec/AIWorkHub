@@ -373,10 +373,17 @@ _CALLBACK_TRANSITION_MAP: dict[str, str] = {
     "monitor_error": "blocked",
     "process_lost": "blocked",
     "stale": "blocked",
+    # dependency_blocked / liveness_lost do not start with "blocked", so without
+    # an explicit mapping they used to fall through to the review_ready fallback
+    # (B921 substatus-truth: a blocked outcome must never be delivered as
+    # review_ready). Map them to their real failure class.
+    "dependency_blocked": "blocked",
+    "liveness_lost": "blocked",
     "launch_failed": "launch_failed",
     "worker_failed": "launch_failed",
     "exited_without_review": "launch_failed",
     "validation_failed": "validation_failed",
+    "required_output_unchanged": "validation_failed",
     "scope_rejected": "scope_rejected",
     "timed_out": "timed_out",
     "cancelled": "cancelled",
