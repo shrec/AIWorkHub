@@ -183,10 +183,15 @@ def test_handle_message_initialize_returns_capability_and_marks_initialized():
         wait_fn=lambda *, timeout_seconds: {"ok": True, "status": "timeout_no_callback"},
         ack_fn=lambda *_: {"ok": True},
     )
-    response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
-    assert response["id"] == 1
-    assert response["result"]["capabilities"]["experimental"][CHANNEL_CAPABILITY] == {}
-    assert server._initialized.is_set()
+    try:
+        response = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        assert response["id"] == 1
+        assert response["result"]["capabilities"]["experimental"][CHANNEL_CAPABILITY] == {}
+        assert server._initialized.is_set()
+    finally:
+        # ``initialize`` starts the background pump; stop it so no daemon thread
+        # leaks into the rest of the suite (a leaked pump used to hot-spin).
+        server.stop()
 
 
 def test_serve_answers_initialize_over_stdio():
@@ -209,6 +214,7 @@ def test_serve_answers_initialize_over_stdio():
         assert '"id": 1' in out.lines[0] or '"id":1' in out.lines[0]
     finally:
         gate.set()
+        server.stop()  # join the background pump so nothing leaks past the test
 
 
 def test_ping_is_answered_and_unknown_request_is_method_not_found():
@@ -220,3 +226,50 @@ def test_ping_is_answered_and_unknown_request_is_method_not_found():
     assert server.handle_message({"method": "notifications/initialized"}) is None
     err = server.handle_message({"id": 3, "method": "tools/call"})
     assert err["error"]["code"] == -32601
+
+
+# ---------------------------------------------------------------------------
+# 5. the push loop paces itself -- an idle/no-manager wait never hot-spins
+# ---------------------------------------------------------------------------
+
+def test_pump_loop_backs_off_and_never_hot_spins_when_idle():
+    """Regression: a wait_fn that returns WITHOUT blocking (elapsed idle window,
+    or a session that is not a verified manager) must make the pump BACK OFF,
+    not hot-spin a CPU core. With a large idle backoff the loop makes exactly
+    one idle poll and then parks until stopped; a hot-spinning loop would call
+    wait_fn thousands of times in the same window -- the bug that pegged a core
+    across the whole test suite (and would peg one in any non-manager session).
+    """
+    import time
+
+    calls = {"n": 0}
+    first_poll = threading.Event()
+
+    def wait_fn(*, timeout_seconds):
+        calls["n"] += 1
+        first_poll.set()
+        return {"ok": True, "status": "timeout_no_callback"}  # idle, returns instantly
+
+    server = CallbackChannelServer(
+        wait_fn=wait_fn,
+        ack_fn=lambda *_: {"ok": True},
+        idle_backoff_seconds=30.0,  # large: one idle poll, then park until stop
+    )
+    server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize"})  # starts pump
+    try:
+        assert first_poll.wait(timeout=5), "pump never ran"
+        time.sleep(0.3)  # a hot-spin would rack up thousands of calls in this window
+        assert calls["n"] <= 2, f"pump hot-spun: {calls['n']} idle polls in 0.3s"
+    finally:
+        server.stop()
+
+
+def test_stop_is_safe_before_pump_ever_starts():
+    """``stop()`` must be a no-op-safe idempotent call even if the pump thread
+    was never started (no ``initialize`` received)."""
+    server = CallbackChannelServer(
+        wait_fn=lambda *, timeout_seconds: {"ok": True, "status": "timeout_no_callback"},
+        ack_fn=lambda *_: {"ok": True},
+    )
+    server.stop()
+    server.stop()  # idempotent

@@ -61,6 +61,15 @@ CHANNEL_CAPABILITY = "claude/channel"
 CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 PROTOCOL_VERSION = "2024-11-05"
 MAX_LINE_BYTES = 8 * 1024 * 1024
+# Idle pacing between non-productive pump iterations. The real
+# ``claude_callback_wait`` blocks up to its timeout while a manager session is
+# waiting, but it returns IMMEDIATELY when the session is not a verified
+# manager (``no_manager``) or the wait window elapses with no callback. Without
+# an explicit backoff the push loop would then hot-spin a full CPU core -- that
+# is what pegged a core across the whole test suite and would peg one in any
+# non-manager production session too. Only a delivered push skips the backoff,
+# so a real backlog still drains promptly.
+DEFAULT_IDLE_BACKOFF_SECONDS = 1.0
 
 # Instruction added to Claude's system prompt so the model knows how to treat
 # these events. One-way: read and act, never reply to the channel.
@@ -150,6 +159,7 @@ class CallbackChannelServer:
         ack_fn: Callable[..., dict[str, Any]] | None = None,
         wait_timeout: int = 60,
         server_name: str = "aiworkhub",
+        idle_backoff_seconds: float = DEFAULT_IDLE_BACKOFF_SECONDS,
     ) -> None:
         self._stdin = stdin if stdin is not None else sys.stdin.buffer
         self._stdout = stdout if stdout is not None else sys.stdout
@@ -157,6 +167,7 @@ class CallbackChannelServer:
         self._ack_fn = ack_fn or _default_ack_fn
         self._wait_timeout = max(1, min(int(wait_timeout), 300))
         self._server_name = server_name
+        self._idle_backoff_seconds = max(0.0, float(idle_backoff_seconds))
         self._write_lock = threading.Lock()
         self._initialized = threading.Event()
         self._stop = threading.Event()
@@ -199,10 +210,18 @@ class CallbackChannelServer:
         self._initialized.wait()
         while not self._stop.is_set():
             try:
-                self.pump_once()
+                status = self.pump_once()
             except Exception:  # noqa: BLE001 -- a push failure must never kill the channel
-                # Back off briefly so a persistent error does not hot-spin.
-                self._stop.wait(1.0)
+                status = "error"
+            # Only a delivered push may have more backlog to drain right away.
+            # Every other outcome -- an elapsed idle wait window, a session that
+            # is not a verified manager (``no_manager``), a rejected ack, or a
+            # transient error -- must back off. The real ``wait_fn`` can return
+            # any of these WITHOUT blocking, so skipping the backoff would
+            # hot-spin a CPU core (the cause of the test-suite slowdown, and a
+            # 100%-CPU idle channel in production).
+            if status != "pushed":
+                self._stop.wait(self._idle_backoff_seconds)
 
     def _ensure_pump_started(self) -> None:
         if self._pump_thread is not None:
@@ -212,6 +231,19 @@ class CallbackChannelServer:
         )
         self._pump_thread = thread
         thread.start()
+
+    def stop(self, *, timeout: float = 2.0) -> None:
+        """Stop the push loop and join its thread (idempotent, bounded).
+
+        Safe to call whether or not the pump was ever started. A pump parked in
+        the idle backoff wakes immediately (it waits on the same stop event); a
+        pump blocked inside a long real ``wait_fn`` is a daemon thread and is
+        left to unwind on its own after ``timeout`` so shutdown never hangs.
+        """
+        self._stop.set()
+        thread = self._pump_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
 
     # --- handshake ----------------------------------------------------------
     def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
