@@ -24,6 +24,7 @@ virtualenv, so it cannot silently succeed by falling back to an ambient
 from __future__ import annotations
 
 import json
+import json
 import os
 import select
 import subprocess
@@ -42,15 +43,25 @@ if str(SRC) not in sys.path:
 
 
 def _vsix_path() -> Path:
+    """Always (re)build the VSIX from the CURRENT source and return exactly that
+    freshly-built artifact.
+
+    An earlier version globbed ``dist/aiworkhub-*.vsix`` and returned
+    ``sorted(...)[-1]``. That sort is lexicographic, so a dist/ holding many
+    historical builds returned e.g. ``aiworkhub-0.6.9.vsix`` ("...-0.6.9" sorts
+    after "...-0.6.31") -- a stale bundle. The test then validated OLD bundled
+    output and silently passed local source changes, while CI (with an empty
+    dist/) built fresh and failed. Building fresh every time makes this test
+    validate the current extension.js/runtime deterministically on every host.
+    """
     dist = EXT_DIR / "dist"
-    candidates = sorted(dist.glob("aiworkhub-*.vsix"))
-    if not candidates:
-        subprocess.run(
-            ["node", "test/package-vsix.js"], cwd=str(EXT_DIR), check=True, timeout=120
-        )
-        candidates = sorted(dist.glob("aiworkhub-*.vsix"))
-    assert candidates, "no packaged VSIX found and packaging step failed to produce one"
-    return candidates[-1]
+    version = json.loads((EXT_DIR / "package.json").read_text(encoding="utf-8"))["version"]
+    subprocess.run(
+        ["node", "test/package-vsix.js"], cwd=str(EXT_DIR), check=True, timeout=120
+    )
+    built = dist / f"aiworkhub-{version}.vsix"
+    assert built.is_file(), f"packaging step did not produce {built.name}"
+    return built
 
 
 @pytest.fixture(scope="module")
@@ -87,7 +98,13 @@ def test_vsix_bundles_canonical_aiworkhub_package_with_dashboard_assets(extracte
 
 def test_extension_js_never_derives_import_from_repo_or_fixed_host_path(extracted_vsix):
     ext_js = (extracted_vsix / "extension" / "extension.js").read_text(encoding="utf-8")
-    assert 'path.join(context.extensionUri.fsPath, "runtime")' in ext_js
+    # The runtime dir is derived from context.extensionUri via
+    # resolveExtensionRuntimeDir, which prefers the packaged runtime/ and only
+    # falls back to the sibling repo src/ in a development checkout -- never a
+    # repository path or a fixed host-absolute path. (A non-existent runtime/
+    # PYTHONPATH is what broke Codex's `python -m aiworkhub.server`.)
+    assert "resolveExtensionRuntimeDir(context.extensionUri.fsPath)" in ext_js
+    assert 'path.join(extensionFsPath, "runtime")' in ext_js
     assert "env.PYTHONPATH =" in ext_js
     assert "cwd: runtimeDir || root" in ext_js
     for forbidden in ("pip install", "pip3 install", "--editable", "site-packages"):
