@@ -99,7 +99,13 @@ assert.ok(ext.includes("mcpClient.stopDispatcherThenTerminate({ restart: false }
 // a fixed host-absolute path. Both the PYTHONPATH env var and the spawned
 // child's own cwd must be derived from context.extensionUri, and the
 // repository path must stay confined to the AIWORKHUB_REPO* data env vars.
-assert.ok(ext.includes('path.join(context.extensionUri.fsPath, "runtime")'));
+// The runtime dir is resolved from context.extensionUri via
+// resolveExtensionRuntimeDir, which prefers the packaged runtime/ and only
+// falls back to the sibling repo src/ in a development checkout (never a
+// fixed host path). Writing a non-existent runtime/ path here is what broke
+// Codex's `python -m aiworkhub.server`.
+assert.ok(ext.includes("resolveExtensionRuntimeDir(context.extensionUri.fsPath)"));
+assert.ok(ext.includes('path.join(extensionFsPath, "runtime")'));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));

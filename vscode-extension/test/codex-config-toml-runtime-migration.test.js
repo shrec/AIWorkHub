@@ -266,4 +266,55 @@ function assertUnchangedOutsideTargetLine(original, migrated, changedLineSubstri
   assert.deepStrictEqual(splitCodexPythonPathValue("/a/runtime:/b/extra"), ["/a/runtime", "/b/extra"]);
 }
 
+// ── 8. resolveExtensionRuntimeDir: prefer the packaged runtime/, fall back to
+//      the dev-checkout src/, and never return a path missing the aiworkhub
+//      package. Writing a non-existent runtime/ into the Codex config is what
+//      made `python -m aiworkhub.server` fail (ModuleNotFoundError) and stopped
+//      the Codex chat from launching. ───────────────────────────────────────
+{
+  const fs = require("fs");
+  const os = require("os");
+  const { resolveExtensionRuntimeDir } = __testInternals;
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "awh-rt-"));
+
+  // (a) packaged VSIX layout: <ext>/runtime/aiworkhub/__init__.py exists.
+  const packagedExt = path.join(base, "shrec.aiworkhub-0.6.31");
+  fs.mkdirSync(path.join(packagedExt, "runtime", "aiworkhub"), { recursive: true });
+  fs.writeFileSync(path.join(packagedExt, "runtime", "aiworkhub", "__init__.py"), "");
+  assert.strictEqual(resolveExtensionRuntimeDir(packagedExt), path.join(packagedExt, "runtime"),
+    "packaged VSIX must resolve to its runtime/ dir");
+
+  // (b) dev checkout: <ext>=<repo>/vscode-extension with NO runtime/, but the
+  //     repo's ../src/aiworkhub exists (runtime/ is only built at package time).
+  const repo = path.join(base, "AIWorkHub");
+  const devExt = path.join(repo, "vscode-extension");
+  fs.mkdirSync(devExt, { recursive: true });
+  fs.mkdirSync(path.join(repo, "src", "aiworkhub"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "src", "aiworkhub", "__init__.py"), "");
+  assert.strictEqual(resolveExtensionRuntimeDir(devExt), path.join(repo, "src"),
+    "dev checkout with no runtime/ must fall back to the repo src/ dir");
+
+  // (c) neither candidate exists: best-effort packaged path so the existing
+  //     repair still runs exactly as before this change.
+  const bareExt = path.join(base, "bare");
+  fs.mkdirSync(bareExt, { recursive: true });
+  assert.strictEqual(resolveExtensionRuntimeDir(bareExt), path.join(bareExt, "runtime"),
+    "with neither candidate present, fall back to the packaged runtime/ path");
+
+  // (d) regression for the dev-mode dead-path bug: a config PYTHONPATH pointing
+  //     at a non-existent runtime/ is now HEALED to the resolved (existing)
+  //     src/ dir instead of being left dead (previously changed=false).
+  const brokenConfig = [
+    "[mcp_servers.AIWorkHub.env]",
+    `PYTHONPATH = "${path.join(devExt, "runtime")}"`,
+  ].join("\n");
+  const healed = repairCodexConfigTomlText(brokenConfig, resolveExtensionRuntimeDir(devExt));
+  assert.strictEqual(healed.changed, true, "dead runtime/ PYTHONPATH must be healed, not left in place");
+  assert.ok(healed.text.includes(`PYTHONPATH = "${path.join(repo, "src")}"`),
+    "healed PYTHONPATH must point at the resolved src/ dir");
+
+  fs.rmSync(base, { recursive: true, force: true });
+}
+
 console.log("AIWorkHub Codex config.toml runtime migration contract checks passed");

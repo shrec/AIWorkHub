@@ -66,6 +66,30 @@ See [Getting Started](docs/GETTING_STARTED.md) for the full walkthrough
 (including headless/CLI-only setup) and [Architecture](docs/ARCHITECTURE.md)
 for how the pieces fit together.
 
+## 0.6.31 coordinator lifecycle and callback reliability
+
+- Claude callback **channel** (`aiworkhub-callback-channel`): a native Claude
+  Code channel that pushes terminal review callbacks into a live session with
+  no polling -- the Claude-side analog of the Codex sideband push. Research
+  preview; live delivery must still be confirmed against a real
+  `claude --channels` session.
+- The callback channel push loop backs off when idle instead of spinning a CPU
+  core when the session is not a verified manager or no callback is due.
+- Coordinator task lifecycle: a repository-local, owner-only coordinator token
+  is the capability for the repository owner (no separately exported env token
+  required); new `archive`/`supersede` commands; and `reject-review` takes an
+  explicit disposition (pending | blocked | archived | superseded). All are
+  coordinator-capability gated and atomic.
+- A readonly task may declare `allowed_writes: []` on purpose; only a missing
+  key is rejected. The validator reports a cached/zero-hit Source Graph as
+  stale rather than contradicting a successful call. Terminal substatuses
+  (dependency-blocked, liveness-lost, required-output-unchanged) map to the
+  correct callback transition instead of silently becoming review-ready.
+- A dependency's declared outputs are materialized into a dependent's isolated
+  worktree so a promoted-but-uncommitted artifact is visible to it. The
+  callback dispatcher fails closed on an unresolved repository identity and
+  recovers through a watchdog.
+
 ## 0.6.30 reliability and quality foundation
 
 - Callback delivery is authorized by an expiring per-window, per-repository

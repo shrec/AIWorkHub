@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.30";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.31";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -1197,6 +1197,26 @@ function codexConfigTomlPath() {
   return resolveCodexConfigTomlPath(process.env);
 }
 
+/** Resolve the directory that must be on PYTHONPATH for `python -m
+ *  aiworkhub.server` to import the bundled runtime. A packaged VSIX ships the
+ *  package at `<ext>/runtime/aiworkhub`; a development checkout has it at
+ *  `<ext>/../src/aiworkhub` and only produces `runtime/` at VSIX build time.
+ *  Prefer the packaged `runtime/`, fall back to the repo `src/` -- the SAME
+ *  runtime/ -> src/ resolution the bundled bin/aiworkhub-app-server-mux
+ *  launcher already performs. Writing a `runtime/` path that does not exist is
+ *  exactly what silently breaks Codex's `python -m aiworkhub.server`
+ *  (ModuleNotFoundError: No module named 'aiworkhub') and stops the Codex chat
+ *  from launching, so this never returns a directory that lacks the aiworkhub
+ *  package unless NEITHER candidate exists (then the packaged path, so the
+ *  existing repair still runs as before). */
+function resolveExtensionRuntimeDir(extensionFsPath) {
+  const packaged = path.join(extensionFsPath, "runtime");
+  if (fs.existsSync(path.join(packaged, "aiworkhub", "__init__.py"))) return packaged;
+  const devSrc = path.resolve(extensionFsPath, "..", "src");
+  if (fs.existsSync(path.join(devSrc, "aiworkhub", "__init__.py"))) return devSrc;
+  return packaged;
+}
+
 // Matches only extension-versioned AIWorkHub runtime paths this extension
 // itself ever writes into PYTHONPATH (`.../shrec.aiworkhub-<version>/runtime`),
 // on any OS path separator. An optional leading Windows drive letter (e.g.
@@ -1432,7 +1452,7 @@ function ensureCodexConfigTomlRepaired(context) {
   } catch (_err) {
     return false;
   }
-  const currentRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
+  const currentRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   const { text, changed } = repairCodexConfigTomlText(original, currentRuntimeDir);
   if (!changed) {
     return false;
@@ -1464,7 +1484,7 @@ function migrateCodexConfigTomlRuntimePath(context) {
   } catch (_err) {
     return false;
   }
-  const currentRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
+  const currentRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   const { content, changed } = migrateCodexConfigTomlText(original, currentRuntimeDir);
   if (!changed) {
     return false;
@@ -2587,7 +2607,7 @@ async function selectRepositoryCommand() {
 
 async function activate(context) {
   extensionContext = context;
-  extensionRuntimeDir = path.join(context.extensionUri.fsPath, "runtime");
+  extensionRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
   await ensureCodexMuxConfigured(context);
@@ -2684,6 +2704,7 @@ module.exports = {
     shouldRepairCodexMuxSetting,
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
+    resolveExtensionRuntimeDir,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,

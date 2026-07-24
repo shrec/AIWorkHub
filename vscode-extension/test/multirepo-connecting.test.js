@@ -80,7 +80,7 @@ class FakeChild extends EventEmitter {
       }
     } else if (tool === "aiworkhub_dashboard_health") {
       this._send({
-        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.30" }) }],
+        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.31" }) }],
       }, message.id);
     } else if (tool === "aiworkhub_dispatcher_ensure_started") {
       this._send({
@@ -126,7 +126,7 @@ function loadExtensionHost(repoRoot) {
     const extension = require(extensionPath);
     const context = {
       extensionUri: { fsPath: path.resolve(__dirname, "..") },
-      extension: { packageJSON: { version: "0.6.30" } },
+      extension: { packageJSON: { version: "0.6.31" } },
       subscriptions: [],
       workspaceState: { update: () => {}, get: () => undefined },
     };

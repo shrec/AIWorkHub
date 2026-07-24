@@ -19,7 +19,7 @@ const os = require("os");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
-const EXPECTED_VERSION = "0.6.30";
+const EXPECTED_VERSION = "0.6.31";
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
