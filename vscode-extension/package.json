@@ -97,6 +97,11 @@
           "default": "",
           "scope": "resource",
           "description": "Optional Python executable. Empty uses the selected repository virtual environment when present, otherwise Python from the system PATH."
+        },
+        "aiworkhub.enableCodexSidebandMux": {
+          "type": "boolean",
+          "default": false,
+          "description": "Route the OpenAI Codex extension's app-server through the AIWorkHub sideband mux (chatgpt.cliExecutable) so terminal review callbacks push into the Codex coordinator chat. OFF by default: it wraps another extension's CLI and, with Codex's single machine-wide IPC socket, can break multi-window use. Enable only after verifying Codex still launches in every window you use. When off, Codex launches directly and the Claude callback lane is unaffected."
         }
       }
     }

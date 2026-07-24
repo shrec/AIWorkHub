@@ -114,6 +114,12 @@ assert.ok(ext.includes('path.join(extensionFsPath, "runtime")'));
 assert.ok(ext.includes("function bindCodexSidebandEnvironment"));
 assert.ok(ext.includes("process.env.AIWORKHUB_REPO_ID = repoId"));
 assert.ok(ext.includes("if (!process.env.AIWORKHUB_REPO_ID)"));
+
+// The Codex sideband mux is OPT-IN and OFF by default: it must be gated behind
+// aiworkhub.enableCodexSidebandMux and, when off, restore chatgpt.cliExecutable
+// so Codex launches directly (never break another extension by default).
+assert.ok(ext.includes('get("enableCodexSidebandMux", false)'));
+assert.ok(ext.includes('await chatgpt.update("cliExecutable", undefined, vscode.ConfigurationTarget.Global)'));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));

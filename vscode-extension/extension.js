@@ -1190,6 +1190,30 @@ async function ensureCodexMuxConfigured(context) {
     outputChannel.appendLine("[callback] Codex sideband mux requires a native Windows launcher");
     return false;
   }
+  // Default-OFF opt-in. Pointing the OpenAI extension's chatgpt.cliExecutable
+  // at our mux is invasive (it wraps another extension's CLI) and, with a single
+  // machine-wide Codex IPC socket, has caused multi-window breakage. So the mux
+  // is OFF unless the user explicitly enables it AND has verified it in their
+  // setup. When OFF (the default) we never touch cliExecutable -- and actively
+  // RESTORE it if an earlier version left our mux there -- so Codex always
+  // launches directly and reliably (the 0.6.30 behavior). The Claude callback
+  // lane (aiworkhub_claude_callback_wait) is independent and unaffected.
+  const sidebandEnabled = vscode.workspace
+    .getConfiguration("aiworkhub")
+    .get("enableCodexSidebandMux", false);
+  if (!sidebandEnabled) {
+    try {
+      const chatgpt = vscode.workspace.getConfiguration("chatgpt");
+      const current = String(chatgpt.get("cliExecutable", "") || "");
+      if (current.includes("aiworkhub-app-server-mux")) {
+        await chatgpt.update("cliExecutable", undefined, vscode.ConfigurationTarget.Global);
+        outputChannel.appendLine("[callback] Codex sideband mux OFF (default); restored chatgpt.cliExecutable so Codex launches directly");
+      }
+    } catch (err) {
+      outputChannel.appendLine(`[callback] could not restore chatgpt.cliExecutable: ${sanitizeErrorMessage(err)}`);
+    }
+    return false;
+  }
   // Do no harm: only hijack the OpenAI extension's chatgpt.cliExecutable when
   // THIS workspace is bound to a real repository, so the mux (which fails closed
   // without AIWORKHUB_REPO_ID, B925) can actually start the Codex app-server.
