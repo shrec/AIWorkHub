@@ -991,6 +991,62 @@ def _project_context_receipt_from_output(
     return result
 
 
+# Sections the launcher can inject and that the worker MCP gate also accepts as
+# a live tool. A section name outside this set is never credited.
+_GATEABLE_CONTEXT_SECTIONS = frozenset(
+    {"source_graph", "session_current_state", "ai_memory", "kb"}
+)
+
+
+def _injected_context_satisfaction(metadata: dict[str, Any]) -> tuple[bool, set[str]]:
+    """Which required tools a VERIFIED injected project-context section already
+    satisfies, and whether the worker acknowledged the injected bundle.
+
+    Injection and a live worker call are ALTERNATIVE valid satisfaction sources
+    for the same required tool -- the launcher already ran Session Manager / AI
+    Memory / KB / Source Graph and injected their results with a hash receipt,
+    so a worker need not re-run them by hand. A section is credited only when:
+
+    * the whole bundle receipt is acknowledged -- the worker echoed a
+      ``PROJECT_CONTEXT_RECEIPT`` whose ``bundle_sha256`` equals the stored one.
+      That sha binds repository/scope identity (the bundle embeds
+      ``repo_identity.scope_root``), so a tampered, repo-mismatched, or
+      unacknowledged receipt yields ``(False, set())`` and the gate stays
+      fail-closed; AND
+    * the section itself was ``executed`` with an empty ``degraded_reason``.
+
+    ``hit_count`` is deliberately NOT required to be > 0: an executed section
+    that returned zero rows (e.g. AI Memory with no matches) is a valid, real
+    result, never a "missing call" (B948/B951 regression). A degraded / stale /
+    failed section is not credited, so a live recovery call is still required.
+    """
+    context = metadata.get("project_context") or {}
+    if not isinstance(context, dict):
+        return False, set()
+    bundle_sha256 = str(context.get("bundle_sha256") or "").strip()
+    stdout_path = str(metadata.get("stdout_path") or "").strip()
+    if not bundle_sha256 or not stdout_path:
+        return False, set()
+    receipt = _project_context_receipt_from_output(
+        Path(stdout_path), expected_bundle_sha256=bundle_sha256
+    )
+    if not receipt.get("acknowledged"):
+        return False, set()
+    satisfied: set[str] = set()
+    for section in context.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        name = str(section.get("name") or "")
+        if name not in _GATEABLE_CONTEXT_SECTIONS:
+            continue
+        if not section.get("executed"):
+            continue
+        if str(section.get("degraded_reason") or "").strip():
+            continue
+        satisfied.add(name)
+    return True, satisfied
+
+
 def _expected_context_bundle_sha(metadata_path: Path | None) -> str:
     if metadata_path is None or not metadata_path.is_file():
         return ""
@@ -1417,6 +1473,8 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         "missing_tools": [],
         "satisfied": True,
         "reason": "",
+        "satisfaction_by_tool": {},
+        "injected_context_acknowledged": False,
     }
     if not gated:
         return result
@@ -1438,13 +1496,37 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # paths, prompts, or database contents -- only counts and a short reason.
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
     successful = verification.get("successful_call_count_by_tool") or {}
+    # A verified-injected project-context section is an alternative, equally
+    # valid satisfaction source to a live worker call for the SAME required
+    # tool (B948/B951): the launcher already ran the tool and injected its
+    # hash-receipted result, so correct work is no longer failed just because
+    # the worker did not additionally re-run it by hand. Fail-closed integrity
+    # (tampered / repo-mismatched / unacknowledged receipt, degraded section)
+    # is preserved inside _injected_context_satisfaction.
+    injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
+    result["injected_context_acknowledged"] = injected_acknowledged
+    satisfaction_by_tool: dict[str, str] = {}
     missing: list[str] = []
-    if verification.get("live_source_graph_calls", 0) <= 0:
+    # Source Graph freshness is unchanged: a live fresh non-empty canonical call
+    # OR a verified-injected, non-degraded source_graph section satisfies it --
+    # never a cached/empty live call and never an unverified injection.
+    if verification.get("live_source_graph_calls", 0) > 0:
+        satisfaction_by_tool["source_graph"] = "live_worker_call"
+    elif injected_acknowledged and "source_graph" in injected_tools:
+        satisfaction_by_tool["source_graph"] = "injected_receipt"
+    else:
         missing.append("source_graph")
     for tool in required_tools:
-        if tool != "source_graph" and int(successful.get(tool) or 0) <= 0:
+        if tool == "source_graph":
+            continue
+        if int(successful.get(tool) or 0) > 0:
+            satisfaction_by_tool[tool] = "live_worker_call"
+        elif injected_acknowledged and tool in injected_tools:
+            satisfaction_by_tool[tool] = "injected_receipt"
+        else:
             missing.append(tool)
     result["missing_tools"] = missing
+    result["satisfaction_by_tool"] = satisfaction_by_tool
     if not verification.get("ok") or missing:
         result["satisfied"] = False
         result["reason"] = verification.get("reason") or (
