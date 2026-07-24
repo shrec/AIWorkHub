@@ -328,6 +328,31 @@ def _current_chat_provider(card: dict[str, Any] | None = None) -> str:
     return selected if selected in ("codex", "claude", "copilot") else "codex"
 
 
+_COORDINATOR_TOKEN_REL = Path(".aiworkhub") / "runtime" / "coordinator.token"
+
+
+def _resolve_coordinator_token_path(configured_path: str) -> tuple[Path, bool]:
+    """Resolve the coordinator token file (Issue 1).
+
+    An explicitly-configured env path (``BITNN_TASKCTL_COORDINATOR_TOKEN_FILE``)
+    is an intentional override and wins -- backward compatible with any
+    deployment that already exports it. Otherwise the DEFAULT is the ACTIVE
+    repository's own ``.aiworkhub/runtime/coordinator.token`` (a git-ignored,
+    owner-only secret created at Init Repo), then the legacy global
+    ``~/.config/aiworkhub/taskctl_coordinator.token`` fallback. Returns
+    ``(path, is_repo_local)``. Portable: only ``Path`` joins, no host-specific
+    assumptions, so it resolves identically on Linux, WSL, and Windows."""
+    if configured_path:
+        return Path(configured_path).expanduser().resolve(), False
+    try:
+        repo_local = repo_root() / _COORDINATOR_TOKEN_REL
+        if repo_local.is_file():
+            return repo_local.resolve(), True
+    except OSError:
+        pass
+    return DEFAULT_COORDINATOR_TOKEN_FILE.resolve(), False
+
+
 def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     """In-process equivalent of ``AITools/taskctl.py::_require_coordinator``.
 
@@ -346,9 +371,7 @@ def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
         return False, f"coordinator_runner_mismatch:expected={CODEX_RUNNER}:got={runner}"
     scrub_coordinator_capability_from_environment()
     supplied, configured_path = coordinator_config()
-    token_path = (
-        Path(configured_path).expanduser() if configured_path else DEFAULT_COORDINATOR_TOKEN_FILE
-    ).resolve()
+    token_path, is_repo_local = _resolve_coordinator_token_path(configured_path)
     try:
         fd = os.open(str(token_path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
@@ -356,7 +379,10 @@ def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     try:
         file_stat = os.fstat(fd)
         mode = stat.S_IMODE(file_stat.st_mode)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.geteuid():
+        # os.geteuid is POSIX-only; on Windows the git-ignored repo-local file's
+        # ACL is the boundary, so skip the same-uid assertion there.
+        owner_ok = (not hasattr(os, "geteuid")) or file_stat.st_uid == os.geteuid()
+        if not stat.S_ISREG(file_stat.st_mode) or not owner_ok:
             return False, "coordinator_capability_denied:token_file_not_owner_regular"
         with os.fdopen(fd, encoding="utf-8") as fh:
             fd = -1
@@ -364,8 +390,16 @@ def _verify_coordinator_capability(runner: str | None) -> tuple[bool, str]:
     finally:
         if fd >= 0:
             os.close(fd)
-    if mode != 0o600:
+    # POSIX 0600 permission gate (mode bits are not meaningful on Windows).
+    if hasattr(os, "geteuid") and mode != 0o600:
         return False, "coordinator_capability_denied:token_file_permissions"
+    # A correctly-owned repo-local coordinator token file IS the capability for
+    # the repository owner -- no separately-exported env token is required (that
+    # was the reported failure: `coordinator capability denied` unless the env
+    # file was manually exported). An env-supplied token, when present, must
+    # still match.
+    if not supplied and is_repo_local and expected:
+        supplied = expected
     if not supplied or not expected or not hmac.compare_digest(supplied, expected):
         return False, "coordinator_capability_denied:token_mismatch"
     return True, "ok"
@@ -1036,11 +1070,7 @@ def _coordinator_taskctl_env() -> dict[str, str]:
     scrub_coordinator_capability_from_environment()
     configured_token, configured_path = coordinator_config()
 
-    token_path = (
-        Path(configured_path).expanduser()
-        if configured_path
-        else DEFAULT_COORDINATOR_TOKEN_FILE
-    ).resolve()
+    token_path, _is_repo_local = _resolve_coordinator_token_path(configured_path)
     try:
         file_token = token_path.read_text(encoding="utf-8").strip()
     except OSError:

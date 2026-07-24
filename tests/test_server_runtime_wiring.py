@@ -142,7 +142,7 @@ def test_server_lifecycle_tools_preserve_public_schema(monkeypatch):
         ("done", {"task_id": "T1"}),
         (
             "reject",
-            {"task_id": "T1", "reason": "repair this"},
+            {"task_id": "T1", "reason": "repair this", "to": "pending"},
         ),
     ]
 

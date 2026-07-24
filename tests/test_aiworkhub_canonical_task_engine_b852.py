@@ -473,6 +473,10 @@ def test_mark_done_requires_coordinator_token(writable_repo, tmp_path, monkeypat
     monkeypatch.setattr(aiworkhub, "_coordinator_token", "", raising=False)
     monkeypatch.setattr(aiworkhub, "_coordinator_token_file", "", raising=False)
     monkeypatch.setattr(core, "_codex_manager_identity", lambda: None)
+    # Issue 1: Init Repo now seeds a repo-local coordinator token that would
+    # itself grant capability. Remove it too so this negative case has NEITHER
+    # a repo-local nor an env token -> genuinely denied.
+    (writable_repo / ".aiworkhub" / "runtime" / "coordinator.token").unlink(missing_ok=True)
     _insert_task(writable_repo, "TASK_G", "claude_coding", "coding")
     picked = core.auto_pickup("claude_coding", "coding")
     assert picked["ok"] is True

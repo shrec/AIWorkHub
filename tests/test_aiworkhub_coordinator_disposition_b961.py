@@ -171,6 +171,51 @@ def test_archive_requires_coordinator_capability(tmp_path, monkeypatch):
     assert not str(_row(root, "T_NOC")["archived_at"]).strip()
 
 
+# --- issue 1: repo-local coordinator token ---------------------------------
+
+import stat as _stat  # noqa: E402
+
+
+def _clear_coordinator_env(monkeypatch) -> None:
+    monkeypatch.delenv("BITNN_TASKCTL_COORDINATOR_TOKEN", raising=False)
+    monkeypatch.delenv("BITNN_TASKCTL_COORDINATOR_TOKEN_FILE", raising=False)
+    monkeypatch.setattr(aiworkhub, "_coordinator_token", "", raising=False)
+    monkeypatch.setattr(aiworkhub, "_coordinator_token_file", "", raising=False)
+
+
+def test_init_repo_creates_owner_only_coordinator_token(tmp_path):
+    root = _init_repo(tmp_path, "repo_tok")
+    token = root / ".aiworkhub" / "runtime" / "coordinator.token"
+    assert token.is_file()
+    assert token.read_text(encoding="utf-8").strip()
+    if hasattr(os, "geteuid"):
+        assert _stat.S_IMODE(token.stat().st_mode) == 0o600
+
+
+def test_repo_local_token_grants_capability_without_env(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "repo_rl")
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    _clear_coordinator_env(monkeypatch)
+    _insert(root, "T_RL", worker_status="unclaimed", status="pending")
+    # No exported env token -- the repo-local owner-only token IS the capability.
+    res = core.archive_task("T_RL", reason="via repo-local token")
+    assert res["ok"] is True, res
+    assert str(_row(root, "T_RL")["archived_at"]).strip()
+
+
+def test_missing_token_denies_capability(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path, "repo_notok")
+    (root / ".aiworkhub" / "runtime" / "coordinator.token").unlink()
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    _clear_coordinator_env(monkeypatch)
+    _insert(root, "T_NT", worker_status="unclaimed", status="pending")
+    res = core.archive_task("T_NT", reason="x")
+    assert res["ok"] is False
+    assert not str(_row(root, "T_NT")["archived_at"]).strip()
+
+
 # --- issue 5: Source Graph refresh before launching dependents -------------
 
 def test_mark_done_refreshes_source_graph_before_reconcile(coord):

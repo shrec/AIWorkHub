@@ -7,9 +7,11 @@ Callers must explicitly ask to resolve, inspect, or bootstrap a repository.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import secrets
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -371,6 +373,19 @@ def bootstrap_repository(
     runtime_ignore = _assert_relative_child(hub, Path(RUNTIME_DIRNAME) / ".gitignore")
     if not runtime_ignore.exists():
         _atomic_write_text(runtime_ignore, "*\n!.gitignore\n")
+    # Issue 1: a repository-local, git-ignored, owner-only coordinator token so
+    # coordinator writes (done / reject-review / archive / ...) succeed against
+    # this repo without exporting a global env token. Idempotent (never
+    # overwrite an existing token) and best-effort (a token write must never
+    # fail Init Repo).
+    coordinator_token = _assert_relative_child(hub, Path(RUNTIME_DIRNAME) / "coordinator.token")
+    if not coordinator_token.exists():
+        with contextlib.suppress(OSError):
+            fd = os.open(str(coordinator_token), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, (secrets.token_hex(32) + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
     from .storage_registry import STORAGE_REGISTRY_REL, default_registry_payload
 
     registry_path = _assert_relative_child(repo, STORAGE_REGISTRY_REL)
