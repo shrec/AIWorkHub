@@ -106,6 +106,14 @@ assert.ok(ext.includes("mcpClient.stopDispatcherThenTerminate({ restart: false }
 // Codex's `python -m aiworkhub.server`.
 assert.ok(ext.includes("resolveExtensionRuntimeDir(context.extensionUri.fsPath)"));
 assert.ok(ext.includes('path.join(extensionFsPath, "runtime")'));
+
+// Do-no-harm Codex integration: publish the repository identity into the shared
+// workspace-host process.env so the OpenAI Codex extension's mux spawn inherits
+// it (B925), and only hijack chatgpt.cliExecutable once a real repo is bound --
+// an unbound workspace must leave cliExecutable untouched so Codex launches.
+assert.ok(ext.includes("function bindCodexSidebandEnvironment"));
+assert.ok(ext.includes("process.env.AIWORKHUB_REPO_ID = repoId"));
+assert.ok(ext.includes("if (!process.env.AIWORKHUB_REPO_ID)"));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));

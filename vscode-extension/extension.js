@@ -1145,9 +1145,57 @@ function shouldRepairCodexMuxSetting(currentValue) {
   return !fs.existsSync(current);
 }
 
+/** Bind (or clear) the repository identity the AIWorkHub Codex sideband mux
+ *  requires into THIS workspace extension host's process environment.
+ *
+ *  The OpenAI ChatGPT/Codex extension runs in the same remote *workspace*
+ *  extension host as AIWorkHub and spawns `chatgpt.cliExecutable` (our mux)
+ *  inheriting this host's `process.env`. The mux's app-server path fails closed
+ *  without `AIWORKHUB_REPO_ID` (B925: no global repository fallback) -- which is
+ *  exactly what leaves the Codex chat stuck on its logo when we point
+ *  cliExecutable at the mux without binding it. Publishing the identity here is
+ *  what the mux means by "the extension binds it into this process's environment
+ *  before spawning it per workspace".
+ *
+ *  Only a REAL, bound `repo_id` is published; an unbound/sentinel identity CLEARS
+ *  the binding so a foreign repo_id can never leak into a mux spawn (B925) and
+ *  Codex is left to launch normally (do no harm). The write/launch gates are
+ *  never published into the shared environment. Returns true when a real
+ *  identity is now bound. */
+function bindCodexSidebandEnvironment(repoIdentity) {
+  const repoId = repoIdentity && String(repoIdentity.repoId || "");
+  const rootPath = repoIdentity && String(repoIdentity.root || "");
+  if (!repoId || !REAL_REPO_ID_RE.test(repoId)) {
+    for (const key of ["AIWORKHUB_REPO_ID", "AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_CALLBACK_TRANSPORT"]) {
+      delete process.env[key];
+    }
+    return false;
+  }
+  process.env.AIWORKHUB_REPO_ID = repoId;
+  if (rootPath) {
+    process.env.AIWORKHUB_REPO_ROOT = rootPath;
+    process.env.AIWORKHUB_REPO = rootPath;
+  }
+  process.env.AIWORKHUB_WINDOW_ID = WINDOW_SCOPE_ID;
+  process.env.AIWORKHUB_CALLBACK_TRANSPORT = "sideband";
+  // Defense in depth: never publish the write/launch gates into a spawn this
+  // extension does not own.
+  delete process.env.AIWORKHUB_ALLOW_WRITES;
+  delete process.env.AIWORKHUB_ALLOW_LAUNCH;
+  return true;
+}
+
 async function ensureCodexMuxConfigured(context) {
   if (process.platform === "win32") {
     outputChannel.appendLine("[callback] Codex sideband mux requires a native Windows launcher");
+    return false;
+  }
+  // Do no harm: only hijack the OpenAI extension's chatgpt.cliExecutable when
+  // THIS workspace is bound to a real repository, so the mux (which fails closed
+  // without AIWORKHUB_REPO_ID, B925) can actually start the Codex app-server.
+  // When unbound, leave cliExecutable untouched so Codex launches normally.
+  if (!process.env.AIWORKHUB_REPO_ID) {
+    outputChannel.appendLine("[callback] repository not bound; leaving chatgpt.cliExecutable untouched (Codex launches directly)");
     return false;
   }
   const muxPath = path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
@@ -2582,6 +2630,12 @@ async function selectRepositoryCommand() {
   const selectedRepo = getActiveRepositoryRoot(ctx);
   activeRepoIdentity = { ...selectedRepo, label: activeRepoLabel };
 
+  // Re-bind the sideband identity for the newly selected repository and update
+  // chatgpt.cliExecutable to match; switching to an unbound repo clears the
+  // binding and leaves Codex to launch directly (do no harm).
+  bindCodexSidebandEnvironment(activeRepoIdentity);
+  await ensureCodexMuxConfigured(ctx);
+
   // Start the new client and refresh.
   try {
     const client = getMcpClient();
@@ -2610,7 +2664,6 @@ async function activate(context) {
   extensionRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
-  await ensureCodexMuxConfigured(context);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
 
@@ -2626,6 +2679,13 @@ async function activate(context) {
       activeRepoLabel = "No workspace";
     }
   }
+
+  // Bind the repository identity into the shared workspace-host process.env so
+  // the OpenAI Codex extension's mux spawn inherits it, THEN (only when a real
+  // repo is bound) point chatgpt.cliExecutable at the mux. Order matters: bind
+  // first so ensureCodexMuxConfigured's do-no-harm guard sees the binding.
+  bindCodexSidebandEnvironment(activeRepoIdentity);
+  await ensureCodexMuxConfigured(context);
 
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
@@ -2705,6 +2765,7 @@ module.exports = {
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,
+    bindCodexSidebandEnvironment,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,
