@@ -129,6 +129,25 @@ ENV_TRANSPORT = "AIWORKHUB_CALLBACK_TRANSPORT"
 _REJECTED_FLAGS = ("--thread-id", "--client-id", "--no-remote")
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,128}$")
+# B925: same bounded-identifier shape as app_server_mux.py's own
+# ``_validate_repo_id`` -- duplicated locally (not imported) so this
+# module's repo_id validation never depends on app_server_mux.py's
+# internals staying in a particular shape, only on this contract.
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _validate_sideband_repo_id(repo_id: str) -> str:
+    """Fail-closed validation for the repository identity a sideband
+    transport binds to. Never guesses, never falls back to a shared/
+    global identity -- an unbound or malformed repo_id must abort
+    construction, not silently produce a transport that could resolve a
+    different repository's mux instance as its owner (B925)."""
+    if not isinstance(repo_id, str):
+        raise ValueError(f"repo_id must be a string, got {type(repo_id).__name__}")
+    stripped = repo_id.strip()
+    if not stripped or not _REPO_ID_RE.fullmatch(stripped):
+        raise ValueError(f"repo_id must be a non-empty bounded identifier, got {repo_id!r}")
+    return stripped
 
 
 def _utcnow() -> str:
@@ -399,12 +418,20 @@ class ClaudeCliBusyError(BusyThreadError):
 
 
 class ClaudeCliUnavailableError(BusyThreadError):
-    """No usable Claude CLI resume capability right now (executable not
-    found, timed out, or the process exited before producing a matching
-    ack). Subclasses ``BusyThreadError`` on purpose (B856 acceptance
-    criterion: "unavailable must NOT dead-letter, must stay pending") --
-    a missing/unconfigured CLI durably parks, it never loses the callback
-    and never consumes the transport hard-failure/dead-letter budget."""
+    """No usable Claude CLI resume capability right now -- the ``claude``
+    executable could not be spawned at all (``FileNotFoundError`` when it is
+    not installed / not on PATH, or another ``OSError`` when the OS refuses
+    to exec it). Subclasses ``BusyThreadError`` on purpose (B856 acceptance
+    criterion: "unavailable must NOT dead-letter, must stay pending") -- a
+    missing/unconfigured CLI durably parks, it never loses the callback and
+    never consumes the transport hard-failure/dead-letter budget.
+
+    A CLI that DID spawn but then timed out, exited non-zero, or returned an
+    envelope that does not echo back this exact request is instead a genuine
+    transport failure and is raised as ``ClaudeCliProtocolError`` (bounded
+    retry / dead-letter) -- see ``ClaudeCliResumeClient._invoke``. Keep the
+    two paths distinct: "unavailable" is "cannot even run", not "ran and
+    failed"."""
 
 
 class ClaudeCliProtocolError(ClaudeCliError):
@@ -850,9 +877,16 @@ class SidebandCallbackClient:
     def __init__(
         self,
         *,
+        repo_id: str,
         sideband_dir: Path | str | None = None,
         timeout: float = DEFAULT_SIDEBAND_TIMEOUT,
     ) -> None:
+        # B925: repo_id is mandatory -- this transport must never resolve
+        # ownership without knowing exactly which repository it is bound
+        # to, closing the exact cross-repository leakage this client
+        # exists to prevent (a Secp256K1fast thread resolving into a
+        # GeoAI mux instance, or vice versa).
+        self._repo_id = _validate_sideband_repo_id(repo_id)
         self._sideband_dir = Path(sideband_dir) if sideband_dir else default_sideband_dir()
         self._timeout = timeout
         self._socket_lock = threading.Lock()
@@ -875,7 +909,7 @@ class SidebandCallbackClient:
                 sock.close()
 
     def _resolve_owner(self, thread_id: str):
-        instances = find_owning_sideband_instances(self._sideband_dir, thread_id)
+        instances = find_owning_sideband_instances(self._sideband_dir, thread_id, self._repo_id)
         if not instances:
             raise SidebandOwnerNotFoundError("no live mux instance owns this thread")
         if len(instances) > 1:
@@ -1557,6 +1591,7 @@ class CallbackBridge:
         lease_margin_seconds: float = DEFAULT_LEASE_MARGIN_SECONDS,
         transport: str = "subprocess",
         sideband_dir: Path | str | None = None,
+        sideband_repo_id: str = "",
         claude_executable: str | list[str] = "claude",
         claude_repo_id: str = "",
         claude_window_id: str = "",
@@ -1577,6 +1612,12 @@ class CallbackBridge:
             raise ValueError(
                 "claude_cli transport requires claude_repo_id and claude_window_id"
             )
+        if transport == "sideband" and not sideband_repo_id:
+            # Fail closed at construction, mirroring the claude_cli case
+            # above: a sideband bridge instance must know its exact
+            # repository identity up front so ownership resolution can
+            # never fall back to a shared/global default (B925).
+            raise ValueError("sideband transport requires sideband_repo_id")
         self._callback_store = callback_store
         self._repo = Path(repo).expanduser().resolve() if repo else _bound_repo_from_env_or_cwd()
         self._db_path = Path(db_path) if db_path else self._callback_store.resolve_db_path(self._repo)
@@ -1599,16 +1640,20 @@ class CallbackBridge:
         # "claude_cli" (B856) delivers via a repository-bound
         # ``claude --resume <session_id>`` CLI transport instead of Codex's
         # App Server wire protocol. The durable outbox schema in
-        # ``callback_store.py`` has no ``provider`` column (out of scope for
-        # this task's allowed_writes); a claude_cli-transport bridge
-        # instance therefore treats its ENTIRE bound queue as claude-routed
-        # -- exactly the existing "route through the origin_thread_id-keyed
-        # rows using the persistent session_id in that slot" pattern -- and
-        # is deployed as a separate bridge process/db from any codex-
-        # transport bridge for the same repo, never mixed in one instance.
+        # ``callback_store.py`` now carries a ``provider`` column on both
+        # ``callback_outbox`` and ``callback_batches`` and
+        # ``claim_pending_callback_batch`` filters on it, so provider
+        # isolation is enforced at the store level. A claude_cli-transport
+        # bridge instance additionally binds its ENTIRE queue as
+        # claude-routed -- the existing "route through the
+        # origin_thread_id-keyed rows using the persistent session_id in
+        # that slot" pattern -- and is still deployed as a separate bridge
+        # process/db from any codex-transport bridge for the same repo,
+        # never mixed in one instance.
         self._transport = transport
         self._provider = str(provider or "").strip().lower()
         self._sideband_dir = Path(sideband_dir) if sideband_dir else default_sideband_dir()
+        self._sideband_repo_id = str(sideband_repo_id or "")
         self._claude_executable = claude_executable
         self._claude_repo_id = claude_repo_id
         self._claude_window_id = claude_window_id
@@ -1716,7 +1761,11 @@ class CallbackBridge:
                 "parked_age_seconds": _age_seconds(updated_at),
                 "not_before_at": str(row["not_before_at"] or ""),
                 "attempts": int(row["attempts"] or 0),
-                "owner_freshness": describe_sideband_owner_freshness(self._sideband_dir, thread_id),
+                "owner_freshness": (
+                    describe_sideband_owner_freshness(self._sideband_dir, thread_id, self._sideband_repo_id)
+                    if self._sideband_repo_id
+                    else {"owner_count": 0, "fresh_owner_count": 0, "ambiguous": False, "owners": []}
+                ),
             })
         return parked
 
@@ -1788,6 +1837,7 @@ class CallbackBridge:
         if self._transport == "sideband":
             if self._sideband_client is None:
                 self._sideband_client = SidebandCallbackClient(
+                    repo_id=self._sideband_repo_id,
                     sideband_dir=self._sideband_dir, timeout=self._app_server_timeout,
                 )
             self._sideband_client.deliver_callback_batch(
@@ -2102,6 +2152,11 @@ class CallbackDispatcher:
             kwargs: dict[str, Any] = dict(self._bridge_kwargs)
             kwargs["repo"] = self.repo_root
             kwargs["provider"] = self.provider
+            # B925: harmless when the resolved transport isn't "sideband"
+            # (CallbackBridge only enforces/uses it in that case) but
+            # always available so a future switch to the sideband
+            # transport for this dispatcher never silently starts unbound.
+            kwargs.setdefault("sideband_repo_id", self.repo_id)
             if self.provider == "codex":
                 # Existing canonical Codex transport (AppServerClient by
                 # default; "sideband" may be supplied explicitly through

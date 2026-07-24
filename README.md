@@ -55,9 +55,12 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
    below): a claimed task's terminal state (review-ready, blocked, failed,
    timed out) wakes the exact Codex thread that registered it -- no manual
    polling or copy/paste. Claude callback delivery reuses the same durable
-   outbox/lease/retry machinery through the `claude --resume` CLI transport;
-   see [Callback Bridge](#callback-bridge-task-mcp---originating-codex-thread)
-   for the current Claude-specific transport modes and limitations.
+   outbox/lease/retry machinery and reaches the exact originating Claude
+   session, via a cooperative MCP callback inbox or the `claude --resume` CLI
+   transport; see [Claude callback capability](#claude-callback-capability)
+   below (and
+   [Getting Started](docs/GETTING_STARTED.md#6-codex-callback-routing--claude-callback-capability))
+   for the current Claude transport modes and limitations.
 
 See [Getting Started](docs/GETTING_STARTED.md) for the full walkthrough
 (including headless/CLI-only setup) and [Architecture](docs/ARCHITECTURE.md)
@@ -428,6 +431,64 @@ systemctl --user enable --now aiworkhub-callback-bridge.service
 
 Uses the existing local Codex authentication (the `codex` CLI's own login);
 the bridge stores no API/access token of its own.
+
+### Claude callback capability
+
+A Claude coordinator is a first-class manager provider, keyed by its
+persistent Claude Code `session_id` (Codex is keyed by `thread_id`). The same
+durable `callback_outbox`/`callback_batches` machinery -- lease/retry/backoff,
+busy-deferral, and batching -- applies unchanged; the `provider` column keeps
+the Codex and Claude lanes isolated so both managers run in parallel without a
+repository-global toggle.
+
+Claude terminal callbacks reach the **exact originating Claude session** by one
+of three modes, never a fabricated delivery:
+
+- **`channel` push -- Codex parity: no polling, the callback wakes the model
+  itself.** A Claude Code *channel* is a plain MCP server that Claude Code
+  spawns and that pushes events into the running session; the model wakes and
+  acts with no polling and no token burn while idle.
+  `aiworkhub-callback-channel` (`callback_channel.py`) is that channel: a
+  background thread claims the next review callback for this session through the
+  same durable outbox (`claude_callback_wait`/`_ack`, never a second database)
+  and emits it as a `notifications/claude/channel` event whose text names only
+  the task_id(s)/transition(s) and directs the model to inspect the review
+  queue -- never worker output. Register it in `.mcp.json` and launch Claude
+  Code with the channel enabled:
+
+  ```json
+  { "mcpServers": { "aiworkhub": { "command": "aiworkhub-callback-channel" } } }
+  ```
+  ```bash
+  claude --dangerously-load-development-channels server:aiworkhub
+  ```
+
+  Channels are a Claude Code research-preview feature (require claude.ai / API
+  auth; not on Bedrock/Vertex/Foundry; the session must be launched with the
+  channel enabled). The exact flag surface is preview-stage and unverified
+  against a live binary here -- the wire shape is unit-tested, live delivery is
+  confirmed against a real `claude --channels` session.
+- **`manager_inbox` -- cooperative pull.** The verified manager owns a two-phase
+  MCP long-poll inbox -- `aiworkhub_claude_callback_wait` returns the next batch
+  belonging to this exact session and `aiworkhub_claude_callback_ack` durably
+  acknowledges it. Reaches the exact chat while the manager is actively waiting
+  on its inbox; no second process is spawned.
+- **`cli_resume`.** A repository-bound `claude --resume <session_id> --print`
+  transport (`ClaudeCliResumeClient`) delivers to a resumable local Claude Code
+  CLI session, gated on an `event_id`/`request_id` acknowledgement echo before a
+  delivery counts as `delivered`.
+
+**Why not the Codex app-server trick.** Codex's sideband transport wedges
+`aiworkhub/app_server_mux.py` between the VS Code Codex extension and its owned
+`codex app-server` child to inject a live turn into the visible thread. Claude
+Code exposes **no** equivalent injectable app-server (confirmed against the
+official docs and the open `anthropics/claude-code` external-message-injection
+feature requests), so that exact topological trick has no Claude analog -- the
+`channel` push above is the supported Claude-native equivalent instead
+(`ClaudeCallbackAdapter`'s `panel`/`wake_transport` seam, B855, remains
+available for any future in-editor wake endpoint). See
+[Getting Started](docs/GETTING_STARTED.md#6-codex-callback-routing--claude-callback-capability)
+for the current capability summary.
 
 ## App Server Mux + Sideband Transport
 

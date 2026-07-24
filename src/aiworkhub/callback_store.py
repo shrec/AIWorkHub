@@ -341,8 +341,19 @@ def _task_still_in_matching_terminal_state(
     current_episode = str(card.get("claim_epoch") or 0)
     if current_episode != str(episode_id):
         return False
-    raw_terminal = card.get("terminal_outcome") or current_status
-    if _normalize_callback_transition(raw_terminal) != transition:
+    # B921: ``task_store.mark_terminal_review`` writes the authoritative
+    # substatus to ``card["terminal_substatus"]`` -- there has never been a
+    # ``card["terminal_outcome"]`` field written anywhere in this codebase,
+    # so reading that name here always fell through to the generic
+    # ``current_status`` bucket ("review"), which coincidentally always
+    # normalizes to "review_ready". That silently matched only a
+    # (formerly always-hardcoded) "review_ready" transition; once the
+    # enqueue side derives the REAL transition from the substatus, this
+    # recheck must derive its expectation the exact same way or every
+    # non-review_ready callback would mismatch here and be superseded
+    # (silently dropped) instead of delivered.
+    raw_terminal = str(card.get("terminal_substatus") or "").strip() or current_status
+    if resolve_callback_transition(raw_terminal) != transition:
         return False
     if transition == "blocked":
         return current_status in ("review", "blocked")
@@ -382,6 +393,31 @@ def _normalize_callback_transition(raw_state: str | None) -> str | None:
     if key.startswith("blocked"):
         return "blocked"
     return _CALLBACK_TRANSITION_MAP.get(key)
+
+
+def normalize_callback_transition(raw_state: str | None) -> str | None:
+    """Public wrapper: map an authoritative terminal status/substatus string
+    (e.g. ``card["terminal_substatus"]``) to its canonical callback
+    transition, or ``None`` if unrecognized. The sole source of truth for
+    this mapping (``_CALLBACK_TRANSITION_MAP``) so every enqueue/supersede
+    call site derives the SAME transition from the SAME authoritative
+    substatus -- never a caller-hardcoded literal that can drift from it
+    (B917: a hardcoded ``"review_ready"`` enqueue produced a compact callback
+    reading ``review_ready`` for a task whose retained ``terminal_review``
+    event and ``terminal_substatus`` were ``validation_failed``)."""
+    return _normalize_callback_transition(raw_state)
+
+
+def resolve_callback_transition(raw_state: str | None) -> str:
+    """``normalize_callback_transition`` with the one fallback every real
+    caller needs: a substatus with no explicit failure-class mapping (e.g.
+    a plain successful ``"exited"``, which was never added to
+    ``_CALLBACK_TRANSITION_MAP``) resolves to ``"review_ready"`` rather than
+    ``None``. This is the single source of truth BOTH the enqueue side
+    (``task_engine.mark_terminal_review``) and the delivery-eligibility
+    recheck (``_task_still_in_matching_terminal_state``) must call so they
+    can never diverge again the way B921 found them diverged."""
+    return _normalize_callback_transition(raw_state) or "review_ready"
 
 
 # --- Batched delivery ---------------------------------------------------

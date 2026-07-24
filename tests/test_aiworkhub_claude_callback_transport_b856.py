@@ -13,6 +13,7 @@ used by the existing Codex path (never a second callback database).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -143,6 +144,35 @@ def test_cli_client_delivers_on_genuine_matching_ack():
     client = ClaudeCliResumeClient(run_fn=run_fn)
     envelope = client.deliver_callback(str(uuid.uuid4()), "TASK_1", "review_ready", event_id="e1", request_id="r1")
     assert envelope["ok"] is True
+
+
+def test_cli_client_timeout_maps_to_protocol_error_not_unavailable():
+    """A ``claude`` process that spawns but times out is a genuine transport
+    failure (bounded retry / dead-letter), never the durable "unavailable"
+    park. Code and both docstrings must agree on this (regression guard for
+    the ClaudeCliUnavailableError/ClaudeCliProtocolError classification)."""
+    def run_fn(cmd, prompt, timeout):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    client = ClaudeCliResumeClient(run_fn=run_fn)
+    with pytest.raises(ClaudeCliProtocolError) as excinfo:
+        client.deliver_callback(str(uuid.uuid4()), "TASK_1", "review_ready", event_id="e1", request_id="r1")
+    # Must NOT be routed through the busy/unavailable durable-park hierarchy.
+    assert not isinstance(excinfo.value, BusyThreadError)
+    assert not isinstance(excinfo.value, ClaudeCliUnavailableError)
+
+
+def test_cli_client_non_filenotfound_oserror_maps_to_unavailable():
+    """The OS refusing to exec ``claude`` (a non-FileNotFound ``OSError`` such
+    as ``PermissionError``) is "cannot even run" -> ClaudeCliUnavailableError
+    (durable park, never dead-lettered), a BusyThreadError subclass."""
+    def run_fn(cmd, prompt, timeout):
+        raise PermissionError("exec denied")
+
+    client = ClaudeCliResumeClient(run_fn=run_fn)
+    with pytest.raises(ClaudeCliUnavailableError) as excinfo:
+        client.deliver_callback(str(uuid.uuid4()), "TASK_1", "review_ready", event_id="e1", request_id="r1")
+    assert isinstance(excinfo.value, BusyThreadError)
 
 
 def test_adapter_never_marks_delivered_without_calling_cli_transport():

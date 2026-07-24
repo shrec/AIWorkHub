@@ -1078,6 +1078,21 @@ def aiworkhub_dispatcher_stop() -> dict[str, Any]:
     return core.dispatcher_stop()
 
 
+@mcp.tool()
+def aiworkhub_dispatcher_watchdog() -> dict[str, Any]:
+    """Detect and auto-recover a down-but-expected callback dispatcher.
+
+    Intended for the VS Code extension's periodic refresh: when dispatch is
+    expected for this process (extension-owned coordinator or verified Claude
+    manager) but the dispatcher is unregistered/stopped, lost its repo_id, or
+    reports a start error, this re-ensures it in place. A healthy dispatcher, a
+    manager-inbox session, or a process where dispatch is not expected is left
+    untouched. Accumulated durable-outbox callbacks replay automatically once
+    the dispatcher is back."""
+
+    return core.dispatcher_watchdog()
+
+
 # ---------------------------------------------------------------------------
 # 0.6.30: Source Graph automatic indexing lifecycle. Repo-bound (one daemon
 # per canonical repository, no global cross-repo DB, no legacy AITools).

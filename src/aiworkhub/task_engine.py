@@ -176,11 +176,21 @@ def mark_terminal_review(
                         or str(card.get("origin_thread_id") or "").strip()
                     )
                     provider = str(card.get("coordinator_provider") or "").strip().lower()
+                    # B917: derive the callback transition from the SAME
+                    # authoritative substatus just recorded in
+                    # card["terminal_substatus"] -- never a hardcoded
+                    # "review_ready" literal, which previously made the
+                    # emitted callback lie about a validation_failed (or any
+                    # other non-success) terminal outcome. Falls back to
+                    # "review_ready" only for a substatus with no explicit
+                    # failure-class mapping (e.g. a plain successful "exited"),
+                    # preserving prior behavior for those.
+                    transition = callback_store.resolve_callback_transition(substatus)
                     callback_enqueued = callback_store.enqueue_callback(
                         conn,
                         task_id,
                         origin_thread_id,
-                        "review_ready",
+                        transition,
                         provider=provider,
                     )
                     conn.commit()

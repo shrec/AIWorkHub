@@ -22,6 +22,7 @@ aiworkhub-callback-bridge = "aiworkhub.callback_bridge:main"
 aiworkhub-deepseek-credential = "aiworkhub.deepseek_credentials:main"
 aiworkhub-app-server-mux = "aiworkhub.app_server_mux:main"
 aiworkhub-reconciler = "aiworkhub.task_reconciler:main"
+aiworkhub-callback-channel = "aiworkhub.callback_channel:main"
 
 [tool.setuptools.package-data]
 aiworkhub = ["dashboard_static/*"]

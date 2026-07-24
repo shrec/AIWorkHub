@@ -3167,6 +3167,22 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "repo": str(root),
             "provider": provider,
         }
+    if not readiness.repo_id:
+        # Requirement: register repo identity BEFORE starting a dispatcher. An
+        # extension-owned coordinator process (it exports a window id) with no
+        # resolved repo_id must fail loudly and recoverably -- never start a
+        # dispatcher bound to an empty repo_id (which then fails closed inside
+        # the sideband transport and merely looks "stopped" with no cause).
+        return {
+            "ok": False,
+            "status": "repo_id_unavailable",
+            "dispatcher_started": False,
+            "healthy": False,
+            "recoverable": True,
+            "reason": "repository_identity_unregistered_reinit_required",
+            "repo": str(root),
+            "provider": provider,
+        }
     bridge = _callback_bridge_module()
     bridge_kwargs: dict[str, Any] = {}
     if provider == "codex":
@@ -3181,13 +3197,16 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         bridge_kwargs=bridge_kwargs,
     )
     health = dispatcher.health()
+    running = bool(health.get("dispatcher_running"))
     return {
-        "ok": True,
-        "status": "started" if health.get("dispatcher_running") else "start_failed",
-        "dispatcher_started": bool(health.get("dispatcher_running")),
+        **health,
+        "ok": running,
+        "status": "started" if running else "start_failed",
+        "dispatcher_started": running,
+        "healthy": running,
+        "recoverable": not running,
         "repo": str(root),
         "manager_route": claude_identity or {},
-        **health,
     }
 
 
@@ -3278,9 +3297,18 @@ def claude_callback_ack(batch_id: str, lease_id: str) -> dict[str, Any]:
 
 
 def dispatcher_health() -> dict[str, Any]:
-    """Read-only dispatcher health for the active repository. An
-    uninitialized repository is reported as a normal (non-degraded)
-    "uninitialized" status, never as an error."""
+    """Read-only dispatcher health for the active repository.
+
+    An uninitialized repository and a bare headless worker (a child that owns
+    no dispatch) are normal, non-degraded states. But when this process is the
+    extension-owned coordinator (it exports ``AIWORKHUB_WINDOW_ID``) or a
+    verified interactive Claude manager -- i.e. dispatch is EXPECTED here -- a
+    dispatcher that is unregistered, stopped, carries an empty/mismatched
+    ``repo_id``, or reports a start error is a HARD, recoverable health failure
+    (``ok=False``, ``healthy=False``, with an explicit ``problems`` list), never
+    a silent ``ok=True/stopped``. The canonical ``repo_id`` is always the
+    storage-registry truth and is never overwritten by a dispatcher's empty one.
+    """
     root = repo_root()
     readiness = task_store.storage_readiness(root)
     if not readiness.ready:
@@ -3288,19 +3316,90 @@ def dispatcher_health() -> dict[str, Any]:
             "ok": True,
             "status": "uninitialized",
             "dispatcher_running": False,
+            "healthy": True,
+            "dispatch_expected": False,
+            "problems": [],
             "reason": readiness.reason,
             "repo": str(root),
         }
     bridge = _callback_bridge_module()
     health = bridge.dispatcher_health(root)
     target = read_selected_coordinator_target(root)
+    window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
+    claude_identity = _claude_manager_identity()
+    sideband = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower() == "sideband"
+    # A verified Claude manager delivers through the MCP long-poll inbox, not a
+    # background dispatcher thread, so it is healthy WITHOUT a registered one.
+    manager_inbox = (
+        claude_identity is not None and not sideband
+        and target["selected_provider"] == "claude"
+    )
+    # Dispatch is expected only in the extension-owned coordinator process (it
+    # exports a window id) or a verified interactive Claude manager. A bare
+    # headless worker MCP child owns no dispatch -- a role boundary, not a fault.
+    dispatch_expected = bool(window_id) or claude_identity is not None
+    running = bool(health.get("dispatcher_running"))
+    registered = bool(health.get("registered"))
+    dispatcher_repo_id = str(health.get("repo_id") or "")
+    problems: list[str] = []
+    if dispatch_expected and not manager_inbox:
+        if not registered:
+            problems.append("dispatcher_unregistered")
+        elif not running:
+            problems.append("dispatcher_stopped")
+        if not readiness.repo_id:
+            problems.append("repo_id_unavailable")
+        elif registered and not dispatcher_repo_id:
+            problems.append("dispatcher_repo_id_empty")
+        elif dispatcher_repo_id and dispatcher_repo_id != readiness.repo_id:
+            problems.append("dispatcher_repo_id_mismatch")
+        start_error = str(health.get("last_start_error") or "")
+        if start_error:
+            problems.append(f"start_error:{start_error}")
+    healthy = not problems
+    status = "manager_inbox" if manager_inbox else ("running" if running else "stopped")
     return {
-        "ok": True,
-        "status": "running" if health.get("dispatcher_running") else "stopped",
+        **health,
+        "ok": healthy,
+        "healthy": healthy,
+        "status": status,
         "repo": str(root),
         "repo_id": readiness.repo_id,
+        "dispatcher_repo_id": dispatcher_repo_id,
         "selected_provider": target["selected_provider"],
-        **health,
+        "dispatch_expected": dispatch_expected,
+        "recoverable": bool(problems),
+        "problems": problems,
+    }
+
+
+def dispatcher_watchdog() -> dict[str, Any]:
+    """Detect a down-but-expected dispatcher and recover it in place.
+
+    Intended to run on the extension's periodic refresh so a dispatcher that was
+    never registered, crashed, lost its ``repo_id``, or reports a start error is
+    automatically re-ensured instead of silently staying stopped until the next
+    manual reload. A healthy dispatcher, a manager-inbox session, or a process
+    where dispatch is not expected is left untouched.
+    """
+    health = dispatcher_health()
+    if not health.get("dispatch_expected") or health.get("healthy", True):
+        return {
+            "ok": True,
+            "recovered": False,
+            "status": health.get("status"),
+            "reason": "healthy_or_not_expected",
+            "health": health,
+        }
+    recovery = dispatcher_ensure_started()
+    after = dispatcher_health()
+    return {
+        "ok": bool(after.get("healthy")),
+        "recovered": bool(after.get("healthy")),
+        "status": after.get("status"),
+        "problems_before": health.get("problems", []),
+        "recovery": recovery,
+        "health": after,
     }
 
 

@@ -1322,10 +1322,20 @@ def test_run_once_requeues_whole_batch_on_active_turn_not_steerable():
 # child subprocess and a pair of OS pipes standing in for the VS Code
 # extension's own stdio, exactly as in ``test_app_server_mux.py``.
 
+# B925: sideband mux instances and their callback clients are repository-
+# bound; tests share one valid repo_id so mux registration and the client's
+# ownership resolution agree (a mismatched/absent repo_id fails closed).
+_SIDEBAND_TEST_REPO_ID = "repo_cb_sideband_test"
+
+
 class _SidebandHarness:
-    def __init__(self, child_args: list[str] | None = None, *, sideband_dir: Path | None = None):
+    def __init__(
+        self, child_args: list[str] | None = None, *,
+        sideband_dir: Path | None = None, repo_id: str = _SIDEBAND_TEST_REPO_ID,
+    ):
         self.sideband_dir = sideband_dir if sideband_dir is not None else Path(tempfile.mkdtemp(prefix="cb-sideband-"))
         self._owns_sideband_dir = sideband_dir is None
+        self.repo_id = repo_id
         ext_read_fd, self._to_mux_write_fd = os.pipe()
         from_mux_read_fd, ext_write_fd = os.pipe()
         self.mux = AppServerMux(
@@ -1334,6 +1344,7 @@ class _SidebandHarness:
             extension_stdin=os.fdopen(ext_read_fd, "rb", buffering=0),
             extension_stdout=os.fdopen(ext_write_fd, "wb", buffering=0),
             sideband_dir=self.sideband_dir,
+            repo_id=repo_id,
         )
         self._to_mux = os.fdopen(self._to_mux_write_fd, "wb", buffering=0)
         self._from_mux = os.fdopen(from_mux_read_fd, "rb", buffering=0)
@@ -1383,7 +1394,9 @@ class _SidebandHarness:
         self._read_line()  # drain the (possibly protocol-error) response
 
     def client(self, timeout: float = 5.0) -> SidebandCallbackClient:
-        return SidebandCallbackClient(sideband_dir=self.sideband_dir, timeout=timeout)
+        return SidebandCallbackClient(
+            repo_id=self.repo_id, sideband_dir=self.sideband_dir, timeout=timeout,
+        )
 
     def close(self) -> None:
         if self._closed:
@@ -1563,7 +1576,7 @@ def test_sideband_client_empty_sideband_dir_raises_missing_owner_error():
     park, never a hard transport failure."""
     empty_dir = Path(tempfile.mkdtemp(prefix="cb-sideband-empty-"))
     try:
-        client = SidebandCallbackClient(sideband_dir=empty_dir, timeout=1)
+        client = SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=empty_dir, timeout=1)
         with pytest.raises(SidebandOwnerNotFoundError):
             client.thread_resume("thread-x")
     finally:
@@ -1619,7 +1632,7 @@ def test_two_instances_each_thread_resolves_to_its_correct_owner_never_wrong_ser
         h_idle.mark_thread_owned(thread_idle)
         h_active.mark_thread_owned(thread_active)
 
-        client = SidebandCallbackClient(sideband_dir=shared_dir, timeout=5)
+        client = SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=shared_dir, timeout=5)
         idle_response = client.thread_resume(thread_idle)
         assert idle_response["result"]["thread"]["status"] == {"type": "idle"}
 
@@ -1665,7 +1678,7 @@ def test_sideband_probe_never_registers_ownership_and_cannot_steal_thread():
         assert foreign_thread not in h.mux.owned_thread_ids  # ...but claims nothing
 
         with pytest.raises(SidebandOwnerNotFoundError):
-            SidebandCallbackClient(sideband_dir=shared_dir, timeout=5).thread_resume(foreign_thread)
+            SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=shared_dir, timeout=5).thread_resume(foreign_thread)
     finally:
         h.close()
         shutil.rmtree(shared_dir, ignore_errors=True)
@@ -1713,9 +1726,9 @@ def test_stale_registry_row_from_dead_process_is_ignored():
 
         assert app_server_mux.list_live_sideband_instances(shared_dir) == []
         with pytest.raises(SidebandOwnerNotFoundError):
-            SidebandCallbackClient(sideband_dir=shared_dir, timeout=1).thread_resume(dead_thread)
+            SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=shared_dir, timeout=1).thread_resume(dead_thread)
         with pytest.raises(SidebandOwnerNotFoundError):
-            SidebandCallbackClient(sideband_dir=shared_dir, timeout=1).thread_resume(reused_thread)
+            SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=shared_dir, timeout=1).thread_resume(reused_thread)
     finally:
         shutil.rmtree(shared_dir, ignore_errors=True)
 
@@ -1737,11 +1750,13 @@ def test_ambiguous_owner_across_two_live_instances_durably_parks():
         h1.mark_thread_owned(contested_thread)
         h2.mark_thread_owned(contested_thread)
 
-        instances = app_server_mux.find_owning_sideband_instances(shared_dir, contested_thread)
+        instances = app_server_mux.find_owning_sideband_instances(
+            shared_dir, contested_thread, _SIDEBAND_TEST_REPO_ID,
+        )
         assert len(instances) == 2
 
         with pytest.raises(SidebandOwnerAmbiguousError):
-            SidebandCallbackClient(sideband_dir=shared_dir, timeout=5).thread_resume(contested_thread)
+            SidebandCallbackClient(repo_id=_SIDEBAND_TEST_REPO_ID, sideband_dir=shared_dir, timeout=5).thread_resume(contested_thread)
     finally:
         h1.close()
         h2.close()
@@ -1764,6 +1779,7 @@ def test_callback_bridge_sideband_transport_uses_sideband_client_not_subprocess(
             bridge = CallbackBridge(
                 repo=repo, db_path=repo / "q.sqlite", state_path=repo / "state.json",
                 transport="sideband", sideband_dir=h.sideband_dir,
+                sideband_repo_id=h.repo_id,
                 lease_seconds=30, app_server_timeout=5, lease_margin_seconds=1,
             )
             batch = CallbackBatch(
@@ -1799,7 +1815,7 @@ def test_callback_bridge_records_configured_transport():
         repo = Path(d)
         bridge = CallbackBridge(
             repo=repo, db_path=repo / "q.sqlite", state_path=repo / "state.json",
-            transport="sideband",
+            transport="sideband", sideband_repo_id=_SIDEBAND_TEST_REPO_ID,
         )
         assert bridge._transport == "sideband"
         default_bridge = CallbackBridge(

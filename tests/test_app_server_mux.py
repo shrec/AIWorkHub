@@ -204,19 +204,25 @@ def test_non_app_server_invocation_never_touches_sideband_dir():
 # In-process mux harness: OS pipes stand in for the extension's stdio
 # ---------------------------------------------------------------------------
 
+# B925: AppServerMux is repository-bound; the harness supplies one valid
+# repo_id so mux registration and ownership resolution agree on it.
+_MUX_TEST_REPO_ID = "repo_asmux_test"
+
+
 class _MuxHarness:
     """Wires a real ``AppServerMux`` to OS pipes (fake extension) and a
     real ``_fake_app_server.py`` subprocess (fake child App Server)."""
 
     def __init__(
         self, tmp_path: Path, child_args: list[str] | None = None,
-        *, sideband_dir: Path | None = None,
+        *, sideband_dir: Path | None = None, repo_id: str = _MUX_TEST_REPO_ID,
     ):
         # A short, independently-rooted temp dir -- AF_UNIX socket paths
         # are capped at ~108 bytes and pytest's own `tmp_path` fixture
         # nests a long test-name-derived path that overflows that limit.
         self.sideband_dir = sideband_dir if sideband_dir is not None else Path(tempfile.mkdtemp(prefix="asmux-"))
         self._owns_sideband_dir = sideband_dir is None
+        self.repo_id = repo_id
         ext_read_fd, self._to_mux_write_fd = os.pipe()
         self._from_mux_read_fd, ext_write_fd = os.pipe()
         self.mux = AppServerMux(
@@ -225,6 +231,7 @@ class _MuxHarness:
             extension_stdin=os.fdopen(ext_read_fd, "rb", buffering=0),
             extension_stdout=os.fdopen(ext_write_fd, "wb", buffering=0),
             sideband_dir=self.sideband_dir,
+            repo_id=repo_id,
         )
         self._to_mux = os.fdopen(self._to_mux_write_fd, "wb", buffering=0)
         self._from_mux = os.fdopen(self._from_mux_read_fd, "rb", buffering=0)
@@ -546,6 +553,7 @@ def test_bind_socket_regenerates_id_on_collision_without_unlinking_existing_file
             extension_stdin=os.fdopen(os.pipe()[0], "rb", buffering=0),
             extension_stdout=os.fdopen(os.pipe()[1], "wb", buffering=0),
             sideband_dir=other_dir,
+            repo_id=_MUX_TEST_REPO_ID,
         )
         try:
             mux.start()

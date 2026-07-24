@@ -110,6 +110,33 @@ ENV_SIDEBAND_DIR = "AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR"
 DEFAULT_SIDEBAND_DIR = Path.home() / ".aiworkhub" / "app_server_mux"
 REAL_EXECUTABLE_CONFIG_NAME = "real_executable"
 
+# B925: the sideband directory is a single machine-wide location shared by
+# every repository's mux instance (see DEFAULT_SIDEBAND_DIR above) -- the
+# measured defect is that instance ownership was resolved by thread_id
+# alone, with no repository binding, so a second repository's coordinator
+# chat could resolve as the "owner" of a thread that belongs to a
+# different repository entirely. ENV_REPO_ID is the immutable repository
+# identity the extension binds into this process's environment before
+# spawning it per workspace; every sideband instance registers it and
+# every ownership lookup is scoped by it, closing the leak structurally
+# instead of relying on thread ids never colliding.
+ENV_REPO_ID = "AIWORKHUB_REPO_ID"
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+def _validate_repo_id(repo_id: Any) -> str:
+    """Validate a repository identity used to scope sideband instance
+    ownership. Fail-closed: never guesses, never truncates, never accepts
+    an empty/foreign-shaped value as a stand-in for a real repo binding --
+    this is the exact invariant that makes cross-repository callback/
+    thread leakage structurally impossible (B925)."""
+    if not isinstance(repo_id, str):
+        raise ValueError(f"repo_id must be a string, got {type(repo_id).__name__}")
+    stripped = repo_id.strip()
+    if not stripped or not _REPO_ID_RE.fullmatch(stripped):
+        raise ValueError(f"repo_id must be a non-empty bounded identifier, got {repo_id!r}")
+    return stripped
+
 APP_SERVER_ARG = "app-server"
 
 SIDEBAND_ALLOWED_METHODS = frozenset({"thread/resume", "turn/steer", "turn/start"})
@@ -330,6 +357,7 @@ class SidebandInstance:
     socket_path: Path
     capability_path: Path
     owned_thread_ids: tuple[str, ...]
+    repo_id: str
     parent_pid: int = 0
     generation_id: str = ""
     heartbeat_at: float = 0.0
@@ -390,6 +418,14 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         or not all(isinstance(t, str) and t for t in owned)
     ):
         return None
+    # B925: repo_id is a required part of a valid instance descriptor --
+    # a legacy/foreign row written without one (or with a malformed one)
+    # is never a resolvable ownership candidate, never treated as
+    # "unscoped" and silently allowed through repo-scoped lookups.
+    try:
+        repo_id = _validate_repo_id(obj.get("repo_id"))
+    except ValueError:
+        return None
     if not _pid_is_live(pid, obj.get("pid_start_time")):
         return None
     if not isinstance(generation_id, str) or not generation_id:
@@ -408,6 +444,7 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         socket_path=Path(socket_path),
         capability_path=Path(capability_path),
         owned_thread_ids=tuple(owned),
+        repo_id=repo_id,
         parent_pid=parent_pid if isinstance(parent_pid, int) and parent_pid > 1 else 0,
         generation_id=generation_id,
         heartbeat_at=float(heartbeat_at),
@@ -503,30 +540,49 @@ def gc_stale_sideband_instances(sideband_dir: Path | str) -> dict[str, int]:
     return report
 
 
-def find_owning_sideband_instances(sideband_dir: Path | str, thread_id: str) -> list[SidebandInstance]:
-    """Live instances whose OWN observed extension traffic bound ``thread_id``.
+def find_owning_sideband_instances(
+    sideband_dir: Path | str, thread_id: str, repo_id: str,
+) -> list[SidebandInstance]:
+    """Live instances bound to ``repo_id`` whose OWN observed extension
+    traffic bound ``thread_id``.
 
-    Zero results means no live mux instance has ever seen the extension
-    itself resume/start that thread (or its owner has since exited) --
-    the caller must treat that as a durable park, never a guess. More
-    than one result means an unresolved ambiguity -- same treatment,
-    never an arbitrary pick."""
+    B925: ``repo_id`` is mandatory and enforced by construction. An
+    instance descriptor registered by a different repository (or one
+    missing a repo binding entirely) is never a candidate owner, so a
+    Secp256K1fast thread can never resolve into a GeoAI mux instance (or
+    vice versa) even if a thread id were ever to collide across
+    repositories -- the mismatch fails closed rather than falling back to
+    "whichever instance happens to own it." Zero results means no live,
+    repo-matching mux instance has ever seen the extension itself
+    resume/start that thread (or its owner has since exited) -- the
+    caller must treat that as a durable park, never a guess. More than
+    one result means an unresolved ambiguity -- same treatment, never an
+    arbitrary pick."""
+    validated_repo_id = _validate_repo_id(repo_id)
     return [
         instance for instance in list_live_sideband_instances(sideband_dir)
-        if thread_id in instance.owned_thread_ids and instance.is_owner_fresh
+        if instance.repo_id == validated_repo_id
+        and thread_id in instance.owned_thread_ids
+        and instance.is_owner_fresh
     ]
 
 
-def describe_sideband_owner_freshness(sideband_dir: Path | str, thread_id: str) -> dict[str, Any]:
+def describe_sideband_owner_freshness(
+    sideband_dir: Path | str, thread_id: str, repo_id: str,
+) -> dict[str, Any]:
     """Redacted owner/generation freshness for callback status surfaces.
 
     This is diagnostic metadata only. Delivery still resolves through
     ``find_owning_sideband_instances`` so a stale descriptor can only park the
     durable callback; it never authorizes a delivery or a second app server.
+    Scoped by ``repo_id`` exactly like the delivery-path lookup above so a
+    status surface never reports (or an operator never mistakes) a
+    different repository's mux instance as this repository's owner.
     """
+    validated_repo_id = _validate_repo_id(repo_id)
     owners = [
         instance for instance in list_live_sideband_instances(sideband_dir)
-        if thread_id in instance.owned_thread_ids
+        if instance.repo_id == validated_repo_id and thread_id in instance.owned_thread_ids
     ]
     return {
         "owner_count": len(owners),
@@ -621,11 +677,16 @@ class AppServerMux:
         self,
         argv: list[str],
         *,
+        repo_id: str,
         real_executable: str | list[str] | None = None,
         extension_stdin: BinaryIO | None = None,
         extension_stdout: BinaryIO | None = None,
         sideband_dir: Path | str | None = None,
     ) -> None:
+        # B925: fail closed at construction -- an unbound/invalid repo_id
+        # must never silently produce an "unscoped" mux instance that a
+        # repo-scoped lookup could later be tempted to treat as a match.
+        self._repo_id = _validate_repo_id(repo_id)
         self._argv = list(argv)
         self._real_executable: str | list[str] = real_executable or resolve_real_executable()
         self._extension_stdin: BinaryIO = extension_stdin if extension_stdin is not None else sys.stdin.buffer
@@ -697,6 +758,10 @@ class AppServerMux:
     @property
     def instance_id(self) -> str:
         return self._instance_id
+
+    @property
+    def repo_id(self) -> str:
+        return self._repo_id
 
     @property
     def capability_token(self) -> str:
@@ -848,6 +913,7 @@ class AppServerMux:
         descriptor = {
             "instance_id": self._instance_id,
             "generation_id": self._generation_id,
+            "repo_id": self._repo_id,
             "pid": self._pid,
             "parent_pid": self._parent_pid,
             "pid_start_time": self._pid_start_time,
@@ -1140,8 +1206,8 @@ def _try_parse_json_object(raw_line: bytes) -> dict[str, Any] | None:
 
 # --- CLI entry point ---------------------------------------------------------
 
-def run_mux(argv: list[str]) -> int:
-    mux = AppServerMux(argv)
+def run_mux(argv: list[str], *, repo_id: str) -> int:
+    mux = AppServerMux(argv, repo_id=repo_id)
     mux.start()
     try:
         return mux.wait()
@@ -1164,7 +1230,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
             return 1
         return 0  # unreachable on success -- execvp replaces this process
-    return run_mux(raw_argv)
+    # B925: the app-server path is the one that registers sideband
+    # ownership, so it is the one that must never start unbound. The VS
+    # Code extension sets AIWORKHUB_REPO_ID per workspace before spawning
+    # this wrapper as chatgpt.cliExecutable -- there is no global/shared
+    # repo fallback and no interactive prompt here, only a fail-closed
+    # refusal to start.
+    repo_id = os.environ.get(ENV_REPO_ID, "").strip()
+    if not repo_id:
+        print(
+            f"app_server_mux: {ENV_REPO_ID} is required for app-server "
+            "invocations -- no global repository fallback is permitted "
+            "(B925). The VS Code extension must set it per workspace "
+            "before spawning this wrapper as chatgpt.cliExecutable.",
+            file=sys.stderr,
+        )
+        return 1
+    return run_mux(raw_argv, repo_id=repo_id)
 
 
 __all__ = [
@@ -1173,6 +1255,7 @@ __all__ = [
     "DEFAULT_REAL_EXECUTABLE",
     "DEFAULT_SIDEBAND_DIR",
     "ENV_REAL_EXECUTABLE",
+    "ENV_REPO_ID",
     "ENV_SIDEBAND_DIR",
     "SIDEBAND_ALLOWED_METHODS",
     "SIDEBAND_ALLOWED_REQUEST_KEYS",
