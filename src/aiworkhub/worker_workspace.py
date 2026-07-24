@@ -756,8 +756,14 @@ def create_workspace(
     repo = repo.resolve()
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError("invalid_request_id")
-    allowed = tuple(_relative_repo_path(v) for v in card.get("allowed_writes") or [])
-    if not allowed:
+    raw_allowed = card.get("allowed_writes")
+    if raw_allowed is None:
+        # Key absent -> genuinely under-specified (distinct from an intentional
+        # readonly empty list, which a canary/no-output card may legitimately
+        # declare -- no NO_WRITES sentinel required).
+        raise WorkspaceError("allowed_writes_missing")
+    allowed = tuple(_relative_repo_path(v) for v in raw_allowed)
+    if not allowed and (card.get("required_outputs") or []):
         raise WorkspaceError("allowed_writes_empty")
     if any(PurePosixPath(pattern).parts[0] == ".git" for pattern in allowed):
         raise WorkspaceError("git_metadata_write_forbidden")

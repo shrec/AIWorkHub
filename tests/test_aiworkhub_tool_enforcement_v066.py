@@ -54,6 +54,12 @@ def test_completion_gate_requires_every_requested_aiworkhub_surface(monkeypatch)
 
 
 def test_completion_gate_rejects_zero_hit_source_graph_for_code_tasks(monkeypatch) -> None:
+    """B834 + B950: a source_graph call that was successful (canonical) but
+    cached / zero-hit (``live_source_graph_calls == 0``) is still fail-closed
+    (B834 -- ``satisfied is False``), but it must NOT be reported as a bare
+    ``missing:source_graph`` while the same evidence's
+    ``successful_call_count_by_tool.source_graph`` reads > 0 (the B950
+    self-contradiction). It is reported as ``stale_or_cached`` instead."""
     monkeypatch.setattr(
         process_launcher.worker_ai_tools_mcp,
         "verify_audit_ledger",
@@ -71,9 +77,17 @@ def test_completion_gate_rejects_zero_hit_source_graph_for_code_tasks(monkeypatc
 
     result = process_launcher._worker_mcp_live_call_gate(_metadata(), "request-1")
 
+    # B834 preserved: a cached/zero-hit source_graph does not satisfy the gate.
     assert result["satisfied"] is False
-    assert result["missing_tools"] == ["source_graph"]
-    assert result["reason"] == "required_aiworkhub_mcp_calls_missing:source_graph"
+    # B950 fix: it is NOT "missing" (it was called successfully) -- no
+    # contradiction with the evidence's own successful_call_count.
+    assert result["missing_tools"] == []
+    assert result["stale_tools"] == ["source_graph"]
+    assert result["satisfaction_by_tool"]["source_graph"] == "stale_or_cached"
+    assert result["reason"] == "source_graph_stale_or_cached:source_graph"
+    # The report is internally consistent: the same result carries the
+    # successful source_graph count that would have contradicted a bare "missing".
+    assert result["verification"]["successful_call_count_by_tool"]["source_graph"] == 1
 
 
 def test_worker_prompt_explains_runtime_enforcement() -> None:

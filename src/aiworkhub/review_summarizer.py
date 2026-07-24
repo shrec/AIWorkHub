@@ -249,7 +249,8 @@ _SEVERITY_RANK: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
 def _derive_risks(card: dict[str, Any]) -> list[dict[str, str]]:
     """Deterministic risk checklist derived from card metadata (read-only)."""
     risks: list[dict[str, str]] = []
-    allowed = card.get("allowed_writes", []) or []
+    raw_allowed = card.get("allowed_writes")
+    allowed = raw_allowed if isinstance(raw_allowed, list) else []
     validation = card.get("validation", []) or []
     forbidden = card.get("forbidden", []) or []
 
@@ -259,7 +260,11 @@ def _derive_risks(card: dict[str, Any]) -> list[dict[str, str]]:
             "severity": "high",
             "detail": "card declares no validation commands",
         })
-    if not allowed:
+    # A genuinely absent allowed_writes key, or an empty scope on a card that
+    # DOES declare required_outputs, is a real risk. An intentionally-empty
+    # readonly/no-output card (allowed_writes: [] with no required_outputs) is
+    # not flagged -- no NO_WRITES sentinel needed.
+    if raw_allowed is None or (not allowed and (card.get("required_outputs") or [])):
         risks.append({
             "code": "missing_allowed_writes",
             "severity": "high",

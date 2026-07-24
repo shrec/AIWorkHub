@@ -1074,8 +1074,18 @@ def _parse_card(result: dict[str, Any], task_id: str) -> dict[str, Any]:
 
 
 def _validate_scope(repo: Path, card: dict[str, Any]) -> None:
-    allowed = card.get("allowed_writes") or []
-    if not isinstance(allowed, list) or not allowed:
+    allowed = card.get("allowed_writes")
+    if allowed is None:
+        # The key is absent -> a genuinely under-specified card. This is
+        # distinct from an intentionally-empty readonly list (see below).
+        raise LaunchRejected("allowed_writes_missing")
+    if not isinstance(allowed, list):
+        raise LaunchRejected("allowed_writes_invalid")
+    if not allowed and (card.get("required_outputs") or []):
+        # An empty write scope is valid ONLY for a readonly / no-output card
+        # (a canary/verification task that declares no required_outputs). A
+        # card that declares required_outputs but no allowed_writes is a real
+        # misconfiguration -- never accepted, and never via a NO_WRITES sentinel.
         raise LaunchRejected("allowed_writes_empty")
     root = repo.resolve()
     for raw in allowed:
@@ -1507,13 +1517,22 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["injected_context_acknowledged"] = injected_acknowledged
     satisfaction_by_tool: dict[str, str] = {}
     missing: list[str] = []
-    # Source Graph freshness is unchanged: a live fresh non-empty canonical call
-    # OR a verified-injected, non-degraded source_graph section satisfies it --
-    # never a cached/empty live call and never an unverified injection.
+    stale: list[str] = []
+    # Source Graph freshness (B834) is unchanged: ONLY a live fresh non-empty
+    # canonical call OR a verified-injected, non-degraded source_graph section
+    # SATISFIES the gate -- never a cached/empty call and never an unverified
+    # injection. But a source_graph that WAS called successfully yet returned
+    # cached/zero-hit is NOT absent: it is reported as "stale_or_cached" (a
+    # distinct, still-fail-closed reason) rather than a bare "missing", so the
+    # terminal evidence can never say "missing:source_graph" while that same
+    # evidence's successful_call_count_by_tool.source_graph reads > 0 (B950).
     if verification.get("live_source_graph_calls", 0) > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
     elif injected_acknowledged and "source_graph" in injected_tools:
         satisfaction_by_tool["source_graph"] = "injected_receipt"
+    elif int(successful.get("source_graph") or 0) > 0:
+        satisfaction_by_tool["source_graph"] = "stale_or_cached"
+        stale.append("source_graph")
     else:
         missing.append("source_graph")
     for tool in required_tools:
@@ -1526,12 +1545,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         else:
             missing.append(tool)
     result["missing_tools"] = missing
+    result["stale_tools"] = stale
     result["satisfaction_by_tool"] = satisfaction_by_tool
-    if not verification.get("ok") or missing:
+    if not verification.get("ok") or missing or stale:
         result["satisfied"] = False
-        result["reason"] = verification.get("reason") or (
-            "required_aiworkhub_mcp_calls_missing:" + ",".join(missing)
-        )
+        reasons: list[str] = []
+        if missing:
+            reasons.append("required_aiworkhub_mcp_calls_missing:" + ",".join(missing))
+        if stale:
+            reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
+        result["reason"] = verification.get("reason") or "; ".join(reasons)
     return result
 
 
