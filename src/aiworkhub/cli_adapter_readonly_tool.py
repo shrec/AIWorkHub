@@ -48,13 +48,14 @@ point it at an isolated temp directory instead of the shared production file.
 
 from __future__ import annotations
 
+import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 from aiworkhub import cli_adapter_dryrun as dryrun
 from aiworkhub import core
+from aiworkhub import task_store
 
 
 # HARD INVARIANT: this tool is read-only. It never writes queue/audit state.
@@ -124,25 +125,50 @@ def collision_cards_path(repo: Any = None) -> Path:
     return Path(root) / _COLLISION_CARDS_DEFAULT_REL
 
 
-def _collision_guard_helpers():
-    """Lazily import the pure, read-only card classification helpers.
+# The active lifecycle buckets that count as a live claim -- the EXACT set the
+# production collision guard uses (see core._active_cards_for_collision_guard).
+_ACTIVE_STATUSES = frozenset({"pending", "processing", "review", "blocked"})
 
-    Reuses ``scripts/build_tasking_parallel_group_collision_guard_v1.py`` so
-    the preflight never drifts from the production ``canonical_status`` /
-    ``ACTIVE_STATUSES`` semantics. This is a plain in-process module import
-    (no CLI invocation of any kind) of a module that itself contains no
-    child-process launch code.
+
+def _load_cards(cards_path: Path) -> list[dict[str, Any]]:
+    """Read the machine task-card JSONL into a list of card dicts (read-only).
+
+    Tolerant by design: blank lines and individually malformed JSON lines are
+    skipped rather than failing the whole preflight, and a non-object line is
+    ignored. Never acquires a lock and never mutates the file.
     """
-    root = str(core.repo_root())
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from scripts.build_tasking_parallel_group_collision_guard_v1 import (
-        ACTIVE_STATUSES,
-        canonical_status,
-        load_cards,
-    )
+    cards: list[dict[str, Any]] = []
+    try:
+        text = cards_path.read_text(encoding="utf-8")
+    except OSError:
+        return cards
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            card = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(card, dict):
+            cards.append(card)
+    return cards
 
-    return ACTIVE_STATUSES, canonical_status, load_cards
+
+def _collision_guard_helpers():
+    """Pure, read-only card classification helpers for the B107 preflight:
+    ``(ACTIVE_STATUSES, canonical_status, load_cards)``.
+
+    ``canonical_status`` is the production ``task_store.canonical_status`` and
+    ``ACTIVE_STATUSES`` is the exact active-bucket set the live
+    ``core.collision_guard`` uses, so the preflight can never drift from
+    production semantics. These ship INSIDE the installed package: the former
+    ``scripts/build_tasking_parallel_group_collision_guard_v1.py`` import was
+    unshippable (``scripts/`` is not packaged into the wheel or the VSIX
+    runtime, and that file no longer exists anywhere), so any invocation on an
+    installed/VSIX runtime raised ``ModuleNotFoundError``.
+    """
+    return _ACTIVE_STATUSES, task_store.canonical_status, _load_cards
 
 
 def collision_preflight(
