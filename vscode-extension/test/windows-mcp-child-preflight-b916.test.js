@@ -51,7 +51,13 @@ const _buildPreflightDiagnostic = __testInternals._buildPreflightDiagnostic;
 
 /** Write a node script whose behaviour is baked into the file body. */
 function writePythonStub(filePath, exitCode, stderrText) {
-  const lines = ["#!/usr/bin/env node"];
+  // Absolute interpreter keeps these fixtures independent of PATH so the
+  // two all-fallback-failure tests can deliberately hide host Python.  The
+  // release workflow installs aiworkhub before running extension tests;
+  // without this isolation its real `python` becomes a valid fallback and
+  // correctly returns no diagnostic, making the negative test environment-
+  // dependent.
+  const lines = [`#!${process.execPath}`];
   // Ignore -c "import ..." args -- just exit with the baked code.
   if (stderrText) {
     lines.push(`process.stderr.write(${JSON.stringify(String(stderrText))});`);
@@ -202,7 +208,14 @@ describe("findPythonCommand (Windows)", () => {
   test("falls back to system when both repo venvs broken", () => {
     createWindowsVenv(tmp.root, ".venv", 1, "ImportError");
     createWindowsVenv(tmp.root, "venv", 1, "ImportError");
-    const r = findPythonCommand(tmp.root);
+    const previousPath = process.env.PATH;
+    process.env.PATH = tmp.root;
+    let r;
+    try {
+      r = findPythonCommand(tmp.root);
+    } finally {
+      process.env.PATH = previousPath;
+    }
     // final fallback: py or python -- with diagnostic
     assert.ok(r.preflightDiagnostic && r.preflightDiagnostic.length > 0,
       "expected diagnostic");
@@ -223,7 +236,14 @@ describe("findPythonCommand (Windows)", () => {
   test("bounded diagnostic when every candidate fails", () => {
     createWindowsVenv(tmp.root, ".venv", 1, "ImportError: cannot import aiworkhub");
     createWindowsVenv(tmp.root, "venv", 127, "some other error");
-    const r = findPythonCommand(tmp.root);
+    const previousPath = process.env.PATH;
+    process.env.PATH = tmp.root;
+    let r;
+    try {
+      r = findPythonCommand(tmp.root);
+    } finally {
+      process.env.PATH = previousPath;
+    }
     assert.ok(r.preflightDiagnostic);
     assert.ok(r.preflightDiagnostic.length <= 1300);
     assert.ok(r.preflightDiagnostic.includes(".venv") || r.preflightDiagnostic.includes("venv"));
