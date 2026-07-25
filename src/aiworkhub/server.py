@@ -245,6 +245,7 @@ from . import stale_recovery
 from . import task_engine
 from . import dependency_autolaunch
 from . import quality_evidence
+from . import shared_router
 
 
 mcp = FastMCP("AIWorkHub MCP")
@@ -307,6 +308,21 @@ def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
     """MANAGER READ: bounded canonical KB relation lookup."""
 
     return manager_ai_tools.kb_related(key=key)
+
+
+@mcp.tool()
+def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
+    """READ-ONLY: bounded shared registry of live AIWorkHub repository routes.
+
+    This is discovery only.  Task storage and task mutation remain scoped to
+    the current repository's own ``.aiworkhub`` MCP child.
+    """
+
+    return shared_router.list_known_repositories(
+        current_root=core.repo_root(),
+        limit=limit,
+        include_inactive=include_inactive,
+    )
 
 
 @mcp.tool()

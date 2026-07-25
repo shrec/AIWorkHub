@@ -156,6 +156,8 @@ def lifecycle_state(card: dict[str, Any]) -> str:
     """
     status = str(card.get("status") or "").strip().lower()
     worker_status = str(card.get("worker_status") or "").strip().lower()
+    if status == "archived":
+        return "archived"
     if status in {"finished", "completed", "stale_already_done"} or worker_status == "done":
         return "finished"
     if status.startswith("blocked") or worker_status.startswith(("blocked", "deferred")):
@@ -179,7 +181,14 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     ``worker_status``, ``allowed_writes`` and an optional ``depends_on``.
     Pure function: no IO, no mutation, deterministic given the same input.
     """
-    by_id = {str(c["task_id"]): c for c in cards}
+    # Archived cards are audit history, not active Plan-DAG nodes.  Filter
+    # them before constructing any derived structure so they cannot reappear
+    # as pending/ready, block dependencies, or reserve write scope.
+    by_id = {
+        str(c["task_id"]): c
+        for c in cards
+        if lifecycle_state(c) != "archived"
+    }
     lifecycle = {tid: lifecycle_state(c) for tid, c in by_id.items()}
 
     dependencies: dict[str, list[str]] = {}

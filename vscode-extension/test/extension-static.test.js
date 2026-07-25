@@ -8,6 +8,7 @@ const pkg = JSON.parse(read("package.json"));
 const ext = read("extension.js");
 const app = read("media/app.js");
 const css = read("media/app.css");
+const runtimeInit = read("../src/aiworkhub/__init__.py");
 
 function absent(haystack, values, label) {
   const hits = values.filter((value) => haystack.includes(value));
@@ -16,6 +17,8 @@ function absent(haystack, values, label) {
 
 assert.strictEqual(pkg.name, "aiworkhub");
 assert.strictEqual(pkg.displayName, "AIWorkHub");
+assert.ok(ext.includes(`EXPECTED_MCP_PACKAGE_VERSION = "${pkg.version}"`));
+assert.ok(runtimeInit.includes(`__version__ = "${pkg.version}"`));
 assert.deepStrictEqual(pkg.extensionKind, ["workspace"]);
 assert.strictEqual(pkg.icon, "media/aiworkhub-icon.png");
 assert.ok(
@@ -114,12 +117,19 @@ assert.ok(ext.includes('path.join(extensionFsPath, "runtime")'));
 assert.ok(ext.includes("function bindCodexSidebandEnvironment"));
 assert.ok(ext.includes("process.env.AIWORKHUB_REPO_ID = repoId"));
 assert.ok(ext.includes("if (!process.env.AIWORKHUB_REPO_ID)"));
+assert.ok(ext.includes("function writeSharedRepoRouteRecord"));
+assert.ok(ext.includes("function removeSharedRepoRouteRecord"));
+assert.ok(ext.includes("aiworkhub.shared_repo_route.v1"));
+assert.ok(ext.includes('path.join(os.homedir(), ".aiworkhub", "router", "repos")'));
+assert.ok(ext.includes('id="repo-router"'));
+assert.ok(app.includes("function renderKnownRepositories"));
+assert.ok(app.includes("known_repositories"));
 
-// The Codex sideband mux is OPT-IN and OFF by default: it must be gated behind
-// aiworkhub.enableCodexSidebandMux and, when off, restore chatgpt.cliExecutable
-// so Codex launches directly (never break another extension by default).
-assert.ok(ext.includes('get("enableCodexSidebandMux", false)'));
-assert.ok(ext.includes('await chatgpt.update("cliExecutable", undefined, vscode.ConfigurationTarget.Global)'));
+// The Codex sideband mux is automatic. Its application-scoped launcher is
+// transparent in unbound windows and repository-scoped when a valid binding is
+// present. A stale user flag cannot silently disable callback routing.
+assert.ok(!ext.includes('get("enableCodexSidebandMux"'));
+assert.ok(!pkg.contributes.configuration.properties["aiworkhub.enableCodexSidebandMux"]);
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));
@@ -127,6 +137,9 @@ assert.ok(ext.includes('path.join(root, ".venv", "Scripts", "python.exe")'));
 assert.ok(ext.includes('command: "py"'));
 assert.ok(ext.includes('argsPrefix: ["-3"]'));
 assert.ok(ext.includes('childProcess.spawn(python.command, [...python.argsPrefix, "-m", "aiworkhub.server"]'));
+assert.ok(ext.includes("function repairWorkspaceMcpConfigObject"));
+assert.ok(ext.includes("ensureWorkspaceMcpConfigsRepaired(context)"));
+assert.ok(ext.includes("PYTHONPATH: runtimeDir"));
 
 // B850: activation and repository selection must never bootstrap/write a
 // repository, and storage readiness must never be computed from directory
@@ -155,6 +168,14 @@ assert.ok(ext.includes("DISPATCHER_TOOLS.ensureStarted"));
 assert.ok(ext.includes("DISPATCHER_TOOLS.stop"));
 assert.ok(ext.includes("panel.__aiworkhubViewState.dispose()"));
 assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must never be referenced");
+{
+  const handshakeStart = ext.indexOf("async _handshake()");
+  const handshakeEnd = ext.indexOf("async _assertRuntimeVersionBeforeServices()", handshakeStart);
+  const handshakeBody = ext.slice(handshakeStart, handshakeEnd);
+  assert.ok(handshakeStart >= 0 && handshakeEnd > handshakeStart);
+  assert.ok(!handshakeBody.includes("this.callTool("), "handshake must never recurse through ensureStarted()");
+  assert.ok(handshakeBody.includes("this._convergeBackgroundServices()"));
+}
 
 const deactivateMarker = "async function deactivate()";
 const deactivateBody = ext.slice(ext.indexOf(deactivateMarker), ext.indexOf(deactivateMarker) + 500);
@@ -166,6 +187,9 @@ assert.ok(ext.includes("claim_episode"));
 assert.ok(ext.includes("extension_host_pid"));
 assert.ok(ext.includes("thread_id"));
 assert.ok(ext.includes("session_id"));
+assert.ok(ext.includes('capability_state: "route_pending"'));
+assert.ok(!ext.includes("thread_id: `codex:${WINDOW_SCOPE_ID}`"), "Codex route must not fabricate a callback thread id");
+assert.ok(ext.includes("target.route = { ...defaults.targets[provider].route, ...existingRoute }"));
 assert.ok(ext.includes("callback_required"));
 assert.ok(ext.includes("notify_and_open_chat"));
 assert.ok(app.includes('case "coordinatorTargets"'));

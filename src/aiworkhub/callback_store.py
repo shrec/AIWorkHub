@@ -729,6 +729,83 @@ def rebind_pending_callbacks(
         raise
 
 
+def seed_missing_review_callbacks(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    origin_thread_id: str | None = None,
+) -> int:
+    """Backfill durable callback rows for review tasks after route recovery.
+
+    Normal terminal transitions enqueue callbacks immediately.  A reload,
+    stale runtime, or earlier route bug can leave a task already in the
+    canonical review bucket without a pending/inflight/delivered outbox row.
+    When a verified manager route is available again, seed only those missing
+    rows so the dispatcher/manager-inbox can replay the review wake.
+
+    Safety boundaries:
+    - Never fabricates a callback provider: only rows owned by ``provider`` are
+      considered.
+    - Never invents a thread from nothing: either the caller supplies the
+      verified current route ``origin_thread_id`` or the task already carries a
+      persisted origin.
+    - Never duplicates or resurrects a task that already has any callback row
+      for the same claim episode.
+    """
+    _ensure_tasks_origin_thread_column(conn)
+    _ensure_callback_outbox_table(conn)
+    provider = str(provider or "").strip().lower()
+    route_origin = str(origin_thread_id or "").strip()
+    if provider not in ("codex", "claude", "copilot"):
+        return 0
+    rows = conn.execute(
+        """
+        SELECT task_id, card_json, origin_thread_id
+          FROM tasks
+         WHERE status='review'
+           AND worker_status='review'
+           AND (archived_at IS NULL OR archived_at='')
+         ORDER BY updated_at ASC, task_id ASC
+        """
+    ).fetchall()
+    seeded = 0
+    for row in rows:
+        task_id = str(row["task_id"] or "")
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        if card.get("callback_required") is False:
+            continue
+        row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
+        if row_provider != provider:
+            continue
+        episode_id = str(card.get("claim_epoch") or 0)
+        existing = conn.execute(
+            "SELECT 1 FROM callback_outbox WHERE task_id=? AND episode_id=? LIMIT 1",
+            (task_id, episode_id),
+        ).fetchone()
+        if existing is not None:
+            continue
+        raw_terminal = str(card.get("terminal_substatus") or "").strip() or "review_ready"
+        transition = resolve_callback_transition(raw_terminal)
+        callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
+        if not callback_origin:
+            continue
+        if enqueue_callback(
+            conn,
+            task_id,
+            callback_origin,
+            transition,
+            provider=provider,
+            episode_id=episode_id,
+        ):
+            seeded += 1
+    return seeded
+
+
 def _iso_plus_seconds(now_iso: str, delay_seconds: float) -> str:
     if delay_seconds <= 0:
         return ""

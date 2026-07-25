@@ -17,7 +17,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import glm_credentials as gc  # noqa: E402
-from aiworkhub import process_launcher, runtime_adapters  # noqa: E402
+from aiworkhub import deepseek_credentials, process_launcher, runtime_adapters  # noqa: E402
 
 
 FAKE_KEY = "sk-glm-B814-FAKE-not-a-real-key"
@@ -254,6 +254,27 @@ def test_glm_status_is_secret_free_and_names_setup_status_commands(tmp_path: Pat
     assert status["supported_models"] == ["glm-5.2"]
     assert FAKE_KEY not in json.dumps(status)
     assert "api_key" not in json.dumps(status)
+
+
+def test_combined_adapter_readiness_does_not_false_positive_glm_without_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(gc.CREDENTIAL_PATH_ENV, str(tmp_path / "absent-glm.json"))
+    monkeypatch.setattr(
+        runtime_adapters,
+        "resolve_executable",
+        lambda a, *_a, **_k: runtime_adapters.ExecutableResolution(a, "/x/copilot", True, ""),
+    )
+
+    readiness = deepseek_credentials.adapter_readiness(repo=tmp_path)
+    glm = next(row for row in readiness["adapters"] if row["adapter_id"] == ADAPTER)
+
+    assert glm["installed"] is True
+    assert glm["credential_present"] is False
+    assert glm["launchable"] is False
+    assert glm["blocker_reason"] == "credential_file_absent"
+    assert glm["kind"] == "local_copilot_byok_glm"
 
 
 def test_glm_runner_rejects_github_hosted_adapters(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path) -> None:

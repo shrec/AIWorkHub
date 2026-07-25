@@ -80,7 +80,7 @@ class FakeChild extends EventEmitter {
       }
     } else if (tool === "aiworkhub_dashboard_health") {
       this._send({
-        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.31" }) }],
+        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.51" }) }],
       }, message.id);
     } else if (tool === "aiworkhub_dispatcher_ensure_started") {
       this._send({
@@ -126,7 +126,7 @@ function loadExtensionHost(repoRoot) {
     const extension = require(extensionPath);
     const context = {
       extensionUri: { fsPath: path.resolve(__dirname, "..") },
-      extension: { packageJSON: { version: "0.6.31" } },
+      extension: { packageJSON: { version: "0.6.51" } },
       subscriptions: [],
       workspaceState: { update: () => {}, get: () => undefined },
     };
@@ -200,7 +200,11 @@ async function snapshotFor(host) {
     const overlappingRefresh = hostA.extension.__testInternals.pushSnapshot(coalescedView);
     assert.strictEqual(slowFirst, overlappingRefresh, "overlapping refresh did not reuse the in-flight snapshot");
     await Promise.all([slowFirst, overlappingRefresh]);
-    assert.strictEqual(firstMessages.filter((message) => message.type === "snapshot").length, 1);
+    assert.strictEqual(
+      firstMessages.filter((message) => message.type === "snapshot").length,
+      2,
+      "overlapping refresh was not replayed after the in-flight snapshot settled",
+    );
     const secondMessages = await snapshotFor(hostB);
 
     const snapA = firstMessages.find((m) => m.type === "snapshot");

@@ -369,14 +369,24 @@ def adapter_readiness(
     """Read-only readiness for every supported adapter.
 
     Local CLI adapters report ``installed``/``launchable`` from executable
-    discovery; ``deepseek_copilot_cli`` additionally reports
-    ``credential_present``; ``deepseek_manual`` is a non-launchable explicit
-    fallback. No secret value is ever included.
+    discovery. The DeepSeek and GLM Copilot BYOK adapters additionally require
+    their provider credential to be present and valid; an installed Copilot
+    executable alone is never reported as launchable. ``deepseek_manual`` is a
+    non-launchable explicit fallback. No secret value is ever included.
     """
     adapters: list[dict[str, Any]] = []
     for adapter_id in runtime_adapters.SUPPORTED_ADAPTERS:
         if adapter_id == ADAPTER_ID:
             adapters.append(credential_status(repo=repo))
+            continue
+        if adapter_id == runtime_adapters.GLM_COPILOT_ADAPTER:
+            # Local import avoids a module-level credentials<->readiness cycle.
+            # The launcher already applies this exact fail-closed GLM gate;
+            # readiness must tell the same truth instead of treating Copilot's
+            # mere presence as proof that a BYOK provider can launch.
+            from . import glm_credentials
+
+            adapters.append(glm_credentials.credential_status(repo=repo))
             continue
         if adapter_id in runtime_adapters.MANUAL_ONLY_ADAPTERS:
             adapters.append({

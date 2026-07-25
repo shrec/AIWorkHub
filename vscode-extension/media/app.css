@@ -485,6 +485,18 @@ main {
   border-bottom-color: var(--blocked);
 }
 
+.source-alert.identity-alert.identity-ok {
+  color: var(--review);
+  background: var(--review-soft);
+  border-bottom-color: var(--review);
+}
+
+.source-alert.identity-alert.identity-warn {
+  color: var(--pending);
+  background: var(--pending-soft);
+  border-bottom-color: var(--pending);
+}
+
 .source-alert strong {
   flex: 0 0 auto;
 }
@@ -533,6 +545,52 @@ main {
   color: var(--ink-soft);
   font-size: 11px;
   font-weight: 650;
+}
+
+.repo-router {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.repo-router > span {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+#repo-router-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.repo-route {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 7px;
+  color: var(--ink-soft);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.repo-route.current {
+  color: var(--review);
+  border-color: var(--review);
+  background: var(--review-soft);
+}
+
+.repo-route.stale {
+  color: var(--stale);
+  border-color: var(--stale);
+  background: var(--stale-soft);
 }
 
 .primary-button:disabled {

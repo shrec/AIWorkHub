@@ -18,13 +18,8 @@
   "record_type": "context_optimization_report",
   "recorded_token_telemetry": {
     "null_when_provider_telemetry_absent": true,
-    "provider_telemetry_rows": 44,
-    "tokens": {
-      "cache_creation_input_tokens": 4002400,
-      "cached_input_tokens": 231291306,
-      "input_tokens": 50168850,
-      "output_tokens": 1953175
-    }
+    "provider_telemetry_rows": 0,
+    "tokens": null
   },
   "runner": "codex_gpt55_aiworkhub_context_optimization_b829_v1",
   "safety": {
@@ -36,6 +31,6 @@
   },
   "schema_id": "aiworkhub.task_mcp.context_economics.v1",
   "task_id": "CODEX_GPT55_AIWORKHUB_CONTEXT_OPTIMIZATION_B829_V1",
-  "validation_success_rate": 0.8475,
+  "validation_success_rate": null,
   "verdict": "PASS"
 }

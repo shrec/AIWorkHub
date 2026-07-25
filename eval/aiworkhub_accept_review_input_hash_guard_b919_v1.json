@@ -1,0 +1,54 @@
+{
+  "schema_id": "geoai.eval.aiworkhub_accept_review_input_hash_guard_b919_v1",
+  "task_id": "CLAUDE_SONNET5_AIWORKHUB_ACCEPT_REVIEW_INPUT_HASH_GUARD_B919_V1",
+  "mode": "accept_review_stale_immutable_input_fail_closed",
+  "result": "implemented",
+  "closes": "B914",
+  "scope": {
+    "root_cause": "ProcessManager.accept_review re-verified only the worker's own changed/output-path hashes before promote(); a declared dependency/input artifact (e.g. B912's canonical output) could advance between claim time and promotion with no check at all, so a retained-worktree validation that passed against a stale input snapshot (29 rows) was silently promoted after the canonical dependency had already advanced (3,522 rows).",
+    "changes": [
+      "process_launcher._path_manifest(base, declared): bounded, deterministic manifest for declared repo-relative paths -- a file entry records sha256/size/line_count, a directory entry records only entry_count plus a listing_sha256 over immediate children's name+size (never recursive content hashing), so cost is proportional to the declared path count, never a broad repository walk",
+      "ProcessManager._launch_isolated captures the immutable_inputs manifest from the canonical repo immediately before task_engine.claim_start_exact (input A) and threads it through metadata.json",
+      "ProcessManager._finalize_isolated_request copies the declared immutable_inputs + claim-time manifest into the review_ready terminal_review evidence unchanged",
+      "ProcessManager.accept_review recomputes the current canonical manifest for the same declared paths immediately before promote() and fails closed with stale_input:dependency_changed:<path> on any mismatch -- no promote() call, no task_engine.accept_review call, canonical repo and task status left exactly as in review",
+      "guard is a no-op when a card declares no immutable_inputs at all -- existing scope/required-output/validation/idempotence gates are unaffected"
+    ]
+  },
+  "acceptance_evidence": [
+    {
+      "requirement": "claim at input A, canonical input mutation to B, then accept_review fails with stale_input/dependency_changed before promotion",
+      "test": "test_accept_review_fails_closed_on_stale_immutable_input"
+    },
+    {
+      "requirement": "canonical output paths and task finished-state remain unchanged on mismatch",
+      "test": "test_accept_review_fails_closed_on_stale_immutable_input"
+    },
+    {
+      "requirement": "unchanged immutable input/dependency hashes still accept and promote exactly once, including on an idempotent retry",
+      "test": "test_accept_review_promotes_exactly_once_when_input_unchanged"
+    },
+    {
+      "requirement": "tasks declaring no immutable_inputs are unaffected by the new guard",
+      "test": "test_accept_review_guard_is_noop_without_declared_immutable_inputs"
+    },
+    {
+      "requirement": "file manifests are bounded/deterministic sha256+size+line_count",
+      "test": "test_path_manifest_file_is_bounded_and_deterministic"
+    },
+    {
+      "requirement": "directory manifests never content-hash children and detect population growth via entry_count",
+      "test": "test_path_manifest_directory_never_content_hashes_children"
+    },
+    {
+      "requirement": "a missing declared path manifests as a bounded {kind: missing}, never an exception",
+      "test": "test_path_manifest_missing_path_is_bounded_kind_missing"
+    }
+  ],
+  "forbidden_regressions": {
+    "promotion_before_input_revalidation": "the new guard runs before promote()/task_engine.accept_review() and returns before either is ever called on mismatch",
+    "hash_bypass": "declared immutable_inputs are re-read from the canonical repo at accept_review time, never trusted from stale evidence alone",
+    "broad_repository_snapshot": "_path_manifest only ever touches the declared paths themselves; a directory entry lists immediate children only and never recurses",
+    "host_global_state": "the manifest comparison reads only self.repo (the bound per-ProcessManager repository), never ambient/global state"
+  },
+  "environment_note": "This worktree is a sparse checkout of only the four allowed_writes files under src/aiworkhub (core.py, process_launcher.py, task_engine.py, task_store.py); every other sibling module (repository_state, callback_store, task_plan, dependency_autolaunch, storage_registry, runtime_adapters, worker_ai_tools_mcp, worker_workspace, provider_tool_guards, task_fsm) is absent, and pytest itself is not installed and could not be installed (sandboxed pip/venv writes are rejected). The test file installs lenient stand-in modules for the absent siblings (mirroring the existing _ensure_deepseek_credentials_stub/_ensure_aiworkhub_sibling_stubs precedent) so the real, unmodified core.py/task_engine.py/process_launcher.py import and run unchanged. All 7 tests were verified to pass by executing them directly against the real production code with a hand-built monkeypatch/tmp_path harness (pytest's own collector was unavailable in this sandbox); the listed pytest command is expected to pass unchanged wherever pytest is installed."
+}

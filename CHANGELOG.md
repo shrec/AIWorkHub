@@ -4,6 +4,30 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.51] - 2026-07-25
+
+### Fixed
+
+- Made packaged MCP runtimes immutable and content-addressed in VS Code global
+  storage, so installing a newer extension cannot delete the runtime beneath
+  already-running Codex/Claude windows.
+- Repaired exact repository/thread callback routing, callback replay after
+  reconnect, terminal substatus preservation, and repository-isolated shared
+  route discovery.
+- Restored Claude manager task creation by normalizing its verified
+  `session_id` with Codex `thread_id` into the canonical origin route.
+- Preserved immutable declared-input hashes through review acceptance and
+  failed closed when a dependency changes before promotion.
+- Repaired workspace MCP configuration migration to the stable packaged
+  runtime on Linux, Windows, Remote-SSH, and multi-repository windows.
+- Improved dashboard manager/routing diagnostics and live-output formatting.
+
+### Changed
+
+- Release verification now requires all four version authorities
+  (`pyproject.toml`, Python `__version__`, extension manifest, and extension
+  runtime constant) to match the release tag.
+
 ## [0.6.26] - 2026-07-22
 
 ### Fixed

@@ -1,0 +1,28 @@
+{
+  "schema_id": "aiworkhub.archived_plan_dag_exclusion.eval.v1",
+  "task_id": "CODEX_AIWORKHUB_ARCHIVED_PLAN_DAG_EXCLUSION_B938_V1",
+  "objective": "Archived canonical task cards are audit history and are excluded from active Plan-DAG computation and auto-pickup readiness.",
+  "changed_paths": [
+    "src/aiworkhub/core.py",
+    "src/aiworkhub/task_plan.py",
+    "tests/test_core_task_plan.py",
+    "eval/aiworkhub_archived_plan_dag_exclusion_b938_v1.json"
+  ],
+  "regressions": [
+    "archived cards are absent from every snapshot structure",
+    "archived allowed_writes do not reserve scope",
+    "task-store status and archived_at remain authoritative and intact",
+    "rejected-then-archived, directly archived, done, pending, processing, and review cases remain distinct",
+    "the B935 archived and B936 pending overlap yields only B936 ready",
+    "an archived legacy rework cannot block a pending Codex-runner auto-pickup"
+  ],
+  "validation": [
+    "PYTHONPATH=src python3 -m pytest -q -p no:cacheprovider tests/test_core_task_plan.py",
+    "python3 -m json.tool eval/aiworkhub_archived_plan_dag_exclusion_b938_v1.json"
+  ],
+  "history_policy": {
+    "queue_history_deleted": false,
+    "archive_audit_fields_preserved": true,
+    "canonical_cards_mutated": false
+  }
+}

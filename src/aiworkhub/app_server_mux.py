@@ -103,6 +103,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
+if __package__:
+    from . import shared_router
+else:  # direct-file CLI compatibility; package launcher uses the branch above
+    shared_router = None  # type: ignore[assignment]
+
 ENV_REAL_EXECUTABLE = "AIWORKHUB_APP_SERVER_MUX_REAL_EXECUTABLE"
 DEFAULT_REAL_EXECUTABLE = "codex"
 
@@ -205,6 +210,47 @@ def is_app_server_invocation(argv: list[str]) -> bool:
     for the App Server subcommand -- the only shape this module proxies;
     every other invocation is a transparent ``execvp`` passthrough."""
     return APP_SERVER_ARG in argv
+
+
+def resolve_repo_id_for_mux() -> str:
+    """Resolve the one repository owned by this Codex extension host.
+
+    VS Code may isolate AIWorkHub and OpenAI extensions while still launching
+    the Codex CLI from the repository window's extension-host process. Runtime
+    ``process.env`` mutation is therefore not a reliable cross-extension
+    transport. Prefer an explicit immutable binding when one is inherited;
+    otherwise resolve exactly one live shared route whose recorded
+    ``extension_host_pid`` equals this launcher's parent PID. Zero or multiple
+    matches remain unbound and take the transparent passthrough path.
+    """
+
+    explicit = os.environ.get(ENV_REPO_ID, "").strip()
+    if explicit:
+        return _validate_repo_id(explicit)
+    if shared_router is None:
+        return ""
+    try:
+        registry = shared_router.list_known_repositories(limit=64)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ""
+    if not isinstance(registry, dict) or not registry.get("ok"):
+        return ""
+    parent_pid = os.getppid()
+    matches = [
+        str(record.get("repo_id") or "")
+        for record in registry.get("repositories", [])
+        if isinstance(record, dict)
+        and int(record.get("extension_host_pid") or 0) == parent_pid
+        and bool(record.get("extension_host_alive"))
+        and not bool(record.get("stale"))
+        and str(record.get("selected_provider") or "").strip().lower() == "codex"
+    ]
+    if len(matches) != 1:
+        return ""
+    try:
+        return _validate_repo_id(matches[0])
+    except ValueError:
+        return ""
 
 
 # --- sideband directory / capability file -------------------------------------
@@ -358,6 +404,8 @@ class SidebandInstance:
     capability_path: Path
     owned_thread_ids: tuple[str, ...]
     repo_id: str
+    active_thread_id: str = ""
+    active_thread_observed_at: float = 0.0
     parent_pid: int = 0
     generation_id: str = ""
     heartbeat_at: float = 0.0
@@ -405,6 +453,8 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
     socket_path = obj.get("socket_path")
     capability_path = obj.get("capability_path")
     owned = obj.get("owned_thread_ids")
+    active_thread_id = obj.get("active_thread_id")
+    active_thread_observed_at = obj.get("active_thread_observed_at")
     parent_pid = obj.get("parent_pid")
     generation_id = obj.get("generation_id")
     heartbeat_at = obj.get("heartbeat_at")
@@ -430,6 +480,13 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         return None
     if not isinstance(generation_id, str) or not generation_id:
         generation_id = instance_id
+    if not isinstance(active_thread_id, str) or active_thread_id not in owned:
+        active_thread_id = owned[-1] if owned else ""
+    if (
+        isinstance(active_thread_observed_at, bool)
+        or not isinstance(active_thread_observed_at, (int, float))
+    ):
+        active_thread_observed_at = 0.0
     if isinstance(heartbeat_at, bool) or not isinstance(heartbeat_at, (int, float)):
         heartbeat_at = st.st_mtime
     if (
@@ -445,6 +502,8 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         capability_path=Path(capability_path),
         owned_thread_ids=tuple(owned),
         repo_id=repo_id,
+        active_thread_id=active_thread_id,
+        active_thread_observed_at=float(active_thread_observed_at),
         parent_pid=parent_pid if isinstance(parent_pid, int) and parent_pid > 1 else 0,
         generation_id=generation_id,
         heartbeat_at=float(heartbeat_at),
@@ -729,6 +788,8 @@ class AppServerMux:
         # ``_write_to_child`` and never pass through that observer).
         self._owned_thread_lock = threading.Lock()
         self._owned_thread_ids: list[str] = []
+        self._active_thread_id = ""
+        self._active_thread_observed_at = 0.0
 
         self._dedup_lock = threading.Lock()
         self._dedup_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -901,15 +962,19 @@ class AppServerMux:
     def _record_owned_thread(self, thread_id: str) -> None:
         with self._owned_thread_lock:
             if thread_id in self._owned_thread_ids:
-                return
+                self._owned_thread_ids.remove(thread_id)
             self._owned_thread_ids.append(thread_id)
             if len(self._owned_thread_ids) > SIDEBAND_MAX_OWNED_THREAD_IDS:
                 self._owned_thread_ids.pop(0)
+            self._active_thread_id = thread_id
+            self._active_thread_observed_at = time.time()
         self._write_registry()
 
     def _write_registry(self) -> None:
         with self._owned_thread_lock:
             owned = list(self._owned_thread_ids)
+            active_thread_id = self._active_thread_id
+            active_thread_observed_at = self._active_thread_observed_at
         descriptor = {
             "instance_id": self._instance_id,
             "generation_id": self._generation_id,
@@ -920,6 +985,8 @@ class AppServerMux:
             "socket_path": str(self._socket_path),
             "capability_path": str(self._capability_path),
             "owned_thread_ids": owned,
+            "active_thread_id": active_thread_id,
+            "active_thread_observed_at": active_thread_observed_at,
             "heartbeat_at": time.time(),
             "owner_lease_seconds": SIDEBAND_OWNER_LEASE_SECONDS,
             "ready": self.ready,
@@ -1230,22 +1297,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
             return 1
         return 0  # unreachable on success -- execvp replaces this process
-    # B925: the app-server path is the one that registers sideband
-    # ownership, so it is the one that must never start unbound. The VS
-    # Code extension sets AIWORKHUB_REPO_ID per workspace before spawning
-    # this wrapper as chatgpt.cliExecutable -- there is no global/shared
-    # repo fallback and no interactive prompt here, only a fail-closed
-    # refusal to start.
-    repo_id = os.environ.get(ENV_REPO_ID, "").strip()
+    # B925/B944: sideband ownership must never be registered without an
+    # immutable repository identity.  The VS Code ``chatgpt.cliExecutable``
+    # setting is application-scoped, however, so a launcher selected by one
+    # initialized window is also inherited by unrelated/uninitialized
+    # windows.  Refusing to start here kills Codex in those windows.  Preserve
+    # the ownership invariant while remaining transparent: an unbound
+    # invocation execs the real App Server byte-for-byte and simply has no
+    # AIWorkHub sideband/callback capability.
+    repo_id = resolve_repo_id_for_mux()
     if not repo_id:
-        print(
-            f"app_server_mux: {ENV_REPO_ID} is required for app-server "
-            "invocations -- no global repository fallback is permitted "
-            "(B925). The VS Code extension must set it per workspace "
-            "before spawning this wrapper as chatgpt.cliExecutable.",
-            file=sys.stderr,
-        )
-        return 1
+        try:
+            os.execvp(real_executable, [real_executable, *raw_argv])
+        except OSError as exc:
+            print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
+            return 1
+        return 0  # unreachable on success -- execvp replaces this process
     return run_mux(raw_argv, repo_id=repo_id)
 
 

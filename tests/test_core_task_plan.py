@@ -23,7 +23,7 @@ def _init_repo(tmp_path: Path) -> Path:
 
 def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", status="pending",
                   worker_status="unclaimed", allowed_writes=None, depends_on=None,
-                  created_at="2026-01-01T00:00:00+00:00"):
+                  created_at="2026-01-01T00:00:00+00:00", archived_at=""):
     _readiness, db_path = task_store._require_ready(repo)
     card = {
         "task_id": task_id,
@@ -31,14 +31,19 @@ def _insert_card(repo: Path, task_id, *, runner="codex_a", topic="coding", statu
         "topic": topic,
         "allowed_writes": allowed_writes or [],
         "depends_on": depends_on or [],
+        "status": status,
+        "worker_status": worker_status,
     }
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
-            "objective, card_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?)",
-            (task_id, runner, topic, status, worker_status, json.dumps(card), created_at, created_at),
+            "objective, card_json, created_at, updated_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, '', '', ?, ?, ?, ?)",
+            (
+                task_id, runner, topic, status, worker_status, json.dumps(card),
+                created_at, created_at, archived_at or "",
+            ),
         )
         conn.commit()
     finally:
@@ -163,3 +168,104 @@ def test_create_task_dependency_validation_rejects_legacy_card_with_invalid_depe
     assert invalid_ids == {"legacy"}
     with pytest.raises(task_plan.TaskPlanError, match="dependency_has_invalid_depends_on"):
         task_plan.validate_new_dependency_edge("new", ["legacy"], edges, invalid_ids=invalid_ids)
+
+
+def test_archived_card_is_excluded_from_every_plan_snapshot_structure():
+    repo = core.repo_root()
+    _insert_card(
+        repo, "archived", status="archived", worker_status="unclaimed",
+        allowed_writes=["shared.py"], depends_on=["missing"],
+        archived_at="2026-02-01T00:00:00+00:00",
+    )
+    _insert_card(repo, "pending", allowed_writes=["shared.py"])
+
+    snapshot = core.task_plan_snapshot()
+
+    assert snapshot["task_ids"] == ["pending"]
+    assert snapshot["lifecycle"] == {"pending": "pending"}
+    assert snapshot["dependencies"] == {"pending": []}
+    assert snapshot["dependents"] == {"pending": []}
+    assert snapshot["blockers"] == {}
+    assert snapshot["write_scope_overlaps"] == {}
+    assert snapshot["ready"] == ["pending"]
+
+
+def test_task_show_preserves_archived_status_and_archive_audit_fields():
+    repo = core.repo_root()
+    archived_at = "2026-02-01T00:00:00+00:00"
+    _insert_card(
+        repo, "archived", status="archived", worker_status="unclaimed",
+        allowed_writes=["shared.py"], archived_at=archived_at,
+    )
+
+    card = task_store.get_task(repo, "archived")
+
+    assert card["status"] == "archived"
+    assert card["worker_status"] == "unclaimed"
+    assert card["archived_at"] == archived_at
+
+
+def test_lifecycle_cases_remain_distinct_when_archived_cards_are_filtered():
+    cards = [
+        {"task_id": "rejected_archived", "status": "archived", "worker_status": "rejected"},
+        {"task_id": "direct_archived", "status": "archived", "worker_status": "unclaimed"},
+        {"task_id": "done", "status": "finished", "worker_status": "done"},
+        {"task_id": "pending", "status": "pending", "worker_status": "unclaimed"},
+        {
+            "task_id": "rejected_pending", "runner": "codex_a", "topic": "coding",
+            "status": "pending", "worker_status": "rejected",
+        },
+        {"task_id": "processing", "status": "processing", "worker_status": "claimed"},
+        {"task_id": "review", "status": "review", "worker_status": "review"},
+    ]
+
+    snapshot = core.task_plan.build_snapshot(cards)
+
+    assert snapshot["task_ids"] == [
+        "done", "pending", "processing", "rejected_pending", "review",
+    ]
+    assert snapshot["lifecycle"] == {
+        "done": "finished",
+        "pending": "pending",
+        "processing": "processing",
+        "rejected_pending": "pending",
+        "review": "review",
+    }
+    assert snapshot["ready"] == ["pending", "rejected_pending"]
+    assert [
+        c["task_id"]
+        for c in core.eligible_dryrun_candidates(
+            cards, "codex_a", ready_ids=set(snapshot["ready"])
+        )
+    ] == []
+
+
+def test_live_b935_b936_shape_only_pending_b936_is_ready():
+    repo = core.repo_root()
+    shared = ["src/aiworkhub/core.py", "tests/test_core_task_plan.py"]
+    _insert_card(
+        repo, "B935", status="archived", worker_status="rejected",
+        allowed_writes=shared, archived_at="2026-07-23T00:00:00+00:00",
+    )
+    _insert_card(repo, "B936", status="pending", allowed_writes=shared)
+
+    snapshot = core.task_plan_snapshot()
+
+    assert "B935" not in snapshot["task_ids"]
+    assert snapshot["ready"] == ["B936"]
+    assert snapshot["write_scope_overlaps"] == {}
+
+
+def test_archived_rework_does_not_block_pending_codex_runner_auto_pickup():
+    repo = core.repo_root()
+    shared = ["src/aiworkhub/core.py"]
+    _insert_card(
+        repo, "legacy_rework", runner="legacy", status="archived",
+        worker_status="rejected", allowed_writes=shared,
+        archived_at="2026-07-23T00:00:00+00:00",
+    )
+    _insert_card(repo, "codex_runner", runner="codex_a", allowed_writes=shared)
+
+    result = core.auto_pickup_dryrun(runner="codex_a", topic="coding")
+
+    assert result["would_claim_task_id"] == "codex_runner"

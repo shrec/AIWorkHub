@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
-  "version": "0.6.31",
+  "version": "0.6.51",
   "publisher": "shrec",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",
@@ -33,7 +33,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "test": "node test/extension-static.test.js",
+    "test": "node test/extension-static.test.js && node test/multirepo-connecting.test.js && node test/stable-runtime-upgrade.test.js && node test/reloadless-runtime-repair.test.js && node test/codex-config-toml-runtime-migration.test.js && node test/workspace-mcp-runtime-repair.test.js && node test/explicit-init-no-fallback.test.js && node test/live-output-formatting.test.js && node test/window-route-lease-renewal-b905.test.js && node test/windows-mcp-child-preflight-b916.test.js",
     "test:multirepo-connecting": "node test/multirepo-connecting.test.js",
     "test:reloadless-runtime-repair": "node test/reloadless-runtime-repair.test.js",
     "package": "node test/package-vsix.js"
@@ -97,11 +97,6 @@
           "default": "",
           "scope": "resource",
           "description": "Optional Python executable. Empty uses the selected repository virtual environment when present, otherwise Python from the system PATH."
-        },
-        "aiworkhub.enableCodexSidebandMux": {
-          "type": "boolean",
-          "default": false,
-          "description": "Route the OpenAI Codex extension's app-server through the AIWorkHub sideband mux (chatgpt.cliExecutable) so terminal review callbacks push into the Codex coordinator chat. OFF by default: it wraps another extension's CLI and, with Codex's single machine-wide IPC socket, can break multi-window use. Enable only after verifying Codex still launches in every window you use. When off, Codex launches directly and the Claude callback lane is unaffected."
         }
       }
     }

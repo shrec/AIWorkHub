@@ -40,6 +40,7 @@ jobs:
           import json
           import os
           import pathlib
+          import re
           import tomllib
 
           tag = os.environ["RELEASE_TAG"]
@@ -51,13 +52,26 @@ jobs:
           extension_version = json.loads(
               pathlib.Path("vscode-extension/package.json").read_text()
           )["version"]
+          init_source = pathlib.Path("src/aiworkhub/__init__.py").read_text()
+          init_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_source, re.MULTILINE)
+          extension_source = pathlib.Path("vscode-extension/extension.js").read_text()
+          runtime_match = re.search(
+              r'^const EXPECTED_MCP_PACKAGE_VERSION\s*=\s*["\']([^"\']+)["\']',
+              extension_source,
+              re.MULTILINE,
+          )
           expected = tag[1:]
 
-          if python_version != expected or extension_version != expected:
+          versions = {
+              "pyproject.toml": python_version,
+              "src/aiworkhub/__init__.py": init_match.group(1) if init_match else "missing",
+              "vscode-extension/package.json": extension_version,
+              "vscode-extension/extension.js": runtime_match.group(1) if runtime_match else "missing",
+          }
+          if any(version != expected for version in versions.values()):
               raise SystemExit(
                   "release version mismatch: "
-                  f"tag={expected}, pyproject.toml={python_version}, "
-                  f"vscode-extension/package.json={extension_version}"
+                  f"tag={expected}, versions={versions}"
               )
           PY
 

@@ -34,7 +34,7 @@ import re
 import sys
 from pathlib import Path
 
-from aiworkhub import callback_bridge, core, dashboard_mcp_app, task_store  # noqa: E402
+from aiworkhub import __version__, callback_bridge, core, dashboard_mcp_app, task_store  # noqa: E402
 
 _TOOL_ROOT = Path(__file__).resolve().parents[1]
 _SRC = _TOOL_ROOT / "src"
@@ -77,7 +77,7 @@ def test_health_view_reports_full_identity_after_repo_bind(tmp_path, monkeypatch
     assert result["repo"] == str(root)
     assert result["storage"]["ready"] is True
     assert _REPO_ID_RE.match(result["storage"]["repo_id"])
-    assert result["server_version"] == "0.6.31"
+    assert result["server_version"] == __version__
 
 
 def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):
@@ -172,8 +172,10 @@ def test_extension_reload_restore_disposes_stale_controller_before_adopting_new_
 
 
 def test_extension_handshake_calls_dispatcher_ensure_started():
-    body = _slice(_EXTENSION_JS, "async _handshake()", 1600)
-    assert "DISPATCHER_TOOLS.ensureStarted" in body
+    handshake = _slice(_EXTENSION_JS, "async _handshake()", 1800)
+    convergence = _slice(_EXTENSION_JS, "_convergeBackgroundServices()", 1800)
+    assert "this._convergeBackgroundServices()" in handshake
+    assert "DISPATCHER_TOOLS.ensureStarted" in convergence
 
 
 def test_extension_deactivate_stops_dispatcher_before_terminating_child():
@@ -201,7 +203,7 @@ def test_extension_repo_switch_stops_old_client_dispatcher_before_rebinding():
 
 
 def test_extension_never_spawns_a_second_child_while_one_is_live():
-    body = _slice(_EXTENSION_JS, "ensureStarted() {", 500)
+    body = _slice(_EXTENSION_JS, "ensureStarted() {", 1000)
     assert "this.running && this.initialized" in body
     assert "this.startingPromise" in body
 

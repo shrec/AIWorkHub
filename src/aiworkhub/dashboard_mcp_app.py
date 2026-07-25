@@ -18,7 +18,7 @@ import os
 import re
 from typing import Any, Mapping
 
-from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, task_store
+from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, shared_router, task_store
 
 
 # Hard bound on the serialized tool response so a very large queue (many
@@ -153,6 +153,39 @@ def snapshot_view() -> dict[str, Any]:
         storage = dict(storage)
         storage["not_initialized"] = is_not_initialized_reason(storage.get("reason", ""))
         snapshot["storage"] = storage
+    try:
+        manager = core.manager_bootstrap()
+    except Exception as exc:  # noqa: BLE001 -- dashboard diagnostics must not break the queue view
+        manager = {
+            "ok": False,
+            "role": "unknown",
+            "provider": "unknown",
+            "manager_route": {},
+            "reason": f"manager_bootstrap_failed:{type(exc).__name__}",
+        }
+    snapshot["manager_identity"] = manager
+    try:
+        snapshot["known_repositories"] = shared_router.list_known_repositories(current_root=core.repo_root(), limit=32)
+    except Exception as exc:  # noqa: BLE001 -- shared router diagnostics must not break the active repo view
+        snapshot["known_repositories"] = {
+            "ok": False,
+            "schema_id": shared_router.SCHEMA_ID,
+            "error": f"shared_router_failed:{type(exc).__name__}",
+            "repositories": [],
+            "rejects": [],
+        }
+    try:
+        targets = core.read_selected_coordinator_target(core.repo_root())
+        selected = str(targets.get("selected_provider") or "")
+        selected_target = targets.get("targets", {}).get(selected, {}) if isinstance(targets.get("targets"), dict) else {}
+        wake = selected_target.get("wake", {}) if isinstance(selected_target, dict) else {}
+        snapshot["manager_identity_target"] = {
+            "selected_provider": selected,
+            "capability_state": selected_target.get("capability_state") if isinstance(selected_target, dict) else "",
+            "reason": wake.get("reason") or wake.get("action") if isinstance(wake, dict) else "",
+        }
+    except Exception:  # noqa: BLE001 -- route diagnostics are optional
+        snapshot["manager_identity_target"] = {}
     snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"
     snapshot["authority_flags"] = _readonly_authority_flags()
     return _bound_snapshot(snapshot)
@@ -233,6 +266,16 @@ def health_view() -> dict[str, Any]:
     result["server_version"] = __version__
     result["server_tool"] = "aiworkhub_dashboard_health"
     result["authority_flags"] = _readonly_authority_flags()
+    try:
+        result["manager_identity"] = core.manager_bootstrap()
+    except Exception as exc:  # noqa: BLE001 -- health surface must never raise
+        result["manager_identity"] = {
+            "ok": False,
+            "role": "unknown",
+            "provider": "unknown",
+            "manager_route": {},
+            "reason": f"manager_bootstrap_failed:{type(exc).__name__}",
+        }
     # B857: best-effort dispatcher health -- never lets a dispatcher-side
     # failure break this cheap connection-banner check. An uninitialized
     # repository reports dispatcher status "uninitialized", not an error.

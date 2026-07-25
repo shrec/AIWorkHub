@@ -23,6 +23,7 @@ from . import (
     refresh_coordinator_config,
 )
 from . import repository_state
+from . import shared_router
 from . import task_store
 from . import callback_store
 from . import task_plan
@@ -202,7 +203,12 @@ def _codex_manager_identity() -> dict[str, str] | None:
             break
         pid = parent_pid
     if not saw_codex_app_server or not mux_pid:
-        return None
+        return (
+            _codex_vscode_env_manager_identity()
+            or _codex_extension_route_manager_identity()
+            or _codex_shared_repo_route_manager_identity()
+            or _codex_route_manager_identity_from_parent_chain()
+        )
     # VS Code extension hosts normally start Codex from a neutral cwd, so cwd
     # cannot identify the owning repository.  Bind the mux to the exact
     # extension-host PID persisted by this repository's AIWorkHub extension.
@@ -223,6 +229,267 @@ def _codex_manager_identity() -> dict[str, str] | None:
             identity["thread_id"] = thread_id
             identity["session_id"] = thread_id
     return identity
+
+
+def _codex_shared_repo_route_manager_identity() -> dict[str, str] | None:
+    """Verify a repo-bound manager MCP through the shared VS Code registry.
+
+    A Codex MCP tool process can be bound to this repository without inheriting
+    ``AIWORKHUB_WINDOW_ID`` from the VS Code extension host.  If the extension
+    has exactly one live, non-stale shared route record for the same
+    repo_id/root, that process is a repo-local manager.  This is polling-only
+    unless the route also carries a real Codex thread UUID.
+    """
+
+    try:
+        root = repo_root()
+        readiness = task_store.storage_readiness(root)
+        if not readiness.ready or not readiness.repo_id:
+            return None
+        registry = shared_router.list_known_repositories(current_root=root, limit=32)
+    except (OSError, RuntimeError, task_store.TaskStoreError, KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(registry, dict) or not registry.get("ok"):
+        return None
+    matches = [
+        record for record in registry.get("repositories", [])
+        if isinstance(record, dict)
+        and record.get("current_repo") is True
+        and str(record.get("repo_id") or "") == str(readiness.repo_id)
+        and bool(record.get("extension_host_alive"))
+        and not bool(record.get("stale"))
+        and str(record.get("selected_provider") or "").strip().lower() == "codex"
+    ]
+    if len(matches) != 1:
+        return None
+    record = matches[0]
+    targets = record.get("targets", {})
+    codex_target = targets.get("codex", {}) if isinstance(targets, dict) else {}
+    route = codex_target.get("route", {}) if isinstance(codex_target, dict) else {}
+    if not isinstance(route, dict):
+        route = {}
+    thread_id = str(route.get("thread_id") or "").strip()
+    session_id = str(route.get("session_id") or record.get("window_id") or "").strip()
+    return {
+        "provider": "codex",
+        "session_id": thread_id if _UUID_RE.fullmatch(thread_id) else session_id,
+        "thread_id": thread_id if _UUID_RE.fullmatch(thread_id) else "",
+        "window_id": str(record.get("window_id") or ""),
+        "callback_supported": "true" if _UUID_RE.fullmatch(thread_id) else "false",
+        "route_state": str(codex_target.get("capability_state") or "route_pending"),
+    }
+
+
+def _codex_extension_route_manager_identity() -> dict[str, str] | None:
+    """Verify the VS Code extension-owned MCP child as the Codex manager.
+
+    The MCP server exposed by the AIWorkHub VS Code extension is intentionally
+    spawned by the extension host, not by Codex. That child will never inherit
+    ``CODEX_THREAD_ID``. It is still a verified repo-local manager endpoint
+    when the selected provider is Codex and the route record is bound to this
+    same repo/window/extension-host PID. A real Codex thread UUID is a
+    callback capability, not the only manager authority. Keep those states
+    separate: route_pending may manage repo-local tasks, but cannot create
+    callback-required tasks until a real thread UUID is persisted.
+    """
+
+    window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
+    if not window_id:
+        return None
+    try:
+        root = repo_root()
+        readiness = task_store.storage_readiness(root)
+        if not readiness.ready or not readiness.repo_id:
+            return None
+        target = read_selected_coordinator_target(root)
+    except (OSError, RuntimeError, task_store.TaskStoreError, KeyError, TypeError, ValueError):
+        return None
+    if str(target.get("selected_provider") or "").strip().lower() != "codex":
+        return None
+    if str(target.get("repo_id") or "").strip() != str(readiness.repo_id):
+        return None
+    if str(target.get("window_id") or "").strip() != window_id:
+        return None
+    extension_host_pid = int(target.get("extension_host_pid") or 0)
+    if extension_host_pid <= 1 or not _pid_in_same_uid_ancestor_chain(extension_host_pid, max_depth=4):
+        return None
+    codex_target = target.get("targets", {}).get("codex", {})
+    if not isinstance(codex_target, dict):
+        return None
+    capability_state = str(codex_target.get("capability_state") or "").strip().lower()
+    if capability_state not in ("available", "ready", "route_pending"):
+        return None
+    route = codex_target.get("route", {})
+    if not isinstance(route, dict):
+        return None
+    thread_id = str(route.get("thread_id") or "").strip()
+    session_id = str(route.get("session_id") or target.get("claim_episode") or window_id).strip()
+    if str(route.get("repo_id") or readiness.repo_id).strip() != str(readiness.repo_id):
+        return None
+    if str(route.get("window_id") or window_id).strip() != window_id:
+        return None
+    return {
+        "provider": "codex",
+        "session_id": thread_id if _UUID_RE.fullmatch(thread_id) else session_id,
+        "thread_id": thread_id if _UUID_RE.fullmatch(thread_id) else "",
+        "window_id": window_id,
+        "callback_supported": "true" if _UUID_RE.fullmatch(thread_id) else "false",
+        "route_state": capability_state or "route_pending",
+    }
+
+
+def _codex_vscode_env_manager_identity() -> dict[str, str] | None:
+    """Verify a Codex VS Code manager route from injected local environment.
+
+    Some Codex MCP launches do not expose the expected App Server -> AIWorkHub
+    mux process chain to the child process, even though the chat is still a
+    VS Code-originated Codex manager and carries the exact thread UUID in the
+    environment.  Accept this route only when all cheap local signals agree:
+
+    * Codex explicitly marks the origin as VS Code.
+    * ``CODEX_THREAD_ID`` is a valid UUID.
+    * The current repository is initialized and currently selects Codex.
+
+    The route file may still be ``route_pending`` while the extension is
+    learning/persisting the app-server mux binding.  A real
+    ``CODEX_THREAD_ID`` plus VS Code provenance is already stronger callback
+    identity than a synthetic ``codex:window_*`` route alias, so do not reject
+    it merely because the route file has not caught up yet.
+    """
+
+    if os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").strip() != "codex_vscode":
+        return None
+    thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if not _UUID_RE.fullmatch(thread_id):
+        return None
+    if not (
+        os.environ.get("VSCODE_IPC_HOOK_CLI")
+        or os.environ.get("VSCODE_ESM_ENTRYPOINT")
+        or os.environ.get("VSCODE_AGENT_FOLDER")
+    ):
+        return None
+    try:
+        root = repo_root()
+        readiness = task_store.storage_readiness(root)
+        if not readiness.ready:
+            return None
+        target = read_selected_coordinator_target(root)
+    except (OSError, RuntimeError, task_store.TaskStoreError, KeyError, TypeError, ValueError):
+        return None
+    if str(target.get("selected_provider") or "").strip().lower() != "codex":
+        return None
+    codex_target = target.get("targets", {}).get("codex", {})
+    route = codex_target.get("route", {}) if isinstance(codex_target, dict) else {}
+    extension_host_pid = int(target.get("extension_host_pid") or 0)
+    if extension_host_pid <= 1 or not _pid_in_same_uid_ancestor_chain(extension_host_pid, max_depth=12):
+        return None
+    window_id = str(route.get("window_id") or target.get("window_id") or f"codex_vscode_{thread_id[:8]}")
+    return {
+        "provider": "codex",
+        "session_id": thread_id,
+        "thread_id": thread_id,
+        "window_id": window_id,
+    }
+
+
+def _codex_route_manager_identity_from_parent_chain() -> dict[str, str] | None:
+    """Verify a Codex VS Code manager from the local parent chain + route file.
+
+    The Codex MCP host does not always pass ``CODEX_THREAD_ID`` or other VS
+    Code environment markers into stdio MCP servers.  In that launch shape the
+    process tree still carries the authority boundary:
+
+    ``aiworkhub.server`` -> ``codex`` -> VS Code extension host.
+
+    Accept the manager only when a same-uid ancestor is named Codex and this
+    repository's current route record names the same extension-host PID as an
+    ancestor.  The route supplies the stable window/session identifiers.  This
+    is repo-local and fails closed for cross-repository or headless launches.
+    """
+
+    saw_codex = False
+    try:
+        root = repo_root()
+        readiness = task_store.storage_readiness(root)
+        if not readiness.ready:
+            return None
+        target = read_selected_coordinator_target(root)
+    except (OSError, RuntimeError, task_store.TaskStoreError, KeyError, TypeError, ValueError):
+        return None
+    if str(target.get("selected_provider") or "").strip().lower() != "codex":
+        return None
+    codex_target = target.get("targets", {}).get("codex", {})
+    if not isinstance(codex_target, dict):
+        return None
+    if str(codex_target.get("capability_state") or "").strip().lower() not in ("available", "ready"):
+        return None
+    extension_host_pid = int(target.get("extension_host_pid") or 0)
+    if extension_host_pid <= 1:
+        return None
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return None
+        proc = Path(f"/proc/{pid}")
+        try:
+            if proc.stat().st_uid != os.geteuid():
+                return None
+            cmdline = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
+            if "codex" in cmdline.lower():
+                saw_codex = True
+            if pid == extension_host_pid:
+                if not saw_codex:
+                    return None
+                route = codex_target.get("route", {})
+                if not isinstance(route, dict):
+                    route = {}
+                session_id = str(route.get("session_id") or target.get("claim_episode") or "").strip()
+                thread_id = str(route.get("thread_id") or "").strip()
+                window_id = str(route.get("window_id") or target.get("window_id") or f"codex_vscode_{extension_host_pid}")
+                if not _UUID_RE.fullmatch(thread_id):
+                    return None
+                identity = {
+                    "provider": "codex",
+                    "session_id": thread_id,
+                    "window_id": window_id,
+                    "thread_id": thread_id,
+                }
+                return identity
+            status = proc.joinpath("status").read_text(encoding="utf-8")
+            pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+        except (OSError, UnicodeDecodeError, StopIteration, ValueError):
+            return None
+    return None
+
+
+def _pid_in_same_uid_ancestor_chain(target_pid: int, *, max_depth: int) -> bool:
+    pid = os.getppid()
+    for _ in range(max_depth):
+        if pid <= 1:
+            return False
+        proc = Path(f"/proc/{pid}")
+        try:
+            if proc.stat().st_uid != os.geteuid():
+                return False
+            if pid == target_pid:
+                return True
+            status = proc.joinpath("status").read_text(encoding="utf-8")
+            pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+        except (OSError, StopIteration, ValueError):
+            return False
+    return False
+
+
+def _valid_origin_thread_id(value: str) -> bool:
+    """Accept only callback-capable canonical chat/session UUIDs.
+
+    Window aliases (``codex:window_*`` / ``claude:window_*``) are UI routing
+    labels, not App Server or Claude session ids.  Treating them as callback
+    origins creates durable outbox rows that no live transport can own, which
+    leaves the manager asleep while review tasks accumulate.
+    """
+
+    return bool(_UUID_RE.fullmatch(value))
 
 
 WINDOW_ROUTE_DIR_REL = Path("config") / "routing" / "windows"
@@ -1631,6 +1898,8 @@ def _lifecycle_state(card: dict[str, Any]) -> str:
     """
     status = str(card.get("status") or "").strip().lower()
     worker_status = str(card.get("worker_status") or "").strip().lower()
+    if status == "archived":
+        return "archived"
     if status in {"finished", "completed", "stale_already_done"} or worker_status == "done":
         return "finished"
     if status.startswith("blocked") or worker_status.startswith(("blocked", "deferred")):
@@ -2122,9 +2391,27 @@ def create_task(
     except task_plan.TaskPlanError as exc:
         return _lifecycle_error(str(exc), 2)
 
-    origin_thread_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
-    if not _UUID_RE.fullmatch(origin_thread_id):
-        return _lifecycle_error("manager_route_has_no_valid_origin_thread", 126)
+    # Codex routes expose ``thread_id`` while Claude's verified VS Code
+    # manager descriptor exposes ``session_id``.  Both are exact originating
+    # chat identities and must be persisted in the same canonical card field.
+    # Requiring only thread_id made every valid Claude manager-created task
+    # fail with the misleading Codex-specific route_pending error.
+    origin_thread_id = str(
+        identity.get("thread_id") or identity.get("session_id") or ""
+    ).strip()
+    if callback_required and not _valid_origin_thread_id(origin_thread_id):
+        provider_name = str(identity.get("provider") or "manager").strip().lower()
+        missing_route = (
+            "codex_thread_id_not_observed"
+            if provider_name == "codex"
+            else f"{provider_name}_origin_id_not_observed"
+        )
+        return _lifecycle_error(
+            f"callback_route_pending:{missing_route}",
+            126,
+        )
+    if not callback_required and not _valid_origin_thread_id(origin_thread_id):
+        origin_thread_id = ""
     provider = str(identity["provider"])
     now = datetime.now(timezone.utc).isoformat()
     context_query = next(
@@ -2149,6 +2436,8 @@ def create_task(
         "origin_thread_id": origin_thread_id,
         "coordinator_provider": provider,
         "callback_required": bool(callback_required),
+        "callback_supported": bool(_valid_origin_thread_id(origin_thread_id)),
+        "manager_route_state": str(identity.get("route_state") or ""),
         "acceptance": acceptance2,
         "allowed_writes": writes2,
         "forbidden": forbidden2,
@@ -3231,6 +3520,40 @@ def _coordinator_route_state_path(root: Path | None = None) -> Path:
     return (root or repo_root()) / ".aiworkhub" / COORDINATOR_ROUTE_STATE_REL
 
 
+def _live_mux_active_thread(root: Path, target: dict[str, Any]) -> str:
+    """Return the active thread observed by this repo/window's one live mux.
+
+    The mux registry is written from actual extension->Codex App Server
+    traffic. Matching requires the immutable repo_id and the exact extension
+    host PID recorded by this route; zero or multiple candidates fail closed.
+    """
+
+    try:
+        from . import app_server_mux
+
+        readiness = task_store.storage_readiness(root)
+        repo_id = str(readiness.repo_id or "")
+        extension_host_pid = int(target.get("extension_host_pid") or 0)
+        if not readiness.ready or not repo_id or extension_host_pid <= 1:
+            return ""
+        matches = [
+            instance
+            for instance in app_server_mux.list_live_sideband_instances(
+                app_server_mux.default_sideband_dir()
+            )
+            if instance.repo_id == repo_id
+            and instance.parent_pid == extension_host_pid
+            and instance.is_owner_fresh
+            and instance.ready
+            and _UUID_RE.fullmatch(instance.active_thread_id or "")
+        ]
+    except (OSError, RuntimeError, TypeError, ValueError, task_store.TaskStoreError):
+        return ""
+    if len(matches) != 1:
+        return ""
+    return str(matches[0].active_thread_id)
+
+
 def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]:
     """Read the explicitly selected coordinator provider ("codex"/"claude"/
     "copilot") from the same file the VS Code extension writes
@@ -3238,7 +3561,8 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
     AITools; missing/corrupt/unrecognized state fails safe to the same
     "codex" default the extension's own ``defaultCoordinatorTargets()``
     uses -- never a guess at a different provider."""
-    path = _coordinator_route_state_path(root)
+    resolved_root = root or repo_root()
+    path = _coordinator_route_state_path(resolved_root)
     default = {"schema_id": "aiworkhub.coordinator_targets.v1", "selected_provider": "codex"}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -3249,7 +3573,47 @@ def read_selected_coordinator_target(root: Path | None = None) -> dict[str, Any]
     provider = str(payload.get("selected_provider") or "").strip().lower()
     if provider not in ("codex", "claude", "copilot"):
         return default
-    return {**default, **payload, "selected_provider": provider}
+    merged = {**default, **payload, "selected_provider": provider}
+    targets = merged.get("targets")
+    if isinstance(targets, dict):
+        codex_target = targets.get("codex")
+        if isinstance(codex_target, dict):
+            route = codex_target.get("route")
+            if isinstance(route, dict):
+                thread_id = str(route.get("thread_id") or "").strip()
+                # Repo/window aliases and empty values are UI labels, not
+                # callback-capable Codex thread UUIDs. Older route files may
+                # still say capability_state=available with a synthetic
+                # codex:window_* value; normalize that stale state on every
+                # read so no manager/dispatcher path treats it as routable.
+                if not _UUID_RE.fullmatch(thread_id):
+                    thread_id = _live_mux_active_thread(resolved_root, merged)
+                if _UUID_RE.fullmatch(thread_id):
+                    next_route = dict(route)
+                    next_route["thread_id"] = thread_id
+                    next_route["session_id"] = thread_id
+                    next_target = dict(codex_target)
+                    next_target["route"] = next_route
+                    next_target["capability_state"] = "available"
+                    next_target["wake"] = {
+                        "mode": "app_server_sideband",
+                        "supported": True,
+                    }
+                    merged["targets"] = {**targets, "codex": next_target}
+                else:
+                    next_route = dict(route)
+                    next_route["thread_id"] = ""
+                    next_route["session_id"] = str(merged.get("claim_episode") or route.get("session_id") or "")
+                    next_target = dict(codex_target)
+                    next_target["route"] = next_route
+                    next_target["capability_state"] = "route_pending"
+                    next_target["wake"] = {
+                        "mode": "direct_api_or_callback_inbox",
+                        "supported": False,
+                        "reason": "codex_thread_id_not_observed",
+                    }
+                    merged["targets"] = {**targets, "codex": next_target}
+    return merged
 
 
 def dispatcher_ensure_started() -> dict[str, Any]:
@@ -3295,6 +3659,11 @@ def dispatcher_ensure_started() -> dict[str, Any]:
                 provider="claude",
                 origin_thread_id=claude_identity["session_id"],
             )
+            seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
+                conn,
+                provider="claude",
+                origin_thread_id=claude_identity["session_id"],
+            )
         finally:
             conn.close()
         return {
@@ -3306,6 +3675,7 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "manager_route": claude_identity,
             "reason": "claude_manager_uses_mcp_callback_wait",
             "rebound_callback_count": rebound_count,
+            "seeded_review_callback_count": seeded_review_callback_count,
         }
     if not window_id:
         # Headless worker MCP processes never own callback dispatch. They
@@ -3343,6 +3713,31 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
         if transport:
             bridge_kwargs["transport"] = transport
+    route_origin_thread_id = ""
+    target_provider = target.get("targets", {}).get(provider, {}) if isinstance(target.get("targets"), dict) else {}
+    if isinstance(target_provider, dict):
+        route = target_provider.get("route", {})
+        if isinstance(route, dict):
+            candidate_thread = str(route.get("thread_id") or route.get("session_id") or "").strip()
+            if _valid_origin_thread_id(candidate_thread):
+                route_origin_thread_id = candidate_thread
+    rebound_count = 0
+    seeded_review_callback_count = 0
+    if route_origin_thread_id:
+        conn = _canonical_connect()
+        try:
+            rebound_count = callback_store.rebind_pending_callbacks(
+                conn,
+                provider=provider,
+                origin_thread_id=route_origin_thread_id,
+            )
+            seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
+                conn,
+                provider=provider,
+                origin_thread_id=route_origin_thread_id,
+            )
+        finally:
+            conn.close()
     dispatcher = bridge.ensure_dispatcher(
         root,
         provider,
@@ -3361,6 +3756,8 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         "recoverable": not running,
         "repo": str(root),
         "manager_route": claude_identity or {},
+        "rebound_callback_count": rebound_count,
+        "seeded_review_callback_count": seeded_review_callback_count,
     }
 
 

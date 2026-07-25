@@ -68,6 +68,9 @@ const elements = {
   uninitializedAlert: document.querySelector("#uninitialized-alert"),
   uninitializedAlertMessage: document.querySelector("#uninitialized-alert-message"),
   initializeButton: document.querySelector("#initialize-button"),
+  identityAlert: document.querySelector("#identity-alert"),
+  identityAlertTitle: document.querySelector("#identity-alert-title"),
+  identityAlertMessage: document.querySelector("#identity-alert-message"),
   filteredCount: document.querySelector("#filtered-count"),
   statusFilters: document.querySelector("#status-filters"),
   taskSearch: document.querySelector("#task-search"),
@@ -110,6 +113,8 @@ const elements = {
   extensionVersion: document.querySelector("#extension-version"),
   mcpRuntimeVersion: document.querySelector("#mcp-runtime-version"),
   targetState: document.querySelector("#target-state"),
+  repoRouter: document.querySelector("#repo-router"),
+  repoRouterList: document.querySelector("#repo-router-list"),
   targetButtons: Array.from(document.querySelectorAll("[data-provider]")),
 };
 
@@ -257,6 +262,50 @@ function renderSourceHealth(snapshot) {
   const sources = Array.from(new Set(errors.map((error) => error.source).filter(Boolean)));
   elements.sourceAlertMessage.textContent = `${errors.length} read source issue${errors.length === 1 ? "" : "s"}: ${sources.slice(0, 4).join(", ")}`;
   setConnection("degraded", "Degraded");
+}
+
+function compactManagerIdentityReason(identity) {
+  const payload = identity && typeof identity === "object" ? identity : {};
+  const provider = String(payload.provider || "unknown");
+  const role = String(payload.role || "unknown");
+  const route = payload.manager_route && typeof payload.manager_route === "object" ? payload.manager_route : {};
+  const pieces = [`role=${role}`, `provider=${provider}`];
+  if (payload.reason) {
+    pieces.push(`reason=${payload.reason}`);
+  }
+  if (route.window_id) {
+    pieces.push(`window=${route.window_id}`);
+  }
+  if (route.thread_id) {
+    pieces.push(`thread=${route.thread_id}`);
+  }
+  const target = state.snapshot && state.snapshot.manager_identity_target
+    ? state.snapshot.manager_identity_target
+    : null;
+  if (target && typeof target === "object") {
+    if (target.capability_state) pieces.push(`route=${target.capability_state}`);
+    if (target.reason) pieces.push(`route_reason=${target.reason}`);
+  }
+  return pieces.join(" · ");
+}
+
+function renderManagerIdentity(snapshot) {
+  if (!elements.identityAlert) {
+    return;
+  }
+  const identity = snapshot && typeof snapshot.manager_identity === "object" ? snapshot.manager_identity : null;
+  if (!identity) {
+    elements.identityAlert.hidden = true;
+    return;
+  }
+  const role = String(identity.role || "unknown");
+  const route = identity.manager_route && typeof identity.manager_route === "object" ? identity.manager_route : {};
+  const isManager = role === "manager" && Boolean(route.session_id || route.thread_id);
+  elements.identityAlert.hidden = false;
+  elements.identityAlert.classList.toggle("identity-ok", isManager);
+  elements.identityAlert.classList.toggle("identity-warn", !isManager);
+  elements.identityAlertTitle.textContent = isManager ? "Manager identity verified" : "Manager identity unverified";
+  elements.identityAlertMessage.textContent = compactManagerIdentityReason(identity);
 }
 
 function replaceSelectOptions(select, values, allLabel, currentValue) {
@@ -676,6 +725,8 @@ function renderSnapshot(snapshot) {
   state.tasks = flattenTasks(snapshot);
   const storageReady = renderStorageState(snapshot);
   renderSummary(snapshot);
+  renderManagerIdentity(snapshot);
+  renderKnownRepositories(snapshot);
   if (storageReady) {
     renderSourceHealth(snapshot);
   }
@@ -730,14 +781,61 @@ function renderRuntimeInfo(info) {
   }
 }
 
+function renderKnownRepositories(snapshot) {
+  if (!elements.repoRouter || !elements.repoRouterList) {
+    return;
+  }
+  const payload = snapshot && snapshot.known_repositories && typeof snapshot.known_repositories === "object"
+    ? snapshot.known_repositories
+    : null;
+  const repos = payload ? asArray(payload.repositories).slice(0, 8) : [];
+  elements.repoRouter.hidden = repos.length === 0;
+  if (!repos.length) {
+    elements.repoRouterList.replaceChildren();
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const repo of repos) {
+    const classes = ["repo-route"];
+    if (repo.current_repo) classes.push("current");
+    if (repo.stale) classes.push("stale");
+    const item = createElement("span", classes.join(" "));
+    const name = String(repo.repo_name || "repo");
+    const selected = String(repo.selected_provider || "unknown");
+    const alive = repo.extension_host_alive ? "live" : "not-live";
+    item.textContent = `${repo.current_repo ? "● " : ""}${name} · ${selected} · ${alive}${repo.stale ? " · stale" : ""}`;
+    item.title = JSON.stringify({
+      repo_id: repo.repo_id,
+      window_id: repo.window_id,
+      selected_provider: selected,
+      extension_host_alive: repo.extension_host_alive,
+      stale: repo.stale,
+      updated_at: repo.updated_at,
+    });
+    fragment.appendChild(item);
+  }
+  elements.repoRouterList.replaceChildren(fragment);
+}
+
 function renderCoordinatorTargets(info) {
   const payload = info && typeof info === "object" ? info : {};
+  const selected = String(payload.selected_provider || "codex");
+  const target = payload.targets && payload.targets[selected] ? payload.targets[selected] : {};
+  const route = target.route && typeof target.route === "object" ? target.route : {};
+  const wake = target.wake && typeof target.wake === "object" ? target.wake : {};
   if (elements.targetState) {
-    elements.targetState.textContent = "automatic: routed by originating chat";
+    const stateText = String(target.capability_state || "automatic");
+    const reason = String(wake.reason || wake.action || "");
+    elements.targetState.textContent = `automatic: ${selected} · ${stateText}${reason ? ` · ${reason}` : ""}`;
     elements.targetState.title = JSON.stringify({
       repo_id: payload.repo_id,
       window_id: payload.window_id,
       claim_episode: payload.claim_episode,
+      selected_provider: selected,
+      capability_state: target.capability_state,
+      thread_id: route.thread_id,
+      session_id: route.session_id,
+      wake,
       routing: "per-task coordinator_provider + thread/session identity",
     });
   }

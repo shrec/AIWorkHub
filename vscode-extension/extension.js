@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.31";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.51";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -45,10 +45,13 @@ const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
 const ALLOWED_REFRESH_INTERVALS_MS = new Set([10000, 30000, 60000]);
 const DEFAULT_REFRESH_INTERVAL_MS = 30000;
 const REPO_ID_RE = /^repo_[a-f0-9]{32}$|^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
+const REAL_THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TARGET_PROVIDERS = Object.freeze(["codex", "claude"]);
 const TARGET_ROUTE_KEY = "routing/coordinator-targets.json";
 const WINDOW_ROUTE_DIR_KEY = "routing/windows";
 const WINDOW_ROUTE_LEASE_TTL_MS = 15 * 60 * 1000;
+const SHARED_REPO_ROUTE_SCHEMA = "aiworkhub.shared_repo_route.v1";
+const SHARED_REPO_ROUTE_TTL_MS = 15 * 60 * 1000;
 // B905 lease renewal: substantially shorter than the 15-minute TTL so a
 // window's route record never expires while the extension host is alive --
 // a slow tick or a single missed renewal still leaves multiple retries
@@ -167,6 +170,53 @@ function atomicWriteJson(file, payload) {
   fs.renameSync(tmp, file);
 }
 
+function sharedRepoRouteDir() {
+  return path.join(os.homedir(), ".aiworkhub", "router", "repos");
+}
+
+function writeSharedRepoRouteRecord(repoInfo, targets) {
+  if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) {
+    return null;
+  }
+  const now = new Date();
+  const record = {
+    schema_id: SHARED_REPO_ROUTE_SCHEMA,
+    repo_id: repoInfo.repoId,
+    repo_name: repoInfo.repoName || repoInfo.label || path.basename(repoInfo.root || ""),
+    repo_root: repoInfo.root,
+    window_id: WINDOW_SCOPE_ID,
+    extension_host_pid: process.pid,
+    selected_provider: targets.selected_provider,
+    targets: targets.targets,
+    updated_at: now.toISOString(),
+    lease_expires_at: new Date(now.getTime() + SHARED_REPO_ROUTE_TTL_MS).toISOString(),
+  };
+  const recordPath = path.join(sharedRepoRouteDir(), `${repoInfo.repoId}.json`);
+  fs.mkdirSync(path.dirname(recordPath), { recursive: true, mode: 0o700 });
+  atomicWriteJson(recordPath, record);
+  try {
+    fs.chmodSync(recordPath, 0o600);
+  } catch (_err) {
+    // Best-effort on platforms/filesystems that do not support POSIX chmod.
+  }
+  return record;
+}
+
+function removeSharedRepoRouteRecord(repoInfo) {
+  if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) {
+    return;
+  }
+  const recordPath = path.join(sharedRepoRouteDir(), `${repoInfo.repoId}.json`);
+  try {
+    const payload = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    if (payload && payload.window_id === WINDOW_SCOPE_ID) {
+      fs.unlinkSync(recordPath);
+    }
+  } catch (_err) {
+    // Missing/unreadable/stale shared discovery record -- nothing to clean.
+  }
+}
+
 /** Return {root, label, uriStr, repoId, repoName, storageReady} for the active
  *  repository, or throw. Performs NO filesystem write and never calls a
  *  bootstrap/initialize routine -- opening or selecting a repository must
@@ -252,14 +302,20 @@ function _sanitisePreflightStderr(raw) {
 // Run a single candidate Python through the preflight gate: "import
 // aiworkhub.server". Returns {ok, candidate, ...diagnosticFields}. Never
 // leaks secrets or host-absolute paths into diagnostic strings.
-function _preflightPythonCandidate(command, extraArgs) {
+function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRuntimeDir) {
   const args = [...(Array.isArray(extraArgs) ? extraArgs : []), "-c", "import aiworkhub.server"];
+  const preflightEnv = { ...process.env };
+  if (runtimeDir) {
+    preflightEnv.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
+  }
   try {
     const result = childProcess.spawnSync(command, args, {
       timeout: 15000,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
+      cwd: runtimeDir || undefined,
+      env: preflightEnv,
     });
     // spawnSync returns result.error for ENOENT / spawn failures without throwing.
     if (result.error) {
@@ -492,6 +548,7 @@ function writeWindowRouteRecord(repoInfo, targets) {
   const recordPath = windowRouteStatePath(repoInfo.root, WINDOW_SCOPE_ID);
   fs.mkdirSync(path.dirname(recordPath), { recursive: true, mode: 0o700 });
   atomicWriteJson(recordPath, record);
+  writeSharedRepoRouteRecord(repoInfo, targets);
   return record;
 }
 
@@ -509,6 +566,7 @@ function removeWindowRouteRecord(repoInfo) {
   } catch (_err) {
     // ENOENT or an unavailable filesystem -- nothing to clean up.
   }
+  removeSharedRepoRouteRecord(repoInfo);
 }
 
 // One process-wide interval that keeps renewing THIS window's own route
@@ -559,9 +617,9 @@ function defaultCoordinatorTargets(repoInfo) {
     targets: {
       codex: {
         provider: "codex",
-        capability_state: "available",
-        route: { repo_id: repoInfo.repoId, window_id: WINDOW_SCOPE_ID, claim_episode: activeClaimEpisode, thread_id: `codex:${WINDOW_SCOPE_ID}`, session_id: activeClaimEpisode },
-        wake: { mode: "direct_api_or_callback_inbox", supported: true },
+        capability_state: "route_pending",
+        route: { repo_id: repoInfo.repoId, window_id: WINDOW_SCOPE_ID, claim_episode: activeClaimEpisode, thread_id: "", session_id: activeClaimEpisode },
+        wake: { mode: "direct_api_or_callback_inbox", supported: false, reason: "codex_thread_id_not_observed" },
       },
       claude: {
         provider: "claude",
@@ -587,6 +645,29 @@ function readCoordinatorTargets(repoInfo) {
   }
 }
 
+function sanitizeCoordinatorTargetRoute(provider, target, repoInfo) {
+  const next = { ...(target || {}) };
+  const route = { ...((next.route && typeof next.route === "object") ? next.route : {}) };
+  route.repo_id = repoInfo.repoId;
+  route.window_id = WINDOW_SCOPE_ID;
+  route.claim_episode = activeClaimEpisode;
+  if (provider === "codex") {
+    const threadId = String(route.thread_id || "");
+    if (!REAL_THREAD_ID_RE.test(threadId)) {
+      route.thread_id = "";
+      route.session_id = activeClaimEpisode;
+      next.capability_state = "route_pending";
+      next.wake = {
+        mode: "direct_api_or_callback_inbox",
+        supported: false,
+        reason: "codex_thread_id_not_observed",
+      };
+    }
+  }
+  next.route = route;
+  return next;
+}
+
 function refreshCoordinatorRouteOwnership(repoInfo) {
   const next = readCoordinatorTargets(repoInfo);
   next.repo_id = repoInfo.repoId;
@@ -597,8 +678,9 @@ function refreshCoordinatorRouteOwnership(repoInfo) {
   const defaults = defaultCoordinatorTargets(repoInfo);
   for (const provider of ["codex", "claude"]) {
     const target = { ...defaults.targets[provider], ...((next.targets || {})[provider] || {}) };
-    target.route = { ...defaults.targets[provider].route };
-    next.targets = { ...(next.targets || {}), [provider]: target };
+    const existingRoute = (((next.targets || {})[provider] || {}).route || {});
+    target.route = { ...defaults.targets[provider].route, ...existingRoute };
+    next.targets = { ...(next.targets || {}), [provider]: sanitizeCoordinatorTargetRoute(provider, target, repoInfo) };
   }
   atomicWriteJson(routeStatePath(repoInfo.root), next);
   writeWindowRouteRecord(repoInfo, next);
@@ -700,6 +782,7 @@ class McpStdioClient {
     // finds the runtime healthy (see pushRuntimeInfo), so a later, distinct
     // mismatch (e.g. a subsequent runtime repair) gets its own fresh budget.
     this.runtimeRepairAttempts = 0;
+    this.runtimeRepairBlockedReason = "";
   }
 
   // B859: the ONE place that decides whether a dispatcher_ensure_started
@@ -728,16 +811,53 @@ class McpStdioClient {
   // Never spawns a second child while one is starting/running -- callers
   // always go through this single bounded entry point.
   ensureStarted() {
-    if (this.running && this.initialized) {
-      return Promise.resolve();
-    }
+    // Startup is not complete until the post-handshake runtime-version
+    // preflight and any bounded repair restart have finished. Check the
+    // shared starting promise BEFORE accepting a handshaken child as ready;
+    // otherwise dashboard refresh can race a stale-child repair and observe
+    // transient mcp_not_running / degraded state that incorrectly asks the
+    // user to intervene manually.
     if (this.startingPromise) {
       return this.startingPromise;
     }
-    this.startingPromise = this._start().finally(() => {
+    if (!this.running && this.runtimeRepairBlockedReason) {
+      return Promise.reject(new Error(this.runtimeRepairBlockedReason));
+    }
+    if (this.running && this.initialized) {
+      return Promise.resolve();
+    }
+    this.startingPromise = this._startWithVersionRepair().finally(() => {
       this.startingPromise = null;
     });
     return this.startingPromise;
+  }
+
+  async _startWithVersionRepair() {
+    try {
+      await this._start();
+      return;
+    } catch (err) {
+      const message = sanitizeErrorMessage(err);
+      if (!message.includes("mcp_version_mismatch_pre_service")) {
+        throw err;
+      }
+      if (this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS) {
+        this.runtimeRepairBlockedReason = "runtime_repair_budget_exhausted";
+        throw err;
+      }
+      this.runtimeRepairAttempts += 1;
+      this.outputChannel.appendLine(`[mcp] runtime mismatch (${message}) -- restarting stale child before services start`);
+      this.stop({ restart: true });
+      try {
+        await this._start();
+      } catch (repairErr) {
+        const repairMessage = sanitizeErrorMessage(repairErr);
+        if (repairMessage.includes("mcp_version_mismatch_pre_service")) {
+          this.runtimeRepairBlockedReason = `runtime_repair_budget_exhausted:${repairMessage}`;
+        }
+        throw repairErr;
+      }
+    }
   }
 
   async _start() {
@@ -844,33 +964,55 @@ class McpStdioClient {
     this.notify("notifications/initialized", {});
     this.initialized = true;
     this.restartAttempts = 0;
-    // B857: converge on exactly one live repository-bound dispatcher right
-    // after every successful handshake (covers activation, tab-
-    // deserialization, and reload alike -- all of them go through
-    // ensureStarted()/_start()/_handshake()). Idempotent server-side
-    // (aiworkhub.core.dispatcher_ensure_started); a failure here must never
-    // fail the MCP connection itself. B859: a transport-level success (no
-    // thrown error) still needs its OWN result checked -- an
-    // ``ok: true``/``dispatcher_started: false``/``status: "start_failed"``
-    // payload is a visible failure, not silently-ignored readiness.
+    // Version/capability convergence is checked by _startWithVersionRepair()
+    // immediately after this handshake returns and before callers treat the
+    // child as ready. A mismatch triggers a bounded restart of only this
+    // repo/window child, so users never need to manually kill stale runtimes.
+    await this._assertRuntimeVersionBeforeServices();
+    // Dispatcher / Source Graph convergence is deliberately background-only.
+    // A high-level tool call here would recurse through ensureStarted() while
+    // ensureStarted() is already waiting for _handshake(), leaving the Webview
+    // stuck at "MCP runtime checking" / "Loading queue".  Use raw JSON-RPC in
+    // a fire-and-forget task so the dashboard can render health/snapshot first.
+    this._convergeBackgroundServices();
+  }
+
+
+  async _assertRuntimeVersionBeforeServices() {
+    let health;
     try {
-      const result = await this.callTool(DISPATCHER_TOOLS.ensureStarted, {});
-      this._recordDispatcherEnsureResult(result, "handshake");
+      health = extractToolResult(await this.request("tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} }));
     } catch (err) {
-      this.dispatcherReady = false;
-      this.outputChannel.appendLine(`[mcp] dispatcher ensure-started failed: ${sanitizeErrorMessage(err)}`);
+      throw new Error(`mcp_health_preflight_failed:${sanitizeErrorMessage(err)}`);
     }
-    // 0.6.30: converge on exactly one repo-bound Source Graph indexing
-    // daemon right after every successful handshake too (activation, tab-
-    // deserialization, and reload). Idempotent server-side
-    // (aiworkhub.core.source_graph_ensure_started); best-effort -- a
-    // failure here must never fail the MCP connection or the dispatcher
-    // convergence above.
-    try {
-      await this.callTool(SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted, {});
-    } catch (err) {
-      this.outputChannel.appendLine(`[mcp] source graph ensure-started failed: ${sanitizeErrorMessage(err)}`);
+    const runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
+    if (runtimeVersion !== EXPECTED_MCP_PACKAGE_VERSION) {
+      throw new Error(`mcp_version_mismatch_pre_service:${runtimeVersion}`);
     }
+  }
+
+  async _callToolRaw(name, args, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
+    return extractToolResult(await this.request("tools/call", { name, arguments: args || {} }, timeoutMs));
+  }
+
+  _convergeBackgroundServices() {
+    const run = async () => {
+      try {
+        const result = await this._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
+        this._recordDispatcherEnsureResult(result, "background convergence");
+      } catch (err) {
+        this.dispatcherReady = false;
+        this.outputChannel.appendLine(`[mcp] dispatcher background convergence failed: ${sanitizeErrorMessage(err)}`);
+      }
+      try {
+        await this._callToolRaw(SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted, {}, 5000);
+      } catch (err) {
+        this.outputChannel.appendLine(`[mcp] source graph background convergence failed: ${sanitizeErrorMessage(err)}`);
+      }
+    };
+    run().catch((err) => {
+      this.outputChannel.appendLine(`[mcp] background service convergence failed: ${sanitizeErrorMessage(err)}`);
+    });
   }
 
   _onStdout(chunk) {
@@ -1133,6 +1275,144 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 let extensionRuntimeDir = null;
 let extensionMuxExecutable = null;
 
+// Installed VSIX directories are versioned and VS Code is free to remove the
+// previous directory as soon as an upgrade lands.  Long-lived Codex/MCP
+// processes must therefore never import from `<extensions>/aiworkhub-X/runtime`:
+// a second window upgrading the extension would orphan the first window's
+// process and every worker it launches.  Materialise immutable, content-
+// addressed runtime generations under extension-global storage instead.
+// Generations are intentionally retained; a later bounded lease-aware GC may
+// remove unused ones, but an upgrade must never delete code beneath a live
+// process.
+const STABLE_RUNTIME_SCHEMA = "aiworkhub.stable_runtime.v1";
+
+function _runtimeTreeFingerprint(root) {
+  const hash = crypto.createHash("sha256");
+  function visit(dir, relBase) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.name !== "__pycache__" && entry.name !== ".pytest_cache")
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const rel = path.join(relBase, entry.name);
+      const full = path.join(dir, entry.name);
+      if (entry.isFile()) {
+        hash.update(`F\0${rel}\0`);
+        hash.update(fs.readFileSync(full));
+      } else if (entry.isSymbolicLink()) {
+        throw new Error(`stable_runtime_unsupported_entry:${rel}`);
+      } else {
+        hash.update(`D\0${rel}\0`);
+        visit(full, rel);
+      }
+    }
+  }
+  visit(root, "");
+  return hash.digest("hex");
+}
+
+function _copyRuntimeTree(source, destination) {
+  fs.mkdirSync(destination, { recursive: true });
+  const entries = fs.readdirSync(source, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === "__pycache__" || entry.name === ".pytest_cache") continue;
+    const src = path.join(source, entry.name);
+    const dst = path.join(destination, entry.name);
+    if (entry.isFile()) {
+      fs.copyFileSync(src, dst);
+    } else if (entry.isSymbolicLink()) {
+      throw new Error(`stable_runtime_unsupported_entry:${entry.name}`);
+    } else {
+      _copyRuntimeTree(src, dst);
+    }
+  }
+}
+
+function materializeStableRuntimeGeneration(context) {
+  const sourceRuntime = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  const sourcePackage = path.join(sourceRuntime, "aiworkhub", "__init__.py");
+  if (!fs.existsSync(sourcePackage)) {
+    throw new Error(`bundled_runtime_missing:${sourceRuntime}`);
+  }
+  const packagedMux = path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
+  const devMux = path.resolve(context.extensionUri.fsPath, "..", "scripts", "aiworkhub-app-server-mux");
+  const sourceMux = fs.existsSync(packagedMux) ? packagedMux : devMux;
+  if (!fs.existsSync(sourceMux)) {
+    throw new Error(`bundled_mux_missing:${sourceMux}`);
+  }
+  const version = String(
+    (context.extension && context.extension.packageJSON && context.extension.packageJSON.version)
+      || EXPECTED_MCP_PACKAGE_VERSION,
+  );
+  const fingerprint = _runtimeTreeFingerprint(sourceRuntime);
+  const storageRoot = context.globalStorageUri && context.globalStorageUri.fsPath
+    ? context.globalStorageUri.fsPath
+    : path.join(os.homedir(), ".aiworkhub", "extension-storage");
+  const generationsRoot = path.join(storageRoot, "runtime", "generations");
+  const generationName = `${version}-${fingerprint.slice(0, 16)}`;
+  const generationRoot = path.join(generationsRoot, generationName);
+  const runtimeDir = path.join(generationRoot, "runtime");
+  const muxPath = path.join(generationRoot, "bin", "aiworkhub-app-server-mux");
+  const manifestPath = path.join(generationRoot, "manifest.json");
+
+  let ready = false;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    ready = manifest.schema_id === STABLE_RUNTIME_SCHEMA
+      && manifest.version === version
+      && manifest.fingerprint === fingerprint
+      && fs.existsSync(path.join(runtimeDir, "aiworkhub", "server.py"))
+      && fs.existsSync(muxPath);
+  } catch (_err) {
+    ready = false;
+  }
+
+  if (!ready) {
+    fs.mkdirSync(generationsRoot, { recursive: true });
+    const staging = path.join(
+      generationsRoot,
+      `.${generationName}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`,
+    );
+    fs.rmSync(staging, { recursive: true, force: true });
+    try {
+      _copyRuntimeTree(sourceRuntime, path.join(staging, "runtime"));
+      fs.mkdirSync(path.join(staging, "bin"), { recursive: true });
+      fs.copyFileSync(sourceMux, path.join(staging, "bin", "aiworkhub-app-server-mux"));
+      if (process.platform !== "win32") {
+        fs.chmodSync(path.join(staging, "bin", "aiworkhub-app-server-mux"), 0o755);
+      }
+      atomicWriteJson(path.join(staging, "manifest.json"), {
+        schema_id: STABLE_RUNTIME_SCHEMA,
+        version,
+        fingerprint,
+        created_at: new Date().toISOString(),
+      });
+      // Same-content concurrent activations converge on one immutable
+      // generation. Never replace a complete generation another window may
+      // already be executing.
+      try {
+        fs.renameSync(staging, generationRoot);
+      } catch (err) {
+        if (!fs.existsSync(manifestPath)) throw err;
+        fs.rmSync(staging, { recursive: true, force: true });
+      }
+    } catch (err) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  atomicWriteJson(path.join(storageRoot, "runtime", "current.json"), {
+    schema_id: STABLE_RUNTIME_SCHEMA,
+    version,
+    fingerprint,
+    generation: generationName,
+    runtime_dir: runtimeDir,
+    mux_path: muxPath,
+    updated_at: new Date().toISOString(),
+  });
+  return { runtimeDir, muxPath, generationRoot, fingerprint, version, storageRoot };
+}
+
 function shouldRepairCodexMuxSetting(currentValue) {
   const current = String(currentValue || "").trim();
   if (!current) return true;
@@ -1190,30 +1470,15 @@ async function ensureCodexMuxConfigured(context) {
     outputChannel.appendLine("[callback] Codex sideband mux requires a native Windows launcher");
     return false;
   }
-  // Default-OFF opt-in. Pointing the OpenAI extension's chatgpt.cliExecutable
-  // at our mux is invasive (it wraps another extension's CLI) and, with a single
-  // machine-wide Codex IPC socket, has caused multi-window breakage. So the mux
-  // is OFF unless the user explicitly enables it AND has verified it in their
-  // setup. When OFF (the default) we never touch cliExecutable -- and actively
-  // RESTORE it if an earlier version left our mux there -- so Codex always
-  // launches directly and reliably (the 0.6.30 behavior). The Claude callback
-  // lane (aiworkhub_claude_callback_wait) is independent and unaffected.
-  const sidebandEnabled = vscode.workspace
-    .getConfiguration("aiworkhub")
-    .get("enableCodexSidebandMux", false);
-  if (!sidebandEnabled) {
-    try {
-      const chatgpt = vscode.workspace.getConfiguration("chatgpt");
-      const current = String(chatgpt.get("cliExecutable", "") || "");
-      if (current.includes("aiworkhub-app-server-mux")) {
-        await chatgpt.update("cliExecutable", undefined, vscode.ConfigurationTarget.Global);
-        outputChannel.appendLine("[callback] Codex sideband mux OFF (default); restored chatgpt.cliExecutable so Codex launches directly");
-      }
-    } catch (err) {
-      outputChannel.appendLine(`[callback] could not restore chatgpt.cliExecutable: ${sanitizeErrorMessage(err)}`);
-    }
-    return false;
-  }
+  // Always-on for initialized repositories. The OpenAI extension's
+  // chatgpt.cliExecutable setting is
+  // application-scoped/global, but the bundled launcher is transparent when a
+  // window has no bound repository and registers sideband ownership only when
+  // this extension host supplies the exact repo_id/window binding. This keeps
+  // multi-window isolation while allowing the mux to observe the real Codex
+  // thread UUID needed for push callbacks. There is deliberately no user flag:
+  // older releases persisted an explicit false value which silently defeated
+  // newer safe defaults and left every task without an origin thread.
   // Do no harm: only hijack the OpenAI extension's chatgpt.cliExecutable when
   // THIS workspace is bound to a real repository, so the mux (which fails closed
   // without AIWORKHUB_REPO_ID, B925) can actually start the Codex app-server.
@@ -1222,7 +1487,8 @@ async function ensureCodexMuxConfigured(context) {
     outputChannel.appendLine("[callback] repository not bound; leaving chatgpt.cliExecutable untouched (Codex launches directly)");
     return false;
   }
-  const muxPath = path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
+  const muxPath = extensionMuxExecutable
+    || path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
   extensionMuxExecutable = muxPath;
   try {
     fs.accessSync(muxPath, fs.constants.R_OK | fs.constants.X_OK);
@@ -1524,7 +1790,7 @@ function ensureCodexConfigTomlRepaired(context) {
   } catch (_err) {
     return false;
   }
-  const currentRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  const currentRuntimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   const { text, changed } = repairCodexConfigTomlText(original, currentRuntimeDir);
   if (!changed) {
     return false;
@@ -1556,7 +1822,7 @@ function migrateCodexConfigTomlRuntimePath(context) {
   } catch (_err) {
     return false;
   }
-  const currentRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  const currentRuntimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   const { content, changed } = migrateCodexConfigTomlText(original, currentRuntimeDir);
   if (!changed) {
     return false;
@@ -1569,6 +1835,67 @@ function migrateCodexConfigTomlRuntimePath(context) {
     outputChannel.appendLine(`[codex] failed to migrate config.toml: ${sanitizeErrorMessage(err)}`);
     return false;
   }
+}
+
+/** Repair a repository-local VS Code MCP registration created by an older
+ *  AIWorkHub release. The dashboard child and Copilot's MCP child are separate
+ *  processes: the latter reads `.vscode/mcp.json`, so a stale repository
+ *  source checkout in PYTHONPATH can fail even while the dashboard is live.
+ *  Keep the registration repository-scoped, but make code authority come from
+ *  this extension's bundled runtime on every supported host OS. */
+function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) {
+  if (!document || typeof document !== "object" || !document.servers || typeof document.servers !== "object") {
+    return { document, changed: false };
+  }
+  let changed = false;
+  for (const [name, value] of Object.entries(document.servers)) {
+    if (!value || typeof value !== "object") continue;
+    const args = Array.isArray(value.args) ? value.args.map(String) : [];
+    const isAiWorkHub = name.toLowerCase() === "aiworkhub" || args.includes("aiworkhub.server");
+    if (!isAiWorkHub) continue;
+    const nextArgs = [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"];
+    const nextEnv = {
+      ...(value.env && typeof value.env === "object" ? value.env : {}),
+      PYTHONPATH: runtimeDir,
+      AIWORKHUB_REPO: repoRoot,
+      AIWORKHUB_REPO_ROOT: repoRoot,
+    };
+    const next = { ...value, command: python.command, args: nextArgs, env: nextEnv, type: "stdio" };
+    if (JSON.stringify(next) !== JSON.stringify(value)) {
+      document.servers[name] = next;
+      changed = true;
+    }
+  }
+  return { document, changed };
+}
+
+function ensureWorkspaceMcpConfigsRepaired(context) {
+  const folders = vscode.workspace.workspaceFolders || [];
+  const runtimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  let repaired = 0;
+  for (const folder of folders) {
+    const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
+    const configPath = path.join(repoRoot, ".vscode", "mcp.json");
+    let document;
+    try {
+      document = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    } catch (_err) {
+      continue;
+    }
+    const python = findPythonCommand(repoRoot);
+    const result = repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python);
+    if (!result.changed) continue;
+    try {
+      fs.writeFileSync(configPath, `${JSON.stringify(result.document, null, 2)}\n`, "utf8");
+      repaired += 1;
+    } catch (err) {
+      outputChannel.appendLine(`[mcp] failed to repair workspace MCP registration: ${sanitizeErrorMessage(err)}`);
+    }
+  }
+  if (repaired) {
+    outputChannel.appendLine(`[mcp] repaired ${repaired} repository-local AIWorkHub MCP registration(s) to bundled runtime`);
+  }
+  return repaired;
 }
 
 function installedExtensionVersion() {
@@ -1697,6 +2024,7 @@ async function pushRuntimeInfo(view) {
 
   if (status.matches) {
     client.runtimeRepairAttempts = 0;
+    client.runtimeRepairBlockedReason = "";
     view.postMessage({
       type: OUTBOUND_TYPES.runtimeInfo,
       payload: runtimeStatusPayload({ runtimeVersion: status.runtimeVersion }),
@@ -1739,6 +2067,7 @@ async function pushRuntimeInfo(view) {
   }
 
   client.runtimeRepairAttempts = 0;
+  client.runtimeRepairBlockedReason = "";
   view.postMessage({
     type: OUTBOUND_TYPES.runtimeInfo,
     payload: runtimeStatusPayload({ runtimeVersion: recheck.runtimeVersion, repaired: true, repairAttempted: true }),
@@ -1785,6 +2114,7 @@ class ViewState {
     // timer tick advanced snapshotRequestSeq, making every eventual response
     // look stale and leaving the Webview on "Connecting" forever.
     this.snapshotInFlight = null;
+    this.snapshotRefreshQueued = false;
   }
 
   bindClient(client) {
@@ -1830,11 +2160,17 @@ class ViewState {
 
 function pushSnapshot(view) {
   if (view.snapshotInFlight) {
+    view.snapshotRefreshQueued = true;
     return view.snapshotInFlight;
   }
+  view.snapshotRefreshQueued = false;
   const inFlight = pushSnapshotOnce(view).finally(() => {
     if (view.snapshotInFlight === inFlight) {
       view.snapshotInFlight = null;
+    }
+    if (view.snapshotRefreshQueued && view.visible) {
+      view.snapshotRefreshQueued = false;
+      return pushSnapshot(view);
     }
   });
   view.snapshotInFlight = inFlight;
@@ -2174,9 +2510,19 @@ function getHtmlForWebview(webview, extensionUri) {
       <button class="primary-button" id="initialize-button" type="button">Initialize AIWorkHub</button>
     </section>
 
+    <section class="source-alert identity-alert" id="identity-alert" aria-live="polite" hidden>
+      <strong id="identity-alert-title">Manager identity</strong>
+      <span id="identity-alert-message"></span>
+    </section>
+
     <section class="target-selector" aria-label="Coordinator routing">
       <span>Coordinator routing</span>
       <strong id="target-state">Automatic by originating chat</strong>
+    </section>
+
+    <section class="repo-router" id="repo-router" aria-label="Shared repository router" hidden>
+      <span>Known repos</span>
+      <div id="repo-router-list"></div>
     </section>
 
     <div class="workspace">
@@ -2685,11 +3031,15 @@ async function selectRepositoryCommand() {
 
 async function activate(context) {
   extensionContext = context;
-  extensionRuntimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
   outputChannel = vscode.window.createOutputChannel("AIWorkHub");
   context.subscriptions.push(outputChannel);
+  const stableRuntime = materializeStableRuntimeGeneration(context);
+  extensionRuntimeDir = stableRuntime.runtimeDir;
+  extensionMuxExecutable = stableRuntime.muxPath;
+  outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
+  ensureWorkspaceMcpConfigsRepaired(context);
 
   // Resolve the initial active repository and label.
   try {
@@ -2789,10 +3139,13 @@ module.exports = {
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,
+    materializeStableRuntimeGeneration,
     bindCodexSidebandEnvironment,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,
+    repairWorkspaceMcpConfigObject,
+    ensureWorkspaceMcpConfigsRepaired,
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
     CODEX_OWNED_RUNTIME_SEGMENT_RE,
