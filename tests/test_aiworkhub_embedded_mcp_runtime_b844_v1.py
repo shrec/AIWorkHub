@@ -133,9 +133,12 @@ def fallback_server_module():
             raise ModuleNotFoundError(name)
         return real_import(name, *args, **kwargs)
 
-    for name in list(sys.modules):
-        if name == "aiworkhub" or name.startswith("aiworkhub."):
-            del sys.modules[name]
+    package = sys.modules.get("aiworkhub")
+    saved_server_module = sys.modules.pop("aiworkhub.server", None)
+    sentinel = object()
+    saved_server_attr = (
+        package.__dict__.pop("server", sentinel) if package is not None else sentinel
+    )
 
     builtins.__import__ = blocked_import
     try:
@@ -145,9 +148,17 @@ def fallback_server_module():
 
     yield server_module
 
-    for name in list(sys.modules):
-        if name == "aiworkhub" or name.startswith("aiworkhub."):
-            del sys.modules[name]
+    # Only server.py needs a fresh import to exercise its stdlib fallback.
+    # Replacing the full package graph creates duplicate exception classes
+    # and module singletons in already-collected tests.
+    sys.modules.pop("aiworkhub.server", None)
+    if saved_server_module is not None:
+        sys.modules["aiworkhub.server"] = saved_server_module
+    if package is not None:
+        if saved_server_attr is sentinel:
+            package.__dict__.pop("server", None)
+        else:
+            package.__dict__["server"] = saved_server_attr
 
 
 def test_stdlib_fallback_engages_and_registers_canonical_dashboard_tools(fallback_server_module):

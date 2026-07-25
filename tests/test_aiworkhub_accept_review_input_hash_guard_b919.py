@@ -105,9 +105,18 @@ _ABSENT_SIBLINGS = (
 )
 
 _AIWORKHUB_STUBBED_MODULES: set[str] = set()
+_AIWORKHUB_SYNTHETIC_PACKAGE = False
 
 
 def _ensure_aiworkhub_sibling_stubs() -> None:
+    global _AIWORKHUB_SYNTHETIC_PACKAGE
+    # Canonical/full checkouts have every sibling and must use the normal
+    # package import path.  Creating then removing a synthetic package in
+    # that case leaves already-collected tests holding different module
+    # objects (locally masked when Copilot happens to be installed, exposed
+    # in clean CI).  The shim exists only for the original sparse worktree.
+    if all((_SRC / "aiworkhub" / f"{sub}.py").is_file() for sub in _ABSENT_SIBLINGS):
+        return
     pkg = sys.modules.get("aiworkhub")
     if pkg is None:
         pkg = types.ModuleType("aiworkhub")
@@ -117,6 +126,7 @@ def _ensure_aiworkhub_sibling_stubs() -> None:
         pkg.coordinator_config = lambda *_a, **_k: {}
         pkg.refresh_coordinator_config = lambda *_a, **_k: {}
         sys.modules["aiworkhub"] = pkg
+        _AIWORKHUB_SYNTHETIC_PACKAGE = True
     for sub in _ABSENT_SIBLINGS:
         full_name = f"aiworkhub.{sub}"
         if full_name in sys.modules:
@@ -142,6 +152,8 @@ _AIWORKHUB_BASELINE_MODULES = frozenset(
 
 
 def _restore_aiworkhub_sys_modules() -> None:
+    if not _AIWORKHUB_SYNTHETIC_PACKAGE and not _AIWORKHUB_STUBBED_MODULES:
+        return
     # Collection imports happen for the complete suite before fixture
     # teardown.  Remove every package/module introduced by this sparse-tree
     # compatibility import immediately, otherwise the synthetic package (it
