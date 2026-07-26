@@ -198,7 +198,19 @@ def _ensure_callback_batches_table(conn: sqlite3.Connection) -> None:
         ("last_failure_kind", "TEXT NOT NULL DEFAULT ''"),
     ):
         if not _column_exists(conn, "callback_batches", column):
-            conn.execute(f"ALTER TABLE callback_batches ADD COLUMN {column} {ddl}")
+            try:
+                conn.execute(f"ALTER TABLE callback_batches ADD COLUMN {column} {ddl}")
+            except sqlite3.OperationalError as exc:
+                # Reload/activation can initialize the same repository from
+                # the extension child and dispatcher thread concurrently.
+                # Both may observe the pre-migration schema before one wins
+                # ALTER TABLE.  The loser's duplicate-column error is a
+                # successful convergence only when the column is now really
+                # visible; every other database error remains fail-closed.
+                if "duplicate column name" not in str(exc).lower() or not _column_exists(
+                    conn, "callback_batches", column
+                ):
+                    raise
     conn.commit()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_callback_batches_state ON callback_batches(state)")
     conn.commit()

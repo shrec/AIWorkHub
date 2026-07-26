@@ -3723,21 +3723,29 @@ def dispatcher_ensure_started() -> dict[str, Any]:
                 route_origin_thread_id = candidate_thread
     rebound_count = 0
     seeded_review_callback_count = 0
-    if route_origin_thread_id:
-        conn = _canonical_connect()
-        try:
+    # Reconcile the durable review queue on every idempotent ensure, even
+    # when the currently-observed manager route is temporarily unavailable.
+    # Normal transitions enqueue immediately, but a child/reload race can
+    # leave an already-reviewable task without an outbox row.  Such a task
+    # still carries its persisted originating thread, which
+    # seed_missing_review_callbacks() can safely reuse.  Waiting for a fresh
+    # route here was the reason those rows only woke the manager after a
+    # later Reload Window.
+    conn = _canonical_connect()
+    try:
+        if route_origin_thread_id:
             rebound_count = callback_store.rebind_pending_callbacks(
                 conn,
                 provider=provider,
                 origin_thread_id=route_origin_thread_id,
             )
-            seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
-                conn,
-                provider=provider,
-                origin_thread_id=route_origin_thread_id,
-            )
-        finally:
-            conn.close()
+        seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
+            conn,
+            provider=provider,
+            origin_thread_id=route_origin_thread_id or None,
+        )
+    finally:
+        conn.close()
     dispatcher = bridge.ensure_dispatcher(
         root,
         provider,
@@ -3934,19 +3942,31 @@ def dispatcher_watchdog() -> dict[str, Any]:
     where dispatch is not expected is left untouched.
     """
     health = dispatcher_health()
-    if not health.get("dispatch_expected") or health.get("healthy", True):
+    if not health.get("dispatch_expected"):
         return {
             "ok": True,
             "recovered": False,
             "status": health.get("status"),
-            "reason": "healthy_or_not_expected",
+            "reason": "dispatch_not_expected",
             "health": health,
         }
+    # ``ensure`` is deliberately idempotent.  Besides restarting a dead
+    # dispatcher it reconciles the durable review queue and seeds any missing
+    # callback outbox rows.  Run it even while the dispatcher thread itself is
+    # healthy: a terminal-transition/outbox race is independent from thread
+    # liveness and otherwise remains invisible until a manual reload.
     recovery = dispatcher_ensure_started()
     after = dispatcher_health()
+    healthy_before = bool(health.get("healthy"))
+    healthy_after = bool(after.get("healthy"))
+    seeded = int(recovery.get("seeded_review_callback_count") or 0)
+    rebound = int(recovery.get("rebound_callback_count") or 0)
     return {
-        "ok": bool(after.get("healthy")),
-        "recovered": bool(after.get("healthy")),
+        "ok": healthy_after,
+        "recovered": (not healthy_before and healthy_after),
+        "reconciled": True,
+        "seeded_review_callback_count": seeded,
+        "rebound_callback_count": rebound,
         "status": after.get("status"),
         "problems_before": health.get("problems", []),
         "recovery": recovery,

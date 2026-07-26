@@ -165,6 +165,8 @@ assert.ok(ext.includes("workspaceState.update(WSP_STATE_KEY_REPO_URI"));
 // legacy .aiworkinghub directory is never read/created.
 assert.ok(ext.includes("async stopDispatcherThenTerminate("));
 assert.ok(ext.includes("DISPATCHER_TOOLS.ensureStarted"));
+assert.ok(ext.includes('watchdog: "aiworkhub_dispatcher_watchdog"'));
+assert.ok(ext.includes('client.callTool(DISPATCHER_TOOLS.watchdog, {})'));
 assert.ok(ext.includes("DISPATCHER_TOOLS.stop"));
 assert.ok(ext.includes("panel.__aiworkhubViewState.dispose()"));
 assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must never be referenced");
@@ -194,6 +196,8 @@ assert.ok(ext.includes("callback_required"));
 assert.ok(ext.includes("notify_and_open_chat"));
 assert.ok(app.includes('case "coordinatorTargets"'));
 assert.ok(app.includes('type: "selectCoordinatorTarget"'));
+assert.ok(app.includes("Manager verified · callback unavailable"));
+assert.ok(app.includes("Manager identity and callback verified"));
 
 // v0.6.9: Live Output presents the provider's terminal envelope as readable
 // sections and metrics. The opaque JSON is retained only in a collapsed raw
@@ -213,6 +217,11 @@ assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));
 // package (including dashboard_static assets) into an extension-local
 // runtime/ directory, sourced from the one canonical src/aiworkhub tree.
 const packageVsix = read("test/package-vsix.js");
+const packageJson = JSON.parse(read("package.json"));
+assert.ok(
+  packageJson.activationEvents.includes("*"),
+  "AIWorkHub must bind repo identity and the Codex mux before onStartupFinished activation races",
+);
 assert.ok(packageVsix.includes('path.join(root, "..", "src", "aiworkhub")'));
 assert.ok(packageVsix.includes('path.join(extensionDir, "runtime", "aiworkhub")'));
 assert.ok(packageVsix.includes("__pycache__"));

@@ -164,6 +164,21 @@ def snapshot_view() -> dict[str, Any]:
             "reason": f"manager_bootstrap_failed:{type(exc).__name__}",
         }
     snapshot["manager_identity"] = manager
+    # Identity authority and callback delivery are deliberately separate
+    # contracts.  A valid manager route does not prove that the extension-
+    # owned dispatcher is registered/running, so surface the live dispatcher
+    # health from this exact repo-bound MCP child in every snapshot.
+    try:
+        snapshot["callback_delivery"] = core.dispatcher_health()
+    except Exception as exc:  # noqa: BLE001 -- callback diagnostics must not break the queue view
+        snapshot["callback_delivery"] = {
+            "ok": False,
+            "healthy": False,
+            "status": "unknown",
+            "dispatcher_running": False,
+            "registered": False,
+            "problems": [f"dispatcher_health_failed:{type(exc).__name__}"],
+        }
     try:
         snapshot["known_repositories"] = shared_router.list_known_repositories(current_root=core.repo_root(), limit=32)
     except Exception as exc:  # noqa: BLE001 -- shared router diagnostics must not break the active repo view
@@ -233,15 +248,18 @@ def health_view() -> dict[str, Any]:
     render its connection banner.  Never calls ``dashboard.build_snapshot``:
     polling stays cheap and cannot pull the queue/cost/process payload.
     """
-    # The VS Code dashboard child exports both names.  Manager MCP clients
-    # launched through the Codex/Claude mux use the canonical core binding
-    # name (AIWORKHUB_REPO), so accept it as the equivalent repo-local source
-    # instead of reporting a false degraded/unselected state.
-    root_raw = str(
-        os.environ.get("AIWORKHUB_REPO_ROOT")
-        or os.environ.get("AIWORKHUB_REPO")
-        or ""
-    ).strip()
+    # Use the same canonical resolver as every manager/task tool.  The VS Code
+    # dashboard child carries explicit AIWORKHUB_REPO* bindings, while the
+    # application-global Codex MCP registration intentionally omits them so
+    # multiple repository windows cannot overwrite one another; that child is
+    # repository-bound by its own process cwd.  Reading only env vars here made
+    # dashboard_health falsely report repo_root_not_selected even though
+    # manager_bootstrap and task_create were correctly bound to the current
+    # repository.
+    try:
+        root_raw = str(core.repo_root())
+    except (OSError, RuntimeError, task_store.TaskStoreError):
+        root_raw = ""
     if not root_raw:
         result: dict[str, Any] = {
             "ok": False,

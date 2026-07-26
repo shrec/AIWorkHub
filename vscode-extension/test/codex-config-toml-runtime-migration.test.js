@@ -48,7 +48,31 @@ try {
   Module._load = originalLoad;
 }
 const { __testInternals } = extensionModule;
-const { repairCodexConfigTomlText, migrateCodexConfigTomlText, splitCodexPythonPathValue } = __testInternals;
+const {
+  repairCodexConfigTomlText,
+  migrateCodexConfigTomlText,
+  splitCodexPythonPathValue,
+  classifyImmediateCodexChildren,
+} = __testInternals;
+
+{
+  const ps = [
+    " 101  10 /usr/bin/node /opt/codex -c x app-server --analytics-default-enabled",
+    " 102  11 python3 /runtime/bin/aiworkhub-app-server-mux app-server",
+    " 103  10 python3 -m aiworkhub.server",
+    " 104  12 /usr/bin/node /opt/codex app-server",
+  ].join("\n");
+  const children = classifyImmediateCodexChildren(ps, 10);
+  assert.deepStrictEqual(children.direct.map((x) => x.pid), [101]);
+  assert.deepStrictEqual(children.mux, []);
+
+  const muxChildren = classifyImmediateCodexChildren(
+    " 201  10 python3 /runtime/bin/aiworkhub-app-server-mux -c x app-server\n",
+    10,
+  );
+  assert.deepStrictEqual(muxChildren.direct, []);
+  assert.deepStrictEqual(muxChildren.mux.map((x) => x.pid), [201]);
+}
 
 const NEW_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.20/runtime";
 const OLD_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.19/runtime";

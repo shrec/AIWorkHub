@@ -63,6 +63,7 @@ class FakeChild extends EventEmitter {
       return;
     }
     const tool = message.params.name;
+    this.spawnRecord.toolCalls.push(tool);
     if (tool === "aiworkhub_dashboard_snapshot") {
       const repoId = this.spawnRecord.env.AIWORKHUB_REPO_ID;
       const result = {
@@ -80,11 +81,28 @@ class FakeChild extends EventEmitter {
       }
     } else if (tool === "aiworkhub_dashboard_health") {
       this._send({
-        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.52" }) }],
+        content: [{ type: "text", text: JSON.stringify({ ok: true, server_version: "0.6.57" }) }],
       }, message.id);
     } else if (tool === "aiworkhub_dispatcher_ensure_started") {
       this._send({
         content: [{ type: "text", text: JSON.stringify({ ok: true, dispatcher_started: true }) }],
+      }, message.id);
+    } else if (tool === "aiworkhub_dispatcher_watchdog") {
+      this._send({
+        content: [{ type: "text", text: JSON.stringify({
+          ok: true,
+          recovered: true,
+          health: {
+            healthy: true,
+            status: "running",
+            dispatch_expected: true,
+            dispatcher_running: true,
+            registered: true,
+            repo_id: this.spawnRecord.repoId,
+            dispatcher_repo_id: this.spawnRecord.repoId,
+            problems: [],
+          },
+        }) }],
       }, message.id);
     } else {
       this._send({ content: [{ type: "text", text: "{}" }] }, message.id);
@@ -126,7 +144,7 @@ function loadExtensionHost(repoRoot) {
     const extension = require(extensionPath);
     const context = {
       extensionUri: { fsPath: path.resolve(__dirname, "..") },
-      extension: { packageJSON: { version: "0.6.52" } },
+      extension: { packageJSON: { version: "0.6.57" } },
       subscriptions: [],
       workspaceState: { update: () => {}, get: () => undefined },
     };
@@ -167,6 +185,7 @@ async function snapshotFor(host) {
       repoRoot: options.env.AIWORKHUB_REPO_ROOT,
       repoId: options.env.AIWORKHUB_REPO_ID,
       windowId: options.env.AIWORKHUB_WINDOW_ID,
+      toolCalls: [],
     };
     spawns.push(spawnRecord);
     const queue = behaviors.get(spawnRecord.repoRoot) || [];
@@ -223,6 +242,10 @@ async function snapshotFor(host) {
       "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ]));
+    assert.ok(
+      spawns.some((spawn) => spawn.toolCalls.includes("aiworkhub_dispatcher_watchdog")),
+      "normal dashboard refresh never invoked the callback dispatcher watchdog",
+    );
     assert.ok(!JSON.stringify(secondMessages).includes("repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert.ok(!JSON.stringify(firstMessages).includes("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 

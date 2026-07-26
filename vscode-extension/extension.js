@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.52";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.57";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -77,6 +77,7 @@ const DASHBOARD_TOOLS = Object.freeze({
 const DISPATCHER_TOOLS = Object.freeze({
   ensureStarted: "aiworkhub_dispatcher_ensure_started",
   health: "aiworkhub_dispatcher_health",
+  watchdog: "aiworkhub_dispatcher_watchdog",
   stop: "aiworkhub_dispatcher_stop",
 });
 // 0.6.30: Source Graph automatic indexing lifecycle -- same start/health/stop
@@ -574,6 +575,87 @@ function removeWindowRouteRecord(repoInfo) {
 // to activeRepoIdentity, so a window with no bound repository yet simply
 // skips a tick instead of writing a bogus record.
 let windowRouteRenewalTimer = null;
+let codexMuxRepairTimer = null;
+let codexMuxRepairAttempted = false;
+
+// VS Code does not define an activation order for two extensions that both
+// start at startup.  On a cold first window, OpenAI Codex can therefore spawn
+// its direct app-server child milliseconds before AIWorkHub publishes the mux
+// executable and repository identity; later windows work only because the
+// application-scoped setting is already warm.  Classify immediate children
+// of THIS extension host only, so the bounded repair can never touch another
+// window/repository or a nested task worker.
+function classifyImmediateCodexChildren(psText, parentPid) {
+  const direct = [];
+  const mux = [];
+  for (const line of String(psText || "").split(/\r?\n/)) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (!match || Number(match[2]) !== Number(parentPid)) continue;
+    const item = { pid: Number(match[1]), command: match[3] };
+    if (item.command.includes("aiworkhub-app-server-mux")) {
+      mux.push(item);
+    } else if (/codex/i.test(item.command) && /(?:^|\s)app-server(?:\s|$)/.test(item.command)) {
+      direct.push(item);
+    }
+  }
+  return { direct, mux };
+}
+
+function stopCodexMuxRepairTimer() {
+  if (codexMuxRepairTimer) {
+    clearInterval(codexMuxRepairTimer);
+    codexMuxRepairTimer = null;
+  }
+}
+
+function scheduleCodexMuxRepair(enabled) {
+  stopCodexMuxRepairTimer();
+  if (!enabled || process.platform === "win32" || codexMuxRepairAttempted) return;
+  let remainingChecks = 20;
+  codexMuxRepairTimer = setInterval(() => {
+    remainingChecks -= 1;
+    let listing;
+    try {
+      listing = childProcess.spawnSync(
+        "ps",
+        ["-eo", "pid=,ppid=,command="],
+        { encoding: "utf8", timeout: 1500, maxBuffer: 2 * 1024 * 1024 },
+      );
+    } catch (_err) {
+      stopCodexMuxRepairTimer();
+      return;
+    }
+    if (!listing || listing.status !== 0) {
+      if (remainingChecks <= 0) stopCodexMuxRepairTimer();
+      return;
+    }
+    const children = classifyImmediateCodexChildren(listing.stdout, process.pid);
+    if (children.mux.length === 1) {
+      stopCodexMuxRepairTimer();
+      return;
+    }
+    // Fail closed on ambiguity.  Exactly one immediate direct app-server and
+    // zero mux children is the measured cold-window race; anything else is
+    // diagnostic-only and must never trigger process mutation.
+    if (children.mux.length === 0 && children.direct.length === 1) {
+      codexMuxRepairAttempted = true;
+      stopCodexMuxRepairTimer();
+      try {
+        process.kill(children.direct[0].pid, "SIGTERM");
+        outputChannel.appendLine(
+          "[callback] restarted one direct Codex app-server so the configured repo-bound mux can take ownership",
+        );
+      } catch (err) {
+        outputChannel.appendLine(`[callback] direct Codex mux repair failed: ${sanitizeErrorMessage(err)}`);
+      }
+      return;
+    }
+    if (remainingChecks <= 0) stopCodexMuxRepairTimer();
+  }, 500);
+  if (codexMuxRepairTimer && typeof codexMuxRepairTimer.unref === "function") {
+    codexMuxRepairTimer.unref();
+  }
+}
 
 function renewWindowRouteLease() {
   if (!activeRepoIdentity || !REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))) {
@@ -801,6 +883,33 @@ class McpStdioClient {
     this.outputChannel.appendLine(
       `[mcp] dispatcher not ready after ${context}: status=${status}${reason ? ` reason=${reason}` : ""}`,
     );
+    return result;
+  }
+
+  // Periodic refresh owns callback liveness as well as queue freshness.  The
+  // watchdog response always includes the post-recovery health object; use it
+  // as the transport truth instead of inferring readiness from manager
+  // identity or route availability.
+  _recordDispatcherWatchdogResult(result, context) {
+    const health = result && result.health && typeof result.health === "object"
+      ? result.health
+      : {};
+    const managerInboxReady = health.status === "manager_inbox" && health.healthy === true;
+    const dispatcherReady = (
+      health.dispatch_expected === true
+      && health.healthy === true
+      && health.dispatcher_running === true
+      && health.registered === true
+      && String(health.repo_id || "") !== ""
+      && String(health.repo_id || "") === String(health.dispatcher_repo_id || "")
+    );
+    this.dispatcherReady = managerInboxReady || dispatcherReady;
+    if (!this.dispatcherReady) {
+      const problems = Array.isArray(health.problems) ? health.problems.join(",") : "";
+      this.outputChannel.appendLine(
+        `[mcp] callback delivery not ready after ${context}: status=${String(health.status || "unknown")}${problems ? ` problems=${problems}` : ""}`,
+      );
+    }
     return result;
   }
 
@@ -2190,6 +2299,19 @@ async function pushSnapshotOnce(view) {
     try {
       const client = getMcpClient();
       view.bindClient(client);
+      // A dispatcher can die after a successful handshake.  Converge it on
+      // every normal dashboard refresh so recovery never depends on Reload
+      // Window or a coordinator-target toggle.  Failure remains visible in
+      // callback_delivery but never prevents the queue snapshot rendering.
+      try {
+        const watchdog = await client.callTool(DISPATCHER_TOOLS.watchdog, {});
+        client._recordDispatcherWatchdogResult(watchdog, "periodic watchdog");
+      } catch (watchdogError) {
+        client.dispatcherReady = false;
+        outputChannel.appendLine(
+          `[mcp] dispatcher watchdog failed: ${sanitizeErrorMessage(watchdogError)}`,
+        );
+      }
       const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
       if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
@@ -3059,7 +3181,8 @@ async function activate(context) {
   // repo is bound) point chatgpt.cliExecutable at the mux. Order matters: bind
   // first so ensureCodexMuxConfigured's do-no-harm guard sees the binding.
   bindCodexSidebandEnvironment(activeRepoIdentity);
-  await ensureCodexMuxConfigured(context);
+  const codexMuxConfigured = await ensureCodexMuxConfigured(context);
+  scheduleCodexMuxRepair(codexMuxConfigured);
 
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
@@ -3106,6 +3229,7 @@ async function activate(context) {
 
 async function deactivate() {
   stopWindowRouteRenewalTimer();
+  stopCodexMuxRepairTimer();
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
@@ -3141,6 +3265,7 @@ module.exports = {
     resolveExtensionRuntimeDir,
     materializeStableRuntimeGeneration,
     bindCodexSidebandEnvironment,
+    classifyImmediateCodexChildren,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,

@@ -86,15 +86,55 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
         return dict(FAKE_SNAPSHOT)
 
     monkeypatch.setattr(dashboard, "build_snapshot", fake_build_snapshot)
+    monkeypatch.setattr(core, "dispatcher_health", lambda: {
+        "ok": True,
+        "healthy": True,
+        "status": "running",
+        "dispatch_expected": True,
+        "dispatcher_running": True,
+        "registered": True,
+        "repo_id": "repo_canon",
+        "dispatcher_repo_id": "repo_canon",
+        "problems": [],
+    })
     result = dashboard_mcp_app.snapshot_view()
 
     assert calls == [((), {})]
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
     assert result["tasks"] == FAKE_SNAPSHOT["tasks"]
+    assert result["callback_delivery"]["status"] == "running"
+    assert result["callback_delivery"]["dispatcher_running"] is True
     assert result["server_tool"] == "aiworkhub_dashboard_snapshot"
     assert result["authority_flags"]["readonly"] is True
     assert result["authority_flags"]["queue_write"] is False
     assert "transport_truncated_fields" not in result
+
+
+def test_snapshot_identity_does_not_hide_stopped_callback_dispatcher(monkeypatch):
+    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(FAKE_SNAPSHOT))
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: {
+        "ok": True,
+        "role": "manager",
+        "provider": "codex",
+        "manager_route": {"thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa"},
+    })
+    monkeypatch.setattr(core, "dispatcher_health", lambda: {
+        "ok": False,
+        "healthy": False,
+        "status": "stopped",
+        "dispatch_expected": True,
+        "dispatcher_running": False,
+        "registered": False,
+        "repo_id": "repo_canon",
+        "dispatcher_repo_id": "",
+        "problems": ["dispatcher_unregistered"],
+    })
+
+    result = dashboard_mcp_app.snapshot_view()
+
+    assert result["manager_identity"]["role"] == "manager"
+    assert result["callback_delivery"]["healthy"] is False
+    assert result["callback_delivery"]["problems"] == ["dispatcher_unregistered"]
 
 
 def test_snapshot_view_bounds_oversized_secondary_sections(monkeypatch):

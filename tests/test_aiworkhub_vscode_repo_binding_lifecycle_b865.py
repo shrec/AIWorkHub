@@ -99,9 +99,25 @@ def test_health_view_accepts_manager_mux_repo_binding(tmp_path, monkeypatch):
 def test_health_view_reports_repo_root_not_selected_before_any_bind(monkeypatch):
     monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
     monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setattr(core, "repo_root", lambda: (_ for _ in ()).throw(RuntimeError("repo_root_not_selected")))
     result = dashboard_mcp_app.health_view()
     assert result["ok"] is False
     assert result["error"] == "repo_root_not_selected"
+
+
+def test_health_view_uses_process_cwd_binding_when_global_mcp_has_no_repo_env(tmp_path, monkeypatch):
+    root = tmp_path / "repo_global_mcp_cwd"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+
+    result = dashboard_mcp_app.health_view()
+
+    assert result["ok"] is True
+    assert result["repo"] == str(root)
+    assert result["storage"]["ready"] is True
 
 
 # ---------------------------------------------------------------------------

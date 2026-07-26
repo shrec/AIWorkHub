@@ -151,13 +151,21 @@ def test_watchdog_recovers_expected_down_dispatcher(monkeypatch):
 
 
 def test_watchdog_noop_when_healthy(monkeypatch):
-    monkeypatch.setattr(core, "dispatcher_health",
-                        lambda: {"dispatch_expected": True, "healthy": True, "status": "running"})
+    healths = iter([
+        {"dispatch_expected": True, "healthy": True, "status": "running"},
+        {"dispatch_expected": True, "healthy": True, "status": "running"},
+    ])
+    monkeypatch.setattr(core, "dispatcher_health", lambda: next(healths))
     called = {"ensure": False}
     monkeypatch.setattr(core, "dispatcher_ensure_started",
-                        lambda: called.__setitem__("ensure", True) or {})
+                        lambda: called.__setitem__("ensure", True) or {
+                            "seeded_review_callback_count": 1,
+                            "rebound_callback_count": 0,
+                        })
     r = core.dispatcher_watchdog()
-    assert r["recovered"] is False and called["ensure"] is False
+    assert r["recovered"] is False and called["ensure"] is True
+    assert r["reconciled"] is True
+    assert r["seeded_review_callback_count"] == 1
 
 
 def test_watchdog_noop_when_not_expected(monkeypatch):
@@ -168,6 +176,7 @@ def test_watchdog_noop_when_not_expected(monkeypatch):
                         lambda: called.__setitem__("ensure", True) or {})
     r = core.dispatcher_watchdog()
     assert r["recovered"] is False and called["ensure"] is False
+    assert r["reason"] == "dispatch_not_expected"
 
 
 # --- terminal enqueue is durable + replays after recovery (#2, #3) ---------

@@ -301,11 +301,33 @@ function renderManagerIdentity(snapshot) {
   const role = String(identity.role || "unknown");
   const route = identity.manager_route && typeof identity.manager_route === "object" ? identity.manager_route : {};
   const isManager = role === "manager" && Boolean(route.session_id || route.thread_id);
+  const delivery = snapshot && typeof snapshot.callback_delivery === "object" ? snapshot.callback_delivery : {};
+  const managerInboxReady = delivery.status === "manager_inbox" && delivery.healthy === true;
+  const dispatcherReady = (
+    delivery.dispatch_expected === true
+    && delivery.healthy === true
+    && delivery.dispatcher_running === true
+    && delivery.registered === true
+    && Boolean(delivery.repo_id)
+    && delivery.repo_id === delivery.dispatcher_repo_id
+  );
+  const callbackReady = managerInboxReady || dispatcherReady;
   elements.identityAlert.hidden = false;
-  elements.identityAlert.classList.toggle("identity-ok", isManager);
-  elements.identityAlert.classList.toggle("identity-warn", !isManager);
-  elements.identityAlertTitle.textContent = isManager ? "Manager identity verified" : "Manager identity unverified";
-  elements.identityAlertMessage.textContent = compactManagerIdentityReason(identity);
+  elements.identityAlert.classList.toggle("identity-ok", isManager && callbackReady);
+  elements.identityAlert.classList.toggle("identity-warn", !isManager || !callbackReady);
+  if (!isManager) {
+    elements.identityAlertTitle.textContent = "Manager identity unverified";
+  } else if (!callbackReady) {
+    elements.identityAlertTitle.textContent = "Manager verified · callback unavailable";
+  } else {
+    elements.identityAlertTitle.textContent = "Manager identity and callback verified";
+  }
+  const identityReason = compactManagerIdentityReason(identity);
+  const deliveryProblems = Array.isArray(delivery.problems) ? delivery.problems.filter(Boolean) : [];
+  const deliveryReason = callbackReady
+    ? `callback=${String(delivery.status || "ready")}`
+    : `callback=${String(delivery.status || "unknown")}${deliveryProblems.length ? ` · ${deliveryProblems.join(",")}` : ""}`;
+  elements.identityAlertMessage.textContent = `${identityReason} · ${deliveryReason}`;
 }
 
 function replaceSelectOptions(select, values, allLabel, currentValue) {
