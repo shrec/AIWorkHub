@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.61";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.62";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -927,7 +927,12 @@ class McpStdioClient {
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
       AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
       AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
-      AIWORKHUB_CALLBACK_TRANSPORT: "repository_inbox_poll",
+      // Use the callback bridge's supported, repo-bound Codex transport.
+      // Do not invent an extension-only transport name: core forwards this
+      // value into CallbackBridge, whose accepted Codex transports are
+      // subprocess and sideband.  The extension deliberately avoids the
+      // foreign-plugin sideband integration, so subprocess is canonical.
+      AIWORKHUB_CALLBACK_TRANSPORT: "subprocess",
     };
     // Extension-local runtime import path: `import aiworkhub` must always
     // resolve to the package this extension bundled under its own

@@ -62,7 +62,7 @@ class FakeChild extends EventEmitter {
         text: JSON.stringify({
           ok: true,
           dispatcher_started: true,
-          server_version: "0.6.61",
+          server_version: "0.6.62",
         }),
       }],
     }, message.id);

@@ -229,6 +229,32 @@ def test_core_dispatcher_forwards_extension_selected_sideband_transport(tmp_path
     assert captured["bridge_kwargs"] == {"transport": "sideband"}
 
 
+def test_core_dispatcher_forwards_extension_selected_subprocess_transport(tmp_path, monkeypatch):
+    root = tmp_path / "repo_subprocess"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "subprocess")
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_subprocess_test")
+    captured = {}
+
+    class FakeDispatcher:
+        def health(self):
+            return {"dispatcher_running": True, "provider": "codex"}
+
+    def fake_ensure(repo_root, provider, **kwargs):
+        captured.update(repo_root=repo_root, provider=provider, **kwargs)
+        return FakeDispatcher()
+
+    monkeypatch.setattr(callback_bridge, "ensure_dispatcher", fake_ensure)
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: callback_bridge)
+    result = core.dispatcher_ensure_started()
+    assert result["dispatcher_started"] is True
+    assert captured["provider"] == "codex"
+    assert captured["bridge_kwargs"] == {"transport": "subprocess"}
+
+
 def test_claude_manager_derives_window_and_coordinator_capability(tmp_path, monkeypatch):
     root = tmp_path / "repo_claude_manager"
     root.mkdir()
