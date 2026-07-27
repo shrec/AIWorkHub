@@ -182,6 +182,9 @@ def test_exact_claim_is_idempotent_never_double_claims(repo):
     assert "ineligible" in str(second.get("stderr") or "")
     row = _row(repo, "TASK_B882E")
     assert row["worker_status"] == "claimed"
+    card = json.loads(row["card_json"])
+    assert card["claim_epoch"] == 1
+    assert card["launch_request_id"] == "req-1"
 
 
 def test_exact_claim_write_gate_closed_blocks_claim(tmp_path, monkeypatch):

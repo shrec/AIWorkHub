@@ -102,10 +102,11 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
     """Idempotent, fail-closed migration: create/upgrade callback_outbox.
 
-    Dedup scope is per CLAIM/REVIEW EPISODE, not per task lifetime: the
-    UNIQUE constraint covers (task_id, transition, origin_thread_id,
-    episode_id, request_id), matching the ``taskctl.py`` claim_epoch
-    convention this table is shared with."""
+    Dedup scope is per CLAIM/REVIEW EPISODE, not per task lifetime, using
+    (task_id, transition, origin_thread_id, episode_id, request_id). Legacy
+    databases may also carry the equivalent table-level UNIQUE constraint;
+    fresh databases enforce the same identity in ``enqueue_callback``'s
+    atomic INSERT...SELECT predicate."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS callback_outbox (
@@ -311,15 +312,28 @@ def enqueue_callback(
     resolved_episode = episode_id if episode_id is not None else current_claim_episode(conn, task_id)
     now = utc_now()
     try:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO callback_outbox(
               task_id, provider, origin_thread_id, transition, episode_id, event_id,
               request_id, state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM callback_outbox
+                WHERE task_id=? AND transition=? AND origin_thread_id=?
+                  AND episode_id=? AND request_id=?
+             )
             """,
-            (task_id, validated_provider, validated_thread, transition, resolved_episode, event_id, request_id, now, now),
+            (
+                task_id, validated_provider, validated_thread, transition,
+                resolved_episode, event_id, request_id, now, now,
+                task_id, transition, validated_thread, resolved_episode, request_id,
+            ),
         )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
         conn.commit()
     except sqlite3.IntegrityError:
         return False

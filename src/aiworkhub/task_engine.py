@@ -95,10 +95,27 @@ def claim_start_exact(
                 "ok": False, "returncode": 1, "command": command, "stdout": "",
                 "stderr": f"identity_mismatch:task_id={task_id}",
             }
+        try:
+            stored_card = json.loads(row["card_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            stored_card = {}
+        if not isinstance(stored_card, dict):
+            stored_card = {}
+        try:
+            claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
+        except (TypeError, ValueError):
+            claim_epoch = 1
+        stored_card.update(
+            claim_epoch=claim_epoch,
+            launch_request_id=request_id,
+            status="processing",
+            worker_status="claimed",
+            claimed_by=runner,
+        )
         cur = conn.execute(
-            "UPDATE tasks SET worker_status='claimed', status='processing', claimed_by=?, "
+            "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
             "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
-            (runner, now, now, now, task_id),
+            (json.dumps(stored_card, ensure_ascii=False, sort_keys=True), runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -192,6 +209,8 @@ def mark_terminal_review(
                         origin_thread_id,
                         transition,
                         provider=provider,
+                        episode_id=str(card.get("claim_epoch") or 0),
+                        request_id=str((evidence or {}).get("request_id") or ""),
                     )
                     conn.commit()
                 finally:
