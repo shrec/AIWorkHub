@@ -260,6 +260,111 @@ def test_js_ts_family_respects_ignored_directories(tmp_path):
     assert not any(rel.startswith(("node_modules/", "dist/")) for rel in rels)
 
 
+def test_archive_is_default_excluded_without_repo_config(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    _write(repo / "archive" / "old.py", "def retired():\n    return 0\n")
+    rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
+    assert "src/live.py" in rels
+    assert "archive/old.py" not in rels
+
+
+def test_repo_ignore_policy_extends_defaults_with_dirs_and_globs(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    config = sg.ensure_ignore_config(repo)
+    config.write_text(json.dumps({
+        "schema_id": sg.IGNORE_SCHEMA_ID,
+        "exclude_dirs": ["vendor"],
+        "exclude_globs": ["generated/**", "**/*.min.js"],
+    }), encoding="utf-8")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    _write(repo / "vendor" / "copy.py", "def vendor_copy():\n    return 0\n")
+    _write(repo / "generated" / "nested" / "auto.py", "def generated():\n    return 0\n")
+    _write(repo / "web" / "bundle.min.js", "module.exports = 1;\n")
+    rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
+    assert rels == {"src/live.py"}
+
+
+def test_malformed_repo_ignore_policy_fails_closed(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    config = sg.ensure_ignore_config(repo)
+    config.write_text('{"schema_id":"wrong","exclude_dirs":[]}', encoding="utf-8")
+    _write(repo / "src" / "must_not_be_indexed.py", "def hidden():\n    return 1\n")
+    with pytest.raises(sg.SourceGraphError, match="source_graph_ignore_invalid"):
+        sg.iter_source_files(repo)
+
+
+def test_incremental_build_removes_entries_newly_covered_by_ignore_policy(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "generated" / "old.py", "def generated_probe():\n    return 1\n")
+    first = sg.build_index(repo, incremental=True)
+    assert first.files_seen == 1
+
+    config = sg.ensure_ignore_config(repo)
+    config.write_text(json.dumps({
+        "schema_id": sg.IGNORE_SCHEMA_ID,
+        "exclude_dirs": ["generated"],
+        "exclude_globs": [],
+    }), encoding="utf-8")
+    second = sg.build_index(repo, incremental=True)
+    assert second.files_removed == 1
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert sg.func(conn, "generated_probe") == []
+    finally:
+        conn.close()
+
+
+def test_repository_writer_lease_rejects_overlapping_build(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    with sg.index_write_lease(repo) as acquired:
+        assert acquired is True
+        with pytest.raises(sg.SourceGraphBuildInProgressError, match="source_graph_build_in_progress"):
+            sg.build_index(repo, incremental=True)
+
+
+def test_wal_readonly_query_can_read_during_writer_transaction(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "live.py", "def live_probe():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+    writer = sg.connect(sg.resolve_db_path(repo))
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        reader = sg.connect(sg.resolve_db_path(repo), read_only=True)
+        try:
+            assert sg.func(reader, "live_probe")
+        finally:
+            reader.close()
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_incremental_build_compacts_large_stale_page_population(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "repo")
+    for index in range(300):
+        _write(
+            repo / "generated" / f"module_{index:04d}.py",
+            f"def probe_{index}():\n    return {index}\n",
+        )
+    sg.build_index(repo, incremental=True)
+    config = sg.ensure_ignore_config(repo)
+    config.write_text(json.dumps({
+        "schema_id": sg.IGNORE_SCHEMA_ID,
+        "exclude_dirs": ["generated"],
+        "exclude_globs": [],
+    }), encoding="utf-8")
+    monkeypatch.setattr(sg, "SOURCE_GRAPH_COMPACT_MIN_BYTES", 0)
+    monkeypatch.setattr(sg, "SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO", 0.000001)
+    report = sg.build_index(repo, incremental=True)
+    assert report.files_removed == 300
+    assert report.freelist_ratio_before_compaction > 0
+    assert report.compaction_performed is True
+    assert report.compaction_error == ""
+    assert report.database_bytes_after_compaction <= report.database_bytes_before_compaction
+
+
 def test_cmake_generated_ts_timestamp_files_excluded_not_mislabeled_typescript(tmp_path):
     """CMake writes non-source ``.ts`` dependency-timestamp files under
     ``CMakeFiles/`` -- these must never be indexed as truthful "typescript"

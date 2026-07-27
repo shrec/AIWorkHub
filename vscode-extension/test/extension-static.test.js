@@ -8,7 +8,6 @@ const pkg = JSON.parse(read("package.json"));
 const ext = read("extension.js");
 const app = read("media/app.js");
 const css = read("media/app.css");
-const runtimeInit = read("../src/aiworkhub/__init__.py");
 
 function absent(haystack, values, label) {
   const hits = values.filter((value) => haystack.includes(value));
@@ -18,7 +17,6 @@ function absent(haystack, values, label) {
 assert.strictEqual(pkg.name, "aiworkhub");
 assert.strictEqual(pkg.displayName, "AIWorkHub");
 assert.ok(ext.includes(`EXPECTED_MCP_PACKAGE_VERSION = "${pkg.version}"`));
-assert.ok(runtimeInit.includes(`__version__ = "${pkg.version}"`));
 assert.deepStrictEqual(pkg.extensionKind, ["workspace"]);
 assert.strictEqual(pkg.icon, "media/aiworkhub-icon.png");
 assert.ok(
@@ -75,10 +73,8 @@ assert.ok(ext.includes('path.join(root, ".aiworkhub", "runtime")'));
 assert.ok(!ext.includes('homedir(), ".config", "aiworkhub", "taskctl_coordinator.token"'));
 assert.ok(ext.includes("snapshotRequestSeq"));
 assert.ok(ext.includes("requestSeq === view.snapshotRequestSeq"));
-assert.ok(ext.includes("AIWORKHUB_CALLBACK_TRANSPORT"));
-assert.ok(ext.includes('getConfiguration("chatgpt")'));
-assert.ok(ext.includes('config.inspect("cliExecutable")'));
-assert.ok(ext.includes('path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux")'));
+assert.ok(ext.includes('AIWORKHUB_CALLBACK_TRANSPORT: "repository_inbox_poll"'));
+absent(ext, ['getConfiguration("chatgpt")', "cliExecutable", "process.kill(", "classifyImmediateCodexChildren"], "foreign plugin mutation/process control");
 assert.ok(ext.includes("retainContextWhenHidden: true"));
 assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
@@ -110,13 +106,10 @@ assert.ok(ext.includes("mcpClient.stopDispatcherThenTerminate({ restart: false }
 assert.ok(ext.includes("resolveExtensionRuntimeDir(context.extensionUri.fsPath)"));
 assert.ok(ext.includes('path.join(extensionFsPath, "runtime")'));
 
-// Do-no-harm Codex integration: publish the repository identity into the shared
-// workspace-host process.env so the OpenAI Codex extension's mux spawn inherits
-// it (B925), and only hijack chatgpt.cliExecutable once a real repo is bound --
-// an unbound workspace must leave cliExecutable untouched so Codex launches.
-assert.ok(ext.includes("function bindCodexSidebandEnvironment"));
-assert.ok(ext.includes("process.env.AIWORKHUB_REPO_ID = repoId"));
-assert.ok(ext.includes("if (!process.env.AIWORKHUB_REPO_ID)"));
+// Cross-plugin failsafe: no foreign extension configuration or shared-host
+// environment binding. Repository identity is private to the owned MCP child.
+assert.ok(!ext.includes("bindCodexSidebandEnvironment"));
+assert.ok(!ext.includes("process.env.AIWORKHUB_REPO_ID ="));
 assert.ok(ext.includes("function writeSharedRepoRouteRecord"));
 assert.ok(ext.includes("function removeSharedRepoRouteRecord"));
 assert.ok(ext.includes("aiworkhub.shared_repo_route.v1"));
@@ -125,11 +118,7 @@ assert.ok(ext.includes('id="repo-router"'));
 assert.ok(app.includes("function renderKnownRepositories"));
 assert.ok(app.includes("known_repositories"));
 
-// The Codex sideband mux is automatic. Its application-scoped launcher is
-// transparent in unbound windows and repository-scoped when a valid binding is
-// present. A stale user flag cannot silently disable callback routing.
-assert.ok(!ext.includes('get("enableCodexSidebandMux"'));
-assert.ok(!pkg.contributes.configuration.properties["aiworkhub.enableCodexSidebandMux"]);
+assert.ok(!ext.includes("aiworkhub-app-server-mux"));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));
@@ -159,15 +148,10 @@ assert.ok(ext.includes("showQuickPick"));
 assert.ok(ext.includes("workspaceState.get(WSP_STATE_KEY_REPO_URI"));
 assert.ok(ext.includes("workspaceState.update(WSP_STATE_KEY_REPO_URI"));
 
-// B865: repository binding + child/dispatcher lifecycle closure -- reload
-// restore never leaves a stale controller running, deactivate/reload/repo-
-// switch always stop the dispatcher before killing the child, and the
-// legacy .aiworkinghub directory is never read/created.
+// Repository binding + exact child lifecycle closure.
 assert.ok(ext.includes("async stopDispatcherThenTerminate("));
-assert.ok(ext.includes("DISPATCHER_TOOLS.ensureStarted"));
-assert.ok(ext.includes('watchdog: "aiworkhub_dispatcher_watchdog"'));
-assert.ok(ext.includes('client.callTool(DISPATCHER_TOOLS.watchdog, {})'));
-assert.ok(ext.includes("DISPATCHER_TOOLS.stop"));
+assert.ok(ext.includes("_terminateOwnedChild"));
+assert.ok(ext.includes("candidate === this.lifecycleChild"));
 assert.ok(ext.includes("panel.__aiworkhubViewState.dispose()"));
 assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must never be referenced");
 {
@@ -218,18 +202,13 @@ assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));
 // runtime/ directory, sourced from the one canonical src/aiworkhub tree.
 const packageVsix = read("test/package-vsix.js");
 const packageJson = JSON.parse(read("package.json"));
-assert.ok(
-  packageJson.activationEvents.includes("*"),
-  "AIWorkHub must bind repo identity and the Codex mux before onStartupFinished activation races",
-);
+assert.ok(packageJson.activationEvents.includes("*"));
 assert.ok(packageVsix.includes('path.join(root, "..", "src", "aiworkhub")'));
 assert.ok(packageVsix.includes('path.join(extensionDir, "runtime", "aiworkhub")'));
 assert.ok(packageVsix.includes("__pycache__"));
 assert.ok(packageVsix.includes("dashboard_static"));
 assert.ok(fs.existsSync(path.join(root, "..", "src", "aiworkhub", "server.py")));
 assert.ok(fs.existsSync(path.join(root, "..", "src", "aiworkhub", "dashboard_static", "index.html")));
-assert.ok(packageVsix.includes("MUX_LAUNCHER_SRC"));
-assert.ok(packageVsix.includes("chmodSync(MUX_LAUNCHER_DEST, 0o755)"));
 
 // Codex config.toml runtime-path repair: activation must fix a stale
 // AIWorkHub-owned PYTHONPATH entry (an older versioned

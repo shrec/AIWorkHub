@@ -28,10 +28,13 @@ Design constraints (see task card B849):
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
+import os
 import sqlite3
 import sys
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +50,8 @@ from .storage_registry import (
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
 BUILD_REVISION = "aiworkhub.source_graph.python_ast.v1"
+IGNORE_SCHEMA_ID = "aiworkhub.source_graph.ignore.v1"
+IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = ("focus", "slice", "bundle")
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
@@ -58,11 +63,13 @@ MAX_DEPTH = 6
 MAX_NEIGHBOR_RESULTS = 200
 MAX_COMPONENT_NODES = 500
 MAX_PATH_VISITS = 5000
+SOURCE_GRAPH_COMPACT_MIN_BYTES = 64 * 1024 * 1024
+SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO = 0.20
 
 DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
     HUB_DIRNAME, ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
-    "dist", "build",
+    "dist", "build", "archive",
     # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
     # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
     # "typescript" evidence would be a false language label, not truthful
@@ -143,6 +150,10 @@ class RepositoryUnresolvedError(SourceGraphError):
     """The repository identity could not be resolved (no manifest/registry)."""
 
 
+class SourceGraphBuildInProgressError(SourceGraphError):
+    """Another process currently owns this repository's index writer lease."""
+
+
 # ---------------------------------------------------------------------------
 # Repository / database resolution -- identity-bound, never a fixed path
 # ---------------------------------------------------------------------------
@@ -168,11 +179,68 @@ def migration_dir(repo_root: Path) -> Path:
     return resolve_db_path(repo_root).parent
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    if read_only:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30.0)
+        conn.execute("PRAGMA query_only=ON")
+    else:
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(SCHEMA)
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
     return conn
+
+
+@contextmanager
+def index_write_lease(repo_root: Path):
+    """Try to own the single cross-process writer lease for ``repo_root``.
+
+    OS advisory locks are released automatically when a process exits, so a
+    crashed/reloaded VS Code child cannot leave stale ownership. The lock is
+    repository-local and therefore preserves multi-repository isolation.
+    """
+
+    lock_path = resolve_db_path(repo_root).with_name("index.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def _now_iso() -> str:
@@ -186,13 +254,120 @@ def _now_iso() -> str:
 INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS
 
 
+@dataclass(frozen=True, slots=True)
+class SourceGraphIgnorePolicy:
+    """Repository-local additions to the non-bypassable safe defaults.
+
+    ``exclude_dirs`` matches directory basenames at any depth.  Use
+    ``exclude_globs`` for repository-relative path rules such as
+    ``generated/**`` or ``**/*.min.js``.  Default excludes are always active:
+    a repository config can extend them, but cannot accidentally make build,
+    archive, VCS, cache, or AIWorkHub runtime trees indexable.
+    """
+
+    exclude_dirs: frozenset[str]
+    exclude_globs: tuple[str, ...]
+
+
+def ignore_config_path(repo_root: Path) -> Path:
+    return repo_root.resolve() / IGNORE_CONFIG_RELATIVE_PATH
+
+
+def ensure_ignore_config(repo_root: Path) -> Path:
+    """Create the editable repository-local ignore policy once.
+
+    The exclusive create is intentionally non-destructive: repeated InitRepo
+    calls never overwrite owner additions.  A concurrent initializer either
+    wins the create or observes the winner's complete file.
+    """
+
+    path = ignore_config_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_id": IGNORE_SCHEMA_ID,
+        "exclude_dirs": [],
+        "exclude_globs": [],
+    }
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        pass
+    return path
+
+
+def _string_list(value: Any, *, field: str, config_path: Path) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise SourceGraphError(f"source_graph_ignore_invalid:{config_path}:{field}_must_be_string_list")
+    return [item.strip().replace("\\", "/") for item in value]
+
+
+def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
+    """Load repository additions; fail closed on malformed policy data."""
+
+    path = ignore_config_path(repo_root)
+    if not path.exists():
+        return SourceGraphIgnorePolicy(frozenset(DEFAULT_EXCLUDE_DIR_NAMES), ())
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SourceGraphError(f"source_graph_ignore_invalid:{path}:{exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_id") != IGNORE_SCHEMA_ID:
+        raise SourceGraphError(f"source_graph_ignore_invalid:{path}:schema_id")
+    extra_dirs = _string_list(payload.get("exclude_dirs", []), field="exclude_dirs", config_path=path)
+    extra_globs = _string_list(payload.get("exclude_globs", []), field="exclude_globs", config_path=path)
+    if any("/" in item or item in {".", ".."} for item in extra_dirs):
+        raise SourceGraphError(f"source_graph_ignore_invalid:{path}:exclude_dirs_must_be_basenames")
+    if any(item.startswith("/") or item == ".." or item.startswith("../") for item in extra_globs):
+        raise SourceGraphError(f"source_graph_ignore_invalid:{path}:exclude_globs_must_be_relative")
+    return SourceGraphIgnorePolicy(
+        frozenset((*DEFAULT_EXCLUDE_DIR_NAMES, *extra_dirs)),
+        tuple(dict.fromkeys(extra_globs)),
+    )
+
+
+def _glob_ignored(relative_path: str, patterns: tuple[str, ...], *, is_dir: bool = False) -> bool:
+    relative_path = relative_path.strip("/")
+    for pattern in patterns:
+        normalized = pattern.strip().strip("/")
+        if not normalized:
+            continue
+        if fnmatch.fnmatchcase(relative_path, normalized):
+            return True
+        # ``foo/**`` must prune ``foo`` before os.walk descends into it.
+        if is_dir and normalized.endswith("/**"):
+            base = normalized[:-3].rstrip("/")
+            if relative_path == base or relative_path.startswith(f"{base}/"):
+                return True
+    return False
+
+
 def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
+    policy = load_ignore_policy(repo_root)
     out: list[Path] = []
-    for ext in INDEXED_EXTENSIONS:
-        for path in repo_root.rglob(f"*{ext}"):
-            rel_parts = path.relative_to(repo_root).parts[:-1]
-            if any(part in DEFAULT_EXCLUDE_DIR_NAMES or part.endswith(".egg-info") for part in rel_parts):
+    indexed_extensions = frozenset(ext.lower() for ext in INDEXED_EXTENSIONS)
+    for current, dirnames, filenames in os.walk(repo_root, followlinks=False):
+        current_path = Path(current)
+        kept_dirs: list[str] = []
+        for dirname in dirnames:
+            candidate = current_path / dirname
+            rel = candidate.relative_to(repo_root).as_posix()
+            if dirname in policy.exclude_dirs or dirname.endswith(".egg-info"):
+                continue
+            if _glob_ignored(rel, policy.exclude_globs, is_dir=True):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = sorted(kept_dirs)
+        for filename in sorted(filenames):
+            path = current_path / filename
+            if path.suffix.lower() not in indexed_extensions:
+                continue
+            rel = path.relative_to(repo_root).as_posix()
+            if _glob_ignored(rel, policy.exclude_globs):
                 continue
             out.append(path)
     return sorted(set(out))
@@ -216,6 +391,11 @@ class BuildReport:
     errors: list[dict[str, str]]
     build_revision: str
     finished_at: str
+    compaction_performed: bool = False
+    database_bytes_before_compaction: int = 0
+    database_bytes_after_compaction: int = 0
+    freelist_ratio_before_compaction: float = 0.0
+    compaction_error: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -225,6 +405,11 @@ class BuildReport:
             "files_removed": self.files_removed, "entities_written": self.entities_written,
             "edges_written": self.edges_written, "errors": self.errors,
             "build_revision": self.build_revision, "finished_at": self.finished_at,
+            "compaction_performed": self.compaction_performed,
+            "database_bytes_before_compaction": self.database_bytes_before_compaction,
+            "database_bytes_after_compaction": self.database_bytes_after_compaction,
+            "freelist_ratio_before_compaction": self.freelist_ratio_before_compaction,
+            "compaction_error": self.compaction_error,
         }
 
 
@@ -276,7 +461,7 @@ def _write_extraction(conn: sqlite3.Connection, extraction: sgast.FileExtraction
         )
 
 
-def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
+def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
     repo_root = repo_root.resolve()
     resolved_db_path = db_path or resolve_db_path(repo_root)
     conn = connect(resolved_db_path)
@@ -284,6 +469,11 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
     seen_rel: set[str] = set()
     changed = unchanged = removed = entities_written = edges_written = 0
     errors: list[dict[str, str]] = []
+    compaction_performed = False
+    compaction_error = ""
+    bytes_before_compaction = 0
+    bytes_after_compaction = 0
+    freelist_ratio = 0.0
     try:
         with conn:
             existing = {
@@ -321,6 +511,23 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
                     "files_removed": removed, "build_revision": BUILD_REVISION,
                 }),),
             )
+        bytes_before_compaction = resolved_db_path.stat().st_size
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        freelist_ratio = (freelist_count / page_count) if page_count else 0.0
+        if (
+            bytes_before_compaction >= SOURCE_GRAPH_COMPACT_MIN_BYTES
+            and freelist_ratio >= SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO
+        ):
+            try:
+                conn.execute("VACUUM")
+                compaction_performed = True
+            except sqlite3.OperationalError as exc:
+                # Index convergence already committed. Preserve a truthful
+                # maintenance signal and retry compaction on a later build
+                # instead of converting usable graph data into a failure.
+                compaction_error = f"{type(exc).__name__}:{exc}"[:500]
+        bytes_after_compaction = resolved_db_path.stat().st_size
     finally:
         conn.close()
     return BuildReport(
@@ -328,7 +535,24 @@ def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bo
         files_seen=len(files_on_disk), files_changed=changed, files_unchanged=unchanged,
         files_removed=removed, entities_written=entities_written, edges_written=edges_written,
         errors=errors, build_revision=BUILD_REVISION, finished_at=_now_iso(),
+        compaction_performed=compaction_performed,
+        database_bytes_before_compaction=bytes_before_compaction,
+        database_bytes_after_compaction=bytes_after_compaction,
+        freelist_ratio_before_compaction=freelist_ratio,
+        compaction_error=compaction_error,
     )
+
+
+def build_index(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
+    """Build with a repository-local, cross-process single-writer lease."""
+
+    repo_root = repo_root.resolve()
+    with index_write_lease(repo_root) as acquired:
+        if not acquired:
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_build_in_progress:{repo_root}"
+            )
+        return _build_index_locked(repo_root, db_path=db_path, incremental=incremental)
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +807,7 @@ def _query_payload(repo_root: Path, mode: str, query: str, budget: int) -> dict[
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
     db_path = resolve_db_path(repo_root)
-    conn = connect(db_path)
+    conn = connect(db_path, read_only=True)
     try:
         matches = find(conn, query, limit=budget)
         matches, truncated = _bounded_rows(matches, budget, byte_cap)
@@ -613,7 +837,7 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
     budget = max(1, min(int(max_lines), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
     db_path = resolve_db_path(repo_root)
-    conn = connect(db_path)
+    conn = connect(db_path, read_only=True)
     try:
         matches = find(conn, query, limit=budget)
         sections: list[dict[str, Any]] = []

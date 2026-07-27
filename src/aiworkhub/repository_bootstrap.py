@@ -89,9 +89,12 @@ def initialize_repository_full(
     source_graph_ready = False
     try:
         db_path = source_graph.resolve_db_path(repo_root)
+        ignore_config = source_graph.ensure_ignore_config(repo_root)
         source_graph_ready = db_path.parent.is_dir()
         if source_graph_ready:
             provisioned.append("source_graph_dir")
+        if ignore_config.is_file():
+            provisioned.append("source_graph_ignore_config")
     except source_graph.SourceGraphError:
         source_graph_ready = False
 

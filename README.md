@@ -194,6 +194,27 @@ adapter, and concurrency cap before starting a process. The worker's first
 operation is exact `taskctl claim-start <task_id>`, and success is not reported
 as complete until the task reaches `review`.
 
+### Source Graph ignore policy
+
+`Initialize AIWorkHub` creates the repository-local policy
+`.aiworkhub/config/source_graph.json`. Add directory basenames to
+`exclude_dirs` or repository-relative patterns to `exclude_globs`:
+
+```json
+{
+  "schema_id": "aiworkhub.source_graph.ignore.v1",
+  "exclude_dirs": ["vendor"],
+  "exclude_globs": ["generated/**", "**/*.min.js"]
+}
+```
+
+The policy extends, but cannot disable, AIWorkHub's safe defaults. VCS,
+AIWorkHub runtime, virtual-environment, cache, build, distribution, worktree,
+and archive directories are pruned before traversal. A malformed policy fails
+closed instead of silently indexing an unintended tree. On the next incremental
+refresh, entries newly covered by the policy are removed from the canonical
+graph database.
+
 ## Task Dispatch, Validation & Acceptance
 
 **Dispatch.** Tasks are claimed, never pushed: `aiworkhub_task_auto_pickup`

@@ -52,27 +52,7 @@ const {
   repairCodexConfigTomlText,
   migrateCodexConfigTomlText,
   splitCodexPythonPathValue,
-  classifyImmediateCodexChildren,
 } = __testInternals;
-
-{
-  const ps = [
-    " 101  10 /usr/bin/node /opt/codex -c x app-server --analytics-default-enabled",
-    " 102  11 python3 /runtime/bin/aiworkhub-app-server-mux app-server",
-    " 103  10 python3 -m aiworkhub.server",
-    " 104  12 /usr/bin/node /opt/codex app-server",
-  ].join("\n");
-  const children = classifyImmediateCodexChildren(ps, 10);
-  assert.deepStrictEqual(children.direct.map((x) => x.pid), [101]);
-  assert.deepStrictEqual(children.mux, []);
-
-  const muxChildren = classifyImmediateCodexChildren(
-    " 201  10 python3 /runtime/bin/aiworkhub-app-server-mux -c x app-server\n",
-    10,
-  );
-  assert.deepStrictEqual(muxChildren.direct, []);
-  assert.deepStrictEqual(muxChildren.mux.map((x) => x.pid), [201]);
-}
 
 const NEW_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.20/runtime";
 const OLD_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.19/runtime";
@@ -341,43 +321,13 @@ function assertUnchangedOutsideTargetLine(original, migrated, changedLineSubstri
   fs.rmSync(base, { recursive: true, force: true });
 }
 
-// ── 9. bindCodexSidebandEnvironment: the OpenAI Codex extension shares this
-//      workspace host's process.env, so binding the repo identity there is how
-//      the mux (which fails closed without AIWORKHUB_REPO_ID, B925) receives it.
-//      A real repo_id publishes the binding; an unbound/sentinel identity clears
-//      it (do no harm: Codex then launches directly), and the write/launch gates
-//      are never published. ──────────────────────────────────────────────────
+// Cross-plugin failsafe: config migration remains a pure owned-table transform
+// and no shared extension-host identity binding helper remains.
 {
-  const { bindCodexSidebandEnvironment } = __testInternals;
-  const saved = {};
-  const keys = ["AIWORKHUB_REPO_ID", "AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO",
-                "AIWORKHUB_CALLBACK_TRANSPORT", "AIWORKHUB_ALLOW_WRITES", "AIWORKHUB_ALLOW_LAUNCH"];
-  for (const k of keys) saved[k] = process.env[k];
-  try {
-    const realRepoId = "repo_" + "a".repeat(32);
-
-    // real repo_id -> publishes the identity, marks sideband transport.
-    process.env.AIWORKHUB_ALLOW_WRITES = "1"; // must be scrubbed
-    assert.strictEqual(bindCodexSidebandEnvironment({ repoId: realRepoId, root: "/tmp/repo" }), true);
-    assert.strictEqual(process.env.AIWORKHUB_REPO_ID, realRepoId);
-    assert.strictEqual(process.env.AIWORKHUB_REPO_ROOT, "/tmp/repo");
-    assert.strictEqual(process.env.AIWORKHUB_CALLBACK_TRANSPORT, "sideband");
-    assert.strictEqual(process.env.AIWORKHUB_ALLOW_WRITES, undefined, "write gate must never be published");
-
-    // sentinel/uninitialized repo_id -> clears the binding (do no harm).
-    assert.strictEqual(bindCodexSidebandEnvironment({ repoId: "manifest-missing" }), false);
-    assert.strictEqual(process.env.AIWORKHUB_REPO_ID, undefined);
-
-    // no identity at all -> also cleared.
-    process.env.AIWORKHUB_REPO_ID = realRepoId;
-    assert.strictEqual(bindCodexSidebandEnvironment(null), false);
-    assert.strictEqual(process.env.AIWORKHUB_REPO_ID, undefined);
-  } finally {
-    for (const k of keys) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
-  }
+  const source = require("fs").readFileSync(extensionPath, "utf8");
+  assert.ok(!source.includes("bindCodexSidebandEnvironment"));
+  assert.ok(!source.includes('getConfiguration("chatgpt")'));
+  assert.ok(!source.includes("cliExecutable"));
 }
 
 console.log("AIWorkHub Codex config.toml runtime migration contract checks passed");

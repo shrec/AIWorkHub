@@ -66,6 +66,9 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
     assert result["ok"]
     assert result["source_graph_ready"] is True
     assert result["source_graph_daemon_started"] is True
+    ignore_config = root / ".aiworkhub" / "config" / "source_graph.json"
+    assert ignore_config.is_file()
+    assert source_graph.load_ignore_policy(root).exclude_dirs >= source_graph.DEFAULT_EXCLUDE_DIR_NAMES
 
     daemon = source_graph_daemon.get_daemon(root)
     assert daemon is not None
@@ -184,6 +187,35 @@ def test_periodic_and_refresh_now_never_overlap(tmp_path, monkeypatch, cleanup_d
         daemon.stop()
 
     assert call_count["n"] == 1
+
+
+def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_daemons):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    with source_graph.index_write_lease(root) as acquired:
+        assert acquired is True
+        assert daemon._run_one_build() is True
+    health = daemon.health()
+    assert health["ok"] is True
+    assert health["status"] == source_graph_daemon.STATUS_STANDBY
+    assert health["writer_state"] == "standby"
+    assert health["last_error"] == ""
+
+
+def test_prior_build_probe_failure_is_degraded_not_dead_indexing(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    def fail_probe():
+        raise RuntimeError("transient probe failure")
+
+    monkeypatch.setattr(daemon, "_has_prior_build", fail_probe)
+    assert daemon._run_one_build() is True
+    health = daemon.health()
+    assert health["status"] == source_graph_daemon.STATUS_DEGRADED
+    assert health["ok"] is False
+    assert "transient probe failure" in health["last_error"]
 
 
 # ---------------------------------------------------------------------------

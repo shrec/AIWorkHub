@@ -793,10 +793,12 @@ function renderRuntimeInfo(info) {
   const expectedMcpVersion = String(payload.expectedMcpVersion || "unknown");
   elements.extensionVersion.textContent = `Extension ${extensionVersion}`;
   elements.mcpRuntimeVersion.textContent = `MCP runtime ${runtimeVersion}`;
-  if (payload.reloadRequired) {
+  if (payload.degraded || payload.reloadRequired) {
     elements.reloadAlert.hidden = false;
+    const attempts = Number(payload.attempts || 0);
+    const maxAttempts = Number(payload.maxAttempts || 3);
     elements.reloadAlertMessage.textContent =
-      `AIWorkHub ${extensionVersion} expects MCP ${expectedMcpVersion}, but the live child reports ${runtimeVersion}. Run Developer: Reload Window or restart the extension host.`;
+      `MCP runtime degraded: ${String(payload.reason || "unavailable")} (${attempts}/${maxAttempts}).`;
   } else {
     elements.reloadAlert.hidden = true;
     elements.reloadAlertMessage.textContent = "";
@@ -1583,7 +1585,9 @@ window.addEventListener("message", (event) => {
 });
 
 elements.refreshButton.addEventListener("click", requestRefresh);
-elements.offlineRetryButton.addEventListener("click", requestRefresh);
+elements.offlineRetryButton.addEventListener("click", () => {
+  vscode.postMessage({ type: "retry" });
+});
 
 // The sole initialization trigger in the UI: one click posts the fixed
 // "initializeStorage" message; the extension host is the only thing that

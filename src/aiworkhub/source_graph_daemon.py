@@ -45,6 +45,7 @@ MIN_REFRESH_INTERVAL_SECONDS = 30.0
 STATUS_STOPPED = "stopped"
 STATUS_INDEXING = "indexing"
 STATUS_READY = "ready"
+STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
 
 
@@ -100,7 +101,7 @@ class SourceGraphDaemon:
             db_path = source_graph.resolve_db_path(self.repo_root)
             if not db_path.exists():
                 return False
-            conn = source_graph.connect(db_path)
+            conn = source_graph.connect(db_path, read_only=True)
             try:
                 row = conn.execute(
                     "SELECT value FROM meta WHERE key='last_build'"
@@ -125,12 +126,24 @@ class SourceGraphDaemon:
         try:
             with self._state_lock:
                 self._status = STATUS_INDEXING
-            incremental = self._has_prior_build()
             try:
+                # Prior-build probing is part of the fallible indexing
+                # operation. A transient SQLite/read failure must be recorded
+                # as degraded and retried, never escape the daemon thread and
+                # strand health at ``indexing`` with ``running=false``.
+                incremental = self._has_prior_build()
                 report = source_graph.build_index(self.repo_root, incremental=incremental)
                 with self._state_lock:
                     self._status = STATUS_READY
                     self._last_report = report.to_json()
+                    self._last_error = ""
+                    self._last_run_at = _utcnow()
+            except source_graph.SourceGraphBuildInProgressError:
+                # Another VS Code/MCP child owns this repository's writer
+                # lease. This process remains a healthy reader/standby and
+                # retries on the next tick; contention is not degradation.
+                with self._state_lock:
+                    self._status = STATUS_STANDBY
                     self._last_error = ""
                     self._last_run_at = _utcnow()
             except Exception as exc:  # noqa: BLE001 -- a failed index must never crash the MCP process
@@ -204,6 +217,7 @@ class SourceGraphDaemon:
                 "last_run_at": self._last_run_at,
                 "last_report": self._last_report,
                 "last_error": self._last_error,
+                "writer_state": "standby" if self._status == STATUS_STANDBY else "active",
             }
 
 
@@ -315,6 +329,7 @@ __all__ = [
     "STATUS_DEGRADED",
     "STATUS_INDEXING",
     "STATUS_READY",
+    "STATUS_STANDBY",
     "STATUS_STOPPED",
     "SourceGraphDaemon",
     "daemon_health",

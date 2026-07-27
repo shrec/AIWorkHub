@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.57";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.61";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -67,17 +67,12 @@ const DASHBOARD_TOOLS = Object.freeze({
   health: "aiworkhub_dashboard_health",
   liveOutput: "aiworkhub_dashboard_task_live_output",
 });
-// B857: the ONE lifecycle-owned callback dispatcher per repository lives
-// inside this repo's own McpStdioClient child process (one dispatcher
-// thread per "python -m aiworkhub.server" process, and this extension
-// already guarantees exactly one such process per active repository --
-// see getMcpClient()/McpStdioClient above). These tools never spawn a
-// second process, a systemd unit, or an HTTP server; they only start/stop/
-// inspect the in-process background thread.
+// Callback delivery is a separate background service from Source Graph.
+// Both are repo-bound and both must converge after the MCP handshake; neither
+// may replace the other in the extension lifecycle.
 const DISPATCHER_TOOLS = Object.freeze({
   ensureStarted: "aiworkhub_dispatcher_ensure_started",
   health: "aiworkhub_dispatcher_health",
-  watchdog: "aiworkhub_dispatcher_watchdog",
   stop: "aiworkhub_dispatcher_stop",
 });
 // 0.6.30: Source Graph automatic indexing lifecycle -- same start/health/stop
@@ -108,8 +103,9 @@ const MCP_REQUEST_TIMEOUT_MS = 20000;
 const MCP_MAX_PENDING_REQUESTS = 16;
 const MCP_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MCP_MAX_STDERR_LOG_BYTES = 4096;
-const MCP_MAX_RESTART_ATTEMPTS = 1;
-const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 1;
+const MCP_MAX_RESTART_ATTEMPTS = 3;
+const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 3;
+const MCP_RECOVERY_BACKOFF_MS = Object.freeze([100, 200, 400]);
 // B893: bounded self-repair budget for a DETECTED runtime version/capability
 // mismatch (a stale bundled runtime after a VSIX update or an in-place
 // runtime repair). Separate from MCP_MAX_RESTART_ATTEMPTS, which bounds
@@ -118,7 +114,7 @@ const MCP_SNAPSHOT_RECOVERY_ATTEMPTS = 1;
 // so a persistently broken runtime degrades visibly instead of respawning
 // forever. Repairing means restarting only THIS client's own child; it never
 // rebinds to a different repository.
-const MCP_MAX_RUNTIME_REPAIR_ATTEMPTS = 1;
+const MCP_MAX_RUNTIME_REPAIR_ATTEMPTS = 3;
 
 // ── Active repository resolution ──────────────────────────────────────────
 // Single-folder workspace: auto-bind to folders[0].
@@ -575,87 +571,6 @@ function removeWindowRouteRecord(repoInfo) {
 // to activeRepoIdentity, so a window with no bound repository yet simply
 // skips a tick instead of writing a bogus record.
 let windowRouteRenewalTimer = null;
-let codexMuxRepairTimer = null;
-let codexMuxRepairAttempted = false;
-
-// VS Code does not define an activation order for two extensions that both
-// start at startup.  On a cold first window, OpenAI Codex can therefore spawn
-// its direct app-server child milliseconds before AIWorkHub publishes the mux
-// executable and repository identity; later windows work only because the
-// application-scoped setting is already warm.  Classify immediate children
-// of THIS extension host only, so the bounded repair can never touch another
-// window/repository or a nested task worker.
-function classifyImmediateCodexChildren(psText, parentPid) {
-  const direct = [];
-  const mux = [];
-  for (const line of String(psText || "").split(/\r?\n/)) {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
-    if (!match || Number(match[2]) !== Number(parentPid)) continue;
-    const item = { pid: Number(match[1]), command: match[3] };
-    if (item.command.includes("aiworkhub-app-server-mux")) {
-      mux.push(item);
-    } else if (/codex/i.test(item.command) && /(?:^|\s)app-server(?:\s|$)/.test(item.command)) {
-      direct.push(item);
-    }
-  }
-  return { direct, mux };
-}
-
-function stopCodexMuxRepairTimer() {
-  if (codexMuxRepairTimer) {
-    clearInterval(codexMuxRepairTimer);
-    codexMuxRepairTimer = null;
-  }
-}
-
-function scheduleCodexMuxRepair(enabled) {
-  stopCodexMuxRepairTimer();
-  if (!enabled || process.platform === "win32" || codexMuxRepairAttempted) return;
-  let remainingChecks = 20;
-  codexMuxRepairTimer = setInterval(() => {
-    remainingChecks -= 1;
-    let listing;
-    try {
-      listing = childProcess.spawnSync(
-        "ps",
-        ["-eo", "pid=,ppid=,command="],
-        { encoding: "utf8", timeout: 1500, maxBuffer: 2 * 1024 * 1024 },
-      );
-    } catch (_err) {
-      stopCodexMuxRepairTimer();
-      return;
-    }
-    if (!listing || listing.status !== 0) {
-      if (remainingChecks <= 0) stopCodexMuxRepairTimer();
-      return;
-    }
-    const children = classifyImmediateCodexChildren(listing.stdout, process.pid);
-    if (children.mux.length === 1) {
-      stopCodexMuxRepairTimer();
-      return;
-    }
-    // Fail closed on ambiguity.  Exactly one immediate direct app-server and
-    // zero mux children is the measured cold-window race; anything else is
-    // diagnostic-only and must never trigger process mutation.
-    if (children.mux.length === 0 && children.direct.length === 1) {
-      codexMuxRepairAttempted = true;
-      stopCodexMuxRepairTimer();
-      try {
-        process.kill(children.direct[0].pid, "SIGTERM");
-        outputChannel.appendLine(
-          "[callback] restarted one direct Codex app-server so the configured repo-bound mux can take ownership",
-        );
-      } catch (err) {
-        outputChannel.appendLine(`[callback] direct Codex mux repair failed: ${sanitizeErrorMessage(err)}`);
-      }
-      return;
-    }
-    if (remainingChecks <= 0) stopCodexMuxRepairTimer();
-  }, 500);
-  if (codexMuxRepairTimer && typeof codexMuxRepairTimer.unref === "function") {
-    codexMuxRepairTimer.unref();
-  }
-}
 
 function renewWindowRouteLease() {
   if (!activeRepoIdentity || !REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))) {
@@ -845,6 +760,8 @@ class McpStdioClient {
     this.repositoryIdentity = repositoryIdentity;
     this.claimEpisode = claimEpisode;
     this.child = null;
+    this.lifecycleChild = null;
+    this.lifecyclePid = null;
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
@@ -853,64 +770,84 @@ class McpStdioClient {
     this.startingPromise = null;
     this.restartAttempts = 0;
     this.intentionalStop = false;
-    // B859: an ``ok: true`` dispatcher_ensure_started response can still
-    // report ``dispatcher_started: false`` / ``status: "start_failed"`` --
-    // the tool call itself succeeded, but the dispatcher did not. Never
-    // inferred from the absence of a transport error; only ever set by
-    // _recordDispatcherEnsureResult().
-    this.dispatcherReady = false;
     // B893: how many bounded runtime-repair restarts this client has spent
     // on the CURRENT mismatch episode. Reset to 0 whenever a health check
     // finds the runtime healthy (see pushRuntimeInfo), so a later, distinct
     // mismatch (e.g. a subsequent runtime repair) gets its own fresh budget.
     this.runtimeRepairAttempts = 0;
     this.runtimeRepairBlockedReason = "";
+    this.recovery = {
+      category: "",
+      reason: "",
+      attempts: 0,
+      maxAttempts: MCP_MAX_RESTART_ATTEMPTS,
+      open: false,
+      inProgress: false,
+      episode: 0,
+    };
+    this.recoveryTimer = null;
   }
 
-  // B859: the ONE place that decides whether a dispatcher_ensure_started
-  // response counts as ready. An ok:true/dispatcher_started:false result
-  // (e.g. the packaged runtime's callback dependency failed to import) is a
-  // visible failure -- logged with a bounded, non-secret diagnostic -- not
-  // a silently-ignored success.
-  _recordDispatcherEnsureResult(result, context) {
-    const started = Boolean(result && result.dispatcher_started);
-    this.dispatcherReady = started;
-    if (started) {
-      return result;
-    }
-    const status = String((result && result.status) || "unknown");
-    const reason = String((result && result.reason) || (result && result.error) || "").slice(0, 300);
-    this.outputChannel.appendLine(
-      `[mcp] dispatcher not ready after ${context}: status=${status}${reason ? ` reason=${reason}` : ""}`,
-    );
-    return result;
+  recoveryStatus() {
+    const state = this.recovery;
+    return {
+      category: String(state.category || "").slice(0, 80),
+      reason: String(state.reason || "").slice(0, 240),
+      attempts: state.attempts,
+      maxAttempts: state.maxAttempts,
+      open: state.open,
+    };
   }
 
-  // Periodic refresh owns callback liveness as well as queue freshness.  The
-  // watchdog response always includes the post-recovery health object; use it
-  // as the transport truth instead of inferring readiness from manager
-  // identity or route availability.
-  _recordDispatcherWatchdogResult(result, context) {
-    const health = result && result.health && typeof result.health === "object"
-      ? result.health
-      : {};
-    const managerInboxReady = health.status === "manager_inbox" && health.healthy === true;
-    const dispatcherReady = (
-      health.dispatch_expected === true
-      && health.healthy === true
-      && health.dispatcher_running === true
-      && health.registered === true
-      && String(health.repo_id || "") !== ""
-      && String(health.repo_id || "") === String(health.dispatcher_repo_id || "")
-    );
-    this.dispatcherReady = managerInboxReady || dispatcherReady;
-    if (!this.dispatcherReady) {
-      const problems = Array.isArray(health.problems) ? health.problems.join(",") : "";
-      this.outputChannel.appendLine(
-        `[mcp] callback delivery not ready after ${context}: status=${String(health.status || "unknown")}${problems ? ` problems=${problems}` : ""}`,
-      );
+  beginExplicitRecovery() {
+    this._clearRecoveryTimer();
+    this.recovery = {
+      category: "manual_retry",
+      reason: "",
+      attempts: 0,
+      maxAttempts: MCP_MAX_RESTART_ATTEMPTS,
+      open: false,
+      inProgress: false,
+      episode: this.recovery.episode + 1,
+    };
+    this.runtimeRepairAttempts = 0;
+    this.runtimeRepairBlockedReason = "";
+  }
+
+  _clearRecoveryTimer() {
+    if (this.recoveryTimer) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
     }
-    return result;
+    this.recovery.inProgress = false;
+  }
+
+  _ownsChild(candidate) {
+    return Boolean(
+      candidate
+      && candidate === this.lifecycleChild
+      && candidate.pid === this.lifecyclePid
+    );
+  }
+
+  _clearLifecycleOwnership(candidate) {
+    if (candidate === this.lifecycleChild) {
+      this.lifecycleChild = null;
+      this.lifecyclePid = null;
+    }
+  }
+
+  _terminateOwnedChild(candidate) {
+    if (!this._ownsChild(candidate)) return false;
+    this._clearLifecycleOwnership(candidate);
+    if (!candidate.killed) {
+      try {
+        candidate.kill();
+      } catch (_err) {
+        return false;
+      }
+    }
+    return true;
   }
 
   get running() {
@@ -929,6 +866,9 @@ class McpStdioClient {
     if (this.startingPromise) {
       return this.startingPromise;
     }
+    if (this.recovery.open) {
+      return Promise.reject(new Error("mcp_recovery_circuit_open"));
+    }
     if (!this.running && this.runtimeRepairBlockedReason) {
       return Promise.reject(new Error(this.runtimeRepairBlockedReason));
     }
@@ -942,43 +882,38 @@ class McpStdioClient {
   }
 
   async _startWithVersionRepair() {
-    try {
-      await this._start();
-      return;
-    } catch (err) {
-      const message = sanitizeErrorMessage(err);
-      if (!message.includes("mcp_version_mismatch_pre_service")) {
-        throw err;
-      }
-      if (this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS) {
-        this.runtimeRepairBlockedReason = "runtime_repair_budget_exhausted";
-        throw err;
-      }
-      this.runtimeRepairAttempts += 1;
-      this.outputChannel.appendLine(`[mcp] runtime mismatch (${message}) -- restarting stale child before services start`);
-      this.stop({ restart: true });
+    for (;;) {
       try {
         await this._start();
-      } catch (repairErr) {
-        const repairMessage = sanitizeErrorMessage(repairErr);
-        if (repairMessage.includes("mcp_version_mismatch_pre_service")) {
-          this.runtimeRepairBlockedReason = `runtime_repair_budget_exhausted:${repairMessage}`;
+        return;
+      } catch (err) {
+        const message = sanitizeErrorMessage(err);
+        if (!message.includes("mcp_version_mismatch_pre_service")) throw err;
+        if (this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS) {
+          this.runtimeRepairBlockedReason = `runtime_repair_budget_exhausted:${message}`;
+          this.recovery.category = "runtime_mismatch";
+          this.recovery.reason = this.runtimeRepairBlockedReason;
+          this.recovery.attempts = MCP_MAX_RUNTIME_REPAIR_ATTEMPTS;
+          this.recovery.open = true;
+          throw err;
         }
-        throw repairErr;
+        const delay = MCP_RECOVERY_BACKOFF_MS[this.runtimeRepairAttempts];
+        this.runtimeRepairAttempts += 1;
+        this.outputChannel.appendLine(`[mcp] runtime mismatch (${message}) -- bounded recovery ${this.runtimeRepairAttempts}/${MCP_MAX_RUNTIME_REPAIR_ATTEMPTS}`);
+        this.stop({ restart: true });
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
 
   async _start() {
     const previousChild = this.child;
+    const previouslyOwnedChild = this.lifecycleChild;
     if (previousChild && !previousChild.killed) {
       this.outputChannel.appendLine("[mcp] replacing non-ready child before reconnect");
       this._failPendingForChild(previousChild, new Error("mcp_reconnect_replaced_non_ready_child"));
-      try {
-        previousChild.kill();
-      } catch (_err) {
-        /* ignore */
-      }
+      this.child = null;
+      this._terminateOwnedChild(previouslyOwnedChild);
     }
     const root = this.repositoryRoot;
     const python = findPythonCommand(root);
@@ -992,7 +927,7 @@ class McpStdioClient {
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
       AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
       AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
-      AIWORKHUB_CALLBACK_TRANSPORT: "sideband",
+      AIWORKHUB_CALLBACK_TRANSPORT: "repository_inbox_poll",
     };
     // Extension-local runtime import path: `import aiworkhub` must always
     // resolve to the package this extension bundled under its own
@@ -1037,8 +972,10 @@ class McpStdioClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+    this.lifecycleChild = child;
+    this.lifecyclePid = child.pid;
 
-    child.stdout.on("data", (chunk) => this._onStdout(chunk));
+    child.stdout.on("data", (chunk) => this._onStdout(child, chunk));
     child.stderr.on("data", (chunk) => {
       this.outputChannel.appendLine(`[mcp stderr] ${sanitizeStderrChunk(chunk)}`);
     });
@@ -1053,13 +990,7 @@ class McpStdioClient {
         this.initialized = false;
       }
       this._failPendingForChild(child, err);
-      if (!child.killed) {
-        try {
-          child.kill();
-        } catch (_killErr) {
-          /* ignore */
-        }
-      }
+      this._terminateOwnedChild(child);
       throw err;
     }
   }
@@ -1072,7 +1003,6 @@ class McpStdioClient {
     });
     this.notify("notifications/initialized", {});
     this.initialized = true;
-    this.restartAttempts = 0;
     // Version/capability convergence is checked by _startWithVersionRepair()
     // immediately after this handshake returns and before callers treat the
     // child as ready. A mismatch triggers a bounded restart of only this
@@ -1107,11 +1037,9 @@ class McpStdioClient {
   _convergeBackgroundServices() {
     const run = async () => {
       try {
-        const result = await this._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
-        this._recordDispatcherEnsureResult(result, "background convergence");
+        await this._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
       } catch (err) {
-        this.dispatcherReady = false;
-        this.outputChannel.appendLine(`[mcp] dispatcher background convergence failed: ${sanitizeErrorMessage(err)}`);
+        this.outputChannel.appendLine(`[mcp] callback dispatcher background convergence failed: ${sanitizeErrorMessage(err)}`);
       }
       try {
         await this._callToolRaw(SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted, {}, 5000);
@@ -1124,7 +1052,8 @@ class McpStdioClient {
     });
   }
 
-  _onStdout(chunk) {
+  _onStdout(emittingChild, chunk) {
+    if (emittingChild !== this.child || !this._ownsChild(emittingChild)) return;
     this.buffer += chunk.toString("utf8");
     if (this.buffer.length > MCP_MAX_LINE_BYTES) {
       this.outputChannel.appendLine("[mcp] unterminated stdout exceeded the response-size cap -- restarting");
@@ -1146,11 +1075,11 @@ class McpStdioClient {
         this.outputChannel.appendLine("[mcp] dropped one oversized response line");
         continue;
       }
-      this._onMessage(line);
+      this._onMessage(emittingChild, line);
     }
   }
 
-  _onMessage(line) {
+  _onMessage(emittingChild, line) {
     let message;
     try {
       message = JSON.parse(line);
@@ -1161,7 +1090,7 @@ class McpStdioClient {
       return;
     }
     const pending = this.pending.get(message.id);
-    if (!pending) {
+    if (!pending || this.pendingChildren.get(message.id) !== emittingChild) {
       return;
     }
     this.pending.delete(message.id);
@@ -1182,6 +1111,7 @@ class McpStdioClient {
       return;
     }
     this.child = null;
+    this._clearLifecycleOwnership(exitedChild);
     this.initialized = false;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
     this._failPendingForChild(exitedChild, failure);
@@ -1196,14 +1126,37 @@ class McpStdioClient {
     if (this.intentionalStop) {
       return;
     }
-    if (this.restartAttempts < MCP_MAX_RESTART_ATTEMPTS) {
-      this.restartAttempts += 1;
-      this.outputChannel.appendLine("[mcp] child exited unexpectedly -- attempting one bounded restart");
-      this.ensureStarted().catch((restartErr) => {
-        this.outputChannel.appendLine(`[mcp] bounded restart failed: ${restartErr.message}`);
+    this._scheduleAutomaticRecovery("child_exit", failure);
+  }
+
+  _scheduleAutomaticRecovery(category, error) {
+    const state = this.recovery;
+    if (state.open || state.inProgress) return;
+    state.category = category;
+    state.reason = sanitizeErrorMessage(error);
+    if (state.attempts >= state.maxAttempts) {
+      state.open = true;
+      return;
+    }
+    const delay = MCP_RECOVERY_BACKOFF_MS[state.attempts];
+    state.attempts += 1;
+    state.inProgress = true;
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+      this.ensureStarted().then(() => {
+        state.open = false;
+        state.reason = "";
+      }).catch((restartErr) => {
+        state.reason = sanitizeErrorMessage(restartErr);
+        if (state.attempts >= state.maxAttempts) state.open = true;
+        else this._scheduleAutomaticRecovery(category, restartErr);
+      }).finally(() => {
+        state.inProgress = false;
+        if (!state.open && !this.running) this._scheduleAutomaticRecovery(category, state.reason);
       });
-    } else {
-      this.outputChannel.appendLine("[mcp] child exited and the restart budget is exhausted -- offline until a manual restart");
+    }, delay);
+    if (this.recoveryTimer && typeof this.recoveryTimer.unref === "function") {
+      this.recoveryTimer.unref();
     }
   }
 
@@ -1248,13 +1201,7 @@ class McpStdioClient {
         this.pendingChildren.delete(id);
         if (this.child === requestChild && !this.initialized) {
           this.child = null;
-          if (requestChild && !requestChild.killed) {
-            try {
-              requestChild.kill();
-            } catch (_err) {
-              /* ignore */
-            }
-          }
+          this._terminateOwnedChild(requestChild);
         }
         reject(new Error("mcp_request_timeout"));
       }, timeoutMs);
@@ -1292,39 +1239,27 @@ class McpStdioClient {
   }
 
   stop({ restart = false } = {}) {
+    this._clearRecoveryTimer();
     this.intentionalStop = !restart;
-    if (restart) {
-      this.restartAttempts = 0;
-    }
-    const child = this.child;
+    const child = this.lifecycleChild;
     this.child = null;
     this.initialized = false;
     this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
-    if (child && !child.killed) {
-      try {
-        child.kill();
-      } catch (_err) {
-        /* ignore */
-      }
-    }
+    this._terminateOwnedChild(child);
   }
 
-  // B865: stop the ONE lifecycle-owned dispatcher for this repository
-  // BEFORE terminating this client's own MCP child process. The dispatcher's
-  // CallbackBridge can hold a nested AppServerClient subprocess
-  // (start_new_session=True -- its own process group), which a bare
-  // SIGTERM to this outer child would never reach, orphaning it. Routing
-  // through the aiworkhub_dispatcher_stop tool first lets the server join
-  // the dispatcher thread and call that nested client's own .stop()
-  // (see aiworkhub.callback_bridge.CallbackBridge.daemon/stop_daemon)
-  // before this outer child dies. Best-effort and bounded: only sent while
-  // the child is alive and handshaken; a transport failure here never
-  // blocks terminating the child -- deactivate/reload/repo-switch must
-  // never hang on a dead connection.
+  // Best-effort service shutdown followed by exact-object child termination.
   async stopDispatcherThenTerminate({ restart = false } = {}) {
-    if (this.running && this.initialized) {
+    this._clearRecoveryTimer();
+    const ownedChild = this.lifecycleChild;
+    this.intentionalStop = !restart;
+    if (this.running && this.initialized && this.child === ownedChild) {
       try {
-        await this.request("tools/call", { name: DISPATCHER_TOOLS.stop, arguments: {} }, MCP_REQUEST_TIMEOUT_MS);
+        await this.request(
+          "tools/call",
+          { name: DISPATCHER_TOOLS.stop, arguments: {} },
+          MCP_REQUEST_TIMEOUT_MS,
+        );
       } catch (_err) {
         // Best-effort -- proceed to terminate the child regardless.
       }
@@ -1382,7 +1317,6 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 // this extension's extensionKind is "workspace". Never derived from the
 // selected repository, an editable install, or a fixed host path.
 let extensionRuntimeDir = null;
-let extensionMuxExecutable = null;
 
 // Installed VSIX directories are versioned and VS Code is free to remove the
 // previous directory as soon as an upgrade lands.  Long-lived Codex/MCP
@@ -1442,25 +1376,26 @@ function materializeStableRuntimeGeneration(context) {
   if (!fs.existsSync(sourcePackage)) {
     throw new Error(`bundled_runtime_missing:${sourceRuntime}`);
   }
-  const packagedMux = path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
-  const devMux = path.resolve(context.extensionUri.fsPath, "..", "scripts", "aiworkhub-app-server-mux");
-  const sourceMux = fs.existsSync(packagedMux) ? packagedMux : devMux;
-  if (!fs.existsSync(sourceMux)) {
-    throw new Error(`bundled_mux_missing:${sourceMux}`);
+  // Minimal unit-test hosts do not provide VS Code's globalStorageUri.
+  if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
+    return {
+      runtimeDir: sourceRuntime,
+      generationRoot: sourceRuntime,
+      fingerprint: _runtimeTreeFingerprint(sourceRuntime),
+      version: String((context.extension && context.extension.packageJSON && context.extension.packageJSON.version) || EXPECTED_MCP_PACKAGE_VERSION),
+      storageRoot: null,
+    };
   }
   const version = String(
     (context.extension && context.extension.packageJSON && context.extension.packageJSON.version)
       || EXPECTED_MCP_PACKAGE_VERSION,
   );
   const fingerprint = _runtimeTreeFingerprint(sourceRuntime);
-  const storageRoot = context.globalStorageUri && context.globalStorageUri.fsPath
-    ? context.globalStorageUri.fsPath
-    : path.join(os.homedir(), ".aiworkhub", "extension-storage");
+  const storageRoot = context.globalStorageUri.fsPath;
   const generationsRoot = path.join(storageRoot, "runtime", "generations");
   const generationName = `${version}-${fingerprint.slice(0, 16)}`;
   const generationRoot = path.join(generationsRoot, generationName);
   const runtimeDir = path.join(generationRoot, "runtime");
-  const muxPath = path.join(generationRoot, "bin", "aiworkhub-app-server-mux");
   const manifestPath = path.join(generationRoot, "manifest.json");
 
   let ready = false;
@@ -1469,8 +1404,7 @@ function materializeStableRuntimeGeneration(context) {
     ready = manifest.schema_id === STABLE_RUNTIME_SCHEMA
       && manifest.version === version
       && manifest.fingerprint === fingerprint
-      && fs.existsSync(path.join(runtimeDir, "aiworkhub", "server.py"))
-      && fs.existsSync(muxPath);
+      && fs.existsSync(path.join(runtimeDir, "aiworkhub", "server.py"));
   } catch (_err) {
     ready = false;
   }
@@ -1484,11 +1418,6 @@ function materializeStableRuntimeGeneration(context) {
     fs.rmSync(staging, { recursive: true, force: true });
     try {
       _copyRuntimeTree(sourceRuntime, path.join(staging, "runtime"));
-      fs.mkdirSync(path.join(staging, "bin"), { recursive: true });
-      fs.copyFileSync(sourceMux, path.join(staging, "bin", "aiworkhub-app-server-mux"));
-      if (process.platform !== "win32") {
-        fs.chmodSync(path.join(staging, "bin", "aiworkhub-app-server-mux"), 0o755);
-      }
       atomicWriteJson(path.join(staging, "manifest.json"), {
         schema_id: STABLE_RUNTIME_SCHEMA,
         version,
@@ -1516,113 +1445,9 @@ function materializeStableRuntimeGeneration(context) {
     fingerprint,
     generation: generationName,
     runtime_dir: runtimeDir,
-    mux_path: muxPath,
     updated_at: new Date().toISOString(),
   });
-  return { runtimeDir, muxPath, generationRoot, fingerprint, version, storageRoot };
-}
-
-function shouldRepairCodexMuxSetting(currentValue) {
-  const current = String(currentValue || "").trim();
-  if (!current) return true;
-  if (current.includes("geoai-app-server-mux")) return true;
-  // Any AIWorkHub-owned mux path is managed by this extension. The exact
-  // current-version path is handled by ensureCodexMuxConfigured before this
-  // helper is called; reaching here means it is stale and must be replaced,
-  // even when the old extension directory still exists on disk.
-  if (current.includes("aiworkhub-app-server-mux")) return true;
-  return !fs.existsSync(current);
-}
-
-/** Bind (or clear) the repository identity the AIWorkHub Codex sideband mux
- *  requires into THIS workspace extension host's process environment.
- *
- *  The OpenAI ChatGPT/Codex extension runs in the same remote *workspace*
- *  extension host as AIWorkHub and spawns `chatgpt.cliExecutable` (our mux)
- *  inheriting this host's `process.env`. The mux's app-server path fails closed
- *  without `AIWORKHUB_REPO_ID` (B925: no global repository fallback) -- which is
- *  exactly what leaves the Codex chat stuck on its logo when we point
- *  cliExecutable at the mux without binding it. Publishing the identity here is
- *  what the mux means by "the extension binds it into this process's environment
- *  before spawning it per workspace".
- *
- *  Only a REAL, bound `repo_id` is published; an unbound/sentinel identity CLEARS
- *  the binding so a foreign repo_id can never leak into a mux spawn (B925) and
- *  Codex is left to launch normally (do no harm). The write/launch gates are
- *  never published into the shared environment. Returns true when a real
- *  identity is now bound. */
-function bindCodexSidebandEnvironment(repoIdentity) {
-  const repoId = repoIdentity && String(repoIdentity.repoId || "");
-  const rootPath = repoIdentity && String(repoIdentity.root || "");
-  if (!repoId || !REAL_REPO_ID_RE.test(repoId)) {
-    for (const key of ["AIWORKHUB_REPO_ID", "AIWORKHUB_REPO_ROOT", "AIWORKHUB_REPO", "AIWORKHUB_CALLBACK_TRANSPORT"]) {
-      delete process.env[key];
-    }
-    return false;
-  }
-  process.env.AIWORKHUB_REPO_ID = repoId;
-  if (rootPath) {
-    process.env.AIWORKHUB_REPO_ROOT = rootPath;
-    process.env.AIWORKHUB_REPO = rootPath;
-  }
-  process.env.AIWORKHUB_WINDOW_ID = WINDOW_SCOPE_ID;
-  process.env.AIWORKHUB_CALLBACK_TRANSPORT = "sideband";
-  // Defense in depth: never publish the write/launch gates into a spawn this
-  // extension does not own.
-  delete process.env.AIWORKHUB_ALLOW_WRITES;
-  delete process.env.AIWORKHUB_ALLOW_LAUNCH;
-  return true;
-}
-
-async function ensureCodexMuxConfigured(context) {
-  if (process.platform === "win32") {
-    outputChannel.appendLine("[callback] Codex sideband mux requires a native Windows launcher");
-    return false;
-  }
-  // Always-on for initialized repositories. The OpenAI extension's
-  // chatgpt.cliExecutable setting is
-  // application-scoped/global, but the bundled launcher is transparent when a
-  // window has no bound repository and registers sideband ownership only when
-  // this extension host supplies the exact repo_id/window binding. This keeps
-  // multi-window isolation while allowing the mux to observe the real Codex
-  // thread UUID needed for push callbacks. There is deliberately no user flag:
-  // older releases persisted an explicit false value which silently defeated
-  // newer safe defaults and left every task without an origin thread.
-  // Do no harm: only hijack the OpenAI extension's chatgpt.cliExecutable when
-  // THIS workspace is bound to a real repository, so the mux (which fails closed
-  // without AIWORKHUB_REPO_ID, B925) can actually start the Codex app-server.
-  // When unbound, leave cliExecutable untouched so Codex launches normally.
-  if (!process.env.AIWORKHUB_REPO_ID) {
-    outputChannel.appendLine("[callback] repository not bound; leaving chatgpt.cliExecutable untouched (Codex launches directly)");
-    return false;
-  }
-  const muxPath = extensionMuxExecutable
-    || path.join(context.extensionUri.fsPath, "bin", "aiworkhub-app-server-mux");
-  extensionMuxExecutable = muxPath;
-  try {
-    fs.accessSync(muxPath, fs.constants.R_OK | fs.constants.X_OK);
-  } catch (err) {
-    outputChannel.appendLine(`[callback] bundled mux unavailable: ${sanitizeErrorMessage(err)}`);
-    return false;
-  }
-  const config = vscode.workspace.getConfiguration("chatgpt");
-  const current = config.get("cliExecutable", "");
-  const inspected = config.inspect("cliExecutable") || {};
-  // This setting is application-scoped. A same-looking value inherited
-  // from Remote Machine/workspace configuration is not authoritative for
-  // the OpenAI extension and previously caused a false "configured" result.
-  // Always materialize the desired value through VS Code's Global target.
-  if (
-    path.resolve(String(current || muxPath)) === path.resolve(muxPath)
-    && inspected.globalValue === muxPath
-  ) return true;
-  if (!shouldRepairCodexMuxSetting(current)) {
-    outputChannel.appendLine("[callback] preserved existing custom chatgpt.cliExecutable");
-    return false;
-  }
-  await config.update("cliExecutable", muxPath, vscode.ConfigurationTarget.Global);
-  outputChannel.appendLine("[callback] repaired chatgpt.cliExecutable to bundled AIWorkHub mux; reload once");
-  return true;
+  return { runtimeDir, generationRoot, fingerprint, version, storageRoot };
 }
 
 // ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
@@ -1649,8 +1474,7 @@ function codexConfigTomlPath() {
  *  package at `<ext>/runtime/aiworkhub`; a development checkout has it at
  *  `<ext>/../src/aiworkhub` and only produces `runtime/` at VSIX build time.
  *  Prefer the packaged `runtime/`, fall back to the repo `src/` -- the SAME
- *  runtime/ -> src/ resolution the bundled bin/aiworkhub-app-server-mux
- *  launcher already performs. Writing a `runtime/` path that does not exist is
+ *  runtime/ -> src/ resolution used in development. Writing a `runtime/` path that does not exist is
  *  exactly what silently breaks Codex's `python -m aiworkhub.server`
  *  (ModuleNotFoundError: No module named 'aiworkhub') and stops the Codex chat
  *  from launching, so this never returns a directory that lacks the aiworkhub
@@ -2075,7 +1899,7 @@ function pushCoordinatorTargets(view) {
 // instruct a manual window/extension-host reload. A mismatch that cannot be
 // repaired within the bounded budget is reported as `degraded` with a
 // readable `reason` instead.
-function runtimeStatusPayload({ runtimeVersion, degraded, repaired, repairAttempted, reason }) {
+function runtimeStatusPayload({ runtimeVersion, degraded, repaired, repairAttempted, reason, attempts, maxAttempts }) {
   return {
     extensionVersion: installedExtensionVersion(),
     expectedMcpVersion: EXPECTED_MCP_PACKAGE_VERSION,
@@ -2085,6 +1909,8 @@ function runtimeStatusPayload({ runtimeVersion, degraded, repaired, repairAttemp
     repaired: Boolean(repaired),
     repairAttempted: Boolean(repairAttempted),
     reason: reason || "ok",
+    attempts: Number(attempts || 0),
+    maxAttempts: Number(maxAttempts || MCP_MAX_RUNTIME_REPAIR_ATTEMPTS),
   };
 }
 
@@ -2289,29 +2115,14 @@ function pushSnapshot(view) {
 async function pushSnapshotOnce(view) {
   const requestSeq = ++view.snapshotRequestSeq;
   let lastError = null;
-  for (let attempt = 0; attempt <= MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
+  const client = getMcpClient();
+  view.bindClient(client);
+  for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
-      const retryClient = mcpClient;
-      if (retryClient) {
-        retryClient.stop({ restart: true });
-      }
+      if (client.recovery.open) break;
+      await new Promise((resolve) => setTimeout(resolve, MCP_RECOVERY_BACKOFF_MS[attempt - 1]));
     }
     try {
-      const client = getMcpClient();
-      view.bindClient(client);
-      // A dispatcher can die after a successful handshake.  Converge it on
-      // every normal dashboard refresh so recovery never depends on Reload
-      // Window or a coordinator-target toggle.  Failure remains visible in
-      // callback_delivery but never prevents the queue snapshot rendering.
-      try {
-        const watchdog = await client.callTool(DISPATCHER_TOOLS.watchdog, {});
-        client._recordDispatcherWatchdogResult(watchdog, "periodic watchdog");
-      } catch (watchdogError) {
-        client.dispatcherReady = false;
-        outputChannel.appendLine(
-          `[mcp] dispatcher watchdog failed: ${sanitizeErrorMessage(watchdogError)}`,
-        );
-      }
       const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
       if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
@@ -2321,10 +2132,18 @@ async function pushSnapshotOnce(view) {
       return;
     } catch (err) {
       lastError = err;
+      client.recovery.category = "snapshot";
+      client.recovery.reason = sanitizeErrorMessage(err);
+      client.recovery.attempts = attempt + 1;
+      if (attempt + 1 >= MCP_SNAPSHOT_RECOVERY_ATTEMPTS) client.recovery.open = true;
     }
   }
   if (requestSeq === view.snapshotRequestSeq) {
-    view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(lastError) });
+    view.postMessage({
+      type: OUTBOUND_TYPES.offline,
+      reason: sanitizeErrorMessage(lastError),
+      recovery: client.recoveryStatus(),
+    });
   }
 }
 
@@ -2431,9 +2250,14 @@ function handleInboundMessage(view, message) {
   switch (message.type) {
     case "ready":
     case "refresh":
-    case "retry":
       pushSnapshot(view);
       break;
+    case "retry": {
+      const client = getMcpClient();
+      client.beginExplicitRecovery();
+      pushSnapshot(view);
+      break;
+    }
     case "selectTask": {
       const taskId = String(message.taskId || "");
       if (!TASK_ID_RE.test(taskId)) {
@@ -2460,21 +2284,6 @@ function handleInboundMessage(view, message) {
       const targets = setCoordinatorTarget(String(message.provider || ""));
       if (targets) {
         view.postMessage({ type: OUTBOUND_TYPES.coordinatorTargets, payload: sanitizeWebviewPayload(targets) });
-        // B857: an explicit coordinator-target switch must re-bind the
-        // ONE live dispatcher to the newly selected provider -- never a
-        // second dispatcher, never left routing to the stale provider.
-        // Fire-and-forget: the Webview already has its optimistic update
-        // above; a transport hiccup here surfaces on the next health poll.
-        {
-          const client = getMcpClient();
-          client
-            .callTool(DISPATCHER_TOOLS.ensureStarted, {})
-            .then((result) => client._recordDispatcherEnsureResult(result, "coordinator-target switch"))
-            .catch((err) => {
-              client.dispatcherReady = false;
-              outputChannel.appendLine(`[mcp] dispatcher re-bind after target switch failed: ${sanitizeErrorMessage(err)}`);
-            });
-        }
       }
       break;
     }
@@ -3122,12 +2931,6 @@ async function selectRepositoryCommand() {
   const selectedRepo = getActiveRepositoryRoot(ctx);
   activeRepoIdentity = { ...selectedRepo, label: activeRepoLabel };
 
-  // Re-bind the sideband identity for the newly selected repository and update
-  // chatgpt.cliExecutable to match; switching to an unbound repo clears the
-  // binding and leaves Codex to launch directly (do no harm).
-  bindCodexSidebandEnvironment(activeRepoIdentity);
-  await ensureCodexMuxConfigured(ctx);
-
   // Start the new client and refresh.
   try {
     const client = getMcpClient();
@@ -3157,7 +2960,6 @@ async function activate(context) {
   context.subscriptions.push(outputChannel);
   const stableRuntime = materializeStableRuntimeGeneration(context);
   extensionRuntimeDir = stableRuntime.runtimeDir;
-  extensionMuxExecutable = stableRuntime.muxPath;
   outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
@@ -3175,14 +2977,6 @@ async function activate(context) {
       activeRepoLabel = "No workspace";
     }
   }
-
-  // Bind the repository identity into the shared workspace-host process.env so
-  // the OpenAI Codex extension's mux spawn inherits it, THEN (only when a real
-  // repo is bound) point chatgpt.cliExecutable at the mux. Order matters: bind
-  // first so ensureCodexMuxConfigured's do-no-harm guard sees the binding.
-  bindCodexSidebandEnvironment(activeRepoIdentity);
-  const codexMuxConfigured = await ensureCodexMuxConfigured(context);
-  scheduleCodexMuxRepair(codexMuxConfigured);
 
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
@@ -3229,7 +3023,6 @@ async function activate(context) {
 
 async function deactivate() {
   stopWindowRouteRenewalTimer();
-  stopCodexMuxRepairTimer();
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
@@ -3259,13 +3052,10 @@ module.exports = {
     _buildPreflightDiagnostic,
     getMcpClient,
     sanitizeErrorMessage,
-    shouldRepairCodexMuxSetting,
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,
     materializeStableRuntimeGeneration,
-    bindCodexSidebandEnvironment,
-    classifyImmediateCodexChildren,
     repairCodexConfigTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,

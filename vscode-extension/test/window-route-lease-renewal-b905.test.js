@@ -56,7 +56,16 @@ class FakeChild extends EventEmitter {
       this._send({}, message.id);
       return;
     }
-    this._send({ content: [{ type: "text", text: JSON.stringify({ ok: true, dispatcher_started: true }) }] }, message.id);
+    this._send({
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          dispatcher_started: true,
+          server_version: "0.6.61",
+        }),
+      }],
+    }, message.id);
   }
 }
 

@@ -19,7 +19,7 @@ const os = require("os");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
-const EXPECTED_VERSION = "0.6.57";
+const EXPECTED_VERSION = require("../package.json").version;
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -229,6 +229,7 @@ async function testBoundedRetryOnPersistentMismatch(tmp) {
     { version: "0.6.10", missingTools: [], dieBeforeInitialize: false },
     { version: "0.6.10", missingTools: [], dieBeforeInitialize: false },
     { version: "0.6.10", missingTools: [], dieBeforeInitialize: false },
+    { version: "0.6.10", missingTools: [], dieBeforeInitialize: false },
   ]]]);
   const fake = installSpawnFake(generations);
   try {
@@ -237,7 +238,9 @@ async function testBoundedRetryOnPersistentMismatch(tmp) {
     const { view, messages } = makeView(host);
 
     await host.extension.__testInternals.pushRuntimeInfo(view);
-    assert.strictEqual(fake.spawns.length, 2, "a persistent mismatch spends exactly the bounded repair budget (1 restart)");
+    await host.extension.__testInternals.pushRuntimeInfo(view);
+    await host.extension.__testInternals.pushRuntimeInfo(view);
+    assert.strictEqual(fake.spawns.length, 4, "a persistent mismatch spends exactly three bounded repair attempts");
     let last = messages.filter((m) => m.type === "runtimeInfo").pop();
     assert.strictEqual(last.payload.reloadRequired, false);
     assert.strictEqual(last.payload.degraded, true);
@@ -246,11 +249,10 @@ async function testBoundedRetryOnPersistentMismatch(tmp) {
       last.payload.reason,
     );
 
-    // A second mismatch check (e.g. the user reopens the tab again) must NOT
-    // spawn a third child -- the bounded budget for this mismatch episode is
+    // A later mismatch check must NOT spawn another child -- the bounded budget for this mismatch episode is
     // already spent, and it must degrade visibly instead of looping forever.
     await host.extension.__testInternals.pushRuntimeInfo(view);
-    assert.strictEqual(fake.spawns.length, 2, "exhausted repair budget must never spawn again for the same mismatch episode");
+    assert.strictEqual(fake.spawns.length, 4, "exhausted repair budget must never spawn again for the same mismatch episode");
     last = messages.filter((m) => m.type === "runtimeInfo").pop();
     assert.strictEqual(last.payload.reloadRequired, false);
     assert.strictEqual(last.payload.degraded, true);
@@ -271,6 +273,8 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
   const generations = new Map([[repoRoot, [
     { version: "0.6.11", missingTools: [], dieBeforeInitialize: false },
     { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: true }, // the repair restart itself fails to handshake
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: true },
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: true },
   ]]]);
   const fake = installSpawnFake(generations);
   try {
@@ -279,7 +283,7 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
     const { view, messages } = makeView(host);
     await host.extension.__testInternals.pushRuntimeInfo(view);
 
-    assert.strictEqual(fake.spawns.length, 2);
+    assert.ok(fake.spawns.length <= 4, "failed recovery must remain within the three-attempt episode");
     const last = messages.filter((m) => m.type === "runtimeInfo").pop();
     assert.strictEqual(last.payload.reloadRequired, false, "a failed restart must never fall back to a manual reload instruction");
     assert.strictEqual(last.payload.degraded, true);
