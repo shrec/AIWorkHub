@@ -70,6 +70,7 @@ const { repairWorkspaceMcpConfigObject } = extensionModule.__testInternals;
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO_ROOT, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_WRITES, "1");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_LAUNCH, "1");
 }
 
 {
@@ -82,6 +83,8 @@ const { repairWorkspaceMcpConfigObject } = extensionModule.__testInternals;
           PYTHONPATH: "C:\\Users\\dev\\.vscode\\extensions\\shrec.aiworkhub-0.6.49\\runtime",
           AIWORKHUB_REPO: "C:\\src\\project",
           AIWORKHUB_REPO_ROOT: "C:\\src\\project",
+          AIWORKHUB_ALLOW_WRITES: "1",
+          AIWORKHUB_ALLOW_LAUNCH: "1",
         },
         type: "stdio",
       },

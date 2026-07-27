@@ -50,9 +50,33 @@ try {
 const { __testInternals } = extensionModule;
 const {
   repairCodexConfigTomlText,
+  ensureCodexManagerGatesTomlText,
   migrateCodexConfigTomlText,
   splitCodexPythonPathValue,
 } = __testInternals;
+
+{
+  const original = [
+    "[mcp_servers.AIWorkHub]",
+    'command = "python3"',
+    'args = ["-m", "aiworkhub.server"]',
+    "",
+    "[mcp_servers.AIWorkHub.env]",
+    'PYTHONPATH = "/runtime"',
+    "",
+    "[mcp_servers.Other.env]",
+    'AIWORKHUB_ALLOW_WRITES = "0"',
+    "",
+  ].join("\n");
+  const repaired = ensureCodexManagerGatesTomlText(original);
+  assert.strictEqual(repaired.changed, true);
+  assert.ok(repaired.text.includes('AIWORKHUB_ALLOW_WRITES = "1"'));
+  assert.ok(repaired.text.includes('AIWORKHUB_ALLOW_LAUNCH = "1"'));
+  assert.ok(repaired.text.includes('[mcp_servers.Other.env]\nAIWORKHUB_ALLOW_WRITES = "0"'));
+  const second = ensureCodexManagerGatesTomlText(repaired.text);
+  assert.strictEqual(second.changed, false);
+  assert.strictEqual(second.text, repaired.text);
+}
 
 const NEW_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.20/runtime";
 const OLD_RUNTIME_LINUX = "/home/dev/.vscode-server/extensions/publisher.aiworkhub-0.6.19/runtime";

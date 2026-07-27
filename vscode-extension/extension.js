@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.62";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.63";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -1592,6 +1592,60 @@ function repairCodexConfigTomlText(text, currentRuntimeDir) {
   return { text: nextLines.join("\n"), changed };
 }
 
+/** Ensure the canonical Codex manager MCP entry can perform the task
+ * lifecycle it exposes. Repository binding remains process-cwd scoped; these
+ * gates only enable already capability-checked manager writes/launches. An
+ * explicit existing value is preserved, so an operator can still disable a
+ * gate. Dashboard children remain read-only because _start() deletes both
+ * variables from their private child environment. */
+function ensureCodexManagerGatesTomlText(text) {
+  const input = String(text || "");
+  const lines = input.split("\n");
+  const insertedSuffix = input.includes("\r\n") ? "\r" : "";
+  const result = [];
+  let currentSection = "";
+  let ownedEnv = false;
+  let hasWrites = false;
+  let hasLaunch = false;
+  let changed = false;
+
+  function flushMissingGates() {
+    if (!ownedEnv) return;
+    if (!hasWrites) {
+      result.push(`AIWORKHUB_ALLOW_WRITES = "1"${insertedSuffix}`);
+      changed = true;
+    }
+    if (!hasLaunch) {
+      result.push(`AIWORKHUB_ALLOW_LAUNCH = "1"${insertedSuffix}`);
+      changed = true;
+    }
+  }
+
+  for (const line of lines) {
+    const sectionMatch = line.match(TOML_SECTION_RE);
+    if (sectionMatch) {
+      flushMissingGates();
+      currentSection = sectionMatch[1];
+      const segments = currentSection.trim().split(".");
+      ownedEnv = segments.length === 3
+        && segments[0].toLowerCase() === "mcp_servers"
+        && OWNED_MCP_SERVER_NAMES.has(segments[1].toLowerCase())
+        && segments[2].toLowerCase() === "env";
+      hasWrites = false;
+      hasLaunch = false;
+      result.push(line);
+      continue;
+    }
+    if (ownedEnv) {
+      if (/^\s*AIWORKHUB_ALLOW_WRITES\s*=/.test(line)) hasWrites = true;
+      if (/^\s*AIWORKHUB_ALLOW_LAUNCH\s*=/.test(line)) hasLaunch = true;
+    }
+    result.push(line);
+  }
+  flushMissingGates();
+  return { text: result.join("\n"), changed };
+}
+
 /** B894a backward-compatible pure helper: like repairCodexConfigTomlText, but
  *  also migrates a custom-named MCP server table when (and only when) that
  *  table's own `args` line (in its top-level `[mcp_servers.<name>]` section,
@@ -1775,6 +1829,26 @@ function migrateCodexConfigTomlRuntimePath(context) {
   }
 }
 
+function ensureCodexManagerGatesRepaired() {
+  const configPath = resolveCodexConfigTomlPath(process.env);
+  let original;
+  try {
+    original = fs.readFileSync(configPath, "utf8");
+  } catch (_err) {
+    return false;
+  }
+  const { text, changed } = ensureCodexManagerGatesTomlText(original);
+  if (!changed) return false;
+  try {
+    fs.writeFileSync(configPath, text, "utf8");
+    outputChannel.appendLine("[codex] enabled capability-gated AIWorkHub manager task lifecycle");
+    return true;
+  } catch (err) {
+    outputChannel.appendLine(`[codex] failed to repair manager gates in config.toml: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+}
+
 /** Repair a repository-local VS Code MCP registration created by an older
  *  AIWorkHub release. The dashboard child and Copilot's MCP child are separate
  *  processes: the latter reads `.vscode/mcp.json`, so a stale repository
@@ -1798,6 +1872,12 @@ function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) 
       AIWORKHUB_REPO: repoRoot,
       AIWORKHUB_REPO_ROOT: repoRoot,
     };
+    if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_WRITES")) {
+      nextEnv.AIWORKHUB_ALLOW_WRITES = "1";
+    }
+    if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_LAUNCH")) {
+      nextEnv.AIWORKHUB_ALLOW_LAUNCH = "1";
+    }
     const next = { ...value, command: python.command, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
       document.servers[name] = next;
@@ -2968,6 +3048,7 @@ async function activate(context) {
   outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
+  ensureCodexManagerGatesRepaired();
   ensureWorkspaceMcpConfigsRepaired(context);
 
   // Resolve the initial active repository and label.
@@ -3062,6 +3143,7 @@ module.exports = {
     resolveExtensionRuntimeDir,
     materializeStableRuntimeGeneration,
     repairCodexConfigTomlText,
+    ensureCodexManagerGatesTomlText,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,
     repairWorkspaceMcpConfigObject,
