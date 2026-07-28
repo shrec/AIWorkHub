@@ -961,6 +961,28 @@ tbody tr.is-selected td:first-child {
   border-bottom: 1px solid var(--line);
 }
 
+.storage-row {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 9px;
+}
+
+.storage-label,
+.storage-scan-state { color: var(--muted); }
+
+.storage-value {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.storage-scan-state { padding: 7px 10px; font-size: 8px; }
+
 .usage-metric {
   min-width: 0;
   padding: 9px 7px;

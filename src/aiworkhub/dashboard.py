@@ -26,6 +26,7 @@ from aiworkhub import (
     deepseek_credentials,
     process_launcher,
     repository_state,
+    storage_observability,
     task_store,
 )
 
@@ -694,6 +695,8 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "reason": str(getattr(readiness, "reason", "unknown_provider")) if readiness is not None else "unknown_provider",
         "repo_id": str(getattr(readiness, "repo_id", "")) if readiness is not None else "",
     }
+    provider_root = getattr(data_provider, "repo_root", None)
+    storage_usage = storage_observability.snapshot(provider_root or _default_repo_root())
     if readiness is not None and not storage_state["ready"]:
         zero_counts = {status: 0 for status in ALL_CANONICAL_STATUSES}
         zero_counts["stale"] = 0
@@ -704,6 +707,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "generated_at": _utc_now(),
             "readonly": True,
             "storage": storage_state,
+            "storage_usage": storage_usage,
             "health": {"ok": False, "degraded": True, "provider_error_count": 0},
             "status_counts": zero_counts,
             "row_counts": {
@@ -915,6 +919,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "generated_at": _utc_now(),
         "readonly": True,
         "storage": storage_state,
+        "storage_usage": storage_usage,
         "health": {
             "ok": not errors,
             "degraded": bool(errors),

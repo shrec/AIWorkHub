@@ -83,6 +83,7 @@ const elements = {
   topicStats: document.querySelector("#topic-stats"),
   runnerStats: document.querySelector("#runner-stats"),
   usageList: document.querySelector("#usage-list"),
+  storageList: document.querySelector("#storage-list"),
   returnList: document.querySelector("#return-list"),
   returnTab: document.querySelector("#tab-returns"),
   runList: document.querySelector("#run-list"),
@@ -586,6 +587,59 @@ function renderUsage(snapshot) {
   elements.usageList.replaceChildren(fragment);
 }
 
+function formatBytes(value) {
+  let amount = Math.max(0, numberValue(value));
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 || amount >= 100 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
+}
+
+function renderStorage(snapshot) {
+  const usage = snapshot && snapshot.storage_usage && typeof snapshot.storage_usage === "object"
+    ? snapshot.storage_usage
+    : null;
+  if (!usage) {
+    elements.storageList.replaceChildren(createElement("div", "panel-list-empty", "Storage data unavailable"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  const overview = createElement("div", "usage-overview storage-overview");
+  const overviewValues = [
+    ["Managed", formatBytes(usage.managed_total_bytes)],
+    ["Repo data", formatBytes(usage.repo_data_bytes)],
+    ["Worker trees", formatBytes(usage.worker_tree_bytes)],
+    ["Free disk", formatBytes(usage.disk_free_bytes)],
+  ];
+  for (const [label, value] of overviewValues) {
+    const metric = createElement("div", "usage-metric");
+    metric.title = `${label}: ${value}`;
+    metric.append(createElement("span", "usage-label", label), createElement("strong", "", value));
+    overview.appendChild(metric);
+  }
+  fragment.appendChild(overview);
+
+  const rows = [
+    ["Repository .aiworkhub", `${formatBytes(usage.repo_data_bytes)} · ${formatCount(usage.repo_data_files)} files`],
+    ["Retained worker trees", `${formatBytes(usage.worker_tree_bytes)} · ${formatCount(usage.worker_tree_count)} trees`],
+    ["Safe reclaimable", formatBytes(usage.safe_reclaimable_bytes)],
+    ["Disk", `${formatBytes(usage.disk_used_bytes)} / ${formatBytes(usage.disk_total_bytes)} · ${numberValue(usage.disk_used_percent).toFixed(1)}% used`],
+  ];
+  for (const [label, value] of rows) {
+    const row = createElement("div", "storage-row");
+    row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+    fragment.appendChild(row);
+  }
+  const stateLabel = String(usage.scan_status || "unknown");
+  const timestamp = usage.scanned_at ? new Date(usage.scanned_at).toLocaleString() : "calculating now";
+  fragment.appendChild(createElement("div", "storage-scan-state", `${stateLabel} · ${timestamp}`));
+  elements.storageList.replaceChildren(fragment);
+}
+
 function taskSignalRow(task, badgeText, badgeClass) {
   const row = createElement("div", "signal-row");
   const top = createElement("div", "signal-topline");
@@ -757,6 +811,7 @@ function renderSnapshot(snapshot) {
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderUsage(snapshot);
+  renderStorage(snapshot);
   renderReturns(snapshot);
   renderRuns(snapshot);
   renderWarnings(snapshot);

@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from aiworkhub import storage_observability
+
+
+def _wait_ready(repo: Path, timeout: float = 2.0) -> dict:
+    deadline = time.monotonic() + timeout
+    result = storage_observability.snapshot(repo)
+    while result["scan_status"] in {"scanning", "refreshing"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        result = storage_observability.snapshot(repo)
+    return result
+
+
+def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    data = repo / ".aiworkhub"
+    data.mkdir(parents=True)
+    (data / "state.db").write_bytes(b"a" * 128)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"b" * 4096)
+    (data / "outside-link").symlink_to(outside)
+    monkeypatch.setattr(
+        storage_observability.worktree_storage,
+        "scan_worktrees",
+        lambda **_kwargs: {
+            "summary": {"total_bytes": 256, "count": 2, "removable_safe_bytes": 64}
+        },
+    )
+    storage_observability._reset_cache_for_tests()
+
+    result = _wait_ready(repo)
+
+    assert result["scan_status"] == "ready"
+    assert result["repo_data_bytes"] == 128
+    assert result["repo_data_files"] == 1
+    assert result["worker_tree_bytes"] == 256
+    assert result["worker_tree_count"] == 2
+    assert result["safe_reclaimable_bytes"] == 64
+    assert result["managed_total_bytes"] == 384
+    assert result["disk_total_bytes"] > 0
+    assert result["disk_free_bytes"] > 0
+    assert result["readonly"] is True
+    assert "repo" not in result and "base" not in result
+
+
+def test_storage_snapshot_returns_immediately_while_slow_scan_runs(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def slow_scan(**_kwargs):
+        time.sleep(0.15)
+        return {"summary": {"total_bytes": 1, "count": 1, "removable_safe_bytes": 0}}
+
+    monkeypatch.setattr(storage_observability.worktree_storage, "scan_worktrees", slow_scan)
+    storage_observability._reset_cache_for_tests()
+    started = time.monotonic()
+
+    first = storage_observability.snapshot(repo)
+
+    assert time.monotonic() - started < 0.1
+    assert first["scan_status"] == "scanning"
+    assert _wait_ready(repo)["scan_status"] == "ready"
+
+
+def test_storage_scan_failure_is_bounded_and_does_not_break_capacity(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(
+        storage_observability.worktree_storage,
+        "scan_worktrees",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("secret details")),
+    )
+    storage_observability._reset_cache_for_tests()
+
+    result = _wait_ready(repo)
+
+    assert result["scan_status"] == "error"
+    assert result["errors"] == ["storage_scan_failed:RuntimeError"]
+    assert result["disk_total_bytes"] > 0
+

@@ -4,6 +4,17 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.67] - 2026-07-28
+
+### Added
+
+- Added a read-only **Storage** dashboard tab showing repository-local
+  `.aiworkhub` data, retained worker worktrees, safely reclaimable bytes, and
+  current filesystem capacity/free space in human-readable units.
+- Added cached background storage measurement, so expensive worktree sizing
+  never blocks the dashboard refresh path even with hundreds of retained
+  task worktrees.
+
 ## [0.6.66] - 2026-07-28
 
 ### Fixed

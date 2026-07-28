@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.66";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.67";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -2851,6 +2851,7 @@ function getHtmlForWebview(webview, extensionUri) {
               <button type="button" role="tab" aria-selected="true" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runners" id="tab-runners" data-tab="runners">Runners</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-usage" id="tab-usage" data-tab="usage">Usage</button>
+              <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-storage" id="tab-storage" data-tab="storage">Storage</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-returns" id="tab-returns" data-tab="returns">Returns</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runs" id="tab-runs" data-tab="runs">Runs</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-warnings" id="tab-warnings" data-tab="warnings">Warnings</button>
@@ -2865,6 +2866,9 @@ function getHtmlForWebview(webview, extensionUri) {
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" hidden>
             <div class="stat-list" id="usage-list"></div>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden>
+            <div class="stat-list" id="storage-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-returns" aria-labelledby="tab-returns" hidden>
             <div class="signal-list" id="return-list"></div>
