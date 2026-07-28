@@ -57,6 +57,9 @@ const elements = {
   autoRefresh: document.querySelector("#auto-refresh"),
   refreshInterval: document.querySelector("#refresh-interval"),
   refreshButton: document.querySelector("#refresh-button"),
+  headerStorage: document.querySelector("#header-storage"),
+  headerStorageManaged: document.querySelector("#header-storage-managed"),
+  headerStorageFree: document.querySelector("#header-storage-free"),
   sourceAlert: document.querySelector("#source-alert"),
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
@@ -249,6 +252,15 @@ function renderSummary(snapshot) {
   document.querySelector("#metric-tokens").textContent = formatCount(totals.total_tokens);
   document.querySelector("#metric-tokens").title = `${numberValue(totals.total_tokens)} tokens`;
   document.querySelector("#metric-cost").textContent = formatMoney(totals.cost_usd);
+  const storage = snapshot && snapshot.storage_usage && typeof snapshot.storage_usage === "object"
+    ? snapshot.storage_usage
+    : null;
+  elements.headerStorageManaged.textContent = storage
+    ? (storage.scan_status === "scanning" ? "Calculating" : formatBytes(storage.managed_total_bytes))
+    : "Unavailable";
+  elements.headerStorageFree.textContent = storage
+    ? `Free ${formatBytes(storage.disk_free_bytes)}`
+    : "Free —";
 }
 
 function renderSourceHealth(snapshot) {
@@ -1879,6 +1891,14 @@ operationTabs.forEach((tab, index) => {
       activateOperationTab(operationTabs[targetIndex], true);
     }
   });
+});
+
+elements.headerStorage.addEventListener("click", () => {
+  const storageTab = operationTabs.find((tab) => tab.dataset.tab === "storage");
+  if (storageTab) {
+    activateOperationTab(storageTab, true);
+    document.querySelector("#panel-storage").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 });
 
 // Restore the last-selected status filter button state (selection itself is

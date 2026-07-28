@@ -13,6 +13,9 @@ for (const token of [
   'id="tab-storage"',
   'id="panel-storage"',
   'id="storage-list"',
+  'id="header-storage"',
+  'id="header-storage-managed"',
+  'id="header-storage-free"',
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -22,6 +25,7 @@ for (const token of [
   "snapshot.storage_usage",
   "Safe reclaimable",
   "renderStorage(snapshot);",
+  "elements.headerStorageManaged.textContent",
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }

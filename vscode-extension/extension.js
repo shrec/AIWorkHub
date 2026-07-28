@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.67";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.68";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -2632,6 +2632,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span id="mcp-runtime-version">MCP runtime checking</span>
       </div>
     </div>
+
+    <button class="header-storage" id="header-storage" type="button" title="Open detailed storage metrics">
+      <span class="header-storage-label">Storage</span>
+      <strong id="header-storage-managed">Calculating</strong>
+      <span id="header-storage-free">Free —</span>
+    </button>
 
     <div class="header-actions">
       <div class="connection-state" id="connection-state" role="status" aria-live="polite">

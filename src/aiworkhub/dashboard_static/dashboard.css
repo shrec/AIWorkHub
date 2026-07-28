@@ -181,6 +181,30 @@ select:focus-visible,
   gap: 9px;
 }
 
+.header-storage {
+  display: grid;
+  grid-template-columns: auto auto;
+  min-width: 180px;
+  align-items: baseline;
+  gap: 1px 9px;
+  padding: 5px 10px;
+  color: var(--ink);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.header-storage-label {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.header-storage strong { font-size: 11px; font-variant-numeric: tabular-nums; }
+#header-storage-free { color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+
 .connection-state {
   gap: 6px;
   color: var(--ink-soft);
