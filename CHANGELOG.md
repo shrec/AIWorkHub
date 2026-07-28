@@ -4,6 +4,52 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.66] - 2026-07-28
+
+### Fixed
+
+- Callback delivery now acknowledges the successful synchronous
+  `turn/start` response. A later cancelled/interrupted terminal notification
+  can no longer retry an already-injected callback five times and then move it
+  to `dead_letter`.
+- A verified route may recover a matching dead-letter callback exactly once,
+  so review work stranded during a reload is replayed without an infinite
+  resurrection loop.
+- Retained worker worktrees are collected after their exact attempt is
+  finished, archived, rejected to pending, blocked, or superseded by a newer
+  review request. The current review request, live processes, malformed
+  authority, and unsafe paths still fail closed and remain untouched.
+- Coordinator lifecycle actions trigger the same safe retention sweep
+  immediately; the periodic reconciler remains the durable fallback.
+- Codex callback ownership remains extension-scoped. A verified headless MCP
+  client no longer becomes a competing dispatcher owner, and AIWorkHub does
+  not silently rewrite another extension's CLI configuration.
+
+## [0.6.65] - 2026-07-27
+
+### Fixed
+
+- B1021: Verified non-route_pending Codex manager identity now makes
+  `dispatch_expected` true in `dispatcher_health` and exposes `window_id`
+  in `dispatcher_ensure_started` even without `AIWORKHUB_WINDOW_ID`, so a
+  Codex-attached dashboard without the env window ID can still dispatch
+  callbacks.
+- B1017: Immediate Codex route publication post-mux-ready convergence: a
+  ready App Server mux instance publishes `capability_state=available` and
+  its verified `thread_id` without waiting for the 4-minute renewal tick,
+  and negative ownership cases correctly remain `route_pending`.
+
+## [0.6.64] - 2026-07-27
+
+### Fixed
+
+- Exact reload and live-mux Codex route publication with shared-manifest
+  split-brain protection prevents stale route tables across concurrent windows.
+- Durable callback outbox rebind, seed, and replay after route restoration
+  ensures no callback is dropped when the transport reconnects.
+- Safe nested `user → message → tool_result` Live Output rendering guards
+  against malformed message envelopes in the dashboard timeline.
+
 ## [0.6.52] - 2026-07-25
 
 ### Fixed

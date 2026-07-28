@@ -2327,7 +2327,9 @@ def create_task(
     manager route.  They are intentionally not caller-controlled parameters.
     Existing task ids are never overwritten.
 
-    ``depends_on`` (optional) names other task_ids in the same repo that must
+    ``callback_required`` controls whether creation must fail closed until a
+    callback-capable manager route is observed. Polling-only cards may be
+    created while that route is pending. ``depends_on`` (optional) names other task_ids in the same repo that must
     reach the ``finished`` lifecycle state before this card is DAG-ready (see
     ``task_plan.py``). Omitting it (the default, ``None``) is identical to the
     pre-DAG behavior: an empty dependency list that never blocks readiness.
@@ -2396,10 +2398,15 @@ def create_task(
     # chat identities and must be persisted in the same canonical card field.
     # Requiring only thread_id made every valid Claude manager-created task
     # fail with the misleading Codex-specific route_pending error.
-    origin_thread_id = str(
+    candidate_origin_thread_id = str(
         identity.get("thread_id") or identity.get("session_id") or ""
     ).strip()
-    if callback_required and not _valid_origin_thread_id(origin_thread_id):
+    origin_thread_id = (
+        candidate_origin_thread_id
+        if _valid_origin_thread_id(candidate_origin_thread_id)
+        else ""
+    )
+    if callback_required and not origin_thread_id:
         provider_name = str(identity.get("provider") or "manager").strip().lower()
         missing_route = (
             "codex_thread_id_not_observed"
@@ -2410,8 +2417,6 @@ def create_task(
             f"callback_route_pending:{missing_route}",
             126,
         )
-    if not callback_required and not _valid_origin_thread_id(origin_thread_id):
-        origin_thread_id = ""
     provider = str(identity["provider"])
     now = datetime.now(timezone.utc).isoformat()
     context_query = next(
@@ -2436,7 +2441,7 @@ def create_task(
         "origin_thread_id": origin_thread_id,
         "coordinator_provider": provider,
         "callback_required": bool(callback_required),
-        "callback_supported": bool(_valid_origin_thread_id(origin_thread_id)),
+        "callback_supported": bool(origin_thread_id),
         "manager_route_state": str(identity.get("route_state") or ""),
         "acceptance": acceptance2,
         "allowed_writes": writes2,
@@ -2668,6 +2673,31 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
     result["dependency_autolaunch"] = dependency_autolaunch.reconcile_after_accept(
         repo_root(), task_id, claim_start_exact
     )
+    _reconcile_retained_workspaces(result)
+    return result
+
+
+def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort immediate GC after a coordinator lifecycle disposition.
+
+    The periodic process reconciler remains the durable safety net, but a
+    successful done/reject/archive/supersede should not leave a large isolated
+    checkout on disk until an extension refresh happens.  Import lazily to
+    avoid the module-level ``core <-> process_launcher`` cycle.  Cleanup is
+    fail-closed and can never turn a successful task transition into failure.
+    """
+    if not result.get("ok"):
+        return result
+    try:
+        from . import process_launcher  # local import: process_launcher imports core
+
+        manager = process_launcher.ProcessManager(repo=repo_root())
+        result["workspace_retention"] = manager._gc_finalized_workspaces()
+    except Exception as exc:  # noqa: BLE001 - lifecycle transition already committed
+        result["workspace_retention"] = {
+            "ok": False,
+            "warning": f"{type(exc).__name__}:{exc}"[:200],
+        }
     return result
 
 
@@ -2721,7 +2751,9 @@ def reject_review(
             )
         card2 = task_store.get_task(repo_root(), task_id)
         stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-        return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+        return _reconcile_retained_workspaces(
+            _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+        )
 
     now = datetime.now(timezone.utc).isoformat()
     if disposition == "blocked":
@@ -2757,7 +2789,9 @@ def reject_review(
         conn.close()
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    return _reconcile_retained_workspaces(
+        _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    )
 
 
 def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> dict[str, Any]:
@@ -2788,7 +2822,9 @@ def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> di
         return _canonical_result(ok=False, returncode=1, stderr=f"archive_failed:{state}", command=command)
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    return _reconcile_retained_workspaces(
+        _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    )
 
 
 def supersede_task(
@@ -2825,7 +2861,9 @@ def supersede_task(
         return _canonical_result(ok=False, returncode=1, stderr=f"supersede_failed:{state}", command=command)
     card2 = task_store.get_task(repo_root(), task_id)
     stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    return _reconcile_retained_workspaces(
+        _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    )
 
 
 def release_launch(
@@ -3784,6 +3822,11 @@ def claude_callback_wait(timeout_seconds: int = 240) -> dict[str, Any]:
     while True:
         conn = _canonical_connect()
         try:
+            callback_store.seed_missing_review_callbacks(
+                conn,
+                provider="claude",
+                origin_thread_id=identity["session_id"],
+            )
             batch = callback_store.claim_pending_callback_batch(
                 conn, lease_seconds=max(120, timeout + 30), provider="claude"
             )

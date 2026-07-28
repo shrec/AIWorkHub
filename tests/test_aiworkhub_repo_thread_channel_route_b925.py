@@ -254,6 +254,10 @@ def test_describe_sideband_owner_freshness_scoped_by_repo_id(tmp_path):
 
 def test_main_unbound_app_server_execs_real_binary_without_sideband(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    # Hermetic: a developer machine may legitimately pin the extension's
+    # absolute Codex binary in ~/.aiworkhub/app_server_mux/real_executable.
+    # This test exercises unbound passthrough shape, not host configuration.
+    monkeypatch.setattr(asm, "resolve_real_executable", lambda: "codex")
     monkeypatch.setattr(
         asm.shared_router,
         "list_known_repositories",

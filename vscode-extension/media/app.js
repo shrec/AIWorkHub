@@ -1254,6 +1254,134 @@ function jsonSummary(value) {
   return redactDisplayText(parsed, 180);
 }
 
+// Bounds for the tool_result envelope extraction below: at most one
+// JSON-string decode of message.content, an explicit recursion depth for
+// unwrapping content-block shapes, an item cap for multi-result messages, and
+// a UTF-8 byte cap (with deterministic "...[truncated]" fallback) so a large
+// excerpt can never grow the rendered row past what one poll response could
+// ever contain.
+const TOOL_RESULT_MAX_DEPTH = 2;
+const TOOL_RESULT_MAX_ITEMS = 20;
+const TOOL_RESULT_DECODE_MAX_BYTES = 4000;
+const TOOL_RESULT_TEXT_MAX_BYTES = 8000;
+
+function boundedUtf8Slice(text, maxBytes) {
+  const source = String(text || "");
+  if (typeof TextEncoder === "undefined" || typeof TextDecoder === "undefined") {
+    return source.length > maxBytes ? source.slice(0, maxBytes) : source;
+  }
+  const encoded = new TextEncoder().encode(source);
+  if (encoded.length <= maxBytes) {
+    return source;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(encoded.slice(0, maxBytes));
+}
+
+function boundedToolResultText(text) {
+  const sliced = boundedUtf8Slice(text, TOOL_RESULT_TEXT_MAX_BYTES);
+  return sliced.length < text.length ? `${sliced}\n...[truncated]` : sliced;
+}
+
+// Redaction that preserves line breaks (unlike redactDisplayText/limitText,
+// which collapse whitespace) so a numbered source excerpt stays readable.
+function redactPreserveLines(value) {
+  const text = String(value === undefined || value === null ? "" : value).replace(
+    /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g,
+    " ",
+  );
+  return text
+    .replace(/\b(?:[A-Za-z]:)?\/(?:[\w .:@-]+\/){1,}[\w .:@-]+/g, "[path]")
+    .replace(/\b(?:sk|pk|ghp|github_pat|xox[baprs]|ya29|hf)_[A-Za-z0-9._-]{12,}\b/g, "[token]")
+    .replace(/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, "[token]");
+}
+
+// Unwraps a tool_result content payload. First-class: a string directly on
+// the item (the exact reported envelope). Also recognized: an array of
+// content blocks ({type:"text", text:...} or nested {content:...}), and the
+// legacy nested {content: {content: "..."}} shape -- one level only, not a
+// generic deep unwrap.
+function toolResultBlockText(content, depth = 0) {
+  if (depth > TOOL_RESULT_MAX_DEPTH) {
+    return "";
+  }
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .slice(0, TOOL_RESULT_MAX_ITEMS)
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+        if (item && typeof item === "object" && typeof item.text === "string") {
+          return item.text;
+        }
+        return toolResultBlockText(item && item.content, depth + 1);
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object" && typeof content.content === "string") {
+    return content.content;
+  }
+  return "";
+}
+
+// Claude CLI --output-format stream-json wraps a tool_result turn as
+// {type:"user", message:{role:"user", content:[{type:"tool_result", ...}]}}.
+// This renders the numbered source excerpt as the row's readable text
+// instead of falling through to a generic "Structured event: type, message"
+// summary, and never surfaces the outer envelope keys (type/message/role/
+// tool_use_id) in that display -- they remain visible only inside the
+// existing collapsed "Raw event" details.
+function toolResultEventFromUserMessage(event, rawLine) {
+  if (!event || typeof event !== "object" || event.type !== "user") {
+    return null;
+  }
+  const message = event.message && typeof event.message === "object" ? event.message : null;
+  if (!message || message.role !== "user") {
+    return null;
+  }
+  let content = message.content;
+  if (typeof content === "string") {
+    const candidate = boundedUtf8Slice(content.trim(), TOOL_RESULT_DECODE_MAX_BYTES);
+    if (!candidate || (candidate[0] !== "[" && candidate[0] !== "{")) {
+      return null;
+    }
+    try {
+      content = JSON.parse(candidate);
+    } catch (_error) {
+      return null;
+    }
+  }
+  if (!Array.isArray(content)) {
+    return null;
+  }
+  const texts = [];
+  for (const block of content.slice(0, TOOL_RESULT_MAX_ITEMS)) {
+    if (!block || typeof block !== "object" || block.type !== "tool_result") {
+      continue;
+    }
+    const text = toolResultBlockText(block.content);
+    if (text) {
+      texts.push(text);
+    }
+  }
+  if (!texts.length) {
+    return null;
+  }
+  return {
+    kind: "event",
+    title: texts.length > 1 ? `Tool result (${texts.length})` : "Tool result",
+    label: "tool result",
+    state: "completed",
+    message: redactPreserveLines(boundedToolResultText(texts.join("\n\n"))),
+    metrics: [],
+    raw: safeRawEvent(rawLine),
+  };
+}
+
 // Claude CLI --output-format stream-json wraps each provider-level SDK event
 // as {type:"stream_event", event:{type:"content_block_delta", delta:{...}}}.
 // delta.type "signature_delta" carries an opaque cryptographic signature over
@@ -1293,6 +1421,10 @@ function timelineEventFromObject(event, rawLine) {
       metrics: [],
       raw: safeRawEvent(rawLine),
     };
+  }
+  const toolResultEvent = toolResultEventFromUserMessage(event, rawLine);
+  if (toolResultEvent) {
+    return toolResultEvent;
   }
   const nestedResult = parseNestedJson(event.result);
   if (nestedResult && typeof nestedResult === "object" && !Array.isArray(nestedResult)) {

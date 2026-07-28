@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 CREATE TABLE IF NOT EXISTS callback_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
   origin_thread_id TEXT NOT NULL,
   transition TEXT NOT NULL,
   episode_id TEXT NOT NULL DEFAULT '0',
@@ -82,11 +83,12 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
+  recovery_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT NOT NULL DEFAULT '',
   lease_id TEXT NOT NULL DEFAULT '',
   lease_expires_at TEXT NOT NULL DEFAULT '',
   batch_id TEXT NOT NULL DEFAULT '',
-  UNIQUE(task_id, transition, origin_thread_id, episode_id, request_id)
+  UNIQUE(task_id, provider, origin_thread_id, episode_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_callback_outbox_state ON callback_outbox(state);

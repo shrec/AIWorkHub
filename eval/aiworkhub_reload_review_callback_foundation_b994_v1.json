@@ -1,0 +1,18 @@
+{
+  "schema_id": "aiworkhub.eval.v1",
+  "task_id": "CODEX_AIWORKHUB_RELOAD_REVIEW_CALLBACK_FOUNDATION_B994_V1",
+  "objective": "Preserve route-pending polling task creation and reconcile the complete canonical review backlog without replaying an already delivered implicit route episode.",
+  "evidence": {
+    "polling_only_route_pending": "tests/test_aiworkhub_reload_review_callback_foundation_b994.py::test_polling_only_route_pending_creation_persists_empty_origin",
+    "callback_required_fail_closed": "tests/test_aiworkhub_reload_review_callback_foundation_b994.py::test_callback_required_route_pending_still_fails_closed",
+    "multi_item_reconciliation": "tests/test_aiworkhub_reload_review_callback_foundation_b994.py::test_reconciliation_seeds_full_eligible_review_backlog_and_filters_rows",
+    "delivered_episode_dedup": "tests/test_aiworkhub_reload_review_callback_foundation_b994.py::test_implicit_origin_does_not_recreate_delivered_episode",
+    "reload_retarget_regression": "tests/test_aiworkhub_callback_review_replay_b962.py::test_seed_missing_review_callbacks_can_retarget_verified_reloaded_route",
+    "terminal_dedup_regression": "tests/test_aiworkhub_terminal_callback_outbox_final_b985.py"
+  },
+  "validation": [
+    "python3 -m pytest -q -p no:cacheprovider tests/test_aiworkhub_reload_review_callback_foundation_b994.py tests/test_aiworkhub_manager_ai_tools.py tests/test_aiworkhub_callback_review_replay_b962.py tests/test_aiworkhub_terminal_callback_outbox_final_b985.py tests/test_callback_bridge.py",
+    "python3 -m json.tool eval/aiworkhub_reload_review_callback_foundation_b994_v1.json",
+    "git diff --check"
+  ]
+}

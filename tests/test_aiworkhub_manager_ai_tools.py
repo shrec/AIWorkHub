@@ -341,7 +341,7 @@ def test_task_create_callback_required_waits_for_real_origin_thread(tmp_path, mo
     assert result["stderr"] == "callback_route_pending:codex_thread_id_not_observed"
 
 
-def test_task_create_can_create_polling_only_card_from_route_pending_manager(tmp_path, monkeypatch):
+def test_task_create_polling_only_succeeds_while_route_is_pending(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     assert task_store.initialize_repository(root)["ok"]
@@ -369,12 +369,13 @@ def test_task_create_can_create_polling_only_card_from_route_pending_manager(tmp
         callback_required=False,
     )
 
-    assert result["ok"] is True, result
+    assert result["ok"] is True
     card = json.loads(result["stdout"])
     assert card["origin_thread_id"] == ""
-    assert card["callback_required"] is False
     assert card["callback_supported"] is False
+    assert card["callback_required"] is False
     assert card["manager_route_state"] == "route_pending"
+    assert task_store.get_task(root, "TASK_POLLING_ONLY")["origin_thread_id"] == ""
 
 
 def test_codex_shared_repo_route_manager_identity_without_window_env(tmp_path, monkeypatch):

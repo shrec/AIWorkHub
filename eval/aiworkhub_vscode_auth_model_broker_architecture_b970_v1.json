@@ -1,0 +1,198 @@
+{
+  "schema_id": "aiworkhub.vscode_auth_model_broker.architecture.v1",
+  "task_id": "CODEX_AIWORKHUB_VSCODE_AUTH_MODEL_BROKER_ARCHITECTURE_B970_V1",
+  "status": "implementation_ready_contract",
+  "decision": {
+    "adapter": "vscode_lm",
+    "primary_path": "direct vscode.lm Language Model API in the active window extension host",
+    "discovery": "vscode.lm.selectChatModels called only downstream of explicit user Start, Retry, or new-task action",
+    "requests": "LanguageModelChat.sendRequest called only in that explicitly initiated bounded episode",
+    "change_events": {
+      "onDidChangeChatModels": "invalidate catalog, cancel or degrade affected requests, and update sanitized UI only; never discover or request in background",
+      "languageModelAccessInformation.onDidChange": "invalidate access state, cancel or degrade affected requests, and update sanitized UI only; never discover or request in background",
+      "consent_rule": "canSendRequest !== true means access_not_granted"
+    },
+    "mcp_sampling": "comparison only; never an inference, authentication, or fallback path"
+  },
+  "authentication": {
+    "exclusive_authority": "active VS Code/Copilot session in the exact window",
+    "forbidden": [
+      "provider API keys",
+      "Claude OAuth",
+      "GLM credential files",
+      "DeepSeek BYOK files",
+      "Codex CLI login",
+      "VS Code authentication token extraction",
+      "credential refresh, storage, copying, logging, or transport"
+    ]
+  },
+  "model_selection": {
+    "aliases": ["claude", "glm-5.2", "deepseek", "codex", "gpt"],
+    "truth_source": "models actually returned by fresh selectChatModels discovery in the current window",
+    "required": [
+      "match returned model metadata and required capabilities",
+      "record returned model identity",
+      "never infer availability from configured provider name",
+      "never silently substitute a family or model"
+    ],
+    "degraded_reasons": [
+      "model_unavailable",
+      "capability_missing",
+      "access_not_granted",
+      "api_unsupported"
+    ]
+  },
+  "isolation": {
+    "scope": ["window_instance", "repository", "isolated_workspace", "task", "request", "episode"],
+    "transport": "connected stdio or anonymous inherited pipes; alternatively a random owner-only per-task OS endpoint unlinked on close",
+    "forbidden": ["global ports", "fixed sockets", "shared mutable routes", "discovery files", "cross-repository channels"],
+    "bindings": [
+      "protocol_version",
+      "window_instance_nonce",
+      "repository_identity",
+      "canonical_workspace_identity",
+      "task_id",
+      "task_mcp_receipt_digest",
+      "request_id",
+      "episode_id",
+      "correlation_id",
+      "monotonic_sequence"
+    ],
+    "mismatch_terminal": "isolation_violation",
+    "secrets_in_payloads": false
+  },
+  "agent_loop": {
+    "tool_surface": "injected AIWorkHub worker MCP only",
+    "preserved_receipts": [
+      "Task MCP identity",
+      "project-context acknowledgement",
+      "Source Graph",
+      "session identity",
+      "AI Memory",
+      "KB",
+      "allowed-write and validation evidence",
+      "callback truth",
+      "manager review gate"
+    ],
+    "workspace_rule": "canonical paths must remain inside the isolated allowed workspace and allowed_writes",
+    "budgets": {
+      "max_model_turns": 12,
+      "max_tool_calls": 32,
+      "wall_seconds": 600,
+      "model_request_seconds": 60,
+      "tool_call_seconds": 30,
+      "max_stream_bytes": 1048576,
+      "max_tool_result_bytes": 262144
+    }
+  },
+  "runtime": {
+    "messages": ["hello", "catalog", "request_start", "stream_chunk", "tool_call", "tool_result", "cancel", "flow_credit", "terminal", "shutdown"],
+    "streaming": "ordered correlated chunks with finite flow credit and bounded queues",
+    "cancellation_sources": ["user", "task", "window disposal", "repository removal", "affected catalog/access invalidation", "timeout", "protocol loss", "extension shutdown"],
+    "retry": "bounded transient-only retry inside the explicit episode, within deadline and only before non-idempotent tool effects",
+    "terminal_exactly_once": true,
+    "terminal_substatuses": [
+      "completed",
+      "cancelled_by_user",
+      "deadline_exceeded",
+      "turn_budget_exhausted",
+      "tool_budget_exhausted",
+      "model_unavailable",
+      "capability_missing",
+      "access_not_granted",
+      "circuit_open",
+      "model_error",
+      "tool_error",
+      "protocol_error",
+      "isolation_violation",
+      "extension_shutdown"
+    ],
+    "shutdown": "stop starts, cancel owned requests, bounded terminal delivery, close owned channels, dispose listeners, clear window-local memory"
+  },
+  "circuit_breaker": {
+    "key": ["window_instance", "returned_model_id"],
+    "open_rule": "configured consecutive classified transient failures",
+    "while_open": "remains open until explicit user Retry or new-task action starts one fresh bounded recovery episode",
+    "recovery": "fresh discovery and access verification in that explicit episode; only a successful model response closes the circuit; failure leaves it open",
+    "automatic_half_open_probe": false,
+    "timer_based_request": false,
+    "polling_reset": false,
+    "inventory_generation_reset": false,
+    "background_event_quota_use": false,
+    "background_event_attempt_reset": false
+  },
+  "failure_safety": {
+    "dashboard": "responsive with exact sanitized degraded capability",
+    "never": [
+      "launch provider CLI",
+      "mutate another extension",
+      "reload or kill VS Code",
+      "read or fall back to credential files",
+      "fall back to BYOK, OAuth, MCP Sampling, legacy adapter, or another model"
+    ]
+  },
+  "migration": [
+    "Introduce vscode_lm behind the adapter boundary with protocol negotiation and feature flag.",
+    "Keep claude_cli, codex_cli, deepseek_copilot_cli, and glm_copilot_cli names parseable only for deprecation and alias mapping; never execute them.",
+    "Canary vscode_lm, then make it default; unavailable aliases degrade without fallback.",
+    "Remove provider-specific automatic adapters after the compatibility window; historical records remain readable and retry creates a new vscode_lm episode."
+  ],
+  "threats": [
+    "cross-window or cross-repository route confusion",
+    "stale catalog or access reuse",
+    "forged correlation or replay",
+    "prompt/tool injection",
+    "path or symlink escape",
+    "secret/error exfiltration",
+    "unbounded output/backpressure failure",
+    "cancellation and shutdown races"
+  ],
+  "isolation_matrix": [
+    {"case": "A/repoA and B/repoB", "expected": "separate channels, catalogs, access, circuits, requests, and workspaces"},
+    {"case": "same repo in A and B", "expected": "distinct window nonces and no shared mutable state"},
+    {"case": "A envelope on B channel", "expected": "isolation_violation before discovery, request, or tool"},
+    {"case": "model/access event in A", "expected": "invalidate/cancel/degrade A only; zero background selectChatModels or sendRequest; B unchanged"},
+    {"case": "A circuit open", "expected": "only explicit Retry/new task in A starts one recovery episode; B unaffected"},
+    {"case": "A shutdown while B streams", "expected": "A cancels and closes; B continues"}
+  ],
+  "tests": {
+    "mocked_extension": [
+      "returned-model-only alias selection and no substitution",
+      "canSendRequest non-true denial",
+      "change handlers call neither selectChatModels nor sendRequest",
+      "explicit-action discovery and request",
+      "stream order, backpressure, cancellation, timeout, terminal once",
+      "manual-only open-circuit recovery with no timer, poll, inventory, or event reset",
+      "two-window isolation, shutdown, sanitization, and zero forbidden fallback"
+    ],
+    "python_protocol": [
+      "handshake bindings, framing, sequence, correlation, and replay",
+      "two-repository isolation and canonical allowed-path/symlink checks",
+      "receipt preservation and MCP tool allowlisting",
+      "turn, tool, time, result-size, and flow budgets",
+      "cancellation races, retry side-effect safety, terminal truth, and manager review gate"
+    ],
+    "manual_canary": "Two windows and a disposable repository using synthetic non-secret identifiers; record metadata only; explicitly start, revoke/alter access, verify no background request, manually recover open circuit, cancel/close one window, and verify the other is unaffected."
+  },
+  "subsequent_files": {
+    "production": [
+      "vscode-extension/src/modelBroker/vscodeLmAdapter.ts",
+      "vscode-extension/src/modelBroker/catalog.ts",
+      "vscode-extension/src/modelBroker/brokerProtocol.ts",
+      "vscode-extension/src/modelBroker/requestController.ts",
+      "vscode-extension/src/modelBroker/circuitBreaker.ts",
+      "vscode-extension/src/modelBroker/extensionLifecycle.ts",
+      "aiworkhub/vscode_lm_adapter.py",
+      "aiworkhub/vscode_lm_protocol.py",
+      "existing extension activation, worker launcher, task supervisor, and adapter registry files resolved by Source Graph"
+    ],
+    "tests": [
+      "vscode-extension/src/test/modelBroker/*.test.ts",
+      "tests/test_vscode_lm_protocol.py",
+      "tests/test_vscode_lm_adapter.py",
+      "tests/test_vscode_lm_isolation.py"
+    ]
+  },
+  "vscode_api_gate": "Pin and verify official vscode.d.ts for selectChatModels, onDidChangeChatModels, LanguageModelChat.sendRequest, streaming, cancellation, and LanguageModelAccessInformation. Proposed APIs require matching Insiders/proposal declarations; absence degrades and never permits fabricated availability or polling.",
+  "review_gate": "stop at verified Codex review"
+}

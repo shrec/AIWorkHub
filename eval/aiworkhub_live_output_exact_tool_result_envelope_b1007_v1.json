@@ -1,0 +1,62 @@
+{
+  "task_id": "CLAUDE_SONNET_AIWORKHUB_LIVE_OUTPUT_EXACT_TOOL_RESULT_ENVELOPE_B1007_V1",
+  "topic": "task_mcp",
+  "objective": "Correct the Live Output timeline renderer for the exact reported MCP tool_result envelope, with bounded normalization and regression coverage.",
+  "reported_fixture": {
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "tool_bfd9f3aaaaaaaaaaaaaaaaaaaayv",
+          "type": "tool_result",
+          "content": "1330\t acknowledged_turn_id = current_turn_id\n1331\t session.mark_acknowledged()"
+        }
+      ]
+    }
+  },
+  "prior_behavior": "timelineEventFromObject had no case for a top-level {type:'user', message:{role:'user', content:[...]}} envelope. It fell through to the generic path, where resultTextFrom found no string fields (message.content is an array, not a string) and jsonSummary(event) rendered only 'Structured event: type, message' -- the numbered source excerpt never reached the readable display.",
+  "fix": {
+    "file": "vscode-extension/media/app.js",
+    "added": [
+      "boundedUtf8Slice(text, maxBytes) -- deterministic UTF-8 byte-bounded slice",
+      "boundedToolResultText(text) -- applies TOOL_RESULT_TEXT_MAX_BYTES with a '...[truncated]' fallback marker",
+      "redactPreserveLines(value) -- strips control chars but preserves newline/carriage-return/tab (unlike redactDisplayText, which collapses whitespace), then applies the existing path/token redaction regexes",
+      "toolResultBlockText(content, depth) -- unwraps a tool_result content payload: string first-class, content-block arrays ({type:'text', text}), and the legacy nested {content:{content:'...'}} shape one level deep only, bounded by TOOL_RESULT_MAX_DEPTH and TOOL_RESULT_MAX_ITEMS",
+      "toolResultEventFromUserMessage(event, rawLine) -- recognizes the {type:'user', message:{role:'user', content:[...]}} envelope, performs at most one bounded JSON-string decode when message.content itself arrives as a JSON string (gated by TOOL_RESULT_DECODE_MAX_BYTES), extracts every tool_result block's text, and renders a single 'Tool result' (or 'Tool result (N)' for multiple) row whose message is the excerpt itself -- never the outer type/message/role/tool_use_id keys"
+    ],
+    "wired_into": "timelineEventFromObject, called immediately after the existing claudeStreamContentBlockDelta handling and before the generic nestedResult/jsonSummary fallback, so all previously passing shapes (assistant/stream/tool/error/ANSI/order/truncation, signature_delta suppression) are unaffected"
+  },
+  "acceptance_checklist": {
+    "exact_fixture_renders_as_readable_text": true,
+    "direct_content_on_tool_result_item_first_class": true,
+    "content_block_arrays_supported": true,
+    "legacy_nested_tool_result_content_supported_explicitly": true,
+    "outer_envelope_keys_omitted_from_display": true,
+    "string_branch_reachable_before_object_array_checks": true,
+    "at_most_one_bounded_json_string_decode": true,
+    "explicit_depth_byte_and_item_caps_with_deterministic_truncation": true,
+    "no_innerHTML_for_tool_content": true,
+    "existing_redaction_and_dom_text_escaping_preserved": true,
+    "injection_shaped_content_inert": true,
+    "existing_assistant_stream_tool_error_ansi_order_truncation_behavior_preserved": true
+  },
+  "validation": [
+    "node --check vscode-extension/media/app.js",
+    "node vscode-extension/test/live-output-formatting.test.js",
+    "npm test --prefix vscode-extension",
+    "python3 -m json.tool eval/aiworkhub_live_output_exact_tool_result_envelope_b1007_v1.json",
+    "git diff --check"
+  ],
+  "regression_cases_added_to_test": [
+    "exact_fixture_direct_content",
+    "content_block_array",
+    "legacy_nested_content",
+    "malformed_missing_content",
+    "oversized_truncation",
+    "multi_result",
+    "json_string_decode",
+    "redaction_preserved",
+    "injection_shaped_content_inert"
+  ]
+}

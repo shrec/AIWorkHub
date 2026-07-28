@@ -1,0 +1,23 @@
+{
+  "schema_id": "aiworkhub.callback_contract_reconciliation.eval.v1",
+  "task_id": "CODEX_AIWORKHUB_CALLBACK_CONTRACT_RECONCILIATION_B996_V1",
+  "dependencies": [
+    "B985",
+    "B994"
+  ],
+  "contracts": {
+    "direct_unknown_transition": "rejected",
+    "reconciled_unknown_review_substatus": "review_ready",
+    "polling_only_route_pending": "persisted_without_origin",
+    "callback_required_route_pending": "fails_closed",
+    "dependency_blocked": "one_pending_blocked_callback_per_route_episode"
+  },
+  "focused_validation": [
+    "tests/test_aiworkhub_callback_contract_reconciliation_b996.py",
+    "tests/test_aiworkhub_callback_review_replay_b962.py",
+    "tests/test_aiworkhub_dependency_autolaunch_b905_v7.py",
+    "tests/test_aiworkhub_manager_ai_tools.py",
+    "tests/test_aiworkhub_reload_review_callback_foundation_b994.py",
+    "tests/test_aiworkhub_terminal_callback_outbox_final_b985.py"
+  ]
+}

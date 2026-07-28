@@ -182,41 +182,34 @@ def mark_terminal_review(
     callback_enqueued = False
     if ok:
         card = task_store.get_task(repo, task_id) or {}
-        if bool(card.get("callback_required", True)):
+        # Callback delivery is a lifecycle invariant, not a per-card option:
+        # every task that entered review gets an outbox row.  The terminal
+        # substatus only determines the compact payload state.
+        try:
+            _readiness, db_path = task_store._require_ready(repo)
+            conn = task_store._connect(db_path)
             try:
-                _readiness, db_path = task_store._require_ready(repo)
-                conn = task_store._connect(db_path)
-                try:
-                    callback_store.init_db(conn)
-                    origin_thread_id = (
-                        callback_store.read_origin_thread(conn, task_id)
-                        or str(card.get("origin_thread_id") or "").strip()
-                    )
-                    provider = str(card.get("coordinator_provider") or "").strip().lower()
-                    # B917: derive the callback transition from the SAME
-                    # authoritative substatus just recorded in
-                    # card["terminal_substatus"] -- never a hardcoded
-                    # "review_ready" literal, which previously made the
-                    # emitted callback lie about a validation_failed (or any
-                    # other non-success) terminal outcome. Falls back to
-                    # "review_ready" only for a substatus with no explicit
-                    # failure-class mapping (e.g. a plain successful "exited"),
-                    # preserving prior behavior for those.
-                    transition = callback_store.resolve_callback_transition(substatus)
-                    callback_enqueued = callback_store.enqueue_callback(
-                        conn,
-                        task_id,
-                        origin_thread_id,
-                        transition,
-                        provider=provider,
-                        episode_id=str(card.get("claim_epoch") or 0),
-                        request_id=str((evidence or {}).get("request_id") or ""),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-            except task_store.TaskStoreError:
-                callback_enqueued = False
+                callback_store.init_db(conn)
+                origin_thread_id = (
+                    callback_store.read_origin_thread(conn, task_id)
+                    or str(card.get("origin_thread_id") or "").strip()
+                )
+                provider = str(card.get("coordinator_provider") or "").strip().lower()
+                transition = callback_store.resolve_callback_transition(substatus)
+                callback_enqueued = callback_store.enqueue_callback(
+                    conn,
+                    task_id,
+                    origin_thread_id,
+                    transition,
+                    provider=provider,
+                    episode_id=str(card.get("claim_epoch") or 0),
+                    request_id=str((evidence or {}).get("request_id") or ""),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except task_store.TaskStoreError:
+            callback_enqueued = False
     return {
         "ok": ok,
         "returncode": 0 if ok else 1,

@@ -216,10 +216,14 @@ def sanitized_env(
         safe.update({str(key): str(value) for key, value in provider_env.items()})
     return safe
 
-# Failure workspaces remain available through coordinator review. They become
-# GC candidates only after the canonical task is finished/archived.
+# Failure workspaces remain available through coordinator review.  Once a
+# coordinator has disposed that exact attempt (finished/archived, returned it
+# to pending, or moved it to blocked), the retained workspace is no longer the
+# authoritative review surface and is safe to collect.  While a card is in
+# review, only the request_id named by terminal_review remains authoritative;
+# older retained attempts for the same card are superseded and collectable.
 GC_CANDIDATE_PROCESS_STATES = TERMINAL_PROCESS_STATES - {"blocked"}
-GC_ELIGIBLE_CANONICAL_STATUSES = {"finished", "archived"}
+GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "pending", "blocked"}
 
 
 # --- B412: token-free liveness contract -------------------------------------
@@ -2924,6 +2928,37 @@ class ProcessManager:
                 skipped += 1
         return {"gc_scanned": scanned, "gc_cleaned": cleaned, "gc_skipped": skipped}
 
+    @staticmethod
+    def _gc_disposition(card: dict[str, Any], request_id: str) -> tuple[bool, str]:
+        """Return whether ``request_id`` is no longer a live review surface.
+
+        This deliberately fails closed for processing cards and malformed
+        review authority.  A review card may have many historical retained
+        worker attempts, but its canonical ``terminal_review`` names exactly
+        one current request; only older, different request ids are collected.
+        """
+        canonical_status = _canonical_task_status(card)
+        if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
+            return True, f"disposed_task_status:{canonical_status}"
+        if canonical_status != "review":
+            return False, f"task_not_disposed:{canonical_status}"
+
+        terminal_review = card.get("terminal_review")
+        if not isinstance(terminal_review, dict):
+            return False, "review_request_identity_missing"
+        evidence = terminal_review.get("evidence")
+        if not isinstance(evidence, dict):
+            return False, "review_request_identity_missing"
+        identity = evidence.get("request_identity")
+        if not isinstance(identity, dict):
+            return False, "review_request_identity_missing"
+        current_request_id = str(identity.get("request_id") or "").strip()
+        if not current_request_id:
+            return False, "review_request_identity_missing"
+        if current_request_id == request_id:
+            return False, "current_review_request"
+        return True, f"superseded_review_request:{current_request_id}"
+
     def _gc_finalized_workspace(
         self, request_id: str, event: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -2976,12 +3011,12 @@ class ProcessManager:
                     "gc": False,
                     "reason": f"task_lookup_failed:{exc}"[:200],
                 }
-            canonical_status = _canonical_task_status(card)
-            if canonical_status not in GC_ELIGIBLE_CANONICAL_STATUSES:
+            eligible, disposition = self._gc_disposition(card, request_id)
+            if not eligible:
                 return {
                     "request_id": request_id,
                     "gc": False,
-                    "reason": f"task_not_finalized:{canonical_status}",
+                    "reason": disposition,
                 }
 
             pid = int(latest.get("pid") or 0)
@@ -3015,9 +3050,9 @@ class ProcessManager:
                 "workspace_retained": False,
                 "workspace_gc": True,
                 "workspace_gc_at": _utcnow(),
-                "workspace_gc_reason": f"finalized_task_status:{canonical_status}",
+                "workspace_gc_reason": disposition,
             })
-            return {"request_id": request_id, "gc": True, "reason": canonical_status}
+            return {"request_id": request_id, "gc": True, "reason": disposition}
 
     def _finalize_isolated_request(
         self,

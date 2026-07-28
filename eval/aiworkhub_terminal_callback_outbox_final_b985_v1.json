@@ -1,0 +1,32 @@
+{
+  "schema_id": "aiworkhub.task_eval.v1",
+  "task_id": "CODEX_AIWORKHUB_TERMINAL_CALLBACK_OUTBOX_FINAL_B985_V1",
+  "runner": "codex_aiworkhub_terminal_callback_outbox_final_b985_v1",
+  "scope": {
+    "allowed_writes": [
+      "src/aiworkhub/task_engine.py",
+      "src/aiworkhub/callback_store.py",
+      "tests/test_aiworkhub_terminal_callback_outbox_final_b985.py",
+      "eval/aiworkhub_terminal_callback_outbox_final_b985_v1.json"
+    ]
+  },
+  "evidence": {
+    "source_graph": {
+      "mode": "focus",
+      "query": "task",
+      "budget": 48,
+      "bundle_type": "explore",
+      "target_omitted": true,
+      "authority_state": "sole_authority"
+    },
+    "session_topic": "Accept terminal callback outbox core for 0.6.64",
+    "ai_memory_query": "Accept terminal callback outbox core for 0.6.64 task_mcp",
+    "kb_query": "Accept terminal callback outbox core for 0.6.64 task_mcp"
+  },
+  "validation": [
+    "python3 -m pytest -q -p no:cacheprovider tests/test_aiworkhub_terminal_callback_outbox_final_b985.py tests/test_task_engine.py tests/test_aiworkhub_manager_ai_tools.py",
+    "python3 -m json.tool eval/aiworkhub_terminal_callback_outbox_final_b985_v1.json",
+    "git diff --check"
+  ],
+  "full_suite_owner": "manager"
+}

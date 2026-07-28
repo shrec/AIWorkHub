@@ -275,4 +275,112 @@ function lines(...events) {
   assert(rendered.indexOf("verdict: pass") < rendered.indexOf("thinking out loud"), "newest event renders first");
 }
 
+{
+  // B1007: the exact reported envelope -- {type:"user", message:{role:"user",
+  // content:[{tool_use_id, type:"tool_result", content:<string>}]}} -- with
+  // content directly on the tool_result item (first-class, no decode needed).
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_bfd9f3aaaaaaaaaaaaaaaaaaaayv", type: "tool_result", content: "1330\t acknowledged_turn_id = current_turn_id\n1331\t session.mark_acknowledged()" }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].kind, "event");
+  assert.strictEqual(events[0].title, "Tool result");
+  assert(events[0].message.includes("1330\t acknowledged_turn_id = current_turn_id"));
+  assert(events[0].message.includes("1331\t session.mark_acknowledged()"));
+  assert(!events[0].message.includes("tool_use_id"));
+  assert(!events[0].message.includes("\"role\""));
+  assert(!JSON.stringify({ title: events[0].title, label: events[0].label, message: events[0].message }).includes("tool_result"));
+}
+
+{
+  // Content-block array form: tool_result.content is an array of blocks.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_02", type: "tool_result", content: [{ type: "text", text: "line one\nline two" }] }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.includes("line one"));
+  assert(events[0].message.includes("line two"));
+}
+
+{
+  // Legacy nested tool_result.content form -- recognized one level deep only.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_03", type: "tool_result", content: { content: "legacy nested body" } }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.includes("legacy nested body"));
+}
+
+{
+  // Malformed: no recognizable content -- degrades to the existing generic
+  // fallback instead of throwing.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_04", type: "tool_result" }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].kind, "event");
+}
+
+{
+  // Oversized: deterministic bounded truncation, never the full raw text.
+  const big = "x".repeat(20000);
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_05", type: "tool_result", content: big }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.length < big.length);
+  assert(events[0].message.includes("...[truncated]"));
+}
+
+{
+  // Multi-result: more than one tool_result block in the same content array.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [
+      { tool_use_id: "tool_06a", type: "tool_result", content: "first result body" },
+      { tool_use_id: "tool_06b", type: "tool_result", content: "second result body" },
+    ] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.includes("first result body"));
+  assert(events[0].message.includes("second result body"));
+  assert.strictEqual(events[0].title, "Tool result (2)");
+}
+
+{
+  // JSON-string form: message.content itself arrives as a JSON-encoded
+  // string (one bounded decode) rather than a native array.
+  const encoded = JSON.stringify([{ tool_use_id: "tool_07", type: "tool_result", content: "decoded from json string" }]);
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: encoded } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.includes("decoded from json string"));
+}
+
+{
+  // Existing redaction still applies to tool_result excerpt text.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_08", type: "tool_result", content: "read /tmp/worktree/secret/keys.txt token sk_test_abcdefghijklmnopqrstuvwxyz" }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(!events[0].message.includes("/tmp/worktree"));
+  assert(!events[0].message.includes("sk_test"));
+}
+
+{
+  // Injection-shaped content stays inert: never innerHTML, always textContent.
+  const events = api.timelineEventsFromText(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_09", type: "tool_result", content: "<img src=x onerror=alert(1)> <script>alert(2)</script>" }] } },
+  ));
+  assert.strictEqual(events.length, 1);
+  assert(events[0].message.includes("<img"));
+  assert(events[0].message.includes("<script>"));
+
+  api.renderFormattedLiveOutput(lines(
+    { type: "user", message: { role: "user", content: [{ tool_use_id: "tool_09b", type: "tool_result", content: "<img src=x onerror=alert(1)>" }] } },
+  ));
+  const container = document.querySelector("#detail-live-output-container");
+  assert(container.textContent.includes("<img src=x"));
+}
+
 console.log("live-output-formatting.test.js: ok");

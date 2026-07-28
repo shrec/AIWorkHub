@@ -1,0 +1,103 @@
+{
+  "schema_id": "aiworkhub.storage_observability_cleanup.architecture_evidence.v1",
+  "task_id": "CODEX_AIWORKHUB_STORAGE_OBSERVABILITY_CLEANUP_ARCHITECTURE_B1002_V1",
+  "artifact": "docs/storage-observability-and-cleanup-design.md",
+  "implementation_status": "design_only",
+  "automatic_cleanup_default": "off",
+  "scope": {
+    "local_only": true,
+    "scopes": ["repo_local", "window_local", "shared_aiworkhub_owned"],
+    "excluded_assumptions": ["team_collaboration", "rbac", "cloud_services", "telemetry_upload", "external_accounts"]
+  },
+  "coverage": {
+    "inventory_categories": [
+      "task_databases",
+      "callback_data",
+      "source_graph_indexes",
+      "isolated_and_retained_worktrees",
+      "process_logs",
+      "runtime_caches",
+      "session_memory_kb_stores",
+      "generated_artifacts",
+      "extension_runtime_and_vsix_caches",
+      "stale_route_records",
+      "platform_temporary_data",
+      "quarantine"
+    ],
+    "labels": ["Stable", "Active", "Reclaimable", "Protected"],
+    "dashboard_fields": [
+      "total_bytes",
+      "reclaimable_bytes",
+      "category_bars",
+      "file_counts",
+      "oldest_timestamp",
+      "newest_timestamp",
+      "repo_global_split",
+      "scan_timestamp"
+    ],
+    "platform_rules": ["windows_drive_case_unc_reparse", "macos_case_unicode_symlink", "linux_symlink_mount_identity"],
+    "safety": [
+      "verified_owned_roots_only",
+      "fail_closed_on_ambiguity",
+      "preview_first",
+      "category_selective",
+      "explicit_confirmation",
+      "bounded_and_auditable",
+      "quarantine_or_trash_where_practical",
+      "per_item_revalidation",
+      "no_double_counting"
+    ],
+    "protected": [
+      "canonical_task_queue",
+      "active_or_review_callback_authority",
+      "credentials_and_tokens",
+      "accepted_evidence_under_retention",
+      "active_worker_workspaces",
+      "live_process_logs",
+      "current_source_graph_authority",
+      "current_vsix_and_runtime",
+      "foreign_repositories",
+      "other_plugins"
+    ],
+    "operability": [
+      "no_model_cost_incremental_scanner",
+      "bounded_paginated_api",
+      "refresh_and_degraded_states",
+      "progress_and_cancellation",
+      "audit_events",
+      "before_after_byte_evidence",
+      "race_and_crash_recovery"
+    ],
+    "deliverables": [
+      "ui_wireframe",
+      "data_contract_and_api",
+      "threat_model",
+      "test_matrix",
+      "rollout_plan",
+      "implementation_decomposition"
+    ]
+  },
+  "retention_defaults": {
+    "terminal_runs_per_task": 10,
+    "extension_runtime_versions": 3,
+    "minimum_age_days": 14,
+    "accepted_evidence_minimum_age_days": 30,
+    "cache_cap_gib": 5,
+    "quarantine_undo_days": 7,
+    "scheduled_cleanup": "separate_opt_in_off_by_default",
+    "stale_lease_proof": ["expired_with_clock_margin", "pid_and_start_token_absent", "heartbeat_absent", "no_live_owner", "second_check_after_grace"]
+  },
+  "validation_commands": [
+    "python3 -m json.tool eval/aiworkhub_storage_observability_cleanup_architecture_b1002_v1.json",
+    "git diff --check"
+  ],
+  "acceptance_mapping": {
+    "inventory_and_classification": "Authoritative owned-root inventory",
+    "dashboard_view": "Scanner and dashboard",
+    "cross_platform_and_deduplication": "Classification and no-double-counting; Cross-platform filesystem rules",
+    "cleanup_safety": "Safety contract; Cleanup transaction and retention",
+    "retention": "Cleanup transaction and retention",
+    "scanner_api_audit": "Scanner and dashboard; API and data contract; Cleanup transaction and retention",
+    "wireframe_threat_tests_rollout": "Scanner and dashboard; Threat model; Test matrix; Rollout and implementation decomposition"
+  }
+}

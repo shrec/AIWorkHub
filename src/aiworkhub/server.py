@@ -338,14 +338,14 @@ def aiworkhub_task_create(
     required_outputs: list[str] | None = None,
     validation: list[str] | None = None,
     priority: str = "normal",
-    callback_required: bool = True,
     task_type: str = "code",
     depends_on: list[str] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
     The live manager session supplies callback provider/origin identity;
-    callers cannot route a task into another chat or overwrite an existing id.
+    callers cannot route a task into another chat, disable the mandatory
+    review callback, or overwrite an existing id.
     ``depends_on`` (optional) names other task_ids in this repo that must
     finish before this card is Plan-DAG ready; omit it for the pre-DAG
     behavior.
@@ -363,7 +363,6 @@ def aiworkhub_task_create(
         required_outputs=required_outputs,
         validation=validation,
         priority=priority,
-        callback_required=callback_required,
         task_type=task_type,
         depends_on=depends_on,
     )

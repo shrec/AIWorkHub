@@ -9,7 +9,17 @@ import pytest
 from aiworkhub import callback_store, task_engine, task_store
 
 
-@pytest.mark.parametrize("substatus", ["review_ready", "validation_failed"])
+@pytest.mark.parametrize(
+    "substatus",
+    [
+        "review_ready",
+        "validation_failed",
+        "scope_rejected",
+        "launch_failed",
+        "cancelled",
+        "process_lost",
+    ],
+)
 def test_repeated_terminal_transition_enqueues_once_per_launch_episode(
     tmp_path: Path, monkeypatch, substatus: str,
 ) -> None:
@@ -87,14 +97,84 @@ def test_repeated_terminal_transition_enqueues_once_per_launch_episode(
             "SELECT transition, episode_id, request_id, state FROM callback_outbox "
             "WHERE task_id=? ORDER BY outbox_id", (task_id,)
         ).fetchall()
+        expected = callback_store.resolve_callback_transition(substatus)
         assert [dict(row) for row in rows] == [
-            {"transition": substatus, "episode_id": "1", "request_id": "request-1", "state": "delivered"},
-            {"transition": substatus, "episode_id": "2", "request_id": "request-2", "state": "pending"},
+            {"transition": expected, "episode_id": "1", "request_id": "request-1", "state": "delivered"},
+            {"transition": expected, "episode_id": "2", "request_id": "request-2", "state": "pending"},
         ]
         assert callback_store.enqueue_callback(
             conn, task_id, origin, substatus, provider="codex",
             episode_id="2", request_id="request-2",
         ) is False
+    finally:
+        conn.close()
+
+
+def test_legacy_callback_required_false_cannot_suppress_review_wake(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    readiness = task_store.storage_readiness(repo)
+    task_id = "CALLBACK_FALSE_MUST_STILL_WAKE_B962"
+    runner = "legacy_worker"
+    origin = str(uuid.uuid4())
+    now = callback_store.utc_now()
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "task_mcp",
+        "callback_required": False,
+        "coordinator_provider": "codex",
+        "origin_thread_id": origin,
+    }
+    conn = callback_store.open_db(Path(readiness.canonical_db))
+    try:
+        callback_store.init_db(conn)
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,topic,status,worker_status,card_json,created_at,updated_at,origin_thread_id) "
+            "VALUES(?,?,?,'processing','processing',?,?,?,?)",
+            (task_id, runner, "task_mcp", json.dumps(card), now, now, origin),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_engine.mark_terminal_review(
+        repo, task_id, runner, "validation_failed", evidence={}
+    )
+    assert result["ok"] is True
+    assert result["callback_enqueued"] is True
+
+
+def test_review_repair_ignores_worker_substatus_and_legacy_opt_out(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    readiness = task_store.storage_readiness(repo)
+    task_id = "CALLBACK_ANY_REVIEW_ROW_B962"
+    origin = str(uuid.uuid4())
+    now = callback_store.utc_now()
+    card = {
+        "task_id": task_id,
+        "callback_required": False,
+        "coordinator_provider": "codex",
+        "origin_thread_id": origin,
+        "terminal_substatus": "brand_new_failure_kind",
+    }
+    conn = callback_store.open_db(Path(readiness.canonical_db))
+    try:
+        callback_store.init_db(conn)
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,topic,status,worker_status,card_json,created_at,updated_at,origin_thread_id) "
+            "VALUES(?,?,?,'review','brand_new_failure_kind',?,?,?,?)",
+            (task_id, "worker", "task_mcp", json.dumps(card), now, now, origin),
+        )
+        conn.commit()
+        assert callback_store.seed_missing_review_callbacks(conn, provider="codex") == 1
+        row = conn.execute(
+            "SELECT transition,state FROM callback_outbox WHERE task_id=?", (task_id,)
+        ).fetchone()
+        assert dict(row) == {"transition": "review_ready", "state": "pending"}
     finally:
         conn.close()
 

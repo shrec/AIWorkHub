@@ -223,8 +223,8 @@ def test_full_wire_sequence_via_app_server_client():
         thread_id = f"thread-{uuid.uuid4()}"
         client.thread_resume(thread_id)
         result = client.turn_start(thread_id, "hello", cwd="/tmp")
-        assert result.get("method") == "turn/completed"
-        assert result.get("params", {}).get("threadId") == thread_id
+        assert result.get("result", {}).get("turn", {}).get("status") == "inProgress"
+        assert result.get("result", {}).get("turn", {}).get("id")
     finally:
         client.stop()
 
@@ -290,7 +290,7 @@ def test_turn_start_busy_response_defers_without_parallel_turn():
         client.stop()
 
 
-def test_turn_completed_must_match_acknowledged_turn_id():
+def test_turn_completion_after_acceptance_is_not_a_delivery_retry_signal():
     client = AppServerClient(
         executable=_fake_executable(["--wrong-turn-completion"]), timeout=5
     )
@@ -299,8 +299,8 @@ def test_turn_completed_must_match_acknowledged_turn_id():
         client.initialize()
         client.send_initialized()
         client.thread_resume("thread-x")
-        with pytest.raises(AppServerError, match="turn identity mismatch"):
-            client.turn_start("thread-x", "hello")
+        result = client.turn_start("thread-x", "hello")
+        assert result.get("result", {}).get("turn", {}).get("status") == "inProgress"
     finally:
         client.stop()
 
@@ -338,7 +338,8 @@ def test_deliver_callback_full_sequence():
             thread_id, "TASK_DELIVER", "review_ready", event_id="ev", request_id="r",
             client_user_message_id="fixed-id-1", cwd="/repo/AIWorkHub",
         )
-        assert result["params"]["threadId"] == thread_id
+        assert result["result"]["turn"]["status"] == "inProgress"
+        assert result["result"]["turn"]["id"]
     finally:
         client.stop()
 

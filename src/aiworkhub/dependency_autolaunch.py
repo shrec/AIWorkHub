@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from . import callback_store
+
 
 SCHEMA_ID = "aiworkhub.dependency_autolaunch_outcome.v1"
 SUCCESS_STATUSES = frozenset({"finished", "completed", "stale_already_done"})
@@ -145,6 +147,20 @@ def _mark_dependency_blocked(
             now,
         ),
     )
+    # dependency_blocked is still a terminal review outcome.  Enqueue its
+    # manager wake in the same transaction instead of relying solely on the
+    # dispatcher's repair scan.
+    origin_thread_id = str(
+        child.card.get("origin_thread_id") or ""
+    ).strip()
+    callback_store.enqueue_callback(
+        conn,
+        child.task_id,
+        origin_thread_id,
+        "blocked",
+        provider=str(child.card.get("coordinator_provider") or "").strip().lower(),
+        episode_id=str(child.card.get("claim_epoch") or 0),
+    )
     return True
 
 
@@ -183,6 +199,7 @@ def reconcile(
     conn = sqlite3.connect(str(db), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        callback_store.init_db(conn)
         rows = _read_rows(conn)
         launched_count = 0
         for child in sorted(rows.values(), key=lambda r: r.task_id):

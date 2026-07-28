@@ -1293,14 +1293,18 @@ class AppServerClient:
         client_user_message_id: str | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Start a turn and wait for the matching ``turn/completed`` notification.
+        """Start a callback turn and return on the matching acceptance ACK.
 
         ``TurnStartParams`` requires ``threadId`` and ``input`` (an array of
         ``UserInput``); ``cwd``/``clientUserMessageId`` are optional. The
-        synchronous response contains ``result.turn.id``. Completion is
-        signalled later by an async ``turn/completed`` notification and is
-        accepted only when both ``threadId`` and ``turn.id`` match the
-        acknowledged turn.
+        synchronous response contains ``result.turn.id`` and is the transport
+        acknowledgement: at that point the callback message has already been
+        accepted by the App Server.  The later assistant-turn outcome is not a
+        delivery verdict.  A cancelled/interrupted/failed ``turn/completed``
+        must therefore never cause the already-injected callback to be retried
+        (which would duplicate the user-visible wake and eventually
+        dead-letter it).  Retry remains limited to failures before this exact
+        request acknowledgement.
         """
         req_id = self._new_id()
         params: dict[str, Any] = {
@@ -1314,8 +1318,6 @@ class AppServerClient:
         self._send({"id": req_id, "method": "turn/start", "params": params})
 
         deadline = time.monotonic() + (timeout if timeout is not None else self._timeout)
-        acknowledged_turn_id: str | None = None
-        completed: dict[str, Any] | None = None
         while True:
             msg = self._recv_raw(deadline)
             if msg.get("id") == req_id:
@@ -1330,28 +1332,10 @@ class AppServerClient:
                 acknowledged_turn_id = turn.get("id") if isinstance(turn, dict) else None
                 if not acknowledged_turn_id:
                     raise AppServerError("turn/start response missing result.turn.id")
-                if completed is not None:
-                    completed_turn = (completed.get("params") or {}).get("turn") or {}
-                    if completed_turn.get("id") != acknowledged_turn_id:
-                        raise AppServerError("turn/completed turn identity mismatch")
-                    if completed_turn.get("status") != "completed":
-                        raise AppServerError("turn/completed reported non-completed status")
-                    return completed
-                continue
-            if msg.get("method") == "turn/completed":
-                params_out = msg.get("params") or {}
-                if params_out.get("threadId") == thread_id:
-                    completed = msg
-                    completed_turn = params_out.get("turn") or {}
-                    if acknowledged_turn_id is not None:
-                        if completed_turn.get("id") != acknowledged_turn_id:
-                            raise AppServerError("turn/completed turn identity mismatch")
-                        if completed_turn.get("status") != "completed":
-                            raise AppServerError("turn/completed reported non-completed status")
-                        return completed
-                continue  # a stray notification for a different thread
+                return msg
             # Ignore other interleaved notifications (turn/started,
-            # turn/diff/updated, turn/plan/updated, etc.) while waiting.
+            # turn/completed, turn/diff/updated, turn/plan/updated, etc.) while
+            # waiting for the exact synchronous request acknowledgement.
         # (unreachable: loop returns or raises via timeout inside _recv_raw)
 
     def turn_steer(
@@ -1941,6 +1925,13 @@ class CallbackBridge:
         }
 
     def _claim_batch(self, conn) -> dict[str, Any] | None:
+        # Repair any review transition written by an alternate lifecycle path
+        # before claiming. This runs on every dispatcher iteration, so a new
+        # task category can never silently enter Review without an outbox wake.
+        if self._provider:
+            self._callback_store.seed_missing_review_callbacks(
+                conn, provider=self._provider
+            )
         if self._provider:
             return self._callback_store.claim_pending_callback_batch(
                 conn, self._lease_seconds, self._max_batch_members, provider=self._provider,

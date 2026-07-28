@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
+  recovery_count INTEGER NOT NULL DEFAULT 0,
   lease_id TEXT NOT NULL DEFAULT '',
   lease_expires_at TEXT NOT NULL DEFAULT '',
   last_error TEXT NOT NULL DEFAULT ''

@@ -46,11 +46,13 @@ def _add(repo: Path, task_id: str, *, deps=None, status="pending", worker="uncla
         "status": status,
         "worker_status": worker,
         "depends_on": list(deps or []),
+        "origin_thread_id": f"thread_{task_id.lower()}",
+        "coordinator_provider": "codex",
     }
     conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
     conn.execute(
-        "INSERT INTO tasks(task_id, runner, topic, status, worker_status, card_json) VALUES(?,?,?,?,?,?)",
-        (task_id, card["runner"], topic, status, worker, json.dumps(card)),
+        "INSERT INTO tasks(task_id, runner, topic, status, worker_status, card_json, origin_thread_id) VALUES(?,?,?,?,?,?,?)",
+        (task_id, card["runner"], topic, status, worker, json.dumps(card), card["origin_thread_id"]),
     )
     conn.commit()
     conn.close()
@@ -179,6 +181,12 @@ def test_failed_and_cancelled_dependency_routes_child_to_review_visible_blocked(
     assert outcome["blocked"] == [{"task_id": "CHILD", "blocked_by": ["CANCELLED", "FAILED"]}]
     status, worker, card = _state(repo, "CHILD")
     assert (status, worker, card["substatus"]) == ("review", "review", "dependency_blocked")
+    conn = sqlite3.connect(repo / ".aiworkhub" / "tasking" / "task_queue.sqlite")
+    row = conn.execute(
+        "SELECT transition,state FROM callback_outbox WHERE task_id='CHILD'"
+    ).fetchone()
+    conn.close()
+    assert row == ("blocked", "pending")
 
 
 def test_adapter_families_and_two_repository_isolation(tmp_path):

@@ -36,7 +36,7 @@ SCHEMA_ID = "aiworkhub.callback_store.v1"
 # separate turns/dead letters).
 DEFAULT_CALLBACK_BATCH_MAX_MEMBERS = 25
 
-# Terminal callback transitions that are allowed to enqueue an outbox wake.
+# Canonical callback payload states. Unknown values remain ineligible.
 CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = frozenset({
     "review_ready",
     "blocked",
@@ -122,6 +122,7 @@ def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           attempts INTEGER NOT NULL DEFAULT 0,
+          recovery_count INTEGER NOT NULL DEFAULT 0,
           last_error TEXT NOT NULL DEFAULT '',
           lease_id TEXT NOT NULL DEFAULT '',
           lease_expires_at TEXT NOT NULL DEFAULT '',
@@ -137,6 +138,7 @@ def _ensure_callback_outbox_table(conn: sqlite3.Connection) -> None:
         ("request_id", "TEXT NOT NULL DEFAULT ''"),
         ("batch_id", "TEXT NOT NULL DEFAULT ''"),
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("recovery_count", "INTEGER NOT NULL DEFAULT 0"),
         ("last_error", "TEXT NOT NULL DEFAULT ''"),
         ("lease_id", "TEXT NOT NULL DEFAULT ''"),
         ("lease_expires_at", "TEXT NOT NULL DEFAULT ''"),
@@ -297,9 +299,7 @@ def enqueue_callback(
     event_id: str = "",
     request_id: str = "",
 ) -> bool:
-    """Enqueue one durable outbox entry. Returns True if newly enqueued,
-    False if ineligible or already present (at-most-once dedup via the
-    UNIQUE constraint, scoped to the current claim episode)."""
+    """Enqueue one durable outbox entry, exactly once per route and episode."""
     if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
         return False
     validated_thread = str(origin_thread_id or "").strip()
@@ -321,14 +321,14 @@ def enqueue_callback(
             SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?
              WHERE NOT EXISTS (
                SELECT 1 FROM callback_outbox
-                WHERE task_id=? AND transition=? AND origin_thread_id=?
-                  AND episode_id=? AND request_id=?
+                WHERE task_id=? AND provider=? AND origin_thread_id=?
+                  AND episode_id=?
              )
             """,
             (
                 task_id, validated_provider, validated_thread, transition,
                 resolved_episode, event_id, request_id, now, now,
-                task_id, transition, validated_thread, resolved_episode, request_id,
+                task_id, validated_provider, validated_thread, resolved_episode,
             ),
         )
         if cur.rowcount != 1:
@@ -775,8 +775,13 @@ def seed_missing_review_callbacks(
     - Never invents a thread from nothing: either the caller supplies the
       verified current route ``origin_thread_id`` or the task already carries a
       persisted origin.
-    - Never duplicates or resurrects a task that already has any callback row
-      for the same claim episode.
+    - With no explicit verified route, never duplicates or resurrects a task
+      that already has any callback row for the same provider/claim episode.
+      An explicit verified route remains route-scoped so reload retargeting can
+      seed the new origin exactly once.
+    - A verified route may recover one matching dead-letter row once when the
+      task is still in the same Review episode.  ``recovery_count`` prevents an
+      endlessly failing transport from being resurrected on every health poll.
     """
     _ensure_tasks_origin_thread_column(conn)
     _ensure_callback_outbox_table(conn)
@@ -789,7 +794,6 @@ def seed_missing_review_callbacks(
         SELECT task_id, card_json, origin_thread_id
           FROM tasks
          WHERE status='review'
-           AND worker_status='review'
            AND (archived_at IS NULL OR archived_at='')
          ORDER BY updated_at ASC, task_id ASC
         """
@@ -803,22 +807,65 @@ def seed_missing_review_callbacks(
             card = {}
         if not isinstance(card, dict):
             card = {}
-        if card.get("callback_required") is False:
-            continue
         row_provider = str(card.get("coordinator_provider") or provider).strip().lower()
         if row_provider != provider:
             continue
         episode_id = str(card.get("claim_epoch") or 0)
-        existing = conn.execute(
-            "SELECT 1 FROM callback_outbox WHERE task_id=? AND episode_id=? LIMIT 1",
-            (task_id, episode_id),
-        ).fetchone()
-        if existing is not None:
-            continue
         raw_terminal = str(card.get("terminal_substatus") or "").strip() or "review_ready"
+        # Reconciliation starts from an already-canonical review row. Preserve
+        # known compact terminal states, but recover an unfamiliar persisted
+        # substatus as review_ready so a future/legacy spelling cannot strand
+        # the review. Direct enqueue_callback callers remain fail-closed.
         transition = resolve_callback_transition(raw_terminal)
         callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
         if not callback_origin:
+            continue
+        if route_origin:
+            existing = conn.execute(
+                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
+                "AND origin_thread_id=? AND episode_id=? LIMIT 1",
+                (task_id, provider, callback_origin, episode_id),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                "SELECT outbox_id,batch_id,state,recovery_count FROM callback_outbox WHERE task_id=? AND provider=? "
+                "AND episode_id=? LIMIT 1",
+                (task_id, provider, episode_id),
+            ).fetchone()
+        if existing is not None:
+            if (
+                route_origin
+                and str(existing["state"] or "") == "dead_letter"
+                and int(existing["recovery_count"] or 0) == 0
+                and _task_still_in_matching_terminal_state(
+                    conn, task_id, transition, episode_id
+                )
+            ):
+                batch_id = str(existing["batch_id"] or "")
+                now = utc_now()
+                if batch_id:
+                    conn.execute(
+                        "UPDATE callback_batches SET state='superseded', updated_at=? "
+                        "WHERE batch_id=? AND state='dead_letter'",
+                        (now, batch_id),
+                    )
+                conn.execute(
+                    "UPDATE callback_outbox SET state='pending', batch_id='', "
+                    "lease_id='', lease_expires_at='', attempts=0, "
+                    "last_error='verified_route_dead_letter_recovery', "
+                    "recovery_count=recovery_count+1, updated_at=? "
+                    "WHERE outbox_id=? AND state='dead_letter' AND recovery_count=0",
+                    (now, existing["outbox_id"]),
+                )
+                conn.commit()
+                append_event(
+                    conn,
+                    task_id,
+                    "callback_dead_letter_recovered_on_verified_route",
+                    "",
+                    {"transition": transition, "episode_id": episode_id},
+                )
+                seeded += 1
             continue
         if enqueue_callback(
             conn,

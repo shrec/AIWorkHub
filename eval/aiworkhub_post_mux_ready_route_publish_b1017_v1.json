@@ -1,0 +1,42 @@
+{
+  "schema_id": "aiworkhub.task_mcp.evaluation_evidence.v1",
+  "task_id": "DEEPSEEK_V4PRO_AIWORKHUB_POST_MUX_READY_ROUTE_PUBLISH_B1017_V1",
+  "runner": "deepseek_v4pro_aiworkhub_post_mux_ready_route_publish_b1017_v1",
+  "topic": "task_mcp",
+  "objective": "Fix the live 0.6.64 canary gap where activation publishes route_pending before the app-server mux descriptor becomes ready and otherwise waits for the 4-minute renewal. Immediately re-run the existing route convergence after the existing ensureStarted promise resolves.",
+  "evidence": {
+    "source_graph_javascript_unsupported": true,
+    "source_graph_evidence": "Source Graph build_revision=python_ast.v1 returned 96 Python-only hits with zero JavaScript coverage. Bounded exact-target reads limited to vscode-extension/extension.js and the B1017 test per coordinator authorization.",
+    "changes_made": {
+      "vscode-extension/extension.js": {
+        "change": "In activate(), after getMcpClient().ensureStarted() resolves successfully, immediately call refreshCoordinatorRouteOwnership(activeRepoIdentity) to publish capability_state=available from a ready mux descriptor instead of waiting for the 4-minute renewal tick.",
+        "preserved": "route_pending pre-start (fail-closed), catch handler for failures, renewal timing, split-brain protection, callback architecture, dispatcher layers"
+      }
+    },
+    "test_assertions": [
+      "B1017.1: Pre-start route is route_pending (fail-closed)",
+      "B1017.2: Post-ensureStarted with ready mux immediately publishes capability_state=available with verified thread_id",
+      "B1017.3: All negative ownership cases (empty thread, wrong repo, wrong PID, stale, not ready) remain route_pending",
+      "B1017.4: Ambiguous ownership (two instances) remains route_pending",
+      "B1017.5: Convergence back to route_pending when mux evidence disappears",
+      "B1017.6: Renewal-tick path converges to available on the same function"
+    ],
+    "validation_passed": [
+      "node --check vscode-extension/extension.js (SYNTAX_OK)",
+      "node vscode-extension/test/codex-route-post-mux-ready-b1017.test.js (PASSED)",
+      "node vscode-extension/test/codex-route-publication-reload-b1008.test.js (PASSED)",
+      "node vscode-extension/test/windows-mcp-child-preflight-b916.test.js (PASSED: 13/13)",
+      "node vscode-extension/test/cross-plugin-failsafe-exact-child-ownership-b971.test.js (PASSED)",
+      "python3 -m json.tool eval/aiworkhub_post_mux_ready_route_publish_b1017_v1.json (JSON_OK)",
+      "git diff --check (OK)"
+    ]
+  },
+  "acceptance_summary": {
+    "route_pending_preserved": "The pre-start route_pending write in getMcpClient() (line 2133) is unchanged; it runs synchronously before ensureStarted is called.",
+    "post_ensureStarted_convergence": "After ensureStarted resolves, refreshCoordinatorRouteOwnership(activeRepoIdentity) immediately re-derives the route from live mux state, publishing available without waiting for the 4-minute tick.",
+    "fail_closed_rules_preserved": "All missing/stale/wrong-repo/wrong-PID/not-ready/invalid/ambiguous cases remain route_pending -- findVerifiedMuxThreadId returns '' for zero or multiple matches.",
+    "no_timing_changes": "Renewal interval (WINDOW_ROUTE_RENEWAL_INTERVAL_MS=4min), callback-store behavior, dispatcher layers, and split-brain protection (writeSharedRepoRouteRecord foreign-window guard) are untouched.",
+    "focused_regression": "B1017 test covers: initial pending, immediate verified publication, negative ownership, ambiguity, convergence on disappearance, and renewal-tick coverage."
+  },
+  "updated_at": "2026-07-27T20:57:48.378Z"
+}

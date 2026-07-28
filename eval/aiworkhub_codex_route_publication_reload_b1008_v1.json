@@ -1,0 +1,79 @@
+{
+  "schema_id": "aiworkhub.eval_manifest.v1",
+  "task_id": "CLAUDE_SONNET_AIWORKHUB_CODEX_ROUTE_PUBLICATION_RELOAD_B1008_V1",
+  "topic": "task_mcp",
+  "objective": "Fix the VS Code extension route-publication seam so activation, reload, restored tabs and live mux observation publish the exact current Codex thread for the exact repo/window, eliminating manager/shared-registry split-brain without fabricating routes.",
+  "changed_files": [
+    "vscode-extension/extension.js",
+    "vscode-extension/test/codex-route-publication-reload-b1008.test.js"
+  ],
+  "production_seam": {
+    "entry_point": "refreshCoordinatorRouteOwnership",
+    "file": "vscode-extension/extension.js",
+    "notes": "Real production publication path (activation getMcpClient, lease-renewal timer renewWindowRouteLease, and selectCoordinatorTarget all converge through this one function) -- no test-only helper was added disconnected from production."
+  },
+  "added_functions": [
+    "appServerMuxSidebandDir",
+    "appServerMuxInstancesDir",
+    "readMuxInstanceDescriptor",
+    "isMuxInstanceFresh",
+    "findVerifiedMuxThreadId",
+    "readSharedRepoRouteRecord",
+    "isSharedRouteRecordLeaseFresh",
+    "sharedRouteHasVerifiedCodexThread"
+  ],
+  "modified_functions": [
+    "sanitizeCoordinatorTargetRoute",
+    "refreshCoordinatorRouteOwnership",
+    "writeSharedRepoRouteRecord"
+  ],
+  "contract_parity": {
+    "mirrors": [
+      "src/aiworkhub/app_server_mux.py:_read_instance_descriptor / SidebandInstance.is_owner_fresh",
+      "src/aiworkhub/core.py:_live_mux_active_thread",
+      "src/aiworkhub/core.py:read_selected_coordinator_target (codex capability_state/wake values)"
+    ],
+    "read_only": true,
+    "python_files_edited": false
+  },
+  "acceptance_checks": [
+    {
+      "id": "verified_ownership_match",
+      "description": "A route becomes available only when exactly one fresh, ready, extension-owned mux instance matches repo_id, parent_pid (extension host), and has a bare UUID active_thread_id.",
+      "covered_by_test": true
+    },
+    {
+      "id": "dual_publication",
+      "description": "Verified thread_id/session_id is written into both the repo-local coordinator-targets.json and the shared router manifest for the same repo/window lease.",
+      "covered_by_test": true
+    },
+    {
+      "id": "negative_cases_stay_pending",
+      "description": "Empty, synthetic codex:window, wrong repo, wrong extension host, wrong window, stale, not-ready, and ambiguous owners all remain route_pending.",
+      "covered_by_test": true
+    },
+    {
+      "id": "no_foreign_downgrade",
+      "description": "A previously-verified foreign or current-window route in the shared manifest is never overwritten by a pending/ambiguous observation, unless its lease has expired.",
+      "covered_by_test": true
+    },
+    {
+      "id": "idempotent_convergence",
+      "description": "Reload/activation/restored-tab/runtime-repair and later live mux observation all converge through the same refreshCoordinatorRouteOwnership call with no polling loop, recursive startup, CLI fallback, or process killing.",
+      "covered_by_test": true
+    },
+    {
+      "id": "no_fabrication",
+      "description": "Thread ids are never derived from window_id/repo_id/claim_episode; only a literal active_thread_id read from a matching live mux registry file is ever published.",
+      "covered_by_test": true
+    }
+  ],
+  "validation": [
+    "node --check vscode-extension/extension.js",
+    "node vscode-extension/test/codex-route-publication-reload-b1008.test.js",
+    "npm test --prefix vscode-extension",
+    "python3 -m json.tool eval/aiworkhub_codex_route_publication_reload_b1008_v1.json",
+    "git diff --check"
+  ],
+  "status": "review_ready"
+}

@@ -18,8 +18,9 @@ already drives on every interval) and
 of (a) the process event is a genuine terminal, non-blocked state with
 ``workspace_retained`` still true, (b) the exact PID/start-tick identity is
 PROVEN dead (never inferred from "alive with unknown ticks"), (c) the
-canonical task status is ``finished`` or ``archived`` (never review/
-processing/pending/blocked), and (d) the workspace path/home are exactly
+canonical task has disposed the exact attempt or a review card names a newer
+request id (never the current review request and never processing), and (d)
+the workspace path/home are exactly
 ``<configured_root>/<request_id>/{worktree,home}``. Every other case is
 skipped and reported, never deleted.
 """
@@ -318,7 +319,7 @@ def test_archived_task_with_dead_process_is_gc_cleaned(tmp_path, monkeypatch):
     assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
     assert not path.exists() and not home.exists()
     assert manager._request_events("req-archived-dead")[-1]["workspace_gc_reason"] == (
-        "finalized_task_status:archived"
+        "disposed_task_status:archived"
     )
 
 
@@ -348,9 +349,9 @@ def test_every_retained_terminal_state_is_gc_eligible_once_finished(tmp_path, mo
 
 @pytest.mark.parametrize(
     "status,worker_status",
-    [("review", "review_ready"), ("processing", "in_progress"), ("pending", "unclaimed"), ("blocked", "blocked")],
+    [("processing", "in_progress")],
 )
-def test_non_finalized_task_status_preserves_the_workspace(tmp_path, monkeypatch, status, worker_status):
+def test_active_task_status_preserves_the_workspace(tmp_path, monkeypatch, status, worker_status):
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     card = _card()
     card.update({"status": status, "worker_status": worker_status})
@@ -370,6 +371,85 @@ def test_non_finalized_task_status_preserves_the_workspace(tmp_path, monkeypatch
     # a genuine GC action gets a persisted event (see module docstring).
     latest = manager._request_events(f"req-preserve-{status}")[-1]
     assert "workspace_gc" not in latest
+
+
+@pytest.mark.parametrize(
+    "status,worker_status",
+    [("pending", "unclaimed"), ("blocked", "blocked")],
+)
+def test_coordinator_disposed_attempt_is_gc_cleaned(tmp_path, monkeypatch, status, worker_status):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    card = _card()
+    card.update({"status": status, "worker_status": worker_status})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=f"req-disposed-{status}",
+        pid=2_147_483_071, pid_start_ticks=999_999_921,
+        state="worker_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+    assert not path.exists() and not home.exists()
+    latest = manager._request_events(f"req-disposed-{status}")[-1]
+    assert latest["workspace_gc_reason"] == f"disposed_task_status:{status}"
+
+
+def test_current_review_request_is_preserved_but_older_attempt_is_gc_cleaned(tmp_path, monkeypatch):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    current_request = "req-current-review"
+    older_request = "req-older-review"
+    card = _card()
+    card.update({
+        "status": "review",
+        "worker_status": "review",
+        "terminal_review": {
+            "substatus": "review_ready",
+            "evidence": {"request_identity": {"request_id": current_request}},
+        },
+    })
+    manager = _build_manager(tmp_path, card)
+    current_path, current_home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=current_request,
+        pid=2_147_483_072, pid_start_ticks=999_999_922,
+        state="review_ready",
+    )
+    older_path, older_home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=older_request,
+        pid=2_147_483_073, pid_start_ticks=999_999_923,
+        state="validation_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 2, "gc_cleaned": 1, "gc_skipped": 1}
+    assert current_path.exists() and current_home.exists()
+    assert not older_path.exists() and not older_home.exists()
+    assert manager._request_events(older_request)[-1]["workspace_gc_reason"] == (
+        f"superseded_review_request:{current_request}"
+    )
+
+
+def test_review_without_exact_request_identity_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    card = _card()
+    card.update({"status": "review", "worker_status": "review", "terminal_review": {}})
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id="req-review-missing-identity",
+        pid=2_147_483_074, pid_start_ticks=999_999_924,
+        state="validation_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
 
 
 def test_blocked_process_event_is_never_a_gc_candidate_even_if_task_finished(tmp_path, monkeypatch):

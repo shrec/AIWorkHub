@@ -7,6 +7,7 @@ const os = require("os");
 const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
+const packageVersion = require(path.resolve(__dirname, "..", "package.json")).version;
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -62,7 +63,7 @@ class FakeChild extends EventEmitter {
         text: JSON.stringify({
           ok: true,
           dispatcher_started: true,
-          server_version: "0.6.63",
+          server_version: packageVersion,
         }),
       }],
     }, message.id);
@@ -104,7 +105,7 @@ function loadExtensionHost(repoRoot) {
     const extension = require(extensionPath);
     const context = {
       extensionUri: { fsPath: path.resolve(__dirname, "..") },
-      extension: { packageJSON: { version: "0.6.29" } },
+      extension: { packageJSON: { version: packageVersion } },
       subscriptions: [],
       workspaceState: { update: () => {}, get: () => undefined },
     };
@@ -154,7 +155,13 @@ function loadExtensionHost(repoRoot) {
 
     // Reload cycle: deactivate must dispose the timer and remove this
     // window's own route file.
+    // Let fire-and-forget dispatcher/source-graph convergence consume the
+    // fake child's immediate responses before teardown. Otherwise the test
+    // kills its EventEmitter child between two background requests and leaves
+    // only the request-deadline timers alive, making the suite appear hung.
+    await new Promise((resolve) => setImmediate(resolve));
     await host.extension.deactivate();
+    await new Promise((resolve) => setImmediate(resolve));
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), false, "timer must be disposed on deactivate");
     assert.strictEqual(windowFiles().length, 0, "window route file must be removed on deactivate");
 
@@ -166,7 +173,9 @@ function loadExtensionHost(repoRoot) {
     host.extension.__testInternals.startWindowRouteRenewalTimer();
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), true, "starting again must not throw or leave the timer stopped");
 
+    await new Promise((resolve) => setImmediate(resolve));
     await host.extension.deactivate();
+    await new Promise((resolve) => setImmediate(resolve));
   } finally {
     childProcess.spawn = originalSpawn;
   }

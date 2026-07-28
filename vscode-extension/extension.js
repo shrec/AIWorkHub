@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.63";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.66";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -171,9 +171,57 @@ function sharedRepoRouteDir() {
   return path.join(os.homedir(), ".aiworkhub", "router", "repos");
 }
 
+function readSharedRepoRouteRecord(repoId) {
+  if (!REAL_REPO_ID_RE.test(String(repoId || ""))) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(fs.readFileSync(path.join(sharedRepoRouteDir(), `${repoId}.json`), "utf8"));
+    return payload && typeof payload === "object" ? payload : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function isSharedRouteRecordLeaseFresh(record) {
+  const expiresAt = Date.parse((record && record.lease_expires_at) || "");
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
+function sharedRouteHasVerifiedCodexThread(record) {
+  const route = record && record.targets && record.targets.codex && record.targets.codex.route;
+  return Boolean(route) && REAL_THREAD_ID_RE.test(String(route.thread_id || ""));
+}
+
+// B1008: the shared repo-wide manifest is a single last-writer-wins file --
+// without this gate, a second window on the same repository (still
+// route_pending, or observing an ambiguous/stale mux) could overwrite a
+// different, still-live window's already-verified Codex thread on its own
+// next lease-renewal tick, flipping a routable shared manifest back to
+// unroutable out from under whichever window is actually connected to Codex.
+// Only withhold the write when ALL of: the existing record belongs to a
+// DIFFERENT window, that window's lease has not expired, it currently holds
+// a verified thread, and THIS window's own targets are not themselves
+// verified -- i.e. never downgrade a foreign live verified route with this
+// window's pending/ambiguous observation. A window overwriting its own prior
+// record, an expired lease, or this window's own fresh verification always
+// proceeds.
 function writeSharedRepoRouteRecord(repoInfo, targets) {
   if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) {
     return null;
+  }
+  const thisWindowCodexRoute = targets && targets.targets && targets.targets.codex && targets.targets.codex.route;
+  const thisWindowVerified = Boolean(thisWindowCodexRoute) && REAL_THREAD_ID_RE.test(String(thisWindowCodexRoute.thread_id || ""));
+  const existing = readSharedRepoRouteRecord(repoInfo.repoId);
+  if (
+    existing
+    && existing.window_id
+    && existing.window_id !== WINDOW_SCOPE_ID
+    && !thisWindowVerified
+    && isSharedRouteRecordLeaseFresh(existing)
+    && sharedRouteHasVerifiedCodexThread(existing)
+  ) {
+    return existing;
   }
   const now = new Date();
   const record = {
@@ -642,6 +690,132 @@ function readCoordinatorTargets(repoInfo) {
   }
 }
 
+// ── Live Codex mux observation (B1008) ─────────────────────────────────────
+// Mirrors src/aiworkhub/app_server_mux.py's per-instance registry contract
+// and src/aiworkhub/core.py:_live_mux_active_thread exactly, so this
+// extension host and the Python coordinator agree on the one live Codex
+// thread (if any) that may ever be published as "verified" for a given
+// repo/window -- never a different repository, never a different extension
+// host, never fabricated from window/repo/claim-episode identifiers alone.
+const APP_SERVER_MUX_SIDEBAND_DIR_ENV = "AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR";
+const APP_SERVER_MUX_INSTANCES_SUBDIR = "instances";
+const APP_SERVER_MUX_REGISTRY_MAX_BYTES = 64 * 1024;
+const APP_SERVER_MUX_DEFAULT_OWNER_LEASE_SECONDS = 90.0;
+
+function appServerMuxSidebandDir() {
+  const override = process.env[APP_SERVER_MUX_SIDEBAND_DIR_ENV];
+  return override && override.trim() ? override.trim() : path.join(os.homedir(), ".aiworkhub", "app_server_mux");
+}
+
+function appServerMuxInstancesDir() {
+  return path.join(appServerMuxSidebandDir(), APP_SERVER_MUX_INSTANCES_SUBDIR);
+}
+
+// Parses and ownership-checks one mux registry descriptor file. Returns
+// null (never throws) for anything missing, oversized, foreign-owned, or
+// corrupt -- callers must treat that identically to "no such instance".
+function readMuxInstanceDescriptor(filePath) {
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (_err) {
+    return null;
+  }
+  if (!stat.isFile() || stat.size > APP_SERVER_MUX_REGISTRY_MAX_BYTES) {
+    return null;
+  }
+  if (process.platform !== "win32") {
+    const ownerOnly = (stat.mode & 0o777) === 0o600
+      && (typeof process.getuid !== "function" || stat.uid === process.getuid());
+    if (!ownerOnly) {
+      return null;
+    }
+  }
+  let payload;
+  try {
+    payload = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (_err) {
+    return null;
+  }
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const repoId = String(payload.repo_id || "");
+  if (!repoId) {
+    return null;
+  }
+  const ownedThreadIds = Array.isArray(payload.owned_thread_ids)
+    ? payload.owned_thread_ids.filter((id) => typeof id === "string" && id)
+    : [];
+  const activeThreadId = typeof payload.active_thread_id === "string" && ownedThreadIds.includes(payload.active_thread_id)
+    ? payload.active_thread_id
+    : (ownedThreadIds.length ? ownedThreadIds[ownedThreadIds.length - 1] : "");
+  const parentPid = Number.isInteger(payload.parent_pid) && payload.parent_pid > 1 ? payload.parent_pid : 0;
+  const heartbeatAt = typeof payload.heartbeat_at === "number" ? payload.heartbeat_at : stat.mtimeMs / 1000;
+  const ownerLeaseSeconds = typeof payload.owner_lease_seconds === "number" && payload.owner_lease_seconds > 0
+    ? payload.owner_lease_seconds
+    : APP_SERVER_MUX_DEFAULT_OWNER_LEASE_SECONDS;
+  return {
+    repoId,
+    parentPid,
+    activeThreadId,
+    heartbeatAt,
+    ownerLeaseSeconds,
+    ready: Boolean(payload.ready),
+  };
+}
+
+// Mirrors SidebandInstance.is_owner_fresh: heartbeat age bounded by the
+// instance's own declared lease, never a fixed extension-side timeout.
+function isMuxInstanceFresh(instance) {
+  if (!(instance.heartbeatAt > 0)) {
+    return false;
+  }
+  const ageSeconds = Math.max(0, Date.now() / 1000 - instance.heartbeatAt);
+  return ageSeconds <= instance.ownerLeaseSeconds;
+}
+
+// Mirrors src/aiworkhub/core.py:_live_mux_active_thread -- the ONE
+// repo/window-scoped live Codex thread this extension host may ever publish
+// as verified. Matching requires the immutable repo_id and this exact
+// extension-host PID; zero or multiple candidates fail closed to "" so an
+// empty, wrong-repo, wrong-host, not-ready, stale, or ambiguous observation
+// never becomes a route.
+function findVerifiedMuxThreadId(repoInfo) {
+  let entries;
+  try {
+    entries = fs.readdirSync(appServerMuxInstancesDir(), { withFileTypes: true });
+  } catch (_err) {
+    return "";
+  }
+  const matches = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      continue;
+    }
+    const instance = readMuxInstanceDescriptor(path.join(appServerMuxInstancesDir(), entry.name));
+    if (
+      instance
+      && instance.repoId === repoInfo.repoId
+      && instance.parentPid === process.pid
+      && instance.ready
+      && isMuxInstanceFresh(instance)
+      && REAL_THREAD_ID_RE.test(instance.activeThreadId)
+    ) {
+      matches.push(instance);
+    }
+  }
+  if (matches.length !== 1) {
+    return "";
+  }
+  return matches[0].activeThreadId;
+}
+
+// Mirrors src/aiworkhub/core.py:read_selected_coordinator_target's codex
+// branch exactly (capability_state "available" / wake "app_server_sideband"
+// when verified; "route_pending" / "codex_thread_id_not_observed" otherwise)
+// so the extension-published route and the Python-side read-time fallback
+// never disagree about what "verified" means.
 function sanitizeCoordinatorTargetRoute(provider, target, repoInfo) {
   const next = { ...(target || {}) };
   const route = { ...((next.route && typeof next.route === "object") ? next.route : {}) };
@@ -650,7 +824,11 @@ function sanitizeCoordinatorTargetRoute(provider, target, repoInfo) {
   route.claim_episode = activeClaimEpisode;
   if (provider === "codex") {
     const threadId = String(route.thread_id || "");
-    if (!REAL_THREAD_ID_RE.test(threadId)) {
+    if (REAL_THREAD_ID_RE.test(threadId)) {
+      route.session_id = threadId;
+      next.capability_state = "available";
+      next.wake = { mode: "app_server_sideband", supported: true };
+    } else {
       route.thread_id = "";
       route.session_id = activeClaimEpisode;
       next.capability_state = "route_pending";
@@ -665,6 +843,13 @@ function sanitizeCoordinatorTargetRoute(provider, target, repoInfo) {
   return next;
 }
 
+// The single convergence point: activation, reload, restored-tab revival,
+// runtime repair, and every lease-renewal tick all call this same function,
+// so each one re-derives the codex route's thread_id fresh from the live mux
+// registry rather than trusting whatever was last persisted. A thread that
+// is no longer observed (mux instance gone, PID mismatch, lease expired)
+// converges back to route_pending on the very next call -- no stale
+// "verified" state ever lingers past its own live evidence.
 function refreshCoordinatorRouteOwnership(repoInfo) {
   const next = readCoordinatorTargets(repoInfo);
   next.repo_id = repoInfo.repoId;
@@ -673,10 +858,14 @@ function refreshCoordinatorRouteOwnership(repoInfo) {
   next.extension_host_pid = process.pid;
   next.updated_at = new Date().toISOString();
   const defaults = defaultCoordinatorTargets(repoInfo);
+  const verifiedCodexThreadId = findVerifiedMuxThreadId(repoInfo);
   for (const provider of ["codex", "claude"]) {
     const target = { ...defaults.targets[provider], ...((next.targets || {})[provider] || {}) };
     const existingRoute = (((next.targets || {})[provider] || {}).route || {});
     target.route = { ...defaults.targets[provider].route, ...existingRoute };
+    if (provider === "codex") {
+      target.route.thread_id = verifiedCodexThreadId;
+    }
     next.targets = { ...(next.targets || {}), [provider]: sanitizeCoordinatorTargetRoute(provider, target, repoInfo) };
   }
   atomicWriteJson(routeStatePath(repoInfo.root), next);
@@ -927,11 +1116,8 @@ class McpStdioClient {
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
       AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
       AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
-      // Use the callback bridge's supported, repo-bound Codex transport.
-      // Do not invent an extension-only transport name: core forwards this
-      // value into CallbackBridge, whose accepted Codex transports are
-      // subprocess and sideband.  The extension deliberately avoids the
-      // foreign-plugin sideband integration, so subprocess is canonical.
+      // A successful synchronous turn/start response is the delivery ACK;
+      // later turn status cannot duplicate or dead-letter the callback.
       AIWORKHUB_CALLBACK_TRANSPORT: "subprocess",
     };
     // Extension-local runtime import path: `import aiworkhub` must always
@@ -3093,7 +3279,13 @@ async function activate(context) {
   // repository must start its MCP child and dispatcher even when the user
   // never opens the dashboard during this window/session.
   if (activeRepoIdentity && activeRepoIdentity.root) {
-    getMcpClient().ensureStarted().catch((err) => {
+    // B1017: publish route_pending first (fail-closed), then immediately
+    // re-run route convergence after the MCP child and dispatcher are both
+    // alive so a ready/fresh mux descriptor publishes capability_state=
+    // available now instead of waiting for the 4-minute renewal tick.
+    getMcpClient().ensureStarted().then(() => {
+      refreshCoordinatorRouteOwnership(activeRepoIdentity);
+    }).catch((err) => {
       outputChannel.appendLine(
         `[mcp] startup dispatcher activation failed: ${sanitizeErrorMessage(err)}`,
       );
@@ -3157,6 +3349,17 @@ module.exports = {
     startWindowRouteRenewalTimer,
     stopWindowRouteRenewalTimer,
     isWindowRouteRenewalTimerActive: () => Boolean(windowRouteRenewalTimer),
+    refreshCoordinatorRouteOwnership,
+    readCoordinatorTargets,
+    sanitizeCoordinatorTargetRoute,
+    routeStatePath,
+    sharedRepoRouteDir,
+    readSharedRepoRouteRecord,
+    writeSharedRepoRouteRecord,
+    appServerMuxSidebandDir,
+    appServerMuxInstancesDir,
+    readMuxInstanceDescriptor,
+    findVerifiedMuxThreadId,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
@@ -3164,6 +3367,8 @@ module.exports = {
       EXPECTED_MCP_PACKAGE_VERSION,
       WINDOW_ROUTE_LEASE_TTL_MS,
       WINDOW_ROUTE_RENEWAL_INTERVAL_MS,
+      APP_SERVER_MUX_SIDEBAND_DIR_ENV,
+      REAL_THREAD_ID_RE,
     },
   },
 };

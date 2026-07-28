@@ -1,0 +1,29 @@
+{
+  "schema_id": "aiworkhub.eval.v1",
+  "task_id": "CODEX_AIWORKHUB_CROSS_PLUGIN_FAILSAFE_EXACT_CHILD_OWNERSHIP_B971_V1",
+  "source_graph": {
+    "mode": "focus",
+    "query": "task",
+    "budget": 48,
+    "bundle_type": "explore",
+    "result": "96 canonical hits; extension targets were not present, so reads were bounded to exact contract-listed paths"
+  },
+  "assertions": [
+    "foreign child objects are never termination-authorized by PID equality",
+    "lifecycle ownership is cleared before signaling the exact spawned object",
+    "automatic recovery is bounded to three attempts and opens a manual-only circuit",
+    "foreign plugin configuration, sideband identity, process discovery, and process signaling are absent",
+    "callbacks use repository-bound inbox polling"
+  ],
+  "validation": [
+    "node --check vscode-extension/extension.js: passed",
+    "node vscode-extension/test/extension-static.test.js: passed",
+    "node vscode-extension/test/multirepo-connecting.test.js: passed",
+    "node vscode-extension/test/reloadless-runtime-repair.test.js: passed",
+    "node vscode-extension/test/codex-config-toml-runtime-migration.test.js: passed",
+    "node vscode-extension/test/cross-plugin-failsafe-exact-child-ownership-b971.test.js: passed",
+    "npm test --prefix vscode-extension: passed",
+    "python3 -m json.tool eval/aiworkhub_cross_plugin_failsafe_exact_child_ownership_b971_v1.json: passed",
+    "git diff --check: passed"
+  ]
+}

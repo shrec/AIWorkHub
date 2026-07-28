@@ -1,0 +1,38 @@
+{
+  "schema_id": "aiworkhub.eval.aiworkhub_mux_launcher_packaging_strict_b1038_v1",
+  "task_id": "DEEPSEEK_V4FLASH_AIWORKHUB_LAUNCHER_PACKAGING_STRICT_B1038_V1",
+  "mode": "strict_no_swallow_cross_platform_launcher_packaging",
+  "result": "implemented",
+  "closes": "B1038",
+  "scope": {
+    "root_cause": "package-vsix.js copied only the POSIX mux launcher and used swallow-tolerant existsSync+mode checks. Windows .cmd launcher was an empty stub. No end-to-end static test validated the strict no-swallow packaging logic or .cmd launcher semantics without creating dist artifacts.",
+    "changes": [
+      "scripts/aiworkhub-app-server-mux.cmd: implemented Windows batch launcher that selects runtime first, dev src second, prepends PYTHONPATH, forwards %*, captures ERRORLEVEL, propagates through endlocal, exits /b 1 on missing runtime",
+      "vscode-extension/test/package-vsix.js: added MUX_LAUNCHER_CMD_SRC/DEST paths; copies both POSIX and .cmd launchers into extension/bin; chmodSync 0o755 and executable-bit check gated behind platform !== win32; uses fs.statSync + .isFile() instead of swallow-tolerant existsSync for both launchers",
+      "vscode-extension/test/mux-launcher-packaging-b1038.test.js: focused static test validates .cmd semantics (preamble, runtime-first, src-fallback, error+exit, %* forward, ERRORLEVEL capture+endlocal propagation) and strict packaging logic (both launchers copied, statSync+isFile, platform guard, no old existsSync pattern) without creating dist artifacts"
+    ]
+  },
+  "acceptance_evidence": [
+    {
+      "requirement": "package-vsix copies both existing POSIX and new Windows launchers into extension/bin and requires both as regular files",
+      "test": "testStrictPackagingLogic — validates fs.copyFileSync for both MUX_LAUNCHER_SRC and MUX_LAUNCHER_CMD_SRC, requires muxStat.isFile() and cmdStat.isFile()"
+    },
+    {
+      "requirement": "Non-Windows uses uncaught chmodSync 0755 and strict executable verification; Windows skips only chmod/mode checks",
+      "test": "testStrictPackagingLogic — validates if (process.platform !== \"win32\") guards fs.chmodSync(0o755) and mode & 0o111 check"
+    },
+    {
+      "requirement": ".cmd selects packaged ../runtime first and dev ../src second, prepends PYTHONPATH, forwards %*, captures ERRORLEVEL immediately, and propagates it through endlocal",
+      "test": "testCmdSemantics — validates all .cmd content semantics including if-exist ordering, PYTHONPATH prepend, python -m %* forward, ERRORLEVEL capture, and endlocal & exit /b propagation"
+    },
+    {
+      "requirement": "Focused static test verifies strict no-swallow packaging logic and .cmd semantics without creating dist artifacts",
+      "test": "mux-launcher-packaging-b1038.test.js — reads source files only (no fs.writeFileSync or execFileSync), validates both launcher content and packaging logic statically"
+    }
+  ],
+  "validation_commands": [
+    "node vscode-extension/test/mux-launcher-packaging-b1038.test.js",
+    "python3 -m json.tool eval/aiworkhub_mux_launcher_packaging_strict_b1038_v1.json",
+    "git diff --check"
+  ]
+}
