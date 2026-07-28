@@ -325,22 +325,32 @@ function renderManagerIdentity(snapshot) {
     && delivery.repo_id === delivery.dispatcher_repo_id
   );
   const callbackReady = managerInboxReady || dispatcherReady;
+  const target = snapshot && snapshot.manager_identity_target && typeof snapshot.manager_identity_target === "object"
+    ? snapshot.manager_identity_target
+    : {};
+  const routeState = String(target.capability_state || route.route_state || "unknown").toLowerCase();
+  const routeReason = String(target.reason || "");
+  const routeReady = ["available", "ready"].includes(routeState);
+  const fullyReady = isManager && routeReady && callbackReady;
   elements.identityAlert.hidden = false;
-  elements.identityAlert.classList.toggle("identity-ok", isManager && callbackReady);
-  elements.identityAlert.classList.toggle("identity-warn", !isManager || !callbackReady);
+  elements.identityAlert.classList.toggle("identity-ok", fullyReady);
+  elements.identityAlert.classList.toggle("identity-warn", !fullyReady);
   if (!isManager) {
     elements.identityAlertTitle.textContent = "Manager identity unverified";
+  } else if (!routeReady) {
+    elements.identityAlertTitle.textContent = "Manager verified · callback route pending";
   } else if (!callbackReady) {
     elements.identityAlertTitle.textContent = "Manager verified · callback unavailable";
   } else {
-    elements.identityAlertTitle.textContent = "Manager identity and callback verified";
+    elements.identityAlertTitle.textContent = "Manager identity, route and callback verified";
   }
   const identityReason = compactManagerIdentityReason(identity);
   const deliveryProblems = Array.isArray(delivery.problems) ? delivery.problems.filter(Boolean) : [];
   const deliveryReason = callbackReady
     ? `callback=${String(delivery.status || "ready")}`
     : `callback=${String(delivery.status || "unknown")}${deliveryProblems.length ? ` · ${deliveryProblems.join(",")}` : ""}`;
-  elements.identityAlertMessage.textContent = `${identityReason} · ${deliveryReason}`;
+  const routeStatus = `route=${routeState}${routeReason ? ` · route_reason=${routeReason}` : ""}`;
+  elements.identityAlertMessage.textContent = `${identityReason} · ${routeStatus} · ${deliveryReason}`;
 }
 
 function replaceSelectOptions(select, values, allLabel, currentValue) {

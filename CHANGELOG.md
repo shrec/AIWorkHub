@@ -4,6 +4,14 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.69] - 2026-07-28
+
+### Fixed
+
+- Stopped the dashboard from showing a green fully-verified manager banner
+  while its coordinator route is still `route_pending`. Identity, route, and
+  dispatcher health are now evaluated and labelled independently.
+
 ## [0.6.68] - 2026-07-28
 
 ### Changed

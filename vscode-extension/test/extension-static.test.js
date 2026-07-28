@@ -182,7 +182,8 @@ assert.ok(ext.includes("notify_and_open_chat"));
 assert.ok(app.includes('case "coordinatorTargets"'));
 assert.ok(app.includes('type: "selectCoordinatorTarget"'));
 assert.ok(app.includes("Manager verified · callback unavailable"));
-assert.ok(app.includes("Manager identity and callback verified"));
+assert.ok(app.includes("Manager verified · callback route pending"));
+assert.ok(app.includes("Manager identity, route and callback verified"));
 
 // v0.6.9: Live Output presents the provider's terminal envelope as readable
 // sections and metrics. The opaque JSON is retained only in a collapsed raw
