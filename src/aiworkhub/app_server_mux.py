@@ -126,6 +126,9 @@ REAL_EXECUTABLE_CONFIG_NAME = "real_executable"
 # every ownership lookup is scoped by it, closing the leak structurally
 # instead of relying on thread ids never colliding.
 ENV_REPO_ID = "AIWORKHUB_REPO_ID"
+ENV_ROUTE_WAIT_SECONDS = "AIWORKHUB_APP_SERVER_MUX_ROUTE_WAIT_SECONDS"
+DEFAULT_ROUTE_WAIT_SECONDS = 10.0
+ROUTE_WAIT_POLL_SECONDS = 0.05
 _REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
@@ -251,6 +254,33 @@ def resolve_repo_id_for_mux() -> str:
         return _validate_repo_id(matches[0])
     except ValueError:
         return ""
+
+
+def wait_for_repo_id_for_mux() -> str:
+    """Wait briefly for this extension host to publish its repo route.
+
+    VS Code starts extensions concurrently. The OpenAI extension can invoke
+    the configured mux a few milliseconds before AIWorkHub has written its
+    extension-host-PID route record. Immediate passthrough makes that one
+    startup race permanent for the lifetime of the Codex app-server. Poll a
+    small bounded window, then retain the existing fail-open passthrough if
+    no unique exact-parent route appears.
+    """
+
+    raw_timeout = os.environ.get(ENV_ROUTE_WAIT_SECONDS, str(DEFAULT_ROUTE_WAIT_SECONDS))
+    try:
+        timeout = max(0.0, min(float(raw_timeout), 30.0))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_ROUTE_WAIT_SECONDS
+    deadline = time.monotonic() + timeout
+    while True:
+        repo_id = resolve_repo_id_for_mux()
+        if repo_id:
+            return repo_id
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        time.sleep(min(ROUTE_WAIT_POLL_SECONDS, remaining))
 
 
 # --- sideband directory / capability file -------------------------------------
@@ -1305,7 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
     # the ownership invariant while remaining transparent: an unbound
     # invocation execs the real App Server byte-for-byte and simply has no
     # AIWorkHub sideband/callback capability.
-    repo_id = resolve_repo_id_for_mux()
+    repo_id = wait_for_repo_id_for_mux()
     if not repo_id:
         try:
             os.execvp(real_executable, [real_executable, *raw_argv])
@@ -1323,6 +1353,7 @@ __all__ = [
     "DEFAULT_SIDEBAND_DIR",
     "ENV_REAL_EXECUTABLE",
     "ENV_REPO_ID",
+    "ENV_ROUTE_WAIT_SECONDS",
     "ENV_SIDEBAND_DIR",
     "SIDEBAND_ALLOWED_METHODS",
     "SIDEBAND_ALLOWED_REQUEST_KEYS",

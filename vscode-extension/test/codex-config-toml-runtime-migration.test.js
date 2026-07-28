@@ -346,12 +346,12 @@ function assertUnchangedOutsideTargetLine(original, migrated, changedLineSubstri
 }
 
 // Cross-plugin failsafe: config migration remains a pure owned-table transform
-// and no shared extension-host identity binding helper remains.
+// and the separate callback mux integration preserves unrelated custom CLIs.
 {
   const source = require("fs").readFileSync(extensionPath, "utf8");
   assert.ok(!source.includes("bindCodexSidebandEnvironment"));
-  assert.ok(!source.includes('getConfiguration("chatgpt")'));
-  assert.ok(!source.includes("cliExecutable"));
+  assert.ok(source.includes('getConfiguration("chatgpt")'));
+  assert.ok(source.includes("custom_cli_executable_preserved"));
 }
 
 console.log("AIWorkHub Codex config.toml runtime migration contract checks passed");

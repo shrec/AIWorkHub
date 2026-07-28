@@ -236,7 +236,7 @@ async function snapshotFor(host) {
       "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ]));
-    assert.ok(spawns.every((spawn) => spawn.env.AIWORKHUB_CALLBACK_TRANSPORT === "subprocess"));
+    assert.ok(spawns.every((spawn) => spawn.env.AIWORKHUB_CALLBACK_TRANSPORT === "sideband"));
     assert.ok(!JSON.stringify(secondMessages).includes("repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert.ok(!JSON.stringify(firstMessages).includes("repo_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 

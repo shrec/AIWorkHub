@@ -1171,6 +1171,210 @@ tbody tr.is-selected td:first-child {
   font-size: 8px;
 }
 
+.system-log-toolbar {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-subtle);
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.system-log-toolbar button {
+  margin-left: 5px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.system-log-terminal {
+  min-height: 158px;
+  background: var(--vscode-terminal-background, #101010);
+  color: var(--vscode-terminal-foreground, #d4d4d4);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9px;
+}
+
+.system-log-row {
+  display: grid;
+  grid-template-columns: 66px 46px 60px minmax(0, 1fr);
+  gap: 7px;
+  padding: 4px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
+}
+
+.system-log-time,
+.system-log-component {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.system-log-level {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.system-log-row.level-warning .system-log-level {
+  color: var(--warning, #d7ba7d);
+}
+
+.system-log-row.level-error .system-log-level {
+  color: var(--danger, #f48771);
+}
+
+.system-log-message {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.activity-peek {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  min-height: 31px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-subtle);
+  font-size: 9px;
+}
+
+.activity-peek-label {
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.activity-peek-message {
+  overflow: hidden;
+  color: var(--ink);
+  font-family: var(--vscode-editor-font-family, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-peek button,
+.dialog-heading button {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.diagnostic-dialog {
+  width: min(880px, calc(100vw - 40px));
+  max-width: 880px;
+  height: min(650px, calc(100vh - 60px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 45%);
+}
+
+.diagnostic-dialog::backdrop {
+  background: rgb(0 0 0 / 55%);
+}
+
+.dialog-heading {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dialog-heading h2 {
+  margin: 0 0 2px;
+  font-size: 13px;
+}
+
+.dialog-heading span,
+.memory-meta {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.diagnostic-dialog .system-log-terminal {
+  height: calc(100% - 83px);
+  overflow: auto;
+}
+
+.dialog-search {
+  box-sizing: border-box;
+  width: calc(100% - 20px);
+  margin: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  outline: none;
+  background: var(--surface-subtle);
+  color: var(--ink);
+}
+
+.dialog-search:focus {
+  border-color: var(--accent);
+}
+
+.memory-list {
+  height: calc(100% - 105px);
+  overflow: auto;
+  padding: 0 10px 10px;
+}
+
+.memory-entry {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin-bottom: 7px;
+  background: var(--surface-subtle);
+}
+
+.memory-entry-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-key {
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+
+.memory-scope {
+  color: var(--accent);
+  font-size: 8px;
+  text-transform: uppercase;
+}
+
+.memory-value {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .usage-metric {
   min-width: 0;
   padding: 8px 6px;

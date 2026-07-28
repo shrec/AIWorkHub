@@ -1,4 +1,5 @@
 const assert = require("assert");
+const childProcess = require("child_process");
 const fs = require("fs");
 const Module = require("module");
 const os = require("os");
@@ -111,6 +112,9 @@ function writeInstance(instancesDir, name, overrides) {
   fs.rmSync(sharedRecordPath, { force: true });
 
   const repoInfo = { root: repoA, repoId: REPO_A_ID, repoName: "alpha", label: "alpha" };
+  const liveForeignHost = childProcess.spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
 
   try {
     assert.strictEqual(
@@ -198,7 +202,7 @@ function writeInstance(instancesDir, name, overrides) {
       repo_name: "alpha",
       repo_root: repoA,
       window_id: FOREIGN_WINDOW_ID,
-      extension_host_pid: process.pid + 5000,
+      extension_host_pid: liveForeignHost.pid,
       selected_provider: "codex",
       targets: {
         codex: {
@@ -224,6 +228,19 @@ function writeInstance(instancesDir, name, overrides) {
       "a foreign window's fresh verified route must never be overwritten by this window's pending observation",
     );
     assert.strictEqual(sharedStillForeign.targets.codex.route.thread_id, FOREIGN_UUID);
+
+    // A fresh lease owned by a dead predecessor must be replaced immediately
+    // after reload; otherwise the new mux can never discover this host PID.
+    liveForeignHost.kill("SIGTERM");
+    await new Promise((resolve) => liveForeignHost.once("exit", resolve));
+    fs.writeFileSync(sharedRecordPath, JSON.stringify(foreignRecord), "utf8");
+    route = internals.refreshCoordinatorRouteOwnership(repoInfo);
+    const sharedAfterDeadOwner = internals.readSharedRepoRouteRecord(REPO_A_ID);
+    assert.notStrictEqual(
+      sharedAfterDeadOwner.window_id,
+      FOREIGN_WINDOW_ID,
+      "a dead extension-host PID must not retain a fresh verified lease",
+    );
 
     // Once this window is itself verified, it may take over the shared manifest.
     writeInstance(instancesDir, "one", { active_thread_id: VALID_UUID_1, owned_thread_ids: [VALID_UUID_1] });
@@ -252,6 +269,7 @@ function writeInstance(instancesDir, name, overrides) {
       "an expired foreign lease must not block this window's own convergence write",
     );
   } finally {
+    if (liveForeignHost.exitCode === null) liveForeignHost.kill("SIGTERM");
     if (originalMuxDirEnv === undefined) {
       delete process.env[muxEnvName];
     } else {

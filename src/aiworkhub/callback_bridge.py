@@ -94,6 +94,9 @@ DEFAULT_APP_SERVER_TIMEOUT = 1800.0
 # timeout path exists anywhere in this module -- every AppServerClient call
 # site takes an explicit timeout, defaulting to DEFAULT_APP_SERVER_TIMEOUT.
 DEFAULT_LEASE_MARGIN_SECONDS = 300.0
+SIDEBAND_APP_SERVER_TIMEOUT_SECONDS = 45.0
+SIDEBAND_LEASE_SECONDS = 90
+SIDEBAND_LEASE_MARGIN_SECONDS = 30.0
 REDACTED_SUFFIX_LENGTH = 4
 
 
@@ -1646,11 +1649,29 @@ class CallbackBridge:
         self._client: AppServerClient | None = None
         self._sideband_client: SidebandCallbackClient | None = None
         self._stop_event = threading.Event()
+        self._startup_recovered_batch_count = 0
 
     def _conn(self):
         conn = self._callback_store.open_db(self._db_path)
         self._callback_store.init_db(conn)
         return conn
+
+    def recover_incompatible_transport_leases(self) -> int:
+        """Startup-only transport migration; direct bridge construction
+        remains side-effect free until the dispatcher actually starts it."""
+        if self._transport != "sideband":
+            return 0
+        conn = self._conn()
+        try:
+            recovered = self._callback_store.recover_incompatible_long_inflight_batches(
+                conn,
+                provider=self._provider or "codex",
+                max_lease_span_seconds=float(SIDEBAND_LEASE_SECONDS),
+            )
+        finally:
+            conn.close()
+        self._startup_recovered_batch_count += recovered
+        return recovered
 
     # --- state persistence ---
     def _read_state(self) -> dict[str, Any]:
@@ -1682,6 +1703,7 @@ class CallbackBridge:
             conn.close()
         state = self._read_state()
         stats["bridge"] = "callback_bridge_v1"
+        stats["startup_recovered_batch_count"] = self._startup_recovered_batch_count
         stats["executable"] = self._executable
         stats["last_delivery_error"] = state.get("last_error", "")
         stats["config"] = {
@@ -1984,8 +2006,11 @@ class CallbackBridge:
                 if consecutive_empty > 10 and self._client is not None:
                     self._client.stop()
                     self._client = None
-                sleep_time = 1.0 if consecutive_empty <= 10 else min(30.0, consecutive_empty * 2.0)
-                time.sleep(sleep_time)
+                # Repo-local SQLite polling is cheap. A 30-second idle
+                # backoff made healthy terminal callbacks look lost; bound
+                # wake latency to two seconds.
+                sleep_time = 1.0 if consecutive_empty <= 10 else 2.0
+                self._stop_event.wait(sleep_time)
             else:
                 consecutive_empty = 0
                 self._process_batch(_batch_from_claim_result(claimed))
@@ -2154,6 +2179,15 @@ class CallbackDispatcher:
                 # bridge_kwargs once the extension-owned App Server socket
                 # is wired as the live default -- unchanged B409 contract).
                 kwargs.setdefault("transport", "subprocess")
+                if kwargs["transport"] == "sideband":
+                    # Sideband is a bounded local socket round-trip to the
+                    # extension-owned mux, not a long-running model turn.
+                    # Reusing the subprocess transport's 35-minute lease made
+                    # abrupt reloads strand every later callback behind one
+                    # orphaned inflight batch.
+                    kwargs.setdefault("app_server_timeout", SIDEBAND_APP_SERVER_TIMEOUT_SECONDS)
+                    kwargs.setdefault("lease_seconds", SIDEBAND_LEASE_SECONDS)
+                    kwargs.setdefault("lease_margin_seconds", SIDEBAND_LEASE_MARGIN_SECONDS)
             elif self.provider == "claude":
                 # Existing canonical Claude transport (B856): claude_cli,
                 # which requires a bound repo_id/window_id at construction
@@ -2163,6 +2197,7 @@ class CallbackDispatcher:
                 kwargs.setdefault("claude_window_id", self.window_id)
             try:
                 bridge = CallbackBridge(**kwargs)
+                bridge.recover_incompatible_transport_leases()
             except Exception as exc:  # noqa: BLE001 -- surfaced via health(), never raised to caller
                 self._start_error = f"construction_failed:{type(exc).__name__}:{exc}"[:500]
                 self._bridge = None

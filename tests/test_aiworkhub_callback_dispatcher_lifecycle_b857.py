@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,6 +164,79 @@ def test_unsupported_provider_fails_closed_no_thread_no_fabricated_delivery(tmp_
     assert health["last_start_error"] == "unsupported_provider:copilot"
     # Visible, never silently treated as delivered.
     assert health["bridge"] is None
+
+
+def test_sideband_dispatcher_uses_bounded_local_transport_lease(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeBridge:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.stopped = threading.Event()
+
+        def daemon(self):
+            self.stopped.wait(1)
+
+        def stop_daemon(self):
+            self.stopped.set()
+
+        def recover_incompatible_transport_leases(self):
+            return 0
+
+        def health(self):
+            return {"by_state": {"pending": 0}, "last_delivery_error": ""}
+
+    monkeypatch.setattr(callback_bridge, "CallbackBridge", FakeBridge)
+    dispatcher = callback_bridge.CallbackDispatcher(
+        tmp_path / "repo",
+        "codex",
+        repo_id="repo_sideband_bounded",
+        bridge_kwargs={"transport": "sideband"},
+    )
+    dispatcher.start()
+    try:
+        assert captured["transport"] == "sideband"
+        assert captured["app_server_timeout"] == callback_bridge.SIDEBAND_APP_SERVER_TIMEOUT_SECONDS
+        assert captured["lease_seconds"] == callback_bridge.SIDEBAND_LEASE_SECONDS
+        assert captured["lease_margin_seconds"] == callback_bridge.SIDEBAND_LEASE_MARGIN_SECONDS
+    finally:
+        dispatcher.stop()
+
+
+def test_sideband_startup_recovers_only_legacy_long_inflight_lease(tmp_path):
+    db_path = tmp_path / "callback.sqlite"
+    conn = callback_store.open_db(db_path)
+    callback_store.init_db(conn)
+    old_claimed = "2026-07-28T11:00:00+00:00"
+    conn.execute(
+        "INSERT INTO callback_batches(batch_id,provider,origin_thread_id,state,created_at,updated_at,"
+        "attempts,lease_id,lease_expires_at,member_count) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            "legacy-batch", "codex", "thread-a", "inflight", old_claimed,
+            old_claimed, 1, "legacy-lease", "2026-07-28T11:35:00+00:00", 1,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO callback_outbox(task_id,provider,origin_thread_id,transition,episode_id,state,"
+        "created_at,updated_at,batch_id) VALUES(?,?,?,?,?,?,?,?,?)",
+        (
+            "TASK_LEGACY", "codex", "thread-a", "review_ready", "1", "inflight",
+            old_claimed, old_claimed, "legacy-batch",
+        ),
+    )
+    conn.commit()
+    recovered = callback_store.recover_incompatible_long_inflight_batches(
+        conn, provider="codex", max_lease_span_seconds=callback_bridge.SIDEBAND_LEASE_SECONDS,
+    )
+    assert recovered == 1
+    batch = conn.execute("SELECT * FROM callback_batches WHERE batch_id='legacy-batch'").fetchone()
+    member = conn.execute("SELECT * FROM callback_outbox WHERE task_id='TASK_LEGACY'").fetchone()
+    assert batch["state"] == "pending"
+    assert batch["lease_id"] == ""
+    assert batch["last_failure_kind"] == "transport_upgrade_recovery"
+    assert member["state"] == "pending"
+    assert member["last_error"] == "legacy_long_lease_recovered_for_sideband"
+    conn.close()
 
 
 def test_dispatcher_health_reports_running_provider_repo_pending_and_error(tmp_path, cleanup_dispatchers):

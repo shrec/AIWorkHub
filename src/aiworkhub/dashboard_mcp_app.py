@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from typing import Any, Mapping
 
-from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, shared_router, task_store
+from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, shared_router, storage_registry, task_store
 
 
 # Hard bound on the serialized tool response so a very large queue (many
@@ -56,6 +57,8 @@ _DETAIL_TRIM_FIELDS: tuple[str, ...] = (
 
 # Bound on the Live Output tool's serialized response.
 MAX_LIVE_OUTPUT_BYTES = 64 * 1024
+MAX_MEMORY_ROWS = 200
+MAX_MEMORY_VALUE_CHARS = 4000
 
 # The ONE genuine "repository has never been initialized" reason prefix
 # ``task_store.storage_readiness`` can produce: ``inspect_repository`` raised
@@ -238,6 +241,61 @@ def task_detail_view(task_id: str) -> dict[str, Any]:
     response["server_tool"] = "aiworkhub_dashboard_task_detail"
     response["authority_flags"] = _readonly_authority_flags()
     return _bound_task_detail(response)
+
+
+def memory_view(limit: int = 100) -> dict[str, Any]:
+    """READ-ONLY: newest canonical AI Memory rows for this repository.
+
+    The database path is resolved exclusively through the repo-bound storage
+    registry and opened read-only. Browsing never mutates access counters.
+    """
+
+    try:
+        safe_limit = max(1, min(int(limit), MAX_MEMORY_ROWS))
+    except (TypeError, ValueError):
+        safe_limit = 100
+    try:
+        root = core.repo_root()
+        registry = storage_registry.load_storage_registry(root)
+        db_path = storage_registry.resolve_database_path(registry, "memory")
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            total = int(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            rows = connection.execute(
+                "SELECT id, key, value, tags, scope, project, created_at, updated_at "
+                "FROM memories ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
+        return {
+            "ok": False,
+            "error": f"memory_unavailable:{type(exc).__name__}",
+            "entries": [],
+            "total": 0,
+            "authority_flags": _readonly_authority_flags(),
+        }
+    entries = [{
+        "id": int(row["id"]),
+        "key": str(row["key"] or "")[:300],
+        "value": str(row["value"] or "")[:MAX_MEMORY_VALUE_CHARS],
+        "tags": str(row["tags"] or "")[:500],
+        "scope": str(row["scope"] or "")[:40],
+        "project": str(row["project"] or "")[:200],
+        "created_at": str(row["created_at"] or "")[:80],
+        "updated_at": str(row["updated_at"] or "")[:80],
+    } for row in rows]
+    return {
+        "ok": True,
+        "server_tool": "aiworkhub_dashboard_memory",
+        "entries": entries,
+        "count": len(entries),
+        "total": total,
+        "truncated": total > len(entries),
+        "authority_flags": _readonly_authority_flags(),
+    }
 
 
 def health_view() -> dict[str, Any]:
@@ -462,6 +520,8 @@ INITIALIZE_TOOLS: dict[str, Any] = {INITIALIZE_TOOL_NAME: initialize_view}
 # unchanged.
 LIVE_OUTPUT_TOOL_NAME = "aiworkhub_dashboard_task_live_output"
 LIVE_OUTPUT_TOOLS: dict[str, Any] = {LIVE_OUTPUT_TOOL_NAME: task_live_output_view}
+MEMORY_TOOL_NAME = "aiworkhub_dashboard_memory"
+MEMORY_TOOLS: dict[str, Any] = {MEMORY_TOOL_NAME: memory_view}
 
 
 def register(mcp: Any) -> tuple[str, ...]:
@@ -481,6 +541,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in LIVE_OUTPUT_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in MEMORY_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in INITIALIZE_TOOLS.items():
         mcp.tool(name=name)(fn)
-    return READONLY_TOOL_NAMES + (LIVE_OUTPUT_TOOL_NAME,) + (INITIALIZE_TOOL_NAME,)
+    return READONLY_TOOL_NAMES + (LIVE_OUTPUT_TOOL_NAME, MEMORY_TOOL_NAME) + (INITIALIZE_TOOL_NAME,)

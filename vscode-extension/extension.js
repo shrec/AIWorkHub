@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.69";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.75";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -27,6 +27,9 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "selectCoordinatorTarget",
   "initializeStorage",
   "requestLiveOutput",
+  "clearSystemLogs",
+  "copySystemLogs",
+  "requestMemory",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -39,6 +42,9 @@ const OUTBOUND_TYPES = Object.freeze({
   runtimeInfo: "runtimeInfo",
   coordinatorTargets: "coordinatorTargets",
   liveOutput: "liveOutput",
+  systemLogs: "systemLogs",
+  notification: "notification",
+  memory: "memory",
 });
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
@@ -66,6 +72,7 @@ const DASHBOARD_TOOLS = Object.freeze({
   taskDetail: "aiworkhub_dashboard_task_detail",
   health: "aiworkhub_dashboard_health",
   liveOutput: "aiworkhub_dashboard_task_live_output",
+  memory: "aiworkhub_dashboard_memory",
 });
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
@@ -193,6 +200,24 @@ function sharedRouteHasVerifiedCodexThread(record) {
   return Boolean(route) && REAL_THREAD_ID_RE.test(String(route.thread_id || ""));
 }
 
+// A lease timestamp alone is not liveness. Reloading or crashing a Remote
+// extension host can leave a freshly renewed shared route on disk even though
+// its owning PID is gone. Preserving that dead record prevents the replacement
+// window from publishing its PID; the App Server mux then cannot bind the
+// repository and falls through to unobserved Codex after its startup timeout.
+// Signal 0 checks existence without terminating the process and is supported
+// by Node on Linux, macOS, and Windows.
+function isLocalProcessAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 1) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
 // B1008: the shared repo-wide manifest is a single last-writer-wins file --
 // without this gate, a second window on the same repository (still
 // route_pending, or observing an ambiguous/stale mux) could overwrite a
@@ -219,6 +244,7 @@ function writeSharedRepoRouteRecord(repoInfo, targets) {
     && existing.window_id !== WINDOW_SCOPE_ID
     && !thisWindowVerified
     && isSharedRouteRecordLeaseFresh(existing)
+    && isLocalProcessAlive(existing.extension_host_pid)
     && sharedRouteHasVerifiedCodexThread(existing)
   ) {
     return existing;
@@ -619,6 +645,9 @@ function removeWindowRouteRecord(repoInfo) {
 // to activeRepoIdentity, so a window with no bound repository yet simply
 // skips a tick instead of writing a bogus record.
 let windowRouteRenewalTimer = null;
+let startupRouteConvergenceTimer = null;
+const STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS = 250;
+const STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS = 40;
 
 function renewWindowRouteLease() {
   if (!activeRepoIdentity || !REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))) {
@@ -637,6 +666,44 @@ function startWindowRouteRenewalTimer() {
   windowRouteRenewalTimer = setInterval(renewWindowRouteLease, WINDOW_ROUTE_RENEWAL_INTERVAL_MS);
   if (windowRouteRenewalTimer && typeof windowRouteRenewalTimer.unref === "function") {
     windowRouteRenewalTimer.unref();
+  }
+}
+
+// The mux descriptor becomes ready before its first thread/start event is
+// necessarily observed. A single refresh immediately after MCP startup can
+// therefore publish route_pending and then leave the truthful UUID invisible
+// until the four-minute lease renewal. Converge only during a bounded startup
+// window; stop as soon as the exact mux-owned thread is available.
+function startStartupRouteConvergence(repoInfo) {
+  stopStartupRouteConvergence();
+  let attempts = 0;
+  const tick = () => {
+    startupRouteConvergenceTimer = null;
+    if (!activeRepoIdentity || activeRepoIdentity.root !== repoInfo.root) return;
+    attempts += 1;
+    let route = null;
+    try {
+      route = refreshCoordinatorRouteOwnership(repoInfo);
+    } catch (_err) {
+      // A later bounded tick can recover from a transient filesystem race.
+    }
+    const threadId = route && route.targets && route.targets.codex
+      && route.targets.codex.route && route.targets.codex.route.thread_id;
+    if (REAL_THREAD_ID_RE.test(String(threadId || "")) || attempts >= STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS) {
+      return;
+    }
+    startupRouteConvergenceTimer = setTimeout(tick, STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS);
+    if (startupRouteConvergenceTimer && typeof startupRouteConvergenceTimer.unref === "function") {
+      startupRouteConvergenceTimer.unref();
+    }
+  };
+  tick();
+}
+
+function stopStartupRouteConvergence() {
+  if (startupRouteConvergenceTimer) {
+    clearTimeout(startupRouteConvergenceTimer);
+    startupRouteConvergenceTimer = null;
   }
 }
 
@@ -1116,9 +1183,11 @@ class McpStdioClient {
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
       AIWORKHUB_WINDOW_ID: WINDOW_SCOPE_ID,
       AIWORKHUB_CLAIM_EPISODE: this.claimEpisode,
-      // A successful synchronous turn/start response is the delivery ACK;
-      // later turn status cannot duplicate or dead-letter the callback.
-      AIWORKHUB_CALLBACK_TRANSPORT: "subprocess",
+      // The extension already owns the repository-bound Codex App Server
+      // through the transparent mux. Deliver callbacks through that exact
+      // mux instead of spawning a second app-server process, which can strand
+      // an inflight batch behind a long lease after reload.
+      AIWORKHUB_CALLBACK_TRANSPORT: "sideband",
     };
     // Extension-local runtime import path: `import aiworkhub` must always
     // resolve to the package this extension bundled under its own
@@ -1508,6 +1577,118 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 // this extension's extensionKind is "workspace". Never derived from the
 // selected repository, an editable install, or a fixed host path.
 let extensionRuntimeDir = null;
+const SYSTEM_LOG_MAX_ENTRIES = 1200;
+const SYSTEM_LOG_MAX_LINE_CHARS = 800;
+const SYSTEM_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SYSTEM_LOG_MAX_FILE_BYTES = 1024 * 1024;
+const SYSTEM_LOG_MAX_PERSISTED_ENTRIES = SYSTEM_LOG_MAX_ENTRIES;
+let systemLogSequence = 0;
+let systemLogEntries = [];
+let systemLogRepoRoot = "";
+let systemLogFlushTimer = null;
+
+function systemLogFile(root) {
+  return path.join(root, ".aiworkhub", "runtime", "logs", "dashboard-system.json");
+}
+
+function pruneSystemLogs(entries) {
+  const cutoff = Date.now() - SYSTEM_LOG_RETENTION_MS;
+  const retained = entries
+    .filter((entry) => Number.isFinite(Date.parse(entry.timestamp)) && Date.parse(entry.timestamp) >= cutoff)
+    .slice(0, SYSTEM_LOG_MAX_PERSISTED_ENTRIES);
+  while (retained.length > 1 && Buffer.byteLength(JSON.stringify(retained), "utf8") > SYSTEM_LOG_MAX_FILE_BYTES) {
+    retained.pop();
+  }
+  return retained;
+}
+
+function flushSystemLogs() {
+  if (systemLogFlushTimer) {
+    clearTimeout(systemLogFlushTimer);
+    systemLogFlushTimer = null;
+  }
+  if (!systemLogRepoRoot || !fs.existsSync(path.join(systemLogRepoRoot, ".aiworkhub", "project.json"))) return;
+  systemLogEntries = pruneSystemLogs(systemLogEntries);
+  try {
+    atomicWriteJson(systemLogFile(systemLogRepoRoot), {
+      schema_id: "aiworkhub.dashboard_system_log.v1",
+      retention_days: 7,
+      max_bytes: SYSTEM_LOG_MAX_FILE_BYTES,
+      entries: systemLogEntries,
+    });
+  } catch (_err) {
+    // Logging must never take the dashboard or MCP lifecycle down.
+  }
+}
+
+function scheduleSystemLogFlush() {
+  if (!systemLogRepoRoot || systemLogFlushTimer) return;
+  systemLogFlushTimer = setTimeout(flushSystemLogs, 500);
+}
+
+function bindSystemLogRepository(root) {
+  if (!root || root === systemLogRepoRoot) return;
+  flushSystemLogs();
+  const startupEntries = systemLogRepoRoot ? [] : systemLogEntries.slice();
+  systemLogRepoRoot = root;
+  let persisted = [];
+  try {
+    const file = systemLogFile(root);
+    const stat = fs.lstatSync(file);
+    if (stat.isFile() && stat.size <= SYSTEM_LOG_MAX_FILE_BYTES + 4096) {
+      const payload = JSON.parse(fs.readFileSync(file, "utf8"));
+      persisted = Array.isArray(payload.entries) ? payload.entries : [];
+    }
+  } catch (_err) {
+    persisted = [];
+  }
+  systemLogEntries = pruneSystemLogs([...startupEntries, ...persisted]);
+  scheduleSystemLogFlush();
+}
+
+function systemLogLevel(message) {
+  const normalized = String(message || "").toLowerCase();
+  if (normalized.includes("error") || normalized.includes("failed") || normalized.includes("mismatch")) return "error";
+  if (normalized.includes("warning") || normalized.includes("degraded")) return "warning";
+  return "info";
+}
+
+function recordSystemLog(value) {
+  const raw = sanitizeStderrChunk(String(value || ""));
+  for (const candidate of raw.split(/\r?\n/)) {
+    const message = candidate.trim().slice(0, SYSTEM_LOG_MAX_LINE_CHARS);
+    if (!message) continue;
+    const componentMatch = /^\[([^\]]{1,24})\]\s*/.exec(message);
+    systemLogEntries.unshift({
+      sequence: ++systemLogSequence,
+      timestamp: new Date().toISOString(),
+      level: systemLogLevel(message),
+      component: componentMatch ? componentMatch[1] : "system",
+      message: componentMatch ? message.slice(componentMatch[0].length) : message,
+    });
+  }
+  systemLogEntries = pruneSystemLogs(systemLogEntries);
+  scheduleSystemLogFlush();
+}
+
+function systemLogSnapshot() {
+  return systemLogEntries.slice(0, SYSTEM_LOG_MAX_ENTRIES).map((entry) => ({ ...entry }));
+}
+
+function clearSystemLogs() {
+  systemLogEntries = [];
+  flushSystemLogs();
+}
+
+function createManagedOutputChannel() {
+  const channel = vscode.window.createOutputChannel("AIWorkHub");
+  const appendLine = channel.appendLine.bind(channel);
+  channel.appendLine = (value) => {
+    appendLine(value);
+    recordSystemLog(value);
+  };
+  return channel;
+}
 
 // Installed VSIX directories are versioned and VS Code is free to remove the
 // previous directory as soon as an upgrade lands.  Long-lived Codex/MCP
@@ -1639,6 +1820,40 @@ function materializeStableRuntimeGeneration(context) {
     updated_at: new Date().toISOString(),
   });
   return { runtimeDir, generationRoot, fingerprint, version, storageRoot };
+}
+
+/** Publish a usable runtime pointer before any expensive fingerprint/copy work.
+ *
+ * VS Code activates extensions concurrently.  Codex may spawn its App Server
+ * a few hundred milliseconds after AIWorkHub activation starts.  Computing a
+ * full runtime fingerprint and materializing an immutable generation before
+ * configuring chatgpt.cliExecutable left a startup window in which Codex
+ * permanently started the bundled binary directly.  The extension's packaged
+ * runtime is already complete and immutable for the lifetime of this installed
+ * extension, so point the stable launcher at it immediately.  The normal
+ * materializer replaces this bootstrap pointer atomically with the content-
+ * addressed generation later in the same activation.
+ */
+function primeStableMuxRuntimePointer(context) {
+  const runtimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  if (!fs.existsSync(path.join(runtimeDir, "aiworkhub", "app_server_mux.py"))) {
+    throw new Error(`bundled_mux_runtime_missing:${runtimeDir}`);
+  }
+  if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
+    return { runtimeDir, storageRoot: null };
+  }
+  const storageRoot = context.globalStorageUri.fsPath;
+  atomicWriteJson(path.join(storageRoot, "runtime", "current.json"), {
+    schema_id: STABLE_RUNTIME_SCHEMA,
+    version: String(
+      (context.extension && context.extension.packageJSON && context.extension.packageJSON.version)
+        || EXPECTED_MCP_PACKAGE_VERSION,
+    ),
+    bootstrap: true,
+    runtime_dir: runtimeDir,
+    updated_at: new Date().toISOString(),
+  });
+  return { runtimeDir, storageRoot };
 }
 
 // ── Codex config.toml PYTHONPATH runtime migration (B894a) ─────────────────
@@ -2035,6 +2250,130 @@ function ensureCodexManagerGatesRepaired() {
   }
 }
 
+/** Ensure Codex App Server traffic is wrapped by AIWorkHub's transparent,
+ * repository-resolving sideband mux.  This is the callback route's actual
+ * thread-observation source; a running dispatcher alone cannot discover the
+ * active Codex thread.  Apply only when the setting is empty or already
+ * AIWorkHub-owned, never overwrite a user's unrelated custom executable.
+ *
+ * The setting is remote-host global because chatgpt.cliExecutable is an
+ * application-scoped OpenAI extension setting.  The mux itself remains
+ * repository-safe: it resolves exactly one live repo route from the spawning
+ * extension-host PID and transparently passes through when no unique repo is
+ * available.  Linux/macOS and Windows use their packaged native launchers.
+ */
+function materializeStableMuxLauncher(context) {
+  if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
+    const fallbackName = process.platform === "win32" ? "aiworkhub-app-server-mux.cmd" : "aiworkhub-app-server-mux";
+    return path.join(context.extensionUri.fsPath, "bin", fallbackName);
+  }
+  const binDir = path.join(context.globalStorageUri.fsPath, "bin");
+  const pythonLauncher = path.join(binDir, "aiworkhub-app-server-mux.py");
+  const posixLauncher = path.join(binDir, "aiworkhub-app-server-mux");
+  const windowsLauncher = path.join(binDir, "aiworkhub-app-server-mux.cmd");
+  const script = `#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
+runtime = Path(current["runtime_dir"])
+if not (runtime / "aiworkhub" / "app_server_mux.py").is_file():
+    raise SystemExit("AIWorkHub stable mux runtime is missing")
+sys.path.insert(0, str(runtime))
+from aiworkhub.app_server_mux import main
+raise SystemExit(main())
+`;
+  const cmd = `@echo off\r\nwhere py >nul 2>nul\r\nif %errorlevel% equ 0 (\r\n  py -3 "%~dp0aiworkhub-app-server-mux.py" %*\r\n) else (\r\n  python "%~dp0aiworkhub-app-server-mux.py" %*\r\n)\r\n`;
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(pythonLauncher, script, { encoding: "utf8", mode: 0o755 });
+  fs.writeFileSync(posixLauncher, script, { encoding: "utf8", mode: 0o755 });
+  fs.writeFileSync(windowsLauncher, cmd, "utf8");
+  if (process.platform !== "win32") {
+    fs.chmodSync(pythonLauncher, 0o755);
+    fs.chmodSync(posixLauncher, 0o755);
+  }
+  return process.platform === "win32" ? windowsLauncher : posixLauncher;
+}
+
+/** Install the stable command name contributed as chatgpt.cliExecutable's
+ * default. Manifest defaults are loaded before extension activation, unlike a
+ * Remote-SSH ConfigurationTarget.Global write which is not authoritative for
+ * an application-scoped setting. Explicit user configuration still wins and
+ * is never overwritten. */
+function materializePathMuxShim(stableLauncher, options = {}) {
+  const platform = options.platform || process.platform;
+  const home = options.home || os.homedir();
+  const env = options.env || process.env;
+  let binDir;
+  if (platform === "win32") {
+    const normalizedHome = path.resolve(home).toLowerCase();
+    const candidates = String(env.PATH || "").split(path.delimiter).filter(Boolean);
+    binDir = candidates.find((candidate) => {
+      try {
+        const resolved = path.resolve(candidate).toLowerCase();
+        return resolved === normalizedHome || resolved.startsWith(normalizedHome + path.sep.toLowerCase());
+      } catch (_err) {
+        return false;
+      }
+    }) || path.join(home, "AppData", "Local", "Microsoft", "WindowsApps");
+  } else {
+    binDir = path.join(home, ".local", "bin");
+  }
+  fs.mkdirSync(binDir, { recursive: true });
+  const shim = path.join(
+    binDir,
+    platform === "win32" ? "aiworkhub-app-server-mux.cmd" : "aiworkhub-app-server-mux",
+  );
+  if (platform === "win32") {
+    const escaped = stableLauncher.replace(/"/g, '""');
+    fs.writeFileSync(shim, `@echo off\r\n"${escaped}" %*\r\n`, "utf8");
+  } else {
+    const escaped = stableLauncher.replace(/'/g, `'\\''`);
+    fs.writeFileSync(shim, `#!/bin/sh\nexec '${escaped}' "$@"\n`, { encoding: "utf8", mode: 0o755 });
+    fs.chmodSync(shim, 0o755);
+  }
+  return shim;
+}
+
+async function ensureCodexCallbackMuxConfigured(context, launcherOverride = "") {
+  const launcherName = process.platform === "win32"
+    ? "aiworkhub-app-server-mux.cmd"
+    : "aiworkhub-app-server-mux";
+  const launcher = launcherOverride || path.join(context.extensionUri.fsPath, "bin", launcherName);
+  try {
+    const stat = fs.statSync(launcher);
+    if (!stat.isFile()) {
+      return { ok: false, changed: false, reason: "mux_launcher_not_file" };
+    }
+  } catch (_err) {
+    return { ok: false, changed: false, reason: "mux_launcher_missing" };
+  }
+
+  try {
+    const config = vscode.workspace.getConfiguration("chatgpt");
+    const current = String(config.get("cliExecutable", "") || "").trim();
+    const aiworkhubOwned = !current || /aiworkhub-app-server-mux(?:\.cmd)?$/i.test(current);
+    if (!aiworkhubOwned) {
+      if (outputChannel) outputChannel.appendLine("[codex] callback mux not applied: custom chatgpt.cliExecutable is preserved");
+      return { ok: false, changed: false, reason: "custom_cli_executable_preserved" };
+    }
+    if (path.resolve(current || launcher) === path.resolve(launcher) && current) {
+      return { ok: true, changed: false, launcher };
+    }
+    if (!config || typeof config.update !== "function") {
+      return { ok: false, changed: false, reason: "configuration_update_unavailable" };
+    }
+    await config.update("cliExecutable", launcher, true);
+    if (outputChannel) outputChannel.appendLine("[codex] configured stable AIWorkHub App Server callback mux");
+    return { ok: true, changed: true, launcher };
+  } catch (err) {
+    if (outputChannel) outputChannel.appendLine(`[codex] callback mux configuration failed: ${sanitizeErrorMessage(err)}`);
+    return { ok: false, changed: false, reason: "configuration_update_failed" };
+  }
+}
+
 /** Repair a repository-local VS Code MCP registration created by an older
  *  AIWorkHub release. The dashboard child and Copilot's MCP child are separate
  *  processes: the latter reads `.vscode/mcp.json`, so a stale repository
@@ -2394,9 +2733,13 @@ async function pushSnapshotOnce(view) {
       await new Promise((resolve) => setTimeout(resolve, MCP_RECOVERY_BACKOFF_MS[attempt - 1]));
     }
     try {
+      if (activeRepoIdentity) refreshCoordinatorRouteOwnership(activeRepoIdentity);
       const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
       if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
-        view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
+        view.postMessage({
+          type: OUTBOUND_TYPES.snapshot,
+          payload: sanitizeWebviewPayload({ ...payload, system_logs: systemLogSnapshot() }),
+        });
       } else if (!payload && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
       }
@@ -2423,9 +2766,13 @@ async function pushSnapshotNoRetry(view) {
   try {
     const client = getMcpClient();
     view.bindClient(client);
+    if (activeRepoIdentity) refreshCoordinatorRouteOwnership(activeRepoIdentity);
     const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
     if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
-      view.postMessage({ type: OUTBOUND_TYPES.snapshot, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({
+        type: OUTBOUND_TYPES.snapshot,
+        payload: sanitizeWebviewPayload({ ...payload, system_logs: systemLogSnapshot() }),
+      });
     } else if (!payload && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
     }
@@ -2473,6 +2820,19 @@ async function pushLiveOutput(view, taskId, cursor) {
     });
     if (view.stillBoundTo(client)) {
       view.postMessage({ type: OUTBOUND_TYPES.liveOutput, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function pushMemory(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(DASHBOARD_TOOLS.memory, { limit: 200 });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.memory, payload: sanitizeWebviewPayload(payload) });
     }
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -2571,6 +2931,26 @@ function handleInboundMessage(view, message) {
       pushLiveOutput(view, taskId, Number.isFinite(cursor) && cursor >= 0 ? cursor : 0);
       break;
     }
+    case "clearSystemLogs":
+      clearSystemLogs();
+      view.postMessage({ type: OUTBOUND_TYPES.systemLogs, payload: [] });
+      break;
+    case "copySystemLogs": {
+      const text = systemLogEntries
+        .slice()
+        .reverse()
+        .map((entry) => `${entry.timestamp} ${entry.level.toUpperCase()} [${entry.component}] ${entry.message}`)
+        .join("\n");
+      Promise.resolve(vscode.env.clipboard.writeText(text)).then(() => {
+        view.postMessage({ type: OUTBOUND_TYPES.notification, message: "System log copied" });
+      }).catch(() => {
+        view.postMessage({ type: OUTBOUND_TYPES.error, message: "system_log_copy_failed" });
+      });
+      break;
+    }
+    case "requestMemory":
+      pushMemory(view);
+      break;
     default:
       break;
   }
@@ -2721,6 +3101,13 @@ function getHtmlForWebview(webview, extensionUri) {
     <section class="source-alert identity-alert" id="identity-alert" aria-live="polite" hidden>
       <strong id="identity-alert-title">Manager identity</strong>
       <span id="identity-alert-message"></span>
+    </section>
+
+    <section class="activity-peek" aria-label="Repository diagnostics">
+      <span class="activity-peek-label">Last log</span>
+      <span class="activity-peek-message" id="last-system-log">No system events yet</span>
+      <button type="button" id="open-system-log">Logs</button>
+      <button type="button" id="open-ai-memory">Memory</button>
     </section>
 
     <section class="target-selector" aria-label="Coordinator routing">
@@ -2889,6 +3276,27 @@ function getHtmlForWebview(webview, extensionUri) {
       </aside>
     </div>
   </main>
+
+  <dialog class="diagnostic-dialog" id="system-log-dialog">
+    <div class="dialog-heading">
+      <div><h2>System Log</h2><span>Newest first · max 1 MB · retained up to 7 days</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="system-log-dialog">Close</button>
+    </div>
+    <div class="system-log-toolbar">
+      <span id="system-log-count">0 events</span>
+      <span><button type="button" id="system-log-copy">Copy</button><button type="button" id="system-log-clear">Clear</button></span>
+    </div>
+    <div class="system-log-terminal" id="system-log-list" role="log" aria-live="polite"></div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog" id="ai-memory-dialog">
+    <div class="dialog-heading">
+      <div><h2>AI Memory</h2><span id="ai-memory-summary">Loading repository memory</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="ai-memory-dialog">Close</button>
+    </div>
+    <input class="dialog-search" id="ai-memory-search" type="search" placeholder="Filter key, value or tags" aria-label="Filter AI Memory">
+    <div class="memory-list" id="ai-memory-list"></div>
+  </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <script nonce="${nonceValue}" src="${scriptUri}"></script>
@@ -3172,6 +3580,7 @@ async function selectRepositoryCommand() {
     const repo = getActiveRepositoryRoot(ctx);
     activeRepoLabel = repositoryLabel(folders, repo.uriStr);
     activeRepoIdentity = { ...repo, label: activeRepoLabel };
+    bindSystemLogRepository(repo.root);
     vscode.window.showInformationMessage(`AIWorkHub: bound to "${activeRepoLabel}" (single-folder workspace).`);
     return;
   }
@@ -3211,6 +3620,7 @@ async function selectRepositoryCommand() {
   activeRepoLabel = repositoryLabel(folders, choice.uriStr);
   const selectedRepo = getActiveRepositoryRoot(ctx);
   activeRepoIdentity = { ...selectedRepo, label: activeRepoLabel };
+  bindSystemLogRepository(selectedRepo.root);
 
   // Start the new client and refresh.
   try {
@@ -3237,21 +3647,25 @@ async function selectRepositoryCommand() {
 
 async function activate(context) {
   extensionContext = context;
-  outputChannel = vscode.window.createOutputChannel("AIWorkHub");
+  outputChannel = createManagedOutputChannel();
   context.subscriptions.push(outputChannel);
-  const stableRuntime = materializeStableRuntimeGeneration(context);
-  extensionRuntimeDir = stableRuntime.runtimeDir;
-  outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
-  ensureCodexConfigTomlRepaired(context);
-  migrateCodexConfigTomlRuntimePath(context);
-  ensureCodexManagerGatesRepaired();
-  ensureWorkspaceMcpConfigsRepaired(context);
 
-  // Resolve the initial active repository and label.
+  // Bootstrap the callback topology first.  Nothing expensive may precede
+  // these operations: OpenAI's onStartupFinished activation runs concurrently
+  // and otherwise wins the spawn race with an unwrapped Codex App Server.
+  const stableMuxLauncher = materializeStableMuxLauncher(context);
+  materializePathMuxShim(stableMuxLauncher);
+  primeStableMuxRuntimePointer(context);
+  await ensureCodexCallbackMuxConfigured(context, stableMuxLauncher);
+
+  // Publish this extension-host PID immediately.  A newly launched mux waits
+  // on this exact repo/PID binding before it starts the real App Server.
   try {
     const repo = getActiveRepositoryRoot(context);
     activeRepoLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], repo.uriStr);
     activeRepoIdentity = { ...repo, label: activeRepoLabel };
+    bindSystemLogRepository(repo.root);
+    refreshCoordinatorRouteOwnership(activeRepoIdentity);
   } catch (err) {
     if (err.message === "no_repository_selected") {
       activeRepoLabel = "Select a repository";
@@ -3259,6 +3673,17 @@ async function activate(context) {
       activeRepoLabel = "No workspace";
     }
   }
+
+  // The callback launcher and repo route are now available.  Materialize the
+  // heavier content-addressed runtime generation without blocking Codex from
+  // entering the mux.
+  const stableRuntime = materializeStableRuntimeGeneration(context);
+  extensionRuntimeDir = stableRuntime.runtimeDir;
+  outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
+  ensureCodexConfigTomlRepaired(context);
+  migrateCodexConfigTomlRuntimePath(context);
+  ensureCodexManagerGatesRepaired();
+  ensureWorkspaceMcpConfigsRepaired(context);
 
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
@@ -3295,6 +3720,7 @@ async function activate(context) {
     // available now instead of waiting for the 4-minute renewal tick.
     getMcpClient().ensureStarted().then(() => {
       refreshCoordinatorRouteOwnership(activeRepoIdentity);
+      startStartupRouteConvergence(activeRepoIdentity);
     }).catch((err) => {
       outputChannel.appendLine(
         `[mcp] startup dispatcher activation failed: ${sanitizeErrorMessage(err)}`,
@@ -3311,6 +3737,8 @@ async function activate(context) {
 
 async function deactivate() {
   stopWindowRouteRenewalTimer();
+  stopStartupRouteConvergence();
+  flushSystemLogs();
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
@@ -3343,9 +3771,16 @@ module.exports = {
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,
+    primeStableMuxRuntimePointer,
     materializeStableRuntimeGeneration,
     repairCodexConfigTomlText,
     ensureCodexManagerGatesTomlText,
+    ensureCodexCallbackMuxConfigured,
+    materializeStableMuxLauncher,
+    materializePathMuxShim,
+    recordSystemLog,
+    systemLogSnapshot,
+    clearSystemLogs,
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,
     repairWorkspaceMcpConfigObject,
@@ -3358,6 +3793,8 @@ module.exports = {
     renewWindowRouteLease,
     startWindowRouteRenewalTimer,
     stopWindowRouteRenewalTimer,
+    startStartupRouteConvergence,
+    stopStartupRouteConvergence,
     isWindowRouteRenewalTimerActive: () => Boolean(windowRouteRenewalTimer),
     refreshCoordinatorRouteOwnership,
     readCoordinatorTargets,
@@ -3377,6 +3814,8 @@ module.exports = {
       EXPECTED_MCP_PACKAGE_VERSION,
       WINDOW_ROUTE_LEASE_TTL_MS,
       WINDOW_ROUTE_RENEWAL_INTERVAL_MS,
+      STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS,
+      STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS,
       APP_SERVER_MUX_SIDEBAND_DIR_ENV,
       REAL_THREAD_ID_RE,
     },

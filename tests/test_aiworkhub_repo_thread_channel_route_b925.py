@@ -254,6 +254,7 @@ def test_describe_sideband_owner_freshness_scoped_by_repo_id(tmp_path):
 
 def test_main_unbound_app_server_execs_real_binary_without_sideband(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    monkeypatch.setenv(asm.ENV_ROUTE_WAIT_SECONDS, "0")
     # Hermetic: a developer machine may legitimately pin the extension's
     # absolute Codex binary in ~/.aiworkhub/app_server_mux/real_executable.
     # This test exercises unbound passthrough shape, not host configuration.
@@ -273,6 +274,33 @@ def test_main_unbound_app_server_execs_real_binary_without_sideband(monkeypatch)
     with pytest.raises(SystemExit):
         asm.main(["app-server", "--listen", "stdio://"])
     assert calls == [("codex", ["codex", "app-server", "--listen", "stdio://"])]
+
+
+def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkeypatch):
+    monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    monkeypatch.setenv(asm.ENV_ROUTE_WAIT_SECONDS, "1")
+    attempts = {"count": 0}
+
+    def routes(**_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return {"ok": True, "repositories": []}
+        return {
+            "ok": True,
+            "repositories": [{
+                "repo_id": "repo_0123456789abcdef0123456789abcdef",
+                "extension_host_pid": 4242,
+                "extension_host_alive": True,
+                "stale": False,
+                "selected_provider": "codex",
+            }],
+        }
+
+    monkeypatch.setattr(asm.os, "getppid", lambda: 4242)
+    monkeypatch.setattr(asm.shared_router, "list_known_repositories", routes)
+    monkeypatch.setattr(asm.time, "sleep", lambda _seconds: None)
+    assert asm.wait_for_repo_id_for_mux() == "repo_0123456789abcdef0123456789abcdef"
+    assert attempts["count"] == 3
 
 
 def test_resolve_repo_id_for_mux_uses_exact_parent_extension_host_route(monkeypatch):

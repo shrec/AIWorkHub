@@ -8,17 +8,22 @@ const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const source = fs.readFileSync(extensionPath, "utf8");
 
 for (const forbidden of [
-  'getConfiguration("chatgpt")',
-  'cliExecutable',
   "classifyImmediateCodexChildren",
-  "process.kill(",
   "pkill",
   "killall",
-  "AIWORKHUB_CALLBACK_TRANSPORT: \"sideband\"",
   "bindCodexSidebandEnvironment",
 ]) {
   assert.ok(!source.includes(forbidden), `foreign integration remains: ${forbidden}`);
 }
+assert.strictEqual(
+  (source.match(/process\.kill\(numericPid, 0\)/g) || []).length,
+  1,
+  "only the non-destructive signal-0 stale-route liveness probe is allowed",
+);
+assert.ok(!/process\.kill\([^,]+,\s*["']SIG/.test(source), "destructive foreign process signal remains");
+assert.ok(source.includes('getConfiguration("chatgpt")'));
+assert.ok(source.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(source.includes("custom_cli_executable_preserved"));
 
 const fakeVscode = {
   workspace: {

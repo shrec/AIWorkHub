@@ -482,6 +482,70 @@ def _reclaim_expired_batches(conn: sqlite3.Connection, now_iso: str) -> None:
         )
 
 
+def recover_incompatible_long_inflight_batches(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    max_lease_span_seconds: float,
+) -> int:
+    """Atomically recover inflight batches created by an incompatible,
+    longer-lived transport generation.
+
+    The VS Code callback owner moved from a separate App Server subprocess
+    (35-minute lease) to the bounded local sideband mux (90-second lease).
+    After an abrupt extension reload the old owner no longer exists, but its
+    durable lease can otherwise block the new transport for over half an
+    hour.  Only batches whose persisted claim-time-to-expiry span exceeds the
+    current transport's declared maximum are recovered; current-generation
+    inflight work is never touched.
+    """
+    _ensure_callback_outbox_table(conn)
+    _ensure_callback_batches_table(conn)
+    normalized_provider = str(provider or "").strip().lower()
+    if not normalized_provider or max_lease_span_seconds <= 0:
+        return 0
+
+    recovered = 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT batch_id,updated_at,lease_expires_at FROM callback_batches "
+            "WHERE state='inflight' AND provider=? AND lease_expires_at<>''",
+            (normalized_provider,),
+        ).fetchall()
+        now = utc_now()
+        for row in rows:
+            try:
+                claimed_at = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+                expires_at = datetime.fromisoformat(str(row["lease_expires_at"]).replace("Z", "+00:00"))
+                lease_span = (expires_at - claimed_at).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if lease_span <= float(max_lease_span_seconds):
+                continue
+            batch_id = str(row["batch_id"])
+            conn.execute(
+                "UPDATE callback_outbox SET state='pending', updated_at=?, "
+                "last_error='legacy_long_lease_recovered_for_sideband' "
+                "WHERE batch_id=? AND state='inflight'",
+                (now, batch_id),
+            )
+            conn.execute(
+                "UPDATE callback_batches SET state='pending', lease_id='', "
+                "lease_expires_at='', not_before_at='', updated_at=?, "
+                "last_error='legacy_long_lease_recovered_for_sideband', "
+                "last_failure_kind='transport_upgrade_recovery' "
+                "WHERE batch_id=? AND state='inflight'",
+                (now, batch_id),
+            )
+            recovered += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return recovered
+
+
 def _supersede_stale_batch_members(conn: sqlite3.Connection, batch_id: str) -> int:
     """Mark any member of ``batch_id`` whose task is no longer in the
     matching eligible terminal state/episode as superseded. Returns the
@@ -1130,6 +1194,7 @@ __all__ = [
     "current_claim_episode",
     "enqueue_callback",
     "claim_pending_callback_batch",
+    "recover_incompatible_long_inflight_batches",
     "mark_batch_delivered",
     "defer_batch_busy",
     "fail_batch_transient",

@@ -40,6 +40,8 @@ const state = {
   liveOutputCursor: 0,
   liveOutputText: "",
   liveOutputTimer: null,
+  systemLogs: [],
+  memoryEntries: [],
 };
 
 function persistState() {
@@ -87,6 +89,18 @@ const elements = {
   runnerStats: document.querySelector("#runner-stats"),
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
+  systemLogList: document.querySelector("#system-log-list"),
+  systemLogCopy: document.querySelector("#system-log-copy"),
+  systemLogClear: document.querySelector("#system-log-clear"),
+  systemLogCount: document.querySelector("#system-log-count"),
+  lastSystemLog: document.querySelector("#last-system-log"),
+  openSystemLog: document.querySelector("#open-system-log"),
+  systemLogDialog: document.querySelector("#system-log-dialog"),
+  openAiMemory: document.querySelector("#open-ai-memory"),
+  aiMemoryDialog: document.querySelector("#ai-memory-dialog"),
+  aiMemorySummary: document.querySelector("#ai-memory-summary"),
+  aiMemorySearch: document.querySelector("#ai-memory-search"),
+  aiMemoryList: document.querySelector("#ai-memory-list"),
   returnList: document.querySelector("#return-list"),
   returnTab: document.querySelector("#tab-returns"),
   runList: document.querySelector("#run-list"),
@@ -291,13 +305,6 @@ function compactManagerIdentityReason(identity) {
   }
   if (route.thread_id) {
     pieces.push(`thread=${route.thread_id}`);
-  }
-  const target = state.snapshot && state.snapshot.manager_identity_target
-    ? state.snapshot.manager_identity_target
-    : null;
-  if (target && typeof target === "object") {
-    if (target.capability_state) pieces.push(`route=${target.capability_state}`);
-    if (target.reason) pieces.push(`route_reason=${target.reason}`);
   }
   return pieces.join(" · ");
 }
@@ -662,6 +669,75 @@ function renderStorage(snapshot) {
   elements.storageList.replaceChildren(fragment);
 }
 
+function renderSystemLogs(snapshotOrEntries) {
+  const entries = Array.isArray(snapshotOrEntries)
+    ? snapshotOrEntries
+    : asArray(snapshotOrEntries && snapshotOrEntries.system_logs);
+  state.systemLogs = entries.slice(0, 1200);
+  elements.systemLogCount.textContent = `${entries.length} event${entries.length === 1 ? "" : "s"}`;
+  const latest = entries[0];
+  elements.lastSystemLog.textContent = latest
+    ? `${String(latest.level || "info").toUpperCase()} · ${String(latest.component || "system")} · ${String(latest.message || "")}`
+    : "No system events yet";
+  elements.lastSystemLog.title = elements.lastSystemLog.textContent;
+  if (!entries.length) {
+    elements.systemLogList.replaceChildren(createElement("div", "panel-list-empty compact", "No system events yet"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of entries.slice(0, 1200)) {
+    const row = createElement("div", `system-log-row level-${String(entry.level || "info")}`);
+    const timestamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : "—";
+    row.append(
+      createElement("time", "system-log-time", timestamp),
+      createElement("span", "system-log-level", String(entry.level || "info").toUpperCase()),
+      createElement("span", "system-log-component", String(entry.component || "system")),
+      createElement("span", "system-log-message", String(entry.message || "")),
+    );
+    fragment.appendChild(row);
+  }
+  elements.systemLogList.replaceChildren(fragment);
+}
+
+function renderMemoryEntries() {
+  const query = String(elements.aiMemorySearch.value || "").trim().toLocaleLowerCase();
+  const filtered = state.memoryEntries.filter((entry) => {
+    if (!query) return true;
+    return [entry.key, entry.value, entry.tags, entry.scope]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  });
+  if (!filtered.length) {
+    elements.aiMemoryList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching memory" : "No saved memory"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of filtered) {
+    const article = createElement("article", "memory-entry");
+    const heading = createElement("div", "memory-entry-heading");
+    heading.append(
+      createElement("strong", "memory-key", String(entry.key || "Untitled memory")),
+      createElement("span", "memory-scope", String(entry.scope || "persistent")),
+    );
+    const meta = [entry.tags, entry.updated_at ? new Date(entry.updated_at).toLocaleString() : ""].filter(Boolean).join(" · ");
+    article.append(heading, createElement("p", "memory-value", String(entry.value || "")));
+    if (meta) article.appendChild(createElement("span", "memory-meta", meta));
+    fragment.appendChild(article);
+  }
+  elements.aiMemoryList.replaceChildren(fragment);
+}
+
+function renderMemory(payload) {
+  if (!payload || payload.ok === false) {
+    state.memoryEntries = [];
+    elements.aiMemorySummary.textContent = (payload && payload.error) || "Memory unavailable";
+    renderMemoryEntries();
+    return;
+  }
+  state.memoryEntries = asArray(payload.entries);
+  elements.aiMemorySummary.textContent = `${formatCount(payload.total)} stored · showing ${formatCount(payload.count)}`;
+  renderMemoryEntries();
+}
+
 function taskSignalRow(task, badgeText, badgeClass) {
   const row = createElement("div", "signal-row");
   const top = createElement("div", "signal-topline");
@@ -834,6 +910,7 @@ function renderSnapshot(snapshot) {
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderUsage(snapshot);
   renderStorage(snapshot);
+  renderSystemLogs(snapshot);
   renderReturns(snapshot);
   renderRuns(snapshot);
   renderWarnings(snapshot);
@@ -1780,6 +1857,15 @@ window.addEventListener("message", (event) => {
       renderRuntimeInfo(message.payload);
       break;
     }
+    case "systemLogs":
+      renderSystemLogs(message.payload);
+      break;
+    case "notification":
+      showToast(message.message || "Done");
+      break;
+    case "memory":
+      renderMemory(message.payload);
+      break;
     case "coordinatorTargets": {
       renderCoordinatorTargets(message.payload);
       break;
@@ -1909,6 +1995,30 @@ elements.headerStorage.addEventListener("click", () => {
     activateOperationTab(storageTab, true);
     document.querySelector("#panel-storage").scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
+});
+
+elements.systemLogCopy.addEventListener("click", () => {
+  vscode.postMessage({ type: "copySystemLogs" });
+});
+
+elements.systemLogClear.addEventListener("click", () => {
+  vscode.postMessage({ type: "clearSystemLogs" });
+});
+
+elements.openSystemLog.addEventListener("click", () => {
+  elements.systemLogDialog.showModal();
+});
+
+elements.openAiMemory.addEventListener("click", () => {
+  elements.aiMemoryDialog.showModal();
+  elements.aiMemorySummary.textContent = "Loading repository memory";
+  vscode.postMessage({ type: "requestMemory" });
+});
+
+elements.aiMemorySearch.addEventListener("input", renderMemoryEntries);
+
+document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+  button.addEventListener("click", () => document.querySelector(`#${button.dataset.closeDialog}`).close());
 });
 
 // Restore the last-selected status filter button state (selection itself is

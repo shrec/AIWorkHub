@@ -295,15 +295,15 @@ class _FakeFastMCP:
 
 
 def test_register_binds_readonly_live_output_and_initialize_tools():
-    # B855/B850 added the task-live-output and initialize tools additively
+    # Task live output, AI Memory browsing, and initialization are additive
     # alongside the original three read-only tools; register() must bind all
-    # five, never dropping the original three or silently losing the newer
-    # two.
+    # six without dropping the historical surface.
     fake_mcp = _FakeFastMCP()
     names = dashboard_mcp_app.register(fake_mcp)
 
     expected_names = set(dashboard_mcp_app.READONLY_TOOL_NAMES) | {
         dashboard_mcp_app.LIVE_OUTPUT_TOOL_NAME,
+        dashboard_mcp_app.MEMORY_TOOL_NAME,
         dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
     assert set(names) == expected_names

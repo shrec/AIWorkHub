@@ -4,6 +4,81 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.6.75] - 2026-07-28
+
+### Fixed
+
+- Callback delivery now uses the already-installed, repository-bound Codex
+  App Server mux sideband instead of spawning a competing second App Server.
+- Sideband delivery has a bounded 45-second local round-trip timeout and
+  90-second recoverable lease, so an abrupt reload cannot block later events
+  behind the subprocess transport's former 35-minute inflight lease.
+- Idle callback polling is capped at two seconds and its wait is interruptible,
+  providing prompt terminal-event delivery and clean extension reloads.
+
+## [0.6.74] - 2026-07-28
+
+### Fixed
+
+- Added a bounded post-startup route convergence loop so the exact Codex
+  thread observed just after mux startup is published within seconds instead
+  of waiting for the four-minute lease-renewal tick.
+- Every dashboard refresh now re-evaluates the live mux-owned route before
+  building the snapshot, making the route banner self-healing without reload.
+
+## [0.6.73] - 2026-07-28
+
+### Fixed
+
+- Reload recovery now treats a shared callback route as live only while both
+  its lease is fresh and its owning extension-host PID exists. A dead previous
+  window can no longer block the replacement window from publishing its route,
+  which previously made the Codex mux time out and left callbacks permanently
+  at `codex_thread_id_not_observed`.
+- Added the pending-to-verified and post-mux-ready callback regressions to the
+  extension's normal release test suite.
+
+## [0.6.72] - 2026-07-28
+
+### Fixed
+
+- Moved the Codex mux launcher out of the versioned VSIX directory into the
+  extension's stable global-storage path. Future extension upgrades update
+  an immutable runtime pointer without requiring a second reload to repair a
+  stale `chatgpt.cliExecutable` path.
+- Classifies routine MCP stderr transport messages as informational unless
+  their content actually contains a warning, degradation, failure, or error.
+
+## [0.6.71] - 2026-07-28
+
+### Fixed
+
+- Closed the VS Code parallel-activation race: the Codex app-server mux now
+  waits up to ten seconds for the exact parent extension-host repository
+  route before safely falling back to transparent passthrough.
+
+### Added
+
+- Added an always-visible one-line latest-system-event strip with a full log
+  popup. Logs are repository-isolated, capped at 1 MiB, and retained for at
+  most seven days under the repo-local runtime tree.
+- Added a read-only AI Memory popup backed by the current repository's
+  canonical storage-registry database, with local filtering and no access
+  counter mutation.
+
+## [0.6.70] - 2026-07-28
+
+### Fixed
+
+- Automatically configures the packaged, cross-platform Codex App Server mux
+  when `chatgpt.cliExecutable` is unset or already AIWorkHub-owned. This is
+  the missing thread-observation source required to recover callback routes
+  after reload; unrelated custom executables are preserved.
+- Removed duplicate `route`/`route_reason` fields from the manager banner.
+- Added a bounded, newest-first System Log terminal with formatted levels and
+  components plus Copy/Clear controls. Its 200-entry ring buffer stays in
+  memory and creates no additional disk ledger.
+
 ## [0.6.69] - 2026-07-28
 
 ### Fixed
