@@ -118,9 +118,9 @@ assertPresent(
 //      /api/restore mutation routes are untouched by this task and are
 //      intentionally excluded from this check.) ───────────────────────────
 const dashboardPy = readPy("dashboard.py");
-const providerClassMatch = dashboardPy.match(/class DashboardProvider:[\s\S]*?\n\ndef /);
+const providerClassMatch = dashboardPy.match(/class DashboardProvider:[\s\S]*?\r?\n\r?\ndef /);
 assert.ok(providerClassMatch, "DashboardProvider class body not found");
-const exactCountsFnMatch = dashboardPy.match(/def exact_status_counts\([\s\S]*?\n\n\n/);
+const exactCountsFnMatch = dashboardPy.match(/def exact_status_counts\([\s\S]*?\r?\n\r?\n\r?\n/);
 assert.ok(exactCountsFnMatch, "exact_status_counts function body not found");
 assertAbsent(
   providerClassMatch[0] + exactCountsFnMatch[0],
