@@ -1,6 +1,6 @@
 """AST-first evidence extraction for the AIWorkHub canonical Source Graph.
 
-Python files are parsed with :mod:`ast` (never regex) so every entity and
+Python files are parsed with :mod:`ast` so every entity and
 edge carries exact ``file:line`` evidence, an extractor identity, and a
 confidence label. Every extracted item is one of three explicit classes:
 
@@ -13,10 +13,11 @@ confidence label. Every extracted item is one of three explicit classes:
   * ``AMBIGUOUS`` -- the callee name is never bound in this module (e.g.
     it may come from a ``from x import *`` or is simply undefined here).
 
-Languages other than Python have no AST extractor wired in here. Rather
-than approximate them with regex heuristics mislabeled as ``EXTRACTED``
-evidence (the failure mode this migration removes), unsupported files are
-recorded with ``status="unsupported_fail_closed"`` and zero entities/edges.
+PHP files use a conservative, dependency-free lexical structural extractor.
+It masks strings/comments before observing namespaces, imports, class-like
+declarations, functions/methods and inheritance. It deliberately emits no
+call edges, because resolving dynamic PHP calls without a full parser would
+overstate authority. Unsupported files remain explicit fail-closed records.
 
 The JavaScript/TypeScript family (``.js .jsx .mjs .cjs .ts .tsx``) is the
 one documented exception: B881 gives these files a truthful *file-level*
@@ -31,11 +32,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v1"
 FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
+PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
 
 EXTRACTED = "EXTRACTED"
 INFERRED = "INFERRED"
@@ -46,6 +49,7 @@ ENTITY_KINDS = ("module", "class", "function", "method", "import", "file")
 EDGE_KINDS = ("imports", "calls", "defines", "inherits")
 
 PYTHON_EXTENSIONS = (".py",)
+PHP_EXTENSIONS = (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8")
 
 # JS/TS family languages get file-level (not semantic) evidence: real path,
 # hash, size and language, no fabricated entities/edges inside the file.
@@ -123,6 +127,16 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
     if js_ts_language is not None:
         return _extract_file_evidence(rel, raw, js_ts_language, source_hash, build_revision)
 
+    if file_path.suffix.lower() in PHP_EXTENSIONS:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return FileExtraction(
+                file_path=rel, language="php", status="decode_error_fail_closed",
+                source_hash=source_hash, error=str(exc),
+            )
+        return _extract_php_lexical(rel, text, source_hash, build_revision)
+
     if file_path.suffix not in PYTHON_EXTENSIONS:
         return FileExtraction(
             file_path=rel, language=file_path.suffix.lstrip(".") or "unknown",
@@ -145,6 +159,230 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
         )
 
     return _extract_python_ast(rel, tree, source_hash, build_revision)
+
+
+def _mask_php_non_code(text: str) -> str:
+    """Mask PHP strings/comments while preserving byte positions/newlines."""
+
+    chars = list(text)
+    i = 0
+    state = "code"
+    quote = ""
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if state == "code":
+            if ch in {"'", '"', "`"}:
+                state, quote = "string", ch
+                chars[i] = " "
+            elif ch == "/" and nxt == "/":
+                state = "line_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+            elif ch == "#":
+                state = "line_comment"
+                chars[i] = " "
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+        elif state == "string":
+            if ch == "\\" and i + 1 < len(chars):
+                if chars[i] != "\n":
+                    chars[i] = " "
+                if chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 1
+            elif ch == quote:
+                chars[i] = " "
+                state = "code"
+            elif ch != "\n":
+                chars[i] = " "
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "code"
+            elif ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _matching_delimiter(text: str, start: int, opening: str, closing: str) -> int:
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == opening:
+            depth += 1
+        elif text[index] == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(text) - 1
+
+
+def _php_line(text: str, position: int) -> int:
+    return text.count("\n", 0, position) + 1
+
+
+def _php_signature(text: str, start: int, end: int) -> str:
+    return " ".join(text[start:end].strip().split())[:400]
+
+
+def _extract_php_lexical(
+    rel: str, text: str, source_hash: str, build_revision: str,
+) -> FileExtraction:
+    """Extract conservative PHP declarations without external dependencies."""
+
+    masked = _mask_php_non_code(text)
+    namespace_match = re.search(r"\bnamespace\s+([A-Za-z_][A-Za-z0-9_\\]*)\s*[;{]", masked)
+    namespace = namespace_match.group(1) if namespace_match else ""
+    module_qualname = rel
+    entities: list[Entity] = [Entity(
+        kind="module", name=rel, qualname=module_qualname, file_path=rel,
+        line_start=1, line_end=max(1, text.count("\n") + 1),
+        signature=f"namespace {namespace}" if namespace else "",
+        evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+        confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+    )]
+    edges: list[Edge] = []
+
+    class_pattern = re.compile(
+        r"\b(class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b([^;{]*)\{",
+        re.IGNORECASE,
+    )
+    class_ranges: list[tuple[int, int, str, str]] = []
+    pending_inherits: list[tuple[str, str, int]] = []
+    local_classes: dict[str, str] = {}
+    for match in class_pattern.finditer(masked):
+        kind_label, name, tail = match.group(1).lower(), match.group(2), match.group(3)
+        open_brace = match.end() - 1
+        close_brace = _matching_delimiter(masked, open_brace, "{", "}")
+        qualname = f"{namespace}\\{name}" if namespace else f"{rel}::{name}"
+        local_classes[name] = qualname
+        class_ranges.append((match.start(), close_brace, name, qualname))
+        signature = _php_signature(text, match.start(), open_brace)
+        line = _php_line(text, match.start())
+        entities.append(Entity(
+            kind="class", name=name, qualname=qualname, file_path=rel,
+            line_start=line, line_end=_php_line(text, close_brace),
+            signature=f"{kind_label} {signature.split(None, 1)[-1]}",
+            evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.98, source_hash=source_hash, build_revision=build_revision,
+        ))
+        edges.append(Edge(
+            kind="defines", src_qualname=module_qualname, dst_name=name,
+            dst_qualname=qualname, file_path=rel, line=line,
+            evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.98, source_hash=source_hash, build_revision=build_revision,
+        ))
+        extends_match = re.search(r"\bextends\s+([A-Za-z_\\][A-Za-z0-9_\\]*)", tail, re.IGNORECASE)
+        if extends_match:
+            pending_inherits.append((qualname, extends_match.group(1), line))
+        implements_match = re.search(r"\bimplements\s+([^\{]+)$", tail, re.IGNORECASE)
+        if implements_match:
+            for base in implements_match.group(1).split(","):
+                base = base.strip()
+                if re.fullmatch(r"[A-Za-z_\\][A-Za-z0-9_\\]*", base):
+                    pending_inherits.append((qualname, base, line))
+
+    def containing_class(position: int) -> tuple[int, int, str, str] | None:
+        matches = [item for item in class_ranges if item[0] < position < item[1]]
+        return min(matches, key=lambda item: item[1] - item[0]) if matches else None
+
+    import_aliases: dict[str, str] = {}
+    for match in re.finditer(r"\buse\s+([^;{}]+);", masked, re.IGNORECASE):
+        if containing_class(match.start()) is not None:
+            continue
+        clause = match.group(1).strip()
+        if clause.lower().startswith(("function ", "const ")):
+            clause = clause.split(None, 1)[1]
+        for item in clause.split(","):
+            item = item.strip()
+            alias_match = re.fullmatch(
+                r"([A-Za-z_\\][A-Za-z0-9_\\]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?",
+                item,
+                re.IGNORECASE,
+            )
+            if not alias_match:
+                continue
+            target, explicit_alias = alias_match.groups()
+            alias = explicit_alias or target.rsplit("\\", 1)[-1]
+            import_aliases[alias] = target
+            line = _php_line(text, match.start())
+            import_qualname = f"{rel}::import::{alias}::{line}"
+            entities.append(Entity(
+                kind="import", name=alias, qualname=import_qualname,
+                file_path=rel, line_start=line, line_end=line, signature=target,
+                evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+                confidence=0.98, source_hash=source_hash, build_revision=build_revision,
+            ))
+            edges.append(Edge(
+                kind="imports", src_qualname=module_qualname, dst_name=target,
+                dst_qualname=None, file_path=rel, line=line,
+                evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+                confidence=0.98, source_hash=source_hash, build_revision=build_revision,
+            ))
+
+    function_pattern = re.compile(
+        r"\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        re.IGNORECASE,
+    )
+    seen_qualnames: dict[str, int] = {}
+    for match in function_pattern.finditer(masked):
+        name = match.group(1)
+        open_paren = match.end() - 1
+        close_paren = _matching_delimiter(masked, open_paren, "(", ")")
+        terminators = [(masked.find(token, close_paren + 1), token) for token in ("{", ";")]
+        terminators = [(pos, token) for pos, token in terminators if pos >= 0]
+        body_pos, token = min(terminators, default=(close_paren, ";"))
+        body_end = _matching_delimiter(masked, body_pos, "{", "}") if token == "{" else body_pos
+        owner = containing_class(match.start())
+        base_qualname = (
+            f"{owner[3]}::{name}" if owner
+            else f"{namespace}\\{name}" if namespace
+            else f"{rel}::{name}"
+        )
+        qualname = _dedupe_qualname(seen_qualnames, base_qualname)
+        line = _php_line(text, match.start())
+        kind = "method" if owner else "function"
+        signature = f"function {name}{_php_signature(text, open_paren, close_paren + 1)}"
+        entities.append(Entity(
+            kind=kind, name=name, qualname=qualname, file_path=rel,
+            line_start=line, line_end=_php_line(text, body_end), signature=signature,
+            evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.96, source_hash=source_hash, build_revision=build_revision,
+        ))
+        parent_qualname = owner[3] if owner else module_qualname
+        edges.append(Edge(
+            kind="defines", src_qualname=parent_qualname, dst_name=name,
+            dst_qualname=qualname, file_path=rel, line=line,
+            evidence_label=EXTRACTED, extractor=PHP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.96, source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    for src, raw_base, line in pending_inherits:
+        simple = raw_base.lstrip("\\").rsplit("\\", 1)[-1]
+        resolved = local_classes.get(simple)
+        target = import_aliases.get(simple, raw_base)
+        edges.append(Edge(
+            kind="inherits", src_qualname=src, dst_name=target,
+            dst_qualname=resolved, file_path=rel, line=line,
+            evidence_label=EXTRACTED if resolved else AMBIGUOUS,
+            extractor=PHP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.98 if resolved else 0.7,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    return FileExtraction(
+        file_path=rel, language="php", status="ok", source_hash=source_hash,
+        entities=tuple(entities), edges=tuple(edges),
+    )
 
 
 def _extract_file_evidence(
@@ -382,6 +620,8 @@ __all__ = [
     "INFERRED",
     "JS_TS_EXTENSIONS",
     "JS_TS_LANGUAGE_BY_EXTENSION",
+    "PHP_EXTENSIONS",
+    "PHP_LEXICAL_EXTRACTOR_ID",
     "Edge",
     "Entity",
     "FileExtraction",

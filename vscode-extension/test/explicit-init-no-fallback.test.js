@@ -70,6 +70,18 @@ assertPresent(
   ],
   "initialize MCP tool wiring",
 );
+const pushInitializeMatch = ext.match(/async function pushInitializeStorage\(view\) \{[\s\S]*?\n}\n/);
+assert.ok(pushInitializeMatch, "pushInitializeStorage function body not found");
+assertPresent(
+  pushInitializeMatch[0],
+  [
+    "const initializedClient = getMcpClient()",
+    "view.bindClient(initializedClient)",
+    "SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted",
+    "sourceGraphStart.daemon_started !== true",
+  ],
+  "post-init Source Graph convergence",
+);
 // The initialize tool must be excluded from the read-only contract list
 // checked by pushRuntimeInfo (EXPECTED_DASHBOARD_TOOL_NAMES), i.e. it must
 // not be one of the DASHBOARD_TOOLS values.

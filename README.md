@@ -49,6 +49,11 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
    `.aiworkhub/tasking/task_queue.sqlite`, and the Source Graph store. The
    initial Source Graph index starts asynchronously; one repo-bound daemon
    then keeps it fresh with non-overlapping incremental refreshes.
+   Python receives AST structural indexing; PHP receives conservative
+   namespace/import/class/interface/trait/enum/function/method/inheritance
+   indexing; JavaScript/TypeScript receive truthful file-level evidence.
+   A successful zero-file pass is reported as `empty`, never falsely as
+   `ready`. Extractor upgrades automatically reindex unchanged source files.
    No durable `.aiworkhub` repository state is created before this explicit
    step, and it is safe to run again (idempotent).
 4. **Work the queue.** The dashboard tab shows pending/processing/review
@@ -220,6 +225,11 @@ and archive directories are pruned before traversal. A malformed policy fails
 closed instead of silently indexing an unintended tree. On the next incremental
 refresh, entries newly covered by the policy are removed from the canonical
 graph database.
+
+The built-in PHP discovery covers `.php`, `.phtml`, and versioned `.php3`
+through `.php8` source. PHP call edges are intentionally omitted until a full
+parser/runtime resolver can prove them; Source Graph never labels guessed
+dynamic calls as extracted evidence.
 
 ## Task Dispatch, Validation & Acceptance
 

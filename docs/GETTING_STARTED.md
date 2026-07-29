@@ -77,9 +77,12 @@ These four context surfaces live inside each repository's own
 `.aiworkhub/` directory and are what a launched worker reads before
 touching code:
 
-- **Source Graph** -- structural code index (functions, structs, call
-  graph) queried by `aiworkhub_task_show`/worker context bundles instead of
-  ad hoc `grep`.
+- **Source Graph** -- repository-local code index queried by
+  `aiworkhub_task_show`/worker context bundles instead of ad hoc `grep`.
+  Python is AST-indexed; PHP namespaces, imports, class-like declarations,
+  functions/methods and inheritance are structurally indexed; JS/TS has
+  truthful file-level evidence. An empty source set reports `empty`, not
+  `ready`.
 - **Session Manager** -- a running ledger of the current session so a
   worker (or the next one) can reconstruct exactly what happened.
 - **AI Memory** -- durable cross-session knowledge (decisions,

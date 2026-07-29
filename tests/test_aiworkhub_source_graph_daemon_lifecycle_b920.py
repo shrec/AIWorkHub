@@ -59,6 +59,7 @@ def _init_repo(tmp_path: Path, name: str = "repo") -> Path:
 def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_daemons):
     root = tmp_path / "repo"
     root.mkdir()
+    (root / "app.php").write_text("<?php\nfunction live_probe(): int { return 1; }\n", encoding="utf-8")
     cleanup_daemons.append(root)
 
     result = repository_bootstrap.initialize_repository_full(root)
@@ -85,7 +86,21 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
         pytest.fail("initial background build never completed")
 
     assert health["status"] == source_graph_daemon.STATUS_READY
+    assert health["last_report"]["files_seen"] == 1
     assert health["last_report"]["incremental"] is False
+
+
+def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
+    root = _init_repo(tmp_path)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    assert daemon._run_one_build() is True
+    health = daemon.health()
+
+    assert health["ok"] is True
+    assert health["status"] == source_graph_daemon.STATUS_EMPTY
+    assert health["last_report"]["files_seen"] == 0
+    assert health["last_report"]["entities_written"] == 0
 
 
 # ---------------------------------------------------------------------------

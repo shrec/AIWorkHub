@@ -45,6 +45,7 @@ MIN_REFRESH_INTERVAL_SECONDS = 30.0
 STATUS_STOPPED = "stopped"
 STATUS_INDEXING = "indexing"
 STATUS_READY = "ready"
+STATUS_EMPTY = "empty"
 STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
 
@@ -134,7 +135,13 @@ class SourceGraphDaemon:
                 incremental = self._has_prior_build()
                 report = source_graph.build_index(self.repo_root, incremental=incremental)
                 with self._state_lock:
-                    self._status = STATUS_READY
+                    # A successful SQLite transaction is not the same thing
+                    # as a usable Source Graph.  Keep empty repositories
+                    # truthful so code-task gates cannot mistake a zero-row
+                    # database for an indexed project.
+                    self._status = (
+                        STATUS_READY if report.files_seen > 0 else STATUS_EMPTY
+                    )
                     self._last_report = report.to_json()
                     self._last_error = ""
                     self._last_run_at = _utcnow()
@@ -327,6 +334,7 @@ __all__ = [
     "DEFAULT_REFRESH_INTERVAL_SECONDS",
     "MIN_REFRESH_INTERVAL_SECONDS",
     "STATUS_DEGRADED",
+    "STATUS_EMPTY",
     "STATUS_INDEXING",
     "STATUS_READY",
     "STATUS_STANDBY",

@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.94";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.95";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -3645,7 +3645,23 @@ async function pushInitializeStorage(view) {
     if (vscodeLmBridgeHost) {
       await vscodeLmBridgeHost.start(activeRepoIdentity);
     }
-    if (view.stillBoundTo(client)) {
+    // Init changes the repository identity from manifest-missing to its real
+    // repo_id. Rebind immediately, then explicitly converge Source Graph on
+    // the NEW MCP child. Relying only on the old child's bootstrap thread (or
+    // on handshake fire-and-forget convergence) lets that first index vanish
+    // when the identity rebind terminates the old child on a fresh install.
+    const initializedClient = getMcpClient();
+    view.bindClient(initializedClient);
+    const sourceGraphStart = await initializedClient.callTool(
+      SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted,
+      {},
+    );
+    if (!sourceGraphStart || sourceGraphStart.ok !== true || sourceGraphStart.daemon_started !== true) {
+      const reason = String((sourceGraphStart && (sourceGraphStart.reason || sourceGraphStart.error || sourceGraphStart.status)) || "source_graph_start_failed");
+      outputChannel.appendLine(`[source-graph] post-init automatic index start failed: ${sanitizeErrorMessage(reason)}`);
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: `source_graph_start_failed:${sanitizeErrorMessage(reason)}` });
+    }
+    if (view.stillBoundTo(initializedClient)) {
       pushRepositoryInfo(view, activeRepoIdentity);
       await pushSnapshot(view);
     }

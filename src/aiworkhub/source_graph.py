@@ -11,6 +11,8 @@ Design constraints (see task card B849):
   * No model/API/network call, no Graphify dependency, no ``graph.json``
     authority, no second external graph product -- SQLite only.
   * Extraction is AST-first for Python (:mod:`aiworkhub.source_graph_ast`).
+    PHP receives conservative lexical structural extraction (namespaces,
+    imports, class-like declarations, functions/methods and inheritance).
     The JavaScript/TypeScript family gets truthful file-level evidence
     (path/hash/language/size, no fabricated functions/calls/edges); every
     other unsupported language fails closed rather than being approximated
@@ -49,7 +51,7 @@ from .storage_registry import (
 )
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
-BUILD_REVISION = "aiworkhub.source_graph.python_ast.v1"
+BUILD_REVISION = "aiworkhub.source_graph.multilang.v2"
 IGNORE_SCHEMA_ID = "aiworkhub.source_graph.ignore.v1"
 IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
 
@@ -251,7 +253,7 @@ def _now_iso() -> str:
 # File discovery -- generic, repo-agnostic (no project-specific hardcoding)
 # ---------------------------------------------------------------------------
 
-INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS
+INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS + sgast.PHP_EXTENSIONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,14 +479,18 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     try:
         with conn:
             existing = {
-                row["file_path"]: row["source_hash"]
-                for row in conn.execute("SELECT file_path, source_hash FROM files")
+                row["file_path"]: (row["source_hash"], row["build_revision"])
+                for row in conn.execute("SELECT file_path, source_hash, build_revision FROM files")
             }
             for path in files_on_disk:
                 extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
                 seen_rel.add(extraction.file_path)
-                prior_hash = existing.get(extraction.file_path)
-                if incremental and prior_hash is not None and prior_hash == extraction.source_hash:
+                prior = existing.get(extraction.file_path)
+                if (
+                    incremental and prior is not None
+                    and prior[0] == extraction.source_hash
+                    and prior[1] == BUILD_REVISION
+                ):
                     unchanged += 1
                     continue
                 _invalidate_file(conn, extraction.file_path)
