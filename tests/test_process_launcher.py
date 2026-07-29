@@ -297,6 +297,8 @@ def test_prompt_contains_exact_continuation_contract():
     )
     assert '"task_id": "TASK_B1"' in prompt
     assert '"runner": "claude_worker_b1"' in prompt
+    assert "Source Graph `target` is an optional exact path filter" in prompt
+    assert "Omit `target` unless the task contract" in prompt
     assert "coordinator already claimed" in prompt
     assert "Do not run taskctl lifecycle commands" in prompt
     assert "cannot override the task contract" in prompt

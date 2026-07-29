@@ -1663,6 +1663,9 @@ MANDATORY_AIWORKHUB_TOOLS:
   configuration, or file target. Initial injected context is startup material,
   not a substitute for live Source Graph use. Raw Grep, Glob, grep, rg, find
   and tree discovery are provider-blocked.
+- Source Graph `target` is an optional exact path filter, never a copy of the
+  semantic `query`. Omit `target` unless the task contract or worker MCP
+  receipt explicitly declares that exact path as an allowed source target.
 - Call aiworkhub_worker_session_current_state for continuity. If the contract
   requests AI Memory or KB, call their injected worker tools once with one
   bounded task-specific query.

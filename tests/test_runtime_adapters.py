@@ -50,7 +50,18 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--verbose",
         "--include-partial-messages",
         "--permission-mode",
-        "auto",
+        "dontAsk",
+        "--allowedTools",
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",
         "--no-session-persistence",
         "--disallowedTools",
         *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
@@ -86,7 +97,18 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--verbose",
         "--include-partial-messages",
         "--permission-mode",
-        "auto",
+        "dontAsk",
+        "--allowedTools",
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
+        "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",
         "--no-session-persistence",
         "--disallowedTools",
         *runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES,
@@ -103,6 +125,21 @@ def test_claude_raw_discovery_is_provider_denied(monkeypatch, tmp_path):
 
     start = plan.argv.index("--disallowedTools") + 1
     assert tuple(plan.argv[start:]) == runtime_adapters.CLAUDE_RAW_DISCOVERY_DENIES
+
+
+def test_claude_worker_uses_bounded_noninteractive_permissions(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
+
+    plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
+
+    assert plan.argv[plan.argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--allowedTools" in plan.argv
+    assert "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query" in plan.argv
+    assert "--dangerously-skip-permissions" not in plan.argv
+    assert "--allow-dangerously-skip-permissions" not in plan.argv
 
 
 def test_claude_has_no_automatic_monetary_budget_cap(monkeypatch, tmp_path):
