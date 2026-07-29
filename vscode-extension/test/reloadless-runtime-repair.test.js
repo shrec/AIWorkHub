@@ -151,6 +151,17 @@ function loadExtensionHost(repoRoot, pythonPath) {
 function installSpawnFake(generationsByRoot) {
   const spawns = [];
   const original = childProcess.spawn;
+  // extension.js canonicalizes repository roots with realpath before
+  // spawning.  macOS commonly rewrites /var -> /private/var and Windows may
+  // normalize drive casing, so key the scripted generations by the same
+  // physical identity instead of accidentally returning the default healthy
+  // generation on non-Linux runners.
+  const canonicalGenerations = new Map(
+    [...generationsByRoot.entries()].map(([root, generations]) => [
+      path.normalize(fs.realpathSync.native(root)),
+      generations,
+    ]),
+  );
   childProcess.spawn = (cmd, args, options) => {
     const spawnRecord = {
       cmd,
@@ -161,7 +172,8 @@ function installSpawnFake(generationsByRoot) {
       windowId: options.env.AIWORKHUB_WINDOW_ID,
     };
     spawns.push(spawnRecord);
-    const queue = generationsByRoot.get(spawnRecord.repoRoot) || [];
+    const canonicalRoot = path.normalize(fs.realpathSync.native(spawnRecord.repoRoot));
+    const queue = canonicalGenerations.get(canonicalRoot) || [];
     const generation = queue.shift() || { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false };
     return new FakeChild(spawnRecord, generation);
   };
