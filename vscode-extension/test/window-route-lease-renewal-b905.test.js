@@ -8,6 +8,7 @@ const path = require("path");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const packageVersion = require(path.resolve(__dirname, "..", "package.json")).version;
+const calledTools = [];
 
 function writeRepo(root, repoId, repoName) {
   fs.mkdirSync(path.join(root, ".aiworkhub"), { recursive: true });
@@ -57,6 +58,7 @@ class FakeChild extends EventEmitter {
       this._send({}, message.id);
       return;
     }
+    calledTools.push(message.params && message.params.name);
     this._send({
       content: [{
         type: "text",
@@ -119,7 +121,14 @@ function loadExtensionHost(repoRoot) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-lease-"));
   const repoA = path.join(tmp, "alpha");
   fs.mkdirSync(repoA);
-  writeRepo(repoA, "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "alpha");
+  const repoId = "repo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  writeRepo(repoA, repoId, "alpha");
+  const muxDir = path.join(tmp, "mux");
+  const muxInstancesDir = path.join(muxDir, "instances");
+  fs.mkdirSync(muxInstancesDir, { recursive: true });
+  const muxEnvName = "AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR";
+  const originalMuxDir = process.env[muxEnvName];
+  process.env[muxEnvName] = muxDir;
 
   const originalSpawn = childProcess.spawn;
   childProcess.spawn = () => new FakeChild();
@@ -134,6 +143,34 @@ function loadExtensionHost(repoRoot) {
 
     await host.extension.activate(host.context);
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), true, "timer must start on activate");
+    assert.strictEqual(host.extension.__testInternals.isDispatcherWatchdogTimerActive(), true, "dispatcher watchdog must start on activate");
+
+    // Simulate a mux thread appearing after startup convergence. One direct
+    // watchdog tick must register/reconcile the dispatcher without reload.
+    const threadId = "11111111-1111-4111-8111-111111111111";
+    const descriptorPath = path.join(muxInstancesDir, "late.json");
+    fs.writeFileSync(descriptorPath, JSON.stringify({
+      instance_id: "late",
+      generation_id: "late-generation",
+      repo_id: repoId,
+      pid: 999999,
+      parent_pid: process.pid,
+      pid_start_time: 1,
+      socket_path: path.join(tmp, "late.sock"),
+      capability_path: path.join(tmp, "late.cap"),
+      owned_thread_ids: [threadId],
+      active_thread_id: threadId,
+      active_thread_observed_at: Date.now() / 1000,
+      heartbeat_at: Date.now() / 1000,
+      owner_lease_seconds: 90,
+      ready: true,
+    }), { encoding: "utf8", mode: 0o600 });
+    fs.chmodSync(descriptorPath, 0o600);
+    const ensureCallsBefore = calledTools.filter((name) => name === "aiworkhub_dispatcher_ensure_started").length;
+    const watchdogHealth = await host.extension.__testInternals.runDispatcherWatchdogTick();
+    const ensureCallsAfter = calledTools.filter((name) => name === "aiworkhub_dispatcher_ensure_started").length;
+    assert.strictEqual(watchdogHealth.ok, true, "watchdog must converge dispatcher health");
+    assert.ok(ensureCallsAfter > ensureCallsBefore, "watchdog must invoke dispatcher ensure after a late verified route appears");
 
     const routePath = host.extension.__testInternals.windowRouteStatePath(repoA, "");
     const windowRouteDir = path.dirname(routePath);
@@ -163,12 +200,14 @@ function loadExtensionHost(repoRoot) {
     await host.extension.deactivate();
     await new Promise((resolve) => setImmediate(resolve));
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), false, "timer must be disposed on deactivate");
+    assert.strictEqual(host.extension.__testInternals.isDispatcherWatchdogTimerActive(), false, "dispatcher watchdog must be disposed on deactivate");
     assert.strictEqual(windowFiles().length, 0, "window route file must be removed on deactivate");
 
     // Restart safely: activating again must not throw and must restore
     // exactly one timer + one route file, never doubling either.
     await host.extension.activate(host.context);
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), true, "timer must restart on reactivation");
+    assert.strictEqual(host.extension.__testInternals.isDispatcherWatchdogTimerActive(), true, "dispatcher watchdog must restart on reactivation");
     assert.strictEqual(windowFiles().length, 1, "exactly one window route file expected after reactivation");
     host.extension.__testInternals.startWindowRouteRenewalTimer();
     assert.strictEqual(host.extension.__testInternals.isWindowRouteRenewalTimerActive(), true, "starting again must not throw or leave the timer stopped");
@@ -177,6 +216,8 @@ function loadExtensionHost(repoRoot) {
     await host.extension.deactivate();
     await new Promise((resolve) => setImmediate(resolve));
   } finally {
+    if (originalMuxDir === undefined) delete process.env[muxEnvName];
+    else process.env[muxEnvName] = originalMuxDir;
     childProcess.spawn = originalSpawn;
   }
   console.log("AIWorkHub window route lease renewal regression passed");

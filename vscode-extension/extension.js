@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.7";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.8";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -63,6 +63,7 @@ const SHARED_REPO_ROUTE_TTL_MS = 15 * 60 * 1000;
 // a slow tick or a single missed renewal still leaves multiple retries
 // before the lease would lapse.
 const WINDOW_ROUTE_RENEWAL_INTERVAL_MS = 4 * 60 * 1000;
+const DISPATCHER_WATCHDOG_INTERVAL_MS = 15 * 1000;
 
 // VS Code Language Model bridge.  Custom models contributed to Copilot Chat
 // (for example customendpoint/glm-5.2) are available only inside the
@@ -671,6 +672,8 @@ function removeWindowRouteRecord(repoInfo) {
 // skips a tick instead of writing a bogus record.
 let windowRouteRenewalTimer = null;
 let startupRouteConvergenceTimer = null;
+let dispatcherWatchdogTimer = null;
+let dispatcherWatchdogInFlight = false;
 const STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS = 250;
 const STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS = 40;
 
@@ -691,6 +694,73 @@ function startWindowRouteRenewalTimer() {
   windowRouteRenewalTimer = setInterval(renewWindowRouteLease, WINDOW_ROUTE_RENEWAL_INTERVAL_MS);
   if (windowRouteRenewalTimer && typeof windowRouteRenewalTimer.unref === "function") {
     windowRouteRenewalTimer.unref();
+  }
+}
+
+// Route discovery and dispatcher registration are separate asynchronous
+// events. A live mux thread may appear after the bounded startup convergence
+// window, or the repo-local dispatcher may stop while the verified route stays
+// healthy. Reconcile those states independently and idempotently so callbacks
+// recover without Reload Window. This watchdog only ever addresses this
+// window's active repository and its already-owned MCP child.
+async function runDispatcherWatchdogTick() {
+  if (
+    dispatcherWatchdogInFlight
+    || !activeRepoIdentity
+    || !REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))
+  ) {
+    return null;
+  }
+  const repoInfo = activeRepoIdentity;
+  const verifiedThreadId = findVerifiedMuxThreadId(repoInfo);
+  if (!REAL_THREAD_ID_RE.test(String(verifiedThreadId || ""))) {
+    return null;
+  }
+  const persisted = readCoordinatorTargets(repoInfo);
+  const persistedThreadId = String(
+    persisted && persisted.targets && persisted.targets.codex
+      && persisted.targets.codex.route && persisted.targets.codex.route.thread_id || "",
+  );
+  if (persistedThreadId !== verifiedThreadId) {
+    refreshCoordinatorRouteOwnership(repoInfo);
+  }
+  dispatcherWatchdogInFlight = true;
+  try {
+    const client = getMcpClient();
+    await client.ensureStarted();
+    const health = await client._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
+    if (!health || health.ok !== true) {
+      outputChannel.appendLine(
+        `[mcp] callback dispatcher watchdog did not converge: ${sanitizeErrorMessage(
+          health && (health.reason || health.last_start_error || health.status) || "unknown",
+        )}`,
+      );
+    }
+    return health;
+  } catch (err) {
+    outputChannel.appendLine(`[mcp] callback dispatcher watchdog failed: ${sanitizeErrorMessage(err)}`);
+    return null;
+  } finally {
+    dispatcherWatchdogInFlight = false;
+  }
+}
+
+function startDispatcherWatchdog() {
+  stopDispatcherWatchdog();
+  dispatcherWatchdogTimer = setInterval(() => {
+    runDispatcherWatchdogTick().catch((err) => {
+      outputChannel.appendLine(`[mcp] callback dispatcher watchdog tick failed: ${sanitizeErrorMessage(err)}`);
+    });
+  }, DISPATCHER_WATCHDOG_INTERVAL_MS);
+  if (dispatcherWatchdogTimer && typeof dispatcherWatchdogTimer.unref === "function") {
+    dispatcherWatchdogTimer.unref();
+  }
+}
+
+function stopDispatcherWatchdog() {
+  if (dispatcherWatchdogTimer) {
+    clearInterval(dispatcherWatchdogTimer);
+    dispatcherWatchdogTimer = null;
   }
 }
 
@@ -5002,9 +5072,11 @@ async function activate(context) {
   // so a reload cycle (deactivate -> activate) never leaves two intervals
   // ticking and never leaves the current window's lease to lapse silently.
   startWindowRouteRenewalTimer();
+  startDispatcherWatchdog();
 }
 
 async function deactivate() {
+  stopDispatcherWatchdog();
   stopWindowRouteRenewalTimer();
   stopStartupRouteConvergence();
   if (vscodeLmBridgeHost) {
@@ -5068,6 +5140,10 @@ module.exports = {
     renewWindowRouteLease,
     startWindowRouteRenewalTimer,
     stopWindowRouteRenewalTimer,
+    runDispatcherWatchdogTick,
+    startDispatcherWatchdog,
+    stopDispatcherWatchdog,
+    isDispatcherWatchdogTimerActive: () => Boolean(dispatcherWatchdogTimer),
     startStartupRouteConvergence,
     stopStartupRouteConvergence,
     isWindowRouteRenewalTimerActive: () => Boolean(windowRouteRenewalTimer),
@@ -5107,6 +5183,7 @@ module.exports = {
       EXPECTED_MCP_PACKAGE_VERSION,
       WINDOW_ROUTE_LEASE_TTL_MS,
       WINDOW_ROUTE_RENEWAL_INTERVAL_MS,
+      DISPATCHER_WATCHDOG_INTERVAL_MS,
       STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS,
       STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS,
       APP_SERVER_MUX_SIDEBAND_DIR_ENV,
