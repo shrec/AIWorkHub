@@ -36,6 +36,11 @@ assert.strictEqual(internals.selectGlm52LanguageModel([unrelated, exact]), exact
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated]), null);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated, deepseek], "deepseek-v4-pro"), deepseek);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated], "deepseek-v4-pro"), null);
+fakeVscode.lm = { accessInformation: { canSendRequest: (model) => model === exact } };
+assert.strictEqual(internals.vscodeLmAccessState(exact), "granted");
+assert.strictEqual(internals.vscodeLmAccessState(deepseek), "not_granted");
+fakeVscode.lm = {};
+assert.strictEqual(internals.vscodeLmAccessState(exact), "unknown");
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", "research/*.json"), true);
