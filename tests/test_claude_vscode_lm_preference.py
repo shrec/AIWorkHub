@@ -1,51 +1,26 @@
-from pathlib import Path
+import pytest
 
 from aiworkhub import process_launcher
 
 
-def test_visible_claude_model_prefers_editor_auth(monkeypatch):
-    monkeypatch.setattr(
-        process_launcher.vscode_lm_bridge,
-        "bridge_readiness",
-        lambda *args, **kwargs: {"launchable": True},
+def test_claude_subscription_adapter_remains_first_party_cli():
+    process_launcher._validate_adapter_identity(
+        "claude_sonnet5_task_v1", "claude_cli"
     )
 
-    assert process_launcher._prefer_editor_auth_adapter(
-        Path("/repo"),
-        runner="claude_sonnet5_task_v1",
-        adapter_id="claude_cli",
-        model="claude-sonnet-5",
-    ) == "vscode_lm"
 
-
-def test_unavailable_editor_model_preserves_explicit_cli_fallback(monkeypatch):
-    monkeypatch.setattr(
-        process_launcher.vscode_lm_bridge,
-        "bridge_readiness",
-        lambda *args, **kwargs: {"launchable": False},
+def test_copilot_workforce_is_explicit_and_editor_only():
+    process_launcher._validate_adapter_identity(
+        "copilot_claude_sonnet46_task_v1", "vscode_lm"
     )
-
-    assert process_launcher._prefer_editor_auth_adapter(
-        Path("/repo"),
-        runner="claude_sonnet5_task_v1",
-        adapter_id="claude_cli",
-        model="claude-sonnet-5",
-    ) == "claude_cli"
+    with pytest.raises(process_launcher.LaunchRejected, match="runner_adapter_mismatch"):
+        process_launcher._validate_adapter_identity(
+            "copilot_claude_sonnet46_task_v1", "claude_cli"
+        )
 
 
-def test_non_claude_runner_is_never_rewritten(monkeypatch):
-    def unexpected(*args, **kwargs):
-        raise AssertionError("bridge readiness must not be queried")
-
-    monkeypatch.setattr(
-        process_launcher.vscode_lm_bridge,
-        "bridge_readiness",
-        unexpected,
-    )
-
-    assert process_launcher._prefer_editor_auth_adapter(
-        Path("/repo"),
-        runner="deepseek_v4pro_task_v1",
-        adapter_id="deepseek_copilot_cli",
-        model="deepseek-v4-pro",
-    ) == "deepseek_copilot_cli"
+def test_claude_and_copilot_are_not_silently_interchanged():
+    with pytest.raises(process_launcher.LaunchRejected, match="runner_adapter_mismatch"):
+        process_launcher._validate_adapter_identity(
+            "claude_sonnet5_task_v1", "deepseek_copilot_cli"
+        )
