@@ -37,7 +37,46 @@ try {
   Module._load = originalLoad;
 }
 
-const { repairWorkspaceMcpConfigObject } = extensionModule.__testInternals;
+const {
+  repairWorkspaceMcpConfigObject,
+  repairClaudeMcpConfigObject,
+  ensureCodexMcpRegistrationTomlText,
+} = extensionModule.__testInternals;
+
+{
+  const result = repairWorkspaceMcpConfigObject(
+    {}, "/extensions/shrec.aiworkhub/runtime", "/repo/fresh",
+    { command: "python3", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.strictEqual(result.document.servers.AIWorkHub.command, "python3");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/fresh");
+}
+
+{
+  const result = repairClaudeMcpConfigObject(
+    {}, "/extensions/shrec.aiworkhub/runtime", "/repo/fresh",
+    { command: "python3", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.deepStrictEqual(result.document.mcpServers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
+}
+
+{
+  const result = ensureCodexMcpRegistrationTomlText(
+    'model = "gpt-5.5"\n',
+    "/extensions/shrec.aiworkhub/runtime",
+    { command: "python3", argsPrefix: [] },
+  );
+  assert.strictEqual(result.changed, true);
+  assert.ok(result.text.includes("[mcp_servers.aiworkhub]"));
+  assert.ok(result.text.includes('args = ["-m", "aiworkhub.server"]'));
+  assert.ok(!result.text.includes("AIWORKHUB_REPO ="));
+  assert.strictEqual(
+    ensureCodexMcpRegistrationTomlText(result.text, "/other/runtime", { command: "python", argsPrefix: [] }).changed,
+    false,
+  );
+}
 
 {
   const untouched = { command: "node", args: ["server.js"], type: "stdio" };

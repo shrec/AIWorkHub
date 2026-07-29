@@ -219,11 +219,11 @@ def sanitized_env(
     return safe
 
 
-def _glm_vscode_worker_env(
+def _vscode_lm_worker_env(
     provider_env: dict[str, str] | None,
     package_import_root: Path,
 ) -> dict[str, str]:
-    """Return the minimal environment needed by the packaged GLM worker.
+    """Return the minimal environment needed by a packaged VS Code LM worker.
 
     The worker runs as ``python -m aiworkhub.vscode_lm_worker`` from an
     isolated repository worktree, so the repository cwd cannot make the
@@ -234,6 +234,11 @@ def _glm_vscode_worker_env(
     env = dict(provider_env or {})
     env[worker_ai_tools_mcp.ENV_PYTHONPATH] = str(package_import_root)
     return env
+
+
+# Backwards-compatible private alias retained for installed integrations and
+# tests that predate the generic VS Code Auth Model Broker.
+_glm_vscode_worker_env = _vscode_lm_worker_env
 
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
@@ -1280,18 +1285,17 @@ def _external_readonly_dirs(
 
 def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
     if runner.startswith("claude_"):
-        allowed: tuple[str, ...] = ("claude_cli",)
+        allowed: tuple[str, ...] = ("vscode_lm", "claude_cli")
     elif runner.startswith("codex_"):
-        allowed = ("codex_cli",)
+        allowed = ("vscode_lm", "codex_cli")
     elif runner.startswith("deepseek_"):
-        # deepseek_* runners launch locally via the Copilot BYOK adapter;
-        # deepseek_manual stays an explicit fallback the coordinator may pick.
-        # Never a GitHub-hosted Claude/GPT adapter for a DeepSeek-labeled task.
-        allowed = ("deepseek_copilot_cli", "deepseek_manual")
+        # Prefer the editor-owned VS Code Language Model API authorization.
+        # BYOK and manual modes remain explicit compatibility fallbacks.
+        allowed = ("vscode_lm", "deepseek_vscode_lm", "deepseek_copilot_cli", "deepseek_manual")
     elif runner.startswith("glm_"):
         # Prefer the credential-free VS Code Language Model API bridge.  Keep
         # the explicit BYOK adapter as a backwards-compatible fallback.
-        allowed = ("glm_vscode_lm", "glm_copilot_cli")
+        allowed = ("vscode_lm", "glm_vscode_lm", "glm_copilot_cli")
     else:
         return
     if adapter_id not in allowed:
@@ -1906,6 +1910,37 @@ class ProcessManager:
             except deepseek_credentials.CredentialError as exc:
                 raise LaunchRejected(f"deepseek_credential_missing:{exc.reason}") from exc
             return credential.provider_env(resolved_model), resolved_model
+        if adapter_id == runtime_adapters.VSCODE_LM_ADAPTER:
+            if not isinstance(model, str) or not model.strip():
+                raise LaunchRejected("vscode_lm_model_required")
+            resolved_model = model.strip()
+            readiness = vscode_lm_bridge.bridge_readiness(
+                self.repo,
+                model=resolved_model,
+                adapter_id=runtime_adapters.VSCODE_LM_ADAPTER,
+            )
+            if not readiness.get("launchable"):
+                raise LaunchRejected(
+                    "vscode_lm_unavailable:"
+                    + str(readiness.get("blocker_reason") or "not_launchable")
+                )
+            return None, resolved_model
+        if adapter_id == runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER:
+            resolved_model, model_error = runtime_adapters.resolve_deepseek_model(model)
+            if model_error:
+                raise LaunchRejected(f"deepseek_model_rejected:{model_error}")
+            assert resolved_model is not None
+            readiness = vscode_lm_bridge.bridge_readiness(
+                self.repo,
+                model=resolved_model,
+                adapter_id=runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+            )
+            if not readiness.get("launchable"):
+                raise LaunchRejected(
+                    "deepseek_vscode_lm_unavailable:"
+                    + str(readiness.get("blocker_reason") or "not_launchable")
+                )
+            return None, resolved_model
         if adapter_id == runtime_adapters.GLM_COPILOT_ADAPTER:
             resolved_model, model_error = runtime_adapters.resolve_glm_model(model)
             if model_error:
@@ -2127,7 +2162,11 @@ class ProcessManager:
                         context_result.prompt_bundle if context_result is not None else ""
                     ),
                 )
-                if adapter_id == runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+                if adapter_id in {
+                    runtime_adapters.VSCODE_LM_ADAPTER,
+                    runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+                    runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+                }:
                     bridge_request = vscode_lm_bridge.create_request(
                         repo=self.repo,
                         request_id=request_id,
@@ -2153,7 +2192,7 @@ class ProcessManager:
                         validation_ok=True,
                         validation_reason="",
                     )
-                    provider_env = _glm_vscode_worker_env(
+                    provider_env = _vscode_lm_worker_env(
                         provider_env,
                         worker_mcp_runtime.package_import_root,
                     )
@@ -3674,7 +3713,12 @@ class ProcessManager:
         if not events:
             return {"ok": False, "reason": "worker_bridge_request_not_found"}
         latest = events[-1]
-        if latest.get("adapter_id") != runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+        vscode_lm_adapters = {
+            runtime_adapters.VSCODE_LM_ADAPTER,
+            runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+            runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+        }
+        if latest.get("adapter_id") not in vscode_lm_adapters:
             return {"ok": False, "reason": "worker_bridge_adapter_mismatch"}
         if latest.get("state") not in ACTIVE_PROCESS_STATES:
             return {"ok": False, "reason": "worker_bridge_request_not_active"}
@@ -3689,7 +3733,7 @@ class ProcessManager:
             return {"ok": False, "reason": "worker_bridge_metadata_unreadable"}
         if (
             str(metadata.get("request_id") or "") != request_id
-            or str(metadata.get("adapter_id") or "") != runtime_adapters.GLM_VSCODE_LM_ADAPTER
+            or str(metadata.get("adapter_id") or "") not in vscode_lm_adapters
         ):
             return {"ok": False, "reason": "worker_bridge_metadata_identity_mismatch"}
         worker_meta = metadata.get("worker_mcp") or {}

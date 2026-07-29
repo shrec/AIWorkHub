@@ -83,7 +83,12 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             pass
 
 
-def bridge_readiness(repo: Path, *, model: str = "glm-5.2") -> dict[str, Any]:
+def bridge_readiness(
+    repo: Path,
+    *,
+    model: str = "glm-5.2",
+    adapter_id: str = "glm_vscode_lm",
+) -> dict[str, Any]:
     """Return a secret-free, fail-closed editor-host bridge status."""
     repo = repo.resolve()
     repo_id = _repo_id(repo)
@@ -117,7 +122,7 @@ def bridge_readiness(repo: Path, *, model: str = "glm-5.2") -> dict[str, Any]:
     ]
     selected = sorted(live, key=lambda item: item["age_seconds"])[0] if live else None
     return {
-        "adapter_id": "glm_vscode_lm",
+        "adapter_id": adapter_id,
         "kind": "vscode_language_model_api",
         "repo_id": repo_id,
         "model": model,

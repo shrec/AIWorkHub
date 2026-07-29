@@ -18,17 +18,21 @@ from typing import Any
 
 
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
+    "vscode_lm",
     "claude_cli",
     "codex_cli",
     "deepseek_copilot_cli",
+    "deepseek_vscode_lm",
     "glm_copilot_cli",
     "glm_vscode_lm",
     "deepseek_manual",
 )
 LOCAL_ADAPTERS: tuple[str, ...] = (
+    "vscode_lm",
     "claude_cli",
     "codex_cli",
     "deepseek_copilot_cli",
+    "deepseek_vscode_lm",
     "glm_copilot_cli",
     "glm_vscode_lm",
 )
@@ -36,11 +40,13 @@ MANUAL_ONLY_ADAPTERS: tuple[str, ...] = ("deepseek_manual",)
 
 ADAPTER_EXECUTABLES: Mapping[str, str] = MappingProxyType(
     {
+        "vscode_lm": sys.executable,
         "claude_cli": "claude",
         "codex_cli": "codex",
         # Official GitHub Copilot CLI, driven in BYOK mode against DeepSeek's
         # OpenAI-compatible API (see deepseek_credentials.py).
         "deepseek_copilot_cli": "copilot",
+        "deepseek_vscode_lm": sys.executable,
         # Official GitHub Copilot CLI, driven in BYOK mode against GLM's
         # OpenAI-compatible API (see glm_credentials.py).
         "glm_copilot_cli": "copilot",
@@ -52,6 +58,7 @@ ADAPTER_EXECUTABLES: Mapping[str, str] = MappingProxyType(
 # is the cheaper/faster variant. A DeepSeek-labeled task may use only these
 # models -- never a GitHub-hosted Claude/GPT model.
 DEEPSEEK_COPILOT_ADAPTER = "deepseek_copilot_cli"
+DEEPSEEK_VSCODE_LM_ADAPTER = "deepseek_vscode_lm"
 DEEPSEEK_SUPPORTED_MODELS: tuple[str, ...] = ("deepseek-v4-pro", "deepseek-v4-flash")
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
 # Copilot BYOK env var whose value the launcher declares as secret-redacted via
@@ -63,6 +70,7 @@ GLM_VSCODE_LM_ADAPTER = "glm_vscode_lm"
 GLM_SUPPORTED_MODELS: tuple[str, ...] = ("glm-5.2",)
 GLM_DEFAULT_MODEL = "glm-5.2"
 GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
+VSCODE_LM_ADAPTER = "vscode_lm"
 
 # Codex normally keeps its own workspace-write sandbox.  When Task MCP already
 # places the whole worker under an outer Landlock/bubblewrap filesystem sandbox,
@@ -437,10 +445,10 @@ def build_runtime_command(
         return _invalid_plan(adapter_id, resolution.reason, cwd=cwd)
 
     executable = resolution.executable
-    if adapter_id == GLM_VSCODE_LM_ADAPTER:
+    if adapter_id in {VSCODE_LM_ADAPTER, GLM_VSCODE_LM_ADAPTER, DEEPSEEK_VSCODE_LM_ADAPTER}:
         return _invalid_plan(
             adapter_id,
-            "glm_vscode_lm_requires_process_launcher_bridge_context",
+            "vscode_lm_requires_process_launcher_bridge_context",
             cwd=cwd,
         )
     if adapter_id == "claude_cli":
@@ -618,6 +626,7 @@ def build_adapter_command(
 __all__ = [
     "ADAPTER_EXECUTABLES",
     "DEEPSEEK_COPILOT_ADAPTER",
+    "DEEPSEEK_VSCODE_LM_ADAPTER",
     "DEEPSEEK_DEFAULT_MODEL",
     "DEEPSEEK_SECRET_ENV_VAR",
     "DEEPSEEK_SUPPORTED_MODELS",
@@ -629,6 +638,7 @@ __all__ = [
     "LOCAL_ADAPTERS",
     "MANUAL_ONLY_ADAPTERS",
     "SUPPORTED_ADAPTERS",
+    "VSCODE_LM_ADAPTER",
     "ExecutableResolution",
     "RuntimeAdapterPlan",
     "build_adapter_command",

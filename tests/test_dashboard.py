@@ -441,6 +441,11 @@ def test_callback_bridge_health_batch_stats_never_expose_full_thread_id(tmp_path
     assert health["batches"]["by_state"]["inflight"] == 1
     assert health["batches"]["inflight_batch_member_count"] == 3
     assert health["bound_task_count"] == 3
+    assert health["backlog_count"] == 3
+    assert health["attempts_total"] == 0
+    assert health["retry_count"] == 0
+    assert health["oldest_pending_at"] == NOW
+    assert health["last_delivered_at"] == ""
 
     snapshot = dashboard.build_snapshot(provider)
     assert thread_id not in json.dumps(snapshot)

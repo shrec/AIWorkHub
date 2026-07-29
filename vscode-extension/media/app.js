@@ -42,6 +42,11 @@ const state = {
   liveOutputTimer: null,
   systemLogs: [],
   memoryEntries: [],
+  returnPage: 0,
+  returnSearch: "",
+  returnTopic: "all",
+  returnRunner: "all",
+  returnPageSize: 20,
 };
 
 function persistState() {
@@ -88,6 +93,11 @@ const elements = {
   identityAlert: document.querySelector("#identity-alert"),
   identityAlertTitle: document.querySelector("#identity-alert-title"),
   identityAlertMessage: document.querySelector("#identity-alert-message"),
+  callbackObservability: document.querySelector("#callback-observability"),
+  callbackBacklog: document.querySelector("#callback-backlog"),
+  callbackDelivery: document.querySelector("#callback-delivery"),
+  callbackRetries: document.querySelector("#callback-retries"),
+  callbackDegraded: document.querySelector("#callback-degraded"),
   filteredCount: document.querySelector("#filtered-count"),
   statusFilters: document.querySelector("#status-filters"),
   taskSearch: document.querySelector("#task-search"),
@@ -115,6 +125,12 @@ const elements = {
   aiMemorySearch: document.querySelector("#ai-memory-search"),
   aiMemoryList: document.querySelector("#ai-memory-list"),
   returnList: document.querySelector("#return-list"),
+  returnSearch: document.querySelector("#return-search"),
+  returnTopic: document.querySelector("#return-topic"),
+  returnRunner: document.querySelector("#return-runner"),
+  returnPrevious: document.querySelector("#return-previous"),
+  returnNext: document.querySelector("#return-next"),
+  returnPage: document.querySelector("#return-page"),
   returnTab: document.querySelector("#tab-returns"),
   runList: document.querySelector("#run-list"),
   runTab: document.querySelector("#tab-runs"),
@@ -411,6 +427,34 @@ function renderManagerIdentity(snapshot) {
     : `callback=${String(delivery.status || "unknown")}${deliveryProblems.length ? ` · ${deliveryProblems.join(",")}` : ""}`;
   const routeStatus = `route=${routeState}${routeReason ? ` · route_reason=${routeReason}` : ""}`;
   elements.identityAlertMessage.textContent = `${identityReason} · ${routeStatus} · ${deliveryReason}`;
+}
+
+function renderCallbackObservability(snapshot) {
+  if (!elements.callbackObservability) return;
+  const health = snapshot && typeof snapshot.callback_bridge_health === "object"
+    ? snapshot.callback_bridge_health
+    : {};
+  const delivery = snapshot && typeof snapshot.callback_delivery === "object"
+    ? snapshot.callback_delivery
+    : {};
+  const states = health.by_state && typeof health.by_state === "object" ? health.by_state : {};
+  const backlog = Number.isFinite(Number(health.backlog_count))
+    ? numberValue(health.backlog_count)
+    : numberValue(states.pending) + numberValue(states.inflight);
+  const lastDelivery = health.last_delivered_at || delivery.last_delivery_at || delivery.last_claude_delivery_at || "";
+  const retries = numberValue(health.retry_count);
+  const problems = asArray(delivery.problems).filter(Boolean);
+  const deadLetters = numberValue(states.dead_letter);
+  const degradedReason = health.last_dead_letter_error || delivery.last_deferral_reason || problems.join(", ") || "none";
+  elements.callbackBacklog.textContent = formatCount(backlog);
+  elements.callbackBacklog.title = `pending=${numberValue(states.pending)}, inflight=${numberValue(states.inflight)}`;
+  elements.callbackDelivery.textContent = lastDelivery ? formatRelativeTime(lastDelivery) : "Never";
+  elements.callbackDelivery.title = lastDelivery || "No delivered callback recorded";
+  elements.callbackRetries.textContent = formatCount(retries);
+  elements.callbackRetries.title = `max attempts=${numberValue(health.max_attempts)}`;
+  elements.callbackDegraded.textContent = deadLetters || problems.length ? degradedReason : "Healthy";
+  elements.callbackDegraded.title = degradedReason;
+  elements.callbackObservability.classList.toggle("is-degraded", Boolean(deadLetters || problems.length));
 }
 
 function replaceSelectOptions(select, values, allLabel, currentValue) {
@@ -880,12 +924,43 @@ function renderReturns(snapshot) {
   const reviewQueue = asArray(inbox.review_queue);
   elements.returnTab.title = `${reviewQueue.length} worker return${reviewQueue.length === 1 ? "" : "s"} awaiting review`;
   elements.returnTab.setAttribute("aria-label", `Returns, ${elements.returnTab.title}`);
+  const topics = Array.from(new Set(reviewQueue.map((item) => String(item.topic || "unknown")))).sort();
+  const runners = Array.from(new Set(reviewQueue.map((item) => String(item.runner || item.claimed_by || "unassigned")))).sort();
+  replaceSelectOptions(elements.returnTopic, topics, "All topics", state.returnTopic);
+  replaceSelectOptions(elements.returnRunner, runners, "All runners", state.returnRunner);
+  state.returnTopic = elements.returnTopic.value;
+  state.returnRunner = elements.returnRunner.value;
+  const needle = state.returnSearch.trim().toLocaleLowerCase();
+  const filtered = reviewQueue.filter((item) => {
+    const topic = String(item.topic || "unknown");
+    const runner = String(item.runner || item.claimed_by || "unassigned");
+    if (state.returnTopic !== "all" && topic !== state.returnTopic) return false;
+    if (state.returnRunner !== "all" && runner !== state.returnRunner) return false;
+    if (!needle) return true;
+    return [item.task_id, item.objective, item.validation_status, topic, runner]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(needle));
+  });
   if (reviewQueue.length === 0) {
+    state.returnPage = 0;
+    elements.returnPage.textContent = "0 / 0";
+    elements.returnPrevious.disabled = true;
+    elements.returnNext.disabled = true;
     elements.returnList.replaceChildren(createElement("div", "panel-list-empty", "No worker returns awaiting review"));
     return;
   }
+  const pageCount = Math.max(1, Math.ceil(filtered.length / state.returnPageSize));
+  state.returnPage = Math.min(state.returnPage, pageCount - 1);
+  const start = state.returnPage * state.returnPageSize;
+  const page = filtered.slice(start, start + state.returnPageSize);
+  elements.returnPage.textContent = `${filtered.length ? state.returnPage + 1 : 0} / ${filtered.length ? pageCount : 0} · ${filtered.length} shown`;
+  elements.returnPrevious.disabled = state.returnPage <= 0;
+  elements.returnNext.disabled = state.returnPage >= pageCount - 1 || filtered.length === 0;
+  if (!page.length) {
+    elements.returnList.replaceChildren(createElement("div", "panel-list-empty", "No matching worker returns"));
+    return;
+  }
   const fragment = document.createDocumentFragment();
-  for (const item of reviewQueue.slice(0, 40)) {
+  for (const item of page) {
     const row = taskSignalRow(item, item.validation_status || "review", validationClass(item.validation_status));
     if (item.objective) {
       row.appendChild(createElement("span", "signal-message", item.objective));
@@ -1020,6 +1095,7 @@ function renderSnapshot(snapshot) {
   const storageReady = renderStorageState(snapshot);
   renderSummary(snapshot);
   renderManagerIdentity(snapshot);
+  renderCallbackObservability(snapshot);
   renderKnownRepositories(snapshot);
   if (storageReady) {
     renderSourceHealth(snapshot);
@@ -2079,6 +2155,34 @@ elements.sortOrder.addEventListener("change", () => {
   state.sort = elements.sortOrder.value;
   persistState();
   renderTaskTable();
+});
+
+elements.returnSearch.addEventListener("input", () => {
+  state.returnSearch = elements.returnSearch.value;
+  state.returnPage = 0;
+  if (state.snapshot) renderReturns(state.snapshot);
+});
+
+elements.returnTopic.addEventListener("change", () => {
+  state.returnTopic = elements.returnTopic.value;
+  state.returnPage = 0;
+  if (state.snapshot) renderReturns(state.snapshot);
+});
+
+elements.returnRunner.addEventListener("change", () => {
+  state.returnRunner = elements.returnRunner.value;
+  state.returnPage = 0;
+  if (state.snapshot) renderReturns(state.snapshot);
+});
+
+elements.returnPrevious.addEventListener("click", () => {
+  state.returnPage = Math.max(0, state.returnPage - 1);
+  if (state.snapshot) renderReturns(state.snapshot);
+});
+
+elements.returnNext.addEventListener("click", () => {
+  state.returnPage += 1;
+  if (state.snapshot) renderReturns(state.snapshot);
 });
 
 document.addEventListener("click", (event) => {

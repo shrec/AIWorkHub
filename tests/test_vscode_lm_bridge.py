@@ -53,6 +53,17 @@ def test_readiness_is_repo_scoped_and_credential_free(tmp_path: Path, monkeypatc
     ready = vscode_lm_bridge.bridge_readiness(repo)
     assert ready["launchable"] is True
     assert ready["window_id"] == "window_test"
+    deepseek_absent = vscode_lm_bridge.bridge_readiness(
+        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
+    )
+    assert deepseek_absent["adapter_id"] == "deepseek_vscode_lm"
+    assert deepseek_absent["launchable"] is False
+    _host(root, repo_id, models=["glm-5.2", "deepseek-v4-pro"])
+    deepseek_ready = vscode_lm_bridge.bridge_readiness(
+        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
+    )
+    assert deepseek_ready["launchable"] is True
+    assert deepseek_ready["credential_required"] is False
     if os.name != "nt":
         assert host.stat().st_mode & 0o077 == 0
 

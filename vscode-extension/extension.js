@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.92";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.93";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -76,6 +76,8 @@ const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v1";
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
+const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"]);
+const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -1618,21 +1620,42 @@ function vscodeLmModelFields(model) {
     .map((value) => value.trim());
 }
 
-function isGlm52LanguageModel(model) {
+function normalizedVscodeLmModelName(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function canonicalVscodeLmModelName(value) {
+  const normalized = normalizedVscodeLmModelName(value);
+  const known = VSCODE_LM_SUPPORTED_MODELS.find((name) => normalizedVscodeLmModelName(name) === normalized);
+  if (known) return known;
+  const raw = String(value || "").trim();
+  return VSCODE_LM_REQUESTED_MODEL_RE.test(raw) ? raw : "";
+}
+
+function isVscodeLanguageModel(model, requestedModel) {
+  const requestedCanonical = canonicalVscodeLmModelName(requestedModel);
+  if (!requestedCanonical) return false;
+  const requested = normalizedVscodeLmModelName(requestedCanonical);
   return vscodeLmModelFields(model).some((value) => {
-    const normalized = value.toLowerCase().replace(/_/g, "-");
-    return normalized === VSCODE_LM_MODEL || normalized.includes(VSCODE_LM_MODEL);
+    const normalized = normalizedVscodeLmModelName(value);
+    return normalized === requested;
   });
 }
 
-function selectGlm52LanguageModel(models) {
-  const matches = (Array.isArray(models) ? models : []).filter(isGlm52LanguageModel);
+function selectVscodeLanguageModel(models, requestedModel) {
+  const requestedCanonical = canonicalVscodeLmModelName(requestedModel);
+  if (!requestedCanonical) return null;
+  const requested = normalizedVscodeLmModelName(requestedCanonical);
+  const matches = (Array.isArray(models) ? models : []).filter((model) => isVscodeLanguageModel(model, requested));
   return matches.sort((left, right) => {
-    const leftExact = vscodeLmModelFields(left).some((value) => value.toLowerCase() === VSCODE_LM_MODEL) ? 0 : 1;
-    const rightExact = vscodeLmModelFields(right).some((value) => value.toLowerCase() === VSCODE_LM_MODEL) ? 0 : 1;
+    const leftExact = vscodeLmModelFields(left).some((value) => normalizedVscodeLmModelName(value) === requested) ? 0 : 1;
+    const rightExact = vscodeLmModelFields(right).some((value) => normalizedVscodeLmModelName(value) === requested) ? 0 : 1;
     return leftExact - rightExact || String(left.id || "").localeCompare(String(right.id || ""));
   })[0] || null;
 }
+
+function isGlm52LanguageModel(model) { return isVscodeLanguageModel(model, VSCODE_LM_MODEL); }
+function selectGlm52LanguageModel(models) { return selectVscodeLanguageModel(models, VSCODE_LM_MODEL); }
 
 function ownerOnlyRegularFile(filePath, maxBytes = VSCODE_LM_MAX_REQUEST_BYTES) {
   try {
@@ -1658,7 +1681,8 @@ function validateVscodeLmRequest(payload, repoInfo) {
   if (canonicalRepositoryRoot(String(payload.repo_root || "")) !== canonicalRepositoryRoot(repoInfo.root)) {
     throw new Error("vscode_lm_repo_root_mismatch");
   }
-  if (String(payload.model || "").toLowerCase() !== VSCODE_LM_MODEL) {
+  const requestedModel = canonicalVscodeLmModelName(payload.model);
+  if (!requestedModel) {
     throw new Error("vscode_lm_model_mismatch");
   }
   if (typeof payload.prompt !== "string" || !payload.prompt.trim()) throw new Error("vscode_lm_prompt_missing");
@@ -1693,7 +1717,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
   }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
-  return { ...payload, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
+  return { ...payload, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
 }
 
 const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
@@ -2123,7 +2147,13 @@ class VscodeLmBridgeHost {
 
   async publishHeartbeat() {
     if (!this.repoInfo || this.disposed) return;
-    const model = selectGlm52LanguageModel(await this.models());
+    const models = await this.models();
+    const visibleModels = Array.from(new Set([
+      ...VSCODE_LM_SUPPORTED_MODELS.filter((name) => selectVscodeLanguageModel(models, name)),
+      ...models.flatMap((model) => [model && model.id, model && model.family])
+        .filter((name) => typeof name === "string" && VSCODE_LM_REQUESTED_MODEL_RE.test(name.trim()))
+        .map((name) => name.trim()),
+    ])).slice(0, 128);
     const globalState = this.context && this.context.globalState;
     const permissionGranted = Boolean(
       globalState && typeof globalState.get === "function"
@@ -2135,8 +2165,11 @@ class VscodeLmBridgeHost {
       repo_id: this.repoInfo.repoId,
       window_id: WINDOW_SCOPE_ID,
       extension_host_pid: process.pid,
-      models: model ? [VSCODE_LM_MODEL] : [],
-      model_metadata: model ? { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version, maxInputTokens: model.maxInputTokens } : null,
+      models: visibleModels,
+      model_metadata: visibleModels.slice(0, 64).map((name) => {
+        const model = selectVscodeLanguageModel(models, name);
+        return { canonical: name, id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version, maxInputTokens: model.maxInputTokens };
+      }),
       permission_granted: permissionGranted,
       updated_at: new Date().toISOString(),
     };
@@ -2149,10 +2182,10 @@ class VscodeLmBridgeHost {
     if (globalState && typeof globalState.get === "function" && globalState.get(VSCODE_LM_PERMISSION_KEY, false)) return true;
     if (!this.permissionPrompt) {
       this.permissionPrompt = vscode.window.showInformationMessage(
-        "AIWorkHub has a queued GLM‑5.2 worker task. Allow it to use the GLM model already authorized in VS Code?",
-        "Allow GLM workers",
+        "AIWorkHub has a queued worker task. Allow it to use models already authorized in VS Code?",
+        "Allow VS Code models",
       ).then(async (choice) => {
-        const granted = choice === "Allow GLM workers";
+        const granted = choice === "Allow VS Code models";
         if (granted && globalState && typeof globalState.update === "function") {
           await globalState.update(VSCODE_LM_PERMISSION_KEY, true);
         }
@@ -2179,7 +2212,7 @@ class VscodeLmBridgeHost {
       const payload = JSON.parse(fs.readFileSync(claimPath, "utf8"));
       const request = validateVscodeLmRequest(payload, this.repoInfo);
       const models = await this.models();
-      const model = selectGlm52LanguageModel(models);
+      const model = selectVscodeLanguageModel(models, request.model);
       if (!model) throw new Error("vscode_lm_model_not_visible");
       if (!(await this.ensurePermission())) throw new Error("vscode_lm_permission_denied");
       const source = new vscode.CancellationTokenSource();
@@ -2682,6 +2715,77 @@ function ensureCodexManagerGatesTomlText(text) {
   return { text: result.join("\n"), changed };
 }
 
+function tomlQuoted(value) {
+  return JSON.stringify(String(value));
+}
+
+function hasAiWorkHubMcpRegistrationToml(text) {
+  let currentSection = "";
+  for (const line of String(text || "").split("\n")) {
+    const sectionMatch = line.match(TOML_SECTION_RE);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1];
+      continue;
+    }
+    const segments = currentSection.trim().split(".");
+    if (segments.length !== 2 || segments[0].toLowerCase() !== "mcp_servers") continue;
+    if (OWNED_MCP_SERVER_NAMES.has(segments[1].toLowerCase())) return true;
+    if (/^\s*args\s*=/.test(line) && line.includes("aiworkhub.server")) return true;
+  }
+  return false;
+}
+
+/** Add the canonical application-global Codex MCP registration on a clean
+ * install. It deliberately carries no repository path: each Codex chat binds
+ * the server from its own cwd, preserving multi-window/repository isolation. */
+function ensureCodexMcpRegistrationTomlText(text, runtimeDir, python) {
+  const input = String(text || "");
+  if (hasAiWorkHubMcpRegistrationToml(input)) return { text: input, changed: false };
+  const prefix = input && !input.endsWith("\n") ? "\n\n" : input ? "\n" : "";
+  const args = [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"];
+  const block = [
+    "[mcp_servers.aiworkhub]",
+    `command = ${tomlQuoted(python.command)}`,
+    `args = [${args.map(tomlQuoted).join(", ")}]`,
+    "",
+    "[mcp_servers.aiworkhub.env]",
+    `PYTHONPATH = ${tomlQuoted(runtimeDir)}`,
+    'AIWORKHUB_ALLOW_WRITES = "1"',
+    'AIWORKHUB_ALLOW_LAUNCH = "1"',
+    "",
+  ].join("\n");
+  return { text: `${input}${prefix}${block}`, changed: true };
+}
+
+function ensureCodexMcpRegistered(context, _repoRoot) {
+  const configPath = resolveCodexConfigTomlPath(process.env);
+  let original = "";
+  try {
+    original = fs.readFileSync(configPath, "utf8");
+  } catch (err) {
+    if (err && err.code !== "ENOENT") {
+      outputChannel.appendLine(`[codex] failed to read config.toml: ${sanitizeErrorMessage(err)}`);
+      return false;
+    }
+  }
+  const runtimeDir = extensionRuntimeDir || resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  // Codex registration is application-global, so it must never point at one
+  // repository's disposable virtualenv. Resolve only a stable user/system
+  // interpreter; the packaged runtime itself comes from PYTHONPATH.
+  const python = findPythonCommand(os.homedir());
+  const result = ensureCodexMcpRegistrationTomlText(original, runtimeDir, python);
+  if (!result.changed) return false;
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, result.text, "utf8");
+    outputChannel.appendLine("[codex] registered the packaged AIWorkHub MCP runtime for new chats");
+    return true;
+  } catch (err) {
+    outputChannel.appendLine(`[codex] failed to register AIWorkHub MCP: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+}
+
 /** B894a backward-compatible pure helper: like repairCodexConfigTomlText, but
  *  also migrates a custom-named MCP server table when (and only when) that
  *  table's own `args` line (in its top-level `[mcp_servers.<name>]` section,
@@ -3015,16 +3119,22 @@ async function ensureCodexCallbackMuxConfigured(context, launcherOverride = "") 
  *  source checkout in PYTHONPATH can fail even while the dashboard is live.
  *  Keep the registration repository-scoped, but make code authority come from
  *  this extension's bundled runtime on every supported host OS. */
-function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) {
-  if (!document || typeof document !== "object" || !document.servers || typeof document.servers !== "object") {
+function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, python) {
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
     return { document, changed: false };
   }
+  if (!document[containerKey] || typeof document[containerKey] !== "object" || Array.isArray(document[containerKey])) {
+    document[containerKey] = {};
+  }
+  const servers = document[containerKey];
   let changed = false;
-  for (const [name, value] of Object.entries(document.servers)) {
+  let found = false;
+  for (const [name, value] of Object.entries(servers)) {
     if (!value || typeof value !== "object") continue;
     const args = Array.isArray(value.args) ? value.args.map(String) : [];
     const isAiWorkHub = name.toLowerCase() === "aiworkhub" || args.includes("aiworkhub.server");
     if (!isAiWorkHub) continue;
+    found = true;
     const nextArgs = [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"];
     const nextEnv = {
       ...(value.env && typeof value.env === "object" ? value.env : {}),
@@ -3040,11 +3150,34 @@ function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) 
     }
     const next = { ...value, command: python.command, args: nextArgs, env: nextEnv, type: "stdio" };
     if (JSON.stringify(next) !== JSON.stringify(value)) {
-      document.servers[name] = next;
+      servers[name] = next;
       changed = true;
     }
   }
+  if (!found) {
+    servers.AIWorkHub = {
+      command: python.command,
+      args: [...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []), "-m", "aiworkhub.server"],
+      env: {
+        PYTHONPATH: runtimeDir,
+        AIWORKHUB_REPO: repoRoot,
+        AIWORKHUB_REPO_ROOT: repoRoot,
+        AIWORKHUB_ALLOW_WRITES: "1",
+        AIWORKHUB_ALLOW_LAUNCH: "1",
+      },
+      type: "stdio",
+    };
+    changed = true;
+  }
   return { document, changed };
+}
+
+function repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python) {
+  return repairMcpConfigObject(document, "servers", runtimeDir, repoRoot, python);
+}
+
+function repairClaudeMcpConfigObject(document, runtimeDir, repoRoot, python) {
+  return repairMcpConfigObject(document, "mcpServers", runtimeDir, repoRoot, python);
 }
 
 function ensureWorkspaceMcpConfigsRepaired(context) {
@@ -3053,21 +3186,29 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
   let repaired = 0;
   for (const folder of folders) {
     const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
-    const configPath = path.join(repoRoot, ".vscode", "mcp.json");
-    let document;
-    try {
-      document = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    } catch (_err) {
-      continue;
-    }
     const python = findPythonCommand(repoRoot);
-    const result = repairWorkspaceMcpConfigObject(document, runtimeDir, repoRoot, python);
-    if (!result.changed) continue;
-    try {
-      fs.writeFileSync(configPath, `${JSON.stringify(result.document, null, 2)}\n`, "utf8");
-      repaired += 1;
-    } catch (err) {
-      outputChannel.appendLine(`[mcp] failed to repair workspace MCP registration: ${sanitizeErrorMessage(err)}`);
+    for (const spec of [
+      { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot" },
+      { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code" },
+    ]) {
+      let document = {};
+      try {
+        document = JSON.parse(fs.readFileSync(spec.configPath, "utf8"));
+      } catch (err) {
+        if (err && err.code !== "ENOENT") {
+          outputChannel.appendLine(`[mcp] ${spec.label} config is invalid/unreadable; preserved without overwrite`);
+          continue;
+        }
+      }
+      const result = repairMcpConfigObject(document, spec.container, runtimeDir, repoRoot, python);
+      if (!result.changed) continue;
+      try {
+        fs.mkdirSync(path.dirname(spec.configPath), { recursive: true });
+        fs.writeFileSync(spec.configPath, `${JSON.stringify(result.document, null, 2)}\n`, "utf8");
+        repaired += 1;
+      } catch (err) {
+        outputChannel.appendLine(`[mcp] failed to register ${spec.label} MCP: ${sanitizeErrorMessage(err)}`);
+      }
     }
   }
   if (repaired) {
@@ -3774,6 +3915,13 @@ function getHtmlForWebview(webview, extensionUri) {
       <span id="identity-alert-message"></span>
     </section>
 
+    <section class="callback-observability" id="callback-observability" aria-label="Callback delivery telemetry">
+      <span><small>Backlog</small><strong id="callback-backlog">0</strong></span>
+      <span><small>Last delivery</small><strong id="callback-delivery">Never</strong></span>
+      <span><small>Retries</small><strong id="callback-retries">0</strong></span>
+      <span><small>Delivery state</small><strong id="callback-degraded">Unknown</strong></span>
+    </section>
+
     <section class="activity-peek" aria-label="Repository diagnostics">
       <span class="activity-peek-label">Last log</span>
       <span class="activity-peek-message" id="last-system-log">No system events yet</span>
@@ -3939,6 +4087,12 @@ function getHtmlForWebview(webview, extensionUri) {
             <div class="stat-list" id="storage-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-returns" aria-labelledby="tab-returns" hidden>
+            <div class="return-toolbar">
+              <input id="return-search" type="search" placeholder="Search returns" aria-label="Search worker returns">
+              <select id="return-topic" aria-label="Filter returns by topic"><option value="all">All topics</option></select>
+              <select id="return-runner" aria-label="Filter returns by runner"><option value="all">All runners</option></select>
+              <span class="return-pagination"><button type="button" id="return-previous" aria-label="Previous return page">Prev</button><span id="return-page">0 / 0</span><button type="button" id="return-next" aria-label="Next return page">Next</button></span>
+            </div>
             <div class="signal-list" id="return-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-runs" aria-labelledby="tab-runs" hidden>
@@ -4368,6 +4522,7 @@ async function activate(context) {
   outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
+  ensureCodexMcpRegistered(context, activeRepoIdentity && activeRepoIdentity.root);
   ensureCodexManagerGatesRepaired();
   ensureWorkspaceMcpConfigsRepaired(context);
 
@@ -4475,7 +4630,10 @@ module.exports = {
     migrateCodexConfigTomlText,
     migrateCodexConfigTomlRuntimePath,
     repairWorkspaceMcpConfigObject,
+    repairClaudeMcpConfigObject,
     ensureWorkspaceMcpConfigsRepaired,
+    ensureCodexMcpRegistrationTomlText,
+    ensureCodexMcpRegistered,
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
     CODEX_OWNED_RUNTIME_SEGMENT_RE,
@@ -4503,6 +4661,8 @@ module.exports = {
     vscodeLmModelFields,
     isGlm52LanguageModel,
     selectGlm52LanguageModel,
+    isVscodeLanguageModel,
+    selectVscodeLanguageModel,
     validateVscodeLmRequest,
     runVscodeLmAgent,
     runVscodeLmTextProtocol,
@@ -4523,6 +4683,7 @@ module.exports = {
       APP_SERVER_MUX_SIDEBAND_DIR_ENV,
       REAL_THREAD_ID_RE,
       VSCODE_LM_MODEL,
+      VSCODE_LM_SUPPORTED_MODELS,
       VSCODE_LM_REQUEST_SCHEMA,
       VSCODE_LM_HOST_SCHEMA,
       VSCODE_LM_RESPONSE_SCHEMA,

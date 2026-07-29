@@ -24,8 +24,11 @@ SUPPORTED_MODELS: tuple[str, ...] = (
     "claude",
 )
 SUPPORTED_ADAPTERS: tuple[str, ...] = (
+    "vscode_lm",
     "codex_cli",
+    "deepseek_vscode_lm",
     "deepseek_copilot_cli",
+    "glm_vscode_lm",
     "glm_cli",
     "claude_cli",
     "manual",

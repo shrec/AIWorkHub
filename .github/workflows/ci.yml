@@ -17,6 +17,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and test Python runtime
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e .
+          python -m pip install "pytest>=8,<10"
+          python -m pytest tests/ -q --tb=short
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install extension dependencies
+        run: npm install
+        working-directory: vscode-extension
+
+      - name: Run extension tests
+        run: npm test
+        working-directory: vscode-extension
+
   python-ci:
     name: Python (3.10–3.12)
     runs-on: ubuntu-latest
@@ -50,7 +88,7 @@ jobs:
 
   python-package:
     name: Python package
-    needs: [python-ci]
+    needs: [python-ci, cross-platform]
     runs-on: ubuntu-latest
 
     steps:
@@ -89,6 +127,7 @@ jobs:
 
   vscode-ci:
     name: VS Code extension (test + package)
+    needs: [cross-platform]
     runs-on: ubuntu-latest
 
     steps:

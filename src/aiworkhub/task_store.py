@@ -619,16 +619,61 @@ def callback_bridge_health(root: str | Path) -> dict[str, Any]:
                 "SELECT COUNT(DISTINCT task_id) AS n FROM callback_outbox WHERE origin_thread_id != ''"
             ).fetchone()["n"]
         )
+        attempt_row = conn.execute(
+            "SELECT COALESCE(SUM(attempts), 0) AS attempts_total, "
+            "COALESCE(SUM(CASE WHEN attempts > 1 THEN attempts - 1 ELSE 0 END), 0) AS retry_count, "
+            "COALESCE(MAX(attempts), 0) AS max_attempts FROM callback_outbox"
+        ).fetchone()
+        last_delivered = conn.execute(
+            "SELECT task_id, transition, updated_at FROM callback_outbox "
+            "WHERE state='delivered' ORDER BY updated_at DESC, outbox_id DESC LIMIT 1"
+        ).fetchone()
+        last_dead_letter = conn.execute(
+            "SELECT task_id, transition, updated_at, last_error FROM callback_outbox "
+            "WHERE state='dead_letter' ORDER BY updated_at DESC, outbox_id DESC LIMIT 1"
+        ).fetchone()
+        oldest_pending = conn.execute(
+            "SELECT MIN(created_at) AS created_at FROM callback_outbox "
+            "WHERE state IN ('pending', 'inflight')"
+        ).fetchone()
+        batch_attempt_row = conn.execute(
+            "SELECT COALESCE(SUM(attempts), 0) AS attempts_total, "
+            "COALESCE(SUM(CASE WHEN attempts > 1 THEN attempts - 1 ELSE 0 END), 0) AS retry_count, "
+            "COALESCE(MAX(attempts), 0) AS max_attempts FROM callback_batches"
+        ).fetchone()
+        last_dead_batch = conn.execute(
+            "SELECT member_count, updated_at, last_error FROM callback_batches "
+            "WHERE state='dead_letter' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
     finally:
         conn.close()
+    backlog_count = counts["pending"] + counts["inflight"]
     return {
         "ok": True,
         "total": sum(counts.values()),
         "by_state": counts,
+        "backlog_count": backlog_count,
+        "attempts_total": int(attempt_row["attempts_total"]),
+        "retry_count": int(attempt_row["retry_count"]),
+        "max_attempts": int(attempt_row["max_attempts"]),
+        "oldest_pending_at": str(oldest_pending["created_at"] or ""),
+        "last_delivered_task_id": str(last_delivered["task_id"] if last_delivered else ""),
+        "last_delivered_transition": str(last_delivered["transition"] if last_delivered else ""),
+        "last_delivered_at": str(last_delivered["updated_at"] if last_delivered else ""),
+        "last_dead_letter_task_id": str(last_dead_letter["task_id"] if last_dead_letter else ""),
+        "last_dead_letter_transition": str(last_dead_letter["transition"] if last_dead_letter else ""),
+        "last_dead_letter_at": str(last_dead_letter["updated_at"] if last_dead_letter else ""),
+        "last_dead_letter_error": str(last_dead_letter["last_error"] if last_dead_letter else "")[:500],
         "batches": {
             "total": sum(batch_counts.values()),
             "by_state": batch_counts,
             "inflight_batch_member_count": inflight_batch_member_count,
+            "attempts_total": int(batch_attempt_row["attempts_total"]),
+            "retry_count": int(batch_attempt_row["retry_count"]),
+            "max_attempts": int(batch_attempt_row["max_attempts"]),
+            "last_dead_letter_batch_member_count": int(last_dead_batch["member_count"] if last_dead_batch else 0),
+            "last_dead_letter_batch_at": str(last_dead_batch["updated_at"] if last_dead_batch else ""),
+            "last_dead_letter_batch_error": str(last_dead_batch["last_error"] if last_dead_batch else "")[:500],
         },
         "bound_task_count": bound_task_count,
         "unbound_task_count": max(0, total_tasks - bound_task_count),

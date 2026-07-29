@@ -17,8 +17,48 @@ permissions:
   contents: read
 
 jobs:
+  platform-qualification:
+    name: Release qualification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and test Python runtime
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e .
+          python -m pip install "pytest>=8,<10"
+          python -m pytest tests/ -q --tb=short
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install extension dependencies
+        run: npm install
+        working-directory: vscode-extension
+
+      - name: Run extension tests
+        run: npm test
+        working-directory: vscode-extension
+
   build:
     name: Build VSIX and Python package
+    needs: [platform-qualification]
     runs-on: ubuntu-latest
 
     steps:

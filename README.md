@@ -255,12 +255,25 @@ A task only reaches accepted/`done` after all three layers pass: worker
 validation -> independent coordinator re-validation -> audit-ledger receipt
 check. Workers stop at `review`; only the coordinator finalizes `done`.
 
-## DeepSeek (`deepseek_copilot_cli`) Adapter
+## DeepSeek (`deepseek_vscode_lm`) Adapter
+
+`vscode_lm` is the preferred provider-neutral adapter; `deepseek_vscode_lm`
+is its backwards-compatible DeepSeek alias. It uses the exact model
+already visible and authorized in the active VS Code/Copilot window through
+the same repository/window-bound Language Model bridge as GLM 5.2. AIWorkHub
+does not read, copy, store, refresh, or transport a provider key. Supported
+models are `deepseek-v4-pro` and `deepseek-v4-flash`; an unavailable exact
+model fails closed rather than substituting another family.
+
+`deepseek_copilot_cli` remains a compatibility-only BYOK adapter for existing
+installations. New worker configurations should select `deepseek_vscode_lm`.
+
+### Compatibility-only BYOK path
 
 `deepseek_copilot_cli` launches the installed official GitHub Copilot CLI in
 "bring your own key" (BYOK) mode against DeepSeek's OpenAI-compatible API
-(`https://api.deepseek.com/v1`). Every `deepseek_*` runner routes to this
-adapter for local launch; `deepseek_manual` stays an explicit fallback only.
+(`https://api.deepseek.com/v1`). Existing `deepseek_*` cards may still route
+explicitly to this adapter; `deepseek_manual` stays an explicit fallback only.
 A DeepSeek-labeled task is never routed to a GitHub-hosted Claude/GPT model.
 
 Supported models: `deepseek-v4-pro` (production coding default) and
