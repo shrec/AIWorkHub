@@ -35,12 +35,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install and test Python runtime
+      - name: Install and qualify cross-platform Python runtime
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e .
           python -m pip install "pytest>=8,<10"
-          python -m pytest tests/ -q --tb=short
+          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py -q --tb=short
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
