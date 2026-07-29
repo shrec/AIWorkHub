@@ -8,6 +8,9 @@ const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const fakeVscode = {
   workspace: { workspaceFolders: [], getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   LanguageModelChatToolMode: { Auto: 1, Required: 2 },
+  LanguageModelToolResultPart: class LanguageModelToolResultPart {
+    constructor(callId, content) { this.callId = callId; this.content = content; }
+  },
   LanguageModelChatMessage: {
     User: (content) => ({ role: "user", content }),
     Assistant: (content) => ({ role: "assistant", content }),
@@ -203,6 +206,35 @@ async function textProtocolChecks() {
   assert.strictEqual(correctedResult, finalResponse);
 }
 
+async function nativeProtocolChecks() {
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "bounded native",
+    files: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const turns = [
+    [{ callId: "call-1", name: "aiworkhub_manager_source_graph_query", input: { mode: "focus", query: "model" } }],
+    [],
+    [{ value: `Completed:\n\`\`\`json\n${finalResponse}\n\`\`\`` }],
+  ];
+  const model = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      const parts = turns.shift();
+      return { stream: (async function* stream() { for (const part of parts) yield part; }()) };
+    },
+  };
+  const originalInvoke = internals.VSCODE_LM_PRIVATE_TOOLS;
+  const result = await internals.runVscodeLmAgent(
+    model,
+    { requestId: "a".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(result, finalResponse);
+  assert.ok(originalInvoke.length > 0);
+}
+
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));
 try {
   const repo = path.join(temp, "repo");
@@ -234,7 +266,7 @@ try {
   fs.rmSync(temp, { recursive: true, force: true });
 }
 
-textProtocolChecks().then(() => {
+Promise.all([textProtocolChecks(), nativeProtocolChecks()]).then(() => {
   console.log("GLM VS Code LM bridge: ok");
 }).catch((err) => {
   console.error(err);

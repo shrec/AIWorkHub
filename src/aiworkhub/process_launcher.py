@@ -1303,6 +1303,40 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
         )
 
 
+def _prefer_editor_auth_adapter(
+    repo: Path,
+    *,
+    runner: str,
+    adapter_id: str,
+    model: str | None,
+) -> str:
+    """Prefer VS Code-owned auth for Claude when the model is visible.
+
+    ``claude_cli`` authenticates from the isolated worker HOME and can retain
+    an expired OAuth access token even while the VS Code Claude/Copilot model
+    is healthy.  The generic VS Code LM bridge already supports Claude
+    runners, preserves repository/worktree isolation, and requires no copied
+    credential.  Resolve this before claim-start so a missing editor model
+    leaves the explicit CLI adapter as the compatibility fallback and never
+    strands a claimed task.
+    """
+    if (
+        adapter_id != "claude_cli"
+        or not runner.startswith("claude_")
+        or not isinstance(model, str)
+        or not model.strip()
+    ):
+        return adapter_id
+    readiness = vscode_lm_bridge.bridge_readiness(
+        repo,
+        model=model.strip(),
+        adapter_id=runtime_adapters.VSCODE_LM_ADAPTER,
+    )
+    if readiness.get("launchable"):
+        return runtime_adapters.VSCODE_LM_ADAPTER
+    return adapter_id
+
+
 def _worker_mcp_bundle_payload(
     context_result: project_context.ProjectContextResult | None,
 ) -> dict[str, Any]:
@@ -2078,6 +2112,13 @@ class ProcessManager:
             )
         if timeout_seconds < 30 or timeout_seconds > 86_400:
             return self._blocked(task_id, runner, topic, adapter_id, "timeout_out_of_range")
+
+        adapter_id = _prefer_editor_auth_adapter(
+            self.repo,
+            runner=runner,
+            adapter_id=adapter_id,
+            model=model,
+        )
 
         request_id: str | None = None
         workspace: WorkerWorkspace | None = None

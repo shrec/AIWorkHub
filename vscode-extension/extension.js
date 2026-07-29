@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.99";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.0";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -2019,7 +2019,17 @@ async function runVscodeLmTextProtocol(
     const response = await model.sendRequest(messages, {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
     }, cancellationToken);
-    const text = await collectVscodeLmResponseText(response);
+    let text;
+    try {
+      text = await collectVscodeLmResponseText(response);
+    } catch (err) {
+      if (String(err && err.message || err) !== "vscode_lm_empty_response") throw err;
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
+        `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+      ));
+      continue;
+    }
     const envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
     if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
@@ -2069,7 +2079,12 @@ async function runVscodeLmTextProtocol(
   throw new Error("vscode_lm_agent_turn_limit");
 }
 
-async function runVscodeLmAgent(model, request, cancellationToken) {
+async function runVscodeLmAgent(
+  model,
+  request,
+  cancellationToken,
+  invokeTool = invokeVscodeLmPrivateTool,
+) {
   if (!model) throw new Error("vscode_lm_model_not_visible");
   if (!model.capabilities || !model.capabilities.toolCalling) {
     return runVscodeLmTextProtocol(model, request, cancellationToken);
@@ -2096,15 +2111,51 @@ async function runVscodeLmAgent(model, request, cancellationToken) {
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const text = textParts.join("").trim();
-      if (!text) throw new Error("vscode_lm_empty_response");
-      return text;
+      if (!text) {
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `The previous provider turn contained neither a tool call nor text. ` +
+          `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
+          `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+        ));
+        continue;
+      }
+      let envelope;
+      try {
+        envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: true });
+      } catch (_err) {
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `The previous response was not a supported JSON envelope. ` +
+          `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
+          `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+        ));
+        continue;
+      }
+      if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `Tool discovery is complete. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+        ));
+        continue;
+      }
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
+      if (finalError) {
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `The previous final envelope was rejected (${finalError}). ` +
+          `Output ONLY one corrected ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object. ` +
+          `Every file path must match allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+        ));
+        continue;
+      }
+      return JSON.stringify(envelope);
     }
     messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
     const results = [];
     for (const call of calls) {
       let result;
       try {
-        result = await invokeVscodeLmPrivateTool(call, request.requestId);
+        result = await invokeTool(call, request.requestId);
       } catch (err) {
         result = { ok: false, error: sanitizeErrorMessage(err) };
       }
