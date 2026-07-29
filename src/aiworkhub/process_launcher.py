@@ -29,9 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import fcntl
-
 from . import core
+from .platform_io import chmod_fd, lock_fd, unlock_fd
 from . import quality_evidence
 from . import task_engine
 try:
@@ -440,7 +439,7 @@ def _load_or_create_terminal_authority_key(key_path: Path) -> bytes:
         # Lost the create race to another process/thread -- read back
         # whatever it wrote instead of minting a second, divergent key.
         return _load_or_create_terminal_authority_key(key_path)
-    os.fchmod(new_fd, 0o600)
+    chmod_fd(new_fd, 0o600)
     with os.fdopen(new_fd, "wb") as fh:
         fh.write(key)
     return key
@@ -790,7 +789,7 @@ def _touch_0600(path: Path) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
     finally:
         os.close(fd)
 
@@ -1829,13 +1828,13 @@ class ProcessManager:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(lock_path, flags, 0o600)
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         with os.fdopen(fd, "a+", encoding="utf-8") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            lock_fd(fh.fileno(), blocking=True)
             try:
                 yield
             finally:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                unlock_fd(fh.fileno())
 
     def _append_event(self, event: dict[str, Any]) -> dict[str, Any]:
         clean = {
@@ -1853,7 +1852,7 @@ class ProcessManager:
             0o600,
         )
         try:
-            os.fchmod(fd, 0o600)
+            chmod_fd(fd, 0o600)
             os.write(fd, payload.encode("utf-8"))
         finally:
             os.close(fd)

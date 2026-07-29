@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 import signal
@@ -40,6 +39,7 @@ from typing import Any
 
 from . import core
 from . import process_launcher
+from .platform_io import chmod_fd, lock_fd, unlock_fd
 
 
 DEFAULT_SCAN_INTERVAL_SECONDS = 30.0
@@ -82,10 +82,10 @@ def single_instance_lock(lock_path: Path):
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(lock_path, flags, 0o600)
-    os.fchmod(fd, 0o600)
+    chmod_fd(fd, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_fd(fd, blocking=False)
         except OSError as exc:
             raise ReconcilerLockHeld(f"reconciler_lock_held:{lock_path}") from exc
         try:
@@ -96,7 +96,7 @@ def single_instance_lock(lock_path: Path):
         yield
     finally:
         with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_fd(fd)
         os.close(fd)
 
 

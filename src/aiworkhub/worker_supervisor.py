@@ -15,6 +15,14 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO
 
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # direct-script entrypoint
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
+
 
 POLL_SECONDS = 0.1
 KILL_GRACE_SECONDS = 5.0
@@ -33,7 +41,7 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(data)
             handle.flush()
@@ -52,7 +60,7 @@ def _open_0600(path: Path) -> BinaryIO:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
-    os.fchmod(fd, 0o600)
+    chmod_fd(fd, 0o600)
     return os.fdopen(fd, "ab", buffering=0)
 
 

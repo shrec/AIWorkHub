@@ -21,6 +21,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import repository_state
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # pragma: no cover - standalone compatibility
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
 
 
 REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"
@@ -68,7 +75,7 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise BridgeError("bridge_document_too_large")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(encoded)
             handle.flush()

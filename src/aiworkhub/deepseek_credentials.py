@@ -34,6 +34,13 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import runtime_adapters
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # pragma: no cover - standalone compatibility
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +298,7 @@ def bootstrap_credential(
         flags |= os.O_NOFOLLOW
     fd = os.open(tmp, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as fh:
             fh.write(data)
             fh.flush()

@@ -31,6 +31,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # direct-script Landlock entrypoint
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
+
 
 def bubblewrap_home_env_value() -> str:
     """Single source of truth for the bubblewrap HOME string.
@@ -503,7 +511,7 @@ def _touch_placeholder(worktree: Path, relative: str) -> None:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    os.fchmod(fd, 0o644)
+    chmod_fd(fd, 0o644)
     os.close(fd)
 
 
@@ -2018,7 +2026,7 @@ def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as fh:
             fh.write(data)
             fh.flush()

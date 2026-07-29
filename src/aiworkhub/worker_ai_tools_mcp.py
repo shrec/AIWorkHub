@@ -88,6 +88,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # minimal copied worker package / direct-script mode
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
+
 from .repository_state import RepositoryStateError
 
 
@@ -414,7 +422,7 @@ def _append_line_0600(path: Path, line: str) -> None:
         # _append_audit swallowed that OSError and every genuine MCP call left
         # an empty ledger.
         try:
-            os.fchmod(fd, 0o600)
+            chmod_fd(fd, 0o600)
         except OSError as exc:
             mode = os.fstat(fd).st_mode & 0o777
             if exc.errno not in {errno.EPERM, errno.EACCES} or mode != 0o600:
@@ -432,7 +440,7 @@ def _touch_0600(path: Path) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
     finally:
         os.close(fd)
 
@@ -1074,7 +1082,7 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         os.write(fd, data.encode("utf-8"))
     finally:
         os.close(fd)
@@ -1199,7 +1207,7 @@ def generate_worker_mcp_runtime(
         flags |= os.O_NOFOLLOW
     fd = os.open(codex_config_path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        chmod_fd(fd, 0o600)
         os.write(fd, toml_text.encode("utf-8"))
     finally:
         os.close(fd)

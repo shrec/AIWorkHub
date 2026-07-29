@@ -37,14 +37,20 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
    the MCP child and Python runtime run on the workspace host.
 2. **Open a repository** in VS Code, then run `AIWorkHub: Open Dashboard`
    (or `AIWorkHub: Select Repository` first in a multi-root window).
+   On activation the extension creates or repairs the packaged MCP
+   registrations for Codex (`~/.codex/config.toml`), VS Code/Copilot
+   (`.vscode/mcp.json`), and Claude Code (`.mcp.json`). Existing unrelated
+   servers are preserved. Codex and Claude discover newly registered tools
+   when a **new chat/session** is opened; reloading an already-running chat
+   does not retroactively add tools to that runtime.
 3. **Init Repo.** On first open the dashboard shows an explicit
    **Initialize AIWorkHub** action. Click it once -- this creates
    `.aiworkhub/project.json`, the storage registry, a fresh canonical
    `.aiworkhub/tasking/task_queue.sqlite`, and the Source Graph store. The
    initial Source Graph index starts asynchronously; one repo-bound daemon
    then keeps it fresh with non-overlapping incremental refreshes.
-   Nothing is created before this explicit step, and it is safe to run
-   again (idempotent).
+   No durable `.aiworkhub` repository state is created before this explicit
+   step, and it is safe to run again (idempotent).
 4. **Work the queue.** The dashboard tab shows pending/processing/review
    tasks, per-topic/runner summaries, cost/usage, and callback-bridge
    health, all read live from `.aiworkhub/`. Selecting a task shows its

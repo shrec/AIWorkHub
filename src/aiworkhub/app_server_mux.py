@@ -103,6 +103,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
 
+try:
+    from .platform_io import chmod_fd
+except ImportError:  # direct-script Codex mux entrypoint
+    def chmod_fd(fd: int, mode: int) -> None:
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, mode)
+
 if __package__:
     from . import shared_router
 else:  # direct-file CLI compatibility; package launcher uses the branch above
@@ -329,7 +337,7 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
     fd = os.open(str(tmp), flags, 0o600)
     try:
         with contextlib.suppress(OSError):
-            os.fchmod(fd, 0o600)
+            chmod_fd(fd, 0o600)
         os.write(fd, data)
         os.fsync(fd)
         st = os.fstat(fd)
