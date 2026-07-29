@@ -93,9 +93,9 @@ async function textProtocolChecks() {
     internals.parseVscodeLmJsonEnvelope(fencedEnvelope),
     JSON.parse(toolRequest),
   );
-  assert.throws(
-    () => internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${finalResponse}`),
-    /ambiguous_json/,
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${finalResponse}`),
+    JSON.parse(toolRequest),
   );
   assert.deepStrictEqual(
     internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${toolRequest}`),
@@ -233,6 +233,37 @@ async function nativeProtocolChecks() {
   );
   assert.strictEqual(result, finalResponse);
   assert.ok(originalInvoke.length > 0);
+
+  let boundedTurns = 0;
+  const boundedOptions = [];
+  const loopingModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      boundedOptions.push(options);
+      boundedTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `loop-${boundedTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${boundedTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  const forcedFinal = await internals.runVscodeLmAgent(
+    loopingModel,
+    { requestId: "b".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(forcedFinal, finalResponse);
+  assert.strictEqual(boundedTurns, 17);
+  assert.ok(!Object.prototype.hasOwnProperty.call(boundedOptions[16], "tools"));
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));

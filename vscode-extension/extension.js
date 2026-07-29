@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.0";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.1";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -82,6 +82,7 @@ const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const VSCODE_LM_MAX_AGENT_TURNS = 24;
+const VSCODE_LM_MAX_TOOL_TURNS = 16;
 const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
 const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_PERMISSION_KEY = "aiworkhub.vscodeLmWorkerPermission.v1";
@@ -1976,6 +1977,15 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
       // fail-closes schema, allowed path, content and required output.
       if (finals.length >= 1) return finals[finals.length - 1];
     }
+    const toolRequests = uniqueCandidates.filter(
+      (candidate) => candidate.schema_id === VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    );
+    // Providers may echo a protocol example before their actual request.
+    // Every bridge tool is read-only and allowlisted; selecting the last
+    // complete request is deterministic and still passes the normal name,
+    // input-size, Source Graph ordering and invocation gates below.  Once
+    // Source Graph is acknowledged a final envelope still wins above.
+    if (toolRequests.length >= 1) return toolRequests[toolRequests.length - 1];
     if (uniqueCandidates.length !== 1) {
       const error = new Error(uniqueCandidates.length > 1
         ? "vscode_lm_text_protocol_ambiguous_json"
@@ -2091,13 +2101,25 @@ async function runVscodeLmAgent(
   }
   const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites))];
   let sourceGraphAcknowledged = false;
+  let toolTurns = 0;
+  let forceFinal = false;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    if (sourceGraphAcknowledged && toolTurns >= VSCODE_LM_MAX_TOOL_TURNS && !forceFinal) {
+      forceFinal = true;
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `The bounded tool phase is complete. Do not request more tools. ` +
+        `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
+        `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+      ));
+    }
     const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
-      tools: availableTools,
-      toolMode: sourceGraphAcknowledged ? vscode.LanguageModelChatToolMode.Auto : vscode.LanguageModelChatToolMode.Required,
     };
+    if (!forceFinal) {
+      options.tools = availableTools;
+      options.toolMode = sourceGraphAcknowledged ? vscode.LanguageModelChatToolMode.Auto : vscode.LanguageModelChatToolMode.Required;
+    }
     const response = await model.sendRequest(messages, options, cancellationToken);
     const assistantParts = [];
     const textParts = [];
@@ -2150,6 +2172,14 @@ async function runVscodeLmAgent(
       }
       return JSON.stringify(envelope);
     }
+    if (forceFinal && calls.length > 0) {
+      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `Tool calls are no longer available in the finalization phase. ` +
+        `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+      ));
+      continue;
+    }
     messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
     const results = [];
     for (const call of calls) {
@@ -2164,6 +2194,7 @@ async function runVscodeLmAgent(
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }
+    toolTurns += 1;
     messages.push(vscode.LanguageModelChatMessage.User(results));
   }
   throw new Error("vscode_lm_agent_turn_limit");
