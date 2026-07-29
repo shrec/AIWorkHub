@@ -91,7 +91,14 @@ test("stable launcher lives outside versioned VSIX and follows runtime current.j
   const stable = __testInternals.materializeStableMuxLauncher(context);
   assert.ok(stable.startsWith(path.join(globalStorage, "bin")));
   assert.ok(!stable.startsWith(context.extensionUri.fsPath + path.sep + "bin"));
-  assert.ok(fs.readFileSync(stable, "utf8").includes('runtime / "aiworkhub" / "app_server_mux.py"'));
+  const pythonLauncher = path.join(path.dirname(stable), "aiworkhub-app-server-mux.py");
+  assert.ok(fs.readFileSync(pythonLauncher, "utf8").includes('runtime / "aiworkhub" / "app_server_mux.py"'));
+  if (process.platform === "win32") {
+    assert.ok(stable.endsWith(".cmd"));
+    assert.ok(fs.readFileSync(stable, "utf8").includes("aiworkhub-app-server-mux.py"));
+  } else {
+    assert.ok((fs.statSync(stable).mode & 0o111) !== 0);
+  }
 });
 
 test("bootstrap runtime pointer is available before immutable generation materialization", () => {
@@ -117,7 +124,25 @@ test("manifest-default mux command is materialized on the extension-host PATH", 
   });
   assert.equal(shim, path.join(home, ".local", "bin", "aiworkhub-app-server-mux"));
   assert.ok(fs.readFileSync(shim, "utf8").includes(launcher));
-  assert.ok((fs.statSync(shim).mode & 0o111) !== 0);
+  if (process.platform !== "win32") {
+    assert.ok((fs.statSync(shim).mode & 0o111) !== 0);
+  }
+});
+
+test("Windows PATH shim is a command wrapper and never depends on POSIX mode bits", () => {
+  const home = path.join(temp, "windows-shim-home");
+  const shim = __testInternals.materializePathMuxShim(launcher, {
+    platform: "win32",
+    home,
+    env: { PATH: "" },
+  });
+  assert.equal(
+    shim,
+    path.join(home, "AppData", "Local", "Microsoft", "WindowsApps", "aiworkhub-app-server-mux.cmd"),
+  );
+  const content = fs.readFileSync(shim, "utf8");
+  assert.ok(content.startsWith("@echo off"));
+  assert.ok(content.includes(launcher));
 });
 
 test("package contributes a pre-activation Codex mux default", () => {
