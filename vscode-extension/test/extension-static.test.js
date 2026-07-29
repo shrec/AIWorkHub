@@ -151,7 +151,7 @@ assert.ok(
 assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
 assert.ok(ext.includes("custom_cli_executable_preserved"));
 assert.ok(ext.includes("codex_extension_not_colocated"));
-assert.ok(ext.includes('syncConfig.update(\n      "ignoredSettings"'));
+assert.match(ext, /syncConfig\.update\(\r?\n\s+"ignoredSettings"/);
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));
