@@ -8,12 +8,22 @@ const path = require("node:path");
 const Module = require("node:module");
 
 let currentValue = "";
+let ignoredSettings = [];
 const updates = [];
 const fakeVscode = {
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   workspace: {
     workspaceFolders: [],
     getConfiguration: (section) => {
+      if (section === "settingsSync") {
+        return {
+          get: (key, fallback) => key === "ignoredSettings" ? ignoredSettings : fallback,
+          update: async (key, value, global) => {
+            updates.push({ section, key, value, global });
+            ignoredSettings = value;
+          },
+        };
+      }
       assert.equal(section, "chatgpt");
       return {
         get: (key, fallback) => key === "cliExecutable" ? currentValue : fallback,
@@ -24,6 +34,7 @@ const fakeVscode = {
       };
     },
   },
+  extensions: { getExtension: () => null },
   window: { createOutputChannel: () => ({ appendLine() {}, dispose() {} }) },
   commands: {},
   Uri: {},
@@ -61,6 +72,37 @@ test("empty Codex executable remains native and is never configured", async () =
   assert.equal(result.ok, true);
   assert.equal(result.changed, false);
   assert.deepEqual(updates, []);
+});
+
+test("co-located Codex is configured through one host-local stable mux", async () => {
+  const codexRoot = path.join(temp, "openai-chatgpt");
+  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+  const platformName = process.platform === "win32" ? "windows" : process.platform;
+  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  fs.writeFileSync(executable, "codex", { mode: 0o755 });
+  fakeVscode.extensions.getExtension = (id) => id === "openai.chatgpt" ? { extensionPath: codexRoot } : null;
+  const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
+  const testSidebandDir = path.join(temp, "sideband");
+  process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = testSidebandDir;
+  currentValue = "";
+  ignoredSettings = [];
+  updates.length = 0;
+  try {
+    const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+    assert.equal(result.ok, true);
+    assert.equal(result.mode, "app_server_sideband");
+    assert.equal(result.changed, true);
+    assert.ok(path.isAbsolute(result.launcher));
+    assert.equal(currentValue, result.launcher);
+    assert.ok(ignoredSettings.includes("chatgpt.cliExecutable"));
+    const pin = fs.readFileSync(path.join(testSidebandDir, "real_executable"), "utf8").trim();
+    assert.equal(pin, executable);
+  } finally {
+    if (previousSidebandDir === undefined) delete process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
+    else process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = previousSidebandDir;
+    fakeVscode.extensions.getExtension = () => null;
+  }
 });
 
 test("legacy absolute AIWorkHub mux path is removed instead of rewritten", async () => {

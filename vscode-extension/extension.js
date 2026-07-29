@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.96";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.97";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -712,7 +712,24 @@ function startStartupRouteConvergence(repoInfo) {
     }
     const threadId = route && route.targets && route.targets.codex
       && route.targets.codex.route && route.targets.codex.route.thread_id;
-    if (REAL_THREAD_ID_RE.test(String(threadId || "")) || attempts >= STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS) {
+    if (REAL_THREAD_ID_RE.test(String(threadId || ""))) {
+      // The MCP child started conservatively in manager_inbox mode. Now that
+      // this exact repo/window owns a live mux thread, re-run the idempotent
+      // dispatcher ensure so Python promotes delivery to app_server_sideband
+      // immediately instead of waiting for a later dashboard refresh/reload.
+      try {
+        const client = getMcpClient();
+        client.ensureStarted().then(() => (
+          client._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000)
+        )).catch((err) => {
+          outputChannel.appendLine(`[mcp] sideband dispatcher promotion failed: ${sanitizeErrorMessage(err)}`);
+        });
+      } catch (err) {
+        outputChannel.appendLine(`[mcp] sideband dispatcher promotion unavailable: ${sanitizeErrorMessage(err)}`);
+      }
+      return;
+    }
+    if (attempts >= STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS) {
       return;
     }
     startupRouteConvergenceTimer = setTimeout(tick, STARTUP_ROUTE_CONVERGENCE_INTERVAL_MS);
@@ -2985,12 +3002,10 @@ function ensureCodexManagerGatesRepaired() {
   }
 }
 
-/** Materialize the optional same-host App Server mux launcher.
- *
- * The launcher remains useful to an explicitly verified local/UI companion,
- * but this workspace extension never advertises it through
- * `chatgpt.cliExecutable`: that setting is application-scoped and would leak
- * remote host paths across windows and Settings Sync.
+/** Materialize the same-host App Server mux launcher at a stable host-local
+ * path. It is advertised only after OpenAI's extension is proven co-located;
+ * the setting is excluded from Settings Sync and repaired independently on
+ * every installed host.
  */
 function materializeStableMuxLauncher(context) {
   if (!context.globalStorageUri || !context.globalStorageUri.fsPath) {
@@ -3097,19 +3112,83 @@ function isLegacyAiWorkHubMuxPath(value) {
     && (path.isAbsolute(current) || /[\\/]/.test(current));
 }
 
-/** Keep the Codex executable override machine-neutral.
+function colocatedCodexExtension() {
+  try {
+    if (!vscode.extensions || typeof vscode.extensions.getExtension !== "function") return null;
+    return vscode.extensions.getExtension("openai.chatgpt") || null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function resolveBundledCodexExecutable(codexExtension) {
+  const extensionRoot = codexExtension && (
+    codexExtension.extensionPath
+    || (codexExtension.extensionUri && codexExtension.extensionUri.fsPath)
+  );
+  if (!extensionRoot) return "";
+  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+  const platformAliases = process.platform === "win32"
+    ? ["windows", "win32"]
+    : process.platform === "darwin" ? ["darwin", "macos"] : [process.platform];
+  const executableName = process.platform === "win32" ? "codex.exe" : "codex";
+  const candidates = [];
+  for (const platformName of platformAliases) {
+    candidates.push(path.join(extensionRoot, "bin", `${platformName}-${arch}`, executableName));
+  }
+  candidates.push(path.join(extensionRoot, "bin", executableName));
+  return candidates.find((candidate) => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.statSync(candidate).isFile();
+    } catch (_err) {
+      return false;
+    }
+  }) || "";
+}
+
+function pinMuxRealExecutable(executable) {
+  if (!executable || !path.isAbsolute(executable)) return false;
+  const sidebandDir = appServerMuxSidebandDir();
+  fs.mkdirSync(sidebandDir, { recursive: true, mode: 0o700 });
+  const pinPath = path.join(sidebandDir, "real_executable");
+  fs.writeFileSync(pinPath, `${executable}\n`, { encoding: "utf8", mode: 0o600 });
+  if (process.platform !== "win32") {
+    fs.chmodSync(sidebandDir, 0o700);
+    fs.chmodSync(pinPath, 0o600);
+  }
+  return true;
+}
+
+async function keepMuxSettingHostLocal() {
+  try {
+    const syncConfig = vscode.workspace.getConfiguration("settingsSync");
+    if (!syncConfig || typeof syncConfig.get !== "function" || typeof syncConfig.update !== "function") return false;
+    const current = syncConfig.get("ignoredSettings", []);
+    const values = Array.isArray(current) ? current.filter((value) => typeof value === "string") : [];
+    if (values.includes("chatgpt.cliExecutable")) return false;
+    await syncConfig.update(
+      "ignoredSettings",
+      [...values, "chatgpt.cliExecutable"],
+      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
+    );
+    return true;
+  } catch (_err) {
+    // Settings Sync may be absent or policy-managed. The co-location gate and
+    // activation-time repair still prevent a foreign absolute path from being
+    // trusted on this host.
+    return false;
+  }
+}
+
+/** Configure direct callbacks only on the host that owns both extensions.
  *
- * `chatgpt.cliExecutable` is owned by the OpenAI extension and has
- * application scope.  Persisting an absolute launcher path here therefore
- * leaks one Remote-SSH user's `/home/...` (or a Windows/macOS equivalent)
- * into every window/profile and through Settings Sync.  AIWorkHub contributes
- * no executable override/default.  Activation is migration-only: clear legacy
- * AIWorkHub absolute values and never write a new value.  Unrelated user
- * overrides remain untouched.  This intentionally keeps Codex native and
- * available in split local/Remote-SSH topologies; callback delivery must use a
- * verified same-host companion or the manager inbox transport instead.
+ * `chatgpt.cliExecutable` has application scope, so the stored launcher is
+ * ignored by Settings Sync and recomputed from this host's stable global
+ * storage on every activation. Split local/Remote-SSH topologies fail open to
+ * native Codex + manager inbox; unrelated user overrides remain untouched.
  */
-async function ensureCodexCallbackMuxConfigured(_context) {
+async function ensureCodexCallbackMuxConfigured(context) {
   try {
     const config = vscode.workspace.getConfiguration("chatgpt");
     const current = String(config.get("cliExecutable", "") || "").trim();
@@ -3117,7 +3196,12 @@ async function ensureCodexCallbackMuxConfigured(_context) {
       if (outputChannel) outputChannel.appendLine("[codex] callback mux not applied: custom chatgpt.cliExecutable is preserved");
       return { ok: false, changed: false, reason: "custom_cli_executable_preserved" };
     }
-    if (isLegacyAiWorkHubMuxPath(current)) {
+    const codexExtension = colocatedCodexExtension();
+    const realExecutable = resolveBundledCodexExecutable(codexExtension);
+    if (!codexExtension || !realExecutable) {
+      if (!isLegacyAiWorkHubMuxPath(current)) {
+        return { ok: true, changed: false, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
+      }
       if (!config || typeof config.update !== "function") {
         return { ok: false, changed: false, reason: "configuration_update_unavailable" };
       }
@@ -3130,9 +3214,26 @@ async function ensureCodexCallbackMuxConfigured(_context) {
           "[codex] removed legacy host-specific AIWorkHub executable override; restored native Codex",
         );
       }
-      return { ok: true, changed: true, launcher: "", mode: "native_codex" };
+      return { ok: true, changed: true, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
     }
-    return { ok: true, changed: false, launcher: "", mode: "native_codex" };
+    const launcher = materializeStableMuxLauncher(context);
+    pinMuxRealExecutable(realExecutable);
+    await keepMuxSettingHostLocal();
+    if (current === launcher) {
+      return { ok: true, changed: false, launcher, mode: "app_server_sideband" };
+    }
+    if (!config || typeof config.update !== "function") {
+      return { ok: false, changed: false, reason: "configuration_update_unavailable" };
+    }
+    await config.update(
+      "cliExecutable",
+      launcher,
+      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
+    );
+    if (outputChannel) {
+      outputChannel.appendLine("[codex] enabled host-local AIWorkHub App Server callback mux; one Codex host restart may be required");
+    }
+    return { ok: true, changed: true, launcher, mode: "app_server_sideband", restart_required: true };
   } catch (err) {
     if (outputChannel) outputChannel.appendLine(`[codex] callback mux configuration failed: ${sanitizeErrorMessage(err)}`);
     return { ok: false, changed: false, reason: "configuration_update_failed" };
@@ -4532,14 +4633,10 @@ async function activate(context) {
   vscodeLmBridgeHost = new VscodeLmBridgeHost(context);
   context.subscriptions.push(vscodeLmBridgeHost);
 
-  // Repair the old application-scoped Codex override before touching any
-  // runtime files.  This migration must remain available even when the
-  // optional mux runtime is damaged or missing; AIWorkHub must never prevent
-  // the native Codex extension from starting.
-  await ensureCodexCallbackMuxConfigured(context);
-
-  // Materialize the optional same-host mux as a fail-open building block.
-  // Split-host Remote-SSH operation never advertises it to Codex.
+  // Materialize the same-host mux as a fail-open building block before it can
+  // be advertised to a co-located Codex extension. The bootstrap pointer is
+  // cheap and closes the first-install race where Codex starts the configured
+  // launcher before the immutable generation copy has completed.
   try {
     const stableMuxLauncher = materializeStableMuxLauncher(context);
     materializePathMuxShim(stableMuxLauncher);
@@ -4550,7 +4647,8 @@ async function activate(context) {
     );
   }
 
-  // Publish this extension-host PID immediately.  A newly launched mux waits
+  // Publish this extension-host PID before changing the Codex executable. A
+  // newly launched mux waits
   // on this exact repo/PID binding before it starts the real App Server.
   try {
     const repo = getActiveRepositoryRoot(context);
@@ -4565,6 +4663,12 @@ async function activate(context) {
       activeRepoLabel = "No workspace";
     }
   }
+
+  // Activate direct wake only when OpenAI's extension and this workspace
+  // extension are actually co-located on the same host. Split-host
+  // Remote-SSH keeps native Codex + durable manager inbox and never receives
+  // a foreign launcher path. Any legacy host path is repaired here too.
+  await ensureCodexCallbackMuxConfigured(context);
 
   // The callback launcher and repo route are now available.  Materialize the
   // heavier content-addressed runtime generation without blocking Codex from

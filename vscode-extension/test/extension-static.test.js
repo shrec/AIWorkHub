@@ -139,17 +139,19 @@ assert.ok(ext.includes('id="repo-router"'));
 assert.ok(app.includes("function renderKnownRepositories"));
 assert.ok(app.includes("known_repositories"));
 
-// The optional same-host mux may be packaged, but the workspace extension
-// must restore native Codex before materializing it and must never publish an
-// application-scoped executable override.
+// The same-host mux is materialized before it can be advertised, and the
+// application-scoped override is enabled only behind the explicit OpenAI
+// extension co-location gate. Split-host Remote-SSH remains native/fail-open.
 assert.ok(ext.includes("materializeStableMuxLauncher(context)"));
 assert.ok(ext.includes("await ensureCodexCallbackMuxConfigured(context)"));
 assert.ok(
-  ext.indexOf("await ensureCodexCallbackMuxConfigured(context)")
-    < ext.lastIndexOf("materializeStableMuxLauncher(context)"),
+  ext.lastIndexOf("materializeStableMuxLauncher(context)")
+    < ext.lastIndexOf("await ensureCodexCallbackMuxConfigured(context)"),
 );
 assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
 assert.ok(ext.includes("custom_cli_executable_preserved"));
+assert.ok(ext.includes("codex_extension_not_colocated"));
+assert.ok(ext.includes('syncConfig.update(\n      "ignoredSettings"'));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));
 assert.ok(!ext.includes('cwd: root,'));

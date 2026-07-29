@@ -141,6 +141,28 @@ ROUTE_WAIT_POLL_SECONDS = 0.05
 _REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
+def _current_uid() -> int | None:
+    """Return the POSIX uid when the host exposes one.
+
+    Windows has no ``os.getuid`` and protects the per-user profile directory
+    with ACLs instead of POSIX mode bits.  Callers therefore enforce the
+    strict uid/mode contract on POSIX and retain the capability-token +
+    per-user-directory boundary on Windows.
+    """
+
+    getuid = getattr(os, "getuid", None)
+    return int(getuid()) if callable(getuid) else None
+
+
+def _owned_by_current_user(st: os.stat_result) -> bool:
+    uid = _current_uid()
+    return uid is None or int(getattr(st, "st_uid", uid)) == uid
+
+
+def _private_mode(st: os.stat_result, expected: int) -> bool:
+    return os.name == "nt" or stat.S_IMODE(st.st_mode) == expected
+
+
 def _validate_repo_id(repo_id: Any) -> str:
     """Validate a repository identity used to scope sideband instance
     ownership. Fail-closed: never guesses, never truncates, never accepts
@@ -205,8 +227,8 @@ def resolve_real_executable() -> str:
         st = os.lstat(config)
         if (
             stat.S_ISREG(st.st_mode)
-            and st.st_uid == os.getuid()
-            and stat.S_IMODE(st.st_mode) == 0o600
+            and _owned_by_current_user(st)
+            and _private_mode(st, 0o600)
             and st.st_size <= 4096
         ):
             candidate = config.read_text(encoding="utf-8").strip()
@@ -312,8 +334,8 @@ def ensure_private_dir(path: Path) -> None:
     st = os.lstat(path)
     if (
         not stat.S_ISDIR(st.st_mode)
-        or st.st_uid != os.getuid()
-        or stat.S_IMODE(st.st_mode) != 0o700
+        or not _owned_by_current_user(st)
+        or not _private_mode(st, 0o700)
     ):
         raise PermissionError("sideband directory is not owner-controlled mode 0700")
 
@@ -344,8 +366,8 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
         st = os.fstat(fd)
         if (
             not stat.S_ISREG(st.st_mode)
-            or st.st_uid != os.getuid()
-            or stat.S_IMODE(st.st_mode) != 0o600
+            or not _owned_by_current_user(st)
+            or not _private_mode(st, 0o600)
         ):
             raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
     finally:
@@ -359,8 +381,8 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
     st = os.lstat(path)
     if (
         not stat.S_ISREG(st.st_mode)
-        or st.st_uid != os.getuid()
-        or stat.S_IMODE(st.st_mode) != 0o600
+        or not _owned_by_current_user(st)
+        or not _private_mode(st, 0o600)
     ):
         raise PermissionError(f"installed {path.name} is not owner-controlled mode 0600")
 
@@ -476,8 +498,8 @@ def _read_instance_descriptor(path: Path) -> SidebandInstance | None:
         return None
     if (
         not stat.S_ISREG(st.st_mode)
-        or st.st_uid != os.getuid()
-        or stat.S_IMODE(st.st_mode) != 0o600
+        or not _owned_by_current_user(st)
+        or not _private_mode(st, 0o600)
         or st.st_size > SIDEBAND_REGISTRY_MAX_BYTES
     ):
         return None
@@ -609,8 +631,8 @@ def gc_stale_sideband_instances(sideband_dir: Path | str) -> dict[str, int]:
             st = os.lstat(entry)
             if (
                 stat.S_ISREG(st.st_mode)
-                and st.st_uid == os.getuid()
-                and stat.S_IMODE(st.st_mode) == 0o600
+                and _owned_by_current_user(st)
+                and _private_mode(st, 0o600)
                 and st.st_size <= SIDEBAND_REGISTRY_MAX_BYTES
             ):
                 raw = json.loads(entry.read_text(encoding="utf-8"))
@@ -1217,7 +1239,8 @@ class AppServerMux:
         except OSError:
             return False
         _pid, uid, _gid = struct.unpack("3i", creds)
-        return uid == os.getuid()
+        current_uid = _current_uid()
+        return current_uid is None or uid == current_uid
 
     def _read_bounded_line(self, conn: socket.socket) -> tuple[bytes | None, bool]:
         chunks: list[bytes] = []

@@ -103,6 +103,24 @@ def test_resolve_real_executable_from_private_pin(monkeypatch, tmp_path):
     assert resolve_real_executable() == str(real)
 
 
+def test_windows_style_runtime_without_getuid_accepts_private_capability_files(monkeypatch, tmp_path):
+    """Import/runtime ownership checks must not crash on Windows, where
+    ``os.getuid`` does not exist. Capability secrecy and the per-user profile
+    ACL remain the host boundary there."""
+    real = tmp_path / "codex-real"
+    _write_executable_script(real, "#!/bin/sh\nexit 0\n")
+    sideband = tmp_path / "sideband"
+    sideband.mkdir(mode=0o700)
+    pin = sideband / app_server_mux.REAL_EXECUTABLE_CONFIG_NAME
+    pin.write_text(str(real), encoding="utf-8")
+    pin.chmod(0o600)
+    monkeypatch.delenv(app_server_mux.ENV_REAL_EXECUTABLE, raising=False)
+    monkeypatch.setenv(app_server_mux.ENV_SIDEBAND_DIR, str(sideband))
+    monkeypatch.delattr(app_server_mux.os, "getuid", raising=False)
+    assert app_server_mux._current_uid() is None
+    assert resolve_real_executable() == str(real)
+
+
 def _write_private_json(path: Path, payload: dict) -> None:
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:

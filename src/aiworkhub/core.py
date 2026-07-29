@@ -3681,6 +3681,21 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         provider = "claude"
     else:
         provider = target["selected_provider"]
+    target_codex = target.get("targets", {}).get("codex", {}) if isinstance(target.get("targets"), dict) else {}
+    target_codex_wake = target_codex.get("wake", {}) if isinstance(target_codex, dict) else {}
+    sideband_route_available = bool(
+        isinstance(target_codex_wake, dict)
+        and target_codex_wake.get("supported")
+        and target_codex_wake.get("mode") == "app_server_sideband"
+    )
+    # The extension child starts conservatively in manager_inbox mode so a
+    # split-host Remote-SSH window can never try a foreign/local socket. Once
+    # the repo/window-scoped mux has published an exact live Codex thread,
+    # promote this ensure call to direct sideband delivery. This decision is
+    # re-evaluated on every watchdog/renewal call instead of being frozen in
+    # the MCP child's startup environment.
+    if callback_transport == "manager_inbox" and provider == "codex" and sideband_route_available:
+        callback_transport = "sideband"
     window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
     if not window_id and claude_identity is not None:
         window_id = claude_identity["window_id"]
@@ -3771,9 +3786,8 @@ def dispatcher_ensure_started() -> dict[str, Any]:
     bridge = _callback_bridge_module()
     bridge_kwargs: dict[str, Any] = {}
     if provider == "codex":
-        transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
-        if transport:
-            bridge_kwargs["transport"] = transport
+        if callback_transport:
+            bridge_kwargs["transport"] = callback_transport
     route_origin_thread_id = ""
     target_provider = target.get("targets", {}).get(provider, {}) if isinstance(target.get("targets"), dict) else {}
     if isinstance(target_provider, dict):
@@ -3953,10 +3967,21 @@ def dispatcher_health() -> dict[str, Any]:
     window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
     claude_identity = _claude_manager_identity()
     callback_transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
-    sideband = callback_transport == "sideband"
+    target_codex = target.get("targets", {}).get("codex", {}) if isinstance(target.get("targets"), dict) else {}
+    target_codex_wake = target_codex.get("wake", {}) if isinstance(target_codex, dict) else {}
+    sideband_route_available = bool(
+        isinstance(target_codex_wake, dict)
+        and target_codex_wake.get("supported")
+        and target_codex_wake.get("mode") == "app_server_sideband"
+    )
+    sideband = callback_transport == "sideband" or (
+        callback_transport == "manager_inbox"
+        and target.get("selected_provider") == "codex"
+        and sideband_route_available
+    )
     # A verified Claude manager delivers through the MCP long-poll inbox, not a
     # background dispatcher thread, so it is healthy WITHOUT a registered one.
-    manager_inbox = callback_transport == "manager_inbox" or (
+    manager_inbox = (callback_transport == "manager_inbox" and not sideband) or (
         claude_identity is not None and not sideband
         and target["selected_provider"] == "claude"
     )

@@ -26,9 +26,14 @@ assert.ok(
   "the mux runtime pointer must be published before expensive generation materialization",
 );
 assert.ok(
-  activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)")
-    < activateSource.indexOf("materializeStableMuxLauncher(context)"),
-  "legacy Codex override cleanup must run before optional mux materialization",
+  activateSource.indexOf("materializeStableMuxLauncher(context)")
+    < activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)"),
+  "the fail-open mux launcher must exist before a co-located Codex can select it",
+);
+assert.ok(
+  activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)")
+    < activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)"),
+  "the exact repo/extension-host route must exist before Codex can start through the mux",
 );
 assert.ok(
   activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)")

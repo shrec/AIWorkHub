@@ -355,6 +355,46 @@ def test_core_native_codex_manager_inbox_never_starts_hidden_app_server(tmp_path
     assert calls["ensure"] == 0
 
 
+def test_core_manager_inbox_promotes_only_after_exact_sideband_route(tmp_path, monkeypatch):
+    root = tmp_path / "repo_native_codex_promoted"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "manager_inbox")
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_native_codex_promoted")
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {
+            "selected_provider": "codex",
+            "targets": {
+                "codex": {
+                    "route": {"thread_id": thread_id},
+                    "wake": {"mode": "app_server_sideband", "supported": True},
+                }
+            },
+        },
+    )
+    captured = {}
+
+    class FakeDispatcher:
+        def health(self):
+            return {"dispatcher_running": True, "provider": "codex"}
+
+    def fake_ensure(repo_root, provider, **kwargs):
+        captured.update(repo_root=repo_root, provider=provider, **kwargs)
+        return FakeDispatcher()
+
+    monkeypatch.setattr(callback_bridge, "ensure_dispatcher", fake_ensure)
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: callback_bridge)
+    result = core.dispatcher_ensure_started()
+    assert result["dispatcher_started"] is True
+    assert captured["provider"] == "codex"
+    assert captured["bridge_kwargs"] == {"transport": "sideband"}
+
+
 def test_claude_manager_derives_window_and_coordinator_capability(tmp_path, monkeypatch):
     root = tmp_path / "repo_claude_manager"
     root.mkdir()
