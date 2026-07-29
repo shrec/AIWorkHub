@@ -14,7 +14,7 @@ assert.ok(source.includes("if (!fs.existsSync(manifestPath)) throw err"));
 assert.ok(source.includes("generationName = `${version}-${fingerprint.slice(0, 16)}`"));
 assert.ok(!source.includes("mux_path"));
 assert.ok(source.includes("materializeStableMuxLauncher(context)"));
-assert.ok(source.includes("ensureCodexCallbackMuxConfigured(context, stableMuxLauncher)"));
+assert.ok(source.includes("ensureCodexCallbackMuxConfigured(context)"));
 assert.ok(source.includes("primeStableMuxRuntimePointer(context)"));
 
 const activateStart = source.indexOf("async function activate(context)");
@@ -26,9 +26,9 @@ assert.ok(
   "the mux runtime pointer must be published before expensive generation materialization",
 );
 assert.ok(
-  activateSource.indexOf("ensureCodexCallbackMuxConfigured(context, stableMuxLauncher)")
-    < activateSource.indexOf("materializeStableRuntimeGeneration(context)"),
-  "Codex mux configuration must win the concurrent extension startup race",
+  activateSource.indexOf("ensureCodexCallbackMuxConfigured(context)")
+    < activateSource.indexOf("materializeStableMuxLauncher(context)"),
+  "legacy Codex override cleanup must run before optional mux materialization",
 );
 assert.ok(
   activateSource.indexOf("refreshCoordinatorRouteOwnership(activeRepoIdentity)")

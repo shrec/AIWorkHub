@@ -22,7 +22,8 @@ assert.strictEqual(
 );
 assert.ok(!/process\.kill\([^,]+,\s*["']SIG/.test(source), "destructive foreign process signal remains");
 assert.ok(source.includes('getConfiguration("chatgpt")'));
-assert.ok(source.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(!source.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(source.includes('config.update("cliExecutable", undefined, globalTarget)'));
 assert.ok(source.includes("custom_cli_executable_preserved"));
 
 const fakeVscode = {

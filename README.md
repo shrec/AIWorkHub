@@ -574,8 +574,9 @@ A separately spawned bridge App Server can only ever see the VS Code OpenAI
 extension's owned thread from the outside: the extension spawns and owns its
 own `codex app-server` child over a private stdio pipe, and `thread/resume`/
 `turn/*` are scoped to the App Server INSTANCE that owns the turn, not the
-thread id in the abstract. `aiworkhub/app_server_mux.py` closes this
-topologically: installed as the extension's `chatgpt.cliExecutable`, it
+thread id in the abstract. `aiworkhub/app_server_mux.py` can close this
+topologically in a verified same-host deployment: when explicitly installed
+as the OpenAI extension's executable wrapper, it
 transparently `execvp`s the real Codex binary for every non-`app-server`
 invocation (exact argv/exit behavior), and for `app-server` invocations
 becomes the one process proxying the extension's stdio to a real child App
@@ -607,19 +608,22 @@ silently shadowed the origin thread owner's endpoint.
 `CallbackBridge(transport="sideband")` reuses the same B407
 `select_steer_target` routing and the existing outbox/lease/retry machinery.
 
-`scripts/install_vscode_app_server_mux.py` is dry-run/check/print-config
-only -- it never touches VS Code settings, the installed extension, systemd,
-or the live callback DB:
+`scripts/install_vscode_app_server_mux.py` is a same-host diagnostic and
+dry-run/check/print-config utility only -- it never touches VS Code settings,
+the installed extension, systemd, or the live callback DB:
 
 ```bash
 python3 scripts/install_vscode_app_server_mux.py --check
 python3 scripts/install_vscode_app_server_mux.py
 ```
 
-Codex owns applying the printed `chatgpt.cliExecutable` value, reloading the
-extension host, the live canary against the extension-owned thread, and
-finally switching the callback bridge to `transport="sideband"` and
-re-enabling its service.
+Do not apply its printed `chatgpt.cliExecutable` value in Remote-SSH/WSL split-
+host operation. That OpenAI setting has application scope; a remote absolute
+path can be synchronized into Windows/macOS or another SSH host and prevent
+Codex from starting. AIWorkHub's VS Code extension never writes or contributes
+that setting. On split-host deployments, Codex remains native and callback
+delivery uses the manager inbox until a verified UI-host companion owns the
+sideband transport.
 
 ## VS Code Dashboard
 

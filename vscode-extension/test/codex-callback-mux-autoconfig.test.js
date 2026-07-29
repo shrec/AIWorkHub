@@ -10,6 +10,7 @@ const Module = require("node:module");
 let currentValue = "";
 const updates = [];
 const fakeVscode = {
+  ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   workspace: {
     workspaceFolders: [],
     getConfiguration: (section) => {
@@ -53,21 +54,42 @@ const context = {
 
 after(() => fs.rmSync(temp, { recursive: true, force: true }));
 
-test("empty Codex executable is configured to packaged mux globally", async () => {
+test("empty Codex executable remains native and is never configured", async () => {
   currentValue = "";
   updates.length = 0;
   const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
   assert.equal(result.ok, true);
-  assert.equal(result.changed, true);
-  assert.deepEqual(updates, [{ key: "cliExecutable", value: launcher, global: true }]);
+  assert.equal(result.changed, false);
+  assert.deepEqual(updates, []);
 });
 
-test("existing AIWorkHub mux path is upgraded to current packaged launcher", async () => {
+test("legacy absolute AIWorkHub mux path is removed instead of rewritten", async () => {
   currentValue = path.join(temp, "old", "aiworkhub-app-server-mux");
   updates.length = 0;
   const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
   assert.equal(result.changed, true);
-  assert.equal(updates[0].value, launcher);
+  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
+  assert.equal(result.launcher, "");
+  assert.equal(result.mode, "native_codex");
+});
+
+test("legacy mux paths from Linux macOS and Windows hosts are all recognized", () => {
+  for (const value of [
+    "/home/metal/.vscode-server/data/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
+    "/Users/alice/Library/Application Support/Code/User/globalStorage/shrec.aiworkhub/bin/aiworkhub-app-server-mux",
+    "C:\\Users\\bob\\AppData\\Roaming\\Code\\User\\globalStorage\\shrec.aiworkhub\\bin\\aiworkhub-app-server-mux.cmd",
+  ]) {
+    assert.equal(__testInternals.isLegacyAiWorkHubMuxPath(value), true, value);
+  }
+});
+
+test("machine-neutral AIWorkHub command is never persisted again", async () => {
+  currentValue = "aiworkhub-app-server-mux";
+  updates.length = 0;
+  const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, false);
+  assert.deepEqual(updates, []);
 });
 
 test("unrelated custom Codex executable is never overwritten", async () => {
@@ -77,6 +99,18 @@ test("unrelated custom Codex executable is never overwritten", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.reason, "custom_cli_executable_preserved");
   assert.deepEqual(updates, []);
+});
+
+test("legacy cleanup does not depend on the optional mux launcher existing", async () => {
+  currentValue = "/home/old/.vscode-server/extensions/shrec.aiworkhub-missing/bin/aiworkhub-app-server-mux";
+  updates.length = 0;
+  const missingContext = {
+    extensionUri: { fsPath: path.join(temp, "does-not-exist") },
+  };
+  const result = await __testInternals.ensureCodexCallbackMuxConfigured(missingContext);
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
 });
 
 test("stable launcher lives outside versioned VSIX and follows runtime current.json", async () => {
@@ -117,12 +151,14 @@ test("bootstrap runtime pointer is available before immutable generation materia
 
 test("manifest-default mux command is materialized on the extension-host PATH", () => {
   const home = path.join(temp, "shim-home");
+  const env = { PATH: path.join(home, "existing-bin") };
   const shim = __testInternals.materializePathMuxShim(launcher, {
     platform: "linux",
     home,
-    env: { PATH: path.join(home, ".local", "bin") },
+    env,
   });
   assert.equal(shim, path.join(home, ".local", "bin", "aiworkhub-app-server-mux"));
+  assert.ok(env.PATH.startsWith(path.join(home, ".local", "bin") + path.delimiter));
   assert.ok(fs.readFileSync(shim, "utf8").includes(launcher));
   if (process.platform !== "win32") {
     assert.ok((fs.statSync(shim).mode & 0o111) !== 0);
@@ -145,10 +181,7 @@ test("Windows PATH shim is a command wrapper and never depends on POSIX mode bit
   assert.ok(content.includes(launcher));
 });
 
-test("package contributes a pre-activation Codex mux default", () => {
+test("package never contributes an application-scoped Codex executable default", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(
-    manifest.contributes.configurationDefaults["chatgpt.cliExecutable"],
-    "aiworkhub-app-server-mux",
-  );
+  assert.ok(!manifest.contributes.configurationDefaults);
 });

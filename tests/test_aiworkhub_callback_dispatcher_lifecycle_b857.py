@@ -329,6 +329,32 @@ def test_core_dispatcher_forwards_extension_selected_subprocess_transport(tmp_pa
     assert captured["bridge_kwargs"] == {"transport": "subprocess"}
 
 
+def test_core_native_codex_manager_inbox_never_starts_hidden_app_server(tmp_path, monkeypatch):
+    root = tmp_path / "repo_native_codex_inbox"
+    root.mkdir()
+    init = task_store.initialize_repository(root)
+    assert init["ok"], init
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "manager_inbox")
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_native_codex_test")
+    calls = {"ensure": 0}
+
+    def forbidden_ensure(*args, **kwargs):
+        calls["ensure"] += 1
+        raise AssertionError("manager inbox must not spawn a callback dispatcher")
+
+    monkeypatch.setattr(callback_bridge, "ensure_dispatcher", forbidden_ensure)
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: callback_bridge)
+    result = core.dispatcher_ensure_started()
+    assert result["ok"] is True
+    assert result["healthy"] is True
+    assert result["status"] == "manager_inbox"
+    assert result["dispatcher_started"] is False
+    assert result["provider"] == "codex"
+    assert result["reason"] == "native_codex_uses_cooperative_manager_inbox"
+    assert calls["ensure"] == 0
+
+
 def test_claude_manager_derives_window_and_coordinator_capability(tmp_path, monkeypatch):
     root = tmp_path / "repo_claude_manager"
     root.mkdir()

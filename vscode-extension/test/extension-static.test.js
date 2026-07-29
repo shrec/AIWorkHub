@@ -80,7 +80,8 @@ assert.ok(ext.includes('path.join(root, ".aiworkhub", "runtime")'));
 assert.ok(!ext.includes('homedir(), ".config", "aiworkhub", "taskctl_coordinator.token"'));
 assert.ok(ext.includes("snapshotRequestSeq"));
 assert.ok(ext.includes("requestSeq === view.snapshotRequestSeq"));
-assert.ok(ext.includes('AIWORKHUB_CALLBACK_TRANSPORT: "sideband"'));
+assert.ok(ext.includes('AIWORKHUB_CALLBACK_TRANSPORT: "manager_inbox"'));
+assert.ok(!ext.includes('AIWORKHUB_CALLBACK_TRANSPORT: "sideband"'));
 assert.ok(!ext.includes('AIWORKHUB_CALLBACK_TRANSPORT: "repository_inbox_poll"'));
 // The only permitted foreign-PID operation is Node's non-destructive signal-0
 // existence probe used to reject a dead route owner after reload.  No signal
@@ -92,7 +93,8 @@ absent(ext, [
   "classifyImmediateCodexChildren",
 ], "destructive foreign process control");
 assert.ok(ext.includes('getConfiguration("chatgpt")'));
-assert.ok(ext.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(ext.includes('config.update("cliExecutable", undefined, globalTarget)'));
 assert.ok(ext.includes("custom_cli_executable_preserved"));
 assert.ok(ext.includes("retainContextWhenHidden: true"));
 assert.ok(ext.includes("getHtmlForNavigatorWebview"));
@@ -137,11 +139,16 @@ assert.ok(ext.includes('id="repo-router"'));
 assert.ok(app.includes("function renderKnownRepositories"));
 assert.ok(app.includes("known_repositories"));
 
-// Codex callback routing owns a packaged app-server mux, but it must be
-// configured through VS Code settings rather than global environment state.
+// The optional same-host mux may be packaged, but the workspace extension
+// must restore native Codex before materializing it and must never publish an
+// application-scoped executable override.
 assert.ok(ext.includes("materializeStableMuxLauncher(context)"));
-assert.ok(ext.includes("ensureCodexCallbackMuxConfigured(context, stableMuxLauncher)"));
-assert.ok(ext.includes('config.update("cliExecutable", launcher, true)'));
+assert.ok(ext.includes("await ensureCodexCallbackMuxConfigured(context)"));
+assert.ok(
+  ext.indexOf("await ensureCodexCallbackMuxConfigured(context)")
+    < ext.lastIndexOf("materializeStableMuxLauncher(context)"),
+);
+assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
 assert.ok(ext.includes("custom_cli_executable_preserved"));
 assert.ok(ext.includes("env.PYTHONPATH ="));
 assert.ok(ext.includes("cwd: runtimeDir || root"));

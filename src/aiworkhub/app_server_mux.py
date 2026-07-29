@@ -13,8 +13,9 @@ start a hidden, invisible turn on a hidden connection (``B407``'s
 ``turn/steer``, done against the WRONG instance, does not fix this).
 
 The fix is topological: install this module as the extension's
-``chatgpt.cliExecutable`` (see ``scripts/install_vscode_app_server_mux.py``
--- print-config only, Codex applies the setting). Two invocation shapes:
+an explicitly verified same-host ``chatgpt.cliExecutable`` deployment (see
+``scripts/install_vscode_app_server_mux.py`` -- print-config only; AIWorkHub
+never applies the application-scoped setting). Two invocation shapes:
 
 - Non-app-server invocation (``codex exec ...`` etc): ``main()`` execs the
   real Codex binary with the EXACT argv it received via ``os.execvp`` --
@@ -1323,8 +1324,9 @@ def run_mux(argv: list[str], *, repo_id: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """``app_server_mux.py <codex argv...>`` -- transparent Codex CLI
-    wrapper. Set as the extension's ``chatgpt.cliExecutable`` (Codex owns
-    that setting change; see ``scripts/install_vscode_app_server_mux.py``).
+    wrapper for an explicitly verified same-host deployment. AIWorkHub never
+    mutates the application-scoped ``chatgpt.cliExecutable`` setting; see
+    ``scripts/install_vscode_app_server_mux.py`` for the diagnostic contract.
     """
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     real_executable = resolve_real_executable()

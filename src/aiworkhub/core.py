@@ -3673,7 +3673,8 @@ def dispatcher_ensure_started() -> dict[str, Any]:
         }
     target = read_selected_coordinator_target(root)
     claude_identity = _claude_manager_identity()
-    if os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower() == "sideband":
+    callback_transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
+    if callback_transport == "sideband":
         provider = "codex"
         claude_identity = None
     elif claude_identity is not None:
@@ -3683,6 +3684,28 @@ def dispatcher_ensure_started() -> dict[str, Any]:
     window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
     if not window_id and claude_identity is not None:
         window_id = claude_identity["window_id"]
+    if callback_transport == "manager_inbox":
+        bridge = _callback_bridge_module()
+        bridge.stop_dispatcher(root)
+        conn = _canonical_connect()
+        try:
+            seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
+                conn,
+                provider=provider,
+                origin_thread_id=None,
+            )
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "healthy": True,
+            "status": "manager_inbox",
+            "dispatcher_started": False,
+            "repo": str(root),
+            "provider": provider,
+            "reason": "native_codex_uses_cooperative_manager_inbox",
+            "seeded_review_callback_count": seeded_review_callback_count,
+        }
     if claude_identity is not None and provider == "claude":
         # A second ``claude --resume --print`` process cannot wake an already
         # open Claude Code webview.  The verified manager instead owns a
@@ -3929,10 +3952,11 @@ def dispatcher_health() -> dict[str, Any]:
     target = read_selected_coordinator_target(root)
     window_id = os.environ.get("AIWORKHUB_WINDOW_ID", "").strip()
     claude_identity = _claude_manager_identity()
-    sideband = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower() == "sideband"
+    callback_transport = os.environ.get("AIWORKHUB_CALLBACK_TRANSPORT", "").strip().lower()
+    sideband = callback_transport == "sideband"
     # A verified Claude manager delivers through the MCP long-poll inbox, not a
     # background dispatcher thread, so it is healthy WITHOUT a registered one.
-    manager_inbox = (
+    manager_inbox = callback_transport == "manager_inbox" or (
         claude_identity is not None and not sideband
         and target["selected_provider"] == "claude"
     )

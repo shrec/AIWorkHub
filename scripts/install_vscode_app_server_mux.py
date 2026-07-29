@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dry-run/check/print-config installer for the App Server mux (B409).
+"""Same-host-only dry-run/check/print-config utility for the App Server mux.
 
 This script NEVER mutates VS Code settings, the installed OpenAI extension,
 systemd, the live callback DB, or any running process. It only prints:
@@ -8,7 +8,10 @@ systemd, the live callback DB, or any running process. It only prints:
 - an environment-readiness check (module present, real ``codex`` on PATH),
 - and the exact rollback value/steps.
 
-Codex owns applying the setting, reloading the VS Code extension host, the
+This output is unsafe for Remote-SSH/WSL split-host operation because the
+OpenAI setting has application scope.  AIWorkHub never applies it
+automatically.  In a verified same-host deployment Codex owns applying the
+setting, reloading the VS Code extension host, the
 live canary against the extension-owned thread, recovery, and finally
 enabling ``aiworkhub-callback-bridge.service`` -- none of that happens here.
 """

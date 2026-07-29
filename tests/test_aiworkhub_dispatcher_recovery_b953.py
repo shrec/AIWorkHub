@@ -111,6 +111,22 @@ def test_manager_inbox_healthy_without_dispatcher(monkeypatch):
     assert h["ok"] is True and h["healthy"] is True and h["problems"] == []
 
 
+def test_native_codex_manager_inbox_is_healthy_without_sideband(monkeypatch):
+    _patch_core(
+        monkeypatch,
+        readiness=_readiness(),
+        bridge_health=_UNREGISTERED,
+        provider="codex",
+        claude_identity=None,
+        window_id="window_native_codex",
+        transport="manager_inbox",
+    )
+    h = core.dispatcher_health()
+    assert h["status"] == "manager_inbox"
+    assert h["dispatch_expected"] is True
+    assert h["ok"] is True and h["healthy"] is True and h["problems"] == []
+
+
 def test_uninitialized_is_non_degraded(monkeypatch):
     _patch_core(monkeypatch, readiness=_readiness(ready=False, repo_id="", reason="not_initialized"),
                 bridge_health={}, window_id="win1")
