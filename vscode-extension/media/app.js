@@ -62,6 +62,9 @@ const elements = {
   headerStorage: document.querySelector("#header-storage"),
   headerStorageManaged: document.querySelector("#header-storage-managed"),
   headerStorageFree: document.querySelector("#header-storage-free"),
+  headerSourceGraph: document.querySelector("#header-source-graph"),
+  headerSourceGraphRate: document.querySelector("#header-source-graph-rate"),
+  headerSourceGraphDetail: document.querySelector("#header-source-graph-detail"),
   sourceAlert: document.querySelector("#source-alert"),
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
@@ -87,6 +90,7 @@ const elements = {
   tableLoading: document.querySelector("#table-loading"),
   topicStats: document.querySelector("#topic-stats"),
   runnerStats: document.querySelector("#runner-stats"),
+  toolUseList: document.querySelector("#tool-use-list"),
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
   systemLogList: document.querySelector("#system-log-list"),
@@ -275,6 +279,23 @@ function renderSummary(snapshot) {
   elements.headerStorageFree.textContent = storage
     ? `Free ${formatBytes(storage.disk_free_bytes)}`
     : "Free —";
+  const sourceGraph = snapshot && snapshot.source_graph_telemetry
+    && typeof snapshot.source_graph_telemetry === "object"
+    ? snapshot.source_graph_telemetry
+    : null;
+  if (elements.headerSourceGraphRate && elements.headerSourceGraphDetail) {
+    const gated = sourceGraph ? numberValue(sourceGraph.gated_tasks) : 0;
+    const live = sourceGraph ? numberValue(sourceGraph.source_graph_live_tasks) : 0;
+    const injected = sourceGraph ? numberValue(sourceGraph.source_graph_injected_only_tasks) : 0;
+    const violations = sourceGraph ? numberValue(sourceGraph.policy_violations) : 0;
+    elements.headerSourceGraphRate.textContent = gated ? `${numberValue(sourceGraph.live_rate).toFixed(1)}% live` : "No sample";
+    elements.headerSourceGraphDetail.textContent = gated
+      ? `${live}/${gated} live · ${injected} injected-only`
+      : "No gated tasks";
+    elements.headerSourceGraph.title = sourceGraph
+      ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${formatBytes(sourceGraph.source_graph_bytes)} · ${violations} policy violations`
+      : "Source Graph telemetry unavailable";
+  }
 }
 
 function renderSourceHealth(snapshot) {
@@ -616,6 +637,73 @@ function renderUsage(snapshot) {
   elements.usageList.replaceChildren(fragment);
 }
 
+function renderToolUse(snapshot) {
+  const telemetry = snapshot && snapshot.source_graph_telemetry
+    && typeof snapshot.source_graph_telemetry === "object"
+    ? snapshot.source_graph_telemetry
+    : null;
+  if (!telemetry || !numberValue(telemetry.gated_tasks)) {
+    elements.toolUseList.replaceChildren(
+      createElement("div", "panel-list-empty", "No authenticated worker tool-use evidence yet"),
+    );
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const overview = createElement("div", "usage-overview tool-use-overview");
+  const overviewValues = [
+    ["Live", `${numberValue(telemetry.live_rate).toFixed(1)}%`],
+    ["Live tasks", `${formatCount(telemetry.source_graph_live_tasks)}/${formatCount(telemetry.gated_tasks)}`],
+    ["Injected only", formatCount(telemetry.source_graph_injected_only_tasks)],
+    ["Missing/stale", formatCount(
+      numberValue(telemetry.source_graph_missing_tasks)
+      + numberValue(telemetry.source_graph_stale_or_cached_tasks),
+    )],
+    ["SG calls", formatCount(telemetry.source_graph_calls)],
+    ["SG bytes", formatBytes(telemetry.source_graph_bytes)],
+    ["Violations", formatCount(telemetry.policy_violations)],
+    ["Tampered", formatCount(telemetry.tampered_ledger_tasks)],
+  ];
+  for (const [label, value] of overviewValues) {
+    const metric = createElement("div", "usage-metric");
+    metric.append(createElement("span", "usage-label", label), createElement("strong", "", value));
+    overview.appendChild(metric);
+  }
+  fragment.appendChild(overview);
+
+  const byAdapter = telemetry.by_adapter && typeof telemetry.by_adapter === "object"
+    ? telemetry.by_adapter
+    : {};
+  const rows = Object.entries(byAdapter)
+    .filter(([, value]) => value && typeof value === "object")
+    .map(([name, value]) => ({ name, ...value }))
+    .sort((left, right) => numberValue(right.gated_tasks) - numberValue(left.gated_tasks) || left.name.localeCompare(right.name));
+  for (const item of rows) {
+    const gated = numberValue(item.gated_tasks);
+    const live = numberValue(item.live_tasks);
+    const row = createElement("div", "stat-row tool-use-row");
+    row.title = `${numberValue(item.source_graph_calls)} Source Graph calls · ${numberValue(item.policy_violations)} policy violations`;
+    const main = createElement("div", "stat-main");
+    const labels = createElement("div", "stat-labels");
+    labels.append(
+      createElement("span", "stat-name", item.name || "unknown"),
+      createElement(
+        "span",
+        "stat-breakdown",
+        `${live} live | ${numberValue(item.injected_only_tasks)} injected | ${numberValue(item.missing_or_stale_tasks)} missing/stale`,
+      ),
+    );
+    const track = createElement("div", "stat-track");
+    const fill = createElement("span", "stat-fill");
+    fill.style.width = `${gated ? Math.max(3, Math.round((live / gated) * 100)) : 0}%`;
+    track.appendChild(fill);
+    main.append(labels, track);
+    row.append(main, createElement("strong", "stat-total", gated ? `${Math.round((live / gated) * 100)}%` : "0%"));
+    fragment.appendChild(row);
+  }
+  elements.toolUseList.replaceChildren(fragment);
+}
+
 function formatBytes(value) {
   let amount = Math.max(0, numberValue(value));
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -909,6 +997,7 @@ function renderSnapshot(snapshot) {
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderUsage(snapshot);
+  renderToolUse(snapshot);
   renderStorage(snapshot);
   renderSystemLogs(snapshot);
   renderReturns(snapshot);
@@ -1083,17 +1172,29 @@ function resultPayload(card) {
 
 function renderAiInfra(card) {
   const info = card.ai_infra_context && typeof card.ai_infra_context === "object" ? card.ai_infra_context : null;
-  if (!info) {
+  const quality = card.quality_gate && typeof card.quality_gate === "object" ? card.quality_gate : null;
+  if (!info && !quality) {
     elements.detailAiInfraBlock.hidden = true;
     elements.detailAiInfra.replaceChildren();
     return;
   }
   const fragment = document.createDocumentFragment();
-  const overview = [
+  const overview = info ? [
     ["Injected", info.injected ? "yes" : "no"],
     ["Acknowledged", info.acknowledged ? "yes" : "no"],
-  ];
-  if (info.estimate && info.estimate.label) {
+  ] : [];
+  if (quality) {
+    overview.push(["Quality gate", quality.passed ? "passed" : "failed"]);
+    overview.push(["Quality checks", String(asArray(quality.checks).length)]);
+  }
+  const toolUse = info && info.tool_use && typeof info.tool_use === "object" ? info.tool_use : null;
+  if (toolUse && toolUse.gated) {
+    overview.push(["SG live", `${numberValue(toolUse.source_graph_live_calls)} calls`]);
+    overview.push(["SG total", `${numberValue(toolUse.source_graph_calls)} calls`]);
+    overview.push(["SG bytes", formatBytes(toolUse.source_graph_bytes)]);
+    overview.push(["Violations", String(numberValue(toolUse.policy_violations))]);
+  }
+  if (info && info.estimate && info.estimate.label) {
     overview.push(["Raw est.", `${numberValue(info.estimate.raw_context_bytes)} B`]);
     overview.push(["Bundle", `${numberValue(info.estimate.bundle_bytes)} B`]);
   }
@@ -1108,7 +1209,7 @@ function renderAiInfra(card) {
     ["AI Memory", "ai_memory"],
     ["KB", "kb"],
   ]) {
-    const section = info[key] && typeof info[key] === "object" ? info[key] : {};
+    const section = info && info[key] && typeof info[key] === "object" ? info[key] : {};
     if (!Object.keys(section).length) {
       continue;
     }

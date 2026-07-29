@@ -511,7 +511,9 @@ def verify_audit_ledger(
         "call_count_by_tool": {},
         "successful_call_count_by_tool": {},
         "bounded_bytes_returned": 0,
+        "bounded_bytes_by_tool": {},
         "cache_hits": 0,
+        "cache_hits_by_tool": {},
         "policy_violations": 0,
         "live_source_graph_calls": 0,
         "authority_index_identity": [],
@@ -530,6 +532,8 @@ def verify_audit_ledger(
 
     call_count: dict[str, int] = {}
     successful_call_count: dict[str, int] = {}
+    bounded_bytes_by_tool: dict[str, int] = {}
+    cache_hits_by_tool: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str, str]] = set()
     for raw_line in lines:
         raw_line = raw_line.strip()
@@ -559,9 +563,12 @@ def verify_audit_ledger(
         result["entries_verified"] += 1
         tool = str(entry.get("tool") or "unknown")
         call_count[tool] = call_count.get(tool, 0) + 1
-        result["bounded_bytes_returned"] += max(0, int(entry.get("bytes_returned") or 0))
+        returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
+        result["bounded_bytes_returned"] += returned_bytes
+        bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes
         if entry.get("cache_hit"):
             result["cache_hits"] += 1
+            cache_hits_by_tool[tool] = cache_hits_by_tool.get(tool, 0) + 1
         if entry.get("violation"):
             result["policy_violations"] += 1
         authority_source = str(entry.get("authority_source") or "")
@@ -590,6 +597,8 @@ def verify_audit_ledger(
             result["live_source_graph_calls"] += 1
     result["call_count_by_tool"] = call_count
     result["successful_call_count_by_tool"] = successful_call_count
+    result["bounded_bytes_by_tool"] = bounded_bytes_by_tool
+    result["cache_hits_by_tool"] = cache_hits_by_tool
     result["authority_index_identity"] = sorted(
         f"{t}:{src}:{state}:{repo}" for t, src, state, repo in authority_seen
     )

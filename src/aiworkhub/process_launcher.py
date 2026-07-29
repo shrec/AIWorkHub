@@ -32,6 +32,7 @@ from typing import Any, Callable
 import fcntl
 
 from . import core
+from . import quality_evidence
 from . import task_engine
 try:
     from . import project_context
@@ -50,6 +51,7 @@ except ImportError:
 
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
+from . import vscode_lm_bridge
 from . import worker_ai_tools_mcp
 try:
     from . import deepseek_credentials
@@ -1270,9 +1272,9 @@ def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
         # Never a GitHub-hosted Claude/GPT adapter for a DeepSeek-labeled task.
         allowed = ("deepseek_copilot_cli", "deepseek_manual")
     elif runner.startswith("glm_"):
-        # glm_* runners launch locally via the Copilot BYOK adapter against
-        # the explicit GLM provider/model allowlist.
-        allowed = ("glm_copilot_cli",)
+        # Prefer the credential-free VS Code Language Model API bridge.  Keep
+        # the explicit BYOK adapter as a backwards-compatible fallback.
+        allowed = ("glm_vscode_lm", "glm_copilot_cli")
     else:
         return
     if adapter_id not in allowed:
@@ -1894,6 +1896,20 @@ class ProcessManager:
             except glm_credentials.CredentialError as exc:
                 raise LaunchRejected(f"glm_credential_missing:{exc.reason}") from exc
             return credential.provider_env(resolved_model), resolved_model
+        if adapter_id == runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+            resolved_model, model_error = runtime_adapters.resolve_glm_model(model)
+            if model_error:
+                raise LaunchRejected(f"glm_model_rejected:{model_error}")
+            assert resolved_model is not None
+            readiness = vscode_lm_bridge.bridge_readiness(
+                self.repo, model=resolved_model
+            )
+            if not readiness.get("launchable"):
+                raise LaunchRejected(
+                    "glm_vscode_lm_unavailable:"
+                    + str(readiness.get("blocker_reason") or "not_launchable")
+                )
+            return None, resolved_model
         else:
             return None, model
 
@@ -2011,6 +2027,7 @@ class ProcessManager:
         workspace: WorkerWorkspace | None = None
         spec_path: Path | None = None
         authority_path: Path | None = None
+        bridge_request: vscode_lm_bridge.BridgeRequest | None = None
         claimed = False
         provider_env: dict[str, str] | None = None
         try:
@@ -2086,14 +2103,36 @@ class ProcessManager:
                         context_result.prompt_bundle if context_result is not None else ""
                     ),
                 )
-                plan = self._build_adapter(
-                    adapter_id=adapter_id,
-                    prompt=prompt,
-                    repo=workspace.path,
-                    model=model,
-                    outer_sandbox_backend=sandbox_backend,
-                    additional_readonly_dirs=external_readonly_dirs,
-                )
+                if adapter_id == runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+                    bridge_request = vscode_lm_bridge.create_request(
+                        repo=self.repo,
+                        request_id=request_id,
+                        workspace_path=workspace.path,
+                        workspace_home=workspace.home,
+                        prompt=prompt,
+                        model=str(model or runtime_adapters.GLM_DEFAULT_MODEL),
+                        allowed_writes=workspace.allowed_writes,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    plan = runtime_adapters.RuntimeAdapterPlan(
+                        adapter_id=adapter_id,
+                        argv=[sys.executable, "-m", "aiworkhub.vscode_lm_worker"],
+                        cwd=str(workspace.path),
+                        executable=sys.executable,
+                        launchable=True,
+                        manual_only=False,
+                        validation_ok=True,
+                        validation_reason="",
+                    )
+                else:
+                    plan = self._build_adapter(
+                        adapter_id=adapter_id,
+                        prompt=prompt,
+                        repo=workspace.path,
+                        model=model,
+                        outer_sandbox_backend=sandbox_backend,
+                        additional_readonly_dirs=external_readonly_dirs,
+                    )
                 if not getattr(plan, "launchable", False):
                     reason = getattr(plan, "reason", "adapter_not_launchable")
                     raise LaunchRejected(reason or "adapter_not_launchable")
@@ -2338,6 +2377,8 @@ class ProcessManager:
                 unlink_if_regular(spec_path)
             if authority_path is not None:
                 unlink_if_regular(authority_path)
+            if bridge_request is not None:
+                vscode_lm_bridge.cancel_request(bridge_request)
             return self._blocked(
                 task_id,
                 runner,
@@ -3165,6 +3206,7 @@ class ProcessManager:
             review_result: dict[str, Any] | None = None
             release_result: dict[str, Any] | None = None
             worker_mcp_gate: dict[str, Any] | None = None
+            quality_gate: dict[str, Any] | None = None
             cleanup = True
             try:
                 if terminal_state != "exited":
@@ -3261,6 +3303,13 @@ class ProcessManager:
                         changed = sorted(set(changed) | validated_required_paths)
                         if not changed:
                             raise WorkspaceError("no_effect")
+                        quality_gate = quality_evidence.run_completion_quality_gate(
+                            workspace.path, changed_paths=changed
+                        )
+                        if not quality_gate.get("passed"):
+                            blockers = quality_gate.get("blocking_checks") or []
+                            reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
+                            raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
                         # Phase 1 review-first reconcile: a successful worker
                         # exit no longer promotes into the canonical repo nor
                         # marks review via core.mark_review directly. The
@@ -3284,6 +3333,7 @@ class ProcessManager:
                                 "required_outputs": required_output_records,
                                 "validation": validations,
                                 "worker_mcp_gate": worker_mcp_gate,
+                                "quality_gate": quality_gate,
                                 "claim_state": claim_state,
                                 "immutable_inputs": metadata.get("immutable_inputs") or [],
                                 "immutable_input_manifest": (
@@ -3310,7 +3360,7 @@ class ProcessManager:
                 error = str(exc)
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
                     terminal_state = "scope_rejected"
-                elif error.startswith(("validation", "required_output")):
+                elif error.startswith(("validation", "required_output", "quality_gate")):
                     terminal_state = "validation_failed"
                 elif error.startswith(("parent_changed", "promotion_scope")):
                     terminal_state = "promotion_conflict"
@@ -3350,6 +3400,7 @@ class ProcessManager:
                             "required_outputs": required_output_records,
                             "validation": validations,
                             "worker_mcp_gate": worker_mcp_gate,
+                            "quality_gate": quality_gate,
                         },
                     )
                     if not release_result.get("ok"):
@@ -3438,6 +3489,7 @@ class ProcessManager:
                 "project_context_delivery": metadata.get("project_context_delivery"),
                 "project_context_acknowledgement": context_ack,
                 "worker_mcp_gate": worker_mcp_gate,
+                "quality_gate": quality_gate,
             })
             if cleanup:
                 try:
@@ -3926,6 +3978,13 @@ class ProcessManager:
                         "validation_required_aiworkhub_mcp_call_missing:"
                         + str(worker_mcp_gate.get("reason") or "")
                     )
+                quality_gate = quality_evidence.run_completion_quality_gate(
+                    workspace.path, changed_paths=changed
+                )
+                if not quality_gate.get("passed"):
+                    blockers = quality_gate.get("blocking_checks") or []
+                    reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
+                    raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
                 validations = run_validations(workspace, card.get("validation") or [])
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(
@@ -3953,6 +4012,7 @@ class ProcessManager:
                     "promoted_paths": promoted,
                     "validation": validations,
                     "required_outputs": required_output_records,
+                    "quality_gate": quality_gate,
                 },
             )
             if not accept_result.get("ok"):

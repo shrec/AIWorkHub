@@ -307,6 +307,30 @@ select:focus-visible,
   background: var(--review-soft);
 }
 
+.header-tool-use {
+  display: grid;
+  grid-template-columns: auto auto;
+  min-width: 180px;
+  align-items: baseline;
+  gap: 1px 9px;
+  padding: 5px 10px;
+  color: var(--ink);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.header-tool-use strong {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+#header-source-graph-detail {
+  color: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
 .header-storage-label {
   grid-column: 1 / -1;
   color: var(--muted);

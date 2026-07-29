@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ SUPPORTED_ADAPTERS: tuple[str, ...] = (
     "codex_cli",
     "deepseek_copilot_cli",
     "glm_copilot_cli",
+    "glm_vscode_lm",
     "deepseek_manual",
 )
 LOCAL_ADAPTERS: tuple[str, ...] = (
@@ -28,6 +30,7 @@ LOCAL_ADAPTERS: tuple[str, ...] = (
     "codex_cli",
     "deepseek_copilot_cli",
     "glm_copilot_cli",
+    "glm_vscode_lm",
 )
 MANUAL_ONLY_ADAPTERS: tuple[str, ...] = ("deepseek_manual",)
 
@@ -41,6 +44,7 @@ ADAPTER_EXECUTABLES: Mapping[str, str] = MappingProxyType(
         # Official GitHub Copilot CLI, driven in BYOK mode against GLM's
         # OpenAI-compatible API (see glm_credentials.py).
         "glm_copilot_cli": "copilot",
+        "glm_vscode_lm": sys.executable,
     }
 )
 
@@ -55,6 +59,7 @@ DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-pro"
 DEEPSEEK_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 
 GLM_COPILOT_ADAPTER = "glm_copilot_cli"
+GLM_VSCODE_LM_ADAPTER = "glm_vscode_lm"
 GLM_SUPPORTED_MODELS: tuple[str, ...] = ("glm-5.2",)
 GLM_DEFAULT_MODEL = "glm-5.2"
 GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
@@ -432,6 +437,12 @@ def build_runtime_command(
         return _invalid_plan(adapter_id, resolution.reason, cwd=cwd)
 
     executable = resolution.executable
+    if adapter_id == GLM_VSCODE_LM_ADAPTER:
+        return _invalid_plan(
+            adapter_id,
+            "glm_vscode_lm_requires_process_launcher_bridge_context",
+            cwd=cwd,
+        )
     if adapter_id == "claude_cli":
         argv = [
             executable,
@@ -611,6 +622,7 @@ __all__ = [
     "DEEPSEEK_SECRET_ENV_VAR",
     "DEEPSEEK_SUPPORTED_MODELS",
     "GLM_COPILOT_ADAPTER",
+    "GLM_VSCODE_LM_ADAPTER",
     "GLM_DEFAULT_MODEL",
     "GLM_SECRET_ENV_VAR",
     "GLM_SUPPORTED_MODELS",

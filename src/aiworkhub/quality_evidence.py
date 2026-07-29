@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import shutil
 import subprocess
 import time
@@ -32,6 +33,27 @@ CONFIG_RELATIVE_PATH = ".aiworkhub/quality.json"
 MAX_AFFECTED_PATHS = 200
 MAX_SUMMARY_CHARS = 2000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+
+# Repository-declared checks are intentionally broader than ordinary CI
+# labels.  This lets a repository make CodeQL/Semgrep/SAST, dependency,
+# secret, memory-safety and robustness checks first-class completion gates
+# instead of disguising them as ``lint``.
+DECLARED_CHECK_KINDS = frozenset(
+    {
+        "build",
+        "test",
+        "lint",
+        "typecheck",
+        "static_analysis",
+        "security",
+        "dependency",
+        "secret_scan",
+        "coverage",
+        "benchmark",
+        "memory_safety",
+        "robustness",
+    }
+)
 
 # Bounded, exact manifest/config paths used for language/tool detection.
 # No globbing, no directory walks -- every entry is an exact repo-relative path.
@@ -199,7 +221,7 @@ def _validate_declared_check(entry: Any) -> None:
     if not isinstance(check_id, str) or not check_id.strip():
         raise MalformedConfigError("declared check missing non-empty 'id'")
     kind = entry.get("kind")
-    if kind not in {"build", "test", "lint", "typecheck"}:
+    if kind not in DECLARED_CHECK_KINDS:
         raise MalformedConfigError(f"declared check {check_id!r} has invalid 'kind': {kind!r}")
     command = entry.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
@@ -276,7 +298,7 @@ def run_declared_checks(
     changed_paths: Iterable[str] | None = None,
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> list[EvidenceCheck]:
-    """Diff/new-code-first execution of repo-local declared build/test/lint/typecheck commands.
+    """Execute repo-local declared quality/security commands for one task delta.
 
     Fails closed (raises MalformedConfigError) on a malformed config instead
     of silently skipping or partially running it. Commands only ever run as
@@ -309,6 +331,133 @@ def run_declared_checks(
             )
         )
     return results
+
+
+def run_builtin_static_checks(
+    repo_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
+    timeout_seconds: int = 60,
+) -> list[EvidenceCheck]:
+    """Always-available, diff-scoped syntax/static checks.
+
+    This is the deterministic floor beneath optional Semgrep/CodeQL gates.
+    It never walks the repository and never downloads a tool or rule pack.
+    Only exact changed paths are inspected, capped by ``MAX_AFFECTED_PATHS``.
+    """
+    root = Path(repo_root).resolve()
+    paths = tuple(sorted(dict.fromkeys(str(p) for p in (changed_paths or ()))))[:MAX_AFFECTED_PATHS]
+    checks: list[EvidenceCheck] = []
+    for relative in paths:
+        candidate = (root / relative).resolve(strict=False)
+        if candidate != root and root not in candidate.parents:
+            checks.append(EvidenceCheck(
+                check_id=f"builtin:path:{relative}", kind="static_analysis", status=STATUS_FAILED,
+                affected_paths=(relative,), summary="changed path escapes repository",
+                provenance="builtin:exact_changed_path", error="path_escape",
+            ))
+            continue
+        if not candidate.exists():
+            # Deleted paths are legitimate changes and have no new source to scan.
+            continue
+        if candidate.is_symlink() or not candidate.is_file():
+            checks.append(EvidenceCheck(
+                check_id=f"builtin:path:{relative}", kind="static_analysis", status=STATUS_FAILED,
+                affected_paths=(relative,), summary="changed source is not a regular file",
+                provenance="builtin:exact_changed_path", error="non_regular_source",
+            ))
+            continue
+        suffix = candidate.suffix.lower()
+        started = time.monotonic()
+        status = STATUS_PASSED
+        error = ""
+        summary = "syntax valid"
+        command: tuple[str, ...] = ()
+        try:
+            if suffix == ".py":
+                ast.parse(candidate.read_text(encoding="utf-8"), filename=relative)
+            elif suffix in {".js", ".cjs", ".mjs"}:
+                command = ("node", "--check", relative)
+                status, stdout, stderr, _duration = _run_command_array(
+                    command, cwd=root, timeout_seconds=timeout_seconds
+                )
+                error = stderr if status != STATUS_PASSED else ""
+                summary = (stdout or stderr or "syntax valid").strip()
+            elif suffix in {".sh", ".bash"}:
+                command = ("bash", "-n", relative)
+                status, stdout, stderr, _duration = _run_command_array(
+                    command, cwd=root, timeout_seconds=timeout_seconds
+                )
+                error = stderr if status != STATUS_PASSED else ""
+                summary = (stdout or stderr or "syntax valid").strip()
+            else:
+                continue
+        except (OSError, UnicodeError, SyntaxError, json.JSONDecodeError) as exc:
+            status = STATUS_FAILED
+            error = str(exc)
+            summary = f"syntax/static parse failed: {exc}"
+        checks.append(EvidenceCheck(
+            check_id=f"builtin:syntax:{relative}",
+            kind="static_analysis",
+            status=status,
+            command=command,
+            duration_seconds=time.monotonic() - started,
+            affected_paths=(relative,),
+            summary=summary,
+            provenance="builtin:diff_scoped_syntax",
+            error=error,
+        ))
+    if not checks:
+        checks.append(EvidenceCheck(
+            check_id="builtin:syntax:no_supported_changed_paths",
+            kind="static_analysis",
+            status=STATUS_PASSED,
+            affected_paths=paths,
+            summary="no changed Python/JavaScript/shell source required syntax parsing",
+            provenance="builtin:diff_scoped_syntax",
+        ))
+    return checks
+
+
+def run_completion_quality_gate(
+    repo_root: Path | str,
+    *,
+    changed_paths: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Execute the mandatory review-quality floor for one task delta.
+
+    Built-in diff syntax checks always run. Every repo-declared check is
+    mandatory: ``failed`` and ``not_available`` both block. Optional
+    CodeQL/Semgrep/etc. availability is reported truthfully but does not pass
+    or fail the task unless the repository declares its exact command in
+    ``.aiworkhub/quality.json``.
+    """
+    root = Path(repo_root)
+    affected = tuple(sorted(str(p) for p in (changed_paths or ())))
+    try:
+        checks = run_builtin_static_checks(root, changed_paths=affected)
+        declared = run_declared_checks(root, changed_paths=affected)
+        config_error = ""
+    except MalformedConfigError as exc:
+        checks = []
+        declared = []
+        config_error = str(exc)
+    all_checks = [*checks, *declared]
+    blockers = [
+        check.check_id
+        for check in all_checks
+        if check.status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}
+    ]
+    optional = [optional_gate_status(root, gate).to_dict() for gate in sorted(OPTIONAL_GATES)]
+    return {
+        "schema_id": "aiworkhub.completion_quality_gate.v1",
+        "passed": not config_error and not blockers,
+        "changed_paths": list(affected[:MAX_AFFECTED_PATHS]),
+        "checks": [check.to_dict() for check in all_checks],
+        "blocking_checks": blockers,
+        "config_error": config_error,
+        "optional_gates": optional,
+    }
 
 
 # ---------------------------------------------------------------------------

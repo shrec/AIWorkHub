@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.75";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.76";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -63,6 +63,23 @@ const SHARED_REPO_ROUTE_TTL_MS = 15 * 60 * 1000;
 // a slow tick or a single missed renewal still leaves multiple retries
 // before the lease would lapse.
 const WINDOW_ROUTE_RENEWAL_INTERVAL_MS = 4 * 60 * 1000;
+
+// VS Code Language Model bridge.  Custom models contributed to Copilot Chat
+// (for example customendpoint/glm-5.2) are available only inside the
+// extension host -- the standalone `copilot` CLI does not inherit that model
+// registration or its editor authorization.  Requests are exchanged through
+// an owner-only runtime spool; task state and outputs stay repository-bound.
+const VSCODE_LM_REQUEST_SCHEMA = "aiworkhub.vscode_lm.request.v1";
+const VSCODE_LM_HOST_SCHEMA = "aiworkhub.vscode_lm.host.v1";
+const VSCODE_LM_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.response.v1";
+const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v1";
+const VSCODE_LM_MODEL = "glm-5.2";
+const VSCODE_LM_POLL_MS = 500;
+const VSCODE_LM_HEARTBEAT_MS = 10000;
+const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const VSCODE_LM_MAX_AGENT_TURNS = 24;
+const VSCODE_LM_PERMISSION_KEY = "aiworkhub.vscodeLmWorkerPermission.v1";
+const VSCODE_LM_REQUEST_ID_RE = /^[a-f0-9]{32}$/;
 
 // ── The exact, narrow, read-only MCP tool allowlist this extension may call.
 // Nothing else is ever sent as a tools/call `name`. See
@@ -1577,6 +1594,344 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 // this extension's extensionKind is "workspace". Never derived from the
 // selected repository, an editable install, or a fixed host path.
 let extensionRuntimeDir = null;
+let vscodeLmBridgeHost = null;
+
+function vscodeLmBridgeRoot() {
+  const override = String(process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT || "").trim();
+  return path.resolve(override || path.join(os.homedir(), ".aiworkhub", "vscode_lm_bridge"));
+}
+
+function atomicWriteOwnerJson(filePath, payload) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(filePath), 0o700); } catch (_err) { /* Windows/filesystem */ }
+  atomicWriteJson(filePath, payload);
+  try { fs.chmodSync(filePath, 0o600); } catch (_err) { /* Windows/filesystem */ }
+}
+
+function vscodeLmModelFields(model) {
+  return [model && model.id, model && model.family, model && model.name, model && model.vendor, model && model.version]
+    .filter((value) => typeof value === "string" && value.trim())
+    .map((value) => value.trim());
+}
+
+function isGlm52LanguageModel(model) {
+  return vscodeLmModelFields(model).some((value) => {
+    const normalized = value.toLowerCase().replace(/_/g, "-");
+    return normalized === VSCODE_LM_MODEL || normalized.includes(VSCODE_LM_MODEL);
+  });
+}
+
+function selectGlm52LanguageModel(models) {
+  const matches = (Array.isArray(models) ? models : []).filter(isGlm52LanguageModel);
+  return matches.sort((left, right) => {
+    const leftExact = vscodeLmModelFields(left).some((value) => value.toLowerCase() === VSCODE_LM_MODEL) ? 0 : 1;
+    const rightExact = vscodeLmModelFields(right).some((value) => value.toLowerCase() === VSCODE_LM_MODEL) ? 0 : 1;
+    return leftExact - rightExact || String(left.id || "").localeCompare(String(right.id || ""));
+  })[0] || null;
+}
+
+function ownerOnlyRegularFile(filePath, maxBytes = VSCODE_LM_MAX_REQUEST_BYTES) {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) return false;
+    if (process.platform !== "win32") {
+      if ((stat.mode & 0o077) !== 0) return false;
+      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
+    }
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function validateVscodeLmRequest(payload, repoInfo) {
+  if (!payload || typeof payload !== "object" || payload.schema_id !== VSCODE_LM_REQUEST_SCHEMA) {
+    throw new Error("vscode_lm_request_schema_mismatch");
+  }
+  const requestId = String(payload.request_id || "");
+  if (!VSCODE_LM_REQUEST_ID_RE.test(requestId)) throw new Error("vscode_lm_request_id_invalid");
+  if (!repoInfo || payload.repo_id !== repoInfo.repoId) throw new Error("vscode_lm_repo_id_mismatch");
+  if (canonicalRepositoryRoot(String(payload.repo_root || "")) !== canonicalRepositoryRoot(repoInfo.root)) {
+    throw new Error("vscode_lm_repo_root_mismatch");
+  }
+  if (String(payload.model || "").toLowerCase() !== VSCODE_LM_MODEL) {
+    throw new Error("vscode_lm_model_mismatch");
+  }
+  if (typeof payload.prompt !== "string" || !payload.prompt.trim()) throw new Error("vscode_lm_prompt_missing");
+  const workspacePath = path.resolve(String(payload.workspace_path || ""));
+  const workspaceHome = path.resolve(String(payload.workspace_home || ""));
+  const responsePath = path.resolve(String(payload.response_path || ""));
+  if (path.basename(workspacePath) !== "worktree" || path.basename(workspaceHome) !== "home") {
+    throw new Error("vscode_lm_workspace_shape_invalid");
+  }
+  if (path.dirname(workspacePath) !== path.dirname(workspaceHome) || path.basename(path.dirname(workspacePath)) !== requestId) {
+    throw new Error("vscode_lm_workspace_request_mismatch");
+  }
+  if (responsePath !== path.join(workspaceHome, ".aiworkhub_vscode_lm_response.json")) {
+    throw new Error("vscode_lm_response_path_invalid");
+  }
+  const allowedWrites = payload.allowed_writes;
+  if (!Array.isArray(allowedWrites) || allowedWrites.some((value) => typeof value !== "string" || value.length > 512)) {
+    throw new Error("vscode_lm_allowed_writes_invalid");
+  }
+  const deadline = Date.parse(String(payload.deadline || ""));
+  if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
+  return { ...payload, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
+}
+
+const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
+  {
+    name: "aiworkhub_manager_source_graph_query",
+    description: "Mandatory repository-bound Source Graph query. Use instead of grep, rg, find, tree, or broad file reads.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["mode", "query"],
+      properties: {
+        mode: { type: "string", enum: ["focus", "slice", "bundle"] },
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        budget: { type: "integer", minimum: 8, maximum: 160 },
+        target: { type: ["string", "null"], maxLength: 256 },
+        bundle_type: { type: "string", enum: ["bugfix", "feature", "refactor", "audit", "optimize", "explore"] },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_manager_session_current_state",
+    description: "Recover bounded current project session state before non-trivial assumptions.",
+    inputSchema: { type: "object", additionalProperties: false, properties: { topic: { type: "string", maxLength: 128 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
+    name: "aiworkhub_manager_ai_memory_search",
+    description: "Search durable repository AI Memory for task-specific decisions and lessons.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
+    name: "aiworkhub_manager_kb_search",
+    description: "Search authoritative repository knowledge-base contracts and documentation.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
+    name: "aiworkhub_manager_kb_get",
+    description: "Fetch one exact authoritative KB entry after search.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
+  },
+  {
+    name: "aiworkhub_manager_kb_related",
+    description: "Fetch bounded related authoritative KB entries.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
+  },
+]);
+
+function languageModelTextPart(value) {
+  return typeof vscode.LanguageModelTextPart === "function" ? new vscode.LanguageModelTextPart(String(value)) : { value: String(value) };
+}
+
+function languageModelToolResultPart(callId, value) {
+  const content = [languageModelTextPart(JSON.stringify(value))];
+  return new vscode.LanguageModelToolResultPart(callId, content);
+}
+
+function isLanguageModelToolCallPart(part) {
+  return Boolean(part && typeof part.callId === "string" && typeof part.name === "string" && part.input && typeof part.input === "object");
+}
+
+async function invokeVscodeLmPrivateTool(call) {
+  const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === call.name);
+  if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(call.name || "")}`);
+  if (!mcpClient || !activeRepoIdentity) throw new Error("vscode_lm_mcp_unavailable");
+  if (mcpClient.repositoryRoot !== activeRepoIdentity.root) throw new Error("vscode_lm_mcp_repo_mismatch");
+  return mcpClient.callTool(permitted.name, call.input || {});
+}
+
+function glmAgentProtocolPrompt(prompt, allowedWrites) {
+  return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
+    `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
+    `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
+    `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}.\n` +
+    `- files must contain complete UTF-8 content and paths must match allowed_writes.\n` +
+    `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
+    `Required shape: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","files":[{"path":"repo/relative","content":"complete content"}]}`;
+}
+
+async function runVscodeLmAgent(model, request, cancellationToken) {
+  if (!model || !model.capabilities || !model.capabilities.toolCalling) {
+    throw new Error("vscode_lm_tool_calling_unavailable");
+  }
+  const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites))];
+  let sourceGraphAcknowledged = false;
+  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
+    const options = {
+      justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
+      tools: availableTools,
+      toolMode: sourceGraphAcknowledged ? vscode.LanguageModelChatToolMode.Auto : vscode.LanguageModelChatToolMode.Required,
+    };
+    const response = await model.sendRequest(messages, options, cancellationToken);
+    const assistantParts = [];
+    const textParts = [];
+    const calls = [];
+    for await (const part of response.stream) {
+      assistantParts.push(part);
+      if (isLanguageModelToolCallPart(part)) calls.push(part);
+      else if (part && typeof part.value === "string") textParts.push(part.value);
+      else if (typeof part === "string") textParts.push(part);
+    }
+    if (calls.length === 0) {
+      if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
+      const text = textParts.join("").trim();
+      if (!text) throw new Error("vscode_lm_empty_response");
+      return text;
+    }
+    messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+    const results = [];
+    for (const call of calls) {
+      let result;
+      try {
+        result = await invokeVscodeLmPrivateTool(call);
+      } catch (err) {
+        result = { ok: false, error: sanitizeErrorMessage(err) };
+      }
+      if (call.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
+        sourceGraphAcknowledged = true;
+      }
+      results.push(languageModelToolResultPart(call.callId, result));
+    }
+    messages.push(vscode.LanguageModelChatMessage.User(results));
+  }
+  throw new Error("vscode_lm_agent_turn_limit");
+}
+
+class VscodeLmBridgeHost {
+  constructor(context) {
+    this.context = context;
+    this.repoInfo = null;
+    this.pollTimer = null;
+    this.heartbeatTimer = null;
+    this.processing = false;
+    this.permissionPrompt = null;
+    this.disposed = false;
+  }
+
+  async start(repoInfo) {
+    this.stop();
+    if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) return;
+    this.repoInfo = { ...repoInfo };
+    await this.publishHeartbeat();
+    this.pollTimer = setInterval(() => this.poll().catch((err) => recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`)), VSCODE_LM_POLL_MS);
+    this.heartbeatTimer = setInterval(() => this.publishHeartbeat().catch(() => {}), VSCODE_LM_HEARTBEAT_MS);
+    if (this.pollTimer && typeof this.pollTimer.unref === "function") this.pollTimer.unref();
+    if (this.heartbeatTimer && typeof this.heartbeatTimer.unref === "function") this.heartbeatTimer.unref();
+  }
+
+  stop() {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.pollTimer = null;
+    this.heartbeatTimer = null;
+    if (this.repoInfo && REAL_REPO_ID_RE.test(String(this.repoInfo.repoId || ""))) {
+      const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
+      try { fs.unlinkSync(hostPath); } catch (_err) { /* absent */ }
+    }
+    this.repoInfo = null;
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.stop();
+  }
+
+  async models() {
+    if (!vscode.lm || typeof vscode.lm.selectChatModels !== "function") return [];
+    return vscode.lm.selectChatModels();
+  }
+
+  async publishHeartbeat() {
+    if (!this.repoInfo || this.disposed) return;
+    const model = selectGlm52LanguageModel(await this.models());
+    const globalState = this.context && this.context.globalState;
+    const permissionGranted = Boolean(
+      globalState && typeof globalState.get === "function"
+        ? globalState.get(VSCODE_LM_PERMISSION_KEY, false)
+        : false,
+    );
+    const payload = {
+      schema_id: VSCODE_LM_HOST_SCHEMA,
+      repo_id: this.repoInfo.repoId,
+      window_id: WINDOW_SCOPE_ID,
+      extension_host_pid: process.pid,
+      models: model ? [VSCODE_LM_MODEL] : [],
+      model_metadata: model ? { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version, maxInputTokens: model.maxInputTokens } : null,
+      permission_granted: permissionGranted,
+      updated_at: new Date().toISOString(),
+    };
+    const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
+    atomicWriteOwnerJson(hostPath, payload);
+  }
+
+  async ensurePermission() {
+    const globalState = this.context && this.context.globalState;
+    if (globalState && typeof globalState.get === "function" && globalState.get(VSCODE_LM_PERMISSION_KEY, false)) return true;
+    if (!this.permissionPrompt) {
+      this.permissionPrompt = vscode.window.showInformationMessage(
+        "AIWorkHub has a queued GLM‑5.2 worker task. Allow it to use the GLM model already authorized in VS Code?",
+        "Allow GLM workers",
+      ).then(async (choice) => {
+        const granted = choice === "Allow GLM workers";
+        if (granted && globalState && typeof globalState.update === "function") {
+          await globalState.update(VSCODE_LM_PERMISSION_KEY, true);
+        }
+        return granted;
+      }).finally(() => { this.permissionPrompt = null; });
+    }
+    return this.permissionPrompt;
+  }
+
+  async poll() {
+    if (this.processing || !this.repoInfo || this.disposed) return;
+    const requestDir = path.join(vscodeLmBridgeRoot(), "requests", this.repoInfo.repoId);
+    let names;
+    try { names = fs.readdirSync(requestDir).filter((name) => VSCODE_LM_REQUEST_ID_RE.test(path.basename(name, ".json")) && name.endsWith(".json")).sort(); }
+    catch (_err) { return; }
+    if (!names.length) return;
+    this.processing = true;
+    let claimPath = null;
+    try {
+      const requestPath = path.join(requestDir, names[0]);
+      claimPath = `${requestPath}.claim-${WINDOW_SCOPE_ID}`;
+      try { fs.renameSync(requestPath, claimPath); } catch (_err) { return; }
+      if (!ownerOnlyRegularFile(claimPath)) throw new Error("vscode_lm_request_not_owner_only");
+      const payload = JSON.parse(fs.readFileSync(claimPath, "utf8"));
+      const request = validateVscodeLmRequest(payload, this.repoInfo);
+      const models = await this.models();
+      const model = selectGlm52LanguageModel(models);
+      if (!model) throw new Error("vscode_lm_model_not_visible");
+      if (!(await this.ensurePermission())) throw new Error("vscode_lm_permission_denied");
+      const source = new vscode.CancellationTokenSource();
+      const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
+      const timer = setTimeout(() => source.cancel(), remainingMs);
+      let text = "";
+      let error = "";
+      try { text = await runVscodeLmAgent(model, request, source.token); }
+      catch (err) { error = sanitizeErrorMessage(err); }
+      finally { clearTimeout(timer); source.dispose(); }
+      atomicWriteOwnerJson(request.responsePath, {
+        schema_id: VSCODE_LM_RESPONSE_SCHEMA,
+        request_id: request.requestId,
+        repo_id: this.repoInfo.repoId,
+        model: { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version },
+        text,
+        error,
+        completed_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`);
+    } finally {
+      if (claimPath) { try { fs.unlinkSync(claimPath); } catch (_err) { /* absent */ } }
+      this.processing = false;
+    }
+  }
+}
 const SYSTEM_LOG_MAX_ENTRIES = 1200;
 const SYSTEM_LOG_MAX_LINE_CHARS = 800;
 const SYSTEM_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -2862,6 +3217,13 @@ async function pushInitializeStorage(view) {
       });
       return;
     }
+    const refreshedRepo = getActiveRepositoryRoot(extensionContext);
+    activeRepoLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], refreshedRepo.uriStr);
+    activeRepoIdentity = { ...refreshedRepo, label: activeRepoLabel };
+    refreshCoordinatorRouteOwnership(activeRepoIdentity);
+    if (vscodeLmBridgeHost) {
+      await vscodeLmBridgeHost.start(activeRepoIdentity);
+    }
     if (view.stillBoundTo(client)) {
       pushRepositoryInfo(view, activeRepoIdentity);
       await pushSnapshot(view);
@@ -3018,6 +3380,12 @@ function getHtmlForWebview(webview, extensionUri) {
       <strong id="header-storage-managed">Calculating</strong>
       <span id="header-storage-free">Free —</span>
     </button>
+
+    <div class="header-tool-use" id="header-source-graph" title="Authenticated Source Graph use across the latest observed worker task runs">
+      <span class="header-storage-label">Source Graph</span>
+      <strong id="header-source-graph-rate">—</strong>
+      <span id="header-source-graph-detail">No evidence</span>
+    </div>
 
     <div class="header-actions">
       <div class="connection-state" id="connection-state" role="status" aria-live="polite">
@@ -3244,6 +3612,7 @@ function getHtmlForWebview(webview, extensionUri) {
               <button type="button" role="tab" aria-selected="true" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runners" id="tab-runners" data-tab="runners">Runners</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-usage" id="tab-usage" data-tab="usage">Usage</button>
+              <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-tool-use" id="tab-tool-use" data-tab="tool-use">Tool Use</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-storage" id="tab-storage" data-tab="storage">Storage</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-returns" id="tab-returns" data-tab="returns">Returns</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runs" id="tab-runs" data-tab="runs">Runs</button>
@@ -3259,6 +3628,9 @@ function getHtmlForWebview(webview, extensionUri) {
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" hidden>
             <div class="stat-list" id="usage-list"></div>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-tool-use" aria-labelledby="tab-tool-use" hidden>
+            <div class="stat-list" id="tool-use-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden>
             <div class="stat-list" id="storage-list"></div>
@@ -3607,6 +3979,9 @@ async function selectRepositoryCommand() {
   // window's own route record for the repository being left -- another
   // window still bound to that repository keeps its own file untouched.
   const previousRepoIdentity = activeRepoIdentity;
+  if (vscodeLmBridgeHost) {
+    vscodeLmBridgeHost.stop();
+  }
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
@@ -3621,6 +3996,9 @@ async function selectRepositoryCommand() {
   const selectedRepo = getActiveRepositoryRoot(ctx);
   activeRepoIdentity = { ...selectedRepo, label: activeRepoLabel };
   bindSystemLogRepository(selectedRepo.root);
+  if (vscodeLmBridgeHost) {
+    await vscodeLmBridgeHost.start(activeRepoIdentity);
+  }
 
   // Start the new client and refresh.
   try {
@@ -3649,6 +4027,8 @@ async function activate(context) {
   extensionContext = context;
   outputChannel = createManagedOutputChannel();
   context.subscriptions.push(outputChannel);
+  vscodeLmBridgeHost = new VscodeLmBridgeHost(context);
+  context.subscriptions.push(vscodeLmBridgeHost);
 
   // Bootstrap the callback topology first.  Nothing expensive may precede
   // these operations: OpenAI's onStartupFinished activation runs concurrently
@@ -3684,6 +4064,10 @@ async function activate(context) {
   migrateCodexConfigTomlRuntimePath(context);
   ensureCodexManagerGatesRepaired();
   ensureWorkspaceMcpConfigsRepaired(context);
+
+  if (activeRepoIdentity && activeRepoIdentity.root) {
+    await vscodeLmBridgeHost.start(activeRepoIdentity);
+  }
 
   // Sidebar view provider (uses legacy view ID for backward compatibility).
   context.subscriptions.push(
@@ -3738,16 +4122,17 @@ async function activate(context) {
 async function deactivate() {
   stopWindowRouteRenewalTimer();
   stopStartupRouteConvergence();
-  flushSystemLogs();
+  if (vscodeLmBridgeHost) {
+    vscodeLmBridgeHost.dispose();
+    vscodeLmBridgeHost = null;
+  }
   if (mcpClient) {
     const oldClient = mcpClient;
     mcpClient = null;
-    // B865: stop the dispatcher before the child dies -- extension host
-    // teardown (deactivate on reload/uninstall/window close) is exactly the
-    // path that previously let a nested app-server subprocess survive as an
-    // orphan (see stopDispatcherThenTerminate).
+    // Stop dispatcher before child termination to prevent reload orphans.
     await oldClient.stopDispatcherThenTerminate({ restart: false });
   }
+  flushSystemLogs();
   // Remove ONLY this window's own route record -- never another window's.
   removeWindowRouteRecord(activeRepoIdentity);
   activeRepoIdentity = null;
@@ -3807,6 +4192,14 @@ module.exports = {
     appServerMuxInstancesDir,
     readMuxInstanceDescriptor,
     findVerifiedMuxThreadId,
+    VscodeLmBridgeHost,
+    vscodeLmBridgeRoot,
+    vscodeLmModelFields,
+    isGlm52LanguageModel,
+    selectGlm52LanguageModel,
+    validateVscodeLmRequest,
+    runVscodeLmAgent,
+    VSCODE_LM_PRIVATE_TOOLS,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
@@ -3818,6 +4211,10 @@ module.exports = {
       STARTUP_ROUTE_CONVERGENCE_MAX_ATTEMPTS,
       APP_SERVER_MUX_SIDEBAND_DIR_ENV,
       REAL_THREAD_ID_RE,
+      VSCODE_LM_MODEL,
+      VSCODE_LM_REQUEST_SCHEMA,
+      VSCODE_LM_HOST_SCHEMA,
+      VSCODE_LM_RESPONSE_SCHEMA,
     },
   },
 };

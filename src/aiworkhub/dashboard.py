@@ -76,7 +76,13 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     context = event.get("project_context")
     delivery = event.get("project_context_delivery")
     ack = event.get("project_context_acknowledgement")
-    if not isinstance(context, Mapping) and not isinstance(delivery, Mapping) and not isinstance(ack, Mapping):
+    gate = event.get("worker_mcp_gate")
+    if (
+        not isinstance(context, Mapping)
+        and not isinstance(delivery, Mapping)
+        and not isinstance(ack, Mapping)
+        and not isinstance(gate, Mapping)
+    ):
         return {}
 
     by_name: dict[str, dict[str, Any]] = {}
@@ -107,6 +113,37 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
                 "delta_bytes": int(raw_estimate.get("delta_bytes") or 0),
             }
 
+    tool_use: dict[str, Any] = {}
+    if isinstance(gate, Mapping):
+        verification = gate.get("verification")
+        if not isinstance(verification, Mapping):
+            verification = {}
+        calls = verification.get("call_count_by_tool")
+        successful = verification.get("successful_call_count_by_tool")
+        bytes_by_tool = verification.get("bounded_bytes_by_tool")
+        cache_by_tool = verification.get("cache_hits_by_tool")
+        satisfaction = gate.get("satisfaction_by_tool")
+        tool_use = {
+            "gated": bool(gate.get("gated")),
+            "satisfied": bool(gate.get("satisfied", True)),
+            "reason": str(gate.get("reason") or "")[:240],
+            "source_graph_satisfaction": str(
+                satisfaction.get("source_graph") if isinstance(satisfaction, Mapping) else ""
+            )[:80],
+            "source_graph_calls": int(calls.get("source_graph") or 0)
+            if isinstance(calls, Mapping) else 0,
+            "source_graph_successful_calls": int(successful.get("source_graph") or 0)
+            if isinstance(successful, Mapping) else 0,
+            "source_graph_live_calls": int(verification.get("live_source_graph_calls") or 0),
+            "source_graph_bytes": int(bytes_by_tool.get("source_graph") or 0)
+            if isinstance(bytes_by_tool, Mapping) else 0,
+            "source_graph_cache_hits": int(cache_by_tool.get("source_graph") or 0)
+            if isinstance(cache_by_tool, Mapping) else 0,
+            "policy_violations": int(verification.get("policy_violations") or 0),
+            "entries_verified": int(verification.get("entries_verified") or 0),
+            "entries_tampered": int(verification.get("entries_tampered") or 0),
+        }
+
     return {
         "source_graph": by_name.get("source_graph", {}),
         "session_current_state": by_name.get("session_current_state", {}),
@@ -130,7 +167,114 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "reason": str(ack.get("reason") or "")[:160] if isinstance(ack, Mapping) else "",
         },
         "estimate": estimate,
+        "tool_use": tool_use,
     }
+
+
+def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate authenticated worker Source Graph evidence by latest task run.
+
+    One task is counted once even when it was retried.  ``live`` means a fresh,
+    non-empty, non-cached worker call verified by the HMAC ledger.  An injected
+    receipt is intentionally reported separately: it proves context delivery,
+    not continued Source Graph use during execution.
+    """
+    latest_by_task: dict[str, Mapping[str, Any]] = {}
+    for row in process_report.get("processes") or []:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = str(row.get("task_id") or "").strip()
+        if task_id and task_id not in latest_by_task:
+            latest_by_task[task_id] = row
+
+    totals: dict[str, Any] = {
+        "schema_id": "aiworkhub.source_graph.telemetry.v1",
+        "observed_tasks": len(latest_by_task),
+        "gated_tasks": 0,
+        "satisfied_tasks": 0,
+        "source_graph_any_tasks": 0,
+        "source_graph_live_tasks": 0,
+        "source_graph_injected_only_tasks": 0,
+        "source_graph_stale_or_cached_tasks": 0,
+        "source_graph_missing_tasks": 0,
+        "source_graph_calls": 0,
+        "source_graph_live_calls": 0,
+        "source_graph_bytes": 0,
+        "source_graph_cache_hits": 0,
+        "policy_violation_tasks": 0,
+        "policy_violations": 0,
+        "tampered_ledger_tasks": 0,
+        "live_rate": 0.0,
+        "any_rate": 0.0,
+        "gate_satisfaction_rate": 0.0,
+        "by_adapter": {},
+    }
+
+    def bucket_for(adapter: str) -> dict[str, int]:
+        buckets = totals["by_adapter"]
+        if adapter not in buckets:
+            buckets[adapter] = {
+                "gated_tasks": 0,
+                "live_tasks": 0,
+                "injected_only_tasks": 0,
+                "missing_or_stale_tasks": 0,
+                "source_graph_calls": 0,
+                "policy_violations": 0,
+            }
+        return buckets[adapter]
+
+    for row in latest_by_task.values():
+        infra = row.get("ai_infra_context")
+        tool_use = infra.get("tool_use") if isinstance(infra, Mapping) else None
+        if not isinstance(tool_use, Mapping) or not tool_use.get("gated"):
+            continue
+        totals["gated_tasks"] += 1
+        adapter = str(row.get("adapter_id") or "unknown")[:120]
+        bucket = bucket_for(adapter)
+        bucket["gated_tasks"] += 1
+        if tool_use.get("satisfied"):
+            totals["satisfied_tasks"] += 1
+
+        calls = int(tool_use.get("source_graph_calls") or 0)
+        live_calls = int(tool_use.get("source_graph_live_calls") or 0)
+        source_bytes = int(tool_use.get("source_graph_bytes") or 0)
+        cache_hits = int(tool_use.get("source_graph_cache_hits") or 0)
+        violations = int(tool_use.get("policy_violations") or 0)
+        satisfaction = str(tool_use.get("source_graph_satisfaction") or "")
+        totals["source_graph_calls"] += calls
+        totals["source_graph_live_calls"] += live_calls
+        totals["source_graph_bytes"] += source_bytes
+        totals["source_graph_cache_hits"] += cache_hits
+        totals["policy_violations"] += violations
+        bucket["source_graph_calls"] += calls
+        bucket["policy_violations"] += violations
+        if violations:
+            totals["policy_violation_tasks"] += 1
+        if int(tool_use.get("entries_tampered") or 0):
+            totals["tampered_ledger_tasks"] += 1
+
+        if live_calls > 0:
+            totals["source_graph_any_tasks"] += 1
+            totals["source_graph_live_tasks"] += 1
+            bucket["live_tasks"] += 1
+        elif satisfaction == "injected_receipt":
+            totals["source_graph_any_tasks"] += 1
+            totals["source_graph_injected_only_tasks"] += 1
+            bucket["injected_only_tasks"] += 1
+        elif satisfaction == "stale_or_cached" or calls > 0:
+            totals["source_graph_any_tasks"] += 1
+            totals["source_graph_stale_or_cached_tasks"] += 1
+            bucket["missing_or_stale_tasks"] += 1
+        else:
+            totals["source_graph_missing_tasks"] += 1
+            bucket["missing_or_stale_tasks"] += 1
+
+    denominator = totals["gated_tasks"]
+    if denominator:
+        totals["live_rate"] = round(100.0 * totals["source_graph_live_tasks"] / denominator, 1)
+        totals["any_rate"] = round(100.0 * totals["source_graph_any_tasks"] / denominator, 1)
+        totals["gate_satisfaction_rate"] = round(100.0 * totals["satisfied_tasks"] / denominator, 1)
+    return totals
 
 
 class DashboardReadError(RuntimeError):
@@ -720,6 +864,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "collision_report": {},
             "agent_processes": {},
             "adapter_readiness": {},
+            "source_graph_telemetry": _source_graph_telemetry({}),
             "callback_bridge_health": {},
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
@@ -943,6 +1088,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "collision_report": dict(collision_report),
         "agent_processes": dict(process_report),
         "adapter_readiness": dict(adapter_readiness),
+        "source_graph_telemetry": _source_graph_telemetry(process_report),
         "callback_bridge_health": dict(callback_bridge_health),
         "warnings": {
             "stale": stale_tasks,
@@ -975,6 +1121,27 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
     # Surface archived_at from the card so the dashboard knows at a glance
     archived_at = str(card.get("archived_at") or "").strip()
     result["task"]["archived_at"] = archived_at
+    terminal_review = card.get("terminal_review")
+    if isinstance(terminal_review, Mapping):
+        evidence = terminal_review.get("evidence")
+        quality = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
+        if isinstance(quality, Mapping):
+            result["task"]["quality_gate"] = {
+                "schema_id": str(quality.get("schema_id") or "")[:100],
+                "passed": bool(quality.get("passed")),
+                "blocking_checks": [str(v)[:200] for v in (quality.get("blocking_checks") or [])[:40]],
+                "config_error": str(quality.get("config_error") or "")[:500],
+                "checks": [
+                    {
+                        "check_id": str(item.get("check_id") or "")[:200],
+                        "kind": str(item.get("kind") or "")[:80],
+                        "status": str(item.get("status") or "")[:80],
+                        "summary": str(item.get("summary") or "")[:500],
+                    }
+                    for item in (quality.get("checks") or [])[:80]
+                    if isinstance(item, Mapping)
+                ],
+            }
     process_reader = getattr(
         data_provider,
         "get_agent_processes",

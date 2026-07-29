@@ -342,15 +342,18 @@ def test_glm_release_eval_json_is_valid() -> None:
 
 
 def test_extension_js_has_no_model_diagnostics_or_glm_canary_surface() -> None:
-    """B880: the Model capabilities / GLM canary diagnostics surface has been
-    removed entirely -- no inbound messages, handlers, or vscode.lm usage."""
+    """B880: the obsolete dashboard diagnostics/canary UI stays removed.
+
+    The production GLM worker bridge intentionally uses ``vscode.lm`` in the
+    extension host because editor-contributed custom models are unavailable to
+    the standalone Copilot CLI.  That is runtime orchestration, not a canary UI.
+    """
     ext_path = _TOOL_ROOT / "vscode-extension" / "extension.js"
     ext = ext_path.read_text(encoding="utf-8")
     for forbidden in (
         "runGlmCanary",
         "refreshModelCapabilities",
         "cancelGlmCanary",
-        "vscode.lm.selectChatModels",
         "GLM_CANARY_FIXED_PROMPT",
         "MODEL_CAPABILITY_STATES",
     ):

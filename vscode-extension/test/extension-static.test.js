@@ -181,7 +181,7 @@ assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must ne
 }
 
 const deactivateMarker = "async function deactivate()";
-const deactivateBody = ext.slice(ext.indexOf(deactivateMarker), ext.indexOf(deactivateMarker) + 500);
+const deactivateBody = ext.slice(ext.indexOf(deactivateMarker), ext.indexOf(deactivateMarker) + 1200);
 assert.ok(deactivateBody.includes("stopDispatcherThenTerminate"));
 
 assert.ok(ext.includes("defaultCoordinatorTargets"));
