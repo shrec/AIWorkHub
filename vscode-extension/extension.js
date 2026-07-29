@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.4";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.5";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -76,7 +76,7 @@ const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v1";
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
-const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"]);
+const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "claude-sonnet-4.6"]);
 const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
@@ -1639,6 +1639,14 @@ function vscodeLmModelFields(model) {
     .map((value) => value.trim());
 }
 
+function isCallableVscodeLmProvider(model) {
+  // `copilotcli` contributes internal agent/picker entries to model
+  // discovery, but those entries return empty streams when invoked through
+  // the public VS Code Language Model API. The public Copilot provider uses
+  // vendor=`copilot`; custom endpoints such as GLM use their own vendor.
+  return normalizedVscodeLmModelName(model && model.vendor) !== "copilotcli";
+}
+
 function normalizedVscodeLmModelName(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
@@ -1686,6 +1694,13 @@ function vscodeLmAccessState(model) {
     // produce the authoritative sendRequest error.
   }
   return "unknown";
+}
+
+function vscodeLmPermissionStorageKey(model) {
+  const identity = [model && model.vendor, model && model.id, model && model.family]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .join("\u0000");
+  return `aiworkhub.vscodeLmWorkerPermission.v2.${crypto.createHash("sha256").update(identity).digest("hex").slice(0, 24)}`;
 }
 
 function isGlm52LanguageModel(model) { return isVscodeLanguageModel(model, VSCODE_LM_MODEL); }
@@ -2343,7 +2358,26 @@ class VscodeLmBridgeHost {
 
   async models() {
     if (!vscode.lm || typeof vscode.lm.selectChatModels !== "function") return [];
-    return vscode.lm.selectChatModels();
+    const models = await vscode.lm.selectChatModels();
+    return models.filter(isCallableVscodeLmProvider);
+  }
+
+  modelAccessState(model) {
+    const nativeState = vscodeLmAccessState(model);
+    if (nativeState !== "unknown") return nativeState;
+    const globalState = this.context && this.context.globalState;
+    if (globalState && typeof globalState.get === "function" &&
+        globalState.get(vscodeLmPermissionStorageKey(model), false)) {
+      return "granted_remembered";
+    }
+    return "unknown";
+  }
+
+  async rememberModelPermission(model) {
+    const globalState = this.context && this.context.globalState;
+    if (globalState && typeof globalState.update === "function") {
+      await globalState.update(vscodeLmPermissionStorageKey(model), true);
+    }
   }
 
   async publishHeartbeat() {
@@ -2365,7 +2399,7 @@ class VscodeLmBridgeHost {
         vendor: model.vendor,
         version: model.version,
         maxInputTokens: model.maxInputTokens,
-        access_state: vscodeLmAccessState(model),
+        access_state: this.modelAccessState(model),
       };
     });
     const payload = {
@@ -2375,7 +2409,7 @@ class VscodeLmBridgeHost {
       extension_host_pid: process.pid,
       models: visibleModels,
       model_metadata: modelMetadata,
-      permission_granted: modelMetadata.some((entry) => entry.access_state === "granted"),
+      permission_granted: modelMetadata.some((entry) => entry.access_state.startsWith("granted")),
       updated_at: new Date().toISOString(),
     };
     const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
@@ -2383,11 +2417,12 @@ class VscodeLmBridgeHost {
   }
 
   async ensurePermission(model) {
-    if (vscodeLmAccessState(model) === "granted") return true;
+    if (this.modelAccessState(model).startsWith("granted")) return true;
     if (!this.permissionPrompt) {
       const label = String((model && (model.name || model.family || model.id)) || "the selected model");
       this.permissionPrompt = vscode.window.showInformationMessage(
         `AIWorkHub has a queued worker task for ${label}. Allow this VS Code model?`,
+        { modal: true, detail: "Permission is scoped to this exact VS Code model and is remembered only after a successful non-empty response." },
         "Allow VS Code models",
       ).then(async (choice) => {
         return choice === "Allow VS Code models";
@@ -2422,7 +2457,10 @@ class VscodeLmBridgeHost {
       let text = "";
       let error = "";
       let diagnostics = null;
-      try { text = await runVscodeLmAgent(model, request, source.token); }
+      try {
+        text = await runVscodeLmAgent(model, request, source.token);
+        if (text) await this.rememberModelPermission(model);
+      }
       catch (err) {
         error = sanitizeErrorMessage(err);
         diagnostics = {
@@ -5047,11 +5085,13 @@ module.exports = {
     VscodeLmBridgeHost,
     vscodeLmBridgeRoot,
     vscodeLmModelFields,
+    isCallableVscodeLmProvider,
     isGlm52LanguageModel,
     selectGlm52LanguageModel,
     isVscodeLanguageModel,
     selectVscodeLanguageModel,
     vscodeLmAccessState,
+    vscodeLmPermissionStorageKey,
     validateVscodeLmRequest,
     runVscodeLmAgent,
     runVscodeLmTextProtocol,
