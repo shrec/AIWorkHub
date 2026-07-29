@@ -94,7 +94,15 @@ def run(spec_path: Path) -> dict[str, Any]:
     if response.get("request_id") != spec.get("request_id"):
         raise RuntimeError("vscode_lm_response_identity_mismatch")
     if response.get("error"):
-        raise RuntimeError(f"vscode_lm_request_failed:{response.get('error')}")
+        diagnostics = response.get("diagnostics")
+        detail = ""
+        if isinstance(diagnostics, dict):
+            bounded = {
+                "protocol_preview": str(diagnostics.get("protocol_preview") or "")[:768],
+                "turn_trace": list(diagnostics.get("turn_trace") or [])[-16:],
+            }
+            detail = f":diagnostics={json.dumps(bounded, ensure_ascii=True, separators=(',', ':'))[:2048]}"
+        raise RuntimeError(f"vscode_lm_request_failed:{response.get('error')}{detail}")
     raw_text = str(response.get("text") or "")
     try:
         edit = json.loads(_strip_fence(raw_text))

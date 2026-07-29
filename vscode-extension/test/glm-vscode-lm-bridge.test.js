@@ -204,6 +204,25 @@ async function textProtocolChecks() {
     async () => ({ ok: true, content: "graph" }),
   );
   assert.strictEqual(correctedResult, finalResponse);
+
+  const invalidThenFinal = ["I should inspect the project first.", finalResponse];
+  const recoveringTextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: invalidThenFinal.shift() }; }()),
+    }),
+  };
+  const recoveredTextResult = await internals.runVscodeLmTextProtocol(
+    recoveringTextModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model" },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(recoveredTextResult, finalResponse);
 }
 
 async function nativeProtocolChecks() {
@@ -262,8 +281,38 @@ async function nativeProtocolChecks() {
     async () => ({ ok: true, content: "graph" }),
   );
   assert.strictEqual(forcedFinal, finalResponse);
-  assert.strictEqual(boundedTurns, 17);
-  assert.ok(!Object.prototype.hasOwnProperty.call(boundedOptions[16], "tools"));
+  assert.strictEqual(boundedTurns, 14);
+  assert.ok(!Object.prototype.hasOwnProperty.call(boundedOptions[13], "tools"));
+
+  let emptyTurns = 0;
+  const emptyOptions = [];
+  const emptyLoopModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      emptyOptions.push(options);
+      emptyTurns += 1;
+      if (emptyTurns === 1) {
+        return {
+          stream: (async function* stream() {
+            yield { callId: "source", name: "aiworkhub_manager_source_graph_query", input: { mode: "focus", query: "model" } };
+          }()),
+        };
+      }
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      return { stream: (async function* stream() {})() };
+    },
+  };
+  const emptyForcedFinal = await internals.runVscodeLmAgent(
+    emptyLoopModel,
+    { requestId: "c".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(emptyForcedFinal, finalResponse);
+  assert.strictEqual(emptyTurns, 14);
+  assert.ok(!Object.prototype.hasOwnProperty.call(emptyOptions[13], "tools"));
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));

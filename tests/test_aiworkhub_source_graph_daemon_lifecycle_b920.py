@@ -24,7 +24,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, repository_bootstrap, source_graph, source_graph_daemon, task_store  # noqa: E402
+from aiworkhub import core, repository_bootstrap, server, source_graph, source_graph_daemon, task_store  # noqa: E402
 
 
 @pytest.fixture
@@ -156,6 +156,32 @@ def test_core_source_graph_ensure_started_then_stop(tmp_path, monkeypatch, clean
     assert stopped["ok"] is True
     assert stopped["stopped"] is True
     assert source_graph_daemon.get_daemon(root) is None
+
+
+def test_server_main_bootstraps_source_graph_before_stdio(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(core, "source_graph_ensure_started", lambda: calls.append("source_graph"))
+    monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
+
+    server.main()
+
+    assert calls == ["source_graph", "mcp"]
+
+
+def test_server_main_keeps_mcp_available_when_source_graph_bootstrap_fails(monkeypatch):
+    calls: list[str] = []
+
+    def fail_start():
+        calls.append("source_graph")
+        raise RuntimeError("indexer_failed")
+
+    monkeypatch.setattr(core, "source_graph_ensure_started", fail_start)
+    monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
+
+    server.main()
+
+    assert calls == ["source_graph", "mcp"]
 
 
 # ---------------------------------------------------------------------------

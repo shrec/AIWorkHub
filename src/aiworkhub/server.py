@@ -1255,6 +1255,18 @@ def aiworkhub_quality_evidence_packet(changed_paths: list[str] | None = None) ->
 
 
 def main() -> None:
+    # Every independently launched manager MCP child owns its repository's
+    # in-process Source Graph daemon.  Dashboard activation already calls the
+    # public ensure tool, but Codex/Claude/Copilot may start this stdio server
+    # without opening the dashboard.  Bootstrap the idempotent daemon here so
+    # a fresh/reloaded chat never observes a permanently empty/stopped graph.
+    # Uninitialized repositories remain a harmless no-op.
+    try:
+        core.source_graph_ensure_started()
+    except Exception:
+        # MCP must remain available so health/InitRepo can explain or repair
+        # indexing; startup indexing failure must not kill the whole server.
+        pass
     mcp.run()
 
 

@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.1";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.2";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -83,6 +83,8 @@ const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const VSCODE_LM_MAX_AGENT_TURNS = 24;
 const VSCODE_LM_MAX_TOOL_TURNS = 16;
+const VSCODE_LM_MAX_POST_SOURCE_TURNS = 12;
+const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
 const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
 const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_PERMISSION_KEY = "aiworkhub.vscodeLmWorkerPermission.v1";
@@ -2001,6 +2003,13 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
   return payload;
 }
 
+function vscodeLmProtocolFailure(code, trace, preview = "") {
+  const error = new Error(code);
+  error.protocolPreview = sanitizeStderrChunk(String(preview || "")).slice(0, 768);
+  error.protocolTrace = Array.isArray(trace) ? trace.slice(-16) : [];
+  return error;
+}
+
 async function runVscodeLmTextProtocol(
   model,
   request,
@@ -2025,7 +2034,26 @@ async function runVscodeLmTextProtocol(
         ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
         : ""),
   )];
+  let postSourceTurns = 0;
+  let finalizationTurns = 0;
+  let forceFinal = false;
+  const protocolTrace = [];
+  let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    if (sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
+      forceFinal = true;
+    }
+    if (forceFinal) {
+      if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+        throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+      }
+      finalizationTurns += 1;
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `The bounded tool/reasoning phase is complete. Do not request more tools. ` +
+        `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
+        `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+      ));
+    }
     const response = await model.sendRequest(messages, {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
     }, cancellationToken);
@@ -2035,16 +2063,36 @@ async function runVscodeLmTextProtocol(
     } catch (err) {
       if (String(err && err.message || err) !== "vscode_lm_empty_response") throw err;
       messages.push(vscode.LanguageModelChatMessage.User(
-        `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
-        `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+        forceFinal
+          ? `The previous provider turn contained no text. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
+          : `The previous provider turn contained no text. Retry without prose and output only the next strict ` +
+            `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+      ));
+      if (sourceGraphAcknowledged) postSourceTurns += 1;
+      protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
+      continue;
+    }
+    if (sourceGraphAcknowledged) postSourceTurns += 1;
+    let envelope;
+    try {
+      envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
+    } catch (err) {
+      lastProtocolPreview = String((err && err.protocolPreview) || text || "");
+      protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: sanitizeErrorMessage(err) });
+      messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        forceFinal
+          ? `The previous response was not valid final JSON. Output ONLY one ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
+          : `The previous response was not a supported transport envelope. Output ONLY one strict ` +
+            `${sourceGraphAcknowledged ? `${VSCODE_LM_EDIT_RESPONSE_SCHEMA} final object or allowlisted ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request` : `${VSCODE_LM_TOOL_REQUEST_SCHEMA} Source Graph request`} with no prose.`,
       ));
       continue;
     }
-    const envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
     if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
       if (finalError) {
+        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
           `The previous final envelope was rejected (${finalError}). ` +
@@ -2056,6 +2104,14 @@ async function runVscodeLmTextProtocol(
       // Always hand the Python worker a canonical JSON-only payload even when
       // the provider surrounded the envelope with prose or a Markdown fence.
       return JSON.stringify(envelope);
+    }
+    if (forceFinal) {
+      protocolTrace.push({ turn, phase: "final", outcome: "tool_request_rejected" });
+      messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `Tool requests are no longer accepted. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+      ));
+      continue;
     }
     if (envelope.schema_id !== VSCODE_LM_TOOL_REQUEST_SCHEMA) {
       throw new Error("vscode_lm_text_protocol_schema_mismatch");
@@ -2078,6 +2134,7 @@ async function runVscodeLmTextProtocol(
     if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
+    protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
       schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
@@ -2086,7 +2143,7 @@ async function runVscodeLmTextProtocol(
       instruction: "Output only the next strict tool-request JSON or final edit-response JSON object.",
     })));
   }
-  throw new Error("vscode_lm_agent_turn_limit");
+  throw vscodeLmProtocolFailure("vscode_lm_agent_turn_limit", protocolTrace, lastProtocolPreview);
 }
 
 async function runVscodeLmAgent(
@@ -2102,9 +2159,15 @@ async function runVscodeLmAgent(
   const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites))];
   let sourceGraphAcknowledged = false;
   let toolTurns = 0;
+  let postSourceTurns = 0;
+  let finalizationTurns = 0;
   let forceFinal = false;
+  const protocolTrace = [];
+  let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
-    if (sourceGraphAcknowledged && toolTurns >= VSCODE_LM_MAX_TOOL_TURNS && !forceFinal) {
+    if (sourceGraphAcknowledged &&
+        (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
+        !forceFinal) {
       forceFinal = true;
       messages.push(vscode.LanguageModelChatMessage.User(
         `The bounded tool phase is complete. Do not request more tools. ` +
@@ -2112,6 +2175,13 @@ async function runVscodeLmAgent(
         `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
       ));
     }
+    if (forceFinal) {
+      if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
+        throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
+      }
+      finalizationTurns += 1;
+    }
+    const startedWithSourceGraph = sourceGraphAcknowledged;
     const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
@@ -2130,10 +2200,12 @@ async function runVscodeLmAgent(
       else if (part && typeof part.value === "string") textParts.push(part.value);
       else if (typeof part === "string") textParts.push(part);
     }
+    if (startedWithSourceGraph) postSourceTurns += 1;
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const text = textParts.join("").trim();
       if (!text) {
+        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
         messages.push(vscode.LanguageModelChatMessage.User(
           `The previous provider turn contained neither a tool call nor text. ` +
           `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
@@ -2144,7 +2216,9 @@ async function runVscodeLmAgent(
       let envelope;
       try {
         envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: true });
-      } catch (_err) {
+      } catch (err) {
+        lastProtocolPreview = String((err && err.protocolPreview) || text || "");
+        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: sanitizeErrorMessage(err) });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
           `The previous response was not a supported JSON envelope. ` +
@@ -2154,6 +2228,7 @@ async function runVscodeLmAgent(
         continue;
       }
       if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
+        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "non_final_envelope" });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
           `Tool discovery is complete. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
@@ -2162,6 +2237,7 @@ async function runVscodeLmAgent(
       }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
       if (finalError) {
+        protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
           `The previous final envelope was rejected (${finalError}). ` +
@@ -2173,6 +2249,7 @@ async function runVscodeLmAgent(
       return JSON.stringify(envelope);
     }
     if (forceFinal && calls.length > 0) {
+      protocolTrace.push({ turn, phase: "final", outcome: "tool_call_rejected" });
       messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
       messages.push(vscode.LanguageModelChatMessage.User(
         `Tool calls are no longer available in the finalization phase. ` +
@@ -2195,9 +2272,10 @@ async function runVscodeLmAgent(
       results.push(languageModelToolResultPart(call.callId, result));
     }
     toolTurns += 1;
+    protocolTrace.push({ turn, phase: "work", outcome: `tools:${calls.length}` });
     messages.push(vscode.LanguageModelChatMessage.User(results));
   }
-  throw new Error("vscode_lm_agent_turn_limit");
+  throw vscodeLmProtocolFailure("vscode_lm_agent_turn_limit", protocolTrace, lastProtocolPreview);
 }
 
 class VscodeLmBridgeHost {
@@ -2319,12 +2397,18 @@ class VscodeLmBridgeHost {
       const timer = setTimeout(() => source.cancel(), remainingMs);
       let text = "";
       let error = "";
+      let diagnostics = null;
       try { text = await runVscodeLmAgent(model, request, source.token); }
       catch (err) {
         error = sanitizeErrorMessage(err);
+        diagnostics = {
+          protocol_preview: sanitizeStderrChunk(String((err && err.protocolPreview) || "")).slice(0, 768),
+          turn_trace: Array.isArray(err && err.protocolTrace) ? err.protocolTrace.slice(-16) : [],
+        };
         if (err && err.protocolPreview) {
-          recordSystemLog(`[glm bridge] rejected response preview ${String(err.protocolPreview).slice(0, 768)}`);
+          recordSystemLog(`[vscode lm bridge] rejected response preview ${diagnostics.protocol_preview}`);
         }
+        recordSystemLog(`[vscode lm bridge] ${error} trace=${JSON.stringify(diagnostics.turn_trace)}`);
       }
       finally { clearTimeout(timer); source.dispose(); }
       atomicWriteOwnerJson(request.responsePath, {
@@ -2334,6 +2418,7 @@ class VscodeLmBridgeHost {
         model: { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version },
         text,
         error,
+        diagnostics,
         completed_at: new Date().toISOString(),
       });
     } catch (err) {

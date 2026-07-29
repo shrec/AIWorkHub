@@ -169,6 +169,46 @@ def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path
     assert not (workspace / "out" / "good.txt").exists()
 
 
+def test_worker_surfaces_bounded_bridge_diagnostics_on_provider_failure(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    request_id = "e" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="bounded",
+        model="glm-5.2",
+        allowed_writes=["out/*.txt"],
+        timeout_seconds=30,
+    )
+    vscode_lm_bridge._atomic_json(  # noqa: SLF001
+        request.response_path,
+        {
+            "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+            "request_id": request_id,
+            "error": "vscode_lm_finalization_limit",
+            "text": "",
+            "diagnostics": {
+                "protocol_preview": "unsupported provider prose",
+                "turn_trace": [{"turn": 13, "phase": "final", "outcome": "invalid_json"}],
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        vscode_lm_worker.run(request.worker_spec_path)
+
+    message = str(captured.value)
+    assert "vscode_lm_request_failed:vscode_lm_finalization_limit" in message
+    assert "unsupported provider prose" in message
+    assert '"phase":"final"' in message
+
+
 def test_create_request_rejects_cross_request_workspace(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     request_id = "c" * 32
