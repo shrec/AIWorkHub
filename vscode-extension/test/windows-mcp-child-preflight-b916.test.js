@@ -86,7 +86,14 @@ function createTempRoot() {
 
 // ── Low-level: _preflightPythonCandidate ─────────────────────────────────
 
-describe("_preflightPythonCandidate", () => {
+// These fixtures are executable Node scripts carrying a Python-like filename.
+// They deliberately simulate Windows candidate paths while running on a POSIX
+// host; native Windows cannot execute a shebang script named ``python.exe``.
+const posixStubOnly = process.platform === "win32"
+  ? "POSIX executable-stub fixture; native Windows has a real-interpreter smoke below"
+  : false;
+
+describe("_preflightPythonCandidate", { skip: posixStubOnly }, () => {
   let tmp;
   beforeEach(() => { tmp = createTempRoot(); });
   afterEach(() => tmp.rm());
@@ -116,7 +123,7 @@ describe("_preflightPythonCandidate", () => {
 
 // ── Sanitisation ─────────────────────────────────────────────────────────
 
-describe("sanitisation", () => {
+describe("sanitisation", { skip: posixStubOnly }, () => {
   test("redacts 24+ char tokens in stderr", () => {
     const stub = path.join(os.tmpdir(), "b916-sanitise-stub");
     writePythonStub(stub, 1, "err: x_abcdefghijklmnopqrstuvwx_01 extra");
@@ -176,7 +183,7 @@ describe("findPythonCommand (Linux)", () => {
 
 // ── Windows findPythonCommand (real temp dirs, real spawnSync) ───────────
 
-describe("findPythonCommand (Windows)", () => {
+describe("findPythonCommand (Windows)", { skip: posixStubOnly }, () => {
   const orig = process.platform;
   let tmp;
 
@@ -249,3 +256,14 @@ describe("findPythonCommand (Windows)", () => {
     assert.ok(r.preflightDiagnostic.includes(".venv") || r.preflightDiagnostic.includes("venv"));
   });
 });
+
+test(
+  "native Windows resolves and preflights the installed system Python",
+  { skip: process.platform !== "win32" },
+  () => {
+    const repoRoot = path.resolve(__dirname, "..", "..");
+    const resolved = findPythonCommand(repoRoot);
+    const preflight = _preflightPythonCandidate(resolved.command, resolved.argsPrefix || []);
+    assert.ok(preflight.ok, JSON.stringify({ resolved, preflight }));
+  },
+);
