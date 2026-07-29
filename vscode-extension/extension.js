@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.2";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.3";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -1872,7 +1872,17 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
 
 async function collectVscodeLmResponseText(response) {
   const textParts = [];
-  for await (const part of response.stream) {
+  // VS Code's LanguageModelChatResponse exposes both a typed `stream` and a
+  // text-only async iterable. Some contributed providers (notably Claude in
+  // Copilot Chat) advertise toolCalling=false and place their content only on
+  // `response.text`; draining `stream` for those models yields zero parts.
+  // Prefer the standard text channel for the emulated JSON protocol and keep
+  // stream as a compatibility fallback for older/custom implementations.
+  const textChannel = response && response.text;
+  const iterable = textChannel && typeof textChannel[Symbol.asyncIterator] === "function"
+    ? textChannel
+    : response.stream;
+  for await (const part of iterable) {
     if (part && typeof part.value === "string") textParts.push(part.value);
     else if (typeof part === "string") textParts.push(part);
   }

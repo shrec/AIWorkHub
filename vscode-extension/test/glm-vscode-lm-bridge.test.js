@@ -223,6 +223,25 @@ async function textProtocolChecks() {
     async () => ({ ok: true, content: "graph" }),
   );
   assert.strictEqual(recoveredTextResult, finalResponse);
+
+  const textChannelModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() {})(),
+      text: (async function* text() { yield finalResponse; }()),
+    }),
+  };
+  const textChannelResult = await internals.runVscodeLmTextProtocol(
+    textChannelModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model" },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(textChannelResult, finalResponse);
 }
 
 async function nativeProtocolChecks() {
