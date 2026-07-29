@@ -48,7 +48,7 @@ assertAbsent(
 // getActiveRepositoryRoot must remain the single resolution path used by
 // activation, selectRepositoryCommand, and getMcpClient -- and it must never
 // call a bootstrap/initialize routine itself.
-const activeRepoFnMatch = ext.match(/function getActiveRepositoryRoot\(context\) \{[\s\S]*?\n}\n/);
+const activeRepoFnMatch = ext.match(/function getActiveRepositoryRoot\(context\) \{[\s\S]*?\r?\n}\r?\n/);
 assert.ok(activeRepoFnMatch, "getActiveRepositoryRoot function body not found");
 assertAbsent(
   activeRepoFnMatch[0],
@@ -70,7 +70,7 @@ assertPresent(
   ],
   "initialize MCP tool wiring",
 );
-const pushInitializeMatch = ext.match(/async function pushInitializeStorage\(view\) \{[\s\S]*?\n}\n/);
+const pushInitializeMatch = ext.match(/async function pushInitializeStorage\(view\) \{[\s\S]*?\r?\n}\r?\n/);
 assert.ok(pushInitializeMatch, "pushInitializeStorage function body not found");
 assertPresent(
   pushInitializeMatch[0],
