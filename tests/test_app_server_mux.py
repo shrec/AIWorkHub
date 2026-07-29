@@ -76,6 +76,13 @@ def test_is_app_server_invocation_false_for_exec():
     assert is_app_server_invocation([]) is False
 
 
+def test_native_launcher_preserves_exact_extension_host_parent_pid(monkeypatch):
+    monkeypatch.setenv(app_server_mux.ENV_EXTENSION_HOST_PID, "424242")
+    assert app_server_mux.extension_host_parent_pid() == 424242
+    monkeypatch.setenv(app_server_mux.ENV_EXTENSION_HOST_PID, "not-a-pid")
+    assert app_server_mux.extension_host_parent_pid() == os.getppid()
+
+
 def test_resolve_real_executable_env_override(monkeypatch):
     monkeypatch.setenv(app_server_mux.ENV_REAL_EXECUTABLE, "/usr/local/bin/codex-real")
     assert resolve_real_executable() == "/usr/local/bin/codex-real"

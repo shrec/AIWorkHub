@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.97";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.99";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -3053,6 +3053,7 @@ function materializePathMuxShim(stableLauncher, options = {}) {
   const platform = options.platform || process.platform;
   const home = options.home || os.homedir();
   const env = options.env || process.env;
+  const arch = options.arch || process.arch;
   let binDir;
   if (platform === "win32") {
     const normalizedHome = path.resolve(home).toLowerCase();
@@ -3069,13 +3070,25 @@ function materializePathMuxShim(stableLauncher, options = {}) {
     binDir = path.join(home, ".local", "bin");
   }
   fs.mkdirSync(binDir, { recursive: true });
-  const shim = path.join(
-    binDir,
-    platform === "win32" ? "aiworkhub-app-server-mux.cmd" : "aiworkhub-app-server-mux",
-  );
+  let shim = path.join(binDir, platform === "win32" ? "aiworkhub-app-server-mux.exe" : "aiworkhub-app-server-mux");
   if (platform === "win32") {
-    const escaped = stableLauncher.replace(/"/g, '""');
-    fs.writeFileSync(shim, `@echo off\r\n"${escaped}" %*\r\n`, "utf8");
+    const nativeArch = arch === "arm64" ? "aarch64" : arch === "x64" ? "x86_64" : arch;
+    const nativeLauncher = options.windowsNativeLauncher || (
+      options.extensionFsPath
+        ? path.join(options.extensionFsPath, "bin", `windows-${nativeArch}`, "aiworkhub-app-server-mux.exe")
+        : ""
+    );
+    if (nativeLauncher && fs.existsSync(nativeLauncher)) {
+      fs.copyFileSync(nativeLauncher, shim);
+      const pythonTarget = path.join(path.dirname(stableLauncher), "aiworkhub-app-server-mux.py");
+      fs.writeFileSync(`${shim}.target`, `${pythonTarget}\r\n`, "utf8");
+    } else {
+      // Development checkout fallback only. Packaged VSIX qualification
+      // requires the native .exe for OpenAI's shell:false spawn path.
+      shim = path.join(binDir, "aiworkhub-app-server-mux.cmd");
+      const escaped = stableLauncher.replace(/"/g, '""');
+      fs.writeFileSync(shim, `@echo off\r\n"${escaped}" %*\r\n`, "utf8");
+    }
   } else {
     const escaped = stableLauncher.replace(/'/g, `'\\''`);
     fs.writeFileSync(shim, `#!/bin/sh\nexec '${escaped}' "$@"\n`, { encoding: "utf8", mode: 0o755 });
@@ -3217,23 +3230,49 @@ async function ensureCodexCallbackMuxConfigured(context) {
       return { ok: true, changed: true, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
     }
     const launcher = materializeStableMuxLauncher(context);
+    const launcherSetting = "aiworkhub-app-server-mux";
     pinMuxRealExecutable(realExecutable);
     await keepMuxSettingHostLocal();
-    if (current === launcher) {
-      return { ok: true, changed: false, launcher, mode: "app_server_sideband" };
+    const activationMarker = `app_server_sideband.v2:${process.platform}:${launcherSetting}`;
+    const markerKey = "aiworkhub.codexCallbackMuxActivation";
+    const previousMarker = context && context.globalState && typeof context.globalState.get === "function"
+      ? String(context.globalState.get(markerKey, "") || "")
+      : activationMarker;
+    if (current === launcherSetting) {
+      // A stale Remote Machine value can equal the correct host-local path
+      // while OpenAI's application-scoped configuration never observed a
+      // change event and its already-running child remains native. Pulse the
+      // value exactly once per host/launcher identity; persistent globalState
+      // prevents a reload/restart loop.
+      if (previousMarker !== activationMarker && config && typeof config.update === "function") {
+        const globalTarget = vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true;
+        await config.update("cliExecutable", undefined, globalTarget);
+        await config.update("cliExecutable", launcherSetting, globalTarget);
+        if (context.globalState && typeof context.globalState.update === "function") {
+          await context.globalState.update(markerKey, activationMarker);
+        }
+        if (outputChannel) {
+          outputChannel.appendLine("[codex] refreshed host-local callback mux activation after stale native child state");
+        }
+        return { ok: true, changed: true, launcher: launcherSetting, mode: "app_server_sideband", activation_refreshed: true };
+      }
+      return { ok: true, changed: false, launcher: launcherSetting, mode: "app_server_sideband" };
     }
     if (!config || typeof config.update !== "function") {
       return { ok: false, changed: false, reason: "configuration_update_unavailable" };
     }
     await config.update(
       "cliExecutable",
-      launcher,
+      launcherSetting,
       vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
     );
+    if (context && context.globalState && typeof context.globalState.update === "function") {
+      await context.globalState.update(markerKey, activationMarker);
+    }
     if (outputChannel) {
       outputChannel.appendLine("[codex] enabled host-local AIWorkHub App Server callback mux; one Codex host restart may be required");
     }
-    return { ok: true, changed: true, launcher, mode: "app_server_sideband", restart_required: true };
+    return { ok: true, changed: true, launcher: launcherSetting, mode: "app_server_sideband", restart_required: true };
   } catch (err) {
     if (outputChannel) outputChannel.appendLine(`[codex] callback mux configuration failed: ${sanitizeErrorMessage(err)}`);
     return { ok: false, changed: false, reason: "configuration_update_failed" };
@@ -4639,7 +4678,7 @@ async function activate(context) {
   // launcher before the immutable generation copy has completed.
   try {
     const stableMuxLauncher = materializeStableMuxLauncher(context);
-    materializePathMuxShim(stableMuxLauncher);
+    materializePathMuxShim(stableMuxLauncher, { extensionFsPath: context.extensionUri.fsPath });
     primeStableMuxRuntimePointer(context);
   } catch (err) {
     outputChannel.appendLine(

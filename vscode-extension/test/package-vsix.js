@@ -23,6 +23,7 @@ const MUX_LAUNCHER_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-
 const MUX_LAUNCHER_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux");
 const MUX_LAUNCHER_CMD_SRC = path.join(root, "..", "scripts", "aiworkhub-app-server-mux.cmd");
 const MUX_LAUNCHER_CMD_DEST = path.join(extensionDir, "bin", "aiworkhub-app-server-mux.cmd");
+const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
 // Never bundle bytecode caches or OS cruft -- only the real package source
 // and its data assets (e.g. dashboard_static/*.css/.js/.html).
 const PY_RUNTIME_SKIP_DIRS = new Set(["__pycache__", ".pytest_cache"]);
@@ -77,6 +78,18 @@ copyPythonRuntime(PY_RUNTIME_SRC, PY_RUNTIME_DEST);
 fs.mkdirSync(path.dirname(MUX_LAUNCHER_DEST), { recursive: true });
 fs.copyFileSync(MUX_LAUNCHER_SRC, MUX_LAUNCHER_DEST);
 fs.copyFileSync(MUX_LAUNCHER_CMD_SRC, MUX_LAUNCHER_CMD_DEST);
+for (const [goarch, folder] of [["amd64", "windows-x86_64"], ["arm64", "windows-aarch64"]]) {
+  const nativeDest = path.join(extensionDir, "bin", folder, "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(nativeDest), { recursive: true });
+  childProcess.execFileSync("go", ["build", "-trimpath", "-ldflags=-s -w", "-o", nativeDest, NATIVE_LAUNCHER_SRC], {
+    cwd: root,
+    env: { ...process.env, GOOS: "windows", GOARCH: goarch, CGO_ENABLED: "0" },
+    stdio: "inherit",
+  });
+  if (!fs.statSync(nativeDest).isFile() || fs.statSync(nativeDest).size < 1024) {
+    throw new Error(`native Windows mux launcher is missing or invalid: ${folder}`);
+  }
+}
 if (process.platform !== "win32") {
   fs.chmodSync(MUX_LAUNCHER_DEST, 0o755);
 }
@@ -145,6 +158,7 @@ const contentTypes = `<?xml version="1.0" encoding="utf-8"?>
   <Default Extension="vsixmanifest" ContentType="text/xml"/>
   <Default Extension="py" ContentType="text/x-python"/>
   <Default Extension="html" ContentType="text/html"/>
+  <Default Extension="exe" ContentType="application/octet-stream"/>
 </Types>
 `;
 

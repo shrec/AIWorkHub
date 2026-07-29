@@ -93,11 +93,53 @@ test("co-located Codex is configured through one host-local stable mux", async (
     assert.equal(result.ok, true);
     assert.equal(result.mode, "app_server_sideband");
     assert.equal(result.changed, true);
-    assert.ok(path.isAbsolute(result.launcher));
+    assert.equal(result.launcher, "aiworkhub-app-server-mux");
     assert.equal(currentValue, result.launcher);
     assert.ok(ignoredSettings.includes("chatgpt.cliExecutable"));
     const pin = fs.readFileSync(path.join(testSidebandDir, "real_executable"), "utf8").trim();
     assert.equal(pin, executable);
+  } finally {
+    if (previousSidebandDir === undefined) delete process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
+    else process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = previousSidebandDir;
+    fakeVscode.extensions.getExtension = () => null;
+  }
+});
+
+test("stale equal launcher receives one bounded activation pulse, never a reload loop", async () => {
+  const codexRoot = path.join(temp, "openai-chatgpt-pulse");
+  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+  const platformName = process.platform === "win32" ? "windows" : process.platform;
+  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  fs.writeFileSync(executable, "codex", { mode: 0o755 });
+  fakeVscode.extensions.getExtension = () => ({ extensionPath: codexRoot });
+  const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
+  process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = path.join(temp, "sideband-pulse");
+  const marker = new Map();
+  const pulseContext = {
+    ...context,
+    globalState: {
+      get: (key, fallback) => marker.has(key) ? marker.get(key) : fallback,
+      update: async (key, value) => marker.set(key, value),
+    },
+  };
+  __testInternals.materializeStableMuxLauncher(pulseContext);
+  currentValue = "aiworkhub-app-server-mux";
+  updates.length = 0;
+  try {
+    const first = await __testInternals.ensureCodexCallbackMuxConfigured(pulseContext);
+    assert.equal(first.activation_refreshed, true);
+    assert.deepEqual(
+      updates.filter((entry) => entry.key === "cliExecutable"),
+      [
+        { key: "cliExecutable", value: undefined, global: 1 },
+        { key: "cliExecutable", value: currentValue, global: 1 },
+      ],
+    );
+    updates.length = 0;
+    const second = await __testInternals.ensureCodexCallbackMuxConfigured(pulseContext);
+    assert.equal(second.changed, false);
+    assert.deepEqual(updates, []);
   } finally {
     if (previousSidebandDir === undefined) delete process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
     else process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = previousSidebandDir;
@@ -223,7 +265,31 @@ test("Windows PATH shim is a command wrapper and never depends on POSIX mode bit
   assert.ok(content.includes(launcher));
 });
 
-test("package never contributes an application-scoped Codex executable default", () => {
+test("packaged Windows host installs a native shell-free launcher with an exact target", () => {
+  const home = path.join(temp, "windows-native-home");
+  const native = path.join(temp, "packaged", "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(native), { recursive: true });
+  fs.writeFileSync(native, Buffer.from("MZ-native-launcher"));
+  const shim = __testInternals.materializePathMuxShim(launcher, {
+    platform: "win32",
+    home,
+    env: { PATH: "" },
+    windowsNativeLauncher: native,
+  });
+  assert.equal(
+    shim,
+    path.join(home, "AppData", "Local", "Microsoft", "WindowsApps", "aiworkhub-app-server-mux.exe"),
+  );
+  assert.deepEqual(fs.readFileSync(shim), fs.readFileSync(native));
+  assert.equal(
+    fs.readFileSync(`${shim}.target`, "utf8").trim(),
+    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.py"),
+  );
+});
+
+test("package contributes only the machine-neutral Codex mux command", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
-  assert.ok(!manifest.contributes.configurationDefaults);
+  assert.deepEqual(manifest.contributes.configurationDefaults, {
+    "chatgpt.cliExecutable": "aiworkhub-app-server-mux",
+  });
 });

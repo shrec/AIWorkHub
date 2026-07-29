@@ -135,6 +135,7 @@ REAL_EXECUTABLE_CONFIG_NAME = "real_executable"
 # every ownership lookup is scoped by it, closing the leak structurally
 # instead of relying on thread ids never colliding.
 ENV_REPO_ID = "AIWORKHUB_REPO_ID"
+ENV_EXTENSION_HOST_PID = "AIWORKHUB_APP_SERVER_MUX_EXTENSION_HOST_PID"
 ENV_ROUTE_WAIT_SECONDS = "AIWORKHUB_APP_SERVER_MUX_ROUTE_WAIT_SECONDS"
 DEFAULT_ROUTE_WAIT_SECONDS = 10.0
 ROUTE_WAIT_POLL_SECONDS = 0.05
@@ -175,6 +176,26 @@ def _validate_repo_id(repo_id: Any) -> str:
     if not stripped or not _REPO_ID_RE.fullmatch(stripped):
         raise ValueError(f"repo_id must be a non-empty bounded identifier, got {repo_id!r}")
     return stripped
+
+
+def extension_host_parent_pid() -> int:
+    """Return the extension-host PID across direct and native-launcher paths.
+
+    POSIX shims ``exec`` Python, so ``getppid`` is already exact. Windows
+    needs a tiny native launcher because Node cannot spawn ``.cmd`` files with
+    ``shell:false``; that launcher preserves its own parent PID in a bounded
+    decimal environment field.
+    """
+
+    raw = os.environ.get(ENV_EXTENSION_HOST_PID, "").strip()
+    if raw:
+        try:
+            candidate = int(raw)
+        except ValueError:
+            candidate = 0
+        if candidate > 1:
+            return candidate
+    return os.getppid()
 
 APP_SERVER_ARG = "app-server"
 
@@ -269,7 +290,7 @@ def resolve_repo_id_for_mux() -> str:
         return ""
     if not isinstance(registry, dict) or not registry.get("ok"):
         return ""
-    parent_pid = os.getppid()
+    parent_pid = extension_host_parent_pid()
     matches = [
         str(record.get("repo_id") or "")
         for record in registry.get("repositories", [])
@@ -832,7 +853,7 @@ class AppServerMux:
         self._capability_token = secrets.token_hex(CAPABILITY_TOKEN_BYTES)
         self._instances_dir = sideband_instances_dir(self._sideband_dir)
         self._pid = os.getpid()
-        self._parent_pid = os.getppid()
+        self._parent_pid = extension_host_parent_pid()
         self._pid_start_time = _proc_start_time(self._pid)
         self._instance_id = ""
         self._generation_id = uuid.uuid4().hex
@@ -1386,6 +1407,7 @@ __all__ = [
     "DEFAULT_SIDEBAND_DIR",
     "ENV_REAL_EXECUTABLE",
     "ENV_REPO_ID",
+    "ENV_EXTENSION_HOST_PID",
     "ENV_ROUTE_WAIT_SECONDS",
     "ENV_SIDEBAND_DIR",
     "SIDEBAND_ALLOWED_METHODS",
