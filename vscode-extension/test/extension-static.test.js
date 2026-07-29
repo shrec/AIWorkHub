@@ -19,6 +19,13 @@ assert.strictEqual(pkg.displayName, "AIWorkHub");
 assert.ok(ext.includes(`EXPECTED_MCP_PACKAGE_VERSION = "${pkg.version}"`));
 assert.deepStrictEqual(pkg.extensionKind, ["workspace"]);
 assert.strictEqual(pkg.icon, "media/aiworkhub-icon.png");
+assert.ok(ext.includes('class="brand-logo"'));
+assert.ok(ext.includes('vscode.Uri.joinPath(mediaUri, "aiworkhub-icon.png")'));
+assert.ok(!ext.includes('class="brand-mark"'));
+assert.ok(css.includes(".brand-logo"));
+assert.ok(ext.includes('getHtmlForNavigatorWebview(webview, extensionUri)'));
+assert.ok(ext.includes('<img class="mark" src="${logoUri}"'));
+assert.ok(!ext.includes('M12 2 21 7v10'));
 assert.ok(
   pkg.activationEvents.includes("onStartupFinished"),
   "AIWorkHub callbacks must activate after VS Code startup without opening the dashboard"
@@ -214,6 +221,11 @@ assert.ok(css.includes(".live-output-metrics"));
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-icon.png")));
 assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-icon.png")).size > 1000);
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));
+const activityIcon = read("media/aiworkhub-activity.svg");
+assert.ok(activityIcon.includes('aria-label="AIWorkHub"'));
+assert.ok(activityIcon.includes('stroke="currentColor"'));
+assert.ok(activityIcon.includes('<circle cx="128" cy="34"'));
+assert.ok(!activityIcon.includes('M12 2 21 7v10'));
 
 // B844: the packaging script must bundle the canonical aiworkhub Python
 // package (including dashboard_static assets) into an extension-local

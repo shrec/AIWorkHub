@@ -8,6 +8,10 @@ const extensionPath = path.resolve(__dirname, "..", "extension.js");
 const fakeVscode = {
   workspace: { workspaceFolders: [], getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   LanguageModelChatToolMode: { Auto: 1, Required: 2 },
+  LanguageModelChatMessage: {
+    User: (content) => ({ role: "user", content }),
+    Assistant: (content) => ({ role: "assistant", content }),
+  },
 };
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
@@ -28,6 +32,173 @@ assert.strictEqual(internals.selectGlm52LanguageModel([unrelated, exact]), exact
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated]), null);
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
+assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", "research/*.json"), true);
+assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
+
+async function textProtocolChecks() {
+  const toolRequest = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_manager_source_graph_query",
+    input: { mode: "focus", query: "model", budget: 48 },
+  });
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "bounded",
+    files: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const queued = [toolRequest, finalResponse];
+  const options = [];
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (_messages, requestOptions) => {
+      options.push(requestOptions);
+      const value = queued.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const calls = [];
+  const result = await internals.runVscodeLmTextProtocol(
+    model,
+    { prompt: "bounded", allowedWrites: ["out/result.json"] },
+    undefined,
+    async (call) => { calls.push(call); return { ok: true, content: "graph" }; },
+  );
+  assert.strictEqual(result, finalResponse);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].name, "aiworkhub_manager_source_graph_query");
+  assert.ok(options.every((entry) => !Object.prototype.hasOwnProperty.call(entry, "tools")));
+
+  const premature = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({ stream: (async function* stream() { yield { value: finalResponse }; }()) }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      premature,
+      { prompt: "bounded", allowedWrites: ["out/result.json"] },
+      undefined,
+      async () => ({ ok: true }),
+    ),
+    /source_graph_not_acknowledged/,
+  );
+
+  const fencedEnvelope = `Here is the requested object:\n\`\`\`json\n${toolRequest}\n\`\`\``;
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(fencedEnvelope),
+    JSON.parse(toolRequest),
+  );
+  assert.throws(
+    () => internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${finalResponse}`),
+    /ambiguous_json/,
+  );
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${toolRequest}`),
+    JSON.parse(toolRequest),
+  );
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(`${toolRequest}\n${finalResponse}`, { preferFinal: true }),
+    JSON.parse(finalResponse),
+  );
+  const laterFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "actual final",
+    files: [{ path: "out/result.json", content: '{"ok":true}\n' }],
+  });
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(`${finalResponse}\nreasoning\n${laterFinal}`, { preferFinal: true }),
+    JSON.parse(laterFinal),
+  );
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(JSON.stringify({
+      name: "aiworkhub_manager_source_graph_query",
+      arguments: JSON.stringify({ mode: "focus", query: "model" }),
+    })),
+    {
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_source_graph_query",
+      input: { mode: "focus", query: "model" },
+    },
+  );
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(JSON.stringify({
+      tool_calls: [{ function: { name: "aiworkhub_manager_kb_search", arguments: '{"query":"contract"}' } }],
+    })),
+    {
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_kb_search",
+      input: { query: "contract" },
+    },
+  );
+  assert.throws(
+    () => internals.parseVscodeLmJsonEnvelope('{"name":"shell","arguments":{"cmd":"pwd"}}'),
+    /invalid_json/,
+  );
+
+  const wrappedQueued = [fencedEnvelope, `Completed:\n\`\`\`json\n${finalResponse}\n\`\`\``];
+  const wrappedModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      const value = wrappedQueued.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const wrappedResult = await internals.runVscodeLmTextProtocol(
+    wrappedModel,
+    { prompt: "bounded", allowedWrites: ["out/result.json"] },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(wrappedResult, finalResponse);
+
+  const prefetchedOptions = [];
+  const prefetchedCalls = [];
+  const prefetchedModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages, requestOptions) => {
+      prefetchedOptions.push({ messages, requestOptions });
+      return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+    },
+  };
+  const prefetchedResult = await internals.runVscodeLmTextProtocol(
+    prefetchedModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      allowed_writes: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
+    },
+    undefined,
+    async (call) => { prefetchedCalls.push(call); return { ok: true, content: "live graph" }; },
+  );
+  assert.strictEqual(prefetchedResult, finalResponse);
+  assert.strictEqual(prefetchedCalls.length, 1);
+  assert.strictEqual(prefetchedCalls[0].name, "aiworkhub_manager_source_graph_query");
+  assert.ok(String(prefetchedOptions[0].messages[0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
+
+  const wrongPath = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "placeholder",
+    files: [{ path: "repo/relative", content: "bad" }],
+  });
+  const correctedQueued = [wrongPath, finalResponse];
+  const correctingModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: correctedQueued.shift() }; }()),
+    }),
+  };
+  const correctedResult = await internals.runVscodeLmTextProtocol(
+    correctingModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model" },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(correctedResult, finalResponse);
+}
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));
 try {
@@ -59,4 +230,9 @@ try {
   fs.rmSync(temp, { recursive: true, force: true });
 }
 
-console.log("GLM VS Code LM bridge: ok");
+textProtocolChecks().then(() => {
+  console.log("GLM VS Code LM bridge: ok");
+}).catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

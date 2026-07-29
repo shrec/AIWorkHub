@@ -1,12 +1,12 @@
-"""B954: a verified-injected project-context section satisfies the terminal
-worker MCP gate (alternative to a live worker call).
+"""Project-context injection and continuous worker tool-use gate coverage.
 
 The measured defect: correctly-finished work went to validation_failed with
 ``required_aiworkhub_mcp_calls_missing:session_current_state,ai_memory`` even
 though the launcher had injected those sections with a verified hash receipt
 (executed=true), because the gate only ever credited LIVE worker calls. This
 locks the acceptance criteria: an executed, non-degraded section whose bundle
-receipt is acknowledged satisfies the tool (zero hit_count is still valid);
+receipt is acknowledged satisfies optional context tools (zero hit_count is
+still valid), while Source Graph additionally requires a fresh live call;
 tampered / repo-mismatched / unacknowledged receipts and degraded sections stay
 fail-closed; the terminal evidence names the satisfaction source per tool.
 """
@@ -61,7 +61,7 @@ def _metadata(tmp_path: Path, *, bundle_sha: str, sections: list[dict], stdout: 
     }
 
 
-def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict | None = None) -> None:
+def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict | None = None, policy_violations: int = 0) -> None:
     payload = dict(successful or {})
 
     def fake_verify(*_a, **_k):
@@ -69,6 +69,7 @@ def _patch_verify(monkeypatch, *, live_source_graph: int = 0, successful: dict |
             "ok": True,
             "live_source_graph_calls": live_source_graph,
             "successful_call_count_by_tool": dict(payload),
+            "policy_violations": policy_violations,
             "reason": "",
         }
 
@@ -87,7 +88,7 @@ def _sections(*specs) -> list[dict]:
 
 # --- PASS: injected+verified sections, no live call ------------------------
 
-def test_injected_session_and_source_graph_no_live_call_passes(tmp_path, monkeypatch):
+def test_injected_session_and_source_graph_no_live_call_fails_continuous_use_gate(tmp_path, monkeypatch):
     _patch_verify(monkeypatch)  # empty ledger, zero live calls
     bundle = _sha()
     stdout = _write_receipt(tmp_path, bundle, section_count=2)
@@ -96,10 +97,10 @@ def test_injected_session_and_source_graph_no_live_call_passes(tmp_path, monkeyp
         ("session_current_state", True, 8, ""),
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
-    assert gate["satisfied"] is True
-    assert gate["missing_tools"] == []
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph_live_call"]
     assert gate["injected_context_acknowledged"] is True
-    assert gate["satisfaction_by_tool"]["source_graph"] == "injected_receipt"
+    assert gate["satisfaction_by_tool"]["source_graph"] == "injected_only_not_sufficient"
     assert gate["satisfaction_by_tool"]["session_current_state"] == "injected_receipt"
 
 
@@ -112,7 +113,8 @@ def test_injected_ai_memory_zero_hit_is_valid(tmp_path, monkeypatch):
         ("ai_memory", True, 0, ""),   # zero hits, but executed + acknowledged
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
-    assert gate["satisfied"] is True
+    assert gate["satisfied"] is False
+    assert gate["missing_tools"] == ["source_graph_live_call"]
     assert gate["satisfaction_by_tool"]["ai_memory"] == "injected_receipt"
 
 
@@ -128,8 +130,8 @@ def test_section_not_executed_and_no_live_call_fails(tmp_path, monkeypatch):
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
     assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["ai_memory"]
-    assert gate["reason"] == "required_aiworkhub_mcp_calls_missing:ai_memory"
+    assert gate["missing_tools"] == ["source_graph_live_call", "ai_memory"]
+    assert gate["reason"] == "required_aiworkhub_mcp_calls_missing:source_graph_live_call,ai_memory"
 
 
 def test_degraded_injected_section_requires_live_recovery(tmp_path, monkeypatch):
@@ -142,7 +144,7 @@ def test_degraded_injected_section_requires_live_recovery(tmp_path, monkeypatch)
     )
     gate = pl._worker_mcp_live_call_gate(_metadata(tmp_path, bundle_sha=bundle, sections=sections, stdout=stdout), "req")
     assert gate["satisfied"] is False
-    assert gate["missing_tools"] == ["session_current_state"]
+    assert gate["missing_tools"] == ["source_graph_live_call", "session_current_state"]
 
 
 # --- FAIL: tampered / repo-mismatched receipt stays fail-closed ------------
@@ -187,6 +189,17 @@ def test_no_injection_but_live_calls_pass(tmp_path, monkeypatch):
     assert gate["satisfied"] is True
     assert gate["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
     assert gate["satisfaction_by_tool"]["session_current_state"] == "live_worker_call"
+
+
+def test_live_calls_with_policy_violation_fail_review_gate(tmp_path, monkeypatch):
+    _patch_verify(monkeypatch, live_source_graph=1, policy_violations=1)
+    stdout = tmp_path / "worker.log"
+    stdout.write_text("live worker\n", encoding="utf-8")
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=_sha(), sections=[], stdout=stdout), "req"
+    )
+    assert gate["satisfied"] is False
+    assert gate["reason"] == "aiworkhub_tool_policy_violations:1"
 
 
 # --- evidence surfaces the satisfaction source per tool --------------------

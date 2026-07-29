@@ -55,7 +55,11 @@ def _write_atomic(workspace: Path, relative: str, content: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
-        os.fchmod(fd, 0o600)
+        # ``mkstemp`` creates the file with owner-only permissions (0600).
+        # Do not call fchmod here: isolated workers deliberately run under a
+        # seccomp profile that rejects metadata-changing syscalls, including
+        # fchmod.  The redundant chmod therefore made a valid GLM response
+        # fail with EPERM before its first allowed output could be written.
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
             handle.write(content)
             handle.flush()

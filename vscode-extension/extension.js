@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.6.77";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.6.92";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -73,11 +73,15 @@ const VSCODE_LM_REQUEST_SCHEMA = "aiworkhub.vscode_lm.request.v1";
 const VSCODE_LM_HOST_SCHEMA = "aiworkhub.vscode_lm.host.v1";
 const VSCODE_LM_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.response.v1";
 const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v1";
+const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
+const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const VSCODE_LM_MAX_AGENT_TURNS = 24;
+const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
+const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_PERMISSION_KEY = "aiworkhub.vscodeLmWorkerPermission.v1";
 const VSCODE_LM_REQUEST_ID_RE = /^[a-f0-9]{32}$/;
 
@@ -1674,6 +1678,19 @@ function validateVscodeLmRequest(payload, repoInfo) {
   if (!Array.isArray(allowedWrites) || allowedWrites.some((value) => typeof value !== "string" || value.length > 512)) {
     throw new Error("vscode_lm_allowed_writes_invalid");
   }
+  const initialSourceGraphRequest = payload.initial_source_graph_request;
+  if (initialSourceGraphRequest !== null && initialSourceGraphRequest !== undefined) {
+    if (!initialSourceGraphRequest || typeof initialSourceGraphRequest !== "object" || Array.isArray(initialSourceGraphRequest)) {
+      throw new Error("vscode_lm_initial_source_graph_request_invalid");
+    }
+    const permittedKeys = new Set(["mode", "query", "budget", "target", "bundle_type"]);
+    if (Object.keys(initialSourceGraphRequest).some((key) => !permittedKeys.has(key)) ||
+        !["focus", "slice", "bundle"].includes(initialSourceGraphRequest.mode) ||
+        typeof initialSourceGraphRequest.query !== "string" || !initialSourceGraphRequest.query.trim() ||
+        initialSourceGraphRequest.query.length > 512) {
+      throw new Error("vscode_lm_initial_source_graph_request_invalid");
+    }
+  }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
   return { ...payload, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
@@ -1736,27 +1753,285 @@ function isLanguageModelToolCallPart(part) {
   return Boolean(part && typeof part.callId === "string" && typeof part.name === "string" && part.input && typeof part.input === "object");
 }
 
-async function invokeVscodeLmPrivateTool(call) {
+async function invokeVscodeLmPrivateTool(call, requestId = "") {
   const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === call.name);
   if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(call.name || "")}`);
   if (!mcpClient || !activeRepoIdentity) throw new Error("vscode_lm_mcp_unavailable");
   if (mcpClient.repositoryRoot !== activeRepoIdentity.root) throw new Error("vscode_lm_mcp_repo_mismatch");
-  return mcpClient.callTool(permitted.name, call.input || {});
+  if (!VSCODE_LM_REQUEST_ID_RE.test(String(requestId || ""))) {
+    throw new Error("vscode_lm_worker_request_id_invalid");
+  }
+  return mcpClient.callTool("aiworkhub_vscode_lm_worker_tool", {
+    request_id: requestId,
+    tool_name: permitted.name,
+    tool_input: call.input || {},
+  });
 }
 
 function glmAgentProtocolPrompt(prompt, allowedWrites) {
+  const examplePath = Array.isArray(allowedWrites) && allowedWrites.length
+    ? String(allowedWrites[0])
+    : "output.json";
   return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
     `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
     `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}.\n` +
     `- files must contain complete UTF-8 content and paths must match allowed_writes.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
-    `Required shape: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","files":[{"path":"repo/relative","content":"complete content"}]}`;
+    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","files":[{"path":${JSON.stringify(examplePath)},"content":"complete content"}]}`;
+}
+
+function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
+  const value = String(rawPath || "").replace(/\\/g, "/");
+  const pattern = String(rawPattern || "").replace(/\\/g, "/");
+  if (!value || value.startsWith("/") || value.split("/").includes("..")) return false;
+  let expression = "^";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === "*" && pattern[index + 1] === "*") {
+      expression += ".*";
+      index += 1;
+    } else if (char === "*") expression += "[^/]*";
+    else if (char === "?") expression += "[^/]";
+    else expression += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`${expression}$`).test(value);
+}
+
+function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
+  if (!envelope || typeof envelope.summary !== "string" || !Array.isArray(envelope.files)) {
+    return "final_shape_invalid";
+  }
+  for (const file of envelope.files) {
+    if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
+      return "final_file_invalid";
+    }
+    if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(file.path, pattern))) {
+      return `final_path_not_allowed:${file.path}`;
+    }
+  }
+  return "";
+}
+
+function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false) {
+  const toolNames = VSCODE_LM_PRIVATE_TOOLS.map((tool) => tool.name);
+  return `${glmAgentProtocolPrompt(prompt, allowedWrites)}\n` +
+    `This provider does not expose native tool calling. Use the strict JSON transport below.\n` +
+    (sourceGraphPrefetched
+      ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
+      : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
+    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"aiworkhub_manager_source_graph_query","input":{"mode":"focus","query":"..."}}\n` +
+    `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
+    `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
+    `- Never wrap JSON in Markdown or add prose.`;
+}
+
+async function collectVscodeLmResponseText(response) {
+  const textParts = [];
+  for await (const part of response.stream) {
+    if (part && typeof part.value === "string") textParts.push(part.value);
+    else if (typeof part === "string") textParts.push(part);
+  }
+  const text = textParts.join("").trim();
+  if (!text) throw new Error("vscode_lm_empty_response");
+  if (Buffer.byteLength(text, "utf8") > VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES) {
+    throw new Error("vscode_lm_text_response_too_large");
+  }
+  return text;
+}
+
+function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
+  const source = String(text || "").trim();
+  const normalize = (candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    if ([VSCODE_LM_TOOL_REQUEST_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA].includes(candidate.schema_id)) {
+      return candidate;
+    }
+    // GLM custom endpoints commonly serialize a function request using an
+    // OpenAI-style object even when VS Code reports toolCalling=false.  Map
+    // only one allowlisted read-only AIWorkHub call into our private schema.
+    let call = candidate;
+    if (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length === 1) {
+      [call] = candidate.tool_calls;
+    }
+    if (call && call.function && typeof call.function === "object") call = call.function;
+    const name = String((call && (call.name || call.tool)) || "");
+    let input = call && (call.input !== undefined ? call.input : call.arguments);
+    if (typeof input === "string") {
+      try { input = JSON.parse(input); } catch (_err) { return null; }
+    }
+    if (VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === name) &&
+        input && typeof input === "object" && !Array.isArray(input)) {
+      return { schema_id: VSCODE_LM_TOOL_REQUEST_SCHEMA, name, input };
+    }
+    // Likewise tolerate an omitted final schema only when the complete edit
+    // response shape is unmistakable; downstream validation still enforces
+    // allowed paths and complete UTF-8 file contents.
+    if (typeof candidate.summary === "string" && Array.isArray(candidate.files)) {
+      return { ...candidate, schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA };
+    }
+    return null;
+  };
+  let payload;
+  try {
+    payload = normalize(JSON.parse(source));
+    if (!payload) throw new Error("unsupported_json_shape");
+  } catch (_err) {
+    // Some VS Code LM providers prepend a short explanation or wrap an
+    // otherwise valid envelope in a Markdown JSON fence even when instructed
+    // not to.  Recover exactly one supported top-level object without ever
+    // evaluating text, accepting nested tool input braces, or silently
+    // choosing between multiple envelopes.
+    const candidates = [];
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < source.length; index += 1) {
+      const char = source[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{") {
+        if (depth === 0) start = index;
+        depth += 1;
+      } else if (char === "}" && depth > 0) {
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          const candidateText = source.slice(start, index + 1);
+          try {
+            const candidate = JSON.parse(candidateText);
+            const normalized = normalize(candidate);
+            if (normalized) candidates.push(normalized);
+          } catch (_candidateErr) {
+            // Keep scanning; malformed prose fragments are not envelopes.
+          }
+          start = -1;
+        }
+      }
+    }
+    const uniqueCandidates = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+      const identity = JSON.stringify(candidate);
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        uniqueCandidates.push(candidate);
+      }
+    }
+    if (uniqueCandidates.length === 1) return uniqueCandidates[0];
+    if (preferFinal) {
+      const finals = uniqueCandidates.filter((candidate) => candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA);
+      // Text-only GLM endpoints may narrate or restate the prompt's example
+      // envelope before emitting the real final object. The last complete
+      // final envelope is the provider's answer; downstream validation still
+      // fail-closes schema, allowed path, content and required output.
+      if (finals.length >= 1) return finals[finals.length - 1];
+    }
+    if (uniqueCandidates.length !== 1) {
+      const error = new Error(uniqueCandidates.length > 1
+        ? "vscode_lm_text_protocol_ambiguous_json"
+        : "vscode_lm_text_protocol_invalid_json");
+      error.protocolPreview = source.slice(0, 768).replace(/\s+/g, " ");
+      throw error;
+    }
+    [payload] = uniqueCandidates;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("vscode_lm_text_protocol_invalid_object");
+  }
+  return payload;
+}
+
+async function runVscodeLmTextProtocol(
+  model,
+  request,
+  cancellationToken,
+  invokeTool = invokeVscodeLmPrivateTool,
+) {
+  let sourceGraphAcknowledged = false;
+  let initialSourceGraphResult = null;
+  if (request.initial_source_graph_request) {
+    initialSourceGraphResult = await invokeTool({
+      name: "aiworkhub_manager_source_graph_query",
+      input: request.initial_source_graph_request,
+    }, request.requestId);
+    if (!initialSourceGraphResult || initialSourceGraphResult.ok !== true) {
+      throw new Error("vscode_lm_initial_source_graph_failed");
+    }
+    sourceGraphAcknowledged = true;
+  }
+  const messages = [vscode.LanguageModelChatMessage.User(
+    glmTextToolProtocolPrompt(request.prompt, request.allowedWrites, sourceGraphAcknowledged) +
+      (sourceGraphAcknowledged
+        ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
+        : ""),
+  )];
+  for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    const response = await model.sendRequest(messages, {
+      justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
+    }, cancellationToken);
+    const text = await collectVscodeLmResponseText(response);
+    const envelope = parseVscodeLmJsonEnvelope(text, { preferFinal: sourceGraphAcknowledged });
+    if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
+      if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
+      if (finalError) {
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `The previous final envelope was rejected (${finalError}). ` +
+          `Output ONLY one corrected ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object. ` +
+          `Every file path must match allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+        ));
+        continue;
+      }
+      // Always hand the Python worker a canonical JSON-only payload even when
+      // the provider surrounded the envelope with prose or a Markdown fence.
+      return JSON.stringify(envelope);
+    }
+    if (envelope.schema_id !== VSCODE_LM_TOOL_REQUEST_SCHEMA) {
+      throw new Error("vscode_lm_text_protocol_schema_mismatch");
+    }
+    const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
+    const permitted = availableTools.find((tool) => tool.name === envelope.name);
+    if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
+    if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
+      throw new Error("vscode_lm_tool_input_invalid");
+    }
+    if (Buffer.byteLength(JSON.stringify(envelope.input), "utf8") > VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES) {
+      throw new Error("vscode_lm_tool_input_too_large");
+    }
+    let result;
+    try {
+      result = await invokeTool({ name: envelope.name, input: envelope.input }, request.requestId);
+    } catch (err) {
+      result = { ok: false, error: sanitizeErrorMessage(err) };
+    }
+    if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
+      sourceGraphAcknowledged = true;
+    }
+    messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+    messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
+      schema_id: VSCODE_LM_TOOL_RESULT_SCHEMA,
+      name: envelope.name,
+      result,
+      instruction: "Output only the next strict tool-request JSON or final edit-response JSON object.",
+    })));
+  }
+  throw new Error("vscode_lm_agent_turn_limit");
 }
 
 async function runVscodeLmAgent(model, request, cancellationToken) {
-  if (!model || !model.capabilities || !model.capabilities.toolCalling) {
-    throw new Error("vscode_lm_tool_calling_unavailable");
+  if (!model) throw new Error("vscode_lm_model_not_visible");
+  if (!model.capabilities || !model.capabilities.toolCalling) {
+    return runVscodeLmTextProtocol(model, request, cancellationToken);
   }
   const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites))];
   let sourceGraphAcknowledged = false;
@@ -1788,7 +2063,7 @@ async function runVscodeLmAgent(model, request, cancellationToken) {
     for (const call of calls) {
       let result;
       try {
-        result = await invokeVscodeLmPrivateTool(call);
+        result = await invokeVscodeLmPrivateTool(call, request.requestId);
       } catch (err) {
         result = { ok: false, error: sanitizeErrorMessage(err) };
       }
@@ -1913,7 +2188,12 @@ class VscodeLmBridgeHost {
       let text = "";
       let error = "";
       try { text = await runVscodeLmAgent(model, request, source.token); }
-      catch (err) { error = sanitizeErrorMessage(err); }
+      catch (err) {
+        error = sanitizeErrorMessage(err);
+        if (err && err.protocolPreview) {
+          recordSystemLog(`[glm bridge] rejected response preview ${String(err.protocolPreview).slice(0, 768)}`);
+        }
+      }
       finally { clearTimeout(timer); source.dispose(); }
       atomicWriteOwnerJson(request.responsePath, {
         schema_id: VSCODE_LM_RESPONSE_SCHEMA,
@@ -3335,6 +3615,7 @@ function getHtmlForWebview(webview, extensionUri) {
   const mediaUri = vscode.Uri.joinPath(extensionUri, "media");
   const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "app.js"));
   const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "app.css"));
+  const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(mediaUri, "aiworkhub-icon.png"));
   const nonceValue = nonce();
   const csp = [
     "default-src 'none'",
@@ -3362,8 +3643,9 @@ function getHtmlForWebview(webview, extensionUri) {
   <a class="skip-link" href="#task-table">Skip to task table</a>
 
   <header class="app-header">
-    <div class="brand-block">
-      <div class="brand-mark" aria-hidden="true">G</div>
+    <div class="header-main">
+      <div class="brand-block">
+        <img class="brand-logo" src="${logoUri}" alt="" aria-hidden="true">
       <div>
         <h1>AIWorkHub</h1>
         <p class="repo-label" id="repo-label">Loading repository</p>
@@ -3373,21 +3655,9 @@ function getHtmlForWebview(webview, extensionUri) {
         <span id="extension-version">Extension 0.3.0</span>
         <span id="mcp-runtime-version">MCP runtime checking</span>
       </div>
-    </div>
+      </div>
 
-    <button class="header-storage" id="header-storage" type="button" title="Open detailed storage metrics">
-      <span class="header-storage-label">Storage</span>
-      <strong id="header-storage-managed">Calculating</strong>
-      <span id="header-storage-free">Free —</span>
-    </button>
-
-    <div class="header-tool-use" id="header-source-graph" title="Authenticated Source Graph use across the latest observed worker task runs">
-      <span class="header-storage-label">Source Graph</span>
-      <strong id="header-source-graph-rate">—</strong>
-      <span id="header-source-graph-detail">No evidence</span>
-    </div>
-
-    <div class="header-actions">
+      <div class="header-actions">
       <div class="connection-state" id="connection-state" role="status" aria-live="polite">
         <span class="connection-dot" aria-hidden="true"></span>
         <span id="connection-label">Connecting</span>
@@ -3404,6 +3674,39 @@ function getHtmlForWebview(webview, extensionUri) {
         <option value="60000">60s</option>
       </select>
       <button class="primary-button" id="refresh-button" type="button">Refresh</button>
+      </div>
+    </div>
+
+    <div class="header-insights" aria-label="Repository storage and AI infrastructure status">
+      <button class="header-insight-card header-storage" id="header-storage" type="button" title="Open detailed storage metrics">
+        <span class="header-storage-label">Storage</span>
+        <strong id="header-storage-managed">Calculating</strong>
+        <span id="header-storage-free">Free —</span>
+      </button>
+
+      <div class="header-insight-card header-tool-use" id="header-source-graph" title="Authenticated Source Graph use across the latest observed worker task runs">
+        <span class="header-storage-label">Source Graph</span>
+        <strong id="header-source-graph-rate">—</strong>
+        <span id="header-source-graph-detail">No evidence</span>
+      </div>
+
+      <div class="header-insight-card" id="header-session-manager" title="Session Manager context recovered across latest task runs">
+        <span class="header-storage-label">Session Manager</span>
+        <strong id="header-session-manager-value">—</strong>
+        <span class="header-insight-detail" id="header-session-manager-detail">No evidence</span>
+      </div>
+
+      <div class="header-insight-card" id="header-ai-memory" title="AI Memory evidence across latest task runs">
+        <span class="header-storage-label">AI Memory</span>
+        <strong id="header-ai-memory-value">—</strong>
+        <span class="header-insight-detail" id="header-ai-memory-detail">No evidence</span>
+      </div>
+
+      <div class="header-insight-card" id="header-kb" title="Knowledge Base evidence across latest task runs">
+        <span class="header-storage-label">KB</span>
+        <strong id="header-kb-value">—</strong>
+        <span class="header-insight-detail" id="header-kb-detail">No evidence</span>
+      </div>
     </div>
   </header>
 
@@ -3684,7 +3987,7 @@ class TaskOperationsViewProvider {
   resolveWebviewView(webviewView) {
     sidebarView = webviewView;
     applyWebviewOptions(webviewView.webview, this.extensionUri);
-    webviewView.webview.html = getHtmlForNavigatorWebview(webviewView.webview);
+    webviewView.webview.html = getHtmlForNavigatorWebview(webviewView.webview, this.extensionUri);
 
     const navigatorView = {
       postMessage: (msg) => {
@@ -3770,13 +4073,16 @@ class DashboardViewProvider {
   }
 }
 
-function getHtmlForNavigatorWebview(webview) {
+function getHtmlForNavigatorWebview(webview, extensionUri) {
+  const logoUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(extensionUri, "media", "aiworkhub-icon.png"),
+  );
   const nonceValue = nonce();
   const csp = [
     "default-src 'none'",
     `style-src 'nonce-${nonceValue}'`,
     `script-src 'nonce-${nonceValue}'`,
-    "img-src data:",
+    `img-src ${webview.cspSource} data:`,
     "frame-src 'none'",
     "connect-src 'none'",
     "object-src 'none'",
@@ -3789,13 +4095,13 @@ function getHtmlForNavigatorWebview(webview) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style nonce="${nonceValue}">
 body{margin:0;padding:12px;color:var(--vscode-foreground);background:var(--vscode-sideBar-background);font:var(--vscode-font-size) var(--vscode-font-family)}
-.mark{width:28px;height:28px;margin-bottom:8px}
+.mark{display:block;width:28px;height:28px;margin-bottom:8px;object-fit:contain}
 h1{font-size:13px;margin:0 0 4px}p{margin:0 0 10px;color:var(--vscode-descriptionForeground);line-height:1.4}
 button{width:100%;height:30px;margin:0 0 8px;color:var(--vscode-button-foreground);background:var(--vscode-button-background);border:0;border-radius:4px;font:inherit}
 button.secondary{color:var(--vscode-button-secondaryForeground);background:var(--vscode-button-secondaryBackground)}
 #repo{font-size:11px;word-break:break-word}
 </style></head><body>
-<svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 21 7v10l-9 5-9-5V7l9-5Zm0 3.1L5.7 8.6v6.8l6.3 3.5 6.3-3.5V8.6L12 5.1Zm0 3.2 3.4 1.9v3.6L12 15.7l-3.4-1.9v-3.6L12 8.3Z"/></svg>
+<img class="mark" src="${logoUri}" alt="" aria-hidden="true">
 <h1>AIWorkHub</h1><p id="repo">Repository not selected</p>
 <button id="open" type="button">Open Dashboard</button>
 <button id="select" class="secondary" type="button">Select Repository</button>
@@ -4199,6 +4505,11 @@ module.exports = {
     selectGlm52LanguageModel,
     validateVscodeLmRequest,
     runVscodeLmAgent,
+    runVscodeLmTextProtocol,
+    parseVscodeLmJsonEnvelope,
+    validateVscodeLmFinalEnvelope,
+    vscodeLmPathMatchesPattern,
+    glmTextToolProtocolPrompt,
     VSCODE_LM_PRIVATE_TOOLS,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
@@ -4215,6 +4526,9 @@ module.exports = {
       VSCODE_LM_REQUEST_SCHEMA,
       VSCODE_LM_HOST_SCHEMA,
       VSCODE_LM_RESPONSE_SCHEMA,
+      VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      VSCODE_LM_TOOL_RESULT_SCHEMA,
     },
   },
 };

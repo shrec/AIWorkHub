@@ -141,6 +141,7 @@ def create_request(
     model: str,
     allowed_writes: Iterable[str],
     timeout_seconds: int,
+    source_graph_request: dict[str, Any] | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -162,6 +163,17 @@ def create_request(
     request_path = bridge_root() / "requests" / repo_id / f"{request_id}.json"
     allowed = [str(value) for value in allowed_writes]
     deadline = datetime.now(timezone.utc) + timedelta(seconds=int(timeout_seconds))
+    initial_source_graph_request: dict[str, Any] | None = None
+    if source_graph_request:
+        mode = str(source_graph_request.get("mode") or "focus")
+        query = str(source_graph_request.get("query") or "").strip()
+        if mode not in {"focus", "slice", "bundle"} or not query or len(query) > 512:
+            raise BridgeError("bridge_source_graph_request_invalid")
+        initial_source_graph_request = {"mode": mode, "query": query}
+        for key in ("budget", "target", "bundle_type"):
+            value = source_graph_request.get(key)
+            if value is not None:
+                initial_source_graph_request[key] = value
     shared = {
         "schema_id": REQUEST_SCHEMA_ID,
         "request_id": request_id,
@@ -173,6 +185,7 @@ def create_request(
         "model": model,
         "prompt": prompt,
         "allowed_writes": allowed,
+        "initial_source_graph_request": initial_source_graph_request,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deadline": deadline.isoformat(),
         "response_contract": {

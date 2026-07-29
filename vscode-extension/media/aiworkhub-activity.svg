@@ -1,3 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-  <path d="M12 2 21 7v10l-9 5-9-5V7l9-5Zm0 3.1L5.7 8.6v6.8l6.3 3.5 6.3-3.5V8.6L12 5.1Zm0 3.2 3.4 1.9v3.6L12 15.7l-3.4-1.9v-3.6L12 8.3Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="AIWorkHub">
+  <g fill="none" stroke="currentColor" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 34 73 69v44m55-79 55 35v44"/>
+    <path d="m73 113-31 19v65l54 32 49-28m38-88 31 19v65l-54 32-53-31"/>
+    <path d="M128 92v59m0 0-32-19-24 14v34l28 16m28-45 32-19 25 14v34l-25 16-32-19"/>
+  </g>
+  <g fill="currentColor">
+    <circle cx="128" cy="34" r="14"/>
+    <circle cx="73" cy="113" r="14"/>
+    <circle cx="183" cy="113" r="14"/>
+    <circle cx="42" cy="197" r="14"/>
+    <circle cx="214" cy="197" r="14"/>
+  </g>
 </svg>

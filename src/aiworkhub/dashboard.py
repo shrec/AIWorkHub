@@ -277,6 +277,49 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     return totals
 
 
+def _project_context_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate latest-per-task Session, Memory and KB context evidence."""
+    latest_by_task: dict[str, Mapping[str, Any]] = {}
+    for row in process_report.get("processes") or []:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = str(row.get("task_id") or "").strip()
+        if task_id and task_id not in latest_by_task:
+            latest_by_task[task_id] = row
+
+    components = {
+        name: {
+            "requested_tasks": 0,
+            "executed_tasks": 0,
+            "hit_count": 0,
+            "bytes": 0,
+            "degraded_tasks": 0,
+        }
+        for name in ("session_current_state", "ai_memory", "kb")
+    }
+    for row in latest_by_task.values():
+        infra = row.get("ai_infra_context")
+        if not isinstance(infra, Mapping):
+            continue
+        for name, totals in components.items():
+            section = infra.get(name)
+            if not isinstance(section, Mapping) or not section:
+                continue
+            if section.get("requested"):
+                totals["requested_tasks"] += 1
+            if section.get("executed"):
+                totals["executed_tasks"] += 1
+            totals["hit_count"] += int(section.get("hit_count") or 0)
+            totals["bytes"] += int(section.get("bytes") or 0)
+            if section.get("degraded_reason"):
+                totals["degraded_tasks"] += 1
+    return {
+        "schema_id": "aiworkhub.project_context.telemetry.v1",
+        "observed_tasks": len(latest_by_task),
+        **components,
+    }
+
+
 class DashboardReadError(RuntimeError):
     """A bounded failure from an existing read-only provider."""
 
@@ -865,6 +908,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "agent_processes": {},
             "adapter_readiness": {},
             "source_graph_telemetry": _source_graph_telemetry({}),
+            "project_context_telemetry": _project_context_telemetry({}),
             "callback_bridge_health": {},
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
@@ -1089,6 +1133,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "agent_processes": dict(process_report),
         "adapter_readiness": dict(adapter_readiness),
         "source_graph_telemetry": _source_graph_telemetry(process_report),
+        "project_context_telemetry": _project_context_telemetry(process_report),
         "callback_bridge_health": dict(callback_bridge_health),
         "warnings": {
             "stale": stale_tasks,

@@ -311,6 +311,21 @@ def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_vscode_lm_worker_tool(
+    request_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> dict[str, Any]:
+    """PRIVATE BRIDGE: execute one active GLM call with worker-scoped audit authority."""
+
+    return process_launcher.default_manager().invoke_vscode_lm_worker_tool(
+        request_id=request_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+    )
+
+
+@mcp.tool()
 def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
     """READ-ONLY: bounded shared registry of live AIWorkHub repository routes.
 

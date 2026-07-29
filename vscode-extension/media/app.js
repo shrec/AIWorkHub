@@ -65,6 +65,15 @@ const elements = {
   headerSourceGraph: document.querySelector("#header-source-graph"),
   headerSourceGraphRate: document.querySelector("#header-source-graph-rate"),
   headerSourceGraphDetail: document.querySelector("#header-source-graph-detail"),
+  headerSessionManager: document.querySelector("#header-session-manager"),
+  headerSessionManagerValue: document.querySelector("#header-session-manager-value"),
+  headerSessionManagerDetail: document.querySelector("#header-session-manager-detail"),
+  headerAiMemory: document.querySelector("#header-ai-memory"),
+  headerAiMemoryValue: document.querySelector("#header-ai-memory-value"),
+  headerAiMemoryDetail: document.querySelector("#header-ai-memory-detail"),
+  headerKb: document.querySelector("#header-kb"),
+  headerKbValue: document.querySelector("#header-kb-value"),
+  headerKbDetail: document.querySelector("#header-kb-detail"),
   sourceAlert: document.querySelector("#source-alert"),
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
@@ -295,6 +304,29 @@ function renderSummary(snapshot) {
     elements.headerSourceGraph.title = sourceGraph
       ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${formatBytes(sourceGraph.source_graph_bytes)} · ${violations} policy violations`
       : "Source Graph telemetry unavailable";
+  }
+  const contextTelemetry = snapshot && snapshot.project_context_telemetry
+    && typeof snapshot.project_context_telemetry === "object"
+    ? snapshot.project_context_telemetry
+    : {};
+  for (const [name, card, value, detail] of [
+    ["session_current_state", elements.headerSessionManager, elements.headerSessionManagerValue, elements.headerSessionManagerDetail],
+    ["ai_memory", elements.headerAiMemory, elements.headerAiMemoryValue, elements.headerAiMemoryDetail],
+    ["kb", elements.headerKb, elements.headerKbValue, elements.headerKbDetail],
+  ]) {
+    if (!value || !detail) continue;
+    const telemetry = contextTelemetry[name] && typeof contextTelemetry[name] === "object"
+      ? contextTelemetry[name]
+      : null;
+    const executed = telemetry ? numberValue(telemetry.executed_tasks) : 0;
+    const hits = telemetry ? numberValue(telemetry.hit_count) : 0;
+    const bytes = telemetry ? numberValue(telemetry.bytes) : 0;
+    const degraded = telemetry ? numberValue(telemetry.degraded_tasks) : 0;
+    value.textContent = telemetry ? `${formatCount(hits)} hits` : "No sample";
+    detail.textContent = telemetry ? `${formatCount(executed)} runs · ${formatBytes(bytes)}` : "No evidence";
+    if (card) card.title = telemetry
+      ? `${formatCount(telemetry.requested_tasks)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} hits · ${degraded} degraded`
+      : "Context telemetry unavailable";
   }
 }
 

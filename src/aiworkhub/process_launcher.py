@@ -218,6 +218,23 @@ def sanitized_env(
         safe.update({str(key): str(value) for key, value in provider_env.items()})
     return safe
 
+
+def _glm_vscode_worker_env(
+    provider_env: dict[str, str] | None,
+    package_import_root: Path,
+) -> dict[str, str]:
+    """Return the minimal environment needed by the packaged GLM worker.
+
+    The worker runs as ``python -m aiworkhub.vscode_lm_worker`` from an
+    isolated repository worktree, so the repository cwd cannot make the
+    installed/bundled ``aiworkhub`` package importable.  Reuse the exact
+    package root already resolved and sandbox-rewritten for the worker MCP
+    runtime instead of depending on a developer checkout or global install.
+    """
+    env = dict(provider_env or {})
+    env[worker_ai_tools_mcp.ENV_PYTHONPATH] = str(package_import_root)
+    return env
+
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
 # to pending, or moved it to blocked), the retained workspace is no longer the
@@ -1512,13 +1529,10 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # paths, prompts, or database contents -- only counts and a short reason.
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
     successful = verification.get("successful_call_count_by_tool") or {}
-    # A verified-injected project-context section is an alternative, equally
-    # valid satisfaction source to a live worker call for the SAME required
-    # tool (B948/B951): the launcher already ran the tool and injected its
-    # hash-receipted result, so correct work is no longer failed just because
-    # the worker did not additionally re-run it by hand. Fail-closed integrity
-    # (tampered / repo-mismatched / unacknowledged receipt, degraded section)
-    # is preserved inside _injected_context_satisfaction.
+    # Injected context accelerates startup but does not prove continuous tool
+    # use.  In particular, Source Graph must have a fresh authenticated worker
+    # call during execution; an initial hash-receipted bundle alone can never
+    # satisfy a code task's discovery gate.
     injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
     result["injected_context_acknowledged"] = injected_acknowledged
     satisfaction_by_tool: dict[str, str] = {}
@@ -1535,7 +1549,8 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     if verification.get("live_source_graph_calls", 0) > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
     elif injected_acknowledged and "source_graph" in injected_tools:
-        satisfaction_by_tool["source_graph"] = "injected_receipt"
+        satisfaction_by_tool["source_graph"] = "injected_only_not_sufficient"
+        missing.append("source_graph_live_call")
     elif int(successful.get("source_graph") or 0) > 0:
         satisfaction_by_tool["source_graph"] = "stale_or_cached"
         stale.append("source_graph")
@@ -1553,13 +1568,16 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["missing_tools"] = missing
     result["stale_tools"] = stale
     result["satisfaction_by_tool"] = satisfaction_by_tool
-    if not verification.get("ok") or missing or stale:
+    policy_violations = int(verification.get("policy_violations") or 0)
+    if not verification.get("ok") or missing or stale or policy_violations:
         result["satisfied"] = False
         reasons: list[str] = []
         if missing:
             reasons.append("required_aiworkhub_mcp_calls_missing:" + ",".join(missing))
         if stale:
             reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
+        if policy_violations:
+            reasons.append(f"aiworkhub_tool_policy_violations:{policy_violations}")
         result["reason"] = verification.get("reason") or "; ".join(reasons)
     return result
 
@@ -1632,13 +1650,17 @@ the listed validation commands. Never use git add -A or git add . and never
 touch paths outside allowed_writes.
 
 MANDATORY_AIWORKHUB_TOOLS:
-- For code discovery call aiworkhub_worker_source_graph_query first. Raw Grep,
-  Glob, grep, rg, find and tree discovery are provider-blocked.
+- For code discovery call aiworkhub_worker_source_graph_query first and call it
+  again whenever you need a new symbol, dependency, call path, control-flow,
+  configuration, or file target. Initial injected context is startup material,
+  not a substitute for live Source Graph use. Raw Grep, Glob, grep, rg, find
+  and tree discovery are provider-blocked.
 - Call aiworkhub_worker_session_current_state for continuity. If the contract
   requests AI Memory or KB, call their injected worker tools once with one
   bounded task-specific query.
 - The coordinator verifies an HMAC-authenticated MCP audit ledger and rejects
-  completion when a required call is missing. Text claims cannot satisfy it.
+  completion when a fresh live Source Graph call is missing. An injected
+  receipt or text claim cannot satisfy this execution-time requirement.
 - If Source Graph reports an exact target unsupported/unindexed, stop and
   report that target. Only a new coordinator-authorized fallback card may use
   raw discovery for it.
@@ -2082,6 +2104,8 @@ class ProcessManager:
                 })
 
                 workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                worker_source_graph_targets = _worker_mcp_source_graph_targets(context_result)
+                worker_session_topic = _worker_mcp_session_topic(context_result, topic)
                 worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
                     workspace,
                     request_id=request_id,
@@ -2090,8 +2114,8 @@ class ProcessManager:
                     topic=topic,
                     backend=sandbox_backend,
                     authority_repo=authority_repo,
-                    source_graph_targets=_worker_mcp_source_graph_targets(context_result),
-                    session_topic=_worker_mcp_session_topic(context_result, topic),
+                    source_graph_targets=worker_source_graph_targets,
+                    session_topic=worker_session_topic,
                 )
                 prompt = build_worker_prompt(
                     task_id=task_id,
@@ -2113,6 +2137,11 @@ class ProcessManager:
                         model=str(model or runtime_adapters.GLM_DEFAULT_MODEL),
                         allowed_writes=workspace.allowed_writes,
                         timeout_seconds=timeout_seconds,
+                        source_graph_request=(
+                            (card.get("project_context") or {}).get("source_graph")
+                            if isinstance(card.get("project_context"), dict)
+                            else None
+                        ),
                     )
                     plan = runtime_adapters.RuntimeAdapterPlan(
                         adapter_id=adapter_id,
@@ -2123,6 +2152,10 @@ class ProcessManager:
                         manual_only=False,
                         validation_ok=True,
                         validation_reason="",
+                    )
+                    provider_env = _glm_vscode_worker_env(
+                        provider_env,
+                        worker_mcp_runtime.package_import_root,
                     )
                 else:
                     plan = self._build_adapter(
@@ -2205,6 +2238,8 @@ class ProcessManager:
                         "copilot_mcp_config_path": str(worker_mcp_runtime.copilot_mcp_config_path),
                         "codex_config_toml_path": str(worker_mcp_runtime.codex_config_toml_path),
                         "authority_repo": str(authority_repo),
+                        "source_graph_targets": worker_source_graph_targets,
+                        "session_topic": worker_session_topic,
                     },
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
@@ -3614,6 +3649,84 @@ class ProcessManager:
             "latest_event": latest,
             "liveness": self._liveness_snapshot(latest),
         }
+
+    def invoke_vscode_lm_worker_tool(
+        self,
+        request_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run one GLM bridge tool through the exact task-scoped worker authority.
+
+        The VS Code Language Model API can only call tools through the
+        extension-owned coordinator MCP connection.  This bridge keeps that
+        transport while executing the call with the launched worker's
+        immutable identity and HMAC audit ledger, so completion gates observe
+        genuine worker tool use instead of an unrelated manager-side call.
+        """
+        if not re.fullmatch(r"[a-f0-9]{32}", str(request_id or "")):
+            return {"ok": False, "reason": "worker_bridge_request_id_invalid"}
+        if not isinstance(tool_input, dict):
+            return {"ok": False, "reason": "worker_bridge_input_invalid"}
+        if len(json.dumps(tool_input, ensure_ascii=False).encode("utf-8")) > 16 * 1024:
+            return {"ok": False, "reason": "worker_bridge_input_too_large"}
+        events = self._request_events(request_id)
+        if not events:
+            return {"ok": False, "reason": "worker_bridge_request_not_found"}
+        latest = events[-1]
+        if latest.get("adapter_id") != runtime_adapters.GLM_VSCODE_LM_ADAPTER:
+            return {"ok": False, "reason": "worker_bridge_adapter_mismatch"}
+        if latest.get("state") not in ACTIVE_PROCESS_STATES:
+            return {"ok": False, "reason": "worker_bridge_request_not_active"}
+        metadata_path = self._metadata_from_events(events)
+        if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
+            return {"ok": False, "reason": "worker_bridge_metadata_invalid"}
+        try:
+            if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > 2 * 1024 * 1024:
+                return {"ok": False, "reason": "worker_bridge_metadata_invalid"}
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"ok": False, "reason": "worker_bridge_metadata_unreadable"}
+        if (
+            str(metadata.get("request_id") or "") != request_id
+            or str(metadata.get("adapter_id") or "") != runtime_adapters.GLM_VSCODE_LM_ADAPTER
+        ):
+            return {"ok": False, "reason": "worker_bridge_metadata_identity_mismatch"}
+        worker_meta = metadata.get("worker_mcp") or {}
+        workspace_meta = metadata.get("workspace") or {}
+        try:
+            ctx = worker_ai_tools_mcp.WorkerToolContext(
+                task_id=str(metadata["task_id"]),
+                runner=str(metadata["runner"]),
+                topic=str(metadata["topic"]),
+                request_id=request_id,
+                repo=Path(str(workspace_meta["path"])).resolve(),
+                authority_repo=Path(str(worker_meta["authority_repo"])).resolve(),
+                source_graph_targets=tuple(str(value) for value in worker_meta.get("source_graph_targets") or []),
+                session_topic=str(worker_meta.get("session_topic") or metadata["topic"]),
+                audit_ledger_path=Path(str(worker_meta["audit_ledger_path"])),
+                audit_hmac_key_path=Path(str(worker_meta["audit_hmac_key_path"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "reason": "worker_bridge_context_invalid"}
+
+        if tool_name == "aiworkhub_manager_source_graph_query":
+            return worker_ai_tools_mcp.source_graph_query(ctx, **tool_input)
+        if tool_name == "aiworkhub_manager_session_current_state":
+            return worker_ai_tools_mcp.session_current_state(ctx, limit=tool_input.get("limit", 12))
+        if tool_name == "aiworkhub_manager_ai_memory_search":
+            return worker_ai_tools_mcp.ai_memory_search(
+                ctx, query=tool_input.get("query", ""), limit=tool_input.get("limit", 8)
+            )
+        if tool_name == "aiworkhub_manager_kb_search":
+            return worker_ai_tools_mcp.kb_search(
+                ctx, query=tool_input.get("query", ""), limit=tool_input.get("limit", 8)
+            )
+        if tool_name == "aiworkhub_manager_kb_get":
+            return worker_ai_tools_mcp.kb_get(ctx, key=tool_input.get("key", ""))
+        if tool_name == "aiworkhub_manager_kb_related":
+            return worker_ai_tools_mcp.kb_related(ctx, key=tool_input.get("key", ""))
+        return {"ok": False, "reason": "worker_bridge_tool_not_allowed"}
 
     def collect(self, request_id: str, max_log_bytes: int = MAX_LOG_TAIL_BYTES) -> dict[str, Any]:
         status = self.status(request_id)

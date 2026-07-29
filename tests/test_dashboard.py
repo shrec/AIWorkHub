@@ -361,6 +361,7 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
     assert snapshot["agent_processes"]["processes"][0]["state"] == "review_ready"
     assert snapshot["callback_bridge_health"]["batches"]["inflight_batch_member_count"] == 3
     assert snapshot["callback_bridge_health"]["by_state"]["inflight"] == 1
+    assert "project_context_telemetry" in snapshot
 
     topic_stats = {row["name"]: row for row in snapshot["summaries"]["topics"]}
     assert topic_stats["imagery"]["total"] == 2
@@ -373,6 +374,35 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
         ("list_tasks", "finished"),
         ("list_tasks", "archived"),
     ]
+
+
+def test_project_context_telemetry_uses_latest_run_per_task():
+    report = {
+        "processes": [
+            {
+                "task_id": "TASK_A",
+                "ai_infra_context": {
+                    "session_current_state": {"requested": True, "executed": True, "hit_count": 8, "bytes": 1200},
+                    "ai_memory": {"requested": True, "executed": True, "hit_count": 3, "bytes": 400},
+                    "kb": {"requested": True, "executed": True, "hit_count": 2, "bytes": 300},
+                },
+            },
+            {"task_id": "TASK_A", "ai_infra_context": {"ai_memory": {"hit_count": 99}}},
+            {
+                "task_id": "TASK_B",
+                "ai_infra_context": {
+                    "session_current_state": {"requested": True, "executed": True, "hit_count": 4, "bytes": 600},
+                    "ai_memory": {"requested": True, "executed": True, "hit_count": 0, "bytes": 0},
+                    "kb": {"requested": True, "executed": False, "hit_count": 0, "bytes": 0, "degraded_reason": "unavailable"},
+                },
+            },
+        ]
+    }
+    telemetry = dashboard._project_context_telemetry(report)  # noqa: SLF001
+    assert telemetry["observed_tasks"] == 2
+    assert telemetry["session_current_state"]["hit_count"] == 12
+    assert telemetry["ai_memory"]["hit_count"] == 3
+    assert telemetry["kb"]["degraded_tasks"] == 1
 
 
 def test_callback_bridge_health_batch_stats_never_expose_full_thread_id(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
-  "version": "0.6.77",
+  "version": "0.6.92",
   "publisher": "shrec",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",
