@@ -9,7 +9,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.7.8";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.7.9";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -30,6 +30,8 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "clearSystemLogs",
   "copySystemLogs",
   "requestMemory",
+  "requestSessions",
+  "requestKb",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -45,6 +47,8 @@ const OUTBOUND_TYPES = Object.freeze({
   systemLogs: "systemLogs",
   notification: "notification",
   memory: "memory",
+  sessions: "sessions",
+  kb: "kb",
 });
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
@@ -99,6 +103,8 @@ const DASHBOARD_TOOLS = Object.freeze({
   health: "aiworkhub_dashboard_health",
   liveOutput: "aiworkhub_dashboard_task_live_output",
   memory: "aiworkhub_dashboard_memory",
+  sessions: "aiworkhub_dashboard_sessions",
+  kb: "aiworkhub_dashboard_kb",
 });
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
@@ -4080,6 +4086,32 @@ async function pushMemory(view) {
   }
 }
 
+async function pushSessions(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(DASHBOARD_TOOLS.sessions, { limit: 200 });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.sessions, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function pushKb(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(DASHBOARD_TOOLS.kb, { limit: 200 });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.kb, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 // The sole initialization trigger: one bounded MCP tool call, tied to the
 // active repo_id/window/claim episode -- the window/claim-episode binding is
 // implicit in the AIWORKHUB_WINDOW_ID/AIWORKHUB_CLAIM_EPISODE env vars the
@@ -4214,6 +4246,12 @@ function handleInboundMessage(view, message) {
     }
     case "requestMemory":
       pushMemory(view);
+      break;
+    case "requestSessions":
+      pushSessions(view);
+      break;
+    case "requestKb":
+      pushKb(view);
       break;
     default:
       break;
@@ -4406,8 +4444,20 @@ function getHtmlForWebview(webview, extensionUri) {
     <section class="activity-peek" aria-label="Repository diagnostics">
       <span class="activity-peek-label">Last log</span>
       <span class="activity-peek-message" id="last-system-log">No system events yet</span>
-      <button type="button" id="open-system-log">Logs</button>
-      <button type="button" id="open-ai-memory">Memory</button>
+      <span class="context-view-actions" aria-label="Repository context viewers">
+        <button class="diagnostic-icon-button" type="button" id="open-system-log" title="Open system logs" aria-label="Open system logs">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v13H4zM7 9l2.5 2.5L7 14m5 0h5"/></svg><span>Logs</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-sessions" title="Open Session Manager" aria-label="Open Session Manager">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v5m0 6v5m12-16v5m0 6v5M6 9h12M6 15h12M9 9v6m6-6v6"/></svg><span>Sessions</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-ai-memory" title="Open AI Memory" aria-label="Open AI Memory">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5.5A3 3 0 0 0 4.5 8v1.2A3.5 3.5 0 0 0 5 16v.5A3.5 3.5 0 0 0 9 20m6-14.5A3 3 0 0 1 19.5 8v1.2A3.5 3.5 0 0 1 19 16v.5a3.5 3.5 0 0 1-4 3.5M9 5.5V20m6-14.5V20M9 10h2m2 4h2"/></svg><span>Memory</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-kb" title="Open Knowledge Base" aria-label="Open Knowledge Base">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/></svg><span>KB</span>
+        </button>
+      </span>
     </section>
 
     <section class="target-selector" aria-label="Coordinator routing">
@@ -4606,6 +4656,24 @@ function getHtmlForWebview(webview, extensionUri) {
     </div>
     <input class="dialog-search" id="ai-memory-search" type="search" placeholder="Filter key, value or tags" aria-label="Filter AI Memory">
     <div class="memory-list" id="ai-memory-list"></div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog" id="sessions-dialog">
+    <div class="dialog-heading">
+      <div><h2>Session Manager</h2><span id="sessions-summary">Loading repository sessions</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="sessions-dialog">Close</button>
+    </div>
+    <input class="dialog-search" id="sessions-search" type="search" placeholder="Filter source, kind or content" aria-label="Filter Session Manager entries">
+    <div class="memory-list" id="sessions-list"></div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog" id="kb-dialog">
+    <div class="dialog-heading">
+      <div><h2>Knowledge Base</h2><span id="kb-summary">Loading repository knowledge</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="kb-dialog">Close</button>
+    </div>
+    <input class="dialog-search" id="kb-search" type="search" placeholder="Filter key, title, category, tags or body" aria-label="Filter Knowledge Base entries">
+    <div class="memory-list" id="kb-list"></div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

@@ -82,6 +82,8 @@ DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordi
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
+_PROCESS_REPO_ROOT_OVERRIDE: Path | None = None
 
 # ---------------------------------------------------------------------------
 # B852: canonical, repo-local task-store write layer.
@@ -1282,14 +1284,92 @@ def _resolve_repo_root_env(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _implicit_codex_repository_root() -> Path | None:
+    """Resolve a repo-neutral Codex MCP process from its live chat route.
+
+    Application-global Codex MCP registration intentionally contains no
+    repository path.  A long-lived chat can therefore outlive the cwd from
+    which its MCP child was first spawned.  Prefer the exact live
+    ``provider/thread/window`` route over that stale cwd, while keeping all
+    explicitly repo-bound extension/worker children unchanged.
+    """
+
+    thread_id = ""
+    extension_host_pid = 0
+    if (
+        os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").strip() == "codex_vscode"
+        and (
+            os.environ.get("VSCODE_IPC_HOOK_CLI")
+            or os.environ.get("VSCODE_ESM_ENTRYPOINT")
+            or os.environ.get("VSCODE_AGENT_FOLDER")
+        )
+    ):
+        candidate = os.environ.get("CODEX_THREAD_ID", "").strip()
+        if _UUID_RE.fullmatch(candidate):
+            thread_id = candidate
+    if not thread_id:
+        pid = os.getppid()
+        mux_pid = 0
+        for _ in range(8):
+            if pid <= 1:
+                break
+            proc = Path(f"/proc/{pid}")
+            try:
+                if proc.stat().st_uid != os.geteuid():
+                    return None
+                cmdline = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
+                status = proc.joinpath("status").read_text(encoding="utf-8")
+                parent_pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+            except (OSError, UnicodeDecodeError, StopIteration, ValueError):
+                break
+            if "aiworkhub-app-server-mux" in cmdline.lower():
+                mux_pid = pid
+                break
+            pid = parent_pid
+        if mux_pid:
+            try:
+                from . import app_server_mux
+
+                instances = [
+                    item for item in app_server_mux.list_live_sideband_instances(
+                        app_server_mux.default_sideband_dir()
+                    )
+                    if item.pid == mux_pid and item.ready and item.is_owner_fresh
+                ]
+            except (OSError, RuntimeError, TypeError, ValueError):
+                instances = []
+            if len(instances) == 1:
+                instance = instances[0]
+                candidate = instance.active_thread_id or (
+                    instance.owned_thread_ids[-1] if instance.owned_thread_ids else ""
+                )
+                if _UUID_RE.fullmatch(candidate):
+                    thread_id = candidate
+                    extension_host_pid = int(instance.parent_pid or 0)
+    if not thread_id:
+        return None
+    resolved = shared_router.resolve_repository_route(
+        provider="codex",
+        thread_id=thread_id,
+        extension_host_pid=extension_host_pid,
+    )
+    if not resolved.get("ok"):
+        return None
+    try:
+        return Path(str(resolved["repo_root"])).resolve()
+    except (KeyError, OSError, RuntimeError):
+        return None
+
+
 def repo_root() -> Path:
     """Return the canonical repository binding for this MCP process.
 
     ``AIWORKHUB_REPO_ROOT`` is the installable extension's canonical binding.
-    ``AIWORKHUB_REPO`` remains a legacy alias for old scripts and tests, but it
-    must never silently override the canonical root.  If both are present and
-    resolve to different directories, fail closed: otherwise a manager/worker
-    opened from repository B can accidentally operate on repository A.
+    ``AIWORKHUB_REPO`` remains a legacy explicit binding for old children and
+    tests, but it must never silently override the canonical root.  A manager
+    switch override is process-local and takes precedence over that legacy
+    starting point.  Live Codex route discovery is used only for a genuinely
+    repo-neutral process; it must never steal an explicitly bound child.
     """
     canonical_raw = os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
     legacy_raw = os.environ.get("AIWORKHUB_REPO", "").strip()
@@ -1304,8 +1384,13 @@ def repo_root() -> Path:
                     f"AIWORKHUB_REPO={legacy}"
                 )
         return canonical
+    if _PROCESS_REPO_ROOT_OVERRIDE is not None:
+        return _PROCESS_REPO_ROOT_OVERRIDE
     if legacy_raw:
         return _resolve_repo_root_env(legacy_raw)
+    routed = _implicit_codex_repository_root()
+    if routed is not None:
+        return routed
     return repository_state.resolve_repository_root(require_manifest=False)
 
 
@@ -2292,7 +2377,10 @@ def manager_bootstrap() -> dict[str, Any]:
             "aiworkhub_task_mark_done or aiworkhub_task_reject_review",
         ],
         "callback": {
-            "codex": "pushes to the exact origin thread through the App Server mux",
+            "codex": (
+                "delivers to the repository's current verified Codex manager; "
+                "the originating thread remains immutable audit provenance"
+            ),
             "claude": "call aiworkhub_dispatcher_ensure_started, then aiworkhub_claude_callback_wait and immediately ack",
         },
         "rules": [
@@ -2303,6 +2391,126 @@ def manager_bootstrap() -> dict[str, Any]:
             "Each repository owns its own task database, callback lanes, and runtime capability.",
         ],
     }
+
+
+def repository_current() -> dict[str, Any]:
+    """Return the exact process/repository authority currently in effect."""
+
+    root = repo_root()
+    readiness = task_store.storage_readiness(root)
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    if os.environ.get("AIWORKHUB_REPO_ROOT", "").strip():
+        binding_source = "explicit_repo_child"
+    elif _PROCESS_REPO_ROOT_OVERRIDE is not None:
+        binding_source = "manager_switch"
+    elif os.environ.get("AIWORKHUB_REPO", "").strip():
+        binding_source = "legacy_explicit"
+    elif _implicit_codex_repository_root() is not None:
+        binding_source = "live_codex_route"
+    else:
+        binding_source = "process_cwd"
+    return {
+        "ok": bool(readiness.ready),
+        "schema_id": "aiworkhub.repository_current.v1",
+        "repo_id": str(readiness.repo_id or ""),
+        "repo_root": str(root),
+        "storage_ready": bool(readiness.ready),
+        "storage_reason": str(readiness.reason or ""),
+        "binding_source": binding_source,
+        "manager_verified": bool(identity),
+        "manager_route": identity or {},
+    }
+
+
+def repository_switch(repo_id: str) -> dict[str, Any]:
+    """Atomically bind a repo-neutral Codex manager MCP to one live repo.
+
+    The caller supplies only a manifest ``repo_id``.  The path is resolved
+    from a live shared-router record and must carry this exact verified
+    manager thread/window.  Explicit extension/worker children remain
+    immutable and require their owner to replace the child instead.
+    """
+
+    global _PROCESS_REPO_ROOT_OVERRIDE
+
+    requested = str(repo_id or "").strip()
+    if not _REPO_ID_RE.fullmatch(requested):
+        return {"ok": False, "error": "repo_id_invalid"}
+    if os.environ.get("AIWORKHUB_REPO_ROOT", "").strip():
+        return {"ok": False, "error": "explicit_repo_child_binding_immutable"}
+    identity = _claude_manager_identity() or _codex_manager_identity()
+    if not isinstance(identity, dict):
+        return {"ok": False, "error": "verified_manager_identity_required"}
+    provider = str(identity.get("provider") or "").strip().lower()
+    if provider != "codex":
+        return {"ok": False, "error": "repository_switch_requires_codex_route"}
+    thread_id = str(identity.get("thread_id") or identity.get("session_id") or "").strip()
+    window_id = str(identity.get("window_id") or "").strip()
+    if not _valid_origin_thread_id(thread_id) or not window_id:
+        return {"ok": False, "error": "callback_capable_manager_route_required"}
+    registry = shared_router.list_known_repositories(limit=256)
+    matches = [
+        record for record in registry.get("repositories", [])
+        if isinstance(record, dict)
+        and str(record.get("repo_id") or "") == requested
+        and bool(record.get("extension_host_alive"))
+        and not bool(record.get("stale"))
+    ] if registry.get("ok") else []
+    if len(matches) != 1:
+        return {"ok": False, "error": "repository_route_not_live" if not matches else "repository_route_ambiguous"}
+    record = matches[0]
+    targets = record.get("targets")
+    target = targets.get(provider) if isinstance(targets, dict) else None
+    route = target.get("route") if isinstance(target, dict) else None
+    if not isinstance(route, dict):
+        return {"ok": False, "error": "target_manager_route_missing"}
+    if (
+        str(record.get("window_id") or "") != window_id
+        or str(route.get("thread_id") or "") != thread_id
+        or str(route.get("repo_id") or requested) != requested
+    ):
+        return {"ok": False, "error": "target_route_not_owned_by_current_manager"}
+    try:
+        target_root = Path(str(record.get("repo_root") or "")).resolve()
+        readiness = task_store.storage_readiness(target_root)
+    except (OSError, RuntimeError, task_store.TaskStoreError):
+        return {"ok": False, "error": "target_repository_unavailable"}
+    if not readiness.ready or str(readiness.repo_id or "") != requested:
+        return {"ok": False, "error": "target_repository_identity_mismatch"}
+    current_root = repo_root()
+    if current_root == target_root:
+        return {**repository_current(), "switched": False}
+    previous_override = _PROCESS_REPO_ROOT_OVERRIDE
+    bridge = _callback_bridge_module()
+    daemon = _source_graph_daemon_module()
+    try:
+        bridge.stop_dispatcher(current_root)
+        daemon.stop_daemon(current_root)
+        _PROCESS_REPO_ROOT_OVERRIDE = target_root
+        rebound_identity = _codex_manager_identity()
+        if (
+            not isinstance(rebound_identity, dict)
+            or str(rebound_identity.get("thread_id") or rebound_identity.get("session_id") or "") != thread_id
+        ):
+            raise RuntimeError("target_manager_identity_not_verified")
+        daemon.ensure_started(target_root)
+        callback = dispatcher_ensure_started()
+        if not callback.get("ok") and callback.get("status") not in {"manager_inbox", "started"}:
+            raise RuntimeError(str(callback.get("reason") or callback.get("status") or "callback_start_failed"))
+        return {
+            **repository_current(),
+            "switched": True,
+            "previous_repo_root": str(current_root),
+            "callback": callback,
+        }
+    except (OSError, RuntimeError, task_store.TaskStoreError) as exc:
+        _PROCESS_REPO_ROOT_OVERRIDE = previous_override
+        try:
+            daemon.ensure_started(current_root)
+            dispatcher_ensure_started()
+        except (OSError, RuntimeError, task_store.TaskStoreError):
+            pass
+        return {"ok": False, "error": f"repository_switch_failed:{type(exc).__name__}:{str(exc)[:160]}"}
 
 
 def create_task(
@@ -3702,12 +3910,40 @@ def dispatcher_ensure_started() -> dict[str, Any]:
     if callback_transport == "manager_inbox":
         bridge = _callback_bridge_module()
         bridge.stop_dispatcher(root)
+        manager_identity = _codex_manager_identity() if provider == "codex" else None
+        manager_origin_thread_id = ""
+        if isinstance(manager_identity, dict):
+            candidate = str(
+                manager_identity.get("thread_id")
+                or manager_identity.get("session_id")
+                or ""
+            ).strip()
+            if _valid_origin_thread_id(candidate):
+                manager_origin_thread_id = candidate
+        if not manager_origin_thread_id:
+            provider_target = (
+                target.get("targets", {}).get(provider, {})
+                if isinstance(target.get("targets"), dict) else {}
+            )
+            route = provider_target.get("route", {}) if isinstance(provider_target, dict) else {}
+            candidate = str(
+                route.get("thread_id") or route.get("session_id") or ""
+            ).strip() if isinstance(route, dict) else ""
+            if _valid_origin_thread_id(candidate):
+                manager_origin_thread_id = candidate
         conn = _canonical_connect()
         try:
+            rebound_count = 0
+            if manager_origin_thread_id:
+                rebound_count = callback_store.rebind_pending_callbacks(
+                    conn,
+                    provider=provider,
+                    origin_thread_id=manager_origin_thread_id,
+                )
             seeded_review_callback_count = callback_store.seed_missing_review_callbacks(
                 conn,
                 provider=provider,
-                origin_thread_id=None,
+                origin_thread_id=manager_origin_thread_id or None,
             )
         finally:
             conn.close()
@@ -3719,6 +3955,8 @@ def dispatcher_ensure_started() -> dict[str, Any]:
             "repo": str(root),
             "provider": provider,
             "reason": "native_codex_uses_cooperative_manager_inbox",
+            "manager_route": manager_identity or {},
+            "rebound_callback_count": rebound_count,
             "seeded_review_callback_count": seeded_review_callback_count,
         }
     if claude_identity is not None and provider == "claude":

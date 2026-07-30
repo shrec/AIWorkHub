@@ -42,6 +42,8 @@ const state = {
   liveOutputTimer: null,
   systemLogs: [],
   memoryEntries: [],
+  sessionEntries: [],
+  kbEntries: [],
   returnPage: 0,
   returnSearch: "",
   returnTopic: "all",
@@ -124,6 +126,16 @@ const elements = {
   aiMemorySummary: document.querySelector("#ai-memory-summary"),
   aiMemorySearch: document.querySelector("#ai-memory-search"),
   aiMemoryList: document.querySelector("#ai-memory-list"),
+  openSessions: document.querySelector("#open-sessions"),
+  sessionsDialog: document.querySelector("#sessions-dialog"),
+  sessionsSummary: document.querySelector("#sessions-summary"),
+  sessionsSearch: document.querySelector("#sessions-search"),
+  sessionsList: document.querySelector("#sessions-list"),
+  openKb: document.querySelector("#open-kb"),
+  kbDialog: document.querySelector("#kb-dialog"),
+  kbSummary: document.querySelector("#kb-summary"),
+  kbSearch: document.querySelector("#kb-search"),
+  kbList: document.querySelector("#kb-list"),
   returnList: document.querySelector("#return-list"),
   returnSearch: document.querySelector("#return-search"),
   returnTopic: document.querySelector("#return-topic"),
@@ -880,7 +892,7 @@ function renderMemoryEntries() {
     const heading = createElement("div", "memory-entry-heading");
     heading.append(
       createElement("strong", "memory-key", String(entry.key || "Untitled memory")),
-      createElement("span", "memory-scope", String(entry.scope || "persistent")),
+      createElement("span", "memory-scope", `${String(entry.scope || "persistent")} · ${String(entry.status || "active")}`),
     );
     const meta = [entry.tags, entry.updated_at ? new Date(entry.updated_at).toLocaleString() : ""].filter(Boolean).join(" · ");
     article.append(heading, createElement("p", "memory-value", String(entry.value || "")));
@@ -900,6 +912,86 @@ function renderMemory(payload) {
   state.memoryEntries = asArray(payload.entries);
   elements.aiMemorySummary.textContent = `${formatCount(payload.total)} stored · showing ${formatCount(payload.count)}`;
   renderMemoryEntries();
+}
+
+function renderSessionEntries() {
+  const query = String(elements.sessionsSearch.value || "").trim().toLocaleLowerCase();
+  const filtered = state.sessionEntries.filter((entry) => {
+    if (!query) return true;
+    return [entry.source_id, entry.kind, entry.content]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  });
+  if (!filtered.length) {
+    elements.sessionsList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching session evidence" : "No session evidence"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of filtered) {
+    const article = createElement("article", "memory-entry context-entry");
+    const heading = createElement("div", "memory-entry-heading");
+    heading.append(
+      createElement("strong", "memory-key", String(entry.source_id || "Session event")),
+      createElement("span", "memory-scope", String(entry.kind || "event")),
+    );
+    article.append(heading, createElement("p", "memory-value", String(entry.content || "")));
+    if (entry.timestamp) article.appendChild(createElement("time", "memory-meta", new Date(entry.timestamp).toLocaleString()));
+    fragment.appendChild(article);
+  }
+  elements.sessionsList.replaceChildren(fragment);
+}
+
+function renderSessions(payload) {
+  if (!payload || payload.ok === false) {
+    state.sessionEntries = [];
+    elements.sessionsSummary.textContent = (payload && payload.error) || "Session Manager unavailable";
+    renderSessionEntries();
+    return;
+  }
+  state.sessionEntries = asArray(payload.entries);
+  elements.sessionsSummary.textContent = `${formatCount(payload.total)} stored · showing ${formatCount(payload.count)}`;
+  renderSessionEntries();
+}
+
+function renderKbEntries() {
+  const query = String(elements.kbSearch.value || "").trim().toLocaleLowerCase();
+  const filtered = state.kbEntries.filter((entry) => {
+    if (!query) return true;
+    return [entry.key, entry.title, entry.category, entry.tags, entry.body, entry.source_refs]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(query));
+  });
+  if (!filtered.length) {
+    elements.kbList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching knowledge" : "Knowledge Base is empty"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of filtered) {
+    const article = createElement("article", "memory-entry context-entry");
+    const heading = createElement("div", "memory-entry-heading");
+    heading.append(
+      createElement("strong", "memory-key", String(entry.title || entry.key || "Knowledge entry")),
+      createElement("span", "memory-scope", `${String(entry.category || "knowledge")} · ${String(entry.status || "active")}`),
+    );
+    const key = entry.title && entry.key ? createElement("span", "memory-meta", String(entry.key)) : null;
+    if (key) article.append(heading, key);
+    else article.appendChild(heading);
+    article.appendChild(createElement("p", "memory-value", String(entry.body || "")));
+    const meta = [entry.tags, entry.source_refs].filter(Boolean).join(" · ");
+    if (meta) article.appendChild(createElement("span", "memory-meta", meta));
+    fragment.appendChild(article);
+  }
+  elements.kbList.replaceChildren(fragment);
+}
+
+function renderKb(payload) {
+  if (!payload || payload.ok === false) {
+    state.kbEntries = [];
+    elements.kbSummary.textContent = (payload && payload.error) || "Knowledge Base unavailable";
+    renderKbEntries();
+    return;
+  }
+  state.kbEntries = asArray(payload.entries);
+  elements.kbSummary.textContent = `${formatCount(payload.total)} stored · showing ${formatCount(payload.count)}`;
+  renderKbEntries();
 }
 
 function taskSignalRow(task, badgeText, badgeClass) {
@@ -2075,6 +2167,12 @@ window.addEventListener("message", (event) => {
     case "memory":
       renderMemory(message.payload);
       break;
+    case "sessions":
+      renderSessions(message.payload);
+      break;
+    case "kb":
+      renderKb(message.payload);
+      break;
     case "coordinatorTargets": {
       renderCoordinatorTargets(message.payload);
       break;
@@ -2253,6 +2351,22 @@ elements.openAiMemory.addEventListener("click", () => {
 });
 
 elements.aiMemorySearch.addEventListener("input", renderMemoryEntries);
+
+elements.openSessions.addEventListener("click", () => {
+  elements.sessionsDialog.showModal();
+  elements.sessionsSummary.textContent = "Loading repository sessions";
+  vscode.postMessage({ type: "requestSessions" });
+});
+
+elements.sessionsSearch.addEventListener("input", renderSessionEntries);
+
+elements.openKb.addEventListener("click", () => {
+  elements.kbDialog.showModal();
+  elements.kbSummary.textContent = "Loading repository knowledge";
+  vscode.postMessage({ type: "requestKb" });
+});
+
+elements.kbSearch.addEventListener("input", renderKbEntries);
 
 document.querySelectorAll("[data-close-dialog]").forEach((button) => {
   button.addEventListener("click", () => document.querySelector(`#${button.dataset.closeDialog}`).close());

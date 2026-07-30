@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "publisher": "shrec",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",
@@ -34,7 +34,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "test": "node test/extension-static.test.js && node test/multirepo-connecting.test.js && node test/stable-runtime-upgrade.test.js && node test/reloadless-runtime-repair.test.js && node test/codex-config-toml-runtime-migration.test.js && node test/codex-callback-mux-autoconfig.test.js && node test/codex-route-publication-reload-b1008.test.js && node test/codex-route-post-mux-ready-b1017.test.js && node test/workspace-mcp-runtime-repair.test.js && node test/explicit-init-no-fallback.test.js && node test/live-output-formatting.test.js && node test/storage-dashboard.test.js && node test/system-log-dashboard.test.js && node test/tool-use-dashboard.test.js && node test/review-inbox-observability.test.js && node test/window-route-lease-renewal-b905.test.js && node test/windows-mcp-child-preflight-b916.test.js && node test/cross-plugin-failsafe-exact-child-ownership-b971.test.js && node test/glm-vscode-lm-bridge.test.js",
+    "test": "node test/extension-static.test.js && node test/multirepo-connecting.test.js && node test/stable-runtime-upgrade.test.js && node test/reloadless-runtime-repair.test.js && node test/codex-config-toml-runtime-migration.test.js && node test/codex-callback-mux-autoconfig.test.js && node test/codex-route-publication-reload-b1008.test.js && node test/codex-route-post-mux-ready-b1017.test.js && node test/workspace-mcp-runtime-repair.test.js && node test/explicit-init-no-fallback.test.js && node test/live-output-formatting.test.js && node test/storage-dashboard.test.js && node test/system-log-dashboard.test.js && node test/context-viewers.test.js && node test/tool-use-dashboard.test.js && node test/review-inbox-observability.test.js && node test/window-route-lease-renewal-b905.test.js && node test/windows-mcp-child-preflight-b916.test.js && node test/cross-plugin-failsafe-exact-child-ownership-b971.test.js && node test/glm-vscode-lm-bridge.test.js",
     "test:multirepo-connecting": "node test/multirepo-connecting.test.js",
     "test:reloadless-runtime-repair": "node test/reloadless-runtime-repair.test.js",
     "package": "node test/package-vsix.js"

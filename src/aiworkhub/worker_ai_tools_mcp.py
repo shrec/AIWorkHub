@@ -86,7 +86,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 try:
     from .platform_io import chmod_fd
@@ -132,6 +132,8 @@ SOURCE_GRAPH_MODES: tuple[str, ...] = ("focus", "slice", "bundle")
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
+SourceGraphMode = Literal["focus", "slice", "bundle"]
+SourceGraphBundleType = Literal["bugfix", "feature", "refactor", "audit", "optimize", "explore"]
 MAX_QUERY_BYTES = 512
 MAX_KEY_BYTES = 256
 MIN_BUDGET = 8
@@ -243,6 +245,12 @@ def _open_readonly_db(path: Path, *, tool: str) -> sqlite3.Connection:
     except sqlite3.Error as exc:
         raise WorkerToolError(f"tool_db_unopenable:{tool}:{exc}") from exc
     return con
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
 def _bounded_text(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -677,11 +685,11 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
-    mode: str,
+    mode: SourceGraphMode,
     query: str,
     budget: int = 64,
     target: str | None = None,
-    bundle_type: str = "explore",
+    bundle_type: SourceGraphBundleType = "explore",
 ) -> dict[str, Any]:
     """Bounded Source Graph focus/slice/bundle discovery, scoped to this task.
 
@@ -697,9 +705,14 @@ def source_graph_query(
 
     tool = "source_graph"
     if mode not in SOURCE_GRAPH_MODES:
-        return _violation(ctx, tool, f"invalid_mode:{mode}")
+        result = _violation(ctx, tool, f"invalid_mode:{mode}")
+        result["allowed_modes"] = list(SOURCE_GRAPH_MODES)
+        result["example"] = {"mode": "focus", "query": "symbol or behavior", "budget": 64}
+        return result
     if bundle_type not in SOURCE_GRAPH_BUNDLE_TYPES:
-        return _violation(ctx, tool, f"invalid_bundle_type:{bundle_type}")
+        result = _violation(ctx, tool, f"invalid_bundle_type:{bundle_type}")
+        result["allowed_bundle_types"] = list(SOURCE_GRAPH_BUNDLE_TYPES)
+        return result
     bounded_query = _bounded_query(query)
     if bounded_query is None:
         return _violation(ctx, tool, "invalid_query")
@@ -898,12 +911,22 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         rows: list[sqlite3.Row] = []
         match_expr = _fts_match_expr(bounded)
         if match_expr is not None:
-            rows = con.execute(
-                "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
-                "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
-                (match_expr, limit),
-            ).fetchall()
+            if _table_exists(con, "context_entity_state"):
+                rows = con.execute(
+                    "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
+                    "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
+                    "LEFT JOIN context_entity_state s ON s.entity_type='memory' AND s.entity_id=m.id "
+                    "WHERE memories_fts MATCH ? AND COALESCE(s.status,'active')='active' "
+                    "ORDER BY rank LIMIT ?",
+                    (match_expr, limit),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT m.key AS key, m.value AS value, m.tags AS tags, m.scope AS scope "
+                    "FROM memories m JOIN memories_fts f ON m.id = f.rowid "
+                    "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (match_expr, limit),
+                ).fetchall()
     except sqlite3.Error as exc:
         return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
     finally:
@@ -923,6 +946,81 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
         "content": text, "cache_hit": False,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
     }
+
+
+def _ai_memory_exact(ctx: WorkerToolContext, *, key: str, related: bool) -> dict[str, Any]:
+    tool = "ai_memory_related" if related else "ai_memory_get"
+    bounded = _bounded_query(key, max_bytes=MAX_KEY_BYTES)
+    if bounded is None:
+        return _violation(ctx, tool, "invalid_key")
+    try:
+        binding = _resolve_authority_db(ctx, component="memory", db_id="memory")
+        con = _open_readonly_db(binding.db_path, tool=tool)
+    except WorkerToolError as exc:
+        return _violation(ctx, tool, str(exc)[:160])
+    try:
+        has_state = _table_exists(con, "context_entity_state")
+        state_join = (
+            "LEFT JOIN context_entity_state s ON s.entity_type='memory' AND s.entity_id=m.id "
+            if has_state else ""
+        )
+        state_filter = "AND COALESCE(s.status,'active')='active' " if has_state else ""
+        row = con.execute(
+            "SELECT m.id,m.key,m.value,m.tags,m.scope FROM memories m " + state_join +
+            "WHERE m.key=? " + state_filter + "ORDER BY m.id DESC LIMIT 1",
+            (bounded,),
+        ).fetchone()
+        if not related:
+            payload = {"memory": dict(row) if row is not None else None, "count": 1 if row is not None else 0}
+        elif row is None:
+            payload = {"related": [], "count": 0}
+        else:
+            seen = {bounded}
+            candidates: list[dict[str, Any]] = []
+            for tag in (item.strip() for item in str(row["tags"] or "").split(",") if item.strip()):
+                rows = con.execute(
+                    "SELECT m.id,m.key,m.value,m.tags,m.scope FROM memories m " + state_join +
+                    "WHERE m.key<>? AND (',' || m.tags || ',') LIKE ? " + state_filter +
+                    "ORDER BY m.id DESC LIMIT 8",
+                    (bounded, f"%,{tag},%"),
+                ).fetchall()
+                for candidate in rows:
+                    if candidate["key"] not in seen:
+                        seen.add(candidate["key"])
+                        candidates.append(dict(candidate))
+                        if len(candidates) >= 8:
+                            break
+                if len(candidates) >= 8:
+                    break
+            payload = {"related": candidates, "count": len(candidates)}
+    except sqlite3.Error as exc:
+        return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
+    finally:
+        con.close()
+    text, truncated = _bounded_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), 8 * 1024)
+    hit_count = int(payload.get("count") or 0)
+    bytes_returned = len(text.encode("utf-8"))
+    _append_audit(
+        ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count,
+        bytes_returned=bytes_returned, authority_source=binding.authority_source,
+        authority_state=binding.authority_state,
+    )
+    return {
+        "ok": True, "tool": tool, "key": bounded, "truncated": truncated,
+        "hit_count": hit_count, "bytes": bytes_returned, "content": text,
+        "cache_hit": False, "authority_source": binding.authority_source,
+        "authority_state": binding.authority_state,
+    }
+
+
+def ai_memory_get(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
+    """Bounded exact lookup of one active canonical AI Memory entry."""
+    return _ai_memory_exact(ctx, key=key, related=False)
+
+
+def ai_memory_related(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
+    """Bounded active memories sharing one or more normalized tags."""
+    return _ai_memory_exact(ctx, key=key, related=True)
 
 
 def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_label: str) -> dict[str, Any]:
@@ -963,24 +1061,37 @@ def _kb_invoke(ctx: WorkerToolContext, *, subcommand: str, argument: str, tool_l
 
 
 def _kb_query(con: sqlite3.Connection, *, subcommand: str, argument: str) -> dict[str, Any]:
+    has_state = _table_exists(con, "context_entity_state")
     if subcommand == "search":
         match_expr = _fts_match_expr(argument)
         rows: list[sqlite3.Row] = []
         if match_expr is not None:
+            state_join = (
+                "LEFT JOIN context_entity_state s ON s.entity_type='kb' AND s.entity_id=e.id "
+                if has_state else ""
+            )
+            state_filter = "AND COALESCE(s.status,'active')='active' " if has_state else ""
             rows = con.execute(
                 "SELECT e.key AS key, e.title AS title, e.category AS category, "
                 "e.tags AS tags, e.body AS body FROM entries e "
-                "JOIN entries_fts f ON e.id = f.rowid WHERE entries_fts MATCH ? "
-                "ORDER BY rank LIMIT 8",
+                "JOIN entries_fts f ON e.id = f.rowid " + state_join +
+                "WHERE entries_fts MATCH ? " + state_filter + "ORDER BY rank LIMIT 8",
                 (match_expr,),
             ).fetchall()
         return {"results": [dict(row) for row in rows], "count": len(rows)}
 
     if subcommand == "get":
-        row = con.execute(
-            "SELECT key, title, body, category, tags, source_refs FROM entries WHERE key=?",
-            (argument,),
-        ).fetchone()
+        if has_state:
+            row = con.execute(
+                "SELECT e.key,e.title,e.body,e.category,e.tags,e.source_refs FROM entries e "
+                "LEFT JOIN context_entity_state s ON s.entity_type='kb' AND s.entity_id=e.id "
+                "WHERE e.key=? AND COALESCE(s.status,'active')='active'", (argument,),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT key, title, body, category, tags, source_refs FROM entries WHERE key=?",
+                (argument,),
+            ).fetchone()
         return {"entry": dict(row) if row is not None else None, "count": 1 if row is not None else 0}
 
     # subcommand == "related"
@@ -1234,6 +1345,8 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
+    "aiworkhub_worker_ai_memory_get",
+    "aiworkhub_worker_ai_memory_related",
     "aiworkhub_worker_kb_search",
     "aiworkhub_worker_kb_get",
     "aiworkhub_worker_kb_related",
@@ -1250,8 +1363,8 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
 
     @mcp.tool(name="aiworkhub_worker_source_graph_query")
     def _source_graph_query(
-        mode: str, query: str, budget: int = 64,
-        target: str | None = None, bundle_type: str = "explore",
+        mode: SourceGraphMode, query: str, budget: int = 64,
+        target: str | None = None, bundle_type: SourceGraphBundleType = "explore",
     ) -> dict[str, Any]:
         """Bounded Source Graph focus/slice/bundle discovery for this task."""
         return source_graph_query(ctx, mode=mode, query=query, budget=budget, target=target, bundle_type=bundle_type)
@@ -1265,6 +1378,16 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     def _ai_memory_search(query: str, limit: int = 8) -> dict[str, Any]:
         """Bounded AI Memory search."""
         return ai_memory_search(ctx, query=query, limit=limit)
+
+    @mcp.tool(name="aiworkhub_worker_ai_memory_get")
+    def _ai_memory_get(key: str) -> dict[str, Any]:
+        """Bounded AI Memory exact-key lookup."""
+        return ai_memory_get(ctx, key=key)
+
+    @mcp.tool(name="aiworkhub_worker_ai_memory_related")
+    def _ai_memory_related(key: str) -> dict[str, Any]:
+        """Bounded AI Memory related-entry lookup."""
+        return ai_memory_related(ctx, key=key)
 
     @mcp.tool(name="aiworkhub_worker_kb_search")
     def _kb_search(query: str, limit: int = 8) -> dict[str, Any]:

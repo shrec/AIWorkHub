@@ -286,8 +286,15 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
     ctx = _ctx(repo, home=tmp_path / "home")
-    assert w.source_graph_query(ctx, mode="grep", query="x")["reason"].startswith("invalid_mode")
-    assert w.source_graph_query(ctx, mode="focus", query="x", bundle_type="hack")["reason"].startswith("invalid_bundle_type")
+    invalid_mode = w.source_graph_query(ctx, mode="grep", query="x")
+    assert invalid_mode["reason"].startswith("invalid_mode")
+    assert invalid_mode["allowed_modes"] == ["focus", "slice", "bundle"]
+    assert invalid_mode["example"]["mode"] == "focus"
+    invalid_bundle = w.source_graph_query(ctx, mode="focus", query="x", bundle_type="hack")
+    assert invalid_bundle["reason"].startswith("invalid_bundle_type")
+    assert invalid_bundle["allowed_bundle_types"] == [
+        "bugfix", "feature", "refactor", "audit", "optimize", "explore",
+    ]
 
 
 # ---------------------------------------------------------------------------

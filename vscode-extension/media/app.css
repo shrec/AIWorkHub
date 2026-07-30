@@ -1274,7 +1274,7 @@ tbody tr.is-selected td:first-child {
 
 .activity-peek {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   min-height: 31px;
   align-items: center;
   gap: 8px;
@@ -1334,6 +1334,8 @@ tbody tr.is-selected td:first-child {
 @media (max-width: 720px) {
   .callback-observability { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .return-toolbar { grid-template-columns: 1fr 1fr; }
+  .diagnostic-icon-button span { display: none; }
+  .activity-peek .diagnostic-icon-button { padding: 4px; }
 }
 
 .activity-peek-label {
@@ -1359,6 +1361,39 @@ tbody tr.is-selected td:first-child {
   color: var(--ink);
   font: inherit;
   cursor: pointer;
+}
+
+.context-view-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.activity-peek .diagnostic-icon-button {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-color: color-mix(in srgb, var(--line) 82%, var(--accent));
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.activity-peek .diagnostic-icon-button:hover {
+  color: var(--vscode-button-foreground, var(--ink));
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.diagnostic-icon-button svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .diagnostic-dialog {
@@ -1431,6 +1466,11 @@ tbody tr.is-selected td:first-child {
   border-radius: 4px;
   margin-bottom: 7px;
   background: var(--surface-subtle);
+}
+
+.context-entry .memory-value {
+  max-height: 180px;
+  overflow: auto;
 }
 
 .memory-entry-heading {

@@ -3,8 +3,10 @@
 The mux is deliberately small and import-safe.  It models the invariants the
 VS Code extension must preserve: a window has exactly one active repository
 session, route identities include repository and claim-episode scope, and
-callbacks are durable by origin instead of rebound to whichever repository is
-currently selected.
+callbacks remain durable inside their repository.  A repository manager
+handoff may change delivery ownership within that same repository while the
+origin route remains immutable audit provenance; cross-repository rebinding is
+never valid.
 """
 
 from __future__ import annotations

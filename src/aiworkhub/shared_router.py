@@ -170,3 +170,65 @@ def list_known_repositories(
         "inactive": inactive[:16],
         "rejects": rejects[:16],
     }
+
+
+def resolve_repository_route(
+    *,
+    provider: str,
+    thread_id: str,
+    extension_host_pid: int = 0,
+) -> dict[str, Any]:
+    """Resolve one live repository for an already-observed chat route.
+
+    This is deliberately an identity lookup, not a path selector.  The caller
+    supplies a provider/thread identity learned from its own transport; roots
+    are accepted only from valid, live shared-registry records whose manifest
+    still contains the advertised ``repo_id``.  Zero hits and ambiguity both
+    fail closed.
+    """
+
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_thread = str(thread_id or "").strip()
+    if normalized_provider not in {"codex", "claude", "copilot"}:
+        return {"ok": False, "error": "provider_invalid", "matches": 0}
+    if not normalized_thread:
+        return {"ok": False, "error": "thread_id_missing", "matches": 0}
+    registry = list_known_repositories(limit=256)
+    if not registry.get("ok"):
+        return {"ok": False, "error": str(registry.get("error") or "registry_unavailable"), "matches": 0}
+    matches: list[dict[str, Any]] = []
+    for record in registry.get("repositories", []):
+        if not isinstance(record, dict):
+            continue
+        if not bool(record.get("extension_host_alive")) or bool(record.get("stale")):
+            continue
+        if extension_host_pid > 1 and int(record.get("extension_host_pid") or 0) != extension_host_pid:
+            continue
+        targets = record.get("targets")
+        target = targets.get(normalized_provider) if isinstance(targets, dict) else None
+        route = target.get("route") if isinstance(target, dict) else None
+        if not isinstance(route, dict):
+            continue
+        if str(route.get("thread_id") or "").strip() != normalized_thread:
+            continue
+        if str(route.get("repo_id") or record.get("repo_id") or "") != str(record.get("repo_id") or ""):
+            continue
+        matches.append(record)
+    if len(matches) != 1:
+        return {
+            "ok": False,
+            "error": "route_not_observed" if not matches else "route_ambiguous",
+            "matches": len(matches),
+        }
+    match = matches[0]
+    return {
+        "ok": True,
+        "schema_id": "aiworkhub.shared_repo_resolution.v1",
+        "repo_id": str(match["repo_id"]),
+        "repo_name": str(match["repo_name"]),
+        "repo_root": str(match["repo_root"]),
+        "window_id": str(match.get("window_id") or ""),
+        "extension_host_pid": int(match.get("extension_host_pid") or 0),
+        "provider": normalized_provider,
+        "thread_id": normalized_thread,
+    }

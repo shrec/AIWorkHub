@@ -181,6 +181,16 @@ def test_stdlib_fallback_schema_generation_covers_every_registered_tool(fallback
         assert isinstance(schema["properties"], dict)
 
 
+def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_module):
+    server_module = fallback_server_module
+    func = server_module.mcp._tools["aiworkhub_manager_source_graph_query"]
+    schema = server_module._stdio_schema_for(func)
+    assert schema["properties"]["mode"]["enum"] == ["focus", "slice", "bundle"]
+    assert schema["properties"]["bundle_type"]["enum"] == [
+        "bugfix", "feature", "refactor", "audit", "optimize", "explore",
+    ]
+
+
 def test_stdlib_fallback_rejects_unknown_tool_and_unknown_method(fallback_server_module):
     server_module = fallback_server_module
     tools = server_module.mcp._tools

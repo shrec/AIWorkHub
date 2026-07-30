@@ -59,6 +59,9 @@ _DETAIL_TRIM_FIELDS: tuple[str, ...] = (
 MAX_LIVE_OUTPUT_BYTES = 64 * 1024
 MAX_MEMORY_ROWS = 200
 MAX_MEMORY_VALUE_CHARS = 4000
+MAX_SESSION_ROWS = 200
+MAX_KB_ROWS = 200
+MAX_CONTEXT_VALUE_CHARS = 4000
 
 # The ONE genuine "repository has never been initialized" reason prefix
 # ``task_store.storage_readiness`` can produce: ``inspect_repository`` raised
@@ -261,10 +264,31 @@ def memory_view(limit: int = 100) -> dict[str, Any]:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            required = {"id", "key", "value", "tags", "scope"}
+            if not required.issubset(columns):
+                raise sqlite3.OperationalError("memory_schema_missing_required_columns")
+            project_expr = "m.project AS project" if "project" in columns else "'' AS project"
+            created_expr = "m.created_at AS created_at" if "created_at" in columns else "'' AS created_at"
+            updated_expr = "m.updated_at AS updated_at" if "updated_at" in columns else "'' AS updated_at"
+            order_column = "updated_at" if "updated_at" in columns else (
+                "created_at" if "created_at" in columns else "id"
+            )
+            has_state = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_entity_state'"
+            ).fetchone() is not None
+            state_join = (
+                "LEFT JOIN context_entity_state s ON s.entity_type='memory' AND s.entity_id=m.id "
+                if has_state else ""
+            )
+            state_expr = "COALESCE(s.status,'active') AS status" if has_state else "'active' AS status"
             total = int(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
             rows = connection.execute(
-                "SELECT id, key, value, tags, scope, project, created_at, updated_at "
-                "FROM memories ORDER BY updated_at DESC, id DESC LIMIT ?",
+                f"SELECT m.id,m.key,m.value,m.tags,m.scope,{project_expr},{created_expr},"
+                f"{updated_expr},{state_expr} FROM memories m {state_join}"
+                f"ORDER BY m.{order_column} DESC,m.id DESC LIMIT ?",
                 (safe_limit,),
             ).fetchall()
         finally:
@@ -286,10 +310,125 @@ def memory_view(limit: int = 100) -> dict[str, Any]:
         "project": str(row["project"] or "")[:200],
         "created_at": str(row["created_at"] or "")[:80],
         "updated_at": str(row["updated_at"] or "")[:80],
+        "status": str(row["status"] or "active")[:32],
     } for row in rows]
     return {
         "ok": True,
         "server_tool": "aiworkhub_dashboard_memory",
+        "entries": entries,
+        "count": len(entries),
+        "total": total,
+        "truncated": total > len(entries),
+        "authority_flags": _readonly_authority_flags(),
+    }
+
+
+def session_view(limit: int = 100) -> dict[str, Any]:
+    """READ-ONLY: newest canonical Session Manager transcript evidence.
+
+    Session continuity is represented by the canonical transcript graph's
+    bounded ``documents`` rows. The dashboard never opens a legacy session
+    file and never mutates access/checkpoint state while browsing.
+    """
+
+    try:
+        safe_limit = max(1, min(int(limit), MAX_SESSION_ROWS))
+    except (TypeError, ValueError):
+        safe_limit = 100
+    try:
+        root = core.repo_root()
+        registry = storage_registry.load_storage_registry(root)
+        db_path = storage_registry.resolve_database_path(registry, "transcript")
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            total = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+            rows = connection.execute(
+                "SELECT doc_id, source_id, timestamp, kind, content FROM documents "
+                "ORDER BY timestamp DESC, doc_id DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
+        return {
+            "ok": False,
+            "error": f"sessions_unavailable:{type(exc).__name__}",
+            "entries": [],
+            "total": 0,
+            "authority_flags": _readonly_authority_flags(),
+        }
+    entries = [{
+        "id": int(row["doc_id"]),
+        "source_id": str(row["source_id"] or "")[:300],
+        "timestamp": str(row["timestamp"] or "")[:80],
+        "kind": str(row["kind"] or "")[:80],
+        "content": str(row["content"] or "")[:MAX_CONTEXT_VALUE_CHARS],
+    } for row in rows]
+    return {
+        "ok": True,
+        "server_tool": "aiworkhub_dashboard_sessions",
+        "entries": entries,
+        "count": len(entries),
+        "total": total,
+        "truncated": total > len(entries),
+        "authority_flags": _readonly_authority_flags(),
+    }
+
+
+def kb_view(limit: int = 100) -> dict[str, Any]:
+    """READ-ONLY: newest canonical repository KB entries."""
+
+    try:
+        safe_limit = max(1, min(int(limit), MAX_KB_ROWS))
+    except (TypeError, ValueError):
+        safe_limit = 100
+    try:
+        root = core.repo_root()
+        registry = storage_registry.load_storage_registry(root)
+        db_path = storage_registry.resolve_database_path(registry, "kb")
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            total = int(connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0])
+            has_state = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_entity_state'"
+            ).fetchone() is not None
+            if has_state:
+                rows = connection.execute(
+                    "SELECT e.id,e.key,e.title,e.body,e.category,e.tags,e.source_refs,"
+                    "COALESCE(s.status,'active') status FROM entries e "
+                    "LEFT JOIN context_entity_state s ON s.entity_type='kb' AND s.entity_id=e.id "
+                    "ORDER BY e.id DESC LIMIT ?", (safe_limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT id,key,title,body,category,tags,source_refs,'active' status "
+                    "FROM entries ORDER BY id DESC LIMIT ?", (safe_limit,),
+                ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
+        return {
+            "ok": False,
+            "error": f"kb_unavailable:{type(exc).__name__}",
+            "entries": [],
+            "total": 0,
+            "authority_flags": _readonly_authority_flags(),
+        }
+    entries = [{
+        "id": int(row["id"]),
+        "key": str(row["key"] or "")[:300],
+        "title": str(row["title"] or "")[:500],
+        "body": str(row["body"] or "")[:MAX_CONTEXT_VALUE_CHARS],
+        "category": str(row["category"] or "")[:120],
+        "tags": str(row["tags"] or "")[:500],
+        "source_refs": str(row["source_refs"] or "")[:1000],
+        "status": str(row["status"] or "active")[:32],
+    } for row in rows]
+    return {
+        "ok": True,
+        "server_tool": "aiworkhub_dashboard_kb",
         "entries": entries,
         "count": len(entries),
         "total": total,
@@ -522,6 +661,10 @@ LIVE_OUTPUT_TOOL_NAME = "aiworkhub_dashboard_task_live_output"
 LIVE_OUTPUT_TOOLS: dict[str, Any] = {LIVE_OUTPUT_TOOL_NAME: task_live_output_view}
 MEMORY_TOOL_NAME = "aiworkhub_dashboard_memory"
 MEMORY_TOOLS: dict[str, Any] = {MEMORY_TOOL_NAME: memory_view}
+SESSION_TOOL_NAME = "aiworkhub_dashboard_sessions"
+SESSION_TOOLS: dict[str, Any] = {SESSION_TOOL_NAME: session_view}
+KB_TOOL_NAME = "aiworkhub_dashboard_kb"
+KB_TOOLS: dict[str, Any] = {KB_TOOL_NAME: kb_view}
 
 
 def register(mcp: Any) -> tuple[str, ...]:
@@ -543,6 +686,15 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in MEMORY_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in SESSION_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in KB_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in INITIALIZE_TOOLS.items():
         mcp.tool(name=name)(fn)
-    return READONLY_TOOL_NAMES + (LIVE_OUTPUT_TOOL_NAME, MEMORY_TOOL_NAME) + (INITIALIZE_TOOL_NAME,)
+    return READONLY_TOOL_NAMES + (
+        LIVE_OUTPUT_TOOL_NAME,
+        MEMORY_TOOL_NAME,
+        SESSION_TOOL_NAME,
+        KB_TOOL_NAME,
+    ) + (INITIALIZE_TOOL_NAME,)

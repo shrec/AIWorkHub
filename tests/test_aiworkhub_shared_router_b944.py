@@ -139,3 +139,75 @@ def test_shared_router_hides_inactive_foreign_records_by_default(tmp_path, monke
 
     assert result["repositories"] == []
     assert result["inactive"][0]["repo_id"] == repo_id
+
+
+def test_shared_router_resolves_exact_live_thread_without_caller_path(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert task_store.initialize_repository(repo)["ok"]
+    repo_id = task_store.storage_readiness(repo).repo_id
+    monkeypatch.setattr(shared_router.Path, "home", lambda: home)
+    _write_record(
+        shared_router.registry_dir(home) / f"{repo_id}.json",
+        {
+            "schema_id": shared_router.SCHEMA_ID,
+            "repo_id": repo_id,
+            "repo_name": "repo",
+            "repo_root": str(repo),
+            "window_id": "window_exact",
+            "extension_host_pid": os.getpid(),
+            "selected_provider": "codex",
+            "targets": {
+                "codex": {
+                    "route": {
+                        "repo_id": repo_id,
+                        "window_id": "window_exact",
+                        "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+                    }
+                }
+            },
+            "updated_at": "2026-07-30T00:00:00Z",
+            "lease_expires_at": "2026-07-30T00:15:00Z",
+        },
+    )
+
+    result = shared_router.resolve_repository_route(
+        provider="codex",
+        thread_id="019f5097-6dbe-7172-870a-945afc5f3bfa",
+        extension_host_pid=os.getpid(),
+    )
+
+    assert result["ok"] is True
+    assert result["repo_id"] == repo_id
+    assert result["repo_root"] == str(repo.resolve())
+
+
+def test_shared_router_route_resolution_fails_closed_on_ambiguity(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(shared_router.Path, "home", lambda: home)
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    for name in ("alpha", "beta"):
+        repo = tmp_path / name
+        repo.mkdir()
+        assert task_store.initialize_repository(repo)["ok"]
+        repo_id = task_store.storage_readiness(repo).repo_id
+        _write_record(
+            shared_router.registry_dir(home) / f"{repo_id}.json",
+            {
+                "schema_id": shared_router.SCHEMA_ID,
+                "repo_id": repo_id,
+                "repo_name": name,
+                "repo_root": str(repo),
+                "window_id": f"window_{name}",
+                "extension_host_pid": os.getpid(),
+                "selected_provider": "codex",
+                "targets": {"codex": {"route": {"repo_id": repo_id, "thread_id": thread_id}}},
+                "updated_at": "2026-07-30T00:00:00Z",
+                "lease_expires_at": "2026-07-30T00:15:00Z",
+            },
+        )
+
+    result = shared_router.resolve_repository_route(provider="codex", thread_id=thread_id)
+
+    assert result == {"ok": False, "error": "route_ambiguous", "matches": 2}

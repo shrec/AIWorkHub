@@ -304,6 +304,8 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
     expected_names = set(dashboard_mcp_app.READONLY_TOOL_NAMES) | {
         dashboard_mcp_app.LIVE_OUTPUT_TOOL_NAME,
         dashboard_mcp_app.MEMORY_TOOL_NAME,
+        dashboard_mcp_app.SESSION_TOOL_NAME,
+        dashboard_mcp_app.KB_TOOL_NAME,
         dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
     assert set(names) == expected_names

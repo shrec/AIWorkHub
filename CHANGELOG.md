@@ -4,6 +4,29 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [0.7.9] - 2026-07-30
+
+### Added
+
+- Added bounded `repo_list`, `repo_current`, and manager-only
+  `repo_switch(repo_id)` operations for exact live multi-repository routing.
+- Added audited and idempotent manager writes for Session Manager, AI Memory,
+  and KB, plus exact/related AI Memory reads on manager and worker surfaces.
+- Added bounded Session Manager and KB dashboard viewers beside Logs and AI
+  Memory, with repository-registry-resolved canonical storage only.
+- Added self-describing Source Graph enum schemas and bounded valid examples
+  for invalid mode requests.
+
+### Fixed
+
+- Repo-neutral Codex MCP processes now resolve the exact live thread route;
+  explicitly repo-bound extension and worker children remain immutable.
+- Cooperative callback startup rebinds pending same-repository events to the
+  current verified manager and recreates missing review callbacks after
+  reload, while retaining the originating thread as audit provenance.
+- AI Memory dashboard/read queries now tolerate fresh minimal schemas and
+  exclude archived or superseded entries when lifecycle state is available.
+
 ## [0.6.75] - 2026-07-28
 
 ### Fixed

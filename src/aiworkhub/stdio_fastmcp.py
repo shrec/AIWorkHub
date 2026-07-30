@@ -50,6 +50,27 @@ def _json_type(annotation: Any) -> str:
     }.get(annotation, "string")
 
 
+def _json_schema_for_annotation(annotation: Any) -> dict[str, Any]:
+    """Return the bounded JSON-schema fragment used by ``tools/list``.
+
+    ``Literal`` support is important for model-facing contracts: an opaque
+    string makes agents guess accepted operation names and waste tool calls.
+    """
+
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        values = list(typing.get_args(annotation))
+        schema: dict[str, Any] = {"enum": values}
+        if values:
+            schema["type"] = _json_type(type(values[0]))
+        return schema
+    if origin in (typing.Union, types.UnionType):
+        args = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return _json_schema_for_annotation(args[0])
+    return {"type": _json_type(annotation)}
+
+
 def _schema_for(func: Any) -> dict[str, Any]:
     try:
         signature = inspect.signature(func)
@@ -64,7 +85,9 @@ def _schema_for(func: Any) -> dict[str, Any]:
     for name, parameter in signature.parameters.items():
         if name == "self":
             continue
-        properties[name] = {"type": _json_type(resolved_hints.get(name, parameter.annotation))}
+        properties[name] = _json_schema_for_annotation(
+            resolved_hints.get(name, parameter.annotation)
+        )
         if parameter.default is inspect.Signature.empty:
             required.append(name)
     schema: dict[str, Any] = {

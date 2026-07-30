@@ -56,16 +56,157 @@ def test_unverified_client_cannot_use_manager_ai_tools(monkeypatch):
     assert result == {"ok": False, "error": "verified_manager_identity_required"}
 
 
+def test_manager_context_writes_require_write_gate_and_are_repo_bound(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: False)
+    denied = manager_ai_tools.session_write(
+        action="checkpoint", topic="release", content="not written",
+        idempotency_key="session:manager:0001", provenance="test",
+    )
+    assert denied["error"] == "write_gate_closed"
+
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    written = manager_ai_tools.session_write(
+        action="checkpoint", topic="release", content="written",
+        idempotency_key="session:manager:0002", provenance="test",
+    )
+    assert written["ok"] is True
+    assert written["manager"]["repo"] == str(root)
+    assert written["surface"] == "manager_mcp"
+
+
+def test_manager_ai_memory_read_surface_closes_get_search_related_cycle(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    for suffix, key in (("a", "routing.contract"), ("b", "callback.contract")):
+        result = manager_ai_tools.ai_memory_write(
+            action="remember", key=key, value=f"value-{suffix}",
+            tags="routing,callback", scope="project",
+            idempotency_key=f"memory:manager:{suffix}:0001", provenance="test",
+        )
+        assert result["ok"] is True
+
+    exact = manager_ai_tools.ai_memory_get(key="routing.contract")
+    related = manager_ai_tools.ai_memory_related(key="routing.contract")
+
+    assert json.loads(exact["content"])["memory"]["value"] == "value-a"
+    assert json.loads(related["content"])["related"][0]["key"] == "callback.contract"
+
+
 def test_main_mcp_exposes_complete_manager_ai_tool_surface():
     for name in (
         "aiworkhub_manager_source_graph_query",
         "aiworkhub_manager_session_current_state",
         "aiworkhub_manager_ai_memory_search",
+        "aiworkhub_manager_ai_memory_get",
+        "aiworkhub_manager_ai_memory_related",
         "aiworkhub_manager_kb_search",
         "aiworkhub_manager_kb_get",
         "aiworkhub_manager_kb_related",
+        "aiworkhub_manager_session_write",
+        "aiworkhub_manager_ai_memory_write",
+        "aiworkhub_manager_kb_write",
+        "aiworkhub_repo_list",
+        "aiworkhub_repo_current",
+        "aiworkhub_repo_switch",
     ):
         assert callable(getattr(server, name))
+
+
+def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_path, monkeypatch):
+    old = tmp_path / "old"
+    target = tmp_path / "target"
+    old.mkdir()
+    target.mkdir()
+    assert task_store.initialize_repository(old)["ok"]
+    assert task_store.initialize_repository(target)["ok"]
+    target_id = task_store.storage_readiness(target).repo_id
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    identity = {
+        "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
+        "window_id": "window_switch",
+    }
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(old))
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+    monkeypatch.setattr(
+        shared_router,
+        "list_known_repositories",
+        lambda **kwargs: {
+            "ok": True,
+            "repositories": [{
+                "repo_id": target_id, "repo_root": str(target), "repo_name": "target",
+                "window_id": "window_switch", "extension_host_alive": True, "stale": False,
+                "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": thread_id}}},
+            }],
+        },
+    )
+    lifecycle = {"stopped_dispatcher": [], "stopped_daemon": [], "started_daemon": []}
+    monkeypatch.setattr(
+        core,
+        "_callback_bridge_module",
+        lambda: type("Bridge", (), {"stop_dispatcher": lambda _self, root: lifecycle["stopped_dispatcher"].append(root)})(),
+    )
+    monkeypatch.setattr(
+        core,
+        "_source_graph_daemon_module",
+        lambda: type("Daemon", (), {
+            "stop_daemon": lambda _self, root: lifecycle["stopped_daemon"].append(root),
+            "ensure_started": lambda _self, root: lifecycle["started_daemon"].append(root) or {"ok": True},
+        })(),
+    )
+    monkeypatch.setattr(core, "dispatcher_ensure_started", lambda: {"ok": True, "status": "manager_inbox"})
+
+    result = core.repository_switch(target_id)
+
+    assert result["ok"] is True
+    assert result["switched"] is True
+    assert result["binding_source"] == "manager_switch"
+    assert core.repo_root() == target.resolve()
+    assert lifecycle["stopped_dispatcher"] == [old.resolve()]
+    assert lifecycle["stopped_daemon"] == [old.resolve()]
+    assert lifecycle["started_daemon"] == [target.resolve()]
+
+
+def test_repository_switch_rejects_foreign_thread_without_mutating_binding(tmp_path, monkeypatch):
+    old = tmp_path / "old"
+    target = tmp_path / "target"
+    old.mkdir()
+    target.mkdir()
+    assert task_store.initialize_repository(old)["ok"]
+    assert task_store.initialize_repository(target)["ok"]
+    target_id = task_store.storage_readiness(target).repo_id
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(old))
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
+        "window_id": "window_owner",
+    })
+    monkeypatch.setattr(shared_router, "list_known_repositories", lambda **kwargs: {
+        "ok": True, "repositories": [{
+            "repo_id": target_id, "repo_root": str(target), "window_id": "window_foreign",
+            "extension_host_alive": True, "stale": False,
+            "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": thread_id}}},
+        }],
+    })
+
+    result = core.repository_switch(target_id)
+
+    assert result == {"ok": False, "error": "target_route_not_owned_by_current_manager"}
+    assert core.repo_root() == old.resolve()
 
 
 def test_task_create_public_schema_requires_automatic_project_context():
@@ -82,6 +223,25 @@ def test_task_create_public_schema_requires_automatic_project_context():
     assert '"session"' in source
     assert '"ai_memory"' in source
     assert '"kb"' in source
+
+
+def test_manager_bootstrap_describes_current_repo_manager_callback_ownership(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+            "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+        },
+    )
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+
+    contract = core.manager_bootstrap()
+
+    assert "current verified Codex manager" in contract["callback"]["codex"]
+    assert "audit provenance" in contract["callback"]["codex"]
 
 
 def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
@@ -169,6 +329,39 @@ def test_codex_vscode_env_identity_survives_route_pending(tmp_path, monkeypatch)
         "thread_id": thread_id,
         "window_id": "window_route_pending",
     }
+
+
+def test_repo_root_prefers_exact_live_codex_route_over_stale_cwd(tmp_path, monkeypatch):
+    routed = tmp_path / "routed"
+    routed.mkdir()
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex_vscode")
+    monkeypatch.setenv("CODEX_THREAD_ID", "019f5097-6dbe-7172-870a-945afc5f3bfa")
+    monkeypatch.setenv("VSCODE_AGENT_FOLDER", "/tmp/vscode-agent")
+    monkeypatch.setattr(
+        shared_router,
+        "resolve_repository_route",
+        lambda **kwargs: {"ok": True, "repo_root": str(routed), "repo_id": "repo_" + "a" * 32},
+    )
+
+    assert core.repo_root() == routed.resolve()
+
+
+def test_repo_root_explicit_binding_wins_over_dynamic_chat_route(tmp_path, monkeypatch):
+    explicit = tmp_path / "explicit"
+    routed = tmp_path / "routed"
+    explicit.mkdir()
+    routed.mkdir()
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(explicit))
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    monkeypatch.setattr(
+        shared_router,
+        "resolve_repository_route",
+        lambda **kwargs: {"ok": True, "repo_root": str(routed)},
+    )
+
+    assert core.repo_root() == explicit.resolve()
 
 
 def test_codex_extension_owned_mcp_identity_uses_persisted_route(tmp_path, monkeypatch):

@@ -355,6 +355,48 @@ def test_core_native_codex_manager_inbox_never_starts_hidden_app_server(tmp_path
     assert calls["ensure"] == 0
 
 
+def test_core_native_codex_manager_inbox_rebinds_pending_to_current_verified_manager(tmp_path, monkeypatch):
+    root = tmp_path / "repo_native_codex_rebind"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_CALLBACK_TRANSPORT", "manager_inbox")
+    monkeypatch.setenv("AIWORKHUB_WINDOW_ID", "window_native_codex_rebind")
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    identity = {
+        "provider": "codex", "session_id": thread_id,
+        "thread_id": thread_id, "window_id": "window_native_codex_rebind",
+    }
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+    monkeypatch.setattr(
+        core,
+        "read_selected_coordinator_target",
+        lambda _root=None: {"selected_provider": "codex", "targets": {"codex": {}}},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        callback_store,
+        "rebind_pending_callbacks",
+        lambda _conn, **kwargs: captured.setdefault("rebind", kwargs) and 3,
+    )
+    monkeypatch.setattr(
+        callback_store,
+        "seed_missing_review_callbacks",
+        lambda _conn, **kwargs: captured.setdefault("seed", kwargs) and 2,
+    )
+    monkeypatch.setattr(core, "_callback_bridge_module", lambda: callback_bridge)
+
+    result = core.dispatcher_ensure_started()
+
+    assert result["status"] == "manager_inbox"
+    assert result["manager_route"] == identity
+    assert result["rebound_callback_count"] == 3
+    assert result["seeded_review_callback_count"] == 2
+    assert captured["rebind"] == {"provider": "codex", "origin_thread_id": thread_id}
+    assert captured["seed"] == {"provider": "codex", "origin_thread_id": thread_id}
+
+
 def test_core_manager_inbox_promotes_only_after_exact_sideband_route(tmp_path, monkeypatch):
     root = tmp_path / "repo_native_codex_promoted"
     root.mkdir()

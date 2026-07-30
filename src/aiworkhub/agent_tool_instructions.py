@@ -89,6 +89,8 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
+    "aiworkhub_worker_ai_memory_get",
+    "aiworkhub_worker_ai_memory_related",
     "aiworkhub_worker_kb_search",
     "aiworkhub_worker_kb_get",
     "aiworkhub_worker_kb_related",

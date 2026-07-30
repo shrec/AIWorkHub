@@ -57,17 +57,37 @@ except ModuleNotFoundError:
         mapping = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}
         return mapping.get(annotation, "string")
 
+    def _stdio_json_schema_for_annotation(annotation: Any) -> dict[str, Any]:
+        origin = typing.get_origin(annotation)
+        if origin is typing.Literal:
+            values = list(typing.get_args(annotation))
+            result: dict[str, Any] = {"enum": values}
+            if values:
+                result["type"] = _stdio_json_type(type(values[0]))
+            return result
+        if origin in (typing.Union, types.UnionType):
+            args = [a for a in typing.get_args(annotation) if a is not type(None)]
+            if len(args) == 1:
+                return _stdio_json_schema_for_annotation(args[0])
+        return {"type": _stdio_json_type(annotation)}
+
     def _stdio_schema_for(func: Any) -> dict[str, Any]:
         try:
             sig = inspect.signature(func)
         except (TypeError, ValueError):
             return {"type": "object", "properties": {}, "additionalProperties": True}
+        try:
+            resolved_hints = typing.get_type_hints(func)
+        except (NameError, TypeError):
+            resolved_hints = {}
         properties: dict[str, Any] = {}
         required: list[str] = []
         for pname, param in sig.parameters.items():
             if pname == "self":
                 continue
-            properties[pname] = {"type": _stdio_json_type(param.annotation)}
+            properties[pname] = _stdio_json_schema_for_annotation(
+                resolved_hints.get(pname, param.annotation)
+            )
             if param.default is inspect.Signature.empty:
                 required.append(pname)
         schema: dict[str, Any] = {"type": "object", "properties": properties, "additionalProperties": False}
@@ -232,6 +252,7 @@ from . import __version__
 from . import agent_tool_instruction_mcp
 from . import cli_adapter_readonly_tool
 from . import completion_inbox
+from . import context_writes
 from . import cost_ledger
 from . import core
 from . import dashboard_mcp_app
@@ -243,6 +264,7 @@ from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
 from . import task_engine
+from . import worker_ai_tools_mcp
 from . import dependency_autolaunch
 from . import quality_evidence
 from . import shared_router
@@ -260,11 +282,11 @@ def aiworkhub_manager_bootstrap() -> dict[str, Any]:
 
 @mcp.tool()
 def aiworkhub_manager_source_graph_query(
-    mode: str,
+    mode: worker_ai_tools_mcp.SourceGraphMode,
     query: str,
     budget: int = 64,
     target: str | None = None,
-    bundle_type: str = "explore",
+    bundle_type: worker_ai_tools_mcp.SourceGraphBundleType = "explore",
 ) -> dict[str, Any]:
     """MANAGER READ: bounded canonical Source Graph query for this repository."""
 
@@ -290,6 +312,20 @@ def aiworkhub_manager_ai_memory_search(query: str, limit: int = 8) -> dict[str, 
 
 
 @mcp.tool()
+def aiworkhub_manager_ai_memory_get(key: str) -> dict[str, Any]:
+    """MANAGER READ: exact active canonical AI Memory lookup."""
+
+    return manager_ai_tools.ai_memory_get(key=key)
+
+
+@mcp.tool()
+def aiworkhub_manager_ai_memory_related(key: str) -> dict[str, Any]:
+    """MANAGER READ: bounded related canonical AI Memory lookup."""
+
+    return manager_ai_tools.ai_memory_related(key=key)
+
+
+@mcp.tool()
 def aiworkhub_manager_kb_search(query: str, limit: int = 8) -> dict[str, Any]:
     """MANAGER READ: bounded canonical KB search."""
 
@@ -308,6 +344,62 @@ def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
     """MANAGER READ: bounded canonical KB relation lookup."""
 
     return manager_ai_tools.kb_related(key=key)
+
+
+@mcp.tool()
+def aiworkhub_manager_session_write(
+    action: context_writes.SessionAction,
+    topic: str,
+    content: str,
+    idempotency_key: str,
+    provenance: str,
+) -> dict[str, Any]:
+    """MANAGER WRITE: append one audited canonical Session Manager event."""
+
+    return manager_ai_tools.session_write(
+        action=action, topic=topic, content=content,
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_ai_memory_write(
+    action: context_writes.MemoryAction,
+    key: str,
+    idempotency_key: str,
+    provenance: str,
+    value: str = "",
+    tags: str = "",
+    scope: str = "project",
+) -> dict[str, Any]:
+    """MANAGER WRITE: remember, update, supersede, or archive canonical memory."""
+
+    return manager_ai_tools.ai_memory_write(
+        action=action, key=key, value=value, tags=tags, scope=scope,
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_kb_write(
+    action: context_writes.KbAction,
+    key: str,
+    idempotency_key: str,
+    provenance: str,
+    title: str = "",
+    body: str = "",
+    category: str = "",
+    tags: str = "",
+    source_refs: str = "",
+    replacement_key: str = "",
+) -> dict[str, Any]:
+    """MANAGER WRITE: upsert, ingest, supersede, or archive canonical KB data."""
+
+    return manager_ai_tools.kb_write(
+        action=action, key=key, title=title, body=body, category=category,
+        tags=tags, source_refs=source_refs, replacement_key=replacement_key,
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
 
 
 @mcp.tool()
@@ -338,6 +430,29 @@ def aiworkhub_router_known_repositories(limit: int = 64, include_inactive: bool 
         limit=limit,
         include_inactive=include_inactive,
     )
+
+
+@mcp.tool()
+def aiworkhub_repo_list(limit: int = 64, include_inactive: bool = False) -> dict[str, Any]:
+    """READ-ONLY: bounded live repository identities available to this manager."""
+
+    return shared_router.list_known_repositories(
+        current_root=core.repo_root(), limit=limit, include_inactive=include_inactive,
+    )
+
+
+@mcp.tool()
+def aiworkhub_repo_current() -> dict[str, Any]:
+    """READ-ONLY: exact current repository, binding source, and manager route."""
+
+    return core.repository_current()
+
+
+@mcp.tool()
+def aiworkhub_repo_switch(repo_id: str) -> dict[str, Any]:
+    """MANAGER OPERATION: atomically switch to one live manager-owned repo_id."""
+
+    return core.repository_switch(repo_id)
 
 
 @mcp.tool()
