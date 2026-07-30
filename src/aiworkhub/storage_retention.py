@@ -113,6 +113,7 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         repo_root=repo_root,
     )
     global_scan = worktree_storage.scan_worktrees(base, with_sizes=True)
+    registrations = worktree_storage.scan_worktree_registrations(repo_root, base)
     repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
     global_worktree_bytes = int(global_scan.get("summary", {}).get("total_bytes") or 0)
     legacy_log_root = repo_root / LEGACY_LOG_RELATIVE_PATH
@@ -149,6 +150,7 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         "policy_days": policy_days,
         "max_bytes": max_bytes,
         "candidates": candidates,
+        "registration_preview_digest": str(registrations.get("preview_digest") or ""),
     }
     digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -185,6 +187,7 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         "protected_count": len(plan.get("would_keep") or []),
         "preview_digest": digest,
         "candidates": candidates,
+        "registration_health": registrations,
         "base": base,
     }
 
@@ -350,6 +353,66 @@ def quarantine(
     return {"ok": True, "batch_id": batch_id, "quarantined": moved, "bytes": moved_bytes, "no_op": False}
 
 
+def prune_stale_registrations(
+    repo_root: Path | str,
+    *,
+    preview_digest: str,
+    confirm: bool,
+    base: Path | None = None,
+) -> dict[str, Any]:
+    """Prune only exact stale AIWorkHub registrations after fresh consent.
+
+    ``git worktree prune`` operates at repository scope. The operation therefore
+    refuses to run when *any* stale registration is outside AIWorkHub's exact
+    configured worktree layout, so a foreign developer worktree is never
+    silently affected.
+    """
+
+    if not confirm:
+        raise StorageRetentionError("explicit_confirmation_required")
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root()).resolve()
+    current = worktree_storage.scan_worktree_registrations(root, worktree_base)
+    if not current.get("ok"):
+        raise StorageRetentionError(str(current.get("error") or "registration_preview_failed"))
+    if preview_digest != current.get("preview_digest"):
+        raise StorageRetentionError("registration_preview_stale")
+    if int(current.get("foreign_stale_count") or 0) > 0:
+        raise StorageRetentionError("foreign_stale_registration_present")
+    if int(current.get("candidate_overflow_count") or 0) > 0:
+        raise StorageRetentionError("registration_candidate_limit_exceeded")
+    candidates = [
+        str(item.get("id") or "")
+        for item in current.get("stale_candidates") or []
+        if isinstance(item, dict)
+    ]
+    if not candidates:
+        return {"ok": True, "pruned": 0, "ids": [], "no_op": True}
+
+    rc, _output = worktree_storage._git(root, "worktree", "prune", "--expire", "now", "--verbose")
+    if rc != 0:
+        raise StorageRetentionError("worktree_registration_prune_failed")
+    after = worktree_storage.scan_worktree_registrations(root, worktree_base)
+    if not after.get("ok"):
+        raise StorageRetentionError(str(after.get("error") or "registration_rescan_failed"))
+    remaining = {
+        str(item.get("id") or "")
+        for item in after.get("stale_candidates") or []
+        if isinstance(item, dict)
+    }
+    pruned_ids = sorted(set(candidates) - remaining)
+    if remaining.intersection(candidates):
+        raise StorageRetentionError("worktree_registration_prune_incomplete")
+    _append_audit(root, {
+        "schema_id": "aiworkhub.storage_retention_audit.v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "stale_registration_prune_completed",
+        "count": len(pruned_ids),
+        "ids": pruned_ids,
+    })
+    return {"ok": True, "pruned": len(pruned_ids), "ids": pruned_ids, "no_op": False}
+
+
 def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     worktree_base = (base or configured_worktree_root()).resolve()
@@ -472,6 +535,7 @@ __all__ = [
     "StorageRetentionError",
     "list_batches",
     "preview",
+    "prune_stale_registrations",
     "purge",
     "quarantine",
     "restore",

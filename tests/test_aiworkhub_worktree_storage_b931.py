@@ -135,6 +135,37 @@ def test_repository_scoped_scan_excludes_unowned_and_orphaned_trees(worktrees, t
     }
 
 
+def test_registration_scan_attributes_only_exact_aiworkhub_layout(worktrees, tmp_path) -> None:
+    foreign = tmp_path / "developer-worktree"
+    _git(worktrees["parent"], "worktree", "add", "--detach", str(foreign), "HEAD")
+    scan = ws.scan_worktree_registrations(worktrees["parent"], worktrees["base"])
+    assert scan["ok"] is True
+    assert scan["registered_count"] == 5
+    assert scan["aiworkhub_registered_count"] == 3
+    assert scan["stale_candidate_count"] == 0
+    assert scan["foreign_stale_count"] == 0
+
+
+def test_registration_scan_is_bounded_and_overflow_fails_closed(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    base = tmp_path / "worktrees"
+    repo.mkdir()
+    base.mkdir()
+    raw = "\0\0".join(
+        f"worktree {base / f'R{i:03d}' / 'worktree'}\0HEAD deadbeef\0prunable gitdir file points to non-existent location"
+        for i in range(ws.REGISTRATION_CANDIDATE_LIMIT + 1)
+    )
+    monkeypatch.setattr(ws, "_git", lambda *_args: (0, raw))
+    monkeypatch.setattr(ws, "_git_common_dir", lambda _root: str(repo / ".git"))
+
+    scan = ws.scan_worktree_registrations(repo, base)
+
+    assert scan["stale_candidate_count"] == ws.REGISTRATION_CANDIDATE_LIMIT + 1
+    assert scan["candidate_overflow_count"] == 1
+    assert len(scan["stale_candidates"]) == ws.REGISTRATION_CANDIDATE_LIMIT
+    assert scan["safe_to_prune"] is False
+
+
 def test_retention_age_policy_keeps_recent_safe_tree(worktrees) -> None:
     safe = worktrees["base"] / "W_SAFE"
     old = time.time() - 31 * 86400

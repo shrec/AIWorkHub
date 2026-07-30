@@ -66,6 +66,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         with_sizes=True,
         repo_root=repo_root,
     )
+    registrations = worktree_storage.scan_worktree_registrations(repo_root)
     summary = worktrees.get("summary") or {}
     worker_bytes = int(summary.get("total_bytes") or 0)
     try:
@@ -130,6 +131,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "dry_run": True,
             "repository_scoped": True,
             "orphaned_excluded": True,
+            "registrations": registrations,
         },
         "quarantine_batches": quarantine_batches,
         "terminal_log_retention": terminal_logs,

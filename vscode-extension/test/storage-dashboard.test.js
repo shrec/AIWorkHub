@@ -22,6 +22,7 @@ for (const token of [
   'id="header-kb"',
   'id="header-preflight"',
   'id="storage-cleanup-preview"',
+  'id="storage-registration-prune"',
   'id="terminal-log-cleanup-preview"',
   'id="runtime-cleanup-preview"',
 ]) {
@@ -48,6 +49,8 @@ for (const token of [
   "Retention dry run",
   "This repository only",
   "requestStorageCleanup",
+  "requestStorageRegistrationPrune",
+  "Stale registrations",
   "requestStorageRestore",
   "requestStoragePurge",
   "Quarantine batches",

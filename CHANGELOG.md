@@ -14,6 +14,9 @@ noted by package/extension version and release tag.
   executed in CI without maintaining a filename chain.
 - Added complete retention footprint accounting for canonical runtime, legacy
   logs, orphan request files and repository/shared worktree populations.
+- Added exact AIWorkHub stale-worktree registration attribution and a
+  digest-bound, explicitly confirmed dashboard prune action that fails closed
+  when any stale foreign registration is present.
 - Added reversible quarantine, restore and delayed purge for the aged legacy
   root `logs/` store, guarded by an exact preview identity and confirmation.
 - Added immutable process-ledger rotation at 48 MiB with streaming readers and

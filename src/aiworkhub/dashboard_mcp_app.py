@@ -491,6 +491,26 @@ def storage_quarantine_view(preview_digest: str, confirm: bool = False) -> dict[
     return response
 
 
+def storage_registration_prune_view(
+    preview_digest: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """USER WRITE: prune exact stale AIWorkHub Git registrations."""
+    try:
+        root = core.repo_root()
+        response = storage_retention.prune_stale_registrations(
+            root,
+            preview_digest=str(preview_digest or "")[:128],
+            confirm=confirm is True,
+        )
+        storage_observability.invalidate(root)
+    except storage_retention.StorageRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_storage_registration_prune"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
 def storage_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
     """USER WRITE: restore one repository-owned quarantine batch."""
     try:
@@ -817,6 +837,7 @@ STORAGE_RETENTION_READ_TOOLS: dict[str, Any] = {
 }
 STORAGE_RETENTION_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_storage_quarantine": storage_quarantine_view,
+    "aiworkhub_dashboard_storage_registration_prune": storage_registration_prune_view,
     "aiworkhub_dashboard_storage_restore": storage_restore_view,
     "aiworkhub_dashboard_storage_purge": storage_purge_view,
 }

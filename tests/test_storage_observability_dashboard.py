@@ -30,6 +30,20 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
             "summary": {"total_bytes": 256, "count": 2, "removable_safe_bytes": 64}
         },
     )
+    monkeypatch.setattr(
+        storage_observability.worktree_storage,
+        "scan_worktree_registrations",
+        lambda _root: {
+            "ok": True,
+            "registered_count": 3,
+            "aiworkhub_registered_count": 2,
+            "stale_candidate_count": 1,
+            "candidate_overflow_count": 0,
+            "foreign_stale_count": 0,
+            "safe_to_prune": True,
+            "preview_digest": "c" * 64,
+        },
+    )
     storage_observability._reset_cache_for_tests()
 
     result = _wait_ready(repo)
@@ -45,6 +59,8 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     assert result["retention_preview"]["dry_run"] is True
     assert result["retention_preview"]["repository_scoped"] is True
     assert result["retention_preview"]["eligible_bytes"] == 64
+    assert result["retention_preview"]["registrations"]["registered_count"] == 3
+    assert result["retention_preview"]["registrations"]["stale_candidate_count"] == 1
     assert result["disk_total_bytes"] > 0
     assert result["disk_free_bytes"] > 0
     assert result["readonly"] is True

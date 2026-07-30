@@ -34,8 +34,10 @@ and deletes nothing unless the caller passes ``confirm=True``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -45,6 +47,9 @@ from typing import Any
 from .worker_workspace import configured_worktree_root
 
 _GIT_TIMEOUT_SECONDS = 30
+_WORKTREE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+REGISTRATION_SCHEMA_ID = "aiworkhub.worktree_registration_preview.v1"
+REGISTRATION_CANDIDATE_LIMIT = 256
 
 # Safety classes assigned to each retained worktree.
 CLASS_REMOVABLE_SAFE = "removable_safe"      # git-clean AND fully pushed: nothing is lost
@@ -109,6 +114,113 @@ def _git_common_dir(cwd: Path) -> str:
         return os.path.normcase(str(candidate.resolve()))
     except OSError:
         return ""
+
+
+def _parse_worktree_porcelain(raw: str) -> list[dict[str, str]]:
+    """Parse ``git worktree list --porcelain -z`` without path guessing."""
+
+    records: list[dict[str, str]] = []
+    for block in raw.split("\0\0"):
+        record: dict[str, str] = {}
+        for field in block.split("\0"):
+            if not field:
+                continue
+            key, _, value = field.partition(" ")
+            record[key] = value
+        if record.get("worktree"):
+            records.append(record)
+    return records
+
+
+def _owned_registration_id(raw_path: str, base: Path) -> str:
+    """Return the request id only for the exact ``base/<id>/worktree`` shape."""
+
+    if not raw_path:
+        return ""
+    candidate = Path(os.path.abspath(raw_path))
+    normalized_base = Path(os.path.abspath(base))
+    if candidate.name != "worktree" or candidate.parent.parent != normalized_base:
+        return ""
+    request_id = candidate.parent.name
+    return request_id if _WORKTREE_ID_RE.fullmatch(request_id) else ""
+
+
+def scan_worktree_registrations(
+    repo_root: Path | str,
+    base: Path | None = None,
+) -> dict[str, Any]:
+    """Read exact Git worktree registrations and attribute stale entries.
+
+    Only the canonical ``<worktree-root>/<request-id>/worktree`` layout is
+    attributed to AIWorkHub. Missing/prunable registrations outside that shape
+    are counted as foreign and make pruning fail closed.
+    """
+
+    root = Path(repo_root).resolve()
+    worktree_base = (base or configured_worktree_root()).resolve()
+    rc, raw = _git(root, "worktree", "list", "--porcelain", "-z")
+    if rc != 0:
+        return {
+            "ok": False,
+            "schema_id": REGISTRATION_SCHEMA_ID,
+            "error": "worktree_registration_list_failed",
+            "registered_count": 0,
+            "aiworkhub_registered_count": 0,
+            "stale_candidate_count": 0,
+            "candidate_overflow_count": 0,
+            "foreign_stale_count": 0,
+            "stale_candidates": [],
+            "safe_to_prune": False,
+            "preview_digest": "",
+        }
+
+    registered_count = 0
+    owned_count = 0
+    candidates: list[dict[str, str]] = []
+    foreign_stale_count = 0
+    for record in _parse_worktree_porcelain(raw):
+        registered_count += 1
+        raw_path = record.get("worktree", "")
+        request_id = _owned_registration_id(raw_path, worktree_base)
+        missing = not Path(raw_path).exists()
+        prune_reason = str(record.get("prunable") or "")
+        stale = missing or bool(prune_reason)
+        if request_id:
+            owned_count += 1
+            if stale:
+                candidates.append({
+                    "id": request_id,
+                    "reason": "prunable" if prune_reason else "missing_checkout",
+                })
+        elif stale:
+            foreign_stale_count += 1
+
+    candidates.sort(key=lambda item: item["id"])
+    candidate_count = len(candidates)
+    candidate_overflow_count = max(0, candidate_count - REGISTRATION_CANDIDATE_LIMIT)
+    bounded_candidates = candidates[:REGISTRATION_CANDIDATE_LIMIT]
+    digest_payload = {
+        "schema_id": REGISTRATION_SCHEMA_ID,
+        "repo_common_dir": _git_common_dir(root),
+        "base": os.path.normcase(str(worktree_base)),
+        "candidates": candidates,
+        "foreign_stale_count": foreign_stale_count,
+    }
+    digest = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "ok": True,
+        "schema_id": REGISTRATION_SCHEMA_ID,
+        "registered_count": registered_count,
+        "aiworkhub_registered_count": owned_count,
+        "stale_candidate_count": candidate_count,
+        "candidate_overflow_count": candidate_overflow_count,
+        "foreign_stale_count": foreign_stale_count,
+        "stale_candidates": bounded_candidates,
+        "safe_to_prune": bool(candidates) and foreign_stale_count == 0 and candidate_overflow_count == 0,
+        "preview_digest": digest,
+    }
 
 
 def _worktree_git_state(worktree_dir: Path) -> dict[str, Any]:

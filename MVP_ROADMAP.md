@@ -205,8 +205,17 @@ do not override this current priority ledger.
             retention previews. On the audited host this corrects 370 MB to
             7.45 GB observed. Aged legacy `logs/` now has preview/quarantine/
             restore/delayed-purge support with exact identity revalidation.
-      - [ ] Attribute/prune stale shared-worktree registrations and execute the
-            explicit legacy quarantine after owner confirmation.
+      - [x] Attribute stale Git registrations only when their path has the
+            exact configured `<root>/<request-id>/worktree` shape; expose a
+            bounded digest-backed preview and require an explicit local-user
+            confirmation before pruning. Any stale foreign registration makes
+            the operation fail closed, and pruning never deletes checkout
+            files. Canonical local evidence: focused storage/dashboard tests
+            (`44 passed`), complete Python suite (`1541 passed, 18 skipped`)
+            and complete 24-file extension suite on 2026-07-30.
+      - [ ] Execute the already-prepared legacy-log quarantine after owner
+            confirmation; keep irreversible purge separately confirmed after
+            the restore window.
       - [x] Rotate the active terminal ledger before 48 MiB, stream immutable
             rotations instead of whole-file reads, include every segment in
             storage accounting, and bound each production worker stdout/stderr

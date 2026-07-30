@@ -261,6 +261,9 @@ rewritten after remediation.
   the public local-link contract. Runtime task operations were already native;
   remaining historical scripts/test fixtures are explicitly an artifact
   disposition problem, not a runtime dependency.
-- **Shared-worktree attribution/pruning and remaining P3-10 artifact
-  disposition remain open** and are tracked in `MVP_ROADMAP.md` in
-  operational-risk order.
+- **Shared-worktree registration attribution/pruning closed:** only exact
+  AIWorkHub registration paths are attributed, the dashboard exposes a bounded
+  digest-backed preview, explicit confirmation is mandatory, and any foreign
+  stale registration fails closed. Git metadata is pruned without deleting a
+  checkout. The separately reversible legacy-log quarantine and remaining
+  P3-10 artifact disposition remain owner-confirmed roadmap work.

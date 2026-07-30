@@ -348,6 +348,16 @@ def test_storage_retention_tools_preserve_read_write_authority(monkeypatch):
     assert written["authority_flags"]["readonly"] is False
     assert written["authority_flags"]["storage_write"] is True
 
+    monkeypatch.setattr(
+        dashboard_mcp_app.storage_retention,
+        "prune_stale_registrations",
+        lambda *_args, **_kwargs: {"ok": True, "pruned": 2},
+    )
+    pruned = dashboard_mcp_app.storage_registration_prune_view("c" * 64, confirm=True)
+    assert pruned["ok"] is True
+    assert pruned["authority_flags"]["readonly"] is False
+    assert pruned["authority_flags"]["storage_write"] is True
+
 
 def test_terminal_log_retention_tools_preserve_read_write_authority(monkeypatch):
     monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: Path("/repo"))

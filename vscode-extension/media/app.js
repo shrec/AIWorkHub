@@ -120,6 +120,7 @@ const elements = {
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
   storageCleanupPreview: document.querySelector("#storage-cleanup-preview"),
+  storageRegistrationPrune: document.querySelector("#storage-registration-prune"),
   terminalLogCleanupPreview: document.querySelector("#terminal-log-cleanup-preview"),
   runtimeCleanupPreview: document.querySelector("#runtime-cleanup-preview"),
   systemLogList: document.querySelector("#system-log-list"),
@@ -1078,6 +1079,21 @@ function renderStorage(snapshot) {
       "telemetry-note",
       "Preview only. Unsaved, unpushed, active, foreign-repository and orphaned worktrees are protected.",
     ));
+    const registrations = retention.registrations && typeof retention.registrations === "object"
+      ? retention.registrations
+      : null;
+    if (registrations) {
+      for (const [label, value] of [
+        ["Git registrations", `${formatCount(registrations.aiworkhub_registered_count)} AIWorkHub / ${formatCount(registrations.registered_count)} total`],
+        ["Stale registrations", `${formatCount(registrations.stale_candidate_count)} owned · ${formatCount(registrations.foreign_stale_count)} foreign`],
+        ["Preview overflow", formatCount(registrations.candidate_overflow_count)],
+        ["Prune status", registrations.safe_to_prune ? "Ready for confirmation" : "Protected / nothing eligible"],
+      ]) {
+        const row = createElement("div", "storage-row storage-retention-row");
+        row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+        fragment.appendChild(row);
+      }
+    }
   }
   const terminalLogs = usage.terminal_log_retention && typeof usage.terminal_log_retention === "object"
     ? usage.terminal_log_retention
@@ -2827,6 +2843,9 @@ elements.headerStorage.addEventListener("click", () => {
 });
 elements.storageCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestStorageCleanup" });
+});
+elements.storageRegistrationPrune.addEventListener("click", () => {
+  vscode.postMessage({ type: "requestStorageRegistrationPrune" });
 });
 elements.terminalLogCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestTerminalLogCleanup" });

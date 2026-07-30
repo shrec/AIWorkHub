@@ -34,6 +34,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestSessions",
   "requestKb",
   "requestStorageCleanup",
+  "requestStorageRegistrationPrune",
   "requestStorageRestore",
   "requestStoragePurge",
   "requestTerminalLogCleanup",
@@ -120,6 +121,7 @@ const DASHBOARD_TOOLS = Object.freeze({
 const STORAGE_RETENTION_TOOLS = Object.freeze({
   preview: "aiworkhub_dashboard_storage_retention_preview",
   quarantine: "aiworkhub_dashboard_storage_quarantine",
+  pruneRegistrations: "aiworkhub_dashboard_storage_registration_prune",
   restore: "aiworkhub_dashboard_storage_restore",
   purge: "aiworkhub_dashboard_storage_purge",
 });
@@ -4278,6 +4280,48 @@ async function runStorageCleanup(view) {
   }
 }
 
+async function runStorageRegistrationPrune(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const preview = await client.callTool(STORAGE_RETENTION_TOOLS.preview, {});
+    if (!preview || preview.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "storage_preview_failed" });
+      return;
+    }
+    const registrations = preview.registration_health && typeof preview.registration_health === "object"
+      ? preview.registration_health
+      : {};
+    const count = Math.max(0, Number(registrations.stale_candidate_count || 0));
+    if (!count) {
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: "No stale AIWorkHub worktree registrations found" });
+      return;
+    }
+    if (Number(registrations.foreign_stale_count || 0) > 0 || registrations.safe_to_prune !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: "registration_prune_blocked_by_foreign_stale_worktree" });
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Prune ${count} stale AIWorkHub Git worktree registration(s)? No checkout files are deleted. Foreign registrations are excluded and block the operation.`,
+      { modal: true },
+      "Prune Registrations",
+    );
+    if (choice !== "Prune Registrations") return;
+    const result = await client.callTool(STORAGE_RETENTION_TOOLS.pruneRegistrations, {
+      preview_digest: String(registrations.preview_digest || ""),
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "registration_prune_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Pruned ${Number(result.pruned || 0)} stale registration(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 async function runStorageRestore(view, batchId) {
   if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
   const choice = await vscode.window.showInformationMessage(
@@ -4617,6 +4661,9 @@ function handleInboundMessage(view, message) {
       break;
     case "requestStorageCleanup":
       runStorageCleanup(view);
+      break;
+    case "requestStorageRegistrationPrune":
+      runStorageRegistrationPrune(view);
       break;
     case "requestStorageRestore": {
       const batchId = String(message.batchId || "");
@@ -5036,6 +5083,7 @@ function getHtmlForWebview(webview, extensionUri) {
           <div class="tab-panel" role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden>
             <div class="storage-action-bar">
               <button id="storage-cleanup-preview" type="button" title="Recompute the repository-scoped retention preview and quarantine eligible worktrees after confirmation">Preview &amp; Quarantine</button>
+              <button id="storage-registration-prune" type="button" title="Preview and prune stale Git registrations owned by this repository; no checkout files are deleted">Prune Registrations</button>
               <button id="terminal-log-cleanup-preview" type="button" title="Preview and quarantine only policy-aged terminal run logs; canonical ledgers and active work remain protected">Terminal Logs</button>
               <button id="runtime-cleanup-preview" type="button" title="Preview and quarantine obsolete extension runtime generations; current, rollback and live leased generations stay protected">Runtime Cache</button>
             </div>

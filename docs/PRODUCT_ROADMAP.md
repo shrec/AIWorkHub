@@ -58,7 +58,8 @@ AIWorkHub telemetry.
   initial typed lifecycle kernel; broader typed coverage remains incremental.
 - Quality Evidence Engine v1 now includes deterministic six-lens verdicts,
   negative calibration, independent read-only review and combined-tree
-  validation. Shared-worktree attribution remains an open hardening boundary.
+  validation. Shared-worktree registration attribution is exact-layout,
+  digest-bound, explicitly confirmed and foreign-stale fail-closed.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
 - The brand foundation, concise public README and registry workflows are
@@ -321,6 +322,9 @@ quarantine; restore remains available for seven days and permanent purge is a
 separate confirmation after expiry. Quarantine bytes remain counted as managed
 storage and are never mislabeled reclaimed. Rotated logs, superseded Source
 Graph generations and obsolete runtime packages remain the next adapters.
+Stale Git registrations are separately inventoried and pruned only when every
+candidate is attributable to the exact AIWorkHub worktree layout; any stale
+foreign registration blocks the repository-wide Git prune operation.
 
 - Ship inventory-only storage accounting first, then preview, quarantine,
   restore, and finally opt-in purge after cross-platform adversarial tests.
