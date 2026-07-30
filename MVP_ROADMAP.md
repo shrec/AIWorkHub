@@ -184,7 +184,7 @@ do not override this current priority ledger.
             bounded dashboard lens/risk/verdict projection.
       - [ ] Execute independent reviewer reports with verified provider/task
             identity and anti-anchored evidence packets.
-      - [ ] Produce and enforce combined-tree differential evidence before
+      - [x] Produce and enforce combined-tree differential evidence before
             manager promotion for medium-and-higher risk tasks.
       - [ ] Expand calibration to one positive and targeted negative fixture
             for every blocking predicate and report false-green/false-red

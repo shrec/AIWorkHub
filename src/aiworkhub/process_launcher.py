@@ -68,6 +68,7 @@ from .worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
     cleanup_workspace,
+    create_combined_validation_workspace,
     create_workspace,
     enforce_scope,
     promote,
@@ -4247,6 +4248,10 @@ class ProcessManager:
         task_id: str,
         *,
         confirm_destructive_change: bool = False,
+        requested_risk_tier: str = quality_evidence.RISK_LOW,
+        risk_signals: list[str] | None = None,
+        reviewer_reports: list[dict[str, Any]] | None = None,
+        confirm_high_risk: bool = False,
     ) -> dict[str, Any]:
         """Coordinator/write-gated acceptance of one ``review_ready`` request.
 
@@ -4261,6 +4266,11 @@ class ProcessManager:
         ``error``.  A retry after this method already promoted and finished
         the exact same request returns ``already_accepted`` instead of
         re-promoting or re-validating anything.
+
+        ``requested_risk_tier`` and ``risk_signals`` are manager-owned inputs.
+        Medium-and-higher profiles materialize a fresh combined-tree workspace
+        and fail closed without the required read-only reviewer reports.
+        High/critical profiles additionally require ``confirm_high_risk``.
         """
         with self._registry_lock():
             events = self._request_events(request_id)
@@ -4498,13 +4508,6 @@ class ProcessManager:
                         "validation_required_aiworkhub_mcp_call_missing:"
                         + str(worker_mcp_gate.get("reason") or "")
                     )
-                quality_gate = quality_evidence.run_completion_quality_gate(
-                    workspace.path, changed_paths=changed
-                )
-                if not quality_gate.get("passed"):
-                    blockers = quality_gate.get("blocking_checks") or []
-                    reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
-                    raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
                 destructive_checks = quality_evidence.run_destructive_diff_checks(
                     self.repo,
                     workspace.path,
@@ -4516,16 +4519,91 @@ class ProcessManager:
                     for check in destructive_checks
                     if check.status == quality_evidence.STATUS_FAILED
                 ]
-                quality_gate["destructive_diff_checks"] = destructive_rows
-                quality_gate["destructive_diff_blockers"] = destructive_blockers
-                quality_gate["destructive_change_confirmed"] = bool(
-                    confirm_destructive_change and destructive_blockers
-                )
                 if destructive_blockers and not confirm_destructive_change:
                     raise WorkspaceError(
                         "destructive_diff_requires_manager_confirmation:"
                         + ",".join(destructive_blockers)[:300]
                     )
+                effective_risk_signals = list(risk_signals or [])
+                risk_profile = quality_evidence.resolve_risk_profile(
+                    requested_risk_tier,
+                    signals=effective_risk_signals,
+                )
+                combined_tree: dict[str, Any] | None = None
+                combined_tree_checks: list[dict[str, Any]] = []
+                if risk_profile.get("combined_tree_required"):
+                    union_workspace, combined_tree = create_combined_validation_workspace(
+                        workspace,
+                        card,
+                        changed,
+                    )
+                    try:
+                        union_validations = run_validations(
+                            union_workspace,
+                            card.get("validation") or [],
+                        )
+                        union_quality = quality_evidence.run_completion_quality_gate(
+                            union_workspace.path,
+                            changed_paths=changed,
+                        )
+                        if not union_quality.get("passed"):
+                            union_blockers = union_quality.get("blocking_checks") or []
+                            raise WorkspaceError(
+                                "combined_tree_quality_failed:"
+                                + ",".join(str(value) for value in union_blockers)[:300]
+                            )
+                        combined_tree_checks = [
+                            {
+                                "check_id": "combined-tree-materialized",
+                                "kind": "requirements",
+                                "status": quality_evidence.STATUS_PASSED,
+                                "provenance": "current canonical tree plus exact candidate delta",
+                            },
+                            *[
+                                {
+                                    **dict(row),
+                                    "check_id": "combined-tree:" + str(row.get("check_id") or "check"),
+                                }
+                                for row in union_quality.get("checks") or []
+                            ],
+                            *[
+                                {
+                                    "check_id": f"combined-tree:validation:{index}",
+                                    "kind": "test",
+                                    "status": quality_evidence.STATUS_PASSED,
+                                    "provenance": str(row.get("command") or "validation")[:2000],
+                                }
+                                for index, row in enumerate(union_validations)
+                            ],
+                        ]
+                        combined_tree["validation"] = union_validations
+                        combined_tree["quality_gate"] = union_quality
+                    finally:
+                        cleanup_workspace(
+                            union_workspace.repo,
+                            union_workspace.path,
+                            union_workspace.home,
+                        )
+                quality_gate = quality_evidence.run_completion_quality_gate(
+                    workspace.path,
+                    changed_paths=changed,
+                    requested_risk_tier=requested_risk_tier,
+                    risk_signals=effective_risk_signals,
+                    reviewer_reports=reviewer_reports or [],
+                    combined_tree_checks=combined_tree_checks,
+                    worker_provider=str(latest.get("adapter_id") or runner),
+                    human_approval=confirm_high_risk,
+                )
+                quality_gate["combined_tree"] = combined_tree
+                if not quality_gate.get("passed"):
+                    blockers = quality_gate.get("blocking_checks") or []
+                    reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
+                    raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
+                quality_gate["destructive_diff_checks"] = destructive_rows
+                quality_gate["destructive_diff_blockers"] = destructive_blockers
+                quality_gate["destructive_change_confirmed"] = bool(
+                    confirm_destructive_change and destructive_blockers
+                )
                 validations = run_validations(workspace, card.get("validation") or [])
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(

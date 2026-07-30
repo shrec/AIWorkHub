@@ -529,3 +529,51 @@ def test_accept_review_requires_explicit_manager_confirmation_for_destructive_di
     quality = accept_review_calls[0]["evidence"]["quality_gate"]
     assert quality["destructive_diff_blockers"] == [blocker.check_id]
     assert quality["destructive_change_confirmed"] is True
+
+
+def test_accept_review_medium_risk_materializes_combined_tree_and_reviewer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    combined_calls: list[list[str]] = []
+
+    def _combined(source, _card, changed):
+        combined_calls.append(list(changed))
+        return source, {
+            "schema_id": "aiworkhub.combined_tree.v1",
+            "candidate_paths": list(changed),
+            "canonical_delta_paths": [],
+            "observed_candidate_paths": list(changed),
+        }
+
+    monkeypatch.setattr(
+        process_launcher,
+        "create_combined_validation_workspace",
+        _combined,
+    )
+
+    accepted = manager.accept_review(
+        request_id,
+        task_id,
+        requested_risk_tier="medium",
+        reviewer_reports=[
+            {
+                "lens": "correctness",
+                "provider": "deepseek_v4pro",
+                "read_only": True,
+                "can_mutate_repo": False,
+                "findings": [],
+            }
+        ],
+    )
+
+    assert accepted["ok"] is True
+    assert combined_calls == [["out/result.txt"]]
+    assert promote_calls == [["out/result.txt"]]
+    quality = accept_review_calls[0]["evidence"]["quality_gate"]
+    assert quality["quality_verdict"]["passed"] is True
+    assert quality["quality_verdict"]["risk_profile"]["effective_tier"] == "medium"
+    assert quality["combined_tree"]["schema_id"] == "aiworkhub.combined_tree.v1"

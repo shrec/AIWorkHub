@@ -379,6 +379,7 @@ def fold_quality_verdict(
     reviewer_reports: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
     worker_provider: str = "",
+    human_approval: bool = False,
     config_error: str = "",
 ) -> dict[str, Any]:
     """Purely fold mechanical and reviewer evidence into one final verdict.
@@ -472,6 +473,9 @@ def fold_quality_verdict(
                 for row in combined_rows
                 if row["status"] != STATUS_PASSED
             )
+
+    if profile.get("explicit_human_approval_required") and not human_approval:
+        blockers.append("explicit_human_approval_missing")
 
     if config_error:
         blockers.append("quality_config_error")
@@ -787,6 +791,7 @@ def run_completion_quality_gate(
     reviewer_reports: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
     worker_provider: str = "",
+    human_approval: bool = False,
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -815,6 +820,7 @@ def run_completion_quality_gate(
             reviewer_reports=reviewer_reports,
             combined_tree_checks=combined_tree_checks,
             worker_provider=worker_provider,
+            human_approval=human_approval,
             config_error=config_error,
         )
     except MalformedConfigError as exc:

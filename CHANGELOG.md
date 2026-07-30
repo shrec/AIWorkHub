@@ -20,6 +20,10 @@ noted by package/extension version and release tag.
 - Added the first Quality Gate 2.0 runtime foundation: a pure six-lens verdict
   fold, monotonic risk profiles, strict read-only reviewer evidence schema,
   initial positive/negative fixtures and bounded dashboard verdict/lens status.
+- Added manager-accept combined-tree validation for medium-and-higher risk:
+  current canonical deltas and deletions are overlaid with the exact retained
+  candidate in a fresh worktree before promotion. High/critical profiles now
+  fail closed without explicit human approval.
 - Added project acknowledgements with attribution to `kimi-atlas` for the
   quality-gate ideas that informed this direction.
 

@@ -27,7 +27,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -855,6 +855,115 @@ def cleanup_workspace(repo: Path, path: Path, home: Path) -> None:
     shutil.rmtree(path.parent, ignore_errors=True)
     if home.exists():
         shutil.rmtree(home, ignore_errors=True)
+
+
+def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
+    """Return the bounded tracked/untracked delta of the live canonical tree."""
+
+    tracked = _run(["git", "diff", "--name-only", "-z", "HEAD"], cwd=repo)
+    if tracked.returncode != 0:
+        raise WorkspaceError(f"combined_tree_git_diff_failed:{tracked.stderr[:300]}")
+    untracked = _run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=repo,
+    )
+    if untracked.returncode != 0:
+        raise WorkspaceError(
+            f"combined_tree_git_untracked_failed:{untracked.stderr[:300]}"
+        )
+    rows = sorted(
+        {
+            _relative_repo_path(value)
+            for value in (tracked.stdout + untracked.stdout).split("\x00")
+            if value
+        }
+    )
+    if len(rows) > MAX_SEED_FILES:
+        raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(rows)}")
+    return rows
+
+
+def _overlay_regular_path(source_root: Path, target_root: Path, relative: str) -> None:
+    source = source_root / relative
+    target = target_root / relative
+    _require_beneath(source_root, source)
+    _require_beneath(target_root, target)
+    if source.is_symlink():
+        raise WorkspaceError(f"combined_tree_symlink_forbidden:{relative}")
+    if not source.exists():
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.exists():
+            raise WorkspaceError(f"combined_tree_delete_non_file:{relative}")
+        return
+    if not source.is_file():
+        raise WorkspaceError(f"combined_tree_source_not_file:{relative}")
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise WorkspaceError(f"combined_tree_target_not_regular:{relative}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
+def create_combined_validation_workspace(
+    source_workspace: WorkerWorkspace,
+    card: Mapping[str, Any],
+    candidate_changed_paths: Iterable[str],
+) -> tuple[WorkerWorkspace, dict[str, Any]]:
+    """Materialize current canonical state plus one retained candidate delta.
+
+    The returned detached worktree starts from ``HEAD``, overlays every
+    tracked/untracked change currently present in the canonical worktree, and
+    then overlays the exact candidate paths last.  Its baseline is reset after
+    the canonical overlay, so later scope checks observe only the candidate
+    delta while validations execute against the complete union.  The caller
+    owns cleanup through :func:`cleanup_workspace`.
+    """
+
+    repo = source_workspace.repo.resolve()
+    candidate = sorted({_relative_repo_path(value) for value in candidate_changed_paths})
+    if not candidate:
+        raise WorkspaceError("combined_tree_candidate_empty")
+    canonical_delta = _canonical_worktree_delta_paths(repo)
+    union_allowed = sorted(set(source_workspace.allowed_writes) | set(canonical_delta))
+    if len(union_allowed) > MAX_SEED_FILES:
+        raise WorkspaceError(f"combined_tree_path_limit_exceeded:{len(union_allowed)}")
+    union_card = dict(card)
+    union_card["allowed_writes"] = union_allowed
+    request_id = f"union_{source_workspace.request_id[:70]}_{uuid.uuid4().hex[:16]}"
+    combined = create_workspace(repo, request_id, union_card, "validation")
+    try:
+        for relative in canonical_delta:
+            _overlay_regular_path(repo, combined.path, relative)
+        baseline_paths = sorted(set(combined.workspace_baseline) | set(canonical_delta))
+        combined = replace(
+            combined,
+            workspace_baseline={
+                relative: _hash_path(combined.path / relative)
+                for relative in baseline_paths
+            },
+        )
+        for relative in candidate:
+            _overlay_regular_path(source_workspace.path, combined.path, relative)
+        observed = changed_paths(combined)
+        unexpected = sorted(set(observed) - set(candidate))
+        missing = sorted(set(candidate) - set(observed))
+        if unexpected:
+            raise WorkspaceError(
+                "combined_tree_unexpected_delta:" + ",".join(unexpected[:20])
+            )
+        if missing:
+            raise WorkspaceError(
+                "combined_tree_candidate_not_materialized:" + ",".join(missing[:20])
+            )
+        return combined, {
+            "schema_id": "aiworkhub.combined_tree.v1",
+            "candidate_paths": candidate,
+            "canonical_delta_paths": canonical_delta,
+            "observed_candidate_paths": observed,
+        }
+    except Exception:
+        cleanup_workspace(repo, combined.path, combined.home)
+        raise
 
 
 def assert_gc_safe_workspace_shape(request_id: str, path: Path, home: Path) -> Path:

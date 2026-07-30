@@ -140,10 +140,25 @@ def test_high_risk_cross_provider_clean_reports_are_verified() -> None:
         reviewer_reports=[_report(lens) for lens in sorted(qe.JUDGMENT_LENSES)],
         combined_tree_checks=[_check("union-tests")],
         worker_provider="worker-a",
+        human_approval=True,
     )
 
     assert verdict["passed"] is True
     assert verdict["status"] == "verified"
+
+
+def test_high_risk_clean_evidence_still_requires_explicit_approval() -> None:
+    profile = qe.resolve_risk_profile("high")
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        risk_profile=profile,
+        reviewer_reports=[_report(lens) for lens in sorted(qe.JUDGMENT_LENSES)],
+        combined_tree_checks=[_check("union-tests")],
+        worker_provider="worker-a",
+    )
+
+    assert verdict["passed"] is False
+    assert "explicit_human_approval_missing" in verdict["blocking_evidence"]
 
 
 def test_model_supplied_pass_cannot_override_blocking_finding() -> None:

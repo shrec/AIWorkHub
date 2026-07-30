@@ -242,6 +242,13 @@ effective risk, verdict, refinement requirement and bounded lens status. The
 first positive/negative fixture matrix proves syntax and unavailable-required-
 check failures; full predicate calibration remains open.
 
+Manager acceptance now materializes a fresh `aiworkhub.combined_tree.v1`
+workspace for medium-and-higher risk. It overlays the current canonical
+tracked/untracked delta (including deletions) and then the exact retained
+candidate, executes validations and the deterministic quality floor there,
+and records bounded union evidence before promotion. High/critical profiles
+also fail closed without an explicit manager approval bit.
+
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and
   requirements/scope. Models emit findings; no model computes PASS/FAIL.

@@ -1312,6 +1312,10 @@ def aiworkhub_agent_accept_review(
     request_id: str,
     task_id: str,
     confirm_destructive_change: bool = False,
+    requested_risk_tier: str = quality_evidence.RISK_LOW,
+    risk_signals: list[str] | None = None,
+    reviewer_reports: list[dict[str, Any]] | None = None,
+    confirm_high_risk: bool = False,
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
 
@@ -1322,12 +1326,19 @@ def aiworkhub_agent_accept_review(
     precondition or revalidation failure leaves the canonical repo untouched
     and the task in review. Idempotent: accepting the same already-finished
     request again returns ``already_accepted`` instead of re-promoting.
+    Medium-and-higher risk profiles also validate a fresh canonical+candidate
+    combined tree and require strict reviewer findings; high/critical review
+    requires an explicit ``confirm_high_risk`` decision.
     """
 
     return process_launcher.default_manager().accept_review(
         request_id,
         task_id,
         confirm_destructive_change=confirm_destructive_change,
+        requested_risk_tier=requested_risk_tier,
+        risk_signals=risk_signals,
+        reviewer_reports=reviewer_reports,
+        confirm_high_risk=confirm_high_risk,
     )
 
 
