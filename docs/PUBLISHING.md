@@ -25,9 +25,17 @@ npm --prefix vscode-extension test
 npm --prefix vscode-extension run package
 ```
 
-Before tagging, set the same version in `pyproject.toml` and
-`vscode-extension/package.json`. The release workflow checks both versions
-against the selected tag and fails before publication when they differ.
+The canonical version lives only in `src/aiworkhub/_version.py`. After changing
+that literal, synchronize the generated extension projections and verify them:
+
+```bash
+python scripts/release_metadata.py sync
+python scripts/release_metadata.py check --tag v<x.y.z>
+```
+
+Python package metadata reads the canonical value dynamically. Extension
+`package.json`, `package-lock.json`, and the packaged-runtime compatibility
+constant are generated projections; CI fails on any drift.
 
 Public-release presentation must also pass this checklist:
 
@@ -58,6 +66,9 @@ The `release.yml` workflow will:
 4. Upload the Python distributions and
    `vscode-extension/dist/aiworkhub-*.vsix` as workflow artifacts.
 5. Create a draft GitHub Release with all three artifacts attached.
+   The published release also includes `SHA256SUMS` for the wheel, source
+   distribution and VSIX; the canonical build verifies byte-identical repeated
+   VSIX packaging before upload.
 6. If `OVSX_TOKEN` is present, publish the VSIX to Open VSX Registry.
 7. If `MARKETPLACE_TOKEN` is present, publish the VSIX to the VS Code
    Marketplace.
@@ -109,6 +120,7 @@ python -m twine upload dist/*
 
 AIWorkHub follows [Semantic Versioning](https://semver.org/). Before a release:
 
-1. Update `version` in `pyproject.toml`.
-2. Update `version` in `vscode-extension/package.json`.
-3. Commit the version changes, then create the matching `v<x.y.z>` tag.
+1. Update `__version__` in `src/aiworkhub/_version.py`.
+2. Run `python scripts/release_metadata.py sync` and commit every projection.
+3. Run `python scripts/release_metadata.py check --tag v<x.y.z>`.
+4. Commit the version changes, then create the matching `v<x.y.z>` tag.

@@ -11,6 +11,14 @@ noted by package/extension version and release tag.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.
+- Added a single canonical release-version authority, deterministic projection
+  sync/check tooling, repeated-build VSIX reproducibility gates and published
+  SHA-256 checksums for release artifacts.
+- Added the Quality Gate 2.0 contract and ADR: six falsifiable lenses,
+  deterministic verdict ownership, risk-proportional review, combined-tree
+  verification and positive/negative gate calibration.
+- Added project acknowledgements with attribution to `kimi-atlas` for the
+  quality-gate ideas that informed this direction.
 
 ### Changed
 

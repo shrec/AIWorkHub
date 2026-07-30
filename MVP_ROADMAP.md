@@ -172,14 +172,23 @@ do not override this current priority ledger.
 
 ### P2 — Maintainability, distribution and ecosystem
 
+- [ ] Close Quality Gate 2.0: pure six-lens verdict, risk-proportional profiles,
+      read-only independent reviewer execution, combined-tree differential,
+      negative-fixture calibration and Review Inbox lens/residual-risk display.
+      Preserve the existing Quality Evidence Engine, exact scope/hashes,
+      declared checks and destructive-diff guard as the deterministic floor;
+      do not create a second review authority. See `docs/QUALITY_CONTROL.md`
+      and ADR 0003.
 - [ ] Split `core.py` and `process_launcher.py` along lifecycle, authority,
       review and context boundaries without changing public MCP contracts.
 - [ ] Modularize the VS Code extension in TypeScript with deterministic bundle
       output and restored-tab/reload E2E coverage.
 - [ ] Centralize pytest fixtures/state isolation and organize unit/integration/
       E2E suites; add Ruff, type checking and pre-commit quality gates.
-- [ ] Make version metadata a single source of truth and enforce Linux/Windows/
-      macOS release CI plus reproducible VSIX checksums.
+- [x] Make version metadata a single source of truth and enforce Linux/Windows/
+      macOS release CI plus reproducible VSIX checksums. Canonical authority is
+      `src/aiworkhub/_version.py`; projections, tag identity, repeated VSIX
+      byte equality and sorted final-asset checksums are release-gated.
 - [ ] Finish public documentation, ADRs, VS Code Marketplace/Open VSX
       publication, then consider GitHub issue/PR sync, webhooks/public API and
       historical reliability analytics.

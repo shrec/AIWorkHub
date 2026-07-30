@@ -43,6 +43,9 @@ AIWorkHub telemetry.
   preview, quarantine, restore and separately confirmed expired purge.
 - Ubuntu, Windows, and macOS CI/release matrices plus VSIX and Python package
   generation.
+- One canonical Python release-version authority with deterministic extension
+  projections, tag/version CI checks, reproducible VSIX qualification and
+  sorted release-asset SHA-256 checksums.
 
 ### Partial or not yet production-closed
 
@@ -52,8 +55,10 @@ AIWorkHub telemetry.
   migration and restored-tab/reload E2E boundary are still open.
 - Shared pytest state isolation, staged Ruff/type gates and test-suite
   organization are not complete.
-- Release versions still have multiple declared metadata locations; a single
-  version authority and reproducible published checksums remain open.
+- Quality Evidence Engine v1 runs the deterministic syntax/configured-check
+  floor and destructive-diff guard, but the six-lens pure verdict, negative
+  gate calibration, independent reviewer execution and combined-tree
+  differential are not yet production-closed.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
 - The brand foundation is present, but Marketplace/Open VSX publication,
@@ -223,6 +228,30 @@ writes, tests, quality checks, SARIF/CodeQL-compatible findings when available,
 coverage, logs, artifacts, tool-use receipts, reviewer decision, and rollback
 identity. `not_available` is never `passed`.
 
+**Quality Gate 2.0:** evolve the existing engine without creating a parallel
+review framework. The canonical contract is documented in
+[`QUALITY_CONTROL.md`](QUALITY_CONTROL.md) and ADR 0003.
+
+- Add one pure deterministic verdict fold over six falsifiable lenses:
+  correctness, does-it-run, test adequacy, security, code quality and
+  requirements/scope. Models emit findings; no model computes PASS/FAIL.
+- Add repository/task risk profiles. The universal floor always runs; medium,
+  high and release profiles progressively require independent review,
+  change-sensitive coverage, security checks, mutation/revert-to-red probes,
+  platform evidence and explicit approval. A worker cannot lower its risk.
+- Execute the existing read-only `quality_reviewer` contract with anti-anchored
+  evidence packets. Prefer a different provider for high-risk correctness and
+  security review; reviewer output is schema-checked and cannot mutate code.
+- Add a combined-tree differential before final acceptance: validate the exact
+  candidate together with accepted dependencies and concurrent canonical
+  changes, then bind the resulting hashes to the acceptance evidence.
+- Add a deterministic negative-gate benchmark: one known-good fixture and one
+  deliberately broken fixture per blocking predicate. Track false-green,
+  false-red, unavailable-evidence and post-accept escape rates.
+- Expose lens status, proof source, reviewer disagreement and residual risk in
+  Review Inbox 2.0. Missing required evidence fails closed; unavailable
+  optional evidence remains visible and never masquerades as passed.
+
 ### Workforce catalog and adaptive scoring
 
 Maintain user-configured available models and score them by verified outcomes:
@@ -329,6 +358,11 @@ or create a second implementation of a live subsystem.
 - Audit broad exception handlers on authority boundaries. A catch-all is valid
   only when it converts the exception into a bounded, observable degraded state
   and never reports success.
+- Calibrate the quality gate itself with committed positive/negative fixtures;
+  CI must prove known-good remains green and every targeted defect becomes the
+  expected non-green verdict.
+- Run dependency/concurrency union validations before acceptance so isolated
+  green tasks cannot create a false-green integrated tree.
 
 ### Release and repository hygiene
 

@@ -20,6 +20,8 @@ import os
 import threading
 import importlib
 
+from ._version import __version__
+
 __all__ = [
     "__version__",
     "COORDINATOR_TOKEN_ENV",
@@ -28,8 +30,6 @@ __all__ = [
     "refresh_coordinator_config",
     "project_context",
 ]
-
-__version__ = "0.8.0"
 
 COORDINATOR_TOKEN_ENV = "BITNN_TASKCTL_COORDINATOR_TOKEN"
 COORDINATOR_TOKEN_FILE_ENV = "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE"

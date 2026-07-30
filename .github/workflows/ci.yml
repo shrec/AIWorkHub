@@ -39,6 +39,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify canonical release metadata
+        run: python scripts/release_metadata.py check
+
       - name: Install and qualify cross-platform Python runtime
         env:
           AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
@@ -181,6 +184,13 @@ jobs:
 
       - name: Package VSIX
         run: npm run package
+        working-directory: vscode-extension
+
+      - name: Verify reproducible VSIX bytes
+        run: |
+          cp dist/aiworkhub-*.vsix /tmp/aiworkhub-first.vsix
+          npm run package
+          cmp /tmp/aiworkhub-first.vsix dist/aiworkhub-*.vsix
         working-directory: vscode-extension
 
       - name: Verify VSIX

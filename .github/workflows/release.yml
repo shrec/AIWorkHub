@@ -40,6 +40,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify canonical release metadata
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
+
       - name: Install and qualify cross-platform Python runtime
         env:
           AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
@@ -100,49 +105,7 @@ jobs:
       - name: Verify release versions
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import pathlib
-          import re
-          import tomllib
-
-          tag = os.environ["RELEASE_TAG"]
-          if not tag.startswith("v"):
-              raise SystemExit(f"release tag must start with v: {tag}")
-
-          with pathlib.Path("pyproject.toml").open("rb") as stream:
-              python_version = tomllib.load(stream)["project"]["version"]
-          extension_version = json.loads(
-              pathlib.Path("vscode-extension/package.json").read_text()
-          )["version"]
-          extension_lock_version = json.loads(
-              pathlib.Path("vscode-extension/package-lock.json").read_text()
-          )["packages"][""]["version"]
-          init_source = pathlib.Path("src/aiworkhub/__init__.py").read_text()
-          init_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_source, re.MULTILINE)
-          extension_source = pathlib.Path("vscode-extension/extension.js").read_text()
-          runtime_match = re.search(
-              r'^const EXPECTED_MCP_PACKAGE_VERSION\s*=\s*["\']([^"\']+)["\']',
-              extension_source,
-              re.MULTILINE,
-          )
-          expected = tag[1:]
-
-          versions = {
-              "pyproject.toml": python_version,
-              "src/aiworkhub/__init__.py": init_match.group(1) if init_match else "missing",
-              "vscode-extension/package.json": extension_version,
-              "vscode-extension/package-lock.json": extension_lock_version,
-              "vscode-extension/extension.js": runtime_match.group(1) if runtime_match else "missing",
-          }
-          if any(version != expected for version in versions.values()):
-              raise SystemExit(
-                  "release version mismatch: "
-                  f"tag={expected}, versions={versions}"
-              )
-          PY
+        run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
 
       - name: Install Python test and build dependencies
         run: |
@@ -198,6 +161,13 @@ jobs:
         run: npm run package
         working-directory: vscode-extension
 
+      - name: Verify reproducible VSIX bytes
+        run: |
+          cp dist/aiworkhub-*.vsix /tmp/aiworkhub-first.vsix
+          npm run package
+          cmp /tmp/aiworkhub-first.vsix dist/aiworkhub-*.vsix
+        working-directory: vscode-extension
+
       - name: Verify VSIX
         run: |
           shopt -s nullglob
@@ -220,6 +190,11 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 1
+
       - name: Download Python distributions
         uses: actions/download-artifact@v4
         with:
@@ -245,6 +220,12 @@ jobs:
           test -s "${sdists[0]}"
           test -s "${vsix[0]}"
 
+      - name: Generate release checksums
+        run: >-
+          python scripts/release_metadata.py checksums
+          --output release-assets/SHA256SUMS
+          release-assets/python/* release-assets/vscode/*
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -263,6 +244,8 @@ jobs:
 
             # Remote-SSH: install on the remote host workspace
             ```
+
+            Verify downloaded artifacts against the attached `SHA256SUMS`.
           draft: false
           prerelease: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
           fail_on_unmatched_files: true
@@ -270,6 +253,7 @@ jobs:
             release-assets/python/aiworkhub-*.whl
             release-assets/python/aiworkhub-*.tar.gz
             release-assets/vscode/aiworkhub-*.vsix
+            release-assets/SHA256SUMS
 
   publish-open-vsx:
     name: Publish to Open VSX Registry

@@ -718,6 +718,7 @@ on Linux, macOS, Windows and the Remote-SSH contract. See
 - [Getting Started](docs/GETTING_STARTED.md) -- install, Init Repo, first task
 - [Architecture](docs/ARCHITECTURE.md) -- how the pieces fit together
 - [Architecture Decisions](docs/adr/README.md) -- durable authority contracts
+- [Quality Control](docs/QUALITY_CONTROL.md) -- deterministic evidence, independent review and risk profiles
 - [Product Roadmap](docs/PRODUCT_ROADMAP.md) -- shipped, partial and planned work
 - [Brand Guide](docs/BRAND.md) -- name, positioning, visual identity and voice
 - [Publishing](docs/PUBLISHING.md) -- release preflight and tag-driven CI release
@@ -729,6 +730,7 @@ on Linux, macOS, Windows and the Remote-SSH contract. See
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security Policy](SECURITY.md)
 - [Support](SUPPORT.md)
+- [Acknowledgements](ACKNOWLEDGEMENTS.md)
 - [License](LICENSE) -- MIT
 - [GitHub Issues](https://github.com/shrec/AIWorkHub/issues) /
   [Pull Requests](https://github.com/shrec/AIWorkHub/pulls)

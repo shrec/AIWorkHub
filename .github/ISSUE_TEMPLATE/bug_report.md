@@ -9,7 +9,7 @@ labels: bug
 A clear description of what went wrong.
 
 **Environment**
-- AIWorkHub version (`pyproject.toml` / extension version):
+- AIWorkHub version (`src/aiworkhub/_version.py` / extension version):
 - Python version:
 - OS (Linux / Windows / WSL / Remote-SSH):
 - VS Code or headless MCP client:

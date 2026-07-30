@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiworkhub"
-version = "0.8.0"
+dynamic = ["version"]
 description = "MCP server for AIWorkHub task queue orchestration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -58,6 +58,9 @@ aiworkhub-callback-channel = "aiworkhub.callback_channel:main"
 
 [tool.setuptools.package-data]
 aiworkhub = ["dashboard_static/*", "py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "aiworkhub._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
