@@ -53,6 +53,7 @@ def build_review_packet(
     claim_epoch: int,
     worker_provider: str,
     changed_path_hashes: Mapping[str, str],
+    objective: str = "",
     acceptance: Iterable[object] = (),
     required_outputs: Iterable[object] = (),
     validation: Iterable[object] = (),
@@ -118,6 +119,7 @@ def build_review_packet(
             "worker_provider": _identity(worker_provider, "worker_provider"),
         },
         "contract": {
+            "objective": str(objective)[:MAX_TEXT_CHARS],
             "acceptance": _bounded_strings(acceptance, limit=MAX_PACKET_COMMANDS),
             "required_outputs": _bounded_strings(required_outputs, limit=MAX_PACKET_COMMANDS),
             "validation": _bounded_strings(validation, limit=MAX_PACKET_COMMANDS),
@@ -196,10 +198,41 @@ def verify_reviewer_receipt(
     }
 
 
+def build_review_prompt(
+    packet: Mapping[str, Any],
+    *,
+    lens: str,
+    submit_tool_name: str = "aiworkhub_worker_quality_review_submit",
+) -> str:
+    """Render a bounded independent-review prompt from packet facts only."""
+
+    if lens not in {"correctness", "security", "code_quality"}:
+        raise ReviewerEvidenceError("invalid_reviewer_lens")
+    packet_body = {k: v for k, v in packet.items() if k != "packet_sha256"}
+    packet_digest = str(packet.get("packet_sha256") or "")
+    if not _SHA256_RE.fullmatch(packet_digest) or _canonical_digest(packet_body) != packet_digest:
+        raise ReviewerEvidenceError("review_packet_digest_invalid")
+    encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return (
+        "You are an independent, strictly read-only quality reviewer.\n"
+        f"Review lens: {lens}.\n"
+        "Inspect the exact candidate workspace and the deterministic packet below. "
+        "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
+        "Do not write, edit, format, or delete repository files.\n"
+        "Report only concrete findings supported by file/line or check evidence. "
+        "Use severity critical, high, medium, or low. An empty findings list is valid.\n"
+        f"Before finishing, call {submit_tool_name} exactly once with "
+        f'packet_sha256="{packet_digest}", lens="{lens}", and your findings array.\n'
+        "The tool call is the authoritative submission; prose is not evidence.\n"
+        f"QUALITY_REVIEW_PACKET: {encoded}\n"
+    )
+
+
 __all__ = [
     "PACKET_SCHEMA_ID",
     "RECEIPT_SCHEMA_ID",
     "ReviewerEvidenceError",
     "build_review_packet",
+    "build_review_prompt",
     "verify_reviewer_receipt",
 ]

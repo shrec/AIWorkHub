@@ -671,6 +671,7 @@ def provision_worker_mcp_runtime(
     backend: str,
     source_graph_targets: list[str] | tuple[str, ...],
     session_topic: str,
+    quality_review_packet_path: Path | None = None,
 ) -> Any:
     """B834: provision this request's isolated worker MCP config + audit ledger.
 
@@ -724,6 +725,17 @@ def provision_worker_mcp_runtime(
         Path(SANDBOX_PACKAGE_IMPORT_ROOT) if backend == "bubblewrap" else host_package_import_root
     )
 
+    worker_review_packet_path: Path | None = None
+    if quality_review_packet_path is not None:
+        host_packet = quality_review_packet_path.resolve()
+        _require_beneath(workspace.home, host_packet)
+        relative_packet = host_packet.relative_to(workspace.home)
+        worker_review_packet_path = (
+            Path(bubblewrap_home_env_value()) / relative_packet
+            if backend == "bubblewrap"
+            else host_packet
+        )
+
     try:
         return worker_ai_tools_mcp.generate_worker_mcp_runtime(
             home=workspace.home,
@@ -736,6 +748,7 @@ def provision_worker_mcp_runtime(
             source_graph_targets=source_graph_targets,
             session_topic=session_topic,
             package_import_root=package_import_root,
+            quality_review_packet_path=worker_review_packet_path,
         )
     except worker_ai_tools_mcp.WorkerToolError as exc:
         # Provisioning/config-injection failure must reject the launch, not
@@ -963,6 +976,75 @@ def create_combined_validation_workspace(
         }
     except Exception:
         cleanup_workspace(repo, combined.path, combined.home)
+        raise
+
+
+def create_quality_review_workspace(
+    source_workspace: WorkerWorkspace,
+    request_id: str,
+    candidate_changed_paths: Iterable[str],
+    adapter_id: str,
+) -> tuple[WorkerWorkspace, dict[str, Any]]:
+    """Materialize one candidate for a strictly read-only reviewer.
+
+    The filesystem content matches the combined canonical+candidate tree,
+    but the returned workspace has no writable paths. The candidate delta is
+    retained in its baseline metadata solely so the coordinator can prove
+    that the reviewer saw the exact packet-bound bytes and made no edits.
+    """
+
+    repo = source_workspace.repo.resolve()
+    candidate = sorted({_relative_repo_path(value) for value in candidate_changed_paths})
+    if not candidate:
+        raise WorkspaceError("quality_review_candidate_empty")
+    canonical_delta = _canonical_worktree_delta_paths(repo)
+    seed_paths = sorted(set(candidate) | set(canonical_delta))
+    if len(seed_paths) > MAX_SEED_FILES:
+        raise WorkspaceError(f"quality_review_path_limit_exceeded:{len(seed_paths)}")
+    seed_card = {
+        "allowed_writes": seed_paths,
+        "required_outputs": [],
+        "read_first": [],
+        "immutable_inputs": [],
+    }
+    review_workspace = create_workspace(repo, request_id, seed_card, adapter_id)
+    try:
+        for relative in canonical_delta:
+            _overlay_regular_path(repo, review_workspace.path, relative)
+        baseline_paths = sorted(
+            set(review_workspace.workspace_baseline) | set(canonical_delta)
+        )
+        canonical_baseline = {
+            relative: _hash_path(review_workspace.path / relative)
+            for relative in baseline_paths
+        }
+        for relative in candidate:
+            _overlay_regular_path(source_workspace.path, review_workspace.path, relative)
+        observed = changed_paths(
+            replace(review_workspace, workspace_baseline=canonical_baseline)
+        )
+        if observed != candidate:
+            raise WorkspaceError(
+                "quality_review_candidate_mismatch:"
+                + ",".join(sorted(set(observed) ^ set(candidate))[:20])
+            )
+        readonly = replace(
+            review_workspace,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={
+                relative: _hash_path(review_workspace.path / relative)
+                for relative in sorted(set(baseline_paths) | set(candidate))
+            },
+        )
+        return readonly, {
+            "schema_id": "aiworkhub.quality_review_workspace.v1",
+            "candidate_paths": candidate,
+            "canonical_delta_paths": canonical_delta,
+            "readonly": True,
+        }
+    except Exception:
+        cleanup_workspace(repo, review_workspace.path, review_workspace.home)
         raise
 
 

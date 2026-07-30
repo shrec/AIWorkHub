@@ -555,7 +555,7 @@ def test_accept_review_requires_explicit_manager_confirmation_for_destructive_di
     assert quality["destructive_change_confirmed"] is True
 
 
-def test_accept_review_medium_risk_materializes_combined_tree_and_reviewer(
+def test_accept_review_rejects_caller_supplied_reviewer_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (
@@ -594,10 +594,12 @@ def test_accept_review_medium_risk_materializes_combined_tree_and_reviewer(
         ],
     )
 
-    assert accepted["ok"] is True
-    assert combined_calls == [["out/result.txt"]]
-    assert promote_calls == [["out/result.txt"]]
-    quality = accept_review_calls[0]["evidence"]["quality_gate"]
-    assert quality["quality_verdict"]["passed"] is True
-    assert quality["quality_verdict"]["risk_profile"]["effective_tier"] == "medium"
-    assert quality["combined_tree"]["schema_id"] == "aiworkhub.combined_tree.v1"
+    assert accepted == {
+        "ok": False,
+        "error": "unverified_reviewer_reports_forbidden",
+        "request_id": request_id,
+        "task_id": task_id,
+    }
+    assert combined_calls == []
+    assert promote_calls == []
+    assert accept_review_calls == []

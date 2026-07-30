@@ -1282,6 +1282,31 @@ def aiworkhub_agent_launch_task(
 
 
 @mcp.tool()
+def aiworkhub_quality_reviewer_launch(
+    target_request_id: str,
+    target_task_id: str,
+    reviewer_task_id: str,
+    runner: str,
+    adapter_id: str,
+    lens: Literal["correctness", "security", "code_quality"],
+    model: str | None = None,
+    timeout_seconds: int = 1800,
+) -> dict[str, Any]:
+    """DUAL-GATED: launch one independent anti-anchored quality reviewer."""
+
+    return process_launcher.default_manager().launch_quality_reviewer(
+        target_request_id=target_request_id,
+        target_task_id=target_task_id,
+        reviewer_task_id=reviewer_task_id,
+        runner=runner,
+        adapter_id=adapter_id,
+        lens=lens,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+@mcp.tool()
 def aiworkhub_agent_task_status(request_id: str) -> dict[str, Any]:
     """READ-ONLY: inspect one launched process and its authoritative task card."""
 
@@ -1316,6 +1341,7 @@ def aiworkhub_agent_accept_review(
     requested_risk_tier: str = quality_evidence.RISK_LOW,
     risk_signals: list[str] | None = None,
     reviewer_reports: list[dict[str, Any]] | None = None,
+    reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
 ) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
@@ -1339,6 +1365,7 @@ def aiworkhub_agent_accept_review(
         requested_risk_tier=requested_risk_tier,
         risk_signals=risk_signals,
         reviewer_reports=reviewer_reports,
+        reviewer_request_ids=reviewer_request_ids,
         confirm_high_risk=confirm_high_risk,
     )
 

@@ -2011,6 +2011,31 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
       },
     },
   },
+  {
+    name: "aiworkhub_manager_quality_review_submit",
+    description: "Submit findings for the exact launcher-bound, read-only quality-review packet.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["packet_sha256", "lens", "findings"],
+      properties: {
+        packet_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+        lens: { type: "string", enum: ["correctness", "security", "code_quality"] },
+        findings: {
+          type: "array", maxItems: 50,
+          items: {
+            type: "object", additionalProperties: false,
+            required: ["id", "severity", "summary", "evidence"],
+            properties: {
+              id: { type: "string", minLength: 1, maxLength: 200 },
+              severity: { type: "string", enum: ["critical", "high", "medium", "low"] },
+              summary: { type: "string", minLength: 1, maxLength: 2000 },
+              evidence: { type: "string", minLength: 1, maxLength: 2000 },
+            },
+          },
+        },
+      },
+    },
+  },
 ]);
 
 function languageModelTextPart(value) {

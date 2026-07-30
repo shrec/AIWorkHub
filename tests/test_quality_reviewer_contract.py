@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from aiworkhub import quality_reviewer as qr
+from aiworkhub import process_launcher
 from aiworkhub import worker_ai_tools_mcp as worker_tools
+from aiworkhub import worker_workspace
 
 
 def _packet() -> dict[str, object]:
@@ -190,6 +193,36 @@ def test_worker_submission_is_packet_bound_and_hmac_audited(tmp_path: Path) -> N
         "task_id": "REVIEW_TASK_1",
     }
 
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=ctx.request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    verified = process_launcher._verified_quality_review_receipt(
+        {
+            "task_id": ctx.task_id,
+            "runner": ctx.runner,
+            "topic": ctx.topic,
+            "adapter_id": "claude_cli",
+            "worker_mcp": {
+                "audit_ledger_path": str(ctx.audit_ledger_path),
+                "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+            },
+            "quality_review": {
+                "packet_path": str(packet_path),
+                "lens": "correctness",
+            },
+        },
+        workspace,
+        ctx.request_id,
+    )
+    assert verified["reviewer"]["provider"] == "claude_cli"
+    assert verified["report"]["provider"] == "claude_cli"
+
 
 def test_ordinary_worker_cannot_submit_unbound_review(tmp_path: Path) -> None:
     ctx = _worker_context(tmp_path, None)
@@ -204,3 +237,45 @@ def test_ordinary_worker_cannot_submit_unbound_review(tmp_path: Path) -> None:
         "tool": "quality_review_submit",
         "reason": "quality_review_packet_not_bound",
     }
+
+
+def test_review_workspace_materializes_candidate_but_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "AIWorkHub Test"], cwd=repo, check=True)
+    source_file = repo / "source.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "source.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repo, check=True)
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(tmp_path / "worktrees"))
+
+    source = worker_workspace.create_workspace(
+        repo,
+        "a" * 32,
+        {"allowed_writes": ["source.py"], "required_outputs": []},
+        "validation",
+    )
+    (source.path / "source.py").write_text("value = 2\n", encoding="utf-8")
+    review = None
+    try:
+        review, evidence = worker_workspace.create_quality_review_workspace(
+            source,
+            "b" * 32,
+            ["source.py"],
+            "validation",
+        )
+        assert review.allowed_writes == ()
+        assert (review.path / "source.py").read_text(encoding="utf-8") == "value = 2\n"
+        assert worker_workspace.enforce_scope(review) == []
+        assert evidence["candidate_paths"] == ["source.py"]
+        (review.path / "source.py").write_text("reviewer edit\n", encoding="utf-8")
+        with pytest.raises(worker_workspace.WorkspaceError, match="scope_violation"):
+            worker_workspace.enforce_scope(review)
+    finally:
+        if review is not None:
+            worker_workspace.cleanup_workspace(repo, review.path, review.home)
+        worker_workspace.cleanup_workspace(repo, source.path, source.home)

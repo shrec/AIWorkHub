@@ -55,6 +55,7 @@ except ImportError:
 
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
+from . import quality_reviewer
 from . import vscode_lm_bridge
 from . import worker_ai_tools_mcp
 try:
@@ -70,6 +71,7 @@ from .worker_workspace import (
     WorkspaceError,
     cleanup_workspace,
     create_combined_validation_workspace,
+    create_quality_review_workspace,
     create_workspace,
     enforce_scope,
     promote,
@@ -507,6 +509,10 @@ def _read_terminal_authority_grant(path: Path) -> dict[str, Any]:
 
 class LaunchRejected(RuntimeError):
     """A bounded, user-visible preflight rejection."""
+
+
+class _QualityReviewFinalized(RuntimeError):
+    """Internal control signal: reviewer evidence reached canonical review."""
 
 
 def _utcnow() -> str:
@@ -1539,6 +1545,7 @@ def _provision_worker_mcp_runtime_for_authority(
     authority_repo: Path,
     source_graph_targets: list[str],
     session_topic: str,
+    quality_review_packet_path: Path | None = None,
 ) -> worker_ai_tools_mcp.WorkerMcpRuntime:
     kwargs: dict[str, Any] = {
         "request_id": request_id,
@@ -1549,6 +1556,8 @@ def _provision_worker_mcp_runtime_for_authority(
         "source_graph_targets": source_graph_targets,
         "session_topic": session_topic,
     }
+    if quality_review_packet_path is not None:
+        kwargs["quality_review_packet_path"] = quality_review_packet_path
     try:
         signature = inspect.signature(provision_worker_mcp_runtime)
     except (TypeError, ValueError):
@@ -1674,6 +1683,79 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             reasons.append(f"aiworkhub_tool_policy_violations:{policy_violations}")
         result["reason"] = verification.get("reason") or "; ".join(reasons)
     return result
+
+
+def _verified_quality_review_receipt(
+    metadata: dict[str, Any],
+    workspace: WorkerWorkspace,
+    request_id: str,
+) -> dict[str, Any]:
+    """Resolve exactly one authenticated submission for a reviewer process."""
+
+    binding = metadata.get("quality_review")
+    if not isinstance(binding, dict):
+        raise WorkspaceError("quality_review_binding_missing")
+    packet_path_raw = binding.get("packet_path")
+    if not isinstance(packet_path_raw, str) or not packet_path_raw:
+        raise WorkspaceError("quality_review_packet_path_missing")
+    packet_path = Path(packet_path_raw).resolve()
+    try:
+        packet_path.relative_to(workspace.home.resolve())
+    except ValueError as exc:
+        raise WorkspaceError("quality_review_packet_outside_home") from exc
+    try:
+        if packet_path.is_symlink() or not packet_path.is_file():
+            raise WorkspaceError("quality_review_packet_invalid")
+        if packet_path.stat().st_size > worker_ai_tools_mcp.MAX_QUALITY_REVIEW_PACKET_BYTES:
+            raise WorkspaceError("quality_review_packet_too_large")
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceError("quality_review_packet_unreadable") from exc
+    worker_meta = metadata.get("worker_mcp") or {}
+    verification = worker_ai_tools_mcp.verify_audit_ledger(
+        Path(str(worker_meta.get("audit_ledger_path") or "")),
+        Path(str(worker_meta.get("audit_hmac_key_path") or "")),
+        task_id=str(metadata.get("task_id") or ""),
+        runner=str(metadata.get("runner") or ""),
+        topic=str(metadata.get("topic") or ""),
+        request_id=request_id,
+    )
+    payloads = verification.get("verified_payloads") or []
+    if len(payloads) != 1:
+        raise WorkspaceError(f"quality_review_submission_count:{len(payloads)}")
+    observed_provider = str(metadata.get("adapter_id") or "")
+    target = packet.get("target") if isinstance(packet, dict) else None
+    if not isinstance(target, dict):
+        raise WorkspaceError("quality_review_packet_target_missing")
+    if observed_provider == str(target.get("worker_provider") or ""):
+        raise WorkspaceError("quality_review_provider_not_independent")
+    receipt = json.loads(json.dumps(payloads[0], ensure_ascii=False))
+    reviewer = receipt.get("reviewer")
+    report = receipt.get("report")
+    if not isinstance(reviewer, dict) or not isinstance(report, dict):
+        raise WorkspaceError("quality_review_receipt_shape_invalid")
+    reviewer["provider"] = observed_provider
+    report["provider"] = observed_provider
+    try:
+        verified = quality_reviewer.verify_reviewer_receipt(
+            receipt,
+            packet=packet,
+            expected_reviewer_request_id=request_id,
+            expected_reviewer_task_id=str(metadata.get("task_id") or ""),
+            observed_provider=observed_provider,
+            observed_terminal_state="review_ready",
+            audit_verified=(
+                bool(verification.get("ok"))
+                and int(verification.get("entries_tampered") or 0) == 0
+            ),
+        )
+    except quality_reviewer.ReviewerEvidenceError as exc:
+        raise WorkspaceError(f"quality_review_receipt_invalid:{exc}") from exc
+    if str((verified.get("report") or {}).get("lens") or "") != str(
+        binding.get("lens") or ""
+    ):
+        raise WorkspaceError("quality_review_lens_mismatch")
+    return verified
 
 
 def build_worker_prompt(
@@ -2138,6 +2220,136 @@ class ProcessManager:
             timeout_seconds=timeout_seconds,
         )
 
+    def launch_quality_reviewer(
+        self,
+        *,
+        target_request_id: str,
+        target_task_id: str,
+        reviewer_task_id: str,
+        runner: str,
+        adapter_id: str,
+        lens: str,
+        model: str | None = None,
+        timeout_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        """Create and launch one independent packet-bound reviewer task."""
+
+        if lens not in quality_evidence.JUDGMENT_LENSES:
+            return {"ok": False, "error": "quality_review_lens_invalid"}
+        events = self._request_events(target_request_id)
+        if not events:
+            return {"ok": False, "error": "quality_review_target_request_not_found"}
+        latest = events[-1]
+        if str(latest.get("task_id") or "") != target_task_id:
+            return {"ok": False, "error": "quality_review_target_identity_mismatch"}
+        if str(latest.get("state") or "") != "review_ready":
+            return {
+                "ok": False,
+                "error": "quality_review_target_not_review_ready",
+                "state": latest.get("state"),
+            }
+        if str(latest.get("adapter_id") or "") == adapter_id:
+            return {"ok": False, "error": "quality_review_provider_not_independent"}
+        try:
+            card = _parse_card(self._show_task(target_task_id), target_task_id)
+            terminal = card.get("terminal_review") or {}
+            evidence = terminal.get("evidence") or {}
+            workspace = WorkerWorkspace.from_metadata(dict(evidence["workspace"]))
+            if workspace.repo != self.repo or workspace.request_id != target_request_id:
+                raise WorkspaceError("quality_review_target_workspace_identity_mismatch")
+            assert_gc_safe_workspace_shape(
+                target_request_id, workspace.path, workspace.home
+            )
+            changed_hashes = evidence.get("changed_path_hashes")
+            if not isinstance(changed_hashes, dict) or not changed_hashes:
+                raise WorkspaceError("quality_review_target_hashes_missing")
+            current_hashes = _changed_path_hashes(workspace, changed_hashes.keys())
+            if current_hashes != changed_hashes:
+                raise WorkspaceError("quality_review_target_hashes_drifted")
+            initial_gate = evidence.get("quality_gate") or {}
+            packet = quality_reviewer.build_review_packet(
+                request_id=target_request_id,
+                task_id=target_task_id,
+                claim_epoch=int(card.get("claim_epoch") or 0),
+                worker_provider=str(latest.get("adapter_id") or latest.get("runner") or ""),
+                changed_path_hashes=changed_hashes,
+                objective=str(card.get("objective") or ""),
+                acceptance=card.get("acceptance") or [],
+                required_outputs=card.get("required_outputs") or [],
+                validation=card.get("validation") or [],
+                mechanical_checks=initial_gate.get("checks") or [],
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            LaunchRejected,
+            WorkspaceError,
+            quality_reviewer.ReviewerEvidenceError,
+        ) as exc:
+            return {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
+
+        created = core.create_task(
+            task_id=reviewer_task_id,
+            title=f"Independent {lens} review for {target_task_id}"[:300],
+            runner=runner,
+            topic="quality_review",
+            objective=(
+                "Review the exact anti-anchored candidate packet and submit "
+                f"{lens} findings through the bound reviewer MCP tool."
+            ),
+            acceptance=[
+                "Exactly one authenticated quality_review_submit receipt",
+                "No repository mutation",
+                "Reviewer provider differs from target worker provider",
+            ],
+            allowed_writes=[],
+            forbidden=[
+                "repository_write",
+                "worker_rationale_as_evidence",
+                "model_supplied_provider_identity",
+            ],
+            required_outputs=[],
+            validation=[],
+            priority="high",
+            callback_required=True,
+            task_type="research",
+        )
+        if not created.get("ok"):
+            return {
+                "ok": False,
+                "error": "quality_review_task_create_failed",
+                "detail": str(created.get("stderr") or created.get("stdout") or "")[:500],
+            }
+        binding = {
+            "target_request_id": target_request_id,
+            "target_task_id": target_task_id,
+            "source_workspace": workspace.as_metadata(),
+            "candidate_paths": sorted(changed_hashes),
+            "packet": packet,
+            "lens": lens,
+        }
+        launched = self._launch_isolated(
+            task_id=reviewer_task_id,
+            runner=runner,
+            topic="quality_review",
+            adapter_id=adapter_id,
+            model=model,
+            owner_prompt="",
+            timeout_seconds=timeout_seconds,
+            quality_review_binding=binding,
+        )
+        return {
+            **launched,
+            "quality_review": {
+                "target_request_id": target_request_id,
+                "target_task_id": target_task_id,
+                "reviewer_task_id": reviewer_task_id,
+                "lens": lens,
+                "packet_sha256": packet["packet_sha256"],
+            },
+        }
+
     def _launch_isolated(
         self,
         *,
@@ -2148,6 +2360,7 @@ class ProcessManager:
         model: str | None,
         owner_prompt: str,
         timeout_seconds: int,
+        quality_review_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not launch_gates_open():
             return self._blocked(
@@ -2217,7 +2430,29 @@ class ProcessManager:
                     ),
                 })
 
-                workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                review_packet_path: Path | None = None
+                review_workspace_evidence: dict[str, Any] | None = None
+                if quality_review_binding is not None:
+                    source_workspace = WorkerWorkspace.from_metadata(
+                        dict(quality_review_binding["source_workspace"])
+                    )
+                    workspace, review_workspace_evidence = create_quality_review_workspace(
+                        source_workspace,
+                        request_id,
+                        quality_review_binding["candidate_paths"],
+                        adapter_id,
+                    )
+                    review_packet_path = (
+                        workspace.home
+                        / "task_mcp_worker_runtime"
+                        / "quality_review_packet.json"
+                    )
+                    write_json_0600(
+                        review_packet_path,
+                        dict(quality_review_binding["packet"]),
+                    )
+                else:
+                    workspace = create_workspace(self.repo, request_id, card, adapter_id)
                 worker_source_graph_targets = _worker_mcp_source_graph_targets(context_result)
                 worker_session_topic = _worker_mcp_session_topic(context_result, topic)
                 worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
@@ -2230,17 +2465,35 @@ class ProcessManager:
                     authority_repo=authority_repo,
                     source_graph_targets=worker_source_graph_targets,
                     session_topic=worker_session_topic,
+                    quality_review_packet_path=review_packet_path,
                 )
-                prompt = build_worker_prompt(
-                    task_id=task_id,
-                    runner=runner,
-                    topic=topic,
-                    card=card,
-                    owner_prompt=owner_prompt,
-                    project_context_bundle=(
-                        context_result.prompt_bundle if context_result is not None else ""
-                    ),
-                )
+                if quality_review_binding is not None:
+                    private_tool_name = (
+                        "aiworkhub_manager_quality_review_submit"
+                        if adapter_id
+                        in {
+                            runtime_adapters.VSCODE_LM_ADAPTER,
+                            runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+                            runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+                        }
+                        else "aiworkhub_worker_quality_review_submit"
+                    )
+                    prompt = quality_reviewer.build_review_prompt(
+                        quality_review_binding["packet"],
+                        lens=str(quality_review_binding["lens"]),
+                        submit_tool_name=private_tool_name,
+                    )
+                else:
+                    prompt = build_worker_prompt(
+                        task_id=task_id,
+                        runner=runner,
+                        topic=topic,
+                        card=card,
+                        owner_prompt=owner_prompt,
+                        project_context_bundle=(
+                            context_result.prompt_bundle if context_result is not None else ""
+                        ),
+                    )
                 if adapter_id in {
                     runtime_adapters.VSCODE_LM_ADAPTER,
                     runtime_adapters.GLM_VSCODE_LM_ADAPTER,
@@ -2372,6 +2625,24 @@ class ProcessManager:
                     "immutable_input_manifest": immutable_input_manifest,
                     "external_readonly_dirs": external_readonly_dirs,
                     "workspace": workspace.as_metadata(),
+                    "quality_review": (
+                        {
+                            "target_request_id": str(
+                                quality_review_binding["target_request_id"]
+                            ),
+                            "target_task_id": str(
+                                quality_review_binding["target_task_id"]
+                            ),
+                            "lens": str(quality_review_binding["lens"]),
+                            "packet_sha256": str(
+                                quality_review_binding["packet"]["packet_sha256"]
+                            ),
+                            "packet_path": str(review_packet_path),
+                            "workspace": review_workspace_evidence,
+                        }
+                        if quality_review_binding is not None
+                        else None
+                    ),
                 }
                 write_json_0600(metadata_path, metadata)
                 authority_path = self._terminal_authority_grant_path(request_id)
@@ -3451,6 +3722,44 @@ class ProcessManager:
                         terminal_state = "review_pending"
                         error = "write_gate_closed_during_reconciliation"
                     else:
+                        if isinstance(metadata.get("quality_review"), dict):
+                            changed = enforce_scope(workspace)
+                            if changed:
+                                raise WorkspaceError(
+                                    "quality_review_workspace_mutated:"
+                                    + ",".join(changed[:20])
+                                )
+                            verified_receipt = _verified_quality_review_receipt(
+                                metadata, workspace, request_id
+                            )
+                            cleanup = False
+                            terminal_state = "review_ready"
+                            review_result = {"ok": True, "idempotent_noop": True}
+                            release_result = self._review_terminal_exact(
+                                metadata,
+                                "review_ready",
+                                request_id=request_id,
+                                evidence={
+                                    "quality_review_receipt": verified_receipt,
+                                    "quality_review": metadata["quality_review"],
+                                    "claim_state": claim_state,
+                                    "workspace": workspace.as_metadata(),
+                                    "request_identity": {
+                                        "request_id": request_id,
+                                        "task_id": str(metadata["task_id"]),
+                                        "runner": str(metadata["runner"]),
+                                        "topic": str(metadata["topic"]),
+                                    },
+                                },
+                            )
+                            if not release_result.get("ok"):
+                                terminal_state = "review_pending"
+                                error = "review_transition_failed:" + str(
+                                    release_result.get("stderr")
+                                    or release_result.get("stdout")
+                                    or ""
+                                )[:300]
+                            raise _QualityReviewFinalized
                         changed = enforce_scope(workspace)
                         required_output_records = validate_required_outputs(
                             workspace,
@@ -3537,6 +3846,8 @@ class ProcessManager:
                                 or release_result.get("stdout")
                                 or ""
                             )[:300]
+            except _QualityReviewFinalized:
+                pass
             except WorkspaceError as exc:
                 error = str(exc)
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
@@ -3865,6 +4176,11 @@ class ProcessManager:
                 session_topic=str(worker_meta.get("session_topic") or metadata["topic"]),
                 audit_ledger_path=Path(str(worker_meta["audit_ledger_path"])),
                 audit_hmac_key_path=Path(str(worker_meta["audit_hmac_key_path"])),
+                quality_review_packet_path=(
+                    Path(str((metadata.get("quality_review") or {})["packet_path"]))
+                    if isinstance(metadata.get("quality_review"), dict)
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             return {"ok": False, "reason": "worker_bridge_context_invalid"}
@@ -3917,6 +4233,16 @@ class ProcessManager:
                 replacement_key=tool_input.get("replacement_key", ""),
                 idempotency_key=tool_input.get("idempotency_key", ""),
                 provenance=tool_input.get("provenance", ""),
+            )
+        if tool_name == "aiworkhub_manager_quality_review_submit":
+            findings = tool_input.get("findings", [])
+            if not isinstance(findings, list):
+                return {"ok": False, "reason": "worker_bridge_findings_invalid"}
+            return worker_ai_tools_mcp.quality_review_submit(
+                ctx,
+                packet_sha256=tool_input.get("packet_sha256", ""),
+                lens=tool_input.get("lens", ""),
+                findings=findings,
             )
         return {"ok": False, "reason": "worker_bridge_tool_not_allowed"}
 
@@ -4232,6 +4558,7 @@ class ProcessManager:
         requested_risk_tier: str = quality_evidence.RISK_LOW,
         risk_signals: list[str] | None = None,
         reviewer_reports: list[dict[str, Any]] | None = None,
+        reviewer_request_ids: list[str] | None = None,
         confirm_high_risk: bool = False,
     ) -> dict[str, Any]:
         """Coordinator/write-gated acceptance of one ``review_ready`` request.
@@ -4254,6 +4581,13 @@ class ProcessManager:
         High/critical profiles additionally require ``confirm_high_risk``.
         """
         with self._registry_lock():
+            if reviewer_reports:
+                return {
+                    "ok": False,
+                    "error": "unverified_reviewer_reports_forbidden",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
             events = self._request_events(request_id)
             if not events:
                 return {"ok": False, "error": "request_not_found", "request_id": request_id}
@@ -4578,12 +4912,77 @@ class ProcessManager:
                             union_workspace.path,
                             union_workspace.home,
                         )
+                reviewer_ids = list(reviewer_request_ids or [])
+                if len(reviewer_ids) > quality_evidence.MAX_REVIEW_REPORTS:
+                    raise WorkspaceError("quality_reviewer_request_overflow")
+                if len(set(reviewer_ids)) != len(reviewer_ids):
+                    raise WorkspaceError("quality_reviewer_request_duplicate")
+                verified_reviewer_reports: list[dict[str, Any]] = []
+                verified_reviewer_tasks: list[tuple[str, WorkerWorkspace]] = []
+                for reviewer_request_id in reviewer_ids:
+                    reviewer_events = self._request_events(reviewer_request_id)
+                    if not reviewer_events:
+                        raise WorkspaceError(
+                            f"quality_reviewer_request_not_found:{reviewer_request_id}"
+                        )
+                    reviewer_latest = reviewer_events[-1]
+                    if str(reviewer_latest.get("state") or "") != "review_ready":
+                        raise WorkspaceError(
+                            f"quality_reviewer_not_review_ready:{reviewer_request_id}"
+                        )
+                    reviewer_metadata_path = self._metadata_from_events(reviewer_events)
+                    if reviewer_metadata_path is None:
+                        raise WorkspaceError(
+                            f"quality_reviewer_metadata_missing:{reviewer_request_id}"
+                        )
+                    if (
+                        reviewer_metadata_path.parent.resolve()
+                        != self.process_dir.resolve()
+                        or reviewer_metadata_path.is_symlink()
+                        or not reviewer_metadata_path.is_file()
+                        or reviewer_metadata_path.stat().st_size > 2 * 1024 * 1024
+                    ):
+                        raise WorkspaceError(
+                            f"quality_reviewer_metadata_invalid:{reviewer_request_id}"
+                        )
+                    try:
+                        reviewer_metadata = json.loads(
+                            reviewer_metadata_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise WorkspaceError(
+                            f"quality_reviewer_metadata_unreadable:{reviewer_request_id}"
+                        ) from exc
+                    reviewer_binding = reviewer_metadata.get("quality_review") or {}
+                    if (
+                        str(reviewer_binding.get("target_request_id") or "") != request_id
+                        or str(reviewer_binding.get("target_task_id") or "") != task_id
+                    ):
+                        raise WorkspaceError(
+                            f"quality_reviewer_target_mismatch:{reviewer_request_id}"
+                        )
+                    reviewer_workspace = WorkerWorkspace.from_metadata(
+                        dict(reviewer_metadata["workspace"])
+                    )
+                    if enforce_scope(reviewer_workspace):
+                        raise WorkspaceError(
+                            f"quality_reviewer_workspace_mutated:{reviewer_request_id}"
+                        )
+                    receipt = _verified_quality_review_receipt(
+                        reviewer_metadata,
+                        reviewer_workspace,
+                        reviewer_request_id,
+                    )
+                    verified_reviewer_reports.append(dict(receipt["report"]))
+                    verified_reviewer_tasks.append(
+                        (str(reviewer_metadata.get("task_id") or ""), reviewer_workspace)
+                    )
                 quality_gate = quality_evidence.run_completion_quality_gate(
                     workspace.path,
                     changed_paths=changed,
                     requested_risk_tier=requested_risk_tier,
                     risk_signals=effective_risk_signals,
-                    reviewer_reports=reviewer_reports or [],
+                    reviewer_reports=verified_reviewer_reports,
                     combined_tree_checks=combined_tree_checks,
                     worker_provider=str(latest.get("adapter_id") or runner),
                     human_approval=confirm_high_risk,
@@ -4640,6 +5039,25 @@ class ProcessManager:
                     "promoted_paths": promoted,
                 }
 
+            reviewer_finalization: list[dict[str, Any]] = []
+            for reviewer_task_id, reviewer_workspace in verified_reviewer_tasks:
+                done = core.mark_done(reviewer_task_id)
+                row = {
+                    "task_id": reviewer_task_id,
+                    "finished": bool(done.get("ok")),
+                    "cleanup_error": "",
+                }
+                if done.get("ok"):
+                    try:
+                        cleanup_workspace(
+                            reviewer_workspace.repo,
+                            reviewer_workspace.path,
+                            reviewer_workspace.home,
+                        )
+                    except WorkspaceError as exc:
+                        row["cleanup_error"] = str(exc)[:300]
+                reviewer_finalization.append(row)
+
             try:
                 cleanup_workspace(workspace.repo, workspace.path, workspace.home)
             except WorkspaceError as exc:
@@ -4654,6 +5072,7 @@ class ProcessManager:
                     "promoted_paths": promoted,
                     "workspace_retained": True,
                     "cleanup_error": str(exc)[:500],
+                    "reviewer_finalization": reviewer_finalization,
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -4662,6 +5081,7 @@ class ProcessManager:
                     "task_id": task_id,
                     "promoted_paths": promoted,
                     "cleanup_error": str(exc)[:500],
+                    "reviewer_finalization": reviewer_finalization,
                 }
 
             self._append_event({
@@ -4674,6 +5094,7 @@ class ProcessManager:
                 "accepted": True,
                 "promoted_paths": promoted,
                 "workspace_retained": False,
+                "reviewer_finalization": reviewer_finalization,
                 "finished_at": _utcnow(),
             })
             return {
@@ -4681,6 +5102,7 @@ class ProcessManager:
                 "request_id": request_id,
                 "task_id": task_id,
                 "promoted_paths": promoted,
+                "reviewer_finalization": reviewer_finalization,
             }
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:
