@@ -29,6 +29,92 @@ const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
 const PY_RUNTIME_SKIP_DIRS = new Set(["__pycache__", ".pytest_cache"]);
 const PY_RUNTIME_SKIP_FILE_SUFFIXES = [".pyc", ".pyo", ".DS_Store"];
 
+// VSIX is a regular ZIP container.  Build it with Node primitives so a clean
+// Windows host does not need a separately-installed `zip` executable.  Stored
+// entries are deliberate: the two native launcher binaries are already dense,
+// while a dependency-free writer keeps local and CI packaging identical.
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function collectFiles(directory, prefix = "") {
+  const files = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.name === ".DS_Store") continue;
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...collectFiles(absolute, relative));
+    else if (entry.isFile()) files.push({ absolute, relative });
+  }
+  return files;
+}
+
+function writePortableZip(sourceDirectory, destination) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  for (const file of collectFiles(sourceDirectory)) {
+    const name = Buffer.from(file.relative.replaceAll(path.sep, "/"), "utf8");
+    const data = fs.readFileSync(file.absolute);
+    const checksum = crc32(data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6); // UTF-8 file names
+    local.writeUInt16LE(0, 8); // stored, no compression
+    local.writeUInt16LE(0, 10); // deterministic DOS time/date
+    local.writeUInt16LE(0x0021, 12);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    localParts.push(local, name, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0x0021, 14);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+    offset += local.length + name.length + data.length;
+  }
+  const centralSize = centralParts.reduce((size, part) => size + part.length, 0);
+  const entryCount = collectFiles(sourceDirectory).length;
+  if (entryCount > 0xffff || offset > 0xffffffff || centralSize > 0xffffffff) {
+    throw new Error("VSIX exceeds the supported non-ZIP64 package bounds");
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entryCount, 8);
+  end.writeUInt16LE(entryCount, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  fs.writeFileSync(destination, Buffer.concat([...localParts, ...centralParts, end]));
+}
+
 function copyFile(rel) {
   const target = path.join(extensionDir, rel);
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -165,9 +251,6 @@ const contentTypes = `<?xml version="1.0" encoding="utf-8"?>
 fs.writeFileSync(path.join(staging, "extension.vsixmanifest"), manifest, "utf8");
 fs.writeFileSync(path.join(staging, "[Content_Types].xml"), contentTypes, "utf8");
 
-childProcess.execFileSync("zip", ["-qr", out, ".", "-x", "*.DS_Store"], {
-  cwd: staging,
-  stdio: "inherit",
-});
+writePortableZip(staging, out);
 fs.rmSync(staging, { recursive: true, force: true });
 console.log(out);

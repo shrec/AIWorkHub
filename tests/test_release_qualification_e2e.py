@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import aiworkhub
@@ -64,21 +67,6 @@ def _create() -> dict:
 
 
 def _stdio_tool_names(repo: Path) -> set[str]:
-    requests = "\n".join(
-        [
-            json.dumps({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "release-qualification", "version": "1"},
-                },
-            }),
-            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
-            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-            "",
-        ]
-    )
     env = dict(os.environ)
     env["AIWORKHUB_REPO_ROOT"] = str(repo)
     env["AIWORKHUB_REPO"] = str(repo)
@@ -86,19 +74,76 @@ def _stdio_tool_names(repo: Path) -> set[str]:
     env["PYTHONPATH"] = os.pathsep.join(
         value for value in (package_root, env.get("PYTHONPATH", "")) if value
     )
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-m", "aiworkhub.server"],
-        input=requests,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        capture_output=True,
         env=env,
-        timeout=30,
-        check=False,
+        bufsize=1,
     )
-    assert completed.returncode == 0, completed.stderr[-2000:]
-    messages = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
-    response = next(message for message in messages if message.get("id") == 2)
-    return {tool["name"] for tool in response["result"]["tools"]}
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    responses: queue.Queue[dict | BaseException] = queue.Queue()
+
+    def _read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                if line.strip():
+                    responses.put(json.loads(line))
+        except BaseException as exc:  # pragma: no cover - diagnostic transport path
+            responses.put(exc)
+
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
+
+    def _write(message: dict) -> None:
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+    def _wait_for(response_id: int, timeout: float = 30.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stderr = process.stderr.read()[-2000:] if process.poll() is not None else ""
+                raise AssertionError(
+                    f"stdio MCP response id={response_id} timed out; "
+                    f"returncode={process.poll()}; stderr={stderr}"
+                )
+            try:
+                message = responses.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise AssertionError(f"stdio MCP response id={response_id} timed out") from exc
+            if isinstance(message, BaseException):
+                raise AssertionError(f"stdio MCP reader failed: {message!r}") from message
+            if message.get("id") == response_id:
+                return message
+
+    try:
+        _write({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "release-qualification", "version": "1"},
+            },
+        })
+        initialized = _wait_for(1)
+        assert "result" in initialized, initialized
+        _write({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        _write({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        response = _wait_for(2)
+        return {tool["name"] for tool in response["result"]["tools"]}
+    finally:
+        process.stdin.close()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=10)
 
 
 def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path, monkeypatch):
