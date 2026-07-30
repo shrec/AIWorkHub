@@ -56,6 +56,7 @@ except ImportError:
     project_context = _FallbackProjectContext()  # type: ignore[assignment]
 from . import runtime_adapters
 from . import quality_reviewer
+from . import terminal_authority
 from . import vscode_lm_bridge
 from . import worker_ai_tools_mcp
 try:
@@ -182,8 +183,8 @@ SUPERVISOR_GRACE_SECONDS = 90
 # request. Never a substitute for general AIWORKHUB_ALLOW_WRITES: it is
 # bound to one exact (repo, task_id, runner, topic, request_id) tuple and is
 # consumed (deleted) on first use, whether or not it validates.
-TERMINAL_AUTHORITY_SCHEMA_ID = "aiworkhub.task_mcp.terminal_authority.v1"
-TERMINAL_AUTHORITY_KEY_FILENAME = ".terminal_authority_hmac.key"
+TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
+TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
 FINALIZATION_PENDING_STATES = {"release_pending", "review_pending", "reconcile_pending"}
 TERMINAL_PROCESS_STATES = {
@@ -398,113 +399,10 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _terminal_authority_signing_material(
-    *, repo: Path, task_id: str, runner: str, topic: str, request_id: str,
-) -> bytes:
-    return "|".join(
-        [TERMINAL_AUTHORITY_SCHEMA_ID, str(repo), task_id, runner, topic, request_id]
-    ).encode("utf-8")
-
-
-def _load_or_create_terminal_authority_key(key_path: Path) -> bytes:
-    """Owner-only, symlink-refusing HMAC key backing every terminal-
-    authority grant issued under one ``process_dir``. Persisted (not
-    per-process) so a grant minted by the process that performed the launch
-    can still be verified by a different, later process reconciling this
-    exact request's terminal outcome after the launcher has exited."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(key_path, flags)
-    except OSError:
-        fd = None
-    if fd is not None:
-        try:
-            st = os.fstat(fd)
-            if (
-                stat.S_ISREG(st.st_mode)
-                and stat.S_IMODE(st.st_mode) == 0o600
-                and st.st_uid == os.getuid()
-            ):
-                with os.fdopen(fd, "rb") as fh:
-                    data = fh.read()
-                if len(data) == 32:
-                    return data
-            else:
-                os.close(fd)
-        except OSError:
-            pass
-    key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(key_path.parent, 0o700)
-    key = os.urandom(32)
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        new_fd = os.open(key_path, flags, 0o600)
-    except FileExistsError:
-        # Lost the create race to another process/thread -- read back
-        # whatever it wrote instead of minting a second, divergent key.
-        return _load_or_create_terminal_authority_key(key_path)
-    chmod_fd(new_fd, 0o600)
-    with os.fdopen(new_fd, "wb") as fh:
-        fh.write(key)
-    return key
-
-
-def _write_terminal_authority_grant(
-    path: Path,
-    key: bytes,
-    *,
-    repo: Path,
-    task_id: str,
-    runner: str,
-    topic: str,
-    request_id: str,
-) -> None:
-    material = _terminal_authority_signing_material(
-        repo=repo, task_id=task_id, runner=runner, topic=topic, request_id=request_id,
-    )
-    write_json_0600(path, {
-        "schema_id": TERMINAL_AUTHORITY_SCHEMA_ID,
-        "repo": str(repo),
-        "task_id": task_id,
-        "runner": runner,
-        "topic": topic,
-        "request_id": request_id,
-        "issued_at": _utcnow(),
-        "signature": hmac.new(key, material, hashlib.sha256).hexdigest(),
-    })
-
-
-def _read_terminal_authority_grant(path: Path) -> dict[str, Any]:
-    """Same fail-closed owner-only/symlink/permission/JSON contract as
-    ``read_supervisor_status`` -- a tampered, foreign-owned, world-readable,
-    or malformed grant is never trusted."""
-    try:
-        st = path.lstat()
-    except OSError:
-        return {}
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        return {}
-    if st.st_uid != os.getuid():
-        return {}
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        return {}
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return {}
-    try:
-        with os.fdopen(fd, "r", encoding="utf-8") as fh:
-            payload = json.loads(fh.read())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+_terminal_authority_signing_material = terminal_authority.signing_material
+_load_or_create_terminal_authority_key = terminal_authority.load_or_create_key
+_write_terminal_authority_grant = terminal_authority.write_grant
+_read_terminal_authority_grant = terminal_authority.read_grant
 
 
 class LaunchRejected(RuntimeError):
