@@ -194,7 +194,8 @@ do not override this current priority ledger.
 - [ ] Modularize the VS Code extension in TypeScript with deterministic bundle
       output and restored-tab/reload E2E coverage.
 - [ ] Centralize pytest fixtures/state isolation and organize unit/integration/
-      E2E suites; add Ruff, type checking and pre-commit quality gates.
+      E2E suites; expand the shipped Ruff/type baseline and add pre-commit
+      quality gates.
 - [ ] Close the 2026-07-30 operational-truth audit in measured order:
       - [x] Missing/empty repository quality policy is explicitly
             `unverified`; public check execution cannot return an empty green.
@@ -226,6 +227,11 @@ do not override this current priority ledger.
             all Python source/scripts/tests and mypy gates the initial typed
             lifecycle kernel. Both CI and tag releases install the declared
             `dev` extra and execute the same repository policy commands.
+      - [x] Replace the implementation-history README with a concise public
+            product entry point; CI now rejects broken public links, leaked
+            task IDs, host-only AITools paths and completion-tool naming drift.
+            Callback sideband is documented as an optional compatibility
+            adapter with a portable manager-inbox fallback.
       - [ ] Expand the typed kernel by measured module groups and disposition
             historical scripts/eval artifacts without deleting owner-owned
             untracked reports or active rollback evidence.
@@ -233,15 +239,17 @@ do not override this current priority ledger.
       macOS release CI plus reproducible VSIX checksums. Canonical authority is
       `src/aiworkhub/_version.py`; projections, tag identity, repeated VSIX
       byte equality and sorted final-asset checksums are release-gated.
-- [ ] Finish public documentation, ADRs, VS Code Marketplace/Open VSX
-      publication, then consider GitHub issue/PR sync, webhooks/public API and
-      historical reliability analytics.
+- [ ] Finish registry publication and launch media, then consider GitHub
+      issue/PR sync, webhooks/public API and historical reliability analytics.
       - [x] Establish the canonical AIWorkHub name, positioning, visual system,
         repository hero, Marketplace copy, support path, package discovery
         metadata and first authority ADR.
-      - [ ] Add clean public product screenshots, complete the core ADR set,
-        publish to VS Code Marketplace/Open VSX and qualify the published
-        install artifacts independently of the source checkout.
+      - [x] Add outcome-first repository copy, public-document regression
+        checks, callback compatibility ADR, Marketplace/Open VSX jobs and an
+        optional tokenless PyPI Trusted Publishing job.
+      - [ ] Add a clean 20-second product recording, configure registry owner
+        identities/tokens, publish to VS Code Marketplace/Open VSX/PyPI and
+        qualify the installed artifacts independently of the source checkout.
 
 ## Phase 0 — Wrapper MVP
 
@@ -249,7 +257,7 @@ Status: complete for local stdio MVP.
 
 - [x] Standalone Python package skeleton.
 - [x] FastMCP stdio server.
-- [x] Read-only task tools over `AITools/taskctl.py`.
+- [x] Read-only task tools over the native repository-local task engine.
 - [x] Write-gated lifecycle tools.
 - [x] Smoke test for health/read/write-gate.
 - [x] MCP client smoke test over real stdio transport.

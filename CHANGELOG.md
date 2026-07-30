@@ -29,6 +29,14 @@ noted by package/extension version and release tag.
   policy, pull-request CI and tag releases through a declared `dev` extra.
 - Release metadata verification now fails when the canonical version has no
   corresponding changelog section.
+- Replaced the implementation-history README with an outcome-first public
+  product page and added a CI contract against broken links, internal task IDs,
+  legacy host paths and completion-tool naming drift.
+- Documented the optional Codex App Server adapter as a replaceable
+  compatibility boundary with manager-inbox fallback, and added optional PyPI
+  Trusted Publishing to the tag release workflow.
+- Modernized package licensing metadata to SPDX/PEP 639 form and made Twine
+  metadata/rendering validation a release gate before registry publication.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.

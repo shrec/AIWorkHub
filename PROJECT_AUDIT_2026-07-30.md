@@ -255,6 +255,12 @@ rewritten after remediation.
   extra, run correctness-critical Ruff rules over all Python paths, and run
   mypy over the first explicit typed lifecycle kernel. Expansion is incremental
   and measured rather than a permanently-red 699-error gate.
-- **Shared-worktree attribution/pruning and P3-10 artifact disposition remain
-  open** and are tracked in `MVP_ROADMAP.md` in
+- **P3-10 public-surface portion closed:** the repository README is now a
+  concise product entry point with one canonical completion-inbox name and no
+  host-only commands, internal task IDs or removed extension links. CI checks
+  the public local-link contract. Runtime task operations were already native;
+  remaining historical scripts/test fixtures are explicitly an artifact
+  disposition problem, not a runtime dependency.
+- **Shared-worktree attribution/pruning and remaining P3-10 artifact
+  disposition remain open** and are tracked in `MVP_ROADMAP.md` in
   operational-risk order.

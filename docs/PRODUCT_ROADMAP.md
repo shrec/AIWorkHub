@@ -53,16 +53,20 @@ AIWorkHub telemetry.
   authority modules and require characterization-first extraction.
 - The extension remains JavaScript-first; its incremental TypeScript module
   migration and restored-tab/reload E2E boundary are still open.
-- Shared pytest state isolation, staged Ruff/type gates and test-suite
-  organization are not complete.
-- Quality Evidence Engine v1 runs the deterministic syntax/configured-check
-  floor and destructive-diff guard, but the six-lens pure verdict, negative
-  gate calibration, independent reviewer execution and combined-tree
-  differential are not yet production-closed.
+- Shared pytest state isolation and test-suite organization are not complete.
+  Correctness-critical Ruff coverage spans the Python tree and mypy gates the
+  initial typed lifecycle kernel; broader typed coverage remains incremental.
+- Quality Evidence Engine v1 now includes deterministic six-lens verdicts,
+  negative calibration, independent read-only review and combined-tree
+  validation. Shared-worktree attribution remains an open hardening boundary.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
-- The brand foundation is present, but Marketplace/Open VSX publication,
-  public screenshots, ADR coverage and long-form launch material remain open.
+- The brand foundation, concise public README and registry workflows are
+  present. Registry-owner setup, public screenshots/GIF and long-form launch
+  material remain open.
+- Codex push callbacks currently include an optional compatibility adapter over
+  a non-public App Server boundary. Manager inbox remains the portable fallback;
+  each supported Codex release needs a compatibility qualification matrix.
 
 ## P0 — Stable multi-repository product (0.7.9)
 

@@ -103,14 +103,12 @@ writes stay bounded to its declared `allowed_writes`.
 
 `callback_bridge.py` closes the loop back to the coordinator: when a
 claimed task reaches a terminal state, a durable, deduplicated
-`callback_outbox`/`callback_batches` entry (`AITools/taskdb.py` in the
-monorepo integration; a repository-local equivalent for a standalone
-checkout) wakes the exact originating Codex thread through the real Codex
-App Server protocol, or the exact Claude session through the
-`claude --resume` CLI transport (`ClaudeCliResumeClient`). See the
-README's
-[Callback Bridge](../README.md#callback-bridge-task-mcp---originating-codex-thread)
-section for the full lease/retry/batching contract, and
+`callback_outbox`/`callback_batches` entry in the repository-local canonical
+task store wakes the verified manager through its available transport. Codex
+can use manager-inbox delivery or the optional same-host App Server sideband;
+Claude can use its manager inbox, native channel or resumable CLI transport.
+See [Callback delivery](CALLBACKS.md) for the full lease/retry/batching contract
+and compatibility boundary, and
 [Getting Started](GETTING_STARTED.md#6-codex-callback-routing--claude-callback-capability)
 for the current Claude-transport capability/limitations summary.
 `app_server_mux.py` is the VS Code-owned App Server sideband transport used

@@ -33,6 +33,8 @@ jobs:
         run: ruff check src/aiworkhub scripts tests
       - name: Mypy typed-kernel gate
         run: mypy
+      - name: Public documentation contract
+        run: python scripts/check_public_docs.py
 
   cross-platform:
     name: Fresh install (${{ matrix.name }})

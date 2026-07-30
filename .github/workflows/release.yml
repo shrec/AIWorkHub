@@ -109,13 +109,14 @@ jobs:
 
       - name: Install Python test and build dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel build
+          python -m pip install --upgrade pip setuptools wheel build twine
           python -m pip install -e ".[dev]"
 
       - name: Run static quality gates
         run: |
           ruff check src/aiworkhub scripts tests
           mypy
+          python scripts/check_public_docs.py
 
       - name: Run Python tests
         run: python -m pytest tests/ -v --tb=short -x
@@ -132,6 +133,7 @@ jobs:
           (( ${#sdists[@]} == 1 ))
           test -s "${wheels[0]}"
           test -s "${sdists[0]}"
+          python -m twine check dist/*
 
       - name: Upload Python distributions
         uses: actions/upload-artifact@v4
@@ -306,3 +308,24 @@ jobs:
           (( ${#vsix[@]} == 1 ))
           test -s "${vsix[0]}"
           npx --yes @vscode/vsce publish --packagePath "${vsix[0]}" -p "$MARKETPLACE_TOKEN"
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: vars.PYPI_PUBLISH_ENABLED == 'true'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aiworkhub/
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download Python distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: aiworkhub-python-dist
+          path: dist/
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

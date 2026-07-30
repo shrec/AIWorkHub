@@ -2,16 +2,15 @@
 
 ## Overview
 
-The release workflow builds and attaches three artifacts to a draft GitHub
-Release:
+The release workflow builds and attaches three artifacts to a GitHub Release:
 
 1. A Python wheel in `dist/`.
 2. A Python source distribution in `dist/`.
 3. A VS Code extension in `vscode-extension/dist/aiworkhub-*.vsix`.
 
 The extension can also be published to the VS Code Marketplace and Open VSX
-Registry when the corresponding repository secrets are configured. PyPI
-publication is a separate manual operation.
+Registry when the corresponding repository secrets are configured. PyPI uses
+GitHub OIDC Trusted Publishing and requires no long-lived upload token.
 
 ## Release Preflight
 
@@ -65,17 +64,21 @@ The `release.yml` workflow will:
 3. Run `npm test` and `npm run package` in `vscode-extension/`.
 4. Upload the Python distributions and
    `vscode-extension/dist/aiworkhub-*.vsix` as workflow artifacts.
-5. Create a draft GitHub Release with all three artifacts attached.
+5. Create a GitHub Release with all three artifacts attached.
    The published release also includes `SHA256SUMS` for the wheel, source
    distribution and VSIX; the canonical build verifies byte-identical repeated
    VSIX packaging before upload.
 6. If `OVSX_TOKEN` is present, publish the VSIX to Open VSX Registry.
 7. If `MARKETPLACE_TOKEN` is present, publish the VSIX to the VS Code
    Marketplace.
+8. If repository variable `PYPI_PUBLISH_ENABLED=true`, publish the wheel and
+   source distribution through the `pypi` GitHub environment and PyPI Trusted
+   Publisher identity.
 
-Both registries are optional. A missing secret skips only that registry. When
-a secret is configured, a failed publication fails the workflow. Registry jobs
-do not gate creation of the draft GitHub Release.
+All registries are optional. A missing extension secret skips only that
+registry. PyPI publication is skipped unless its repository variable is
+enabled. A configured registry failure fails its job but does not gate GitHub
+Release creation.
 
 ### Required Secrets (optional)
 
@@ -83,6 +86,14 @@ do not gate creation of the draft GitHub Release.
 |--------|---------|
 | `OVSX_TOKEN` | Open VSX Registry publish |
 | `MARKETPLACE_TOKEN` | VS Code Marketplace publish (VS Publisher) |
+
+### PyPI trusted publisher setup
+
+In the PyPI `aiworkhub` project, add a GitHub Trusted Publisher for repository
+`shrec/AIWorkHub`, workflow `release.yml`, environment `pypi`. In GitHub, create
+the protected `pypi` environment and set repository variable
+`PYPI_PUBLISH_ENABLED=true`. The release job then receives a short-lived OIDC
+identity; no PyPI token is stored in GitHub.
 
 ## Local VSIX Installation
 
@@ -107,14 +118,16 @@ workspace:
 3. The extension kind is `workspace`, so it runs on the remote host — no
    browser, iframe, or port-forwarding required.
 
-## Python Package (PyPI)
+## Python Package (manual build verification)
 
 ```bash
 pip install build twine
 python -m build --outdir dist
 python -m twine check dist/*
-python -m twine upload dist/*
 ```
+
+Production uploads are owned by the tag-driven Trusted Publishing job. Do not
+store a long-lived PyPI credential in the repository or workflow secrets.
 
 ## Versioning
 

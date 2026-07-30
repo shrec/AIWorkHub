@@ -115,10 +115,14 @@ def test_ci_and_release_enforce_metadata_reproducibility_and_checksums() -> None
     assert 'python -m pip install -e ".[dev]"' in ci
     assert "ruff check src/aiworkhub scripts tests" in ci
     assert "mypy" in ci
+    assert "python scripts/check_public_docs.py" in ci
     assert "Verify reproducible VSIX bytes" in ci
     assert "scripts/release_metadata.py check --tag" in release
     assert 'python -m pip install -e ".[dev]"' in release
     assert "ruff check src/aiworkhub scripts tests" in release
     assert "mypy" in release
+    assert "python scripts/check_public_docs.py" in release
+    assert "pypa/gh-action-pypi-publish@release/v1" in release
+    assert "python -m twine check dist/*" in release
     assert "Verify reproducible VSIX bytes" in release
     assert "release-assets/SHA256SUMS" in release
