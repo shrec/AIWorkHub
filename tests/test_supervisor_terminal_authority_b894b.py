@@ -526,6 +526,56 @@ def test_failure_outcome_reaches_review_without_ambient_writes_or_any_grant(tmp_
     assert card["worker_status"] != "unclaimed"
 
 
+@pytest.mark.parametrize("operation", ["archived", "superseded"])
+def test_failure_outcome_preserves_already_finalized_task(
+    tmp_path, monkeypatch, operation,
+):
+    """A late child exit is process evidence, never authority to resurrect
+    a task that the manager already archived or superseded."""
+    card = _card()
+    card.update({
+        "archived_at": "2026-07-30T00:00:00+00:00",
+        "archive_operation": operation,
+    })
+    manager = _build_manager(tmp_path, card)
+    review_calls = []
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_review",
+        lambda *args, **kwargs: review_calls.append((args, kwargs)) or {"ok": True},
+    )
+
+    request_id = f"req-already-{operation}"
+    dead_pid = 2_147_483_051
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=dead_pid,
+        supervisor_ticks=999_999_949,
+        supervisor_status={
+            "state": "timed_out",
+            "exit_code": 124,
+            "started_at_epoch": time.time() - 30,
+            "finished_at_epoch": time.time() - 5,
+        },
+    )
+
+    result = manager._finalize_isolated_request(request_id)
+
+    assert result["state"] == "timed_out"
+    assert result["error"] == ""
+    assert result["release_transition_ok"] is True
+    assert result["canonical_lifecycle"] == "archived"
+    assert result["terminal_review_disposition"] == (
+        f"terminal_skipped_already_finalized:{operation}"
+    )
+    assert review_calls == []
+    assert card["archived_at"]
+    assert card["archive_operation"] == operation
+
+
 def test_ambient_writes_alone_still_authorizes_and_consumes_any_stray_grant(tmp_path, monkeypatch):
     """The ambient flag remains a valid path on its own (e.g. a reconciler
     daemon process that legitimately keeps AIWORKHUB_ALLOW_WRITES=1 for its

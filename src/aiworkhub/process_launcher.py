@@ -2962,6 +2962,33 @@ class ProcessManager:
     ) -> dict[str, Any]:
         task_id = str(metadata["task_id"])
         runner = str(metadata["runner"])
+        # The queue is authoritative over a still-exiting child.  A manager
+        # may deliberately archive/supersede an in-flight task while its
+        # supervisor is winding down; that late process result remains useful
+        # evidence, but it must never resurrect the canonical card by trying
+        # an archived -> review transition.  Detect the durable archive marker
+        # immediately before the write, keeping task_store's strict illegal-
+        # transition guard intact and leaving ordinary processing outcomes on
+        # the normal review path below.
+        try:
+            card = _parse_card(self._show_task(task_id), task_id)
+            archived_at = str(card.get("archived_at") or "").strip()
+            lifecycle = core._lifecycle_state(card)
+            if archived_at or lifecycle == "archived":
+                operation = str(card.get("archive_operation") or "archived").strip().lower()
+                disposition = "superseded" if operation == "superseded" else "archived"
+                return {
+                    "ok": True,
+                    "idempotent_noop": True,
+                    "canonical_lifecycle": "archived",
+                    "terminal_review_disposition": (
+                        f"terminal_skipped_already_finalized:{disposition}"
+                    ),
+                }
+        except Exception:
+            # A failed defensive read is not authority to suppress review;
+            # preserve the existing fail-closed transition behavior.
+            pass
         payload = {
             "request_id": request_id,
             "adapter_id": metadata.get("adapter_id"),
@@ -3561,6 +3588,12 @@ class ProcessManager:
                 "validation": validations,
                 "review_transition_ok": bool(review_result and review_result.get("ok")),
                 "release_transition_ok": bool(release_result and release_result.get("ok")),
+                "terminal_review_disposition": str(
+                    (release_result or {}).get("terminal_review_disposition") or ""
+                )[:200],
+                "canonical_lifecycle": str(
+                    (release_result or {}).get("canonical_lifecycle") or ""
+                )[:40],
                 "liveness_lost": liveness_lost,
                 "error": error[:500],
                 "usage": usage,
