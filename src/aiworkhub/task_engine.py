@@ -105,6 +105,7 @@ def claim_start_exact(
             claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
         except (TypeError, ValueError):
             claim_epoch = 1
+        prior_episode = task_store.begin_claim_episode(stored_card)
         stored_card.update(
             claim_epoch=claim_epoch,
             launch_request_id=request_id,
@@ -114,7 +115,8 @@ def claim_start_exact(
         )
         cur = conn.execute(
             "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
-            "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
+            "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
+            "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
             (json.dumps(stored_card, ensure_ascii=False, sort_keys=True), runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
@@ -127,7 +129,17 @@ def claim_start_exact(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (
                 task_id, "claim_start", runner,
-                json.dumps({"runner": runner, "topic": topic, "request_id": request_id}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "runner": runner,
+                        "topic": topic,
+                        "request_id": request_id,
+                        "claim_epoch": claim_epoch,
+                        "prior_episode": prior_episode,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 now,
             ),
         )

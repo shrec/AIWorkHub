@@ -187,6 +187,69 @@ def test_exact_claim_is_idempotent_never_double_claims(repo):
     assert card["launch_request_id"] == "req-1"
 
 
+def test_new_claim_clears_stale_episode_metadata_but_preserves_audit(repo):
+    stale_fields = {
+        "terminal_review": {"substatus": "validation_failed"},
+        "terminal_substatus": "validation_failed",
+        "deterministic_verification": {"ok": False},
+        "review_requested_by": CARD_RUNNER,
+        "validation_status": "failed",
+        "validation_error": "old failure",
+        "blocker_reason": "old blocker",
+        "launch_error": "old launch error",
+        "terminal_outcome": "old outcome",
+    }
+    _insert_task(
+        repo,
+        "TASK_B882_REWORK",
+        CARD_RUNNER,
+        CARD_TOPIC,
+        card_extra=stale_fields,
+    )
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE task_id=?",
+            (NOW, "TASK_B882_REWORK"),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (
+                "TASK_B882_REWORK",
+                "terminal_review",
+                CARD_RUNNER,
+                json.dumps({"substatus": "validation_failed"}),
+                NOW,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    claimed = task_engine.claim_start_exact(
+        repo,
+        "TASK_B882_REWORK",
+        CARD_RUNNER,
+        CARD_TOPIC,
+        request_id="req-new-episode",
+    )
+
+    assert claimed["ok"] is True, claimed
+    row = _row(repo, "TASK_B882_REWORK")
+    assert row["completed_at"] is None
+    card = json.loads(row["card_json"])
+    assert card["claim_epoch"] == 1
+    for key in stale_fields:
+        assert key not in card
+    events = task_store.get_task_events(repo, "TASK_B882_REWORK", limit=10)
+    assert [event["event"] for event in events] == ["claim_start", "terminal_review"]
+    claim_payload = json.loads(events[0]["payload"])
+    assert claim_payload["prior_episode"]["terminal_substatus"] == "validation_failed"
+    assert claim_payload["prior_episode"]["validation_error"] == "old failure"
+
+
 def test_exact_claim_write_gate_closed_blocks_claim(tmp_path, monkeypatch):
     root = _init_repo(tmp_path)
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))

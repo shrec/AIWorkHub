@@ -31,13 +31,17 @@ do not override this current priority ledger.
 - [ ] Add an idempotent, provenance-preserving importer for explicitly selected
       legacy Session/AI Memory/KB stores (dry-run, duplicate report, rollback;
       never implicit global-path discovery).
-- [ ] Finish atomic manager repository switching: switch only the manager's
+- [x] Finish atomic manager repository switching: switch only the manager's
       active repo binding, keep every task/context/log/index/callback in its
       origin repository, stop old repo daemons, start new repo daemons, and
       support deterministic A -> B -> A recovery without moving task cards.
-- [ ] Clear stale terminal substatus, launch error and validation reason on a
+      Switches are serialized; failed target convergence stops target services
+      and restores the prior binding/daemons.
+- [x] Clear stale terminal substatus, launch error and validation reason on a
       genuine new claim/relaunch episode while retaining the old episode in
-      append-only audit history.
+      append-only audit history. Both exact-claim and auto-pickup now start a
+      clean episode, clear stale completion time and retain a bounded prior
+      episode summary on the immutable claim event.
 - [ ] Run and publish one fresh-install E2E qualification matrix for Linux,
       Remote-SSH, Windows and macOS: install, InitRepo, MCP registration,
       first index, worker launch, terminal review, callback, acceptance,

@@ -179,6 +179,134 @@ def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_pat
     assert lifecycle["started_daemon"] == [target.resolve()]
 
 
+def test_repository_switch_roundtrip_is_serialized_and_repo_local(tmp_path, monkeypatch):
+    root_a = tmp_path / "repo_a"
+    root_b = tmp_path / "repo_b"
+    root_a.mkdir()
+    root_b.mkdir()
+    assert task_store.initialize_repository(root_a)["ok"]
+    assert task_store.initialize_repository(root_b)["ok"]
+    repo_a = task_store.storage_readiness(root_a).repo_id
+    repo_b = task_store.storage_readiness(root_b).repo_id
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    identity = {
+        "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
+        "window_id": "window_roundtrip",
+    }
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root_a))
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+
+    def record(root: Path, repo_id: str) -> dict:
+        return {
+            "repo_id": repo_id,
+            "repo_root": str(root),
+            "window_id": "window_roundtrip",
+            "extension_host_alive": True,
+            "stale": False,
+            "targets": {"codex": {"route": {"repo_id": repo_id, "thread_id": thread_id}}},
+        }
+
+    monkeypatch.setattr(
+        shared_router,
+        "list_known_repositories",
+        lambda **kwargs: {"ok": True, "repositories": [record(root_a, repo_a), record(root_b, repo_b)]},
+    )
+    lifecycle = {"dispatcher_stop": [], "daemon_stop": [], "daemon_start": []}
+    monkeypatch.setattr(
+        core,
+        "_callback_bridge_module",
+        lambda: type("Bridge", (), {
+            "stop_dispatcher": lambda _self, root: lifecycle["dispatcher_stop"].append(root),
+        })(),
+    )
+    monkeypatch.setattr(
+        core,
+        "_source_graph_daemon_module",
+        lambda: type("Daemon", (), {
+            "stop_daemon": lambda _self, root: lifecycle["daemon_stop"].append(root),
+            "ensure_started": lambda _self, root: lifecycle["daemon_start"].append(root) or {"ok": True},
+        })(),
+    )
+    monkeypatch.setattr(core, "dispatcher_ensure_started", lambda: {"ok": True, "status": "manager_inbox"})
+
+    to_b = core.repository_switch(repo_b)
+    back_to_a = core.repository_switch(repo_a)
+
+    assert to_b["ok"] is True and to_b["repo_id"] == repo_b
+    assert back_to_a["ok"] is True and back_to_a["repo_id"] == repo_a
+    assert core.repo_root() == root_a.resolve()
+    assert lifecycle["dispatcher_stop"] == [root_a.resolve(), root_b.resolve()]
+    assert lifecycle["daemon_stop"] == [root_a.resolve(), root_b.resolve()]
+    assert lifecycle["daemon_start"] == [root_b.resolve(), root_a.resolve()]
+
+
+def test_repository_switch_failed_target_stops_target_and_restores_old_services(tmp_path, monkeypatch):
+    old = tmp_path / "old"
+    target = tmp_path / "target"
+    old.mkdir()
+    target.mkdir()
+    assert task_store.initialize_repository(old)["ok"]
+    assert task_store.initialize_repository(target)["ok"]
+    target_id = task_store.storage_readiness(target).repo_id
+    thread_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    identity = {
+        "provider": "codex", "session_id": thread_id, "thread_id": thread_id,
+        "window_id": "window_rollback",
+    }
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.setenv("AIWORKHUB_REPO", str(old))
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", None)
+    monkeypatch.setattr(core, "_implicit_codex_repository_root", lambda: None)
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: identity)
+    monkeypatch.setattr(shared_router, "list_known_repositories", lambda **kwargs: {
+        "ok": True,
+        "repositories": [{
+            "repo_id": target_id,
+            "repo_root": str(target),
+            "window_id": "window_rollback",
+            "extension_host_alive": True,
+            "stale": False,
+            "targets": {"codex": {"route": {"repo_id": target_id, "thread_id": thread_id}}},
+        }],
+    })
+    lifecycle = {"dispatcher_stop": [], "daemon_stop": [], "daemon_start": []}
+    monkeypatch.setattr(
+        core,
+        "_callback_bridge_module",
+        lambda: type("Bridge", (), {
+            "stop_dispatcher": lambda _self, root: lifecycle["dispatcher_stop"].append(root),
+        })(),
+    )
+
+    def ensure_daemon(_self, root: Path) -> dict:
+        lifecycle["daemon_start"].append(root)
+        return {"ok": root == old.resolve(), "error": "target_index_failed"}
+
+    monkeypatch.setattr(
+        core,
+        "_source_graph_daemon_module",
+        lambda: type("Daemon", (), {
+            "stop_daemon": lambda _self, root: lifecycle["daemon_stop"].append(root),
+            "ensure_started": ensure_daemon,
+        })(),
+    )
+    monkeypatch.setattr(core, "dispatcher_ensure_started", lambda: {"ok": True, "status": "manager_inbox"})
+
+    result = core.repository_switch(target_id)
+
+    assert result["ok"] is False
+    assert "target_index_failed" in result["error"]
+    assert core.repo_root() == old.resolve()
+    assert lifecycle["dispatcher_stop"] == [old.resolve(), target.resolve()]
+    assert lifecycle["daemon_stop"] == [old.resolve(), target.resolve()]
+    assert lifecycle["daemon_start"] == [target.resolve(), old.resolve()]
+
+
 def test_repository_switch_rejects_foreign_thread_without_mutating_binding(tmp_path, monkeypatch):
     old = tmp_path / "old"
     target = tmp_path / "target"

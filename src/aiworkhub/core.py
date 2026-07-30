@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -84,6 +85,7 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
 _PROCESS_REPO_ROOT_OVERRIDE: Path | None = None
+_REPOSITORY_SWITCH_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
 # B852: canonical, repo-local task-store write layer.
@@ -1858,6 +1860,7 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
             claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
         except (TypeError, ValueError):
             claim_epoch = 1
+        prior_episode = task_store.begin_claim_episode(stored_card)
         stored_card.update(
             claim_epoch=claim_epoch,
             status="processing",
@@ -1866,7 +1869,8 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
         )
         cur = conn.execute(
             "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
-            "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
+            "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
+            "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
             (json.dumps(stored_card, ensure_ascii=False), runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
@@ -1876,7 +1880,22 @@ def auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
             )
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
-            (task_id, "auto_pickup", runner, json.dumps({"runner": runner, "topic": topic}, ensure_ascii=False), now),
+            (
+                task_id,
+                "auto_pickup",
+                runner,
+                json.dumps(
+                    {
+                        "runner": runner,
+                        "topic": topic,
+                        "claim_epoch": claim_epoch,
+                        "prior_episode": prior_episode,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
         )
         conn.commit()
     finally:
@@ -1925,6 +1944,7 @@ def claim_start_exact(
             claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
         except (TypeError, ValueError):
             claim_epoch = 1
+        prior_episode = task_store.begin_claim_episode(stored_card)
         stored_card.update(
             claim_epoch=claim_epoch,
             status="processing",
@@ -1933,7 +1953,8 @@ def claim_start_exact(
         )
         cur = conn.execute(
             "UPDATE tasks SET card_json=?, runner=?, topic=?, worker_status='claimed', status='processing', claimed_by=?, "
-            "claimed_at=?, started_at=?, updated_at=? WHERE task_id=? AND worker_status='unclaimed'",
+            "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
+            "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
             (json.dumps(stored_card, ensure_ascii=False), runner, topic, runner, now, now, now, task_id),
         )
         if cur.rowcount != 1:
@@ -1947,7 +1968,17 @@ def claim_start_exact(
                 task_id,
                 "claim_start",
                 runner,
-                json.dumps({"runner": runner, "topic": topic, "request_id": request_id}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "runner": runner,
+                        "topic": topic,
+                        "request_id": request_id,
+                        "claim_epoch": claim_epoch,
+                        "prior_episode": prior_episode,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 now,
             ),
         )
@@ -2423,6 +2454,19 @@ def repository_current() -> dict[str, Any]:
 
 
 def repository_switch(repo_id: str) -> dict[str, Any]:
+    """Serialize one complete repository lifecycle handoff.
+
+    The lock covers route validation, old-service shutdown, binding swap,
+    target-service convergence and rollback.  Other switch requests therefore
+    observe either the old repository or the fully-started target, never an
+    interleaved half-switch.
+    """
+
+    with _REPOSITORY_SWITCH_LOCK:
+        return _repository_switch_locked(repo_id)
+
+
+def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
     """Atomically bind a repo-neutral Codex manager MCP to one live repo.
 
     The caller supplies only a manifest ``repo_id``.  The path is resolved
@@ -2483,17 +2527,23 @@ def repository_switch(repo_id: str) -> dict[str, Any]:
     previous_override = _PROCESS_REPO_ROOT_OVERRIDE
     bridge = _callback_bridge_module()
     daemon = _source_graph_daemon_module()
+    target_binding_active = False
     try:
         bridge.stop_dispatcher(current_root)
         daemon.stop_daemon(current_root)
         _PROCESS_REPO_ROOT_OVERRIDE = target_root
+        target_binding_active = True
         rebound_identity = _codex_manager_identity()
         if (
             not isinstance(rebound_identity, dict)
             or str(rebound_identity.get("thread_id") or rebound_identity.get("session_id") or "") != thread_id
         ):
             raise RuntimeError("target_manager_identity_not_verified")
-        daemon.ensure_started(target_root)
+        source_graph = daemon.ensure_started(target_root)
+        if isinstance(source_graph, dict) and not source_graph.get("ok", True):
+            raise RuntimeError(
+                str(source_graph.get("error") or source_graph.get("reason") or "source_graph_start_failed")
+            )
         callback = dispatcher_ensure_started()
         if not callback.get("ok") and callback.get("status") not in {"manager_inbox", "started"}:
             raise RuntimeError(str(callback.get("reason") or callback.get("status") or "callback_start_failed"))
@@ -2501,14 +2551,26 @@ def repository_switch(repo_id: str) -> dict[str, Any]:
             **repository_current(),
             "switched": True,
             "previous_repo_root": str(current_root),
+            "source_graph": source_graph,
             "callback": callback,
         }
-    except (OSError, RuntimeError, task_store.TaskStoreError) as exc:
+    except (OSError, RuntimeError, ValueError, task_store.TaskStoreError) as exc:
+        # A failed target convergence must not leave target-owned background
+        # services alive after authority returns to the old repository.
+        if target_binding_active:
+            try:
+                bridge.stop_dispatcher(target_root)
+            except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
+                pass
+            try:
+                daemon.stop_daemon(target_root)
+            except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
+                pass
         _PROCESS_REPO_ROOT_OVERRIDE = previous_override
         try:
             daemon.ensure_started(current_root)
             dispatcher_ensure_started()
-        except (OSError, RuntimeError, task_store.TaskStoreError):
+        except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
             pass
         return {"ok": False, "error": f"repository_switch_failed:{type(exc).__name__}:{str(exc)[:160]}"}
 

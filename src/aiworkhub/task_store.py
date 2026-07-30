@@ -66,6 +66,60 @@ CANONICAL_STATUSES: tuple[str, ...] = (
     "archived",
 )
 
+# Card fields below describe only the *current* execution episode.  A task
+# rejected back to ``pending`` may retain them in card_json for review/audit
+# display, but the next genuine claim must not inherit that stale terminal
+# truth.  Immutable history remains in task_events (including the original
+# terminal_review/reject_review rows); this list deliberately excludes task
+# identity, requirements, validation commands and other durable card fields.
+CURRENT_EPISODE_CARD_FIELDS: tuple[str, ...] = (
+    "terminal_review",
+    "terminal_substatus",
+    "terminal_outcome",
+    "terminal_review_reason",
+    "terminal_worker",
+    "terminal_review_disposition",
+    "deterministic_verification",
+    "review_requested_by",
+    "review_outcome",
+    "review_reason",
+    "validation_status",
+    "validation_error",
+    "validation_output",
+    "blocker_reason",
+    "launch_error",
+    "launch_failed",
+    "accepted_request_id",
+    "accepted_by",
+    "accepted_at",
+    "accept_evidence",
+)
+
+
+def begin_claim_episode(card: dict[str, Any]) -> dict[str, Any]:
+    """Clear stale current-episode metadata and return bounded audit context.
+
+    Callers invoke this only inside the same transaction that successfully
+    changes an unclaimed/pending row to processing.  The returned summary may
+    be embedded in the new ``claim_start`` event; it never replaces the full,
+    append-only terminal events already persisted for the preceding episode.
+    """
+
+    prior = {
+        key: card.get(key)
+        for key in (
+            "terminal_substatus",
+            "validation_status",
+            "validation_error",
+            "blocker_reason",
+            "launch_error",
+        )
+        if card.get(key) not in (None, "", [], {})
+    }
+    for key in CURRENT_EPISODE_CARD_FIELDS:
+        card.pop(key, None)
+    return prior
+
 REQUIRED_TABLES: tuple[str, ...] = (
     "tasks",
     "task_events",
@@ -1023,6 +1077,7 @@ def initialize_repository(
 
 __all__ = [
     "CANONICAL_STATUSES",
+    "CURRENT_EPISODE_CARD_FIELDS",
     "InitializationRefusedError",
     "REQUIRED_TABLES",
     "SCHEMA",
@@ -1031,6 +1086,7 @@ __all__ = [
     "StorageReadiness",
     "TaskStoreError",
     "archive_task",
+    "begin_claim_episode",
     "callback_bridge_health",
     "canonical_status",
     "database_identity",
