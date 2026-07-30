@@ -1887,6 +1887,57 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     description: "Fetch bounded related authoritative KB entries.",
     inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
   },
+  {
+    name: "aiworkhub_manager_session_write_intent",
+    description: "Propose a bounded Session event for explicit verified-manager disposition; never writes canonical context directly.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "content", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["start", "event", "checkpoint", "state", "handoff", "close"] },
+        content: { type: "string", minLength: 1, maxLength: 32768 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_manager_ai_memory_write_intent",
+    description: "Propose a bounded AI Memory mutation for explicit verified-manager disposition.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "key", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["remember", "update", "supersede", "archive"] },
+        key: { type: "string", minLength: 1, maxLength: 256 },
+        value: { type: "string", maxLength: 32768 },
+        tags: { type: "string", maxLength: 1024 },
+        scope: { type: "string", maxLength: 64 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_manager_kb_write_intent",
+    description: "Propose a bounded KB mutation for explicit verified-manager disposition.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "key", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["upsert", "ingest", "supersede", "archive"] },
+        key: { type: "string", minLength: 1, maxLength: 256 },
+        title: { type: "string", maxLength: 1024 },
+        body: { type: "string", maxLength: 32768 },
+        category: { type: "string", maxLength: 128 },
+        tags: { type: "string", maxLength: 1024 },
+        source_refs: { type: "string", maxLength: 2048 },
+        replacement_key: { type: "string", maxLength: 256 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
 ]);
 
 function languageModelTextPart(value) {

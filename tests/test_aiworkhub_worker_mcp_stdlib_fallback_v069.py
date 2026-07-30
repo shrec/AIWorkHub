@@ -55,6 +55,9 @@ def test_worker_mcp_starts_without_optional_mcp_package(tmp_path: Path) -> None:
             "aiworkhub_worker_kb_search",
         "aiworkhub_worker_kb_get",
         "aiworkhub_worker_kb_related",
+        "aiworkhub_worker_session_write_intent",
+        "aiworkhub_worker_ai_memory_write_intent",
+        "aiworkhub_worker_kb_write_intent",
     }
     source_schema = tools["aiworkhub_worker_source_graph_query"]["inputSchema"]
     assert source_schema["properties"]["budget"]["type"] == "integer"

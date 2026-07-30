@@ -561,6 +561,8 @@ def verify_audit_ledger(
             continue
         if not isinstance(entry, dict):
             continue
+        if entry.get("schema_id") != AUDIT_ENTRY_SCHEMA_ID:
+            continue
         digest = entry.pop("hmac_sha256", None)
         if not isinstance(digest, str):
             continue
@@ -1144,6 +1146,83 @@ def kb_related(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
     return _kb_invoke(ctx, subcommand="related", argument=key, tool_label="kb")
 
 
+def _context_write_intent(
+    ctx: WorkerToolContext, *, component: str, action: str,
+    payload: dict[str, Any], idempotency_key: str, provenance: str,
+) -> dict[str, Any]:
+    """Append a proposal to the authenticated request ledger only.
+
+    This deliberately never resolves or opens a canonical database.  The
+    verified manager owns disposition and canonical application.
+    """
+
+    if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
+        return {"ok": False, "error": "worker_context_intent_runtime_unavailable"}
+    # Lazy by design: minimal/bundled read-only worker packages used for
+    # discovery portability can still import this module.  A runtime that
+    # advertises the write-intent tools must ship the complete package.
+    from . import context_write_intents
+    try:
+        return context_write_intents.append_intent(
+            ledger_path=ctx.audit_ledger_path,
+            key_path=ctx.audit_hmac_key_path,
+            task_id=ctx.task_id,
+            runner=ctx.runner,
+            topic=ctx.topic,
+            request_id=ctx.request_id,
+            authority_repo=ctx.authority_repo,
+            component=component,  # type: ignore[arg-type]
+            action=action,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            provenance=provenance,
+        )
+    except context_write_intents.ContextWriteIntentError as exc:
+        return {"ok": False, "error": str(exc)[:240]}
+    except OSError as exc:
+        return {"ok": False, "error": f"worker_context_intent_failed:{type(exc).__name__}"}
+
+
+def session_write_intent(
+    ctx: WorkerToolContext, *, action: str, content: str,
+    idempotency_key: str, provenance: str,
+) -> dict[str, Any]:
+    return _context_write_intent(
+        ctx, component="session", action=action,
+        payload={"topic": ctx.session_topic, "content": content},
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+def ai_memory_write_intent(
+    ctx: WorkerToolContext, *, action: str, key: str, value: str = "",
+    tags: str = "", scope: str = "project", idempotency_key: str,
+    provenance: str,
+) -> dict[str, Any]:
+    return _context_write_intent(
+        ctx, component="memory", action=action,
+        payload={"key": key, "value": value, "tags": tags, "scope": scope},
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+def kb_write_intent(
+    ctx: WorkerToolContext, *, action: str, key: str, title: str = "",
+    body: str = "", category: str = "", tags: str = "",
+    source_refs: str = "", replacement_key: str = "",
+    idempotency_key: str, provenance: str,
+) -> dict[str, Any]:
+    return _context_write_intent(
+        ctx, component="kb", action=action,
+        payload={
+            "key": key, "title": title, "body": body, "category": category,
+            "tags": tags, "source_refs": source_refs,
+            "replacement_key": replacement_key,
+        },
+        idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-request MCP runtime generation (host-side; called BEFORE the sandboxed
 # adapter process starts, so it may write freely under the isolated home)
@@ -1350,6 +1429,9 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_kb_search",
     "aiworkhub_worker_kb_get",
     "aiworkhub_worker_kb_related",
+    "aiworkhub_worker_session_write_intent",
+    "aiworkhub_worker_ai_memory_write_intent",
+    "aiworkhub_worker_kb_write_intent",
 )
 
 
@@ -1403,6 +1485,41 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     def _kb_related(key: str) -> dict[str, Any]:
         """Bounded KB related-entries lookup."""
         return kb_related(ctx, key=key)
+
+    @mcp.tool(name="aiworkhub_worker_session_write_intent")
+    def _session_write_intent(
+        action: str, content: str, idempotency_key: str, provenance: str,
+    ) -> dict[str, Any]:
+        """Submit a bounded Session proposal for explicit manager review."""
+        return session_write_intent(
+            ctx, action=action, content=content,
+            idempotency_key=idempotency_key, provenance=provenance,
+        )
+
+    @mcp.tool(name="aiworkhub_worker_ai_memory_write_intent")
+    def _ai_memory_write_intent(
+        action: str, key: str, idempotency_key: str, provenance: str,
+        value: str = "", tags: str = "", scope: str = "project",
+    ) -> dict[str, Any]:
+        """Submit a bounded AI Memory proposal for explicit manager review."""
+        return ai_memory_write_intent(
+            ctx, action=action, key=key, value=value, tags=tags, scope=scope,
+            idempotency_key=idempotency_key, provenance=provenance,
+        )
+
+    @mcp.tool(name="aiworkhub_worker_kb_write_intent")
+    def _kb_write_intent(
+        action: str, key: str, idempotency_key: str, provenance: str,
+        title: str = "", body: str = "", category: str = "", tags: str = "",
+        source_refs: str = "", replacement_key: str = "",
+    ) -> dict[str, Any]:
+        """Submit a bounded KB proposal for explicit manager review."""
+        return kb_write_intent(
+            ctx, action=action, key=key, title=title, body=body,
+            category=category, tags=tags, source_refs=source_refs,
+            replacement_key=replacement_key, idempotency_key=idempotency_key,
+            provenance=provenance,
+        )
 
     return MCP_TOOL_NAMES
 
@@ -1461,6 +1578,9 @@ __all__ = [
     "kb_search",
     "load_context_from_env",
     "register_tools",
+    "session_write_intent",
+    "ai_memory_write_intent",
+    "kb_write_intent",
     "resolve_host_package_import_root",
     "session_current_state",
     "source_graph_query",

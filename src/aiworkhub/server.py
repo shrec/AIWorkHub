@@ -5,7 +5,7 @@ import json
 import sys
 import types
 import typing
-from typing import Any
+from typing import Any, Literal
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -399,6 +399,27 @@ def aiworkhub_manager_kb_write(
         action=action, key=key, title=title, body=body, category=category,
         tags=tags, source_refs=source_refs, replacement_key=replacement_key,
         idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_context_write_intents(request_id: str) -> dict[str, Any]:
+    """MANAGER READ: inspect authenticated worker context-write proposals."""
+
+    return process_launcher.default_manager().context_write_intents(request_id)
+
+
+@mcp.tool()
+def aiworkhub_manager_context_write_intent_dispose(
+    request_id: str,
+    intent_id: str,
+    decision: Literal["accepted", "rejected"],
+    reason: str,
+) -> dict[str, Any]:
+    """MANAGER WRITE: explicitly accept or reject one worker proposal."""
+
+    return process_launcher.default_manager().dispose_context_write_intent(
+        request_id, intent_id, decision=decision, reason=reason,
     )
 
 

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import core
+from . import context_write_intents
+from . import context_writes
 from .platform_io import chmod_fd, lock_fd, unlock_fd
 from . import quality_evidence
 from . import task_engine
@@ -3810,7 +3813,211 @@ class ProcessManager:
             return worker_ai_tools_mcp.kb_get(ctx, key=tool_input.get("key", ""))
         if tool_name == "aiworkhub_manager_kb_related":
             return worker_ai_tools_mcp.kb_related(ctx, key=tool_input.get("key", ""))
+        if tool_name == "aiworkhub_manager_session_write_intent":
+            return worker_ai_tools_mcp.session_write_intent(
+                ctx,
+                action=tool_input.get("action", ""),
+                content=tool_input.get("content", ""),
+                idempotency_key=tool_input.get("idempotency_key", ""),
+                provenance=tool_input.get("provenance", ""),
+            )
+        if tool_name == "aiworkhub_manager_ai_memory_write_intent":
+            return worker_ai_tools_mcp.ai_memory_write_intent(
+                ctx,
+                action=tool_input.get("action", ""),
+                key=tool_input.get("key", ""),
+                value=tool_input.get("value", ""),
+                tags=tool_input.get("tags", ""),
+                scope=tool_input.get("scope", "project"),
+                idempotency_key=tool_input.get("idempotency_key", ""),
+                provenance=tool_input.get("provenance", ""),
+            )
+        if tool_name == "aiworkhub_manager_kb_write_intent":
+            return worker_ai_tools_mcp.kb_write_intent(
+                ctx,
+                action=tool_input.get("action", ""),
+                key=tool_input.get("key", ""),
+                title=tool_input.get("title", ""),
+                body=tool_input.get("body", ""),
+                category=tool_input.get("category", ""),
+                tags=tool_input.get("tags", ""),
+                source_refs=tool_input.get("source_refs", ""),
+                replacement_key=tool_input.get("replacement_key", ""),
+                idempotency_key=tool_input.get("idempotency_key", ""),
+                provenance=tool_input.get("provenance", ""),
+            )
         return {"ok": False, "reason": "worker_bridge_tool_not_allowed"}
+
+    def _context_intent_request(
+        self, request_id: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """Resolve one request's immutable worker-MCP ledger binding."""
+
+        if not re.fullmatch(r"[a-f0-9]{32}", str(request_id or "")):
+            return None, {"ok": False, "error": "context_intent_request_id_invalid"}
+        events = self._request_events(request_id)
+        if not events:
+            return None, {"ok": False, "error": "context_intent_request_not_found"}
+        metadata_path = self._metadata_from_events(events)
+        if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
+            return None, {"ok": False, "error": "context_intent_metadata_invalid"}
+        try:
+            if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.stat().st_size > 2 * 1024 * 1024:
+                return None, {"ok": False, "error": "context_intent_metadata_invalid"}
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None, {"ok": False, "error": "context_intent_metadata_unreadable"}
+        if str(metadata.get("request_id") or "") != request_id:
+            return None, {"ok": False, "error": "context_intent_request_identity_mismatch"}
+        worker = metadata.get("worker_mcp")
+        if not isinstance(worker, dict):
+            return None, {"ok": False, "error": "context_intent_worker_runtime_missing"}
+        try:
+            authority_repo = Path(str(worker["authority_repo"])).resolve()
+            ledger_path = Path(str(worker["audit_ledger_path"])).resolve()
+            key_path = Path(str(worker["audit_hmac_key_path"])).resolve()
+        except (KeyError, TypeError, ValueError):
+            return None, {"ok": False, "error": "context_intent_worker_runtime_invalid"}
+        if authority_repo != self.repo:
+            return None, {"ok": False, "error": "context_intent_authority_repo_mismatch"}
+        if (
+            ledger_path.is_symlink() or key_path.is_symlink()
+            or not ledger_path.is_file() or not key_path.is_file()
+            or ledger_path.stat().st_size > 4 * 1024 * 1024
+            or key_path.stat().st_size > 4096
+        ):
+            return None, {"ok": False, "error": "context_intent_ledger_invalid"}
+        binding = {
+            "request_id": request_id,
+            "task_id": str(metadata.get("task_id") or ""),
+            "runner": str(metadata.get("runner") or ""),
+            "topic": str(metadata.get("topic") or ""),
+            "authority_repo": authority_repo,
+            "ledger_path": ledger_path,
+            "key_path": key_path,
+        }
+        if not binding["task_id"] or not binding["runner"] or not binding["topic"]:
+            return None, {"ok": False, "error": "context_intent_binding_incomplete"}
+        return binding, {}
+
+    def _context_write_intent_snapshot(self, request_id: str) -> dict[str, Any]:
+        binding, error = self._context_intent_request(request_id)
+        if binding is None:
+            return error
+        try:
+            intents = context_write_intents.read_verified_intents(
+                ledger_path=binding["ledger_path"],
+                key_path=binding["key_path"],
+                task_id=binding["task_id"],
+                runner=binding["runner"],
+                topic=binding["topic"],
+                request_id=request_id,
+                authority_repo=binding["authority_repo"],
+            )
+            dispositions = context_write_intents.decisions(self.repo, request_id=request_id)
+        except (context_write_intents.ContextWriteIntentError, OSError, sqlite3.Error) as exc:
+            return {"ok": False, "error": f"context_intent_read_failed:{type(exc).__name__}"}
+        rows: list[dict[str, Any]] = []
+        for intent in intents:
+            intent_id = str(intent["intent_id"])
+            decision = dispositions.get(intent_id)
+            rows.append({
+                **intent,
+                "status": str(decision.get("decision")) if decision else "pending_manager_review",
+                "decision": decision,
+            })
+        pending = [row for row in rows if row["status"] == "pending_manager_review"]
+        return {
+            "ok": True,
+            "schema_id": "aiworkhub.context_write_intent_inbox.v1",
+            "request_id": request_id,
+            "task_id": binding["task_id"],
+            "intents": rows,
+            "counts": {
+                "total": len(rows),
+                "pending": len(pending),
+                "accepted": sum(row["status"] == "accepted" for row in rows),
+                "rejected": sum(row["status"] == "rejected" for row in rows),
+            },
+        }
+
+    def context_write_intents(self, request_id: str) -> dict[str, Any]:
+        """MANAGER READ: inspect authenticated proposals for one request."""
+
+        route = core.manager_bootstrap()
+        if route.get("role") != "manager" or not isinstance(route.get("manager_route"), dict):
+            return {"ok": False, "error": "verified_manager_identity_required"}
+        route_repo = Path(str(route.get("repo") or self.repo)).resolve()
+        if route_repo != self.repo:
+            return {"ok": False, "error": "manager_repository_mismatch"}
+        return self._context_write_intent_snapshot(request_id)
+
+    def dispose_context_write_intent(
+        self, request_id: str, intent_id: str, *, decision: str, reason: str,
+    ) -> dict[str, Any]:
+        """MANAGER WRITE: accept/reject one exact authenticated proposal."""
+
+        route = core.manager_bootstrap()
+        identity = route.get("manager_route") if isinstance(route, dict) else None
+        if route.get("role") != "manager" or not isinstance(identity, dict):
+            return {"ok": False, "error": "verified_manager_identity_required"}
+        if Path(str(route.get("repo") or self.repo)).resolve() != self.repo:
+            return {"ok": False, "error": "manager_repository_mismatch"}
+        if decision not in {"accepted", "rejected"}:
+            return {"ok": False, "error": "invalid_decision"}
+        if not core.writes_allowed():
+            return {"ok": False, "error": "write_gate_closed"}
+        snapshot = self._context_write_intent_snapshot(request_id)
+        if not snapshot.get("ok"):
+            return snapshot
+        try:
+            card = _parse_card(self._show_task(str(snapshot["task_id"])), str(snapshot["task_id"]))
+        except LaunchRejected as exc:
+            return {"ok": False, "error": f"task_lookup_failed:{exc}"}
+        if _canonical_task_status(card) != "review":
+            return {"ok": False, "error": "context_intent_task_not_in_review"}
+        selected = next(
+            (row for row in snapshot["intents"] if str(row.get("intent_id")) == intent_id), None,
+        )
+        if selected is None:
+            return {"ok": False, "error": "context_intent_not_found"}
+        prior = selected.get("decision")
+        if isinstance(prior, dict):
+            if str(prior.get("decision")) != decision:
+                return {"ok": False, "error": "intent_already_disposed"}
+            return {"ok": True, "idempotent": True, **prior}
+        provider = str(identity.get("provider") or route.get("provider") or "manager")
+        session_id = str(identity.get("thread_id") or identity.get("session_id") or "")
+        if not session_id:
+            return {"ok": False, "error": "manager_session_identity_missing"}
+        result: dict[str, Any] = {"ok": True, "applied": False}
+        try:
+            if decision == "accepted":
+                result = context_write_intents.apply_accepted_intent(
+                    self.repo,
+                    intent=selected,
+                    manager_provider=provider,
+                    manager_session_id=session_id,
+                )
+            recorded = context_write_intents.record_decision(
+                self.repo,
+                intent=selected,
+                decision=decision,  # type: ignore[arg-type]
+                reason=reason,
+                manager_provider=provider,
+                manager_session_id=session_id,
+                result=result,
+            )
+        except (context_write_intents.ContextWriteIntentError, context_writes.ContextWriteError) as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+        except (OSError, sqlite3.Error) as exc:
+            return {"ok": False, "error": f"context_intent_disposition_failed:{type(exc).__name__}"}
+        return {
+            **recorded,
+            "schema_id": context_write_intents.DECISION_SCHEMA_ID,
+            "request_id": request_id,
+            "task_id": snapshot["task_id"],
+        }
 
     def collect(self, request_id: str, max_log_bytes: int = MAX_LOG_TAIL_BYTES) -> dict[str, Any]:
         status = self.status(request_id)
@@ -4063,6 +4270,26 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                 }
+
+            intent_snapshot = self._context_write_intent_snapshot(request_id)
+            if intent_snapshot.get("ok"):
+                pending_intents = int((intent_snapshot.get("counts") or {}).get("pending") or 0)
+                if pending_intents:
+                    return {
+                        "ok": False,
+                        "error": f"context_write_intents_pending:{pending_intents}",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "pending_context_write_intents": [
+                            {
+                                "intent_id": row.get("intent_id"),
+                                "component": row.get("component"),
+                                "action": row.get("action"),
+                            }
+                            for row in intent_snapshot.get("intents") or []
+                            if row.get("status") == "pending_manager_review"
+                        ],
+                    }
 
             workspace_meta = evidence.get("workspace")
             if not isinstance(workspace_meta, dict):

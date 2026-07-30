@@ -121,7 +121,7 @@ def test_worker_mcp_server_launches_as_a_package_module_and_serves_tools_over_re
 
     result = asyncio.run(_run_handshake(params))
     assert result["tool_names"] == set(w.MCP_TOOL_NAMES)
-    assert len(w.MCP_TOOL_NAMES) == 8
+    assert len(w.MCP_TOOL_NAMES) == 11
     assert result["call_is_error"] is not True
 
 

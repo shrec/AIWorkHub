@@ -1,11 +1,12 @@
 # AIWorkHub MCP Agent Notes
 
-This repository is intended to become an independent submodule.
+This is the standalone canonical AIWorkHub repository.
 
 Rules:
-- Keep the task queue source of truth in the parent AIWorkHub repository.
-- Do not duplicate `AITools/taskctl.py` logic here unless a deliberate migration task says so.
-- Prefer wrapping `taskctl.py` through stable command boundaries.
+- Keep every repository's task and context source of truth in that repository's
+  own `.aiworkhub/` storage; never move task cards across repositories.
+- Use the native AIWorkHub MCP surfaces rather than legacy `AITools` scripts or
+  databases as model interfaces.
 - Write operations must remain explicit and gated by `AIWORKHUB_ALLOW_WRITES=1`.
 - Never run `git add -A` from this repository against the parent repository.
 
@@ -32,6 +33,7 @@ Adaptive use:
 - Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.
 - Task MCP receipt is always required; Source Graph is required for code tasks.
 - Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.
+- Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.
 - Do not make empty irrelevant calls to satisfy ceremony.
 Source Graph gate:
 - When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.

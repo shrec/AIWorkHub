@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-CANONICAL_MAX_BYTES = 2200
+CANONICAL_MAX_BYTES = 2600
 PROJECTION_MAX_BYTES = 3000
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
@@ -50,6 +50,7 @@ POLICY = ToolPolicy(
         "Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.",
         "Task MCP receipt is always required; Source Graph is required for code tasks.",
         "Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.",
+        "Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.",
         "Do not make empty irrelevant calls to satisfy ceremony.",
     ),
     source_graph=(
@@ -94,6 +95,9 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_kb_search",
     "aiworkhub_worker_kb_get",
     "aiworkhub_worker_kb_related",
+    "aiworkhub_worker_session_write_intent",
+    "aiworkhub_worker_ai_memory_write_intent",
+    "aiworkhub_worker_kb_write_intent",
 )
 
 

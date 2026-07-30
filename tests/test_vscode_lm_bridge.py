@@ -315,3 +315,29 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     assert ctx.authority_repo == repo.resolve()
     assert ctx.audit_ledger_path == ledger
     assert observed["kwargs"] == {"mode": "focus", "query": "bridge", "budget": 16}
+
+    def _session_intent(
+        bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,
+    ) -> dict[str, object]:
+        observed.update({"intent_ctx": bound_ctx, "intent_kwargs": kwargs})
+        return {"ok": True, "status": "pending_manager_review", "intent_id": "f" * 64}
+
+    monkeypatch.setattr(worker_ai_tools_mcp, "session_write_intent", _session_intent)
+    intent = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_session_write_intent",
+        {
+            "action": "checkpoint",
+            "content": "bounded",
+            "idempotency_key": "session:bridge:0001",
+            "provenance": "bridge test",
+        },
+    )
+    assert intent["status"] == "pending_manager_review"
+    assert observed["intent_ctx"] is ctx or observed["intent_ctx"].request_id == request_id
+    assert observed["intent_kwargs"] == {
+        "action": "checkpoint",
+        "content": "bounded",
+        "idempotency_key": "session:bridge:0001",
+        "provenance": "bridge test",
+    }

@@ -1,8 +1,84 @@
 # AIWorkHub MCP MVP Roadmap
 
-Goal: increase AIWorkHub development throughput by letting MCP-capable agents read and eventually operate the task queue directly.
+Goal: provide a repository-native, model-agnostic development orchestrator
+whose task lifecycle, source context, sessions, memory, knowledge, review and
+callback routing work consistently in every supported VS Code environment.
 
-Current rule: keep the existing parent task system active until this repository is complete enough to replace manual copy/paste coordination.
+Current canonical baseline (2026-07-30): standalone GitHub repository,
+release `0.7.9`, native repo-local `.aiworkhub` storage, multi-repository
+manager routing, isolated workers, review-first promotion, callback outbox,
+Source Graph daemon, Session/AI Memory/KB manager read-write surfaces, and a
+native VS Code dashboard. Historical phase notes below remain as evidence but
+do not override this current priority ledger.
+
+## Current Priority Ledger — Post-0.7.9
+
+### P0 — Stable product closure
+
+- [x] Preserve archived/superseded lifecycle authority when an old child exits
+      late; never recreate review/pending work from a finalized card.
+- [x] Block destructive review false-greens using absolute/relative file-loss
+      and Python public-API-loss evidence unless the verified manager supplies
+      explicit destructive-change confirmation.
+- [x] Expose manager Session Manager, AI Memory and KB canonical read/write
+      tools with repo/session identity, idempotency, provenance and soft-delete
+      audit.
+- [x] Add bounded HMAC-authenticated worker Session/AI Memory/KB write intents;
+      workers never open canonical context databases.
+- [x] Add verified-manager intent inbox plus explicit accept/reject disposition;
+      accepted proposals apply only through the canonical context mutation
+      layer and unresolved proposals block task acceptance.
+- [ ] Add an idempotent, provenance-preserving importer for explicitly selected
+      legacy Session/AI Memory/KB stores (dry-run, duplicate report, rollback;
+      never implicit global-path discovery).
+- [ ] Finish atomic manager repository switching: switch only the manager's
+      active repo binding, keep every task/context/log/index/callback in its
+      origin repository, stop old repo daemons, start new repo daemons, and
+      support deterministic A -> B -> A recovery without moving task cards.
+- [ ] Clear stale terminal substatus, launch error and validation reason on a
+      genuine new claim/relaunch episode while retaining the old episode in
+      append-only audit history.
+- [ ] Run and publish one fresh-install E2E qualification matrix for Linux,
+      Remote-SSH, Windows and macOS: install, InitRepo, MCP registration,
+      first index, worker launch, terminal review, callback, acceptance,
+      reload/restart recovery and repository isolation.
+- [ ] Cut the next stable release only after the matrix is green and the
+      bundled runtime/extension/source version hashes agree.
+
+### P1 — Context economy and orchestration UX
+
+- [ ] Source Graph language-complete first indexing (including PHP), automatic
+      InitRepo indexing, bounded incremental file-change/periodic refresh,
+      configurable generated/vendor/archive ignore rules and stale-index health.
+- [ ] Per-task tool-use telemetry: Source Graph calls/hits/zero-hits, bounded
+      fallback reason, raw-discovery violations, bytes returned and conservative
+      context-savings labels. Dashboard must distinguish measured bytes from
+      token/cost truth.
+- [ ] Visual Plan DAG with dependencies, blockers, ready capacity and critical
+      path; retain the existing dependency-safe autolaunch authority.
+- [ ] Review Inbox 2.0: pagination, bounded filters, terminal summaries and a
+      portable evidence bundle (diff, tests, logs, artifacts, approvals).
+- [ ] Unified environment/provider preflight and repo-local Policy-as-Code for
+      provider scope, forbidden commands, required validation and retention.
+- [ ] Manager-editable model workforce inventory/scoring based on observed task
+      outcomes, without fabricating provider quota/limit data unavailable from
+      the provider extension API.
+- [ ] Complete storage retention UX: size by component, archive/restore,
+      age/size policy, dry-run cleanup and rollback-safe deletion.
+
+### P2 — Maintainability, distribution and ecosystem
+
+- [ ] Split `core.py` and `process_launcher.py` along lifecycle, authority,
+      review and context boundaries without changing public MCP contracts.
+- [ ] Modularize the VS Code extension in TypeScript with deterministic bundle
+      output and restored-tab/reload E2E coverage.
+- [ ] Centralize pytest fixtures/state isolation and organize unit/integration/
+      E2E suites; add Ruff, type checking and pre-commit quality gates.
+- [ ] Make version metadata a single source of truth and enforce Linux/Windows/
+      macOS release CI plus reproducible VSIX checksums.
+- [ ] Finish public documentation, ADRs, VS Code Marketplace/Open VSX
+      publication, then consider GitHub issue/PR sync, webhooks/public API and
+      historical reliability analytics.
 
 ## Phase 0 — Wrapper MVP
 
@@ -66,7 +142,8 @@ Status: complete for local stdio MVP.
 - [x] Validate collision guard before and after the live canary batch.
 - [x] Validate no parent-repo task state corruption (`taskctl verify` PASS after completion).
 - [x] Freeze MCP tool contract v1.
-- [ ] Convert this directory to real GitHub repo/submodule.
+- [x] Convert this directory to a standalone GitHub repository (completed;
+      the old submodule wording is superseded).
 
 ### MVP Finish Gate
 
@@ -370,13 +447,15 @@ rollout open.
       clean shutdown (socket + capability file removed). Mirrored
       integration coverage for `SidebandCallbackClient` lives in
       `tests/test_callback_bridge.py`.
-- [ ] Live wiring: Codex applies `chatgpt.cliExecutable`, reloads the
+- [x] Live wiring: Codex applied the mux/runtime integration, reloaded the
       extension host, runs the live canary against the extension-owned
       thread, and only then flips `CallbackBridge` to `transport="sideband"`
       and re-enables the callback service. Not performed by this worker
       (forbidden: `separate_app_server_fallback` stays forbidden even after
       this lands -- this mux IS the fallback-free replacement).
-- [ ] `AITools/taskdb.py` in this isolated task worktree currently lacks the
+- [x] Historical isolated-worktree `AITools/taskdb.py` gap is superseded by the
+      standalone canonical task store and durable callback implementation. The
+      original observation was:
       `callback_outbox`/`callback_batches` functions (`claim_pending_callback_batch`,
       `callback_outbox_stats`, etc.) that `callback_bridge.py` already
       depends on for both transports -- a pre-existing environment gap
@@ -425,7 +504,9 @@ newest process silently shadowed the origin thread owner's endpoint.
       stale/pid-reuse registry rows are ignored, and an ambiguous owner
       durably parks. Existing B409/B416/B471 security, dedup, redaction and
       batch-atomicity tests are unchanged and green.
-- [ ] Live wiring unchanged from Phase 7: Codex still owns applying
+- [x] Live multi-instance wiring was activated and is now covered by the
+      current manager-route/callback watchdog architecture. Historical steps
+      retained below: Codex owned applying
       `chatgpt.cliExecutable`, the extension host reload, the live canary,
       and flipping `CallbackBridge` to `transport="sideband"`.
 
