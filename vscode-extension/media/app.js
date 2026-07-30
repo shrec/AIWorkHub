@@ -111,6 +111,7 @@ const elements = {
   tableLoading: document.querySelector("#table-loading"),
   topicStats: document.querySelector("#topic-stats"),
   runnerStats: document.querySelector("#runner-stats"),
+  planDag: document.querySelector("#plan-dag"),
   toolUseList: document.querySelector("#tool-use-list"),
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
@@ -823,6 +824,77 @@ function renderToolUse(snapshot) {
   elements.toolUseList.replaceChildren(fragment);
 }
 
+function renderPlanDag(snapshot) {
+  if (!elements.planDag) return;
+  const plan = snapshot && snapshot.task_plan && typeof snapshot.task_plan === "object"
+    ? snapshot.task_plan
+    : null;
+  if (!plan || !Array.isArray(plan.layers) || !plan.task_ids || !plan.task_ids.length) {
+    elements.planDag.replaceChildren(
+      createElement("div", "panel-list-empty", "No task dependency graph yet"),
+    );
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const overview = createElement("div", "usage-overview plan-overview");
+  for (const [label, value] of [
+    ["Nodes", formatCount(plan.task_ids.length)],
+    ["Edges", formatCount(plan.edge_count)],
+    ["Ready capacity", formatCount(plan.ready_capacity)],
+    ["Blocked", formatCount(plan.blocked_count)],
+    ["Critical path", formatCount(plan.critical_path_length)],
+    ["DAG valid", plan.dag_valid ? "yes" : "no"],
+  ]) {
+    const metric = createElement("div", "usage-metric");
+    metric.append(createElement("span", "usage-label", label), createElement("strong", "", value));
+    overview.appendChild(metric);
+  }
+  fragment.appendChild(overview);
+
+  if (Array.isArray(plan.cycle_nodes) && plan.cycle_nodes.length) {
+    fragment.appendChild(createElement(
+      "div", "plan-alert", `Cycle detected: ${plan.cycle_nodes.join(", ")}`,
+    ));
+  }
+
+  const dependencies = plan.dependencies && typeof plan.dependencies === "object" ? plan.dependencies : {};
+  const blockers = plan.blockers && typeof plan.blockers === "object" ? plan.blockers : {};
+  const lifecycle = plan.lifecycle && typeof plan.lifecycle === "object" ? plan.lifecycle : {};
+  const ready = new Set(Array.isArray(plan.ready) ? plan.ready : []);
+  const critical = new Set(Array.isArray(plan.critical_path) ? plan.critical_path : []);
+  const dag = createElement("div", "plan-dag-grid");
+  for (const layer of plan.layers) {
+    if (!layer || !Array.isArray(layer.task_ids)) continue;
+    const column = createElement("section", "plan-layer");
+    column.appendChild(createElement("h3", "plan-layer-title", `Stage ${numberValue(layer.index) + 1}`));
+    for (const taskId of layer.task_ids) {
+      const card = createElement("div", "plan-node");
+      if (critical.has(taskId)) card.classList.add("critical");
+      if (ready.has(taskId)) card.classList.add("ready");
+      if (Array.isArray(blockers[taskId]) && blockers[taskId].length) card.classList.add("blocked");
+      card.append(
+        createElement("strong", "plan-node-id", taskId),
+        createElement("span", "plan-node-state", String(lifecycle[taskId] || "pending")),
+      );
+      const deps = Array.isArray(dependencies[taskId]) ? dependencies[taskId] : [];
+      if (deps.length) card.appendChild(createElement("span", "plan-node-deps", `← ${deps.join(", ")}`));
+      const blockedBy = Array.isArray(blockers[taskId]) ? blockers[taskId] : [];
+      if (blockedBy.length) card.appendChild(createElement("span", "plan-node-blockers", `blocked: ${blockedBy.join(", ")}`));
+      column.appendChild(card);
+    }
+    dag.appendChild(column);
+  }
+  fragment.appendChild(dag);
+
+  if (Array.isArray(plan.critical_path) && plan.critical_path.length) {
+    fragment.appendChild(createElement(
+      "div", "telemetry-note", `Critical path: ${plan.critical_path.join(" → ")}`,
+    ));
+  }
+  elements.planDag.replaceChildren(fragment);
+}
+
 function formatBytes(value) {
   let amount = Math.max(0, numberValue(value));
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -1228,6 +1300,7 @@ function renderSnapshot(snapshot) {
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderUsage(snapshot);
+  renderPlanDag(snapshot);
   renderToolUse(snapshot);
   renderStorage(snapshot);
   renderSystemLogs(snapshot);

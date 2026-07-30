@@ -104,6 +104,45 @@ def test_snapshot_disjoint_writes_are_all_ready_in_parallel():
     snap = task_plan.build_snapshot(cards)
     assert set(snap["ready"]) == {"t1", "t2", "t3"}
     assert snap["write_scope_overlaps"] == {}
+    assert snap["ready_capacity"] == 3
+    assert snap["layers"] == [{"index": 0, "task_ids": ["t1", "t2", "t3"]}]
+
+
+def test_snapshot_projects_layers_and_current_critical_path():
+    cards = [
+        _card("root", status="finished"),
+        _card("left", depends_on=["root"]),
+        _card("right", depends_on=["root"]),
+        _card("leaf", depends_on=["left"]),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["dag_valid"] is True
+    assert snap["edge_count"] == 3
+    assert snap["active_count"] == 3
+    assert snap["blocked_count"] == 1
+    assert snap["layers"] == [
+        {"index": 0, "task_ids": ["root"]},
+        {"index": 1, "task_ids": ["left", "right"]},
+        {"index": 2, "task_ids": ["leaf"]},
+    ]
+    assert snap["critical_path"] == ["root", "left", "leaf"]
+    assert snap["critical_path_length"] == 3
+
+
+def test_snapshot_legacy_cycle_is_visible_and_has_no_fabricated_critical_path():
+    cards = [
+        _card("a", depends_on=["b"]),
+        _card("b", depends_on=["a"]),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["dag_valid"] is False
+    assert snap["cycle_nodes"] == ["a", "b"]
+    assert snap["critical_path"] == []
+    assert snap["critical_path_length"] == 0
 
 
 def test_snapshot_existing_cards_with_no_depends_on_behave_identically():

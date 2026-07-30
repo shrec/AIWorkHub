@@ -27,6 +27,7 @@ from aiworkhub import (
     process_launcher,
     repository_state,
     storage_observability,
+    task_plan,
     task_store,
 )
 
@@ -805,6 +806,19 @@ class DashboardProvider:
         full origin_thread_id."""
         return task_store.callback_bridge_health(self.repo_root)
 
+    def get_task_plan(self) -> dict[str, Any]:
+        """Read-only Plan-DAG projection from full canonical cards."""
+        cards: list[dict[str, Any]] = []
+        for row in task_store.list_tasks(self.repo_root, status=None, limit=5000):
+            card = task_store.get_task(self.repo_root, str(row.get("task_id") or ""))
+            if card is not None:
+                cards.append(card)
+        return {
+            "ok": True,
+            "schema_id": "aiworkhub.task_plan_snapshot.v1",
+            **task_plan.build_snapshot(cards),
+        }
+
 
 def _normalize_task_rows(value: Any, status: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
@@ -973,6 +987,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "source_graph_telemetry": _source_graph_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
             "callback_bridge_health": {},
+            "task_plan": {},
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
         }
@@ -1072,6 +1087,16 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "message": "callback bridge health provider returned a non-object",
         })
         callback_bridge_health = {}
+
+    plan_reader = getattr(data_provider, "get_task_plan", lambda: {})
+    task_plan_snapshot = _safe_read("task_plan", plan_reader, errors, {})
+    if not isinstance(task_plan_snapshot, Mapping):
+        errors.append({
+            "source": "task_plan",
+            "kind": "DashboardReadError",
+            "message": "task plan provider returned a non-object",
+        })
+        task_plan_snapshot = {}
 
     _merge_inbox_facts(task_groups, inbox)
     _merge_process_liveness_into_tasks(task_groups, process_report)
@@ -1198,6 +1223,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "source_graph_telemetry": _source_graph_telemetry(process_report),
         "project_context_telemetry": _project_context_telemetry(process_report),
         "callback_bridge_health": dict(callback_bridge_health),
+        "task_plan": dict(task_plan_snapshot),
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,

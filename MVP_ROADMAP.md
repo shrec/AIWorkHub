@@ -88,8 +88,16 @@ do not override this current priority ledger.
       local evidence: focused telemetry/worker tests (`64 passed`), complete
       Python suite (`1467 passed, 18 skipped`) and complete extension suite on
       2026-07-30.
-- [ ] Visual Plan DAG with dependencies, blockers, ready capacity and critical
+- [x] Visual Plan DAG with dependencies, blockers, ready capacity and critical
       path; retain the existing dependency-safe autolaunch authority.
+      The canonical pure task-plan projection now adds deterministic
+      topological stages, node/edge/active/blocked counts, ready capacity,
+      current critical path and explicit legacy-cycle validity without
+      changing claim/autolaunch behavior. The native dashboard renders a
+      horizontally scrollable `Plan DAG` with ready, blocked and critical
+      nodes plus exact dependency/blocker labels. Canonical local evidence:
+      task-plan/core/dashboard tests (`45 passed`), complete Python suite
+      (`1469 passed, 18 skipped`) and complete extension suite on 2026-07-30.
 - [ ] Review Inbox 2.0: pagination, bounded filters, terminal summaries and a
       portable evidence bundle (diff, tests, logs, artifacts, approvals).
 - [ ] Unified environment/provider preflight and repo-local Policy-as-Code for

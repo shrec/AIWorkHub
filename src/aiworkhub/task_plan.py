@@ -239,6 +239,53 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         ready.append(tid)
         claimed_paths |= my_writes
 
+    # Deterministic topological presentation metadata.  This never changes
+    # claim authority: it projects the already-validated dependency map for
+    # the dashboard.  Legacy cycles fail visibly instead of fabricating a
+    # critical path through an invalid graph.
+    present_dependencies = {
+        tid: [dep for dep in deps if dep in by_id]
+        for tid, deps in dependencies.items()
+    }
+    indegree = {tid: len(deps) for tid, deps in present_dependencies.items()}
+    layer_by_id = {tid: 0 for tid in by_id}
+    queue = sorted(tid for tid, degree in indegree.items() if degree == 0)
+    topological: list[str] = []
+    while queue:
+        tid = queue.pop(0)
+        topological.append(tid)
+        for child in sorted(dependents.get(tid, [])):
+            if child not in indegree:
+                continue
+            layer_by_id[child] = max(layer_by_id[child], layer_by_id[tid] + 1)
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                queue.append(child)
+                queue.sort()
+    cycle_nodes = sorted(tid for tid, degree in indegree.items() if degree > 0)
+    layers: list[dict[str, Any]] = []
+    for layer_index in sorted(set(layer_by_id.values())):
+        task_ids = sorted(
+            tid for tid, value in layer_by_id.items()
+            if value == layer_index and tid not in cycle_nodes
+        )
+        if task_ids:
+            layers.append({"index": layer_index, "task_ids": task_ids})
+
+    critical_path: list[str] = []
+    if not cycle_nodes:
+        longest_to: dict[str, list[str]] = {}
+        for tid in topological:
+            candidates = [longest_to[dep] for dep in present_dependencies[tid]]
+            prefix = max(candidates, key=lambda value: (len(value), value)) if candidates else []
+            longest_to[tid] = [*prefix, tid]
+        active_candidates = [
+            path for tid, path in longest_to.items()
+            if lifecycle.get(tid) != "finished"
+        ]
+        if active_candidates:
+            critical_path = max(active_candidates, key=lambda value: (len(value), value))
+
     return {
         "task_ids": sorted(by_id),
         "lifecycle": lifecycle,
@@ -248,6 +295,15 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "invalid_depends_on": sorted(invalid_depends_on),
         "write_scope_overlaps": write_scope_overlaps,
         "ready": ready,
+        "ready_capacity": len(ready),
+        "active_count": sum(1 for value in lifecycle.values() if value != "finished"),
+        "blocked_count": len([tid for tid, value in blockers.items() if value]),
+        "edge_count": sum(len(value) for value in dependencies.values()),
+        "layers": layers,
+        "critical_path": critical_path,
+        "critical_path_length": len(critical_path),
+        "dag_valid": not cycle_nodes and not invalid_depends_on,
+        "cycle_nodes": cycle_nodes,
     }
 
 
