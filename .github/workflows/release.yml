@@ -58,6 +58,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
+          cache: false
 
       - name: Install extension dependencies
         run: npm install
@@ -116,6 +117,9 @@ jobs:
           extension_version = json.loads(
               pathlib.Path("vscode-extension/package.json").read_text()
           )["version"]
+          extension_lock_version = json.loads(
+              pathlib.Path("vscode-extension/package-lock.json").read_text()
+          )["packages"][""]["version"]
           init_source = pathlib.Path("src/aiworkhub/__init__.py").read_text()
           init_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_source, re.MULTILINE)
           extension_source = pathlib.Path("vscode-extension/extension.js").read_text()
@@ -130,6 +134,7 @@ jobs:
               "pyproject.toml": python_version,
               "src/aiworkhub/__init__.py": init_match.group(1) if init_match else "missing",
               "vscode-extension/package.json": extension_version,
+              "vscode-extension/package-lock.json": extension_lock_version,
               "vscode-extension/extension.js": runtime_match.group(1) if runtime_match else "missing",
           }
           if any(version != expected for version in versions.values()):
@@ -179,6 +184,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
+          cache: false
 
       - name: Install dependencies
         run: npm install

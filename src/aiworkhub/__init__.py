@@ -29,7 +29,7 @@ __all__ = [
     "project_context",
 ]
 
-__version__ = "0.7.9"
+__version__ = "0.8.0"
 
 COORDINATOR_TOKEN_ENV = "BITNN_TASKCTL_COORDINATOR_TOKEN"
 COORDINATOR_TOKEN_FILE_ENV = "BITNN_TASKCTL_COORDINATOR_TOKEN_FILE"

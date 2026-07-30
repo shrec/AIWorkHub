@@ -44,13 +44,14 @@ do not override this current priority ledger.
       append-only audit history. Both exact-claim and auto-pickup now start a
       clean episode, clear stale completion time and retain a bounded prior
       episode summary on the immutable claim event.
-- [ ] Run and publish one fresh-install E2E qualification matrix for Linux,
+- [x] Run and publish one fresh-install E2E qualification matrix for Linux,
       Remote-SSH, Windows and macOS: install, InitRepo, MCP registration,
       first index, worker launch, terminal review, callback, acceptance,
       reload/restart recovery and repository isolation.
-      The portable lifecycle harness and four-lane GitHub matrix are now in
-      place; keep this gate open until the pushed Linux, Remote-SSH contract,
-      Windows and macOS runs all publish green evidence artifacts.
+      The portable lifecycle harness and four-lane GitHub matrix are in place.
+      Canonical green evidence: GitHub Actions run `30548398008` on commit
+      `5f57fa5` (Linux, Remote-SSH contract, Windows and macOS qualification
+      artifacts, plus Python 3.10/3.11/3.12, VSIX and distribution jobs).
 - [ ] Cut the next stable release only after the matrix is green and the
       bundled runtime/extension/source version hashes agree.
 
