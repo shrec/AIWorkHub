@@ -161,6 +161,8 @@ const elements = {
   detailResult: document.querySelector("#detail-result"),
   detailAiInfraBlock: document.querySelector("#detail-ai-infra-block"),
   detailAiInfra: document.querySelector("#detail-ai-infra"),
+  detailEvidenceBlock: document.querySelector("#detail-evidence-block"),
+  detailEvidence: document.querySelector("#detail-evidence"),
   detailWritesBlock: document.querySelector("#detail-writes-block"),
   detailWrites: document.querySelector("#detail-writes"),
   detailLiveOutputBlock: document.querySelector("#detail-live-output-block"),
@@ -1531,6 +1533,107 @@ function renderAiInfra(card) {
   elements.detailAiInfraBlock.hidden = false;
 }
 
+function appendEvidenceList(fragment, title, values) {
+  const items = asArray(values).filter((value) => String(value || "").trim());
+  if (!items.length) {
+    return;
+  }
+  const section = createElement("section", "review-evidence-section");
+  section.appendChild(createElement("h4", "", title));
+  const list = createElement("ul", "path-list");
+  list.replaceChildren(...items.map((value) => createElement("li", "", String(value))));
+  section.appendChild(list);
+  fragment.appendChild(section);
+}
+
+function renderReviewEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object") {
+    elements.detailEvidence.replaceChildren();
+    elements.detailEvidenceBlock.hidden = true;
+    elements.detailEvidenceBlock.open = false;
+    return;
+  }
+  const terminal = evidence.terminal && typeof evidence.terminal === "object" ? evidence.terminal : {};
+  const diff = evidence.diff && typeof evidence.diff === "object" ? evidence.diff : {};
+  const tests = asArray(evidence.tests);
+  const artifacts = asArray(evidence.artifacts);
+  const approvals = asArray(evidence.approvals);
+  const changedPaths = asArray(diff.changed_paths);
+  const overview = createElement("div", "ai-infra-grid review-evidence-overview");
+  for (const [label, value] of [
+    ["Status", terminal.status || "unknown"],
+    ["Outcome", terminal.substatus || terminal.worker_status || "unreported"],
+    ["Process", terminal.process_state || "unreported"],
+    ["Changed", String(changedPaths.length)],
+    ["Tests", `${tests.filter((item) => item && item.ok).length}/${tests.length} passed`],
+    ["Artifacts", String(artifacts.length)],
+    ["Approvals", String(approvals.length)],
+  ]) {
+    const item = createElement("div", "ai-infra-item");
+    item.append(createElement("span", "ai-infra-label", label), createElement("strong", "", value));
+    overview.appendChild(item);
+  }
+
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(overview);
+  if (terminal.error) {
+    const error = createElement("section", "review-evidence-section evidence-error");
+    error.append(createElement("h4", "", "Terminal error"), createElement("p", "", terminal.error));
+    fragment.appendChild(error);
+  }
+  const hashes = diff.changed_path_hashes && typeof diff.changed_path_hashes === "object"
+    ? diff.changed_path_hashes
+    : {};
+  appendEvidenceList(fragment, "Changed paths", changedPaths.map((path) => {
+    const hash = hashes[path] ? ` · ${String(hashes[path]).slice(0, 12)}` : "";
+    return `${path}${hash}`;
+  }));
+  if (tests.length) {
+    const section = createElement("section", "review-evidence-section");
+    section.appendChild(createElement("h4", "", "Validation"));
+    const list = createElement("ul", "review-evidence-list");
+    for (const test of tests) {
+      if (!test || typeof test !== "object") continue;
+      const row = createElement("li", test.ok ? "evidence-pass" : "evidence-fail");
+      row.append(
+        createElement("strong", "", test.ok ? "Passed" : "Failed"),
+        createElement("span", "", test.command || "unnamed check"),
+      );
+      if (test.summary) row.appendChild(createElement("small", "", test.summary));
+      list.appendChild(row);
+    }
+    section.appendChild(list);
+    fragment.appendChild(section);
+  }
+  appendEvidenceList(fragment, "Artifacts", artifacts);
+  if (approvals.length) {
+    const section = createElement("section", "review-evidence-section");
+    section.appendChild(createElement("h4", "", "Approval history"));
+    const list = createElement("ul", "review-evidence-list");
+    for (const approval of approvals) {
+      if (!approval || typeof approval !== "object") continue;
+      const transition = [approval.from_state, approval.to_state].filter(Boolean).join(" → ");
+      const row = createElement("li", "");
+      row.append(
+        createElement("strong", "", approval.event || "event"),
+        createElement("span", "", transition || approval.actor || "recorded"),
+      );
+      if (approval.reason) row.appendChild(createElement("small", "", approval.reason));
+      list.appendChild(row);
+    }
+    section.appendChild(list);
+    fragment.appendChild(section);
+  }
+  const summary = evidence.logs && evidence.logs.result_summary;
+  if (summary) {
+    const section = createElement("section", "review-evidence-section");
+    section.append(createElement("h4", "", "Result summary"), createElement("p", "", summary));
+    fragment.appendChild(section);
+  }
+  elements.detailEvidence.replaceChildren(fragment);
+  elements.detailEvidenceBlock.hidden = false;
+}
+
 function renderTaskDetail(card) {
   const status = canonicalStatus(card);
   elements.detailHeading.textContent = card.task_id || state.selectedTaskId;
@@ -1545,6 +1648,7 @@ function renderTaskDetail(card) {
   elements.detailValidation.className = `validation-label ${validationClass(validation)}`;
   elements.detailResult.textContent = resultPayload(card);
   renderAiInfra(card);
+  renderReviewEvidence(card.review_evidence_bundle);
 
   const allowedWrites = asArray(card.allowed_writes);
   elements.detailWritesBlock.hidden = allowedWrites.length === 0;

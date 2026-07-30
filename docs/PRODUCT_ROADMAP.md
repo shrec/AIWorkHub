@@ -224,6 +224,12 @@ Pagination, task/model/status/time filters, bounded default payloads, recent
 terminal summary, stale-processing recovery, bulk-safe review navigation, and
 clear evidence completeness.
 
+**0.8.0 closure:** the repository-bound inbox provides bounded pagination and
+filters, recent terminal/callback summaries and a portable task-detail evidence
+bundle. The bundle derives diff identity, tests, required outputs, artifacts,
+numeric usage and approval history from canonical stores while excluding raw
+logs and redacting host-local paths and obvious credential assignments.
+
 ### Visual DAG and planner
 
 Display dependencies, blocked reasons, write collisions, critical path,

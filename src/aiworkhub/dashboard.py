@@ -48,6 +48,14 @@ _LIST_LINE_RE = re.compile(
     r"(?:\s+outcome=(?P<outcome>\S+))?\s*$"
 )
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+_PORTABLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_HOST_PATH_IN_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|/)[^\s\"'`<>]+"
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|credential|password|secret|token)"
+    r"\s*([:=])\s*([^\s,;]+)"
+)
 _PROCESS_RUN_FIELDS = {
     "request_id",
     "task_id",
@@ -71,6 +79,34 @@ _PROCESS_RUN_FIELDS = {
     "usage_recorded",
     "usage_error",
 }
+
+
+def _portable_text(value: Any, limit: int) -> str:
+    """Return bounded review text without host paths or obvious secrets.
+
+    Evidence bundles are intended to move between machines.  They therefore
+    retain useful summaries and commands, but never preserve host-local
+    absolute paths or credential assignments copied from provider output.
+    """
+    text = _PORTABLE_CONTROL_RE.sub("", str(value or ""))
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
+    text = _HOST_PATH_IN_TEXT_RE.sub("<host-path>", text)
+    return text[: max(0, int(limit))]
+
+
+def _portable_path(value: Any, limit: int = 500) -> str:
+    text = _PORTABLE_CONTROL_RE.sub("", str(value or "")).strip()
+    if text.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", text):
+        name = re.split(r"[\\/]", text.rstrip("/\\"))[-1]
+        text = f"<host-path>/{name}" if name else "<host-path>"
+    return text[: max(0, int(limit))]
+
+
+def _bounded_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -709,6 +745,9 @@ class DashboardProvider:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         return task_store.get_task(self.repo_root, task_id)
 
+    def get_task_events(self, task_id: str) -> list[dict[str, Any]]:
+        return task_store.get_task_events(self.repo_root, task_id)
+
     def get_completion_inbox(self) -> dict[str, Any]:
         review_rows = task_store.list_tasks(self.repo_root, status="review", limit=self.task_limit)
         processing_rows = task_store.list_tasks(self.repo_root, status="processing", limit=self.task_limit)
@@ -1256,8 +1295,11 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
     archived_at = str(card.get("archived_at") or "").strip()
     result["task"]["archived_at"] = archived_at
     terminal_review = card.get("terminal_review")
+    terminal_evidence: Mapping[str, Any] = {}
     if isinstance(terminal_review, Mapping):
         evidence = terminal_review.get("evidence")
+        if isinstance(evidence, Mapping):
+            terminal_evidence = evidence
         quality = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
         if isinstance(quality, Mapping):
             result["task"]["quality_gate"] = {
@@ -1285,6 +1327,7 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
         process_report = process_reader()
     except Exception:
         process_report = {}
+    selected_process: Mapping[str, Any] = {}
     if isinstance(process_report, Mapping):
         for row in process_report.get("processes") or []:
             if not isinstance(row, Mapping) or str(row.get("task_id") or "") != task_id:
@@ -1295,5 +1338,149 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
                 result["task"]["adapter_id"] = str(row["adapter_id"])[:120]
             if row.get("ai_infra_context"):
                 result["task"]["ai_infra_context"] = row["ai_infra_context"]
+            selected_process = row
             break
+
+    event_reader = getattr(data_provider, "get_task_events", lambda _task_id: [])
+    try:
+        raw_events = event_reader(task_id)
+    except Exception:
+        raw_events = []
+    events = [item for item in raw_events if isinstance(item, Mapping)][-100:]
+    changed_hashes = terminal_evidence.get("changed_path_hashes")
+    if not isinstance(changed_hashes, Mapping):
+        changed_hashes = {}
+    validations = terminal_evidence.get("validation")
+    if not isinstance(validations, list):
+        validations = []
+    required_outputs = terminal_evidence.get("required_outputs")
+    if not isinstance(required_outputs, list):
+        required_outputs = []
+    validation_summary = [
+        {
+            "command": _portable_text(item.get("command") or item.get("check_id"), 500),
+            "ok": bool(item.get("ok", item.get("passed", False))),
+            "returncode": item.get("returncode"),
+            "summary": _portable_text(
+                item.get("summary") or item.get("stderr") or item.get("stdout") or "",
+                1000,
+            ),
+        }
+        for item in validations[:200]
+        if isinstance(item, Mapping)
+    ]
+    required_output_summary = [
+        {
+            "path": _portable_path(item.get("path")),
+            "sha256": str(item.get("sha256") or "")[:128],
+            "bytes": _bounded_int(item.get("bytes") or item.get("size")),
+            "unchanged_allowed": bool(item.get("unchanged_allowed")),
+        }
+        if isinstance(item, Mapping)
+        else {"path": _portable_path(item)}
+        for item in required_outputs[:200]
+    ]
+    artifact_values: list[str] = []
+    for source in (
+        card.get("artifacts"),
+        card.get("artifact_paths"),
+        card.get("required_outputs"),
+        terminal_evidence.get("artifacts"),
+        terminal_evidence.get("artifact_paths"),
+    ):
+        values = source if isinstance(source, list) else [source] if isinstance(source, str) else []
+        for value in values:
+            if isinstance(value, Mapping):
+                value = value.get("path") or value.get("artifact") or ""
+            text = _portable_path(value)
+            if text and text not in artifact_values:
+                artifact_values.append(text)
+    approval_history: list[dict[str, Any]] = []
+    for item in events:
+        event_name = str(item.get("event") or item.get("action") or "").strip()
+        if not event_name:
+            continue
+        payload = item.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        approval_history.append(
+            {
+                "event": event_name[:80],
+                "timestamp": str(item.get("timestamp") or item.get("created_at") or "")[:80],
+                "actor": str(item.get("runner") or payload.get("actor") or "")[:120],
+                "from_state": str(item.get("from_state") or payload.get("from_state") or "")[:80],
+                "to_state": str(item.get("to_state") or payload.get("to_state") or "")[:80],
+                "reason": _portable_text(
+                    item.get("reason")
+                    or item.get("error")
+                    or payload.get("reason")
+                    or payload.get("error"),
+                    300,
+                ),
+            }
+        )
+    result["task"]["review_evidence_bundle"] = {
+        "schema_id": "aiworkhub.review_evidence_bundle.v1",
+        "task_id": task_id,
+        "generated_at": result["generated_at"],
+        "terminal": {
+            "status": str(card.get("status") or "")[:80],
+            "worker_status": str(card.get("worker_status") or "")[:80],
+            "substatus": str(
+                card.get("terminal_substatus")
+                or (terminal_review.get("substatus") if isinstance(terminal_review, Mapping) else "")
+                or ""
+            )[:120],
+            "process_state": str(selected_process.get("state") or "")[:80],
+            "exit_code": selected_process.get("exit_code"),
+            "error": str(
+                _portable_text(
+                    terminal_evidence.get("error") or selected_process.get("error"), 500
+                )
+            ),
+        },
+        "diff": {
+            "changed_paths": [
+                _portable_path(value)
+                for value in (
+                    terminal_evidence.get("changed_paths")
+                    if isinstance(terminal_evidence.get("changed_paths"), list)
+                    else []
+                )[:500]
+            ],
+            "changed_path_hashes": {
+                _portable_path(key): str(value)[:128]
+                for key, value in list(changed_hashes.items())[:500]
+            },
+            "promoted_paths": [
+                _portable_path(value)
+                for value in (
+                    terminal_evidence.get("promoted_paths")
+                    if isinstance(terminal_evidence.get("promoted_paths"), list)
+                    else []
+                )[:500]
+            ],
+        },
+        "tests": validation_summary,
+        "required_outputs": required_output_summary,
+        "logs": {
+            "result_summary": _portable_text(
+                card.get("completion_summary") or card.get("review_summary"), 2000
+            ),
+            "usage": {
+                str(key)[:80]: value
+                for key, value in list((selected_process.get("usage") or {}).items())[:80]
+                if isinstance(value, (bool, int, float))
+            }
+            if isinstance(selected_process.get("usage"), Mapping)
+            else {},
+        },
+        "artifacts": artifact_values[:500],
+        "approvals": approval_history,
+    }
     return result

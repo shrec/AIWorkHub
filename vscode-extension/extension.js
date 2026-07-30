@@ -4631,6 +4631,10 @@ function getHtmlForWebview(webview, extensionUri) {
               <h3>AI context</h3>
               <div class="ai-infra-grid" id="detail-ai-infra"></div>
             </div>
+            <details class="result-block" id="detail-evidence-block" hidden>
+              <summary>Portable review evidence</summary>
+              <div class="review-evidence" id="detail-evidence"></div>
+            </details>
             <div class="result-block" id="detail-writes-block">
               <h3>Allowed writes</h3>
               <ul class="path-list" id="detail-writes"></ul>

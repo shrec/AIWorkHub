@@ -722,3 +722,108 @@ def test_task_detail_uses_actual_process_model_and_adapter():
     assert detail is not None
     assert detail["task"]["model"] == "deepseek-v4-pro"
     assert detail["task"]["adapter_id"] == "deepseek_copilot_cli"
+
+
+def test_task_detail_builds_bounded_portable_review_evidence_bundle():
+    class EvidenceProvider:
+        def get_task(self, task_id):
+            assert task_id == "TASK_REVIEW_EVIDENCE_B13_V1"
+            return {
+                "task_id": task_id,
+                "status": "review",
+                "worker_status": "review",
+                "completion_summary": (
+                    "validated /home/shrek/private/result.json token=super-secret-value"
+                ),
+                "artifacts": [
+                    "eval/evidence.json",
+                    "/home/shrek/private/raw-output.json",
+                ],
+                "terminal_review": {
+                    "substatus": "review_ready",
+                    "evidence": {
+                        "changed_paths": ["src/aiworkhub/dashboard.py"],
+                        "changed_path_hashes": {"src/aiworkhub/dashboard.py": "a" * 64},
+                        "promoted_paths": ["src/aiworkhub/dashboard.py"],
+                        "validation": [
+                            {
+                                "command": "python /home/shrek/private/check.py",
+                                "ok": True,
+                                "returncode": 0,
+                                "summary": "passed password=hunter2",
+                            }
+                        ],
+                        "required_outputs": [
+                            {
+                                "path": "eval/evidence.json",
+                                "sha256": "b" * 64,
+                                "bytes": 42,
+                            }
+                        ],
+                        "error": "",
+                    },
+                },
+            }
+
+        def get_agent_processes(self):
+            return {
+                "ok": True,
+                "processes": [
+                    {
+                        "task_id": "TASK_REVIEW_EVIDENCE_B13_V1",
+                        "state": "completed",
+                        "exit_code": 0,
+                        "stdout_path": "/home/shrek/private/stdout.jsonl",
+                        "stderr_path": "/home/shrek/private/stderr.log",
+                        "usage": {"input_tokens": 12, "output_tokens": 5},
+                    }
+                ],
+            }
+
+        def get_task_events(self, task_id):
+            assert task_id == "TASK_REVIEW_EVIDENCE_B13_V1"
+            return [
+                {
+                    "event": "terminal_review",
+                    "runner": "runner_b13",
+                    "created_at": "2026-07-30T13:00:00+00:00",
+                    "payload": json.dumps(
+                        {
+                            "from_state": "processing",
+                            "to_state": "review",
+                            "reason": "ready /home/shrek/private/task.json",
+                        }
+                    ),
+                }
+            ]
+
+    detail = dashboard.build_task_detail(
+        "TASK_REVIEW_EVIDENCE_B13_V1", EvidenceProvider()
+    )
+    assert detail is not None
+    bundle = detail["task"]["review_evidence_bundle"]
+    assert bundle["schema_id"] == "aiworkhub.review_evidence_bundle.v1"
+    assert bundle["terminal"]["substatus"] == "review_ready"
+    assert bundle["diff"]["changed_paths"] == ["src/aiworkhub/dashboard.py"]
+    assert bundle["tests"][0]["ok"] is True
+    assert bundle["tests"][0]["command"] == "python <host-path>"
+    assert bundle["tests"][0]["summary"] == "passed password=<redacted>"
+    assert bundle["required_outputs"][0]["bytes"] == 42
+    assert bundle["artifacts"] == [
+        "eval/evidence.json",
+        "<host-path>/raw-output.json",
+    ]
+    assert bundle["approvals"][0] == {
+        "event": "terminal_review",
+        "timestamp": "2026-07-30T13:00:00+00:00",
+        "actor": "runner_b13",
+        "from_state": "processing",
+        "to_state": "review",
+        "reason": "ready <host-path>",
+    }
+    serialized = json.dumps(bundle, sort_keys=True)
+    assert "/home/shrek" not in serialized
+    assert "super-secret-value" not in serialized
+    assert "hunter2" not in serialized
+    assert "stdout_path" not in serialized
+    assert "stderr_path" not in serialized

@@ -1178,6 +1178,69 @@ tbody tr.is-selected td:first-child {
   font-size: 9px;
 }
 
+.review-evidence {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.review-evidence-overview {
+  margin: 0;
+}
+
+.review-evidence-section {
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.review-evidence-section h4 {
+  margin: 0 0 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.review-evidence-section p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-evidence-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-evidence-list li {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editor-background);
+  overflow-wrap: anywhere;
+}
+
+.review-evidence-list li small {
+  grid-column: 1 / -1;
+  color: var(--vscode-descriptionForeground);
+}
+
+.review-evidence-list .evidence-pass strong {
+  color: var(--vscode-testing-iconPassed);
+}
+
+.review-evidence-list .evidence-fail strong,
+.evidence-error {
+  color: var(--vscode-testing-iconFailed);
+}
+
 .tabs-heading {
   display: block;
   padding-bottom: 0;

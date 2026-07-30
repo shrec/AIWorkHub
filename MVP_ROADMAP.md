@@ -98,8 +98,17 @@ do not override this current priority ledger.
       nodes plus exact dependency/blocker labels. Canonical local evidence:
       task-plan/core/dashboard tests (`45 passed`), complete Python suite
       (`1469 passed, 18 skipped`) and complete extension suite on 2026-07-30.
-- [ ] Review Inbox 2.0: pagination, bounded filters, terminal summaries and a
+- [x] Review Inbox 2.0: pagination, bounded filters, terminal summaries and a
       portable evidence bundle (diff, tests, logs, artifacts, approvals).
+      The existing repository-bound inbox keeps bounded pages, filter state,
+      recent terminal outcomes and callback-delivery observability. Task detail
+      now projects `aiworkhub.review_evidence_bundle.v1` from canonical task,
+      process and audit sources: portable diff identities, validation summaries,
+      required outputs, artifacts, numeric usage and approval history. Host-local
+      paths, raw process logs and obvious credential assignments are excluded or
+      redacted. Canonical local evidence: dashboard/task/process tests (`40
+      passed`), complete Python suite (`1470 passed, 18 skipped`) and complete
+      extension suite on 2026-07-30.
 - [ ] Unified environment/provider preflight and repo-local Policy-as-Code for
       provider scope, forbidden commands, required validation and retention.
 - [ ] Manager-editable model workforce inventory/scoring based on observed task
