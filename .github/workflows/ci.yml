@@ -18,12 +18,16 @@ concurrency:
 
 jobs:
   cross-platform:
-    name: Cross-platform (${{ matrix.os }})
+    name: Fresh install (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - { name: linux, os: ubuntu-latest, mode: local }
+          - { name: remote-ssh-contract, os: ubuntu-latest, mode: remote_ssh_contract }
+          - { name: windows, os: windows-latest, mode: local }
+          - { name: macos, os: macos-latest, mode: local }
 
     steps:
       - uses: actions/checkout@v4
@@ -36,16 +40,23 @@ jobs:
           python-version: "3.12"
 
       - name: Install and qualify cross-platform Python runtime
+        env:
+          AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -e .
+          python -m pip install .
           python -m pip install "pytest>=8,<10"
-          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py -q --tb=short
+          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Set up Go for native Windows callback launchers
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
 
       - name: Install extension dependencies
         run: npm install
@@ -54,6 +65,19 @@ jobs:
       - name: Run extension tests
         run: npm test
         working-directory: vscode-extension
+
+      - name: Package fresh VSIX
+        run: npm run package
+        working-directory: vscode-extension
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-${{ matrix.name }}
+          path: |
+            qualification-${{ matrix.name }}.xml
+            vscode-extension/dist/aiworkhub-*.vsix
+          if-no-files-found: error
 
   python-ci:
     name: Python (3.10–3.12)

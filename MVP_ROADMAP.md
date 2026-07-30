@@ -48,6 +48,9 @@ do not override this current priority ledger.
       Remote-SSH, Windows and macOS: install, InitRepo, MCP registration,
       first index, worker launch, terminal review, callback, acceptance,
       reload/restart recovery and repository isolation.
+      The portable lifecycle harness and four-lane GitHub matrix are now in
+      place; keep this gate open until the pushed Linux, Remote-SSH contract,
+      Windows and macOS runs all publish green evidence artifacts.
 - [ ] Cut the next stable release only after the matrix is green and the
       bundled runtime/extension/source version hashes agree.
 
