@@ -436,6 +436,30 @@ def test_accept_review_fails_closed_on_stale_immutable_input(
     assert card["worker_status"] == "review"
 
 
+def test_accept_review_fails_closed_on_stale_verification_claim_epoch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    card["claim_epoch"] = 4
+    card["deterministic_verification"] = {
+        "applicable": True,
+        "pass": True,
+        "claim_epoch": 3,
+    }
+
+    result = manager.accept_review(request_id, task_id)
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "deterministic_verification_claim_epoch_mismatch:expected=4:observed=3"
+    )
+    assert promote_calls == []
+    assert accept_review_calls == []
+
+
 def test_accept_review_promotes_exactly_once_when_input_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

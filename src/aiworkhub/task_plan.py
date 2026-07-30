@@ -286,6 +286,12 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if active_candidates:
             critical_path = max(active_candidates, key=lambda value: (len(value), value))
 
+    dependency_blocked_ids = sorted(tid for tid, value in blockers.items() if value)
+    lifecycle_blocked_ids = sorted(
+        tid for tid, value in lifecycle.items() if value == "blocked"
+    )
+    blocked_task_ids = sorted(set(dependency_blocked_ids) | set(lifecycle_blocked_ids))
+
     return {
         "task_ids": sorted(by_id),
         "lifecycle": lifecycle,
@@ -297,7 +303,14 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "ready": ready,
         "ready_capacity": len(ready),
         "active_count": sum(1 for value in lifecycle.values() if value != "finished"),
-        "blocked_count": len([tid for tid, value in blockers.items() if value]),
+        # Backward-compatible total: callers that historically consumed
+        # ``blocked_count`` now see every blocked task, not only DAG edges.
+        "blocked_count": len(blocked_task_ids),
+        "blocked_task_ids": blocked_task_ids,
+        "dependency_blocked_count": len(dependency_blocked_ids),
+        "dependency_blocked_task_ids": dependency_blocked_ids,
+        "lifecycle_blocked_count": len(lifecycle_blocked_ids),
+        "lifecycle_blocked_task_ids": lifecycle_blocked_ids,
         "edge_count": sum(len(value) for value in dependencies.values()),
         "layers": layers,
         "critical_path": critical_path,

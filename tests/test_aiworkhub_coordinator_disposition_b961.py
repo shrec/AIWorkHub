@@ -97,11 +97,22 @@ def test_reject_to_pending_requeues_for_rework(coord):
 
 
 def test_reject_to_blocked_parks_as_blocked(coord):
-    _insert(coord, "T_BLOCK")
+    _insert(
+        coord,
+        "T_BLOCK",
+        card={
+            "claim_epoch": 3,
+            "terminal_review": {"substatus": "review_ready"},
+            "deterministic_verification": {"pass": True, "claim_epoch": 3},
+        },
+    )
     res = core.reject_review("T_BLOCK", "needs external input", to="blocked")
     assert res["ok"] is True, res
     row = _row(coord, "T_BLOCK")
     assert row["status"] == "blocked" and row["worker_status"] == "blocked"
+    card = json.loads(row["card_json"])
+    assert "deterministic_verification" not in card
+    assert "terminal_review" not in card
 
 
 def test_reject_to_archived_retires_atomically(coord):

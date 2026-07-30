@@ -3026,10 +3026,16 @@ def reject_review(
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
-        set_clause = "worker_status='blocked', status='blocked', updated_at=?"
+        card.update(status="blocked", worker_status="blocked")
+        set_clause = "worker_status='blocked', status='blocked', card_json=?, updated_at=?"
     else:  # "pending" -- rework, requeue for a fresh claim
-        set_clause = "worker_status='unclaimed', status='pending', claimed_by=NULL, updated_at=?"
+        card.update(status="pending", worker_status="unclaimed", claimed_by=None)
+        set_clause = (
+            "worker_status='unclaimed', status='pending', claimed_by=NULL, "
+            "card_json=?, updated_at=?"
+        )
     try:
         conn = _canonical_connect()
     except task_store.TaskStoreError as exc:
@@ -3037,7 +3043,7 @@ def reject_review(
     try:
         cur = conn.execute(
             f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review'",
-            (now, task_id),
+            (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -3050,7 +3056,16 @@ def reject_review(
                 task_id,
                 "reject_review",
                 CODEX_RUNNER,
-                json.dumps({"topic": live_topic, "reason": reason, "to": disposition}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "topic": live_topic,
+                        "reason": reason,
+                        "to": disposition,
+                        "prior_episode": prior_episode,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 now,
             ),
         )

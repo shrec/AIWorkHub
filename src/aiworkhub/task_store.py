@@ -864,10 +864,15 @@ def mark_terminal_review(
         if not isinstance(card, dict):
             card = {}
         evidence_payload = dict(evidence or {})
+        try:
+            claim_epoch = max(0, int(card.get("claim_epoch") or 0))
+        except (TypeError, ValueError):
+            claim_epoch = 0
         deterministic_verification = task_fsm.deterministic_verification(
             substatus,
             evidence_payload.get("validation"),
             evidence_payload.get("required_outputs"),
+            claim_epoch=claim_epoch,
         )
         terminal = {
             "substatus": substatus[:120],
@@ -875,6 +880,7 @@ def mark_terminal_review(
             "deterministic_verification": deterministic_verification,
             "recorded_at": now,
             "runner": runner,
+            "claim_epoch": claim_epoch,
         }
         card["terminal_review"] = terminal
         card["terminal_substatus"] = terminal["substatus"]

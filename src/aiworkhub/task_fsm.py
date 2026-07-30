@@ -145,6 +145,8 @@ def deterministic_verification(
     substatus: str,
     validations: list[Mapping[str, object]] | None,
     required_output_records: list[Mapping[str, object]] | None,
+    *,
+    claim_epoch: int = 0,
 ) -> dict[str, object]:
     """Deterministic, fail-closed pass/fail record for one terminal outcome.
 
@@ -158,6 +160,10 @@ def deterministic_verification(
     validations = list(validations or [])
     required_output_records = list(required_output_records or [])
     verdict = evidence_verdict(validations, required_output_records)
+    try:
+        epoch = max(0, int(claim_epoch))
+    except (TypeError, ValueError):
+        epoch = 0
 
     if substatus not in KNOWN_TERMINAL_SUBSTATUSES:
         return {
@@ -165,6 +171,7 @@ def deterministic_verification(
             "pass": False,
             "substatus": substatus,
             "reason": "unknown_substatus",
+            "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
 
@@ -174,6 +181,7 @@ def deterministic_verification(
             "pass": False,
             "substatus": substatus,
             "reason": "known_failure_substatus",
+            "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
 
@@ -183,6 +191,7 @@ def deterministic_verification(
             "pass": False,
             "substatus": substatus,
             "reason": "no_gates_recorded",
+            "claim_epoch": epoch,
             "evidence_verdict": verdict,
         }
 
@@ -191,6 +200,7 @@ def deterministic_verification(
         "pass": bool(verdict["passed"]),
         "substatus": substatus,
         "reason": "evidence_verdict_passed" if verdict["passed"] else "evidence_verdict_failed",
+        "claim_epoch": epoch,
         "evidence_verdict": verdict,
     }
 

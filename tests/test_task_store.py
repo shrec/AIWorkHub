@@ -249,6 +249,8 @@ def test_mark_terminal_review_review_ready_passes_only_with_clean_evidence(
     verification = card["deterministic_verification"]
     assert verification["applicable"] is True
     assert verification["pass"] is True
+    assert verification["claim_epoch"] == 0
+    assert card["terminal_review"]["claim_epoch"] == 0
 
 
 def test_mark_terminal_review_review_ready_fails_on_none_returncode(

@@ -871,7 +871,9 @@ function renderPlanDag(snapshot) {
     ["Nodes", formatCount(plan.task_ids.length)],
     ["Edges", formatCount(plan.edge_count)],
     ["Ready capacity", formatCount(plan.ready_capacity)],
-    ["Blocked", formatCount(plan.blocked_count)],
+    ["Blocked total", formatCount(plan.blocked_count)],
+    ["DAG-blocked", formatCount(plan.dependency_blocked_count)],
+    ["Lifecycle-blocked", formatCount(plan.lifecycle_blocked_count)],
     ["Critical path", formatCount(plan.critical_path_length)],
     ["DAG valid", plan.dag_valid ? "yes" : "no"],
   ]) {

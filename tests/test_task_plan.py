@@ -122,6 +122,8 @@ def test_snapshot_projects_layers_and_current_critical_path():
     assert snap["edge_count"] == 3
     assert snap["active_count"] == 3
     assert snap["blocked_count"] == 1
+    assert snap["dependency_blocked_count"] == 1
+    assert snap["lifecycle_blocked_count"] == 0
     assert snap["layers"] == [
         {"index": 0, "task_ids": ["root"]},
         {"index": 1, "task_ids": ["left", "right"]},
@@ -129,6 +131,23 @@ def test_snapshot_projects_layers_and_current_critical_path():
     ]
     assert snap["critical_path"] == ["root", "left", "leaf"]
     assert snap["critical_path_length"] == 3
+
+
+def test_snapshot_blocked_count_includes_lifecycle_and_names_dag_subset():
+    cards = [
+        _card("lifecycle", status="blocked", worker_status="blocked"),
+        _card("dependency", depends_on=["unfinished"]),
+        _card("unfinished", status="processing", worker_status="claimed"),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["blocked_count"] == 2
+    assert snap["blocked_task_ids"] == ["dependency", "lifecycle"]
+    assert snap["dependency_blocked_count"] == 1
+    assert snap["dependency_blocked_task_ids"] == ["dependency"]
+    assert snap["lifecycle_blocked_count"] == 1
+    assert snap["lifecycle_blocked_task_ids"] == ["lifecycle"]
 
 
 def test_snapshot_legacy_cycle_is_visible_and_has_no_fabricated_critical_path():

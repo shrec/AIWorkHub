@@ -213,8 +213,13 @@ do not override this current priority ledger.
             evidence: focused ledger/supervisor/launcher/retention regression
             (`37 passed`), complete Python suite (`1530 passed, 18 skipped`)
             and complete 24-file extension suite on 2026-07-30.
-      - [ ] Bind deterministic verification to claim epoch and separate DAG-
-            dependency blocking from lifecycle-blocked counts.
+      - [x] Bind deterministic verification and terminal evidence to the exact
+            claim epoch, clear episode-local verdicts on reject/block/re-claim,
+            and fail manager acceptance on epoch mismatch. Plan DAG now reports
+            total, dependency and lifecycle blocked populations separately.
+            Canonical local evidence: focused lifecycle/plan/acceptance
+            regression (`100 passed`), complete Python suite (`1532 passed,
+            18 skipped`) and complete 24-file extension suite on 2026-07-30.
       - [x] Discover and execute every extension `*.test.js` sequentially;
             CI no longer depends on a hand-maintained filename chain.
       - [ ] Add calibrated Ruff/type gates and close stale repository artifacts.

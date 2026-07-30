@@ -4329,6 +4329,19 @@ class ProcessManager:
                     "task_id": task_id,
                 }
             deterministic = card.get("deterministic_verification") or {}
+            if deterministic:
+                expected_epoch = str(card.get("claim_epoch") or 0)
+                observed_epoch = str(deterministic.get("claim_epoch") or 0)
+                if observed_epoch != expected_epoch:
+                    return {
+                        "ok": False,
+                        "error": (
+                            "deterministic_verification_claim_epoch_mismatch:"
+                            f"expected={expected_epoch}:observed={observed_epoch}"
+                        ),
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
             if deterministic.get("applicable") and not deterministic.get("pass"):
                 return {
                     "ok": False,

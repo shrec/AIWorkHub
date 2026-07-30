@@ -20,6 +20,11 @@ noted by package/extension version and release tag.
   complete rotated-segment storage accounting.
 - Added 16 MiB per-stream worker output bounds that retain the newest stdout
   and stderr tail and record dropped-byte evidence in supervisor status.
+- Added claim-epoch binding for deterministic verification and terminal review
+  evidence; stale verdicts are cleared on reject/re-claim and cannot authorize
+  acceptance from another execution episode.
+- Split Plan DAG blockage observability into total, dependency-blocked and
+  lifecycle-blocked counts and exact task-ID populations.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.

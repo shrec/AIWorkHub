@@ -247,6 +247,10 @@ rewritten after remediation.
   immutable segments are streamed and storage-accounted. Production worker
   stdout and stderr are independently bounded to a 16 MiB latest-tail file;
   truncation and dropped-byte counts are explicit supervisor evidence.
-- **Shared-worktree attribution/pruning, P2-6/P2-7 and
+- **P2-6/P2-7 closed:** deterministic verification and terminal review evidence
+  carry the exact claim epoch; episode-local truth is cleared on rejection and
+  acceptance fails closed on an epoch mismatch. Plan snapshots expose total,
+  DAG-dependency and lifecycle-blocked counts and IDs separately.
+- **Shared-worktree attribution/pruning and
   P3-9/P3-10 remain open** and are tracked in `MVP_ROADMAP.md` in
   operational-risk order.
