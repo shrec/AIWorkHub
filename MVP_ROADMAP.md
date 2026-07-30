@@ -60,9 +60,19 @@ do not override this current priority ledger.
 
 ### P1 — Context economy and orchestration UX
 
-- [ ] Source Graph language-complete first indexing (including PHP), automatic
+- [x] Source Graph language-complete first indexing (including PHP), automatic
       InitRepo indexing, bounded incremental file-change/periodic refresh,
       configurable generated/vendor/archive ignore rules and stale-index health.
+      Python AST, conservative PHP structural extraction and truthful JS/TS
+      file evidence are indexed on the first non-blocking InitRepo build; the
+      per-repository daemon performs non-overlapping incremental refreshes and
+      honors fail-closed repository-local ignore rules. Health now exposes
+      language capability/extension inventory, last-success age, a bounded
+      stale threshold and a non-green `stale` state. The formerly blanket-
+      skipped hosted-CI daemon lifecycle suite now uses deterministic build
+      completion synchronization and passes with `GITHUB_ACTIONS=true`.
+      Canonical local evidence: 65 focused Source Graph tests and the complete
+      suite (`1465 passed, 18 skipped`) on 2026-07-30.
 - [ ] Per-task tool-use telemetry: Source Graph calls/hits/zero-hits, bounded
       fallback reason, raw-discovery violations, bytes returned and conservative
       context-savings labels. Dashboard must distinguish measured bytes from

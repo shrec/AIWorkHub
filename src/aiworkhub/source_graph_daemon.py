@@ -41,6 +41,8 @@ from . import source_graph
 
 DEFAULT_REFRESH_INTERVAL_SECONDS = 300.0
 MIN_REFRESH_INTERVAL_SECONDS = 30.0
+DEFAULT_STALE_MULTIPLIER = 3.0
+MIN_STALE_AFTER_SECONDS = 120.0
 
 STATUS_STOPPED = "stopped"
 STATUS_INDEXING = "indexing"
@@ -48,6 +50,7 @@ STATUS_READY = "ready"
 STATUS_EMPTY = "empty"
 STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
+STATUS_STALE = "stale"
 
 
 def _utcnow() -> str:
@@ -68,10 +71,23 @@ class SourceGraphDaemon:
         repo_root: Path | str,
         *,
         refresh_interval_seconds: float = DEFAULT_REFRESH_INTERVAL_SECONDS,
+        stale_after_seconds: float | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.refresh_interval_seconds = max(
             MIN_REFRESH_INTERVAL_SECONDS, float(refresh_interval_seconds)
+        )
+        default_stale_after = max(
+            MIN_STALE_AFTER_SECONDS,
+            self.refresh_interval_seconds * DEFAULT_STALE_MULTIPLIER,
+        )
+        self.stale_after_seconds = max(
+            self.refresh_interval_seconds,
+            (
+                float(stale_after_seconds)
+                if stale_after_seconds is not None
+                else default_stale_after
+            ),
         )
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -83,7 +99,9 @@ class SourceGraphDaemon:
         self._last_report: dict[str, Any] | None = None
         self._last_error: str = ""
         self._last_run_at: str = ""
+        self._last_success_at: str = ""
         self._started_at: str = ""
+        self._build_completed = threading.Event()
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -145,6 +163,7 @@ class SourceGraphDaemon:
                     self._last_report = report.to_json()
                     self._last_error = ""
                     self._last_run_at = _utcnow()
+                    self._last_success_at = self._last_run_at
             except source_graph.SourceGraphBuildInProgressError:
                 # Another VS Code/MCP child owns this repository's writer
                 # lease. This process remains a healthy reader/standby and
@@ -160,6 +179,7 @@ class SourceGraphDaemon:
                     self._last_run_at = _utcnow()
             return True
         finally:
+            self._build_completed.set()
             self._build_lock.release()
 
     def _loop(self) -> None:
@@ -212,19 +232,56 @@ class SourceGraphDaemon:
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
         return {**health, "triggered": True}
 
+    def wait_for_first_build(self, *, timeout: float = 10.0) -> bool:
+        """Wait for the first build attempt without polling or sleeping.
+
+        This is primarily a deterministic lifecycle synchronization surface
+        for release qualification. It is also useful to callers that choose
+        to wait for initial indexing after the intentionally non-blocking
+        InitRepo call. Repeated calls remain idempotent once the event is set.
+        """
+
+        return self._build_completed.wait(timeout=max(0.0, float(timeout)))
+
     def health(self) -> dict[str, Any]:
         with self._state_lock:
+            running = self.is_running()
+            status = self._status
+            index_age_seconds: float | None = None
+            freshness_anchor = self._last_success_at or self._started_at
+            if freshness_anchor:
+                try:
+                    anchor = datetime.fromisoformat(freshness_anchor)
+                    index_age_seconds = max(
+                        0.0,
+                        (datetime.now(timezone.utc) - anchor).total_seconds(),
+                    )
+                except ValueError:
+                    index_age_seconds = None
+            stale = bool(
+                running
+                and status not in {STATUS_STOPPED, STATUS_DEGRADED}
+                and index_age_seconds is not None
+                and index_age_seconds > self.stale_after_seconds
+            )
+            reported_status = STATUS_STALE if stale else status
             return {
-                "ok": self._status != STATUS_DEGRADED,
-                "status": self._status,
-                "running": self.is_running(),
+                "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE},
+                "status": reported_status,
+                "running": running,
                 "repo_root": str(self.repo_root),
                 "refresh_interval_seconds": self.refresh_interval_seconds,
+                "stale_after_seconds": self.stale_after_seconds,
                 "started_at": self._started_at,
                 "last_run_at": self._last_run_at,
+                "last_success_at": self._last_success_at,
+                "index_age_seconds": index_age_seconds,
+                "stale_reason": "last_success_exceeded_threshold" if stale else "",
                 "last_report": self._last_report,
                 "last_error": self._last_error,
-                "writer_state": "standby" if self._status == STATUS_STANDBY else "active",
+                "writer_state": "standby" if status == STATUS_STANDBY else "active",
+                "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
+                "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
             }
 
 
@@ -302,10 +359,16 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "running": False,
             "repo_root": str(Path(repo_root).resolve()),
             "refresh_interval_seconds": None,
+            "stale_after_seconds": None,
             "started_at": "",
             "last_run_at": "",
+            "last_success_at": "",
+            "index_age_seconds": None,
+            "stale_reason": "",
             "last_report": None,
             "last_error": "",
+            "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
+            "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
             "registered": False,
         }
     out = daemon.health()
@@ -332,12 +395,15 @@ def refresh_now(repo_root: Path | str) -> dict[str, Any]:
 
 __all__ = [
     "DEFAULT_REFRESH_INTERVAL_SECONDS",
+    "DEFAULT_STALE_MULTIPLIER",
     "MIN_REFRESH_INTERVAL_SECONDS",
+    "MIN_STALE_AFTER_SECONDS",
     "STATUS_DEGRADED",
     "STATUS_EMPTY",
     "STATUS_INDEXING",
     "STATUS_READY",
     "STATUS_STANDBY",
+    "STATUS_STALE",
     "STATUS_STOPPED",
     "SourceGraphDaemon",
     "daemon_health",

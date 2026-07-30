@@ -254,6 +254,12 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS + sgast.PHP_EXTENSIONS
+LANGUAGE_CAPABILITIES: dict[str, str] = {
+    "python": "semantic_ast",
+    "php": "semantic_lexical",
+    "javascript": "file_evidence",
+    "typescript": "file_evidence",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,6 +948,7 @@ if __name__ == "__main__":
 __all__ = [
     "BUILD_REVISION",
     "INDEXED_EXTENSIONS",
+    "LANGUAGE_CAPABILITIES",
     "BuildReport",
     "MAX_BUDGET_ROWS",
     "MAX_COMPONENT_NODES",

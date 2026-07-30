@@ -13,9 +13,9 @@ rule) -- no test shares a canonical DB or daemon-registry key with another.
 
 from __future__ import annotations
 
-import os
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -31,11 +31,6 @@ from aiworkhub import core, repository_bootstrap, server, source_graph, source_g
 def cleanup_daemons():
     """Stop every daemon this test registered, even on failure -- a stray
     indexing thread from one test must never leak into the next."""
-    # Real source_graph daemon spawn/stop is timing-sensitive and flakes
-    # non-deterministically under hosted-CI load (passes in isolation and
-    # locally). Gate on hosted CI, mirroring the repo's Landlock/sandbox gating.
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        pytest.skip("real source_graph daemon lifecycle is timing-flaky under hosted-CI load")
     roots: list[Path] = []
     yield roots
     for root in roots:
@@ -75,19 +70,16 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
     assert daemon is not None
     assert daemon.is_running()
 
-    # Wait for the background first build to finish (bounded poll -- the
-    # call above must not itself have blocked on this).
-    for _ in range(200):
-        health = daemon.health()
-        if health["status"] in (source_graph_daemon.STATUS_READY, source_graph_daemon.STATUS_DEGRADED):
-            break
-        threading.Event().wait(0.05)
-    else:
-        pytest.fail("initial background build never completed")
+    # Wait on the daemon's build-completion event, not timing-sensitive
+    # sleep/poll loops. InitRepo itself remains non-blocking.
+    assert daemon.wait_for_first_build(timeout=10), "initial background build never completed"
+    health = daemon.health()
 
     assert health["status"] == source_graph_daemon.STATUS_READY
     assert health["last_report"]["files_seen"] == 1
     assert health["last_report"]["incremental"] is False
+    assert health["language_capabilities"]["php"] == "semantic_lexical"
+    assert ".php" in health["indexed_extensions"]
 
 
 def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
@@ -101,6 +93,43 @@ def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
     assert health["status"] == source_graph_daemon.STATUS_EMPTY
     assert health["last_report"]["files_seen"] == 0
     assert health["last_report"]["entities_written"] == 0
+
+
+def test_old_success_is_truthfully_stale_until_next_success(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    daemon = source_graph_daemon.SourceGraphDaemon(
+        root,
+        refresh_interval_seconds=source_graph_daemon.MIN_REFRESH_INTERVAL_SECONDS,
+        stale_after_seconds=source_graph_daemon.MIN_REFRESH_INTERVAL_SECONDS,
+    )
+    daemon._thread = threading.current_thread()
+    daemon._status = source_graph_daemon.STATUS_READY
+    daemon._started_at = datetime.now(timezone.utc).isoformat()
+    daemon._last_success_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=2)
+    ).isoformat()
+
+    stale = daemon.health()
+
+    assert stale["ok"] is False
+    assert stale["status"] == source_graph_daemon.STATUS_STALE
+    assert stale["stale_reason"] == "last_success_exceeded_threshold"
+    assert stale["index_age_seconds"] >= 119
+
+    def successful_build(repo_root, *, incremental=True, db_path=None):
+        return source_graph.BuildReport(
+            repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
+            files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
+            entities_written=1, edges_written=0, errors=[],
+            build_revision="test", finished_at="t",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", successful_build)
+    assert daemon._run_one_build() is True
+    fresh = daemon.health()
+    assert fresh["ok"] is True
+    assert fresh["status"] == source_graph_daemon.STATUS_READY
+    assert fresh["stale_reason"] == ""
 
 
 # ---------------------------------------------------------------------------
