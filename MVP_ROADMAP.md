@@ -179,6 +179,16 @@ do not override this current priority ledger.
       declared checks and destructive-diff guard as the deterministic floor;
       do not create a second review authority. See `docs/QUALITY_CONTROL.md`
       and ADR 0003.
+      - [x] Pure `aiworkhub.quality_verdict.v2` fold, monotonic risk profiles,
+            strict read-only reviewer schema, initial negative fixtures and
+            bounded dashboard lens/risk/verdict projection.
+      - [ ] Execute independent reviewer reports with verified provider/task
+            identity and anti-anchored evidence packets.
+      - [ ] Produce and enforce combined-tree differential evidence before
+            manager promotion for medium-and-higher risk tasks.
+      - [ ] Expand calibration to one positive and targeted negative fixture
+            for every blocking predicate and report false-green/false-red
+            rates across the platform matrix.
 - [ ] Split `core.py` and `process_launcher.py` along lifecycle, authority,
       review and context boundaries without changing public MCP contracts.
 - [ ] Modularize the VS Code extension in TypeScript with deterministic bundle

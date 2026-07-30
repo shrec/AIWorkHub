@@ -232,6 +232,16 @@ identity. `not_available` is never `passed`.
 review framework. The canonical contract is documented in
 [`QUALITY_CONTROL.md`](QUALITY_CONTROL.md) and ADR 0003.
 
+**Implemented foundation:** the existing engine now emits
+`aiworkhub.quality_verdict.v2`. One pure fold owns verdict status across all six
+lenses; model-supplied `PASS` fields are discarded. Monotonic risk resolution
+raises task requirements from declared/observed signals but never lets a worker
+lower them. Read-only reviewer reports use a bounded strict schema, missing
+required reviewer/combined-tree evidence fails closed, and the dashboard shows
+effective risk, verdict, refinement requirement and bounded lens status. The
+first positive/negative fixture matrix proves syntax and unavailable-required-
+check failures; full predicate calibration remains open.
+
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and
   requirements/scope. Models emit findings; no model computes PASS/FAIL.

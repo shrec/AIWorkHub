@@ -17,6 +17,9 @@ noted by package/extension version and release tag.
 - Added the Quality Gate 2.0 contract and ADR: six falsifiable lenses,
   deterministic verdict ownership, risk-proportional review, combined-tree
   verification and positive/negative gate calibration.
+- Added the first Quality Gate 2.0 runtime foundation: a pure six-lens verdict
+  fold, monotonic risk profiles, strict read-only reviewer evidence schema,
+  initial positive/negative fixtures and bounded dashboard verdict/lens status.
 - Added project acknowledgements with attribution to `kimi-atlas` for the
   quality-gate ideas that informed this direction.
 

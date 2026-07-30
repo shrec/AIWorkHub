@@ -74,6 +74,8 @@ assert.ok(ext.includes('const DISPLAY_NAME = "AIWorkHub"'));
 assert.ok(ext.includes('const PANEL_VIEW_TYPE = "aiworkhub.dashboard"'));
 assert.strictEqual((ext.match(/createWebviewPanel/g) || []).length, 1);
 assert.ok(ext.includes("registerWebviewPanelSerializer(PANEL_VIEW_TYPE"));
+assert.ok(app.includes('"Quality lenses",'));
+assert.ok(app.includes('["Refinement", verdict.refine_required ? "required" : "clear"]'));
 assert.ok(ext.includes("startup dispatcher activation failed"));
 assert.ok(ext.includes("ensureRepositoryCoordinatorCapability(root)"));
 assert.ok(ext.includes('path.join(root, ".aiworkhub", "runtime")'));

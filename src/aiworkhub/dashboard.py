@@ -1340,7 +1340,7 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
             terminal_evidence = evidence
         quality = evidence.get("quality_gate") if isinstance(evidence, Mapping) else None
         if isinstance(quality, Mapping):
-            result["task"]["quality_gate"] = {
+            quality_projection: dict[str, Any] = {
                 "schema_id": str(quality.get("schema_id") or "")[:100],
                 "passed": bool(quality.get("passed")),
                 "blocking_checks": [str(v)[:200] for v in (quality.get("blocking_checks") or [])[:40]],
@@ -1356,6 +1356,43 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
                     if isinstance(item, Mapping)
                 ],
             }
+            verdict = quality.get("quality_verdict")
+            if isinstance(verdict, Mapping):
+                risk = verdict.get("risk_profile")
+                quality_projection["quality_verdict"] = {
+                    "schema_id": str(verdict.get("schema_id") or "")[:100],
+                    "status": str(verdict.get("status") or "unverified")[:80],
+                    "passed": bool(verdict.get("passed")),
+                    "refine_required": bool(verdict.get("refine_required")),
+                    "risk_tier": (
+                        str(risk.get("effective_tier") or "unknown")[:40]
+                        if isinstance(risk, Mapping)
+                        else "unknown"
+                    ),
+                    "blocking_evidence": [
+                        str(value)[:200]
+                        for value in (verdict.get("blocking_evidence") or [])[:40]
+                    ],
+                    "lenses": [
+                        {
+                            "lens": str(item.get("lens") or "")[:80],
+                            "status": str(item.get("status") or "")[:80],
+                            "evidence_count": (
+                                len(item.get("evidence_ids"))
+                                if isinstance(item.get("evidence_ids"), list)
+                                else 0
+                            ),
+                            "finding_count": (
+                                len(item.get("finding_ids"))
+                                if isinstance(item.get("finding_ids"), list)
+                                else 0
+                            ),
+                        }
+                        for item in (verdict.get("lenses") or [])[:12]
+                        if isinstance(item, Mapping)
+                    ],
+                }
+            result["task"]["quality_gate"] = quality_projection
     process_reader = getattr(
         data_provider,
         "get_agent_processes",

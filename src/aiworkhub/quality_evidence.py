@@ -22,12 +22,108 @@ from typing import Any, Iterable, Mapping
 # ---------------------------------------------------------------------------
 
 SCHEMA_ID = "aiworkhub.quality_evidence.v1"
+VERDICT_SCHEMA_ID = "aiworkhub.quality_verdict.v2"
 
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_NOT_AVAILABLE = "not_available"
 STATUS_SKIPPED = "skipped"
 VALID_STATUSES = frozenset({STATUS_PASSED, STATUS_FAILED, STATUS_NOT_AVAILABLE, STATUS_SKIPPED})
+
+LENS_CORRECTNESS = "correctness"
+LENS_DOES_IT_RUN = "does_it_run"
+LENS_TEST_ADEQUACY = "test_adequacy"
+LENS_SECURITY = "security"
+LENS_CODE_QUALITY = "code_quality"
+LENS_REQUIREMENTS_SCOPE = "requirements_scope"
+QUALITY_LENSES = (
+    LENS_CORRECTNESS,
+    LENS_DOES_IT_RUN,
+    LENS_TEST_ADEQUACY,
+    LENS_SECURITY,
+    LENS_CODE_QUALITY,
+    LENS_REQUIREMENTS_SCOPE,
+)
+JUDGMENT_LENSES = frozenset({LENS_CORRECTNESS, LENS_SECURITY, LENS_CODE_QUALITY})
+
+SEVERITY_CRITICAL = "critical"
+SEVERITY_HIGH = "high"
+SEVERITY_MEDIUM = "medium"
+SEVERITY_LOW = "low"
+VALID_SEVERITIES = frozenset(
+    {SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
+)
+BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_HIGH})
+
+RISK_LOW = "low"
+RISK_MEDIUM = "medium"
+RISK_HIGH = "high"
+RISK_CRITICAL = "critical"
+RISK_TIERS = (RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL)
+_RISK_RANK = {tier: index for index, tier in enumerate(RISK_TIERS)}
+_RISK_SIGNAL_FLOORS = {
+    "public_api": RISK_MEDIUM,
+    "combined_change": RISK_MEDIUM,
+    "authority_boundary": RISK_HIGH,
+    "concurrency": RISK_HIGH,
+    "destructive_change": RISK_HIGH,
+    "schema_migration": RISK_HIGH,
+    "security_sensitive": RISK_HIGH,
+    "release": RISK_CRITICAL,
+}
+_RISK_PROFILES: dict[str, dict[str, Any]] = {
+    RISK_LOW: {
+        "required_reviewer_lenses": (),
+        "combined_tree_required": False,
+        "cross_provider_required": False,
+        "explicit_human_approval_required": False,
+    },
+    RISK_MEDIUM: {
+        "required_reviewer_lenses": (LENS_CORRECTNESS,),
+        "combined_tree_required": True,
+        "cross_provider_required": False,
+        "explicit_human_approval_required": False,
+    },
+    RISK_HIGH: {
+        "required_reviewer_lenses": (
+            LENS_CORRECTNESS,
+            LENS_SECURITY,
+            LENS_CODE_QUALITY,
+        ),
+        "combined_tree_required": True,
+        "cross_provider_required": True,
+        "explicit_human_approval_required": True,
+    },
+    RISK_CRITICAL: {
+        "required_reviewer_lenses": (
+            LENS_CORRECTNESS,
+            LENS_SECURITY,
+            LENS_CODE_QUALITY,
+        ),
+        "combined_tree_required": True,
+        "cross_provider_required": True,
+        "explicit_human_approval_required": True,
+    },
+}
+
+_CHECK_KIND_LENSES: dict[str, tuple[str, ...]] = {
+    "build": (LENS_DOES_IT_RUN,),
+    "test": (LENS_CORRECTNESS, LENS_DOES_IT_RUN, LENS_TEST_ADEQUACY),
+    "lint": (LENS_CODE_QUALITY,),
+    "typecheck": (LENS_CODE_QUALITY, LENS_CORRECTNESS),
+    "static_analysis": (LENS_CODE_QUALITY,),
+    "security": (LENS_SECURITY,),
+    "dependency": (LENS_SECURITY,),
+    "secret_scan": (LENS_SECURITY,),
+    "coverage": (LENS_TEST_ADEQUACY,),
+    "benchmark": (LENS_DOES_IT_RUN,),
+    "memory_safety": (LENS_SECURITY, LENS_CORRECTNESS),
+    "robustness": (LENS_CORRECTNESS, LENS_TEST_ADEQUACY),
+    "requirements": (LENS_REQUIREMENTS_SCOPE,),
+    "scope": (LENS_REQUIREMENTS_SCOPE,),
+}
+MAX_REVIEW_REPORTS = 12
+MAX_REVIEW_FINDINGS = 50
 
 CONFIG_RELATIVE_PATH = ".aiworkhub/quality.json"
 MAX_AFFECTED_PATHS = 200
@@ -136,6 +232,263 @@ class EvidenceCheck:
             "provenance": self.provenance,
             "error": self.error,
         }
+
+
+def resolve_risk_profile(
+    requested_tier: str = RISK_LOW,
+    *,
+    signals: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Return one monotonic, deterministic quality-risk profile.
+
+    A caller may request a stricter tier, but it cannot use ``requested_tier``
+    to lower the floor implied by observed signals. Unknown tiers/signals fail
+    closed instead of silently becoming low risk.
+    """
+
+    if requested_tier not in _RISK_RANK:
+        raise MalformedConfigError(f"unknown risk tier: {requested_tier!r}")
+    normalized_signals = tuple(sorted(dict.fromkeys(str(value) for value in signals)))
+    unknown = sorted(set(normalized_signals) - set(_RISK_SIGNAL_FLOORS))
+    if unknown:
+        raise MalformedConfigError("unknown risk signal(s): " + ",".join(unknown))
+    effective = requested_tier
+    for signal in normalized_signals:
+        floor = _RISK_SIGNAL_FLOORS[signal]
+        if _RISK_RANK[floor] > _RISK_RANK[effective]:
+            effective = floor
+    profile = dict(_RISK_PROFILES[effective])
+    profile.update(
+        {
+            "schema_id": VERDICT_SCHEMA_ID,
+            "requested_tier": requested_tier,
+            "effective_tier": effective,
+            "signals": list(normalized_signals),
+        }
+    )
+    profile["required_reviewer_lenses"] = list(profile["required_reviewer_lenses"])
+    return profile
+
+
+def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(check, EvidenceCheck):
+        return check.to_dict()
+    if not isinstance(check, Mapping):
+        raise MalformedConfigError("quality check must be an EvidenceCheck or mapping")
+    check_id = check.get("check_id")
+    kind = check.get("kind")
+    status = check.get("status")
+    if not isinstance(check_id, str) or not check_id.strip():
+        raise MalformedConfigError("quality check missing non-empty check_id")
+    if not isinstance(kind, str) or not kind.strip():
+        raise MalformedConfigError(f"quality check {check_id!r} missing kind")
+    if status not in VALID_STATUSES:
+        raise MalformedConfigError(f"quality check {check_id!r} has invalid status")
+    return {
+        "check_id": check_id,
+        "kind": kind,
+        "status": status,
+        "provenance": str(check.get("provenance") or "")[:MAX_SUMMARY_CHARS],
+    }
+
+
+def _normalize_reviewer_reports(
+    reports: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Normalize read-only reviewer evidence; never accept reviewer verdicts.
+
+    Reports carry findings only. Any supplied ``verdict``/``passed`` field is
+    ignored deliberately: final status belongs to :func:`fold_quality_verdict`.
+    Malformed reports become bounded schema blockers rather than exceptions.
+    """
+
+    normalized: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, report in enumerate(list(reports)[:MAX_REVIEW_REPORTS]):
+        if not isinstance(report, Mapping):
+            errors.append(f"reviewer_schema:{index}:not_object")
+            continue
+        lens = report.get("lens")
+        provider = report.get("provider")
+        findings = report.get("findings")
+        if lens not in JUDGMENT_LENSES:
+            errors.append(f"reviewer_schema:{index}:invalid_lens")
+            continue
+        if not isinstance(provider, str) or not provider.strip():
+            errors.append(f"reviewer_schema:{index}:provider_missing")
+            continue
+        if report.get("read_only") is not True or report.get("can_mutate_repo") is not False:
+            errors.append(f"reviewer_schema:{index}:not_read_only")
+            continue
+        if not isinstance(findings, list) or len(findings) > MAX_REVIEW_FINDINGS:
+            errors.append(f"reviewer_schema:{index}:findings_invalid")
+            continue
+        clean_findings: list[dict[str, str]] = []
+        malformed = False
+        for finding_index, finding in enumerate(findings):
+            if not isinstance(finding, Mapping):
+                errors.append(f"reviewer_schema:{index}:{finding_index}:not_object")
+                malformed = True
+                continue
+            severity = finding.get("severity")
+            finding_id = finding.get("id")
+            summary = finding.get("summary")
+            evidence = finding.get("evidence")
+            if severity not in VALID_SEVERITIES:
+                errors.append(f"reviewer_schema:{index}:{finding_index}:invalid_severity")
+                malformed = True
+                continue
+            if not isinstance(finding_id, str) or not finding_id.strip():
+                errors.append(f"reviewer_schema:{index}:{finding_index}:id_missing")
+                malformed = True
+                continue
+            if not isinstance(summary, str) or not summary.strip():
+                errors.append(f"reviewer_schema:{index}:{finding_index}:summary_missing")
+                malformed = True
+                continue
+            if not isinstance(evidence, str) or not evidence.strip():
+                errors.append(f"reviewer_schema:{index}:{finding_index}:evidence_missing")
+                malformed = True
+                continue
+            clean_findings.append(
+                {
+                    "id": finding_id[:200],
+                    "severity": str(severity),
+                    "summary": summary[:MAX_SUMMARY_CHARS],
+                    "evidence": evidence[:MAX_SUMMARY_CHARS],
+                }
+            )
+        if malformed:
+            continue
+        normalized.append(
+            {
+                "lens": str(lens),
+                "provider": provider.strip()[:200],
+                "read_only": True,
+                "can_mutate_repo": False,
+                "findings": clean_findings,
+            }
+        )
+    return normalized, errors
+
+
+def fold_quality_verdict(
+    checks: Iterable[EvidenceCheck | Mapping[str, Any]],
+    *,
+    risk_profile: Mapping[str, Any] | None = None,
+    reviewer_reports: Iterable[Mapping[str, Any]] = (),
+    combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
+    worker_provider: str = "",
+    config_error: str = "",
+) -> dict[str, Any]:
+    """Purely fold mechanical and reviewer evidence into one final verdict.
+
+    The function performs no I/O and trusts no model-supplied pass/fail field.
+    Blocking mechanical states, malformed reviewer evidence, missing required
+    lenses and required combined-tree failures all produce ``unverified``.
+    """
+
+    profile = dict(risk_profile or resolve_risk_profile())
+    effective_tier = profile.get("effective_tier")
+    if effective_tier not in _RISK_RANK:
+        raise MalformedConfigError("risk profile effective_tier invalid")
+    required_lenses = tuple(profile.get("required_reviewer_lenses") or ())
+    if any(lens not in JUDGMENT_LENSES for lens in required_lenses):
+        raise MalformedConfigError("risk profile contains invalid reviewer lens")
+
+    lens_rows = {
+        lens: {"lens": lens, "status": STATUS_SKIPPED, "evidence_ids": [], "finding_ids": []}
+        for lens in QUALITY_LENSES
+    }
+    blockers: list[str] = []
+    normalized_checks: list[dict[str, Any]] = []
+    try:
+        normalized_checks = [_check_payload(check) for check in checks]
+    except MalformedConfigError as exc:
+        blockers.append("mechanical_schema:" + str(exc)[:300])
+    for check in normalized_checks:
+        check_id = str(check["check_id"])
+        status = str(check["status"])
+        lenses = _CHECK_KIND_LENSES.get(str(check["kind"]), (LENS_CODE_QUALITY,))
+        for lens in lenses:
+            row = lens_rows[lens]
+            row["evidence_ids"].append(check_id)
+            if status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}:
+                row["status"] = status
+            elif status == STATUS_PASSED and row["status"] == STATUS_SKIPPED:
+                row["status"] = STATUS_PASSED
+        if status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}:
+            blockers.append(check_id)
+
+    normalized_reports, schema_errors = _normalize_reviewer_reports(reviewer_reports)
+    blockers.extend(schema_errors)
+    reports_by_lens: dict[str, list[dict[str, Any]]] = {}
+    refine_required = False
+    for report in normalized_reports:
+        lens = str(report["lens"])
+        reports_by_lens.setdefault(lens, []).append(report)
+        row = lens_rows[lens]
+        if row["status"] == STATUS_SKIPPED:
+            row["status"] = STATUS_PASSED
+        for finding in report["findings"]:
+            finding_id = f"reviewer:{lens}:{finding['id']}"
+            row["finding_ids"].append(finding_id)
+            if finding["severity"] in BLOCKING_SEVERITIES:
+                blockers.append(finding_id)
+                row["status"] = STATUS_FAILED
+            if lens in {LENS_CORRECTNESS, LENS_SECURITY}:
+                refine_required = True
+                if finding["severity"] not in BLOCKING_SEVERITIES:
+                    blockers.append(f"refinement_required:{finding_id}")
+                    row["status"] = STATUS_FAILED
+
+    cross_provider_required = bool(profile.get("cross_provider_required"))
+    for lens in required_lenses:
+        reports = reports_by_lens.get(lens, [])
+        if not reports:
+            blocker = f"required_reviewer_missing:{lens}"
+            blockers.append(blocker)
+            lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+            continue
+        if cross_provider_required:
+            if not worker_provider:
+                blockers.append(f"worker_provider_missing_for_independence:{lens}")
+                lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+            elif not any(report["provider"] != worker_provider for report in reports):
+                blockers.append(f"independent_reviewer_missing:{lens}")
+                lens_rows[lens]["status"] = STATUS_NOT_AVAILABLE
+
+    combined_rows: list[dict[str, Any]] = []
+    try:
+        combined_rows = [_check_payload(check) for check in combined_tree_checks]
+    except MalformedConfigError as exc:
+        blockers.append("combined_tree_schema:" + str(exc)[:300])
+    if profile.get("combined_tree_required"):
+        if not combined_rows:
+            blockers.append("combined_tree_evidence_missing")
+        elif any(row["status"] != STATUS_PASSED for row in combined_rows):
+            blockers.extend(
+                f"combined_tree:{row['check_id']}"
+                for row in combined_rows
+                if row["status"] != STATUS_PASSED
+            )
+
+    if config_error:
+        blockers.append("quality_config_error")
+    unique_blockers = list(dict.fromkeys(blockers))
+    return {
+        "schema_id": VERDICT_SCHEMA_ID,
+        "status": "verified" if not unique_blockers else "unverified",
+        "passed": not unique_blockers,
+        "risk_profile": profile,
+        "lenses": [lens_rows[lens] for lens in QUALITY_LENSES],
+        "mechanical_checks": normalized_checks,
+        "reviewer_reports": normalized_reports,
+        "combined_tree_checks": combined_rows,
+        "blocking_evidence": unique_blockers,
+        "refine_required": bool(refine_required),
+        "config_error": config_error[:MAX_SUMMARY_CHARS],
+    }
 
 
 def _exact_exists(repo_root: Path, relative: str) -> bool:
@@ -429,6 +782,11 @@ def run_completion_quality_gate(
     repo_root: Path | str,
     *,
     changed_paths: Iterable[str] | None = None,
+    requested_risk_tier: str = RISK_LOW,
+    risk_signals: Iterable[str] = (),
+    reviewer_reports: Iterable[Mapping[str, Any]] = (),
+    combined_tree_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
+    worker_provider: str = "",
 ) -> dict[str, Any]:
     """Execute the mandatory review-quality floor for one task delta.
 
@@ -449,20 +807,43 @@ def run_completion_quality_gate(
         declared = []
         config_error = str(exc)
     all_checks = [*checks, *declared]
-    blockers = [
-        check.check_id
-        for check in all_checks
-        if check.status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}
-    ]
+    try:
+        risk_profile = resolve_risk_profile(requested_risk_tier, signals=risk_signals)
+        verdict = fold_quality_verdict(
+            all_checks,
+            risk_profile=risk_profile,
+            reviewer_reports=reviewer_reports,
+            combined_tree_checks=combined_tree_checks,
+            worker_provider=worker_provider,
+            config_error=config_error,
+        )
+    except MalformedConfigError as exc:
+        risk_profile = {}
+        verdict = {
+            "schema_id": VERDICT_SCHEMA_ID,
+            "status": "unverified",
+            "passed": False,
+            "risk_profile": {},
+            "lenses": [],
+            "mechanical_checks": [check.to_dict() for check in all_checks],
+            "reviewer_reports": [],
+            "combined_tree_checks": [],
+            "blocking_evidence": ["quality_verdict_schema_error"],
+            "refine_required": False,
+            "config_error": str(exc)[:MAX_SUMMARY_CHARS],
+        }
+    blockers = list(verdict["blocking_evidence"])
     optional = [optional_gate_status(root, gate).to_dict() for gate in sorted(OPTIONAL_GATES)]
     return {
         "schema_id": "aiworkhub.completion_quality_gate.v1",
-        "passed": not config_error and not blockers,
+        "passed": bool(verdict["passed"]),
         "changed_paths": list(affected[:MAX_AFFECTED_PATHS]),
         "checks": [check.to_dict() for check in all_checks],
         "blocking_checks": blockers,
         "config_error": config_error,
         "optional_gates": optional,
+        "risk_profile": risk_profile,
+        "quality_verdict": verdict,
     }
 
 
@@ -756,11 +1137,39 @@ def quality_reviewer_contract() -> dict[str, Any]:
     """
 
     return {
-        "schema_id": SCHEMA_ID,
+        "schema_id": VERDICT_SCHEMA_ID,
         "role": "quality_reviewer",
         "read_only": True,
         "can_mutate_repo": False,
         "cross_provider": True,
+        "judgment_lenses": sorted(JUDGMENT_LENSES),
+        "finding_severities": sorted(VALID_SEVERITIES),
+        "reviewer_verdict_accepted": False,
+        "max_reports": MAX_REVIEW_REPORTS,
+        "max_findings_per_report": MAX_REVIEW_FINDINGS,
+    }
+
+
+def quality_verdict_contract() -> dict[str, Any]:
+    """Read-only schema/authority description for UI and model consumers."""
+
+    return {
+        "schema_id": VERDICT_SCHEMA_ID,
+        "verdict_owner": "pure_deterministic_fold",
+        "model_verdict_accepted": False,
+        "quality_lenses": list(QUALITY_LENSES),
+        "blocking_severities": sorted(BLOCKING_SEVERITIES),
+        "risk_tiers": list(RISK_TIERS),
+        "risk_signal_floors": dict(sorted(_RISK_SIGNAL_FLOORS.items())),
+        "profiles": {
+            tier: {
+                **dict(_RISK_PROFILES[tier]),
+                "required_reviewer_lenses": list(
+                    _RISK_PROFILES[tier]["required_reviewer_lenses"]
+                ),
+            }
+            for tier in RISK_TIERS
+        },
     }
 
 
@@ -792,4 +1201,5 @@ def build_evidence_packet(
         "config_error": config_error,
         "optional_gates": optional_gates,
         "quality_reviewer_contract": quality_reviewer_contract(),
+        "quality_verdict_contract": quality_verdict_contract(),
     }

@@ -760,6 +760,35 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
                                 "bytes": 42,
                             }
                         ],
+                        "quality_gate": {
+                            "schema_id": "aiworkhub.completion_quality_gate.v1",
+                            "passed": False,
+                            "blocking_checks": ["reviewer:security:unsafe-path"],
+                            "checks": [
+                                {
+                                    "check_id": "tests",
+                                    "kind": "test",
+                                    "status": "passed",
+                                    "summary": "focused suite passed",
+                                }
+                            ],
+                            "quality_verdict": {
+                                "schema_id": "aiworkhub.quality_verdict.v2",
+                                "status": "unverified",
+                                "passed": False,
+                                "refine_required": True,
+                                "risk_profile": {"effective_tier": "high"},
+                                "blocking_evidence": ["reviewer:security:unsafe-path"],
+                                "lenses": [
+                                    {
+                                        "lens": "security",
+                                        "status": "failed",
+                                        "evidence_ids": ["security-scan"],
+                                        "finding_ids": ["reviewer:security:unsafe-path"],
+                                    }
+                                ],
+                            },
+                        },
                         "error": "",
                     },
                 },
@@ -809,6 +838,24 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
     assert bundle["tests"][0]["command"] == "python <host-path>"
     assert bundle["tests"][0]["summary"] == "passed password=<redacted>"
     assert bundle["required_outputs"][0]["bytes"] == 42
+    quality = detail["task"]["quality_gate"]
+    assert quality["passed"] is False
+    assert quality["quality_verdict"] == {
+        "schema_id": "aiworkhub.quality_verdict.v2",
+        "status": "unverified",
+        "passed": False,
+        "refine_required": True,
+        "risk_tier": "high",
+        "blocking_evidence": ["reviewer:security:unsafe-path"],
+        "lenses": [
+            {
+                "lens": "security",
+                "status": "failed",
+                "evidence_count": 1,
+                "finding_count": 1,
+            }
+        ],
+    }
     assert bundle["artifacts"] == [
         "eval/evidence.json",
         "<host-path>/raw-output.json",

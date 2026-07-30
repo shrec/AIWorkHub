@@ -1763,6 +1763,19 @@ function renderAiInfra(card) {
   if (quality) {
     overview.push(["Quality gate", quality.passed ? "passed" : "failed"]);
     overview.push(["Quality checks", String(asArray(quality.checks).length)]);
+    const verdict = quality.quality_verdict && typeof quality.quality_verdict === "object"
+      ? quality.quality_verdict
+      : null;
+    if (verdict) {
+      overview.push(["Verdict", verdict.status || (verdict.passed ? "verified" : "unverified")]);
+      overview.push(["Risk", verdict.risk_tier || "unknown"]);
+      overview.push(["Refinement", verdict.refine_required ? "required" : "clear"]);
+      const lenses = asArray(verdict.lenses);
+      overview.push([
+        "Quality lenses",
+        `${lenses.filter((item) => item && item.status === "passed").length}/${lenses.length} passed`,
+      ]);
+    }
   }
   const toolUse = info && info.tool_use && typeof info.tool_use === "object" ? info.tool_use : null;
   if (toolUse && toolUse.gated) {
