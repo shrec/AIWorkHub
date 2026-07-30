@@ -46,6 +46,7 @@ DEFAULT_POLICY: dict[str, Any] = {
         "logs_days": 7,
         "terminal_runs_days": 30,
         "source_graph_generations": 3,
+        "worktree_max_bytes": 5 * 1024 * 1024 * 1024,
     },
 }
 
@@ -120,6 +121,15 @@ def validate_policy(value: Any) -> dict[str, Any]:
                 "source_graph_generations",
                 1,
                 20,
+            ),
+            "worktree_max_bytes": _bounded_int(
+                retention.get(
+                    "worktree_max_bytes",
+                    DEFAULT_POLICY["retention"]["worktree_max_bytes"],
+                ),
+                "worktree_max_bytes",
+                64 * 1024 * 1024,
+                1024 * 1024 * 1024 * 1024,
             ),
         },
     }

@@ -1,6 +1,10 @@
 # AIWorkHub Storage Observability and Cleanup
 
-Status: architecture proposal; documentation only. Automatic cleanup is off by default. This design is local-only and assumes no collaboration, RBAC, cloud service, telemetry upload, or external account.
+Status: retained-worktree inventory/preview/quarantine/restore/expired-purge is
+implemented; terminal-log, superseded-graph and obsolete-runtime adapters are
+still planned. Automatic cleanup remains off by default. This design is
+local-only and assumes no collaboration, RBAC, cloud service, telemetry upload,
+or external account.
 
 ## Safety contract
 

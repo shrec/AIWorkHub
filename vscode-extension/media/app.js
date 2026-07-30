@@ -119,6 +119,7 @@ const elements = {
   toolUseList: document.querySelector("#tool-use-list"),
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
+  storageCleanupPreview: document.querySelector("#storage-cleanup-preview"),
   systemLogList: document.querySelector("#system-log-list"),
   systemLogCopy: document.querySelector("#system-log-copy"),
   systemLogClear: document.querySelector("#system-log-clear"),
@@ -1011,7 +1012,7 @@ function renderStorage(snapshot) {
     ["Managed", formatBytes(usage.managed_total_bytes)],
     ["Repo data", formatBytes(usage.repo_data_bytes)],
     ["Worker trees", formatBytes(usage.worker_tree_bytes)],
-    ["Free disk", formatBytes(usage.disk_free_bytes)],
+    ["Quarantine", formatBytes(usage.quarantine_bytes)],
   ];
   for (const [label, value] of overviewValues) {
     const metric = createElement("div", "usage-metric");
@@ -1025,12 +1026,86 @@ function renderStorage(snapshot) {
     ["Repository .aiworkhub", `${formatBytes(usage.repo_data_bytes)} · ${formatCount(usage.repo_data_files)} files`],
     ["Retained worker trees", `${formatBytes(usage.worker_tree_bytes)} · ${formatCount(usage.worker_tree_count)} trees`],
     ["Safe reclaimable", formatBytes(usage.safe_reclaimable_bytes)],
+    ["Quarantine", formatBytes(usage.quarantine_bytes)],
     ["Disk", `${formatBytes(usage.disk_used_bytes)} / ${formatBytes(usage.disk_total_bytes)} · ${numberValue(usage.disk_used_percent).toFixed(1)}% used`],
   ];
   for (const [label, value] of rows) {
     const row = createElement("div", "storage-row");
     row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
     fragment.appendChild(row);
+  }
+  const components = asArray(usage.components)
+    .filter((item) => item && typeof item === "object")
+    .sort((left, right) => numberValue(right.bytes) - numberValue(left.bytes));
+  if (components.length) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Repository components"));
+    for (const component of components) {
+      const row = createElement("div", "storage-row storage-component-row");
+      row.append(
+        createElement("span", "storage-label", String(component.id || "component")),
+        createElement(
+          "strong",
+          "storage-value",
+          `${formatBytes(component.bytes)} · ${formatCount(component.files)} files`,
+        ),
+      );
+      fragment.appendChild(row);
+    }
+  }
+  const retention = usage.retention_preview && typeof usage.retention_preview === "object"
+    ? usage.retention_preview
+    : null;
+  if (retention) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Retention dry run"));
+    for (const [label, value] of [
+      ["Policy", `keep ${formatCount(retention.policy_days)} days`],
+      ["Size cap", `${formatBytes(retention.current_bytes)} / ${formatBytes(retention.max_bytes)}`],
+      ["Eligible", `${formatCount(retention.eligible_count)} trees · ${formatBytes(retention.eligible_bytes)}`],
+      ["After quarantine", formatBytes(retention.projected_bytes)],
+      ["Protected", `${formatCount(retention.protected_count)} trees`],
+      ["Scope", retention.repository_scoped ? "This repository only" : "Unavailable"],
+    ]) {
+      const row = createElement("div", "storage-row storage-retention-row");
+      row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+      fragment.appendChild(row);
+    }
+    fragment.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      "Preview only. Unsaved, unpushed, active, foreign-repository and orphaned worktrees are protected.",
+    ));
+  }
+  const batches = asArray(usage.quarantine_batches)
+    .filter((item) => item && typeof item === "object");
+  if (batches.length) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Quarantine batches"));
+    for (const batch of batches) {
+      const row = createElement("div", "storage-batch-row");
+      const detail = createElement("div", "storage-batch-detail");
+      detail.append(
+        createElement("strong", "", String(batch.batch_id || "batch")),
+        createElement(
+          "span",
+          "storage-label",
+          `${formatCount(batch.quarantined_count)} quarantined · ${formatBytes(batch.bytes)} · restore until ${batch.restore_deadline ? new Date(batch.restore_deadline).toLocaleString() : "unknown"}`,
+        ),
+      );
+      const actions = createElement("div", "storage-batch-actions");
+      if (numberValue(batch.quarantined_count) > 0) {
+        const restore = createElement("button", "secondary-button", "Restore");
+        restore.type = "button";
+        restore.dataset.restoreBatch = String(batch.batch_id || "");
+        actions.appendChild(restore);
+      }
+      if (batch.purge_eligible) {
+        const purge = createElement("button", "danger-button", "Purge");
+        purge.type = "button";
+        purge.dataset.purgeBatch = String(batch.batch_id || "");
+        actions.appendChild(purge);
+      }
+      row.append(detail, actions);
+      fragment.appendChild(row);
+    }
   }
   const stateLabel = String(usage.scan_status || "unknown");
   const timestamp = usage.scanned_at ? new Date(usage.scanned_at).toLocaleString() : "calculating now";
@@ -2626,6 +2701,20 @@ elements.headerStorage.addEventListener("click", () => {
   if (storageTab) {
     activateOperationTab(storageTab, true);
     document.querySelector("#panel-storage").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+});
+elements.storageCleanupPreview.addEventListener("click", () => {
+  vscode.postMessage({ type: "requestStorageCleanup" });
+});
+elements.storageList.addEventListener("click", (event) => {
+  const restore = event.target.closest("[data-restore-batch]");
+  if (restore) {
+    vscode.postMessage({ type: "requestStorageRestore", batchId: restore.dataset.restoreBatch });
+    return;
+  }
+  const purge = event.target.closest("[data-purge-batch]");
+  if (purge) {
+    vscode.postMessage({ type: "requestStoragePurge", batchId: purge.dataset.purgeBatch });
   }
 });
 

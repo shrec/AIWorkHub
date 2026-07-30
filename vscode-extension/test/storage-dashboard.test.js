@@ -21,6 +21,7 @@ for (const token of [
   'id="header-ai-memory"',
   'id="header-kb"',
   'id="header-preflight"',
+  'id="storage-cleanup-preview"',
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -41,10 +42,19 @@ for (const token of [
   "elements.headerKbValue",
   "elements.headerPreflightValue",
   "snapshot.environment_preflight",
+  "Repository components",
+  "Retention dry run",
+  "This repository only",
+  "requestStorageCleanup",
+  "requestStorageRestore",
+  "requestStoragePurge",
+  "Quarantine batches",
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }
 assert.ok(css.includes(".storage-row"), "storage dashboard styling is missing");
+assert.ok(css.includes(".storage-section-title"), "storage section styling is missing");
+assert.ok(css.includes(".storage-batch-row"), "storage quarantine styling is missing");
 assert.ok(css.includes("grid-template-columns: repeat(6"), "AI infrastructure cards must share one full-width row");
 assert.ok(css.includes("align-items: center"), "AI infrastructure cards must be centered");
 console.log("storage dashboard contract: ok");

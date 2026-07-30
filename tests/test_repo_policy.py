@@ -26,11 +26,21 @@ def test_ensure_policy_is_owner_only_idempotent_and_valid(tmp_path: Path) -> Non
     policy = repo_policy.load_policy(root)
     assert policy["configured"] is True
     assert policy["tools"]["raw_discovery_forbidden"] == ["grep", "rg", "find", "tree"]
+    assert policy["retention"]["worktree_max_bytes"] == 5 * 1024 * 1024 * 1024
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     same, created_again = repo_policy.ensure_policy(root)
     assert same == path
     assert created_again is False
+
+
+def test_legacy_policy_without_worktree_cap_receives_safe_default(tmp_path: Path) -> None:
+    root = _initialized_root(tmp_path)
+    value = json.loads(json.dumps(repo_policy.DEFAULT_POLICY))
+    del value["retention"]["worktree_max_bytes"]
+    repo_policy.policy_path(root).write_text(json.dumps(value), encoding="utf-8")
+    loaded = repo_policy.load_policy(root)
+    assert loaded["retention"]["worktree_max_bytes"] == 5 * 1024 * 1024 * 1024
 
 
 def test_policy_fails_closed_if_mandatory_discovery_denies_are_removed(tmp_path: Path) -> None:

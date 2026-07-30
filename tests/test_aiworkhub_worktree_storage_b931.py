@@ -12,8 +12,10 @@ state and prove the classification and the cleanup guarantees.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -107,6 +109,43 @@ def test_plan_include_orphaned_adds_only_orphans(worktrees) -> None:
     assert remove_ids == {"W_SAFE", "W_ORPHAN"}
     # dirty/unpushed WORK is still never removable, even in orphaned mode.
     assert {wt["id"] for wt in plan["would_keep"]} == {"W_DIRTY", "W_UNPUSHED"}
+
+
+def test_repository_scoped_scan_excludes_unowned_and_orphaned_trees(worktrees, tmp_path) -> None:
+    foreign = tmp_path / "foreign"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "main",
+        str(tmp_path / "remote.git"),
+        str(foreign),
+    )
+    foreign_tree = worktrees["base"] / "W_FOREIGN" / "worktree"
+    foreign_tree.parent.mkdir(parents=True)
+    _git(foreign, "worktree", "add", "--detach", str(foreign_tree), "HEAD")
+
+    scan = ws.scan_worktrees(worktrees["base"], repo_root=worktrees["parent"])
+
+    assert scan["scope"] == "repository"
+    assert {item["id"] for item in scan["worktrees"]} == {
+        "W_SAFE",
+        "W_DIRTY",
+        "W_UNPUSHED",
+    }
+
+
+def test_retention_age_policy_keeps_recent_safe_tree(worktrees) -> None:
+    safe = worktrees["base"] / "W_SAFE"
+    old = time.time() - 31 * 86400
+    os.utime(safe, (old, old))
+    scan = ws.scan_worktrees(worktrees["base"])
+
+    eligible = ws.plan_cleanup(scan, min_age_days=30)
+    protected = ws.plan_cleanup(scan, min_age_days=32)
+
+    assert {item["id"] for item in eligible["would_remove"]} == {"W_SAFE"}
+    assert "W_SAFE" in {item["id"] for item in protected["would_keep"]}
 
 
 def test_execute_dry_run_deletes_nothing(worktrees) -> None:

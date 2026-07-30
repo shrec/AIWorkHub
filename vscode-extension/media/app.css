@@ -1378,6 +1378,67 @@ tbody tr.is-selected td:first-child {
   font-size: 8px;
 }
 
+.storage-section-title {
+  padding: 8px 10px 4px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.storage-component-row,
+.storage-retention-row {
+  padding-left: 18px;
+}
+
+.storage-action-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-subtle);
+}
+
+.storage-action-bar button,
+.storage-batch-actions button {
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  color: var(--ink);
+  background: var(--vscode-button-secondaryBackground);
+  cursor: pointer;
+  font-size: 9px;
+}
+
+.storage-batch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 10px 7px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.storage-batch-detail {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  overflow-wrap: anywhere;
+  font-size: 9px;
+}
+
+.storage-batch-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.storage-batch-actions .danger-button {
+  color: var(--vscode-testing-iconFailed);
+}
+
 .system-log-toolbar {
   position: sticky;
   z-index: 1;

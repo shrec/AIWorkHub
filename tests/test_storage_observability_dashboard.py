@@ -41,6 +41,10 @@ def test_storage_snapshot_counts_repo_data_and_never_follows_symlinks(tmp_path, 
     assert result["worker_tree_count"] == 2
     assert result["safe_reclaimable_bytes"] == 64
     assert result["managed_total_bytes"] == 384
+    assert result["components"] == [{"id": "state.db", "bytes": 128, "files": 1}]
+    assert result["retention_preview"]["dry_run"] is True
+    assert result["retention_preview"]["repository_scoped"] is True
+    assert result["retention_preview"]["eligible_bytes"] == 64
     assert result["disk_total_bytes"] > 0
     assert result["disk_free_bytes"] > 0
     assert result["readonly"] is True
@@ -81,4 +85,3 @@ def test_storage_scan_failure_is_bounded_and_does_not_break_capacity(tmp_path, m
     assert result["scan_status"] == "error"
     assert result["errors"] == ["storage_scan_failed:RuntimeError"]
     assert result["disk_total_bytes"] > 0
-

@@ -38,6 +38,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,21 @@ def _repo_name(origin_url: str) -> str:
     return tail[:-4] if tail.endswith(".git") else tail
 
 
+def _git_common_dir(cwd: Path) -> str:
+    rc, common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc != 0 or not common:
+        rc, common = _git(cwd, "rev-parse", "--git-common-dir")
+    if rc != 0 or not common:
+        return ""
+    candidate = Path(common)
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    try:
+        return os.path.normcase(str(candidate.resolve()))
+    except OSError:
+        return ""
+
+
 def _worktree_git_state(worktree_dir: Path) -> dict[str, Any]:
     """Classify one worktree checkout's git safety state.
 
@@ -122,10 +138,7 @@ def _worktree_git_state(worktree_dir: Path) -> dict[str, Any]:
     # Fail closed: if we cannot prove every commit is on a remote, treat it as
     # unpushed (never removable) rather than risk losing local commits.
     state["unpushed"] = not (rc_ahead == 0 and ahead == "0")
-    _, common = _git(worktree_dir, "rev-parse", "--absolute-git-dir")
-    if not common:
-        _, common = _git(worktree_dir, "rev-parse", "--git-common-dir")
-    state["parent_git_dir"] = common
+    state["parent_git_dir"] = _git_common_dir(worktree_dir)
     return state
 
 
@@ -137,7 +150,12 @@ def _classify(git_state: dict[str, Any]) -> str:
     return CLASS_REMOVABLE_SAFE
 
 
-def scan_worktrees(base: Path | None = None, *, with_sizes: bool = True) -> dict[str, Any]:
+def scan_worktrees(
+    base: Path | None = None,
+    *,
+    with_sizes: bool = True,
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
     """Enumerate every retained worktree under ``base`` with its safety class.
 
     Returns ``{base, exists, worktrees: [...], summary: {...}}``. Read-only:
@@ -145,10 +163,11 @@ def scan_worktrees(base: Path | None = None, *, with_sizes: bool = True) -> dict
     walk for a fast listing.
     """
     base = (base or configured_worktree_root()).resolve()
+    repo_common_dir = _git_common_dir(Path(repo_root).resolve()) if repo_root else ""
     worktrees: list[dict[str, Any]] = []
     if base.is_dir():
         for entry in sorted(base.iterdir()):
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.name.startswith("."):
                 continue
             worktree_dir = entry / "worktree"
             git_state = (
@@ -157,6 +176,18 @@ def scan_worktrees(base: Path | None = None, *, with_sizes: bool = True) -> dict
                 else {"git_ok": False, "origin": "", "head": "", "dirty": False,
                       "unpushed": False, "parent_git_dir": ""}
             )
+            if repo_root and (
+                not repo_common_dir
+                or git_state.get("parent_git_dir") != repo_common_dir
+            ):
+                # Orphaned or foreign-repository worktrees are deliberately
+                # excluded from a repository-scoped view. Ownership cannot be
+                # inferred from the directory name or remote URL.
+                continue
+            try:
+                modified_at = entry.stat().st_mtime
+            except OSError:
+                modified_at = time.time()
             worktrees.append(
                 {
                     "id": entry.name,
@@ -169,12 +200,15 @@ def scan_worktrees(base: Path | None = None, *, with_sizes: bool = True) -> dict
                     "dirty": git_state["dirty"],
                     "unpushed": git_state["unpushed"],
                     "parent_git_dir": git_state["parent_git_dir"],
+                    "modified_at_epoch": modified_at,
+                    "age_seconds": max(0.0, time.time() - modified_at),
                     "class": _classify(git_state),
                 }
             )
     return {
         "base": str(base),
         "exists": base.is_dir(),
+        "scope": "repository" if repo_root else "global",
         "worktrees": worktrees,
         "summary": summarize(worktrees),
     }
@@ -207,7 +241,10 @@ def summarize(worktrees: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def plan_cleanup(
-    scan: dict[str, Any] | None = None, *, include_orphaned: bool = False
+    scan: dict[str, Any] | None = None,
+    *,
+    include_orphaned: bool = False,
+    min_age_days: int = 0,
 ) -> dict[str, Any]:
     """Split a scan into what a cleanup WOULD remove vs keep (no deletion).
 
@@ -219,12 +256,20 @@ def plan_cleanup(
     """
     if scan is None:
         scan = scan_worktrees()
+    safe_age_days = max(0, min(int(min_age_days), 3650))
+    minimum_age_seconds = safe_age_days * 86400
     eligible = {CLASS_REMOVABLE_SAFE} | ({CLASS_ORPHANED} if include_orphaned else set())
-    would_remove = [wt for wt in scan["worktrees"] if wt["class"] in eligible]
-    would_keep = [wt for wt in scan["worktrees"] if wt["class"] not in eligible]
+    would_remove = [
+        wt
+        for wt in scan["worktrees"]
+        if wt["class"] in eligible
+        and float(wt.get("age_seconds") or 0.0) >= minimum_age_seconds
+    ]
+    would_keep = [wt for wt in scan["worktrees"] if wt not in would_remove]
     return {
         "base": scan["base"],
         "include_orphaned": include_orphaned,
+        "min_age_days": safe_age_days,
         "would_remove": would_remove,
         "would_keep": would_keep,
         "reclaim_bytes": sum((wt.get("size_bytes") or 0) for wt in would_remove),

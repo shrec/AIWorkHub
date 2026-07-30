@@ -142,6 +142,16 @@ do not override this current priority ledger.
       extension suite on 2026-07-30.
 - [ ] Complete storage retention UX: size by component, archive/restore,
       age/size policy, dry-run cleanup and rollback-safe deletion.
+      - [x] Repository-scoped retained-worktree lifecycle: exact Git-common-dir
+        ownership, component inventory, age/size policy preview, same-volume
+        quarantine, seven-day restore window and separately confirmed expired
+        purge. Unsaved, unpushed, active, orphaned and foreign-repository trees
+        fail closed. Canonical local evidence: storage/dashboard tests (`48
+        passed`), complete Python suite (`1489 passed, 18 skipped`) and complete
+        extension suite on 2026-07-30.
+      - [ ] Extend the same preview/quarantine/restore contract to rotated
+        terminal logs, superseded Source Graph generations and obsolete
+        extension/runtime caches with their owning lease authorities.
 
 ### P2 — Maintainability, distribution and ecosystem
 

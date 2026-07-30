@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import worktree_storage
+from . import repo_policy, storage_retention, worktree_storage
 
 SCAN_TTL_SECONDS = 60.0
 
@@ -46,9 +46,53 @@ def _tree_size(path: Path) -> tuple[int, int]:
 
 def _measure(repo_root: Path) -> dict[str, Any]:
     repo_bytes, repo_files = _tree_size(repo_root / ".aiworkhub")
-    worktrees = worktree_storage.scan_worktrees(with_sizes=True)
+    components: list[dict[str, Any]] = []
+    hub = repo_root / ".aiworkhub"
+    if hub.is_dir():
+        for entry in sorted(hub.iterdir(), key=lambda item: item.name):
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                size, files = _tree_size(entry)
+            elif entry.is_file():
+                try:
+                    size, files = entry.stat().st_size, 1
+                except OSError:
+                    continue
+            else:
+                continue
+            components.append({"id": entry.name, "bytes": size, "files": files})
+    worktrees = worktree_storage.scan_worktrees(
+        with_sizes=True,
+        repo_root=repo_root,
+    )
     summary = worktrees.get("summary") or {}
     worker_bytes = int(summary.get("total_bytes") or 0)
+    try:
+        policy = repo_policy.load_policy(repo_root)
+        min_age_days = int(policy["retention"]["terminal_runs_days"])
+        worktree_max_bytes = int(policy["retention"]["worktree_max_bytes"])
+    except (KeyError, TypeError, ValueError, repo_policy.RepoPolicyError):
+        min_age_days = int(repo_policy.DEFAULT_POLICY["retention"]["terminal_runs_days"])
+        worktree_max_bytes = int(repo_policy.DEFAULT_POLICY["retention"]["worktree_max_bytes"])
+    if isinstance(worktrees.get("worktrees"), list) and worktrees.get("base"):
+        cleanup = worktree_storage.plan_cleanup(
+            worktrees,
+            include_orphaned=False,
+            min_age_days=min_age_days,
+        )
+    else:
+        cleanup = {
+            "would_remove": [],
+            "would_keep": [],
+            "reclaim_bytes": int(summary.get("removable_safe_bytes") or 0),
+        }
+    try:
+        quarantine = storage_retention.list_batches(repo_root)
+        quarantine_batches = quarantine.get("batches") or []
+    except storage_retention.StorageRetentionError:
+        quarantine_batches = []
+    quarantine_bytes = sum(int(item.get("bytes") or 0) for item in quarantine_batches)
     return {
         "scan_status": "ready",
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -56,8 +100,24 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         "repo_data_files": repo_files,
         "worker_tree_bytes": worker_bytes,
         "worker_tree_count": int(summary.get("count") or 0),
-        "safe_reclaimable_bytes": int(summary.get("removable_safe_bytes") or 0),
-        "managed_total_bytes": repo_bytes + worker_bytes,
+        "safe_reclaimable_bytes": int(cleanup.get("reclaim_bytes") or 0),
+        "quarantine_bytes": quarantine_bytes,
+        "managed_total_bytes": repo_bytes + worker_bytes + quarantine_bytes,
+        "components": components,
+        "retention_preview": {
+            "policy_days": min_age_days,
+            "max_bytes": worktree_max_bytes,
+            "current_bytes": worker_bytes,
+            "projected_bytes": max(0, worker_bytes - int(cleanup.get("reclaim_bytes") or 0)),
+            "over_limit_bytes": max(0, worker_bytes - worktree_max_bytes),
+            "eligible_count": len(cleanup.get("would_remove") or []),
+            "protected_count": len(cleanup.get("would_keep") or []),
+            "eligible_bytes": int(cleanup.get("reclaim_bytes") or 0),
+            "dry_run": True,
+            "repository_scoped": True,
+            "orphaned_excluded": True,
+        },
+        "quarantine_batches": quarantine_batches,
         "errors": [],
     }
 
@@ -127,8 +187,24 @@ def snapshot(repo_root: Path | str) -> dict[str, Any]:
             "repo_data_files": 0,
             "worker_tree_bytes": 0,
             "worker_tree_count": 0,
+            "quarantine_bytes": 0,
             "safe_reclaimable_bytes": 0,
             "managed_total_bytes": 0,
+            "components": [],
+            "retention_preview": {
+                "policy_days": 0,
+                "max_bytes": 0,
+                "current_bytes": 0,
+                "projected_bytes": 0,
+                "over_limit_bytes": 0,
+                "eligible_count": 0,
+                "protected_count": 0,
+                "eligible_bytes": 0,
+                "dry_run": True,
+                "repository_scoped": True,
+                "orphaned_excluded": True,
+            },
+            "quarantine_batches": [],
             "errors": [],
         }
     elif running:
@@ -140,3 +216,10 @@ def _reset_cache_for_tests() -> None:
     with _lock:
         _cache.clear()
         _running.clear()
+
+
+def invalidate(repo_root: Path | str) -> None:
+    """Drop one repository's completed size snapshot after a retention write."""
+    key = str(Path(repo_root).resolve())
+    with _lock:
+        _cache.pop(key, None)

@@ -282,6 +282,16 @@ is bounded here and consumed by the separate storage-lifecycle workstream.
 
 ## P2 — Storage lifecycle, analytics, and integrations (0.9.x)
 
+**Implemented foundation (0.8.0):** retained worker worktrees now have a
+repository-scoped lifecycle backed by exact Git-common-dir ownership. The
+dashboard shows `.aiworkhub` component sizes, policy age/size limits and a
+read-only cleanup projection. A fresh digest plus explicit local-user gesture
+moves only clean, fully-pushed, policy-aged worktrees into same-volume
+quarantine; restore remains available for seven days and permanent purge is a
+separate confirmation after expiry. Quarantine bytes remain counted as managed
+storage and are never mislabeled reclaimed. Rotated logs, superseded Source
+Graph generations and obsolete runtime packages remain the next adapters.
+
 - Ship inventory-only storage accounting first, then preview, quarantine,
   restore, and finally opt-in purge after cross-platform adversarial tests.
 - Retain only bounded logs, terminal runs, obsolete Source Graph generations,

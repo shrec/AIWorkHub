@@ -19,7 +19,18 @@ import re
 import sqlite3
 from typing import Any, Mapping
 
-from aiworkhub import __version__, core, dashboard, process_launcher, repository_bootstrap, shared_router, storage_registry, task_store
+from aiworkhub import (
+    __version__,
+    core,
+    dashboard,
+    process_launcher,
+    repository_bootstrap,
+    shared_router,
+    storage_observability,
+    storage_registry,
+    storage_retention,
+    task_store,
+)
 
 
 # Hard bound on the serialized tool response so a very large queue (many
@@ -91,6 +102,18 @@ def _readonly_authority_flags() -> dict[str, bool]:
         "readonly": True,
         "queue_write": False,
         "audit_write": False,
+        "process_launch": False,
+        "agent_launch": False,
+        "shell_invocation": False,
+    }
+
+
+def _storage_write_authority_flags() -> dict[str, bool]:
+    return {
+        "readonly": False,
+        "queue_write": False,
+        "audit_write": True,
+        "storage_write": True,
         "process_launch": False,
         "agent_launch": False,
         "shell_invocation": False,
@@ -437,6 +460,70 @@ def kb_view(limit: int = 100) -> dict[str, Any]:
     }
 
 
+def storage_retention_preview_view() -> dict[str, Any]:
+    """READ-ONLY: fresh repository-scoped cleanup preview and batch list."""
+    try:
+        root = core.repo_root()
+        response = storage_retention.preview(root)
+        response["quarantine"] = storage_retention.list_batches(root)
+    except storage_retention.StorageRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_storage_retention_preview"
+    response["authority_flags"] = _readonly_authority_flags()
+    return response
+
+
+def storage_quarantine_view(preview_digest: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: quarantine one still-current preview after explicit consent."""
+    try:
+        root = core.repo_root()
+        response = storage_retention.quarantine(
+            root,
+            preview_digest=str(preview_digest or "")[:128],
+            confirm=confirm is True,
+        )
+        storage_observability.invalidate(root)
+    except storage_retention.StorageRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_storage_quarantine"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def storage_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: restore one repository-owned quarantine batch."""
+    try:
+        root = core.repo_root()
+        response = storage_retention.restore(
+            root,
+            batch_id=str(batch_id or "")[:128],
+            confirm=confirm is True,
+        )
+        storage_observability.invalidate(root)
+    except storage_retention.StorageRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_storage_restore"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def storage_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: permanently purge one expired quarantine batch."""
+    try:
+        root = core.repo_root()
+        response = storage_retention.purge(
+            root,
+            batch_id=str(batch_id or "")[:128],
+            confirm=confirm is True,
+        )
+        storage_observability.invalidate(root)
+    except storage_retention.StorageRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_storage_purge"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
 def health_view() -> dict[str, Any]:
     """READ-ONLY: cheap liveness check for the Webview's connection banner.
 
@@ -665,6 +752,15 @@ SESSION_TOOL_NAME = "aiworkhub_dashboard_sessions"
 SESSION_TOOLS: dict[str, Any] = {SESSION_TOOL_NAME: session_view}
 KB_TOOL_NAME = "aiworkhub_dashboard_kb"
 KB_TOOLS: dict[str, Any] = {KB_TOOL_NAME: kb_view}
+STORAGE_RETENTION_PREVIEW_TOOL_NAME = "aiworkhub_dashboard_storage_retention_preview"
+STORAGE_RETENTION_READ_TOOLS: dict[str, Any] = {
+    STORAGE_RETENTION_PREVIEW_TOOL_NAME: storage_retention_preview_view,
+}
+STORAGE_RETENTION_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_storage_quarantine": storage_quarantine_view,
+    "aiworkhub_dashboard_storage_restore": storage_restore_view,
+    "aiworkhub_dashboard_storage_purge": storage_purge_view,
+}
 
 
 def register(mcp: Any) -> tuple[str, ...]:
@@ -690,6 +786,10 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in KB_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in STORAGE_RETENTION_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in STORAGE_RETENTION_WRITE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in INITIALIZE_TOOLS.items():
         mcp.tool(name=name)(fn)
     return READONLY_TOOL_NAMES + (
@@ -697,4 +797,5 @@ def register(mcp: Any) -> tuple[str, ...]:
         MEMORY_TOOL_NAME,
         SESSION_TOOL_NAME,
         KB_TOOL_NAME,
-    ) + (INITIALIZE_TOOL_NAME,)
+        STORAGE_RETENTION_PREVIEW_TOOL_NAME,
+    ) + tuple(STORAGE_RETENTION_WRITE_TOOLS) + (INITIALIZE_TOOL_NAME,)

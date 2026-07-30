@@ -32,6 +32,9 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestMemory",
   "requestSessions",
   "requestKb",
+  "requestStorageCleanup",
+  "requestStorageRestore",
+  "requestStoragePurge",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -52,6 +55,7 @@ const OUTBOUND_TYPES = Object.freeze({
 });
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
+const STORAGE_BATCH_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const ALLOWED_REFRESH_INTERVALS_MS = new Set([10000, 30000, 60000]);
 const DEFAULT_REFRESH_INTERVAL_MS = 30000;
 const REPO_ID_RE = /^repo_[a-f0-9]{32}$|^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
@@ -105,6 +109,12 @@ const DASHBOARD_TOOLS = Object.freeze({
   memory: "aiworkhub_dashboard_memory",
   sessions: "aiworkhub_dashboard_sessions",
   kb: "aiworkhub_dashboard_kb",
+});
+const STORAGE_RETENTION_TOOLS = Object.freeze({
+  preview: "aiworkhub_dashboard_storage_retention_preview",
+  quarantine: "aiworkhub_dashboard_storage_quarantine",
+  restore: "aiworkhub_dashboard_storage_restore",
+  purge: "aiworkhub_dashboard_storage_purge",
 });
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
@@ -4163,6 +4173,88 @@ async function pushKb(view) {
   }
 }
 
+async function runStorageCleanup(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const preview = await client.callTool(STORAGE_RETENTION_TOOLS.preview, {});
+    if (!preview || preview.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "storage_preview_failed" });
+      return;
+    }
+    const count = Math.max(0, Number(preview.candidate_count || 0));
+    if (!count) {
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: "No policy-aged, clean and fully-pushed worktrees are eligible" });
+      return;
+    }
+    const bytes = Math.max(0, Number(preview.candidate_bytes || 0));
+    const choice = await vscode.window.showWarningMessage(
+      `Move ${count} retained worktree(s) (${bytes} bytes) into the 7-day AIWorkHub quarantine? Unsaved, unpushed, active and foreign-repository worktrees are excluded.`,
+      { modal: true },
+      "Quarantine",
+    );
+    if (choice !== "Quarantine") return;
+    const result = await client.callTool(STORAGE_RETENTION_TOOLS.quarantine, {
+      preview_digest: String(preview.preview_digest || ""),
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "storage_quarantine_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Quarantined ${Number(result.quarantined || 0)} worktree(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runStorageRestore(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showInformationMessage(
+    `Restore AIWorkHub quarantine batch ${batchId}? Existing destinations are never overwritten.`,
+    { modal: true },
+    "Restore",
+  );
+  if (choice !== "Restore") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(STORAGE_RETENTION_TOOLS.restore, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "storage_restore_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${Number(result.restored || 0)} worktree(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runStoragePurge(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Permanently purge expired AIWorkHub quarantine batch ${batchId}? This cannot be undone.`,
+    { modal: true },
+    "Permanently Purge",
+  );
+  if (choice !== "Permanently Purge") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(STORAGE_RETENTION_TOOLS.purge, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "storage_purge_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: "Expired quarantine batch permanently purged" });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 // The sole initialization trigger: one bounded MCP tool call, tied to the
 // active repo_id/window/claim episode -- the window/claim-episode binding is
 // implicit in the AIWORKHUB_WINDOW_ID/AIWORKHUB_CLAIM_EPISODE env vars the
@@ -4304,6 +4396,19 @@ function handleInboundMessage(view, message) {
     case "requestKb":
       pushKb(view);
       break;
+    case "requestStorageCleanup":
+      runStorageCleanup(view);
+      break;
+    case "requestStorageRestore": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runStorageRestore(view, batchId);
+      break;
+    }
+    case "requestStoragePurge": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runStoragePurge(view, batchId);
+      break;
+    }
     default:
       break;
   }
@@ -4684,6 +4789,9 @@ function getHtmlForWebview(webview, extensionUri) {
             <div class="stat-list" id="tool-use-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden>
+            <div class="storage-action-bar">
+              <button id="storage-cleanup-preview" type="button" title="Recompute the repository-scoped retention preview and quarantine eligible worktrees after confirmation">Preview &amp; Quarantine</button>
+            </div>
             <div class="stat-list" id="storage-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-returns" aria-labelledby="tab-returns" hidden>
