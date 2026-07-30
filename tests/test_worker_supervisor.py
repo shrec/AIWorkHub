@@ -78,6 +78,29 @@ def test_supervisor_spawn_failure_is_never_reported_as_success(tmp_path: Path) -
     assert "FileNotFoundError" in status["error"]
 
 
+def test_supervisor_bounds_verbose_output_and_keeps_tail(tmp_path: Path) -> None:
+    spec_path, spec = _spec(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('x' * 20000 + 'FINAL-TAIL\\n')",
+        ],
+    )
+    spec["max_output_bytes"] = 2048
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    output = Path(spec["stdout_path"]).read_bytes()
+    status = _read_status(Path(spec["status_path"]))
+    assert len(output) <= 2048
+    assert b"earlier worker output truncated" in output
+    assert b"FINAL-TAIL" in output
+    assert status["stdout_dropped_bytes"] > 0
+
+
 def test_supervisor_timeout_kills_child_and_persists_timeout(tmp_path: Path) -> None:
     spec_path, spec = _spec(
         tmp_path,

@@ -35,6 +35,7 @@ from . import context_write_intents
 from . import context_writes
 from .platform_io import chmod_fd, lock_fd, unlock_fd
 from . import quality_evidence
+from . import process_event_ledger
 from . import repo_policy
 from . import task_engine
 try:
@@ -1935,32 +1936,11 @@ class ProcessManager:
             "timestamp": _utcnow(),
             **event,
         }
-        self.process_log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        payload = json.dumps(clean, ensure_ascii=False, sort_keys=True) + "\n"
-        # One append write keeps records intact across concurrently monitoring
-        # threads. O_APPEND is used deliberately; the file is never rewritten.
-        fd = os.open(
-            self.process_log_path,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-            0o600,
-        )
-        try:
-            chmod_fd(fd, 0o600)
-            os.write(fd, payload.encode("utf-8"))
-        finally:
-            os.close(fd)
+        process_event_ledger.append_event(self.process_log_path, clean)
         return clean
 
     def _events(self) -> list[dict[str, Any]]:
-        if not self.process_log_path.is_file():
-            return []
-        rows: list[dict[str, Any]] = []
-        for line in self.process_log_path.read_text(encoding="utf-8").splitlines():
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return rows
+        return list(process_event_ledger.iter_events(self.process_log_path))
 
     def _latest_by_request(self) -> dict[str, dict[str, Any]]:
         latest: dict[str, dict[str, Any]] = {}
@@ -2412,6 +2392,7 @@ class ProcessManager:
                     "cancel_path": str(cancel_path),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
+                    "max_output_bytes": 16 * 1024 * 1024,
                 })
 
                 supervisor = Path(__file__).with_name("worker_supervisor.py")

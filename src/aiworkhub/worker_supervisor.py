@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -32,6 +33,9 @@ _PR_SET_PDEATHSIG = 1
 # while the child runs. Heartbeat cadence is deliberately independent of any
 # model turn, dashboard read, or MCP request.
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MIN_MAX_OUTPUT_BYTES = 1024
+_TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
 
 
 def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
@@ -56,12 +60,12 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
 def _open_0600(path: Path) -> BinaryIO:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
-    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+    flags = os.O_CREAT | os.O_APPEND | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     chmod_fd(fd, 0o600)
-    return os.fdopen(fd, "ab", buffering=0)
+    return os.fdopen(fd, "a+b", buffering=0)
 
 
 def _terminate_child(child: subprocess.Popen[bytes], grace: float = KILL_GRACE_SECONDS) -> int:
@@ -142,11 +146,59 @@ def _pid_start_ticks(pid: int) -> int | None:
         return None
 
 
-def _file_size(handle: BinaryIO) -> int:
+def _file_size(path: Path) -> int:
     try:
-        return os.fstat(handle.fileno()).st_size
+        return path.stat().st_size
     except OSError:
         return 0
+
+
+class _BoundedTailWriter:
+    """Continuously drain a pipe while bounding its on-disk tail file."""
+
+    def __init__(self, path: Path, max_bytes: int) -> None:
+        self.path = path
+        self.max_bytes = max(MIN_MAX_OUTPUT_BYTES, int(max_bytes))
+        self.keep_bytes = max(512, self.max_bytes // 2)
+        self.dropped_bytes = 0
+        self.error = ""
+
+    def _compact(self, handle: BinaryIO) -> None:
+        size = os.fstat(handle.fileno()).st_size
+        if size <= self.max_bytes:
+            return
+        max_tail = max(0, self.max_bytes - len(_TRUNCATION_MARKER))
+        keep = min(self.keep_bytes, max_tail, size)
+        os.lseek(handle.fileno(), max(0, size - keep), os.SEEK_SET)
+        tail = os.read(handle.fileno(), keep)
+        self.dropped_bytes += max(0, size - len(tail))
+        os.ftruncate(handle.fileno(), 0)
+        os.lseek(handle.fileno(), 0, os.SEEK_SET)
+        os.write(handle.fileno(), _TRUNCATION_MARKER)
+        if tail:
+            os.write(handle.fileno(), tail)
+
+    def drain(self, stream: BinaryIO) -> None:
+        try:
+            with _open_0600(self.path) as handle:
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    self._compact(handle)
+        except Exception as exc:  # drain to EOF even when persistence fails
+            self.error = f"{type(exc).__name__}:{exc}"[:500]
+            try:
+                while stream.read(64 * 1024):
+                    pass
+            except Exception:
+                pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def supervise(spec: dict[str, Any]) -> int:
@@ -159,6 +211,11 @@ def supervise(spec: dict[str, Any]) -> int:
     cancel_path = Path(str(spec["cancel_path"]))
     stdout_path = Path(str(spec["stdout_path"]))
     stderr_path = Path(str(spec["stderr_path"]))
+    try:
+        max_output_bytes = int(spec.get("max_output_bytes") or DEFAULT_MAX_OUTPUT_BYTES)
+    except (TypeError, ValueError):
+        max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
+    max_output_bytes = max(MIN_MAX_OUTPUT_BYTES, max_output_bytes)
     try:
         heartbeat_interval = float(spec.get("heartbeat_interval_seconds") or DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
     except (TypeError, ValueError):
@@ -188,112 +245,136 @@ def supervise(spec: dict[str, Any]) -> int:
     })
 
     try:
-        with _open_0600(stdout_path) as out, _open_0600(stderr_path) as err:
-            try:
-                child = subprocess.Popen(
-                    argv,
-                    cwd=cwd,
-                    env=os.environ.copy(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=out,
-                    stderr=err,
-                    shell=False,
-                    start_new_session=True,
-                    preexec_fn=_die_with_supervisor,
-                )
-            except Exception as exc:
-                _write_json_0600(status_path, {
-                    "state": "spawn_failed",
-                    "supervisor_pid": supervisor_pid,
-                    "exit_code": 126,
-                    "error": f"{type(exc).__name__}:{exc}"[:500],
-                    "started_at_epoch": started_epoch,
-                    "finished_at_epoch": time.time(),
-                    "timeout_seconds": timeout,
-                })
-                return 126
-
-            child_start_ticks = _pid_start_ticks(child.pid)
-            heartbeat_seq = 0
-            last_stdout_bytes = _file_size(out)
-            last_stderr_bytes = _file_size(err)
-            last_output_change_epoch = started_epoch
-            next_heartbeat_monotonic = time.monotonic()
+        try:
+            child = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=os.environ.copy(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                preexec_fn=_die_with_supervisor,
+            )
+        except Exception as exc:
             _write_json_0600(status_path, {
-                "state": "running",
+                "state": "spawn_failed",
                 "supervisor_pid": supervisor_pid,
-                "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
-                "child_pid": child.pid,
-                "child_pid_start_ticks": child_start_ticks,
-                "started_at_epoch": started_epoch,
-                "deadline_epoch": deadline_epoch,
-                "timeout_seconds": timeout,
-                "heartbeat_seq": heartbeat_seq,
-                "heartbeat_at_epoch": time.time(),
-                "stdout_bytes": last_stdout_bytes,
-                "stderr_bytes": last_stderr_bytes,
-                "last_output_change_epoch": last_output_change_epoch,
-            })
-            final_state = "exited"
-            while True:
-                returncode = child.poll()
-                if returncode is not None:
-                    break
-                if cancel_requested or cancel_path.exists():
-                    final_state = "cancelled"
-                    returncode = _terminate_child(child)
-                    break
-                if time.monotonic() >= deadline_monotonic:
-                    final_state = "timed_out"
-                    returncode = _terminate_child(child)
-                    break
-                now_monotonic = time.monotonic()
-                if now_monotonic >= next_heartbeat_monotonic:
-                    # Heartbeat is a supervisor-owned liveness signal only --
-                    # it never touches task lifecycle/updated_at and is
-                    # orthogonal to "state" (semantic progress), which is
-                    # still set exclusively by the transitions above/below.
-                    stdout_bytes = _file_size(out)
-                    stderr_bytes = _file_size(err)
-                    if stdout_bytes != last_stdout_bytes or stderr_bytes != last_stderr_bytes:
-                        last_output_change_epoch = time.time()
-                        last_stdout_bytes = stdout_bytes
-                        last_stderr_bytes = stderr_bytes
-                    heartbeat_seq += 1
-                    _write_json_0600(status_path, {
-                        "state": "running",
-                        "supervisor_pid": supervisor_pid,
-                        "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
-                        "child_pid": child.pid,
-                        "child_pid_start_ticks": child_start_ticks,
-                        "started_at_epoch": started_epoch,
-                        "deadline_epoch": deadline_epoch,
-                        "timeout_seconds": timeout,
-                        "heartbeat_seq": heartbeat_seq,
-                        "heartbeat_at_epoch": time.time(),
-                        "stdout_bytes": last_stdout_bytes,
-                        "stderr_bytes": last_stderr_bytes,
-                        "last_output_change_epoch": last_output_change_epoch,
-                    })
-                    next_heartbeat_monotonic = now_monotonic + heartbeat_interval
-                time.sleep(POLL_SECONDS)
-
-            _write_json_0600(status_path, {
-                "state": final_state,
-                "supervisor_pid": supervisor_pid,
-                "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
-                "child_pid": child.pid,
-                "child_pid_start_ticks": child_start_ticks,
-                "exit_code": returncode,
+                "exit_code": 126,
+                "error": f"{type(exc).__name__}:{exc}"[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),
                 "timeout_seconds": timeout,
-                "heartbeat_seq": heartbeat_seq,
-                "heartbeat_at_epoch": time.time(),
-                "stdout_bytes": _file_size(out),
-                "stderr_bytes": _file_size(err),
-                "last_output_change_epoch": last_output_change_epoch,
             })
+            return 126
+
+        assert child.stdout is not None and child.stderr is not None
+        stdout_capture = _BoundedTailWriter(stdout_path, max_output_bytes)
+        stderr_capture = _BoundedTailWriter(stderr_path, max_output_bytes)
+        capture_threads = [
+            threading.Thread(target=stdout_capture.drain, args=(child.stdout,), daemon=True),
+            threading.Thread(target=stderr_capture.drain, args=(child.stderr,), daemon=True),
+        ]
+        for capture_thread in capture_threads:
+            capture_thread.start()
+
+        child_start_ticks = _pid_start_ticks(child.pid)
+        heartbeat_seq = 0
+        last_stdout_bytes = _file_size(stdout_path)
+        last_stderr_bytes = _file_size(stderr_path)
+        last_output_change_epoch = started_epoch
+        next_heartbeat_monotonic = time.monotonic()
+        _write_json_0600(status_path, {
+            "state": "running",
+            "supervisor_pid": supervisor_pid,
+            "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
+            "child_pid": child.pid,
+            "child_pid_start_ticks": child_start_ticks,
+            "started_at_epoch": started_epoch,
+            "deadline_epoch": deadline_epoch,
+            "timeout_seconds": timeout,
+            "heartbeat_seq": heartbeat_seq,
+            "heartbeat_at_epoch": time.time(),
+            "stdout_bytes": last_stdout_bytes,
+            "stderr_bytes": last_stderr_bytes,
+            "last_output_change_epoch": last_output_change_epoch,
+        })
+        final_state = "exited"
+        while True:
+            returncode = child.poll()
+            if returncode is not None:
+                break
+            if cancel_requested or cancel_path.exists():
+                final_state = "cancelled"
+                returncode = _terminate_child(child)
+                break
+            if time.monotonic() >= deadline_monotonic:
+                final_state = "timed_out"
+                returncode = _terminate_child(child)
+                break
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_heartbeat_monotonic:
+                # Heartbeat is a supervisor-owned liveness signal only --
+                # it never touches task lifecycle/updated_at and is
+                # orthogonal to "state" (semantic progress), which is
+                # still set exclusively by the transitions above/below.
+                stdout_bytes = _file_size(stdout_path)
+                stderr_bytes = _file_size(stderr_path)
+                if stdout_bytes != last_stdout_bytes or stderr_bytes != last_stderr_bytes:
+                    last_output_change_epoch = time.time()
+                    last_stdout_bytes = stdout_bytes
+                    last_stderr_bytes = stderr_bytes
+                heartbeat_seq += 1
+                _write_json_0600(status_path, {
+                    "state": "running",
+                    "supervisor_pid": supervisor_pid,
+                    "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
+                    "child_pid": child.pid,
+                    "child_pid_start_ticks": child_start_ticks,
+                    "started_at_epoch": started_epoch,
+                    "deadline_epoch": deadline_epoch,
+                    "timeout_seconds": timeout,
+                    "heartbeat_seq": heartbeat_seq,
+                    "heartbeat_at_epoch": time.time(),
+                    "stdout_bytes": last_stdout_bytes,
+                    "stderr_bytes": last_stderr_bytes,
+                    "last_output_change_epoch": last_output_change_epoch,
+                })
+                next_heartbeat_monotonic = now_monotonic + heartbeat_interval
+            time.sleep(POLL_SECONDS)
+
+        for capture_thread in capture_threads:
+            capture_thread.join(timeout=KILL_GRACE_SECONDS)
+        capture_errors = [
+            value for value in (stdout_capture.error, stderr_capture.error) if value
+        ]
+        final_stdout_bytes = _file_size(stdout_path)
+        final_stderr_bytes = _file_size(stderr_path)
+        if (
+            final_stdout_bytes != last_stdout_bytes
+            or final_stderr_bytes != last_stderr_bytes
+        ):
+            last_output_change_epoch = time.time()
+        _write_json_0600(status_path, {
+            "state": final_state,
+            "supervisor_pid": supervisor_pid,
+            "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
+            "child_pid": child.pid,
+            "child_pid_start_ticks": child_start_ticks,
+            "exit_code": returncode,
+            "started_at_epoch": started_epoch,
+            "finished_at_epoch": time.time(),
+            "timeout_seconds": timeout,
+            "heartbeat_seq": heartbeat_seq,
+            "heartbeat_at_epoch": time.time(),
+            "stdout_bytes": final_stdout_bytes,
+            "stderr_bytes": final_stderr_bytes,
+            "stdout_dropped_bytes": stdout_capture.dropped_bytes,
+            "stderr_dropped_bytes": stderr_capture.dropped_bytes,
+            "capture_errors": capture_errors,
+            "last_output_change_epoch": last_output_change_epoch,
+        })
     except Exception as exc:
         if child is not None and child.poll() is None:
             _terminate_child(child)

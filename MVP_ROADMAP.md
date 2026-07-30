@@ -206,7 +206,13 @@ do not override this current priority ledger.
             restore/delayed-purge support with exact identity revalidation.
       - [ ] Attribute/prune stale shared-worktree registrations and execute the
             explicit legacy quarantine after owner confirmation.
-      - [ ] Rotate/stream the terminal ledger and bound each worker stdout log.
+      - [x] Rotate the active terminal ledger before 48 MiB, stream immutable
+            rotations instead of whole-file reads, include every segment in
+            storage accounting, and bound each production worker stdout/stderr
+            tail to 16 MiB with explicit dropped-byte evidence. Canonical local
+            evidence: focused ledger/supervisor/launcher/retention regression
+            (`37 passed`), complete Python suite (`1530 passed, 18 skipped`)
+            and complete 24-file extension suite on 2026-07-30.
       - [ ] Bind deterministic verification to claim epoch and separate DAG-
             dependency blocking from lifecycle-blocked counts.
       - [x] Discover and execute every extension `*.test.js` sequentially;

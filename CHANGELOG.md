@@ -16,6 +16,10 @@ noted by package/extension version and release tag.
   logs, orphan request files and repository/shared worktree populations.
 - Added reversible quarantine, restore and delayed purge for the aged legacy
   root `logs/` store, guarded by an exact preview identity and confirmation.
+- Added immutable process-ledger rotation at 48 MiB with streaming readers and
+  complete rotated-segment storage accounting.
+- Added 16 MiB per-stream worker output bounds that retain the newest stdout
+  and stderr tail and record dropped-byte evidence in supervisor status.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.

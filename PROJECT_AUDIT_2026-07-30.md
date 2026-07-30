@@ -243,6 +243,10 @@ rewritten after remediation.
 - **P1-3 lifecycle closed, cleanup pending confirmation:** the 3.84 GB aged
   legacy `logs/` store is now one exact preview candidate with reversible
   quarantine/restore and delayed purge; no data was moved automatically.
-- **Shared-worktree attribution/pruning, P2-4/P2-5, P2-6/P2-7 and
+- **P2-4/P2-5 closed:** the active process ledger rotates before 48 MiB and all
+  immutable segments are streamed and storage-accounted. Production worker
+  stdout and stderr are independently bounded to a 16 MiB latest-tail file;
+  truncation and dropped-byte counts are explicit supervisor evidence.
+- **Shared-worktree attribution/pruning, P2-6/P2-7 and
   P3-9/P3-10 remain open** and are tracked in `MVP_ROADMAP.md` in
   operational-risk order.

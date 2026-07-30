@@ -1,7 +1,8 @@
 """Repository-bound retention for terminal worker output files.
 
-The append-only process event ledger is canonical evidence and is never moved
-or rewritten here.  Only the four per-request files owned by a terminal run
+The append-only process event ledger is canonical evidence; its bounded active
+file and immutable rotations are never cleanup candidates here. Only the four
+per-request files owned by a terminal run
 may enter quarantine, and only after the task store independently confirms the
 task itself is finished or archived.  Active, review, blocked, pending,
 unknown and recent runs fail closed.
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import repo_policy, task_store
+from . import process_event_ledger, repo_policy, task_store
 
 
 SCHEMA_ID = "aiworkhub.terminal_log_retention.v1"
@@ -34,6 +35,8 @@ LEGACY_PROCESS_FILES_RELATIVE_PATH = Path("logs/processes")
 MANIFEST_NAME = "manifest.json"
 UNDO_DAYS = 7
 KEEP_LAST_PER_TASK = 10
+# Compatibility constant for callers/tests.  Writers rotate at 48 MiB and the
+# reader streams every immutable segment, so this is no longer a failure cap.
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 
@@ -116,25 +119,17 @@ def _latest_rows(root: Path) -> dict[str, dict[str, Any]]:
     try:
         info = ledger.lstat()
     except FileNotFoundError:
-        return {}
+        if not process_event_ledger.ledger_paths(ledger):
+            return {}
+        info = None
     except OSError as exc:
         raise TerminalLogRetentionError("terminal_log_ledger_unavailable") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    if info is not None and (
+        stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+    ):
         raise TerminalLogRetentionError("terminal_log_ledger_invalid")
-    if info.st_size > MAX_LEDGER_BYTES:
-        raise TerminalLogRetentionError("terminal_log_ledger_too_large")
     latest: dict[str, dict[str, Any]] = {}
-    try:
-        lines = ledger.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise TerminalLogRetentionError("terminal_log_ledger_unreadable") from exc
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
+    for row in process_event_ledger.iter_events(ledger):
         request_id = str(row.get("request_id") or "")
         if not _REQUEST_RE.fullmatch(request_id):
             continue
@@ -178,15 +173,10 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         for item in files
     )
     ledger_path = root / PROCESS_LOG_RELATIVE_PATH
-    try:
-        ledger_info = ledger_path.lstat()
-        ledger_bytes = (
-            int(ledger_info.st_size)
-            if stat.S_ISREG(ledger_info.st_mode) and not stat.S_ISLNK(ledger_info.st_mode)
-            else 0
-        )
-    except OSError:
-        ledger_bytes = 0
+    ledger_bytes = sum(
+        int(path.stat().st_size)
+        for path in process_event_ledger.ledger_paths(ledger_path)
+    )
     latest_rows = _latest_rows(root)
     for request_id, row in latest_rows.items():
         task_id = str(row.get("task_id") or "")
