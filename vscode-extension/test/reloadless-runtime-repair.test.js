@@ -84,6 +84,7 @@ class FakeChild extends EventEmitter {
         "aiworkhub_dashboard_memory",
         "aiworkhub_dashboard_sessions",
         "aiworkhub_dashboard_kb",
+        "aiworkhub_dashboard_settings",
       ].filter((name) => !this.generation.missingTools.includes(name));
       this._send({ tools: names.map((name) => ({ name })) }, message.id);
       return;

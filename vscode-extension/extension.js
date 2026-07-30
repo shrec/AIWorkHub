@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.0";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.1";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -33,6 +33,8 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestMemory",
   "requestSessions",
   "requestKb",
+  "requestSettings",
+  "updateFeatureSetting",
   "requestStorageCleanup",
   "requestStorageRegistrationPrune",
   "requestStorageRestore",
@@ -60,6 +62,7 @@ const OUTBOUND_TYPES = Object.freeze({
   memory: "memory",
   sessions: "sessions",
   kb: "kb",
+  settings: "settings",
 });
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
@@ -117,7 +120,16 @@ const DASHBOARD_TOOLS = Object.freeze({
   memory: "aiworkhub_dashboard_memory",
   sessions: "aiworkhub_dashboard_sessions",
   kb: "aiworkhub_dashboard_kb",
+  settings: "aiworkhub_dashboard_settings",
 });
+const SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update";
+const FEATURE_SETTING_KEYS = new Set([
+  "source_graph",
+  "session_manager",
+  "ai_memory",
+  "knowledge_base",
+  "context_graph",
+]);
 const STORAGE_RETENTION_TOOLS = Object.freeze({
   preview: "aiworkhub_dashboard_storage_retention_preview",
   quarantine: "aiworkhub_dashboard_storage_quarantine",
@@ -4269,6 +4281,48 @@ async function pushKb(view) {
   }
 }
 
+async function pushSettings(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(DASHBOARD_TOOLS.settings, {});
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.settings, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function updateFeatureSetting(view, feature, enabled, expectedRevision) {
+  if (!FEATURE_SETTING_KEYS.has(feature) || typeof enabled !== "boolean" ||
+      !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_feature_setting_update" });
+    return;
+  }
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(SETTINGS_UPDATE_TOOL, {
+      changes: { [feature]: enabled },
+      expected_revision: expectedRevision,
+    });
+    if (!payload || payload.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (payload && payload.error) || "feature_setting_update_failed" });
+      await pushSettings(view);
+      return;
+    }
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.settings, payload: sanitizeWebviewPayload(payload) });
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: `${feature.replaceAll("_", " ")} ${enabled ? "enabled" : "disabled"}` });
+      await pushSnapshot(view);
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+    await pushSettings(view);
+  }
+}
+
 async function runStorageCleanup(view) {
   try {
     const client = getMcpClient();
@@ -4584,7 +4638,8 @@ async function pushInitializeStorage(view) {
       SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted,
       {},
     );
-    if (!sourceGraphStart || sourceGraphStart.ok !== true || sourceGraphStart.daemon_started !== true) {
+    if (!sourceGraphStart || sourceGraphStart.ok !== true ||
+        (sourceGraphStart.daemon_started !== true && sourceGraphStart.status !== "disabled")) {
       const reason = String((sourceGraphStart && (sourceGraphStart.reason || sourceGraphStart.error || sourceGraphStart.status)) || "source_graph_start_failed");
       outputChannel.appendLine(`[source-graph] post-init automatic index start failed: ${sanitizeErrorMessage(reason)}`);
       view.postMessage({ type: OUTBOUND_TYPES.error, message: `source_graph_start_failed:${sanitizeErrorMessage(reason)}` });
@@ -4607,6 +4662,9 @@ function handleInboundMessage(view, message) {
   }
   switch (message.type) {
     case "ready":
+      pushSettings(view);
+      pushSnapshot(view);
+      break;
     case "refresh":
       pushSnapshot(view);
       break;
@@ -4683,6 +4741,17 @@ function handleInboundMessage(view, message) {
       break;
     case "requestKb":
       pushKb(view);
+      break;
+    case "requestSettings":
+      pushSettings(view);
+      break;
+    case "updateFeatureSetting":
+      updateFeatureSetting(
+        view,
+        String(message.feature || ""),
+        message.enabled,
+        Number(message.expectedRevision),
+      );
       break;
     case "requestStorageCleanup":
       runStorageCleanup(view);
@@ -4936,6 +5005,9 @@ function getHtmlForWebview(webview, extensionUri) {
         <button class="diagnostic-icon-button" type="button" id="open-kb" title="Open Knowledge Base" aria-label="Open Knowledge Base">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/></svg><span>KB</span>
         </button>
+        <button class="diagnostic-icon-button" type="button" id="open-settings" title="Open repository settings" aria-label="Open repository settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM19 12l2-1-2-3-2 .5-1.5-1L15 5h-6L8 7.5l-1.5 1L4 8l-1 3 2 1v2l-2 1 1 3 2.5-.5 1.5 1L9 21h6l1-2.5 1.5-1L20 18l1-3-2-1z"/></svg><span>Settings</span>
+        </button>
       </span>
     </section>
 
@@ -5171,6 +5243,17 @@ function getHtmlForWebview(webview, extensionUri) {
     </div>
     <input class="dialog-search" id="kb-search" type="search" placeholder="Filter key, title, category, tags or body" aria-label="Filter Knowledge Base entries">
     <div class="memory-list" id="kb-list"></div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog settings-dialog" id="settings-dialog">
+    <div class="dialog-heading">
+      <div><h2>Repository Settings</h2><span id="settings-summary">Loading repository feature settings</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="settings-dialog">Close</button>
+    </div>
+    <div class="settings-list" id="settings-list">
+      <div class="panel-state">Loading settings</div>
+    </div>
+    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>. Task orchestration and callback routing remain protected core services.</div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

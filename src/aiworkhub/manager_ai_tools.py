@@ -15,6 +15,7 @@ from typing import Any, Callable
 from . import core
 from . import context_writes
 from . import context_importer
+from . import feature_settings
 from . import storage_registry
 from . import workforce_catalog
 from . import workforce_router
@@ -196,6 +197,9 @@ def session_write(
     *, action: context_writes.SessionAction, topic: str, content: str,
     idempotency_key: str, provenance: str,
 ) -> dict[str, Any]:
+    context, manager = _manager_context(topic=topic)
+    if context is not None and not feature_settings.enabled(context.authority_repo, "session_manager"):
+        return {**feature_settings.disabled_result("session_manager"), "manager": manager, "surface": "manager_mcp"}
     return _write_invoke(
         lambda repo, actor: context_writes.session_write(
             repo, actor=actor, action=action, topic=topic, content=content,
@@ -210,6 +214,9 @@ def ai_memory_write(
     tags: str = "", scope: str = "project", idempotency_key: str,
     provenance: str,
 ) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is not None and not feature_settings.enabled(context.authority_repo, "ai_memory"):
+        return {**feature_settings.disabled_result("ai_memory"), "manager": manager, "surface": "manager_mcp"}
     return _write_invoke(
         lambda repo, actor: context_writes.memory_write(
             repo, actor=actor, action=action, key=key, value=value, tags=tags,
@@ -223,6 +230,9 @@ def kb_write(
     category: str = "", tags: str = "", source_refs: str = "",
     replacement_key: str = "", idempotency_key: str, provenance: str,
 ) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is not None and not feature_settings.enabled(context.authority_repo, "knowledge_base"):
+        return {**feature_settings.disabled_result("knowledge_base"), "manager": manager, "surface": "manager_mcp"}
     return _write_invoke(
         lambda repo, actor: context_writes.kb_write(
             repo, actor=actor, action=action, key=key, title=title, body=body,

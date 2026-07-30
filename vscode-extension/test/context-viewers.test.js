@@ -14,16 +14,24 @@ for (const marker of [
   'id="open-sessions"',
   'id="open-ai-memory"',
   'id="open-kb"',
+  'id="open-settings"',
   'id="sessions-dialog"',
   'id="kb-dialog"',
+  'id="settings-dialog"',
 ]) {
   assert.ok(extension.includes(marker), `missing context viewer marker: ${marker}`);
 }
 
 assert.ok(extension.includes('sessions: "aiworkhub_dashboard_sessions"'));
 assert.ok(extension.includes('kb: "aiworkhub_dashboard_kb"'));
+assert.ok(extension.includes('settings: "aiworkhub_dashboard_settings"'));
+assert.ok(extension.includes('SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update"'));
 assert.ok(app.includes("function renderSessions(payload)"));
 assert.ok(app.includes("function renderKb(payload)"));
 assert.ok(app.includes('type: "requestSessions"'));
 assert.ok(app.includes('type: "requestKb"'));
+assert.ok(app.includes('type: "requestSettings"'));
+assert.ok(app.includes('type: "updateFeatureSetting"'));
+assert.ok(app.includes("function renderSettings(payload)"));
 assert.ok(css.includes(".diagnostic-icon-button svg"));
+assert.ok(css.includes(".settings-row"));

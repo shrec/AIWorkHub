@@ -4433,6 +4433,18 @@ def source_graph_ensure_started() -> dict[str, Any]:
             "reason": readiness.reason,
             "repo": str(root),
         }
+    from . import feature_settings
+
+    if not feature_settings.enabled(root, "source_graph"):
+        stopped = _source_graph_daemon_module().stop_daemon(root)
+        return {
+            "ok": True,
+            "status": "disabled",
+            "daemon_started": False,
+            "stopped": stopped,
+            "reason": "disabled_by_repository_settings",
+            "repo": str(root),
+        }
     module = _source_graph_daemon_module()
     daemon = module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
     health = daemon.health()
@@ -4449,6 +4461,16 @@ def source_graph_health() -> dict[str, Any]:
     """READ-ONLY: Source Graph indexing daemon health for the active
     repository (indexing/ready/degraded, last report/error/time)."""
     root = repo_root()
+    from . import feature_settings
+
+    if not feature_settings.enabled(root, "source_graph"):
+        return {
+            "ok": True,
+            "status": "disabled",
+            "running": False,
+            "reason": "disabled_by_repository_settings",
+            "repo": str(root),
+        }
     return _source_graph_daemon_module().daemon_health(root)
 
 
@@ -4457,6 +4479,16 @@ def source_graph_refresh_now() -> dict[str, Any]:
     non-overlapping with the periodic loop. Starts the daemon first if it
     is not registered yet, but only for an already-initialized repository."""
     root = repo_root()
+    from . import feature_settings
+
+    if not feature_settings.enabled(root, "source_graph"):
+        return {
+            "ok": True,
+            "status": "disabled",
+            "triggered": False,
+            "reason": "disabled_by_repository_settings",
+            "repo": str(root),
+        }
     readiness = task_store.storage_readiness(root)
     if not readiness.ready:
         return {

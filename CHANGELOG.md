@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-30
+
+### Added
+
+- Added a repository-local Settings dialog for Source Graph, Session Manager,
+  AI Memory, Knowledge Base and the upcoming Context Graph runtime.
+- Added an optimistic revision-guarded `.aiworkhub/config/features.json`
+  contract so concurrent VS Code windows cannot silently overwrite settings.
+
+### Changed
+
+- Source Graph settings now control the real repo-bound daemon lifecycle;
+  disabling stops indexing and tool calls fail explicitly until re-enabled.
+- Session Manager, AI Memory and Knowledge Base model tools now honor their
+  repository feature switches while task orchestration and callback routing
+  remain protected core services.
+
 ### Added
 
 - Added a tracked repository quality policy with portable `{python}` command

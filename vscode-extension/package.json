@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-native AI orchestration for VS Code: plan work, coordinate models, query source intelligence, preserve context and verify results.",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publisher": "shrec",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",

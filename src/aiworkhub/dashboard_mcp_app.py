@@ -23,6 +23,7 @@ from aiworkhub import (
     __version__,
     core,
     dashboard,
+    feature_settings,
     process_launcher,
     repository_bootstrap,
     shared_router,
@@ -119,6 +120,40 @@ def _storage_write_authority_flags() -> dict[str, bool]:
         "agent_launch": False,
         "shell_invocation": False,
     }
+
+
+def settings_view() -> dict[str, Any]:
+    """READ-ONLY: repository-local feature switches and capabilities."""
+    try:
+        result = feature_settings.load(core.repo_root())
+    except feature_settings.FeatureSettingsError as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    result["server_tool"] = "aiworkhub_dashboard_settings"
+    result["authority_flags"] = _readonly_authority_flags()
+    return result
+
+
+def settings_update_view(changes: dict[str, bool], expected_revision: int) -> dict[str, Any]:
+    """USER WRITE: atomically update bounded repository feature switches."""
+    root = core.repo_root()
+    try:
+        result = feature_settings.update(
+            root,
+            changes=changes,
+            expected_revision=expected_revision,
+        )
+        if "source_graph" in changes:
+            lifecycle = (
+                core.source_graph_ensure_started()
+                if changes["source_graph"]
+                else core.source_graph_stop()
+            )
+            result["source_graph_lifecycle"] = lifecycle
+    except (feature_settings.FeatureSettingsError, OSError, ValueError) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    result["server_tool"] = "aiworkhub_dashboard_settings_update"
+    result["authority_flags"] = _storage_write_authority_flags()
+    return result
 
 
 def _byte_len(payload: Mapping[str, Any]) -> int:
@@ -831,6 +866,10 @@ SESSION_TOOL_NAME = "aiworkhub_dashboard_sessions"
 SESSION_TOOLS: dict[str, Any] = {SESSION_TOOL_NAME: session_view}
 KB_TOOL_NAME = "aiworkhub_dashboard_kb"
 KB_TOOLS: dict[str, Any] = {KB_TOOL_NAME: kb_view}
+SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
+SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
+SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
+SETTINGS_UPDATE_TOOLS: dict[str, Any] = {SETTINGS_UPDATE_TOOL_NAME: settings_update_view}
 STORAGE_RETENTION_PREVIEW_TOOL_NAME = "aiworkhub_dashboard_storage_retention_preview"
 STORAGE_RETENTION_READ_TOOLS: dict[str, Any] = {
     STORAGE_RETENTION_PREVIEW_TOOL_NAME: storage_retention_preview_view,
@@ -875,6 +914,10 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in KB_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in SETTINGS_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in SETTINGS_UPDATE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_READ_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_WRITE_TOOLS.items():
@@ -890,10 +933,12 @@ def register(mcp: Any) -> tuple[str, ...]:
         MEMORY_TOOL_NAME,
         SESSION_TOOL_NAME,
         KB_TOOL_NAME,
+        SETTINGS_TOOL_NAME,
         STORAGE_RETENTION_PREVIEW_TOOL_NAME,
         TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
     ) + (
         tuple(STORAGE_RETENTION_WRITE_TOOLS)
         + tuple(TERMINAL_LOG_RETENTION_WRITE_TOOLS)
+        + tuple(SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)
     )

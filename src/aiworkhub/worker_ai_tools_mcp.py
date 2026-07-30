@@ -741,6 +741,10 @@ def source_graph_query(
     """
 
     tool = "source_graph"
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "source_graph"):
+        return feature_settings.disabled_result("source_graph")
     if mode not in SOURCE_GRAPH_MODES:
         result = _violation(ctx, tool, f"invalid_mode:{mode}")
         result["allowed_modes"] = list(SOURCE_GRAPH_MODES)
@@ -853,6 +857,10 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     """
 
     tool = "session_current_state"
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "session_manager"):
+        return feature_settings.disabled_result("session_manager")
     try:
         limit = max(MIN_LIMIT, min(int(limit), MAX_LIMIT))
     except (TypeError, ValueError):
@@ -929,6 +937,10 @@ def ai_memory_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> d
     """
 
     tool = "ai_memory"
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "ai_memory"):
+        return feature_settings.disabled_result("ai_memory")
     bounded = _bounded_query(query)
     if bounded is None:
         return _violation(ctx, tool, "invalid_query")
@@ -1052,11 +1064,19 @@ def _ai_memory_exact(ctx: WorkerToolContext, *, key: str, related: bool) -> dict
 
 def ai_memory_get(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
     """Bounded exact lookup of one active canonical AI Memory entry."""
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "ai_memory"):
+        return feature_settings.disabled_result("ai_memory")
     return _ai_memory_exact(ctx, key=key, related=False)
 
 
 def ai_memory_related(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
     """Bounded active memories sharing one or more normalized tags."""
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "ai_memory"):
+        return feature_settings.disabled_result("ai_memory")
     return _ai_memory_exact(ctx, key=key, related=True)
 
 
@@ -1165,6 +1185,10 @@ def _kb_query(con: sqlite3.Connection, *, subcommand: str, argument: str) -> dic
 def kb_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> dict[str, Any]:
     """Bounded KB full-text search."""
 
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "knowledge_base"):
+        return feature_settings.disabled_result("knowledge_base")
     del limit  # kb.py search's own --limit is fixed at 8 by _kb_invoke; kept for a stable tool signature
     return _kb_invoke(ctx, subcommand="search", argument=query, tool_label="kb")
 
@@ -1172,12 +1196,20 @@ def kb_search(ctx: WorkerToolContext, *, query: str, limit: int = 8) -> dict[str
 def kb_get(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
     """Bounded KB exact-key lookup."""
 
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "knowledge_base"):
+        return feature_settings.disabled_result("knowledge_base")
     return _kb_invoke(ctx, subcommand="get", argument=key, tool_label="kb")
 
 
 def kb_related(ctx: WorkerToolContext, *, key: str) -> dict[str, Any]:
     """Bounded KB related-entries lookup."""
 
+    from . import feature_settings
+
+    if not feature_settings.enabled(ctx.authority_repo, "knowledge_base"):
+        return feature_settings.disabled_result("knowledge_base")
     return _kb_invoke(ctx, subcommand="related", argument=key, tool_label="kb")
 
 
@@ -1191,6 +1223,15 @@ def _context_write_intent(
     verified manager owns disposition and canonical application.
     """
 
+    from . import feature_settings
+
+    feature = {
+        "session": "session_manager",
+        "memory": "ai_memory",
+        "kb": "knowledge_base",
+    }.get(component)
+    if feature and not feature_settings.enabled(ctx.authority_repo, feature):
+        return feature_settings.disabled_result(feature)
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
         return {"ok": False, "error": "worker_context_intent_runtime_unavailable"}
     # Lazy by design: minimal/bundled read-only worker packages used for

@@ -44,6 +44,7 @@ const state = {
   memoryEntries: [],
   sessionEntries: [],
   kbEntries: [],
+  featureSettings: null,
   returnPage: 0,
   returnSearch: "",
   returnTopic: "all",
@@ -145,6 +146,10 @@ const elements = {
   kbSummary: document.querySelector("#kb-summary"),
   kbSearch: document.querySelector("#kb-search"),
   kbList: document.querySelector("#kb-list"),
+  openSettings: document.querySelector("#open-settings"),
+  settingsDialog: document.querySelector("#settings-dialog"),
+  settingsSummary: document.querySelector("#settings-summary"),
+  settingsList: document.querySelector("#settings-list"),
   returnList: document.querySelector("#return-list"),
   returnSearch: document.querySelector("#return-search"),
   returnTopic: document.querySelector("#return-topic"),
@@ -2619,6 +2624,53 @@ function requestTaskDetail(taskId) {
   startLiveOutputPolling(taskId);
 }
 
+const FEATURE_LABELS = Object.freeze({
+  source_graph: ["Source Graph", "Indexes and retrieves repository source structure. Disabling stops the repository daemon."],
+  session_manager: ["Session Manager", "Preserves checkpoints and active development continuity."],
+  ai_memory: ["AI Memory", "Stores and retrieves durable project lessons and decisions."],
+  knowledge_base: ["Knowledge Base", "Provides authoritative repository facts and contracts."],
+  context_graph: ["Context Graph", "Transcript-linked operational graph. The switch is ready; runtime support is the next milestone."],
+});
+
+function renderSettings(payload) {
+  if (!payload || payload.ok !== true || !payload.features) {
+    state.featureSettings = null;
+    elements.settingsSummary.textContent = (payload && payload.error) || "Settings unavailable";
+    elements.settingsList.replaceChildren(Object.assign(document.createElement("div"), {
+      className: "panel-state error-state",
+      textContent: "Repository settings could not be loaded",
+    }));
+    return;
+  }
+  state.featureSettings = payload;
+  elements.settingsSummary.textContent = `Repository-local · revision ${Number(payload.revision || 0)}`;
+  const fragment = document.createDocumentFragment();
+  for (const [key, [label, description]] of Object.entries(FEATURE_LABELS)) {
+    const row = document.createElement("label");
+    row.className = "settings-row";
+    const copy = document.createElement("span");
+    copy.className = "settings-copy";
+    const title = document.createElement("strong");
+    title.textContent = label;
+    const detail = document.createElement("small");
+    detail.textContent = description;
+    copy.append(title, detail);
+    const control = document.createElement("span");
+    control.className = "switch-control";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(payload.features[key]);
+    input.dataset.featureSetting = key;
+    input.setAttribute("aria-label", `${label} enabled`);
+    const track = document.createElement("span");
+    track.className = "switch-track";
+    control.append(input, track);
+    row.append(copy, control);
+    fragment.append(row);
+  }
+  elements.settingsList.replaceChildren(fragment);
+}
+
 // ── Fixed-enum inbound message handling from the extension host ───────────
 window.addEventListener("message", (event) => {
   const message = event.data;
@@ -2682,6 +2734,9 @@ window.addEventListener("message", (event) => {
       break;
     case "kb":
       renderKb(message.payload);
+      break;
+    case "settings":
+      renderSettings(message.payload);
       break;
     case "coordinatorTargets": {
       renderCoordinatorTargets(message.payload);
@@ -2917,6 +2972,24 @@ elements.openKb.addEventListener("click", () => {
   elements.kbDialog.showModal();
   elements.kbSummary.textContent = "Loading repository knowledge";
   vscode.postMessage({ type: "requestKb" });
+});
+
+elements.openSettings.addEventListener("click", () => {
+  elements.settingsDialog.showModal();
+  elements.settingsSummary.textContent = "Loading repository feature settings";
+  vscode.postMessage({ type: "requestSettings" });
+});
+
+elements.settingsList.addEventListener("change", (event) => {
+  const input = event.target.closest("[data-feature-setting]");
+  if (!input || !state.featureSettings) return;
+  input.disabled = true;
+  vscode.postMessage({
+    type: "updateFeatureSetting",
+    feature: input.dataset.featureSetting,
+    enabled: Boolean(input.checked),
+    expectedRevision: Number(state.featureSettings.revision || 0),
+  });
 });
 
 elements.kbSearch.addEventListener("input", renderKbEntries);
