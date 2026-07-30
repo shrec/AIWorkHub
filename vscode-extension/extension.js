@@ -4655,6 +4655,7 @@ function getHtmlForWebview(webview, extensionUri) {
               <button type="button" role="tab" aria-selected="true" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runners" id="tab-runners" data-tab="runners">Runners</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-plan" id="tab-plan" data-tab="plan">Plan DAG</button>
+              <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-workforce" id="tab-workforce" data-tab="workforce">Workforce</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-usage" id="tab-usage" data-tab="usage">Usage</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-tool-use" id="tab-tool-use" data-tab="tool-use">Tool Use</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-storage" id="tab-storage" data-tab="storage">Storage</button>
@@ -4672,6 +4673,9 @@ function getHtmlForWebview(webview, extensionUri) {
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-plan" aria-labelledby="tab-plan" hidden>
             <div id="plan-dag"></div>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-workforce" aria-labelledby="tab-workforce" hidden>
+            <div id="workforce-list"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" hidden>
             <div class="stat-list" id="usage-list"></div>

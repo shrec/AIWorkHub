@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import repo_policy, source_graph, source_graph_daemon, task_store
+from . import repo_policy, source_graph, source_graph_daemon, task_store, workforce_catalog
 
 
 def canonicalize_workspace_root(root: str | Path) -> Path:
@@ -87,6 +87,8 @@ def initialize_repository_full(
     # the user's retained policy without overwriting it.
     _policy_path, policy_created = repo_policy.ensure_policy(repo_root)
     provisioned.append("repo_policy" if policy_created else "repo_policy_verified")
+    _workforce_path, workforce_created = workforce_catalog.ensure_catalog(repo_root)
+    provisioned.append("workforce_catalog" if workforce_created else "workforce_catalog_verified")
 
     # The one authority this wrapper adds beyond task_store's own call:
     # ensure the Source Graph database directory exists. resolve_db_path

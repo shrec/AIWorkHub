@@ -255,6 +255,17 @@ Keep authentication surfaces truthful: VS Code/Copilot models use VS Code
 authorization; first-party Claude subscription use remains a distinct adapter
 and must never be mislabeled as Copilot Claude.
 
+**0.8.0 closure:** InitRepo provisions a bounded repository-local catalog and
+Manager MCP exposes audited upsert, evidence-backed inventory and explainable
+ranking. Runtime scoring joins only same-repository canonical task/process
+evidence (acceptance, review readiness, validation failure, retry, latency,
+tokens and observed cost); absent evidence uses a labeled conservative prior.
+Quota remains explicitly unavailable when the provider API does not expose it.
+The native dashboard displays each route's exact readiness state, whether model
+access was actually observed, outcome sample size and bounded manager score
+adjustment. First-party Claude, Codex, DeepSeek VS Code LM and GLM VS Code LM
+remain separate adapter identities.
+
 ### Environment preflight and policy as code
 
 Before launch, verify runtime, model access, repository identity, Source Graph,

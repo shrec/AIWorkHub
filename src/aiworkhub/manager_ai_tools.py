@@ -16,6 +16,8 @@ from . import core
 from . import context_writes
 from . import context_importer
 from . import storage_registry
+from . import workforce_catalog
+from . import workforce_router
 from . import worker_ai_tools_mcp as worker_tools
 
 
@@ -71,7 +73,7 @@ def _write_invoke(
     }
     try:
         result = dict(call(context.authority_repo, actor))
-    except context_writes.ContextWriteError as exc:
+    except (context_writes.ContextWriteError, workforce_catalog.WorkforceCatalogError) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
         result = {"ok": False, "error": f"context_write_failed:{type(exc).__name__}"}
@@ -126,6 +128,68 @@ def kb_get(*, key: str) -> dict[str, Any]:
 
 def kb_related(*, key: str) -> dict[str, Any]:
     return _invoke(lambda ctx: worker_tools.kb_related(ctx, key=key))
+
+
+def _workforce_process_rows(repo: Path) -> list[dict[str, Any]]:
+    """Read one authority repository's bounded process ledger without reconcile."""
+    # Import lazily: dashboard imports workforce_catalog during server
+    # bootstrap. Its reader is intentionally read-only and receives the exact
+    # authority repo's process log, avoiding the ambient/default ProcessManager
+    # that may belong to another VS Code window.
+    from . import dashboard
+
+    report = dashboard.read_process_runs(
+        process_log_path=(repo / ".aiworkhub/runtime/process_logs/process_events.jsonl"),
+        limit=1000,
+    )
+    return [dict(item) for item in report.get("processes") or [] if isinstance(item, dict)]
+
+
+def workforce_catalog_read() -> dict[str, Any]:
+    def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        return workforce_catalog.build_catalog(
+            ctx.authority_repo,
+            process_rows=_workforce_process_rows(ctx.authority_repo),
+        )
+
+    return _invoke(
+        call
+    )
+
+
+def workforce_rank(
+    *,
+    task_id: str,
+    kinds: list[str],
+    risk: str = "medium",
+    context_tokens: int = 0,
+    tool_needs: list[str] | None = None,
+    quality_floor: float = 0.0,
+) -> dict[str, Any]:
+    def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        task = workforce_router.TaskRequirements.build(
+            task_id=task_id,
+            repo_id=core.repository_current().get("repo_id") or "unknown",
+            kinds=kinds,
+            risk=risk,
+            context_tokens=context_tokens,
+            tool_needs=tool_needs or [],
+            quality_floor=quality_floor,
+        )
+        snapshot = workforce_catalog.build_catalog(
+            ctx.authority_repo,
+            process_rows=_workforce_process_rows(ctx.authority_repo),
+        )
+        return workforce_catalog.rank_task(ctx.authority_repo, task, catalog=snapshot)
+
+    return _invoke(call)
+
+
+def workforce_upsert(*, worker: dict[str, Any]) -> dict[str, Any]:
+    return _write_invoke(
+        lambda repo, actor: workforce_catalog.upsert_worker(repo, worker, actor=actor),
+        topic="workforce",
+    )
 
 
 def session_write(

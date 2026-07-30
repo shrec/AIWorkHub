@@ -30,6 +30,7 @@ from aiworkhub import (
     storage_observability,
     task_plan,
     task_store,
+    workforce_catalog,
 )
 
 
@@ -843,6 +844,14 @@ class DashboardProvider:
         """Unified repository, policy, Source Graph and provider readiness."""
         return repo_policy.build_preflight(self.repo_root)
 
+    def get_workforce_catalog(self) -> dict[str, Any]:
+        """Configured workforce joined to bounded canonical process evidence."""
+        process_report = read_process_runs(limit=5000)
+        return workforce_catalog.build_catalog(
+            self.repo_root,
+            process_rows=process_report.get("processes") or [],
+        )
+
     def get_callback_bridge_health(self) -> dict[str, Any]:
         """Read-only, redacted-safe callback bridge health: bound/unbound
         task counts and per-state outbox counts, sourced from the canonical
@@ -1130,6 +1139,16 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         })
         environment_preflight = {}
 
+    workforce_reader = getattr(data_provider, "get_workforce_catalog", lambda: {})
+    workforce = _safe_read("workforce_catalog", workforce_reader, errors, {})
+    if not isinstance(workforce, Mapping):
+        errors.append({
+            "source": "workforce_catalog",
+            "kind": "DashboardReadError",
+            "message": "workforce catalog provider returned a non-object",
+        })
+        workforce = {}
+
     callback_reader = getattr(
         data_provider,
         "get_callback_bridge_health",
@@ -1277,6 +1296,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "agent_processes": dict(process_report),
         "adapter_readiness": dict(adapter_readiness),
         "environment_preflight": dict(environment_preflight),
+        "workforce_catalog": dict(workforce),
         "source_graph_telemetry": _source_graph_telemetry(process_report),
         "project_context_telemetry": _project_context_telemetry(process_report),
         "callback_bridge_health": dict(callback_bridge_health),

@@ -349,6 +349,34 @@ def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_workforce_catalog() -> dict[str, Any]:
+    """MANAGER READ: configured models joined to observed canonical outcomes."""
+
+    return manager_ai_tools.workforce_catalog_read()
+
+
+@mcp.tool()
+def aiworkhub_manager_workforce_rank(
+    task_id: str,
+    kinds: list[str],
+    risk: str = "medium",
+    context_tokens: int = 0,
+    tool_needs: list[str] | None = None,
+    quality_floor: float = 0.0,
+) -> dict[str, Any]:
+    """MANAGER READ: explainable cheapest-capable routing from current evidence."""
+
+    return manager_ai_tools.workforce_rank(
+        task_id=task_id,
+        kinds=kinds,
+        risk=risk,
+        context_tokens=context_tokens,
+        tool_needs=tool_needs,
+        quality_floor=quality_floor,
+    )
+
+
+@mcp.tool()
 def aiworkhub_manager_session_write(
     action: context_writes.SessionAction,
     topic: str,
@@ -402,6 +430,37 @@ def aiworkhub_manager_kb_write(
         tags=tags, source_refs=source_refs, replacement_key=replacement_key,
         idempotency_key=idempotency_key, provenance=provenance,
     )
+
+
+@mcp.tool()
+def aiworkhub_manager_workforce_upsert(
+    worker_id: str,
+    adapter_id: str,
+    model: str,
+    provider: str,
+    supports: list[str],
+    tools: list[str] | None = None,
+    enabled: bool = True,
+    max_context_tokens: int = 0,
+    max_risk: str = "medium",
+    quality_ceiling: float = 1.0,
+    manager_score_adjustment: float = 0.0,
+) -> dict[str, Any]:
+    """MANAGER WRITE: audited bounded upsert of one repository worker model."""
+
+    return manager_ai_tools.workforce_upsert(worker={
+        "worker_id": worker_id,
+        "adapter_id": adapter_id,
+        "model": model,
+        "provider": provider,
+        "supports": supports,
+        "tools": tools or [],
+        "enabled": enabled,
+        "max_context_tokens": max_context_tokens,
+        "max_risk": max_risk,
+        "quality_ceiling": quality_ceiling,
+        "manager_score_adjustment": manager_score_adjustment,
+    })
 
 
 @mcp.tool()

@@ -243,8 +243,9 @@ class WorkerCapability:
     quality_ceiling: float = 1.0
     available: bool = True
     credential_ok: bool = True
-    quota_available: bool = True
+    quota_available: bool | None = None
     no_provider_override: bool = False
+    manager_score_adjustment: float = 0.0
     evidence: OutcomeEvidence = field(default_factory=OutcomeEvidence)
 
     @classmethod
@@ -262,8 +263,9 @@ class WorkerCapability:
         quality_ceiling: float = 1.0,
         available: bool = True,
         credential_ok: bool = True,
-        quota_available: bool = True,
+        quota_available: bool | None = None,
         no_provider_override: bool = False,
+        manager_score_adjustment: float = 0.0,
         evidence: OutcomeEvidence | None = None,
     ) -> "WorkerCapability":
         cleaned_supports = _clean_set(supports)
@@ -284,8 +286,9 @@ class WorkerCapability:
             quality_ceiling=_bounded_rate(quality_ceiling, 1.0),
             available=bool(available),
             credential_ok=bool(credential_ok),
-            quota_available=bool(quota_available),
+            quota_available=None if quota_available is None else bool(quota_available),
             no_provider_override=bool(no_provider_override),
+            manager_score_adjustment=max(-20.0, min(20.0, float(manager_score_adjustment or 0.0))),
             evidence=evidence or OutcomeEvidence(),
         )
 
@@ -304,6 +307,7 @@ class WorkerCapability:
             "credential_ok": self.credential_ok,
             "quota_available": self.quota_available,
             "no_provider_override": self.no_provider_override,
+            "manager_score_adjustment": self.manager_score_adjustment,
             "evidence": self.evidence.as_dict(),
         }
 
@@ -371,7 +375,7 @@ def _exclusion_reasons(task: TaskRequirements, worker: WorkerCapability) -> list
         reasons.append("worker_unavailable")
     if not worker.credential_ok:
         reasons.append("credentials_missing")
-    if not worker.quota_available:
+    if worker.quota_available is False:
         reasons.append("quota_unavailable")
     if not task.kinds.issubset(worker.supports):
         missing = sorted(task.kinds - worker.supports)
@@ -392,6 +396,10 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
     values, sources = worker.evidence.normalized()
     observed_success = min(values["accepted_rate"], values["review_ready_rate"])
     effective_success = max(0.0, observed_success - values["validation_failure_rate"])
+    manager_adjusted_success = max(
+        0.0,
+        min(1.0, effective_success + (worker.manager_score_adjustment / 100.0)),
+    )
     estimated_cost = round(
         values["cost_usd_per_1k_tokens"] * values["estimated_tokens"] / 1000.0,
         6,
@@ -404,6 +412,8 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         "review_ready_rate": values["review_ready_rate"],
         "validation_failure_rate": values["validation_failure_rate"],
         "effective_success_rate": round(effective_success, 6),
+        "manager_adjusted_success_rate": round(manager_adjusted_success, 6),
+        "manager_score_adjustment": worker.manager_score_adjustment,
         "p50_latency_seconds": values["p50_latency_seconds"],
         "p95_latency_seconds": values["p95_latency_seconds"],
         "cost_usd_per_1k_tokens": values["cost_usd_per_1k_tokens"],
@@ -423,7 +433,7 @@ def _candidate_sort_key(candidate: CandidateRecord) -> tuple[Any, ...]:
         int(candidate.excluded),
         components.get("deadline_penalty", 0),
         components.get("estimated_cost_usd", CONSERVATIVE_PRIORS["cost_usd_per_1k_tokens"]),
-        -components.get("effective_success_rate", 0.0),
+        -components.get("manager_adjusted_success_rate", 0.0),
         components.get("validation_failure_rate", 1.0),
         components.get("p50_latency_seconds", CONSERVATIVE_PRIORS["p50_latency_seconds"]),
         components.get("p95_latency_seconds", CONSERVATIVE_PRIORS["p95_latency_seconds"]),

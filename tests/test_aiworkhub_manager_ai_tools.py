@@ -115,11 +115,32 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_manager_context_write_intents",
         "aiworkhub_manager_context_write_intent_dispose",
         "aiworkhub_manager_context_import",
+        "aiworkhub_manager_workforce_catalog",
+        "aiworkhub_manager_workforce_rank",
+        "aiworkhub_manager_workforce_upsert",
         "aiworkhub_repo_list",
         "aiworkhub_repo_current",
         "aiworkhub_repo_switch",
     ):
         assert callable(getattr(server, name))
+
+
+def test_manager_workforce_reads_only_authority_repo_process_log(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        manager_ai_tools,
+        "_workforce_process_rows",
+        lambda repo: observed.append(repo) or [],
+    )
+    result = manager_ai_tools.workforce_catalog_read()
+
+    assert result["ok"] is True
+    assert observed == [root]
+    assert result["manager"]["repo"] == str(root)
 
 
 def test_repository_switch_is_repo_id_only_and_preserves_current_manager(tmp_path, monkeypatch):

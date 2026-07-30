@@ -115,6 +115,7 @@ const elements = {
   topicStats: document.querySelector("#topic-stats"),
   runnerStats: document.querySelector("#runner-stats"),
   planDag: document.querySelector("#plan-dag"),
+  workforceList: document.querySelector("#workforce-list"),
   toolUseList: document.querySelector("#tool-use-list"),
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
@@ -920,6 +921,70 @@ function renderPlanDag(snapshot) {
   elements.planDag.replaceChildren(fragment);
 }
 
+function renderWorkforce(snapshot) {
+  if (!elements.workforceList) return;
+  const catalog = snapshot && snapshot.workforce_catalog
+    && typeof snapshot.workforce_catalog === "object"
+    ? snapshot.workforce_catalog
+    : null;
+  const workers = catalog ? asArray(catalog.workers) : [];
+  if (!workers.length) {
+    elements.workforceList.replaceChildren(
+      createElement("div", "panel-list-empty", "No configured worker models"),
+    );
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  const summary = catalog.summary && typeof catalog.summary === "object" ? catalog.summary : {};
+  const overview = createElement("div", "usage-overview workforce-overview");
+  for (const [label, value] of [
+    ["Models", formatCount(summary.workers)],
+    ["Enabled", formatCount(summary.enabled)],
+    ["Available", formatCount(summary.available)],
+    ["Observed", formatCount(summary.observed)],
+  ]) {
+    const metric = createElement("div", "usage-metric");
+    metric.append(createElement("span", "usage-label", label), createElement("strong", "", value));
+    overview.appendChild(metric);
+  }
+  fragment.appendChild(overview);
+  const list = createElement("div", "workforce-grid");
+  for (const worker of workers) {
+    if (!worker || typeof worker !== "object") continue;
+    const outcomes = worker.outcomes && typeof worker.outcomes === "object" ? worker.outcomes : {};
+    const row = createElement("article", "workforce-row");
+    if (worker.available) row.classList.add("available");
+    if (!worker.enabled) row.classList.add("disabled");
+    const heading = createElement("div", "workforce-heading");
+    heading.append(
+      createElement("strong", "", worker.worker_id || worker.model || "worker"),
+      createElement("span", "", `${worker.provider || "provider"} · ${worker.adapter_id || "adapter"}`),
+    );
+    const score = createElement(
+      "strong",
+      "workforce-score",
+      `${numberValue(worker.effective_score).toFixed(1)}`,
+    );
+    score.title = worker.observed_score === null || worker.observed_score === undefined
+      ? `Conservative prior + manager adjustment ${numberValue(worker.manager_score_adjustment)}`
+      : `Observed ${numberValue(worker.observed_score).toFixed(1)} + manager adjustment ${numberValue(worker.manager_score_adjustment)}`;
+    row.append(heading, score);
+    row.appendChild(createElement(
+      "div",
+      "workforce-metrics",
+      `${worker.readiness_status || (worker.available ? "ready" : "unavailable")} · ${worker.availability_observed ? "access observed" : "access unverified"} · ${formatCount(outcomes.sample_count)} samples · ${outcomes.accepted_rate === null || outcomes.accepted_rate === undefined ? "accept n/a" : `${(numberValue(outcomes.accepted_rate) * 100).toFixed(1)}% accepted`} · ${formatCount(outcomes.retry_count)} retries`,
+    ));
+    list.appendChild(row);
+  }
+  fragment.appendChild(list);
+  fragment.appendChild(createElement(
+    "div",
+    "telemetry-note",
+    "Scores use canonical outcomes; missing samples use a labeled conservative prior. Provider quota is never fabricated.",
+  ));
+  elements.workforceList.replaceChildren(fragment);
+}
+
 function formatBytes(value) {
   let amount = Math.max(0, numberValue(value));
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -1326,6 +1391,7 @@ function renderSnapshot(snapshot) {
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
   renderUsage(snapshot);
   renderPlanDag(snapshot);
+  renderWorkforce(snapshot);
   renderToolUse(snapshot);
   renderStorage(snapshot);
   renderSystemLogs(snapshot);

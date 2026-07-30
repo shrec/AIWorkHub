@@ -1241,6 +1241,56 @@ tbody tr.is-selected td:first-child {
   color: var(--vscode-testing-iconFailed);
 }
 
+.workforce-overview {
+  margin-bottom: 10px;
+}
+
+.workforce-grid {
+  display: grid;
+  gap: 7px;
+}
+
+.workforce-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 4px 10px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--vscode-descriptionForeground);
+  border-radius: 4px;
+  background: var(--surface-subtle);
+}
+
+.workforce-row.available {
+  border-left-color: var(--vscode-testing-iconPassed);
+}
+
+.workforce-row.disabled {
+  opacity: 0.6;
+}
+
+.workforce-heading {
+  display: grid;
+  min-width: 0;
+}
+
+.workforce-heading span,
+.workforce-metrics {
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.workforce-score {
+  align-self: center;
+  color: var(--vscode-charts-blue);
+  font-size: 18px;
+}
+
+.workforce-metrics {
+  grid-column: 1 / -1;
+}
+
 .tabs-heading {
   display: block;
   padding-bottom: 0;

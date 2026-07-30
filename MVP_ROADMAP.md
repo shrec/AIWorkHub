@@ -124,9 +124,22 @@ do not override this current priority ledger.
       credential authority actually observes access. Canonical local evidence:
       policy/init/launch/dashboard tests (`44 passed`), complete Python suite
       (`1475 passed, 18 skipped`) and complete extension suite on 2026-07-30.
-- [ ] Manager-editable model workforce inventory/scoring based on observed task
+- [x] Manager-editable model workforce inventory/scoring based on observed task
       outcomes, without fabricating provider quota/limit data unavailable from
       the provider extension API.
+      InitRepo provisions a bounded repository-local workforce catalog covering
+      the configured first-party Claude, Codex, DeepSeek VS Code LM and GLM VS
+      Code LM routes. Manager MCP exposes audited catalog updates, evidence-
+      backed inventory reads and explainable cheapest-capable ranking. Accepted,
+      review-ready, validation-failure, retry, latency, token and cost evidence
+      is joined only from the same repository's canonical cards and bounded
+      process ledger; missing samples use an explicit conservative prior and
+      unavailable provider quotas remain `unavailable_from_provider_api`.
+      Dashboard `Workforce` shows readiness/access-observation truth, sample
+      counts, acceptance/retry evidence and the bounded manager adjustment.
+      Canonical local evidence: focused workforce/manager/dashboard tests (`60
+      passed`), complete Python suite (`1482 passed, 18 skipped`) and complete
+      extension suite on 2026-07-30.
 - [ ] Complete storage retention UX: size by component, archive/restore,
       age/size policy, dry-run cleanup and rollback-safe deletion.
 

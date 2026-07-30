@@ -205,3 +205,15 @@ def test_decision_record_declares_pure_policy_and_residual_escalation():
     assert policy["worker_launch"] is False
     assert policy["duplicate_accepted_work"] == "prohibited"
     assert policy["failed_residuals"] == "escalate_residual_only"
+
+
+def test_manager_score_adjustment_changes_equal_evidence_order_explainably():
+    task = _task(quality_floor=0.0)
+    base = dict(cost=1.0, accepted=0.9, review_ready=0.9, validation_failure=0.05)
+    low = _worker("low", "gpt-5.5", "openai", **base)
+    high = _worker("high", "gpt-5.5", "openai", **base)
+    low = WorkerCapability.build(**{**low.as_dict(), "manager_score_adjustment": -5.0, "evidence": low.evidence})
+    high = WorkerCapability.build(**{**high.as_dict(), "manager_score_adjustment": 5.0, "evidence": high.evidence})
+    decision = select_worker(task, [low, high])
+    assert decision.selected_worker_id == "high"
+    assert decision.candidates[0].score_components["manager_adjusted_success_rate"] == 0.9
