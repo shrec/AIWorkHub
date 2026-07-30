@@ -21,6 +21,10 @@ server for any MCP-capable client (Claude Code, Codex, other agent hosts).
 - Default mode: read-only and launch-disabled until explicitly enabled
 - Multi-repository isolation: one MCP stdio child and one `.aiworkhub/`
   state directory per opened repository; nothing is shared across repos
+- Explicit legacy context import: a verified manager may dry-run, apply or
+  rollback one selected repo-relative Session/AI Memory/KB SQLite source;
+  there is no global discovery, canonical overwrite or unsafe rollback of
+  rows changed after import
 - Local model adapters: Claude Code CLI, Codex CLI, and `deepseek_copilot_cli`
   (official GitHub Copilot CLI driven in BYOK mode against DeepSeek's
   OpenAI-compatible API)

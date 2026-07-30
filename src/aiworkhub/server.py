@@ -252,6 +252,7 @@ from . import __version__
 from . import agent_tool_instruction_mcp
 from . import cli_adapter_readonly_tool
 from . import completion_inbox
+from . import context_importer
 from . import context_writes
 from . import cost_ledger
 from . import core
@@ -399,6 +400,29 @@ def aiworkhub_manager_kb_write(
         action=action, key=key, title=title, body=body, category=category,
         tags=tags, source_refs=source_refs, replacement_key=replacement_key,
         idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_context_import(
+    component: context_importer.Component,
+    operation: context_importer.Operation,
+    source_path: str = "",
+    idempotency_key: str = "",
+    import_id: str = "",
+    provenance: str = "",
+    limit: int = 10_000,
+) -> dict[str, Any]:
+    """MANAGER: dry-run, apply or rollback one explicit repo-local legacy context store."""
+
+    return manager_ai_tools.context_import(
+        component=component,
+        operation=operation,
+        source_path=source_path,
+        idempotency_key=idempotency_key,
+        import_id=import_id,
+        provenance=provenance,
+        limit=limit,
     )
 
 

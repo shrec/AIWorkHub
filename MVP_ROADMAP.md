@@ -28,9 +28,11 @@ do not override this current priority ledger.
 - [x] Add verified-manager intent inbox plus explicit accept/reject disposition;
       accepted proposals apply only through the canonical context mutation
       layer and unresolved proposals block task acceptance.
-- [ ] Add an idempotent, provenance-preserving importer for explicitly selected
+- [x] Add an idempotent, provenance-preserving importer for explicitly selected
       legacy Session/AI Memory/KB stores (dry-run, duplicate report, rollback;
-      never implicit global-path discovery).
+      never implicit global-path discovery). Import sources are repo-relative,
+      schema/quick-check validated and fingerprinted; conflicts never overwrite
+      canonical rows, and rollback refuses to erase rows changed after import.
 - [x] Finish atomic manager repository switching: switch only the manager's
       active repo binding, keep every task/context/log/index/callback in its
       origin repository, stop old repo daemons, start new repo daemons, and

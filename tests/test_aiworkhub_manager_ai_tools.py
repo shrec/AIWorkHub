@@ -114,6 +114,7 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_manager_kb_write",
         "aiworkhub_manager_context_write_intents",
         "aiworkhub_manager_context_write_intent_dispose",
+        "aiworkhub_manager_context_import",
         "aiworkhub_repo_list",
         "aiworkhub_repo_current",
         "aiworkhub_repo_switch",

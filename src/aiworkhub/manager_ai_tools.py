@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from . import core
 from . import context_writes
+from . import context_importer
 from . import storage_registry
 from . import worker_ai_tools_mcp as worker_tools
 
@@ -168,11 +169,47 @@ def kb_write(
     )
 
 
+def context_import(
+    *, component: context_importer.Component, operation: context_importer.Operation,
+    source_path: str = "", idempotency_key: str = "", import_id: str = "",
+    provenance: str = "", limit: int = 10_000,
+) -> dict[str, Any]:
+    context, manager = _manager_context(topic="context_import")
+    if context is None:
+        return manager
+    if operation != "dry_run" and not core.writes_allowed():
+        return {
+            "ok": False, "error": "write_gate_closed",
+            "surface": "manager_mcp", "manager": manager,
+        }
+    try:
+        result = context_importer.import_context(
+            context.authority_repo,
+            component=component,
+            operation=operation,
+            source_path=source_path,
+            idempotency_key=idempotency_key,
+            import_id=import_id,
+            limit=limit,
+            actor_id=manager["session_id"],
+            provider=manager["provider"],
+            provenance=provenance,
+        )
+    except context_importer.ContextImportError as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
+        result = {"ok": False, "error": f"context_import_failed:{type(exc).__name__}"}
+    result["manager"] = manager
+    result["surface"] = "manager_mcp"
+    return result
+
+
 __all__ = [
     "ai_memory_get",
     "ai_memory_related",
     "ai_memory_search",
     "ai_memory_write",
+    "context_import",
     "kb_get",
     "kb_related",
     "kb_search",
