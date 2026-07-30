@@ -1,10 +1,11 @@
 # AIWorkHub Storage Observability and Cleanup
 
-Status: retained-worktree and terminal-run-log inventory/preview/quarantine/
-restore/expired-purge are implemented. The canonical process ledger is never a
-cleanup candidate. Superseded-graph and obsolete-runtime adapters remain
-planned; the current Source Graph has one canonical SQLite generation and must
-not fabricate a generation lifecycle merely to report reclaimable bytes.
+Status: retained-worktree, terminal-run-log and immutable extension-runtime
+inventory/preview/quarantine/restore/expired-purge are implemented. The
+canonical process ledger is never a cleanup candidate. Runtime generations are
+protected by per-window heartbeat leases, a latest-three rollback floor and a
+seven-day rollout grace. The current Source Graph has one canonical SQLite
+generation and therefore exposes no fabricated superseded population.
 Automatic cleanup remains off by default. This design is local-only and assumes
 no collaboration, RBAC, cloud service, telemetry upload, or external account.
 

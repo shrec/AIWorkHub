@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const runtimeRetention = require("./runtime-retention");
 
 const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
@@ -38,6 +39,9 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestTerminalLogCleanup",
   "requestTerminalLogRestore",
   "requestTerminalLogPurge",
+  "requestRuntimeCleanup",
+  "requestRuntimeRestore",
+  "requestRuntimePurge",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -1715,6 +1719,54 @@ let activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
 // selected repository, an editable install, or a fixed host path.
 let extensionRuntimeDir = null;
 let vscodeLmBridgeHost = null;
+let stableRuntimeInfo = null;
+let stableRuntimeLease = null;
+let stableRuntimeLeaseTimer = null;
+let runtimeRetentionCache = null;
+
+function stopStableRuntimeLease() {
+  if (stableRuntimeLeaseTimer) clearInterval(stableRuntimeLeaseTimer);
+  stableRuntimeLeaseTimer = null;
+  if (stableRuntimeLease) stableRuntimeLease.dispose();
+  stableRuntimeLease = null;
+}
+
+function startStableRuntimeLease(runtimeInfo) {
+  stopStableRuntimeLease();
+  stableRuntimeInfo = runtimeInfo;
+  runtimeRetentionCache = null;
+  if (!runtimeInfo || !runtimeInfo.storageRoot || !runtimeInfo.generationRoot) return;
+  stableRuntimeLease = runtimeRetention.acquireLease({
+    generationRoot: runtimeInfo.generationRoot,
+    windowId: WINDOW_SCOPE_ID,
+    pid: process.pid,
+  });
+  stableRuntimeLeaseTimer = setInterval(() => {
+    try {
+      stableRuntimeLease.heartbeat();
+    } catch (err) {
+      if (outputChannel) outputChannel.appendLine(`[runtime] lease heartbeat failed: ${sanitizeErrorMessage(err)}`);
+    }
+  }, 2 * 60 * 1000);
+  if (typeof stableRuntimeLeaseTimer.unref === "function") stableRuntimeLeaseTimer.unref();
+}
+
+function runtimeRetentionSnapshot({ force = false } = {}) {
+  if (!stableRuntimeInfo || !stableRuntimeInfo.storageRoot) {
+    return { ok: false, error: "runtime_global_storage_unavailable", candidates: [], quarantine_batches: [] };
+  }
+  const now = Date.now();
+  if (!force && runtimeRetentionCache && now - runtimeRetentionCache.cached_at < 60000) {
+    return runtimeRetentionCache.payload;
+  }
+  try {
+    const payload = runtimeRetention.scan({ storageRoot: stableRuntimeInfo.storageRoot, nowMs: now });
+    runtimeRetentionCache = { cached_at: now, payload };
+    return payload;
+  } catch (err) {
+    return { ok: false, error: sanitizeErrorMessage(err), candidates: [], quarantine_batches: [] };
+  }
+}
 
 function vscodeLmBridgeRoot() {
   const override = String(process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT || "").trim();
@@ -4055,7 +4107,11 @@ async function pushSnapshotOnce(view) {
       if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({
           type: OUTBOUND_TYPES.snapshot,
-          payload: sanitizeWebviewPayload({ ...payload, system_logs: systemLogSnapshot() }),
+          payload: sanitizeWebviewPayload({
+            ...payload,
+            system_logs: systemLogSnapshot(),
+            extension_runtime_storage: runtimeRetentionSnapshot(),
+          }),
         });
       } else if (!payload && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
@@ -4088,7 +4144,11 @@ async function pushSnapshotNoRetry(view) {
     if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({
         type: OUTBOUND_TYPES.snapshot,
-        payload: sanitizeWebviewPayload({ ...payload, system_logs: systemLogSnapshot() }),
+        payload: sanitizeWebviewPayload({
+          ...payload,
+          system_logs: systemLogSnapshot(),
+          extension_runtime_storage: runtimeRetentionSnapshot(),
+        }),
       });
     } else if (!payload && requestSeq === view.snapshotRequestSeq) {
       view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
@@ -4346,6 +4406,74 @@ async function runTerminalLogPurge(view, batchId) {
   }
 }
 
+async function runRuntimeCleanup(view) {
+  const preview = runtimeRetentionSnapshot({ force: true });
+  if (!preview || preview.ok !== true) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "runtime_retention_preview_failed" });
+    return;
+  }
+  const count = Math.max(0, Number(preview.candidate_count || 0));
+  if (!count) {
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: "No lease-free obsolete runtime generations are eligible" });
+    return;
+  }
+  const bytes = Math.max(0, Number(preview.candidate_bytes || 0));
+  const choice = await vscode.window.showWarningMessage(
+    `Move ${count} obsolete AIWorkHub runtime generation(s) (${bytes} bytes) into 7-day quarantine? The current generation, latest three generations and every live/unknown window lease remain protected.`,
+    { modal: true },
+    "Quarantine Runtimes",
+  );
+  if (choice !== "Quarantine Runtimes") return;
+  try {
+    const result = runtimeRetention.quarantine({
+      storageRoot: stableRuntimeInfo.storageRoot,
+      previewDigest: String(preview.preview_digest || ""),
+      confirm: true,
+    });
+    runtimeRetentionCache = null;
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Quarantined ${Number(result.quarantined || 0)} runtime generation(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runRuntimeRestore(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId) || !stableRuntimeInfo || !stableRuntimeInfo.storageRoot) return;
+  const choice = await vscode.window.showInformationMessage(
+    `Restore runtime generation batch ${batchId}? Existing generations are never overwritten.`,
+    { modal: true },
+    "Restore Runtimes",
+  );
+  if (choice !== "Restore Runtimes") return;
+  try {
+    const result = runtimeRetention.restore({ storageRoot: stableRuntimeInfo.storageRoot, batchId, confirm: true });
+    runtimeRetentionCache = null;
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${Number(result.restored || 0)} runtime generation(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runRuntimePurge(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId) || !stableRuntimeInfo || !stableRuntimeInfo.storageRoot) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Permanently purge expired runtime generation batch ${batchId}? This cannot be undone.`,
+    { modal: true },
+    "Permanently Purge Runtimes",
+  );
+  if (choice !== "Permanently Purge Runtimes") return;
+  try {
+    const result = runtimeRetention.purge({ storageRoot: stableRuntimeInfo.storageRoot, batchId, confirm: true });
+    runtimeRetentionCache = null;
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Purged ${Number(result.bytes || 0)} bytes of expired runtime cache` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 // The sole initialization trigger: one bounded MCP tool call, tied to the
 // active repo_id/window/claim episode -- the window/claim-episode binding is
 // implicit in the AIWORKHUB_WINDOW_ID/AIWORKHUB_CLAIM_EPISODE env vars the
@@ -4511,6 +4639,19 @@ function handleInboundMessage(view, message) {
     case "requestTerminalLogPurge": {
       const batchId = String(message.batchId || "");
       if (STORAGE_BATCH_ID_RE.test(batchId)) runTerminalLogPurge(view, batchId);
+      break;
+    }
+    case "requestRuntimeCleanup":
+      runRuntimeCleanup(view);
+      break;
+    case "requestRuntimeRestore": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runRuntimeRestore(view, batchId);
+      break;
+    }
+    case "requestRuntimePurge": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runRuntimePurge(view, batchId);
       break;
     }
     default:
@@ -4896,6 +5037,7 @@ function getHtmlForWebview(webview, extensionUri) {
             <div class="storage-action-bar">
               <button id="storage-cleanup-preview" type="button" title="Recompute the repository-scoped retention preview and quarantine eligible worktrees after confirmation">Preview &amp; Quarantine</button>
               <button id="terminal-log-cleanup-preview" type="button" title="Preview and quarantine only policy-aged terminal run logs; canonical ledgers and active work remain protected">Terminal Logs</button>
+              <button id="runtime-cleanup-preview" type="button" title="Preview and quarantine obsolete extension runtime generations; current, rollback and live leased generations stay protected">Runtime Cache</button>
             </div>
             <div class="stat-list" id="storage-list"></div>
           </div>
@@ -5363,6 +5505,16 @@ async function activate(context) {
   // entering the mux.
   const stableRuntime = materializeStableRuntimeGeneration(context);
   extensionRuntimeDir = stableRuntime.runtimeDir;
+  try {
+    startStableRuntimeLease(stableRuntime);
+  } catch (err) {
+    stableRuntimeInfo = stableRuntime;
+    runtimeRetentionCache = {
+      cached_at: Date.now(),
+      payload: { ok: false, error: `runtime_lease_unavailable:${sanitizeErrorMessage(err)}`, candidates: [], quarantine_batches: [] },
+    };
+    outputChannel.appendLine(`[runtime] retention lease unavailable; cleanup disabled: ${sanitizeErrorMessage(err)}`);
+  }
   outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
@@ -5426,6 +5578,7 @@ async function activate(context) {
 }
 
 async function deactivate() {
+  stopStableRuntimeLease();
   stopDispatcherWatchdog();
   stopWindowRouteRenewalTimer();
   stopStartupRouteConvergence();

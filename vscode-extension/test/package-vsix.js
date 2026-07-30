@@ -149,6 +149,7 @@ for (const rel of [
   "package.json",
   "README.md",
   "extension.js",
+  "runtime-retention.js",
   "media/app.js",
   "media/app.css",
   "media/aiworkhub-icon.png",

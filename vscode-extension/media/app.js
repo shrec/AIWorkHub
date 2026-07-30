@@ -121,6 +121,7 @@ const elements = {
   storageList: document.querySelector("#storage-list"),
   storageCleanupPreview: document.querySelector("#storage-cleanup-preview"),
   terminalLogCleanupPreview: document.querySelector("#terminal-log-cleanup-preview"),
+  runtimeCleanupPreview: document.querySelector("#runtime-cleanup-preview"),
   systemLogList: document.querySelector("#system-log-list"),
   systemLogCopy: document.querySelector("#system-log-copy"),
   systemLogClear: document.querySelector("#system-log-clear"),
@@ -1100,6 +1101,31 @@ function renderStorage(snapshot) {
         : "The append-only process ledger and active/review task output are never cleanup candidates.",
     ));
   }
+  const runtimeStorage = snapshot && snapshot.extension_runtime_storage
+    && typeof snapshot.extension_runtime_storage === "object"
+    ? snapshot.extension_runtime_storage
+    : null;
+  if (runtimeStorage) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Extension runtime cache"));
+    for (const [label, value] of [
+      ["Scope", "Shared AIWorkHub extension storage"],
+      ["Generations", `${formatCount(runtimeStorage.generation_count)} · keep latest ${formatCount(runtimeStorage.keep_generations)}`],
+      ["Current", formatBytes(runtimeStorage.current_bytes)],
+      ["Eligible", `${formatCount(runtimeStorage.candidate_count)} generations · ${formatBytes(runtimeStorage.candidate_bytes)}`],
+      ["Protected", `${formatCount(runtimeStorage.protected_count)} generations`],
+    ]) {
+      const row = createElement("div", "storage-row storage-retention-row");
+      row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+      fragment.appendChild(row);
+    }
+    fragment.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      runtimeStorage.ok === false
+        ? `Runtime cache scan degraded: ${String(runtimeStorage.error || "unknown")}`
+        : "Current, latest-three rollback and every live or invalid-lease generation are protected.",
+    ));
+  }
   const batches = asArray(usage.quarantine_batches)
     .filter((item) => item && typeof item === "object");
   if (batches.length) {
@@ -1154,6 +1180,34 @@ function renderStorage(snapshot) {
         const purge = createElement("button", "danger-button", "Purge logs");
         purge.type = "button";
         purge.dataset.purgeTerminalLogBatch = String(batch.batch_id || "");
+        actions.appendChild(purge);
+      }
+      row.append(detail, actions);
+      fragment.appendChild(row);
+    }
+  }
+  const runtimeBatches = asArray(runtimeStorage && runtimeStorage.quarantine_batches)
+    .filter((item) => item && typeof item === "object");
+  if (runtimeBatches.length) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Runtime cache quarantine"));
+    for (const batch of runtimeBatches) {
+      const row = createElement("div", "storage-batch-row");
+      const detail = createElement("div", "storage-batch-detail");
+      detail.append(
+        createElement("strong", "", String(batch.batch_id || "batch")),
+        createElement("span", "storage-label", `${formatCount(batch.quarantined_count)} generations · ${formatBytes(batch.bytes)} · restore until ${batch.restore_deadline ? new Date(batch.restore_deadline).toLocaleString() : "unknown"}`),
+      );
+      const actions = createElement("div", "storage-batch-actions");
+      if (numberValue(batch.quarantined_count) > 0) {
+        const restore = createElement("button", "secondary-button", "Restore runtimes");
+        restore.type = "button";
+        restore.dataset.restoreRuntimeBatch = String(batch.batch_id || "");
+        actions.appendChild(restore);
+      }
+      if (batch.purge_eligible) {
+        const purge = createElement("button", "danger-button", "Purge runtimes");
+        purge.type = "button";
+        purge.dataset.purgeRuntimeBatch = String(batch.batch_id || "");
         actions.appendChild(purge);
       }
       row.append(detail, actions);
@@ -2762,7 +2816,20 @@ elements.storageCleanupPreview.addEventListener("click", () => {
 elements.terminalLogCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestTerminalLogCleanup" });
 });
+elements.runtimeCleanupPreview.addEventListener("click", () => {
+  vscode.postMessage({ type: "requestRuntimeCleanup" });
+});
 elements.storageList.addEventListener("click", (event) => {
+  const restoreRuntimes = event.target.closest("[data-restore-runtime-batch]");
+  if (restoreRuntimes) {
+    vscode.postMessage({ type: "requestRuntimeRestore", batchId: restoreRuntimes.dataset.restoreRuntimeBatch });
+    return;
+  }
+  const purgeRuntimes = event.target.closest("[data-purge-runtime-batch]");
+  if (purgeRuntimes) {
+    vscode.postMessage({ type: "requestRuntimePurge", batchId: purgeRuntimes.dataset.purgeRuntimeBatch });
+    return;
+  }
   const restoreLogs = event.target.closest("[data-restore-terminal-log-batch]");
   if (restoreLogs) {
     vscode.postMessage({ type: "requestTerminalLogRestore", batchId: restoreLogs.dataset.restoreTerminalLogBatch });

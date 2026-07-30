@@ -140,7 +140,7 @@ do not override this current priority ledger.
       Canonical local evidence: focused workforce/manager/dashboard tests (`60
       passed`), complete Python suite (`1482 passed, 18 skipped`) and complete
       extension suite on 2026-07-30.
-- [ ] Complete storage retention UX: size by component, archive/restore,
+- [x] Complete storage retention UX: size by component, archive/restore,
       age/size policy, dry-run cleanup and rollback-safe deletion.
       - [x] Repository-scoped retained-worktree lifecycle: exact Git-common-dir
         ownership, component inventory, age/size policy preview, same-volume
@@ -157,10 +157,18 @@ do not override this current priority ledger.
         restore and separately confirmed expired purge are exposed in MCP and
         the Storage dashboard. Canonical local evidence: complete Python suite
         (`1494 passed, 18 skipped`) and complete extension suite on 2026-07-30.
-      - [ ] Extend the same contract to superseded Source Graph generations
-        and obsolete extension/runtime caches with their owning lease
-        authorities. The current Source Graph uses one canonical SQLite
-        generation, so no second generation may be invented merely for GC.
+      - [x] Extension runtime generation lifecycle: every live VS Code window
+        owns a heartbeat lease; current, latest-three rollback, live-lease and
+        malformed-lease generations fail closed. A seven-day rollout grace
+        protects pre-feature windows, then explicit preview/quarantine/restore
+        and expired purge manage only AIWorkHub global-storage generations.
+        VS Code-owned installed-extension directories remain out of scope.
+        Canonical local evidence: runtime lifecycle/security regression plus
+        the complete extension suite and portable VSIX build on 2026-07-30.
+      - [x] Source Graph generation disposition: the production graph has one
+        repository-bound canonical SQLite authority rather than retained index
+        generations. It is measured as protected repository data; no synthetic
+        generation lifecycle or false reclaimable population is created.
 
 ### P2 — Maintainability, distribution and ecosystem
 
