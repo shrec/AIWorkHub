@@ -1,7 +1,7 @@
 # AIWorkHub Product Roadmap
 
-Status: canonical product direction after the 0.7.8 repository, routing,
-dashboard, CI, and tool-use audit. This roadmap separates shipped capability
+Status: canonical product direction after the 0.8.0 repository, orchestration,
+storage, CI, and tool-use closure. This roadmap separates shipped capability
 from partial capability and planned work. A design document or canary is not a
 shipped feature.
 
@@ -17,7 +17,7 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
-## Current baseline (0.7.8)
+## Current baseline (0.8.0)
 
 ### Shipped foundations
 
@@ -33,51 +33,31 @@ AIWorkHub telemetry.
   live calls, cached calls, missing/stale use, bytes returned, policy
   violations, tamper detection, and per-adapter summaries.
 - Quality Evidence Engine foundations and evidence-aware task review.
+- Visual Plan DAG, Review Inbox 2.0, repository Policy as Code, environment
+  preflight and evidence-backed adaptive workforce scoring.
+- Canonical manager/worker Session Manager, AI Memory and KB read/write
+  surfaces with provenance, idempotency and audited soft lifecycle operations.
 - Storage observability, bounded system logs, and local dashboard views for
   task operations and context systems.
+- Safe repository worktree, terminal-run and extension-runtime retention with
+  preview, quarantine, restore and separately confirmed expired purge.
 - Ubuntu, Windows, and macOS CI/release matrices plus VSIX and Python package
   generation.
 
 ### Partial or not yet production-closed
 
-- A dashboard can select a repository, but an already-running Codex chat MCP
-  process can retain its old cwd/repository. Manager route and MCP authority can
-  therefore enter a split-brain state.
-- Callback delivery is durable, but route convergence and post-switch/reload
-  delivery still need a complete behavioral qualification matrix.
-- Session Manager, AI Memory, and KB do not yet expose the complete canonical
-  manager/worker read-write lifecycle required for durable context ownership.
-- Source Graph telemetry proves calls, but does not yet quantify workflow-stage
-  coverage, raw-discovery fallback, historical trends, or attributable context
-  savings.
-- Storage cleanup has a safety design, but deletion/quarantine execution is not
-  a production feature.
-- The VS Code authenticated model broker is only partially qualified across
-  model families and authentication surfaces.
-- Branding, GitHub discovery metadata, visual product explanation, and public
-  documentation are below product-launch quality.
-
-### Current unreleased implementation slice
-
-- Dashboard context controls are now a single icon-based strip for Logs,
-  Session Manager, AI Memory, and KB.
-- Session/KB viewers use bounded, repository-registry-resolved read-only MCP
-  calls; the Memory viewer accepts both fresh minimal and migrated schemas.
-- Manager MCP exposes audited, idempotent, soft-delete-only writes for Session
-  Manager, AI Memory, and KB; AI Memory now also has exact get and related
-  reads on both manager and worker surfaces.
-- The packaged stdio MCP schema exposes Source Graph `mode` and `bundle_type`
-  enums, and invalid calls return allowed values plus a valid bounded example.
-- Repo-neutral Codex MCP processes resolve an exact live thread route instead
-  of trusting stale cwd, while explicitly repo-bound extension/worker children
-  remain immutable. Bounded `repo_list`, `repo_current`, and manager-only
-  `repo_switch(repo_id)` operations fail closed on ambiguous or foreign routes.
-- Cooperative manager-inbox callback startup now rebinds pending same-repo
-  events to the current verified manager and seeds missing review callbacks;
-  original thread identity remains audit provenance.
-
-These changes remain unreleased until the relevant extension, Python, packaged
-runtime, reload, and repository-isolation gates pass together.
+- `core.py`, `process_launcher.py` and the extension entry point remain large
+  authority modules and require characterization-first extraction.
+- The extension remains JavaScript-first; its incremental TypeScript module
+  migration and restored-tab/reload E2E boundary are still open.
+- Shared pytest state isolation, staged Ruff/type gates and test-suite
+  organization are not complete.
+- Release versions still have multiple declared metadata locations; a single
+  version authority and reproducible published checksums remain open.
+- The VS Code authenticated model broker is not fully qualified across every
+  provider's first-party and Copilot authorization surface.
+- The brand foundation is present, but Marketplace/Open VSX publication,
+  public screenshots, ADR coverage and long-form launch material remain open.
 
 ## P0 — Stable multi-repository product (0.7.9)
 

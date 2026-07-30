@@ -1,7 +1,7 @@
 {
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
-  "description": "Repository-bound AIWorkHub dashboard for VS Code. Opens the operational dashboard as a full editor WebviewPanel and talks to one repository-scoped MCP stdio runtime on the workspace host.",
+  "description": "Repository-native AI orchestration for VS Code: plan work, coordinate models, query source intelligence, preserve context and verify results.",
   "version": "0.8.0",
   "publisher": "shrec",
   "license": "MIT",
@@ -18,10 +18,19 @@
   ],
   "keywords": [
     "aiworkhub",
+    "ai agents",
+    "agent orchestration",
+    "developer tools",
     "mcp",
-    "dashboard",
+    "multi agent",
+    "source graph",
+    "task planning",
     "remote-ssh"
   ],
+  "galleryBanner": {
+    "color": "#07111f",
+    "theme": "dark"
+  },
   "activationEvents": [
     "*",
     "onStartupFinished",

@@ -28,8 +28,12 @@ Security-sensitive areas:
   Read-only by default.
 - **File access**: workers operate in isolated workspaces with landlock
   rules when available.
-- **No network listener**: the MCP server uses stdio only; the dashboard
-  binds to `127.0.0.1` when enabled.
+- **No network listener**: the MCP server uses stdio only and the native VS
+  Code dashboard communicates with its repository-scoped child process. It
+  does not bind localhost, a LAN address or a public port.
+- **Repository isolation**: task state, routes, context stores and Source Graph
+  data resolve through the selected repository's canonical `.aiworkhub`
+  registry. Cross-repository ambiguity fails closed.
 
 Untrusted third-party model adapters are not supported. Use only adapters
 provided or reviewed by the AIWorkHub maintainers.

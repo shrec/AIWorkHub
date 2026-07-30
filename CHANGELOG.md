@@ -4,6 +4,21 @@ All notable changes to AIWorkHub are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has
 noted by package/extension version and release tag.
 
+## [Unreleased]
+
+### Added
+
+- Added the canonical AIWorkHub brand system, repository hero, positioning,
+  public support guide, Marketplace-ready extension page and package discovery
+  metadata.
+
+### Changed
+
+- Reframed the repository landing page around user outcomes and the current
+  product architecture instead of historical implementation notes.
+- Corrected the security and issue-reporting guidance to reflect the native
+  stdio dashboard and repository-local runtime.
+
 ## [0.7.9] - 2026-07-30
 
 ### Added

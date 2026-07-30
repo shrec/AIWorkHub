@@ -29,6 +29,17 @@ Before tagging, set the same version in `pyproject.toml` and
 `vscode-extension/package.json`. The release workflow checks both versions
 against the selected tag and fails before publication when they differ.
 
+Public-release presentation must also pass this checklist:
+
+- canonical name, tagline and logo follow [the Brand Guide](BRAND.md);
+- the repository and Marketplace READMEs describe the current shipped product;
+- `CHANGELOG.md` has a dated entry for the release;
+- `SECURITY.md`, `SUPPORT.md` and community templates contain no legacy paths;
+- screenshots come from a clean demonstration repository and expose no source,
+  prompts, credentials, host paths or memory content;
+- GitHub description and topics match the current product position;
+- generated wheel, sdist and VSIX checksums are attached to the release.
+
 ## Tag-Driven Release
 
 Push a version tag to trigger the release workflow:

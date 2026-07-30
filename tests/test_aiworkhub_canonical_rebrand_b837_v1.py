@@ -49,7 +49,10 @@ def test_readme_and_migration_manifest_are_release_facing() -> None:
     readme = _read("README.md")
     manifest = json.loads(_read("eval/aiworkhub_canonical_rebrand_b837_v1.json"))
     assert readme.startswith("# AIWorkHub")
-    assert "repository-bound development brain/control plane" in readme
+    assert "local-first control plane for multi-model software development" in readme
+    assert "docs/assets/aiworkhub-hero.svg" in readme
+    assert (ROOT / "docs" / "assets" / "aiworkhub-hero.svg").is_file()
+    assert (ROOT / "docs" / "BRAND.md").is_file()
     assert manifest["canonical"]["display_name"] == "AIWorkHub"
     assert manifest["canonical"]["abbreviation"] == "AWH"
     assert manifest["canonical"]["python_package"] == "aiworkhub"

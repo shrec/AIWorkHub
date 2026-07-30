@@ -183,6 +183,12 @@ do not override this current priority ledger.
 - [ ] Finish public documentation, ADRs, VS Code Marketplace/Open VSX
       publication, then consider GitHub issue/PR sync, webhooks/public API and
       historical reliability analytics.
+      - [x] Establish the canonical AIWorkHub name, positioning, visual system,
+        repository hero, Marketplace copy, support path, package discovery
+        metadata and first authority ADR.
+      - [ ] Add clean public product screenshots, complete the core ADR set,
+        publish to VS Code Marketplace/Open VSX and qualify the published
+        install artifacts independently of the source checkout.
 
 ## Phase 0 — Wrapper MVP
 

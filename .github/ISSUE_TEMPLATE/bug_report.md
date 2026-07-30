@@ -20,6 +20,7 @@ A clear description of what went wrong.
 **Expected behavior**
 
 **Logs**
-Attach relevant output from the AIWorkHub output channel, or
-`tools/geoai-task-mcp/logs/audit.jsonl` (redact any path/host detail you
-consider sensitive). Never attach secrets or credentials.
+Attach only the bounded relevant entries from the dashboard **Logs** viewer or
+the **AIWorkHub** VS Code output channel. Redact paths and host details that are
+not needed to reproduce the problem. Never attach source, prompts, memories,
+secrets or credentials.

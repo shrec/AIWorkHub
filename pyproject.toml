@@ -8,9 +8,41 @@ version = "0.8.0"
 description = "MCP server for AIWorkHub task queue orchestration"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "AIWorkHub contributors" }]
+keywords = [
+  "ai-agents",
+  "developer-tools",
+  "mcp",
+  "multi-agent",
+  "orchestration",
+  "source-graph",
+  "vscode",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+]
 dependencies = [
   "mcp>=1.0.0,<2"
 ]
+
+[project.urls]
+Homepage = "https://github.com/shrec/AIWorkHub"
+Documentation = "https://github.com/shrec/AIWorkHub#readme"
+Issues = "https://github.com/shrec/AIWorkHub/issues"
+Changelog = "https://github.com/shrec/AIWorkHub/blob/main/CHANGELOG.md"
+Source = "https://github.com/shrec/AIWorkHub"
 
 [project.scripts]
 aiworkhub = "aiworkhub.server:main"

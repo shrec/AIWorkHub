@@ -154,6 +154,7 @@ for (const rel of [
   "media/app.css",
   "media/aiworkhub-icon.png",
   "media/aiworkhub-activity.svg",
+  "media/aiworkhub-hero.svg",
 ]) {
   copyFile(rel);
 }

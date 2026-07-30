@@ -231,6 +231,8 @@ assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-icon.png")));
 assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-icon.png")).size > 1000);
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));
 const activityIcon = read("media/aiworkhub-activity.svg");
+assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-hero.svg")));
+assert.ok(read("README.md").includes("media/aiworkhub-hero.svg"));
 assert.ok(activityIcon.includes('aria-label="AIWorkHub"'));
 assert.ok(activityIcon.includes('stroke="currentColor"'));
 assert.ok(activityIcon.includes('<circle cx="128" cy="34"'));

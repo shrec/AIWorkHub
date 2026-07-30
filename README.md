@@ -1,36 +1,67 @@
 # AIWorkHub
 
-AIWorkHub (AWH) is a repository-bound development brain/control plane for
-AI coding agents. Opened against any Git checkout, it binds task lifecycle,
-Source Graph code discovery, Session Manager continuity, bounded AI Memory,
-KB lookups, isolated worker launch, and Codex/Claude callback routing to
-that exact repository. Every repository owns its own durable state under a
-repository-local `.aiworkhub/` directory (task queue, sessions, memory, KB,
-Source Graph, routing config) -- there is no shared server, no central
-database, and no host-specific path baked into the tool.
+<div align="center">
+  <img src="docs/assets/aiworkhub-hero.svg" alt="AIWorkHub — repository-native AI orchestration" width="100%">
+</div>
 
-The primary interface is the **AIWorkHub VS Code extension**: a native
-editor-tab Webview that talks to a repository-scoped Task MCP stdio child
-process. It never opens a browser, binds a port, or exposes a LAN address.
-The same `aiworkhub` Python package is also usable headless as an MCP
-server for any MCP-capable client (Claude Code, Codex, other agent hosts).
+<p align="center">
+  <strong>The local-first control plane for multi-model software development.</strong><br>
+  Give every repository its own plan, source intelligence, memory, workers,
+  evidence and review loop.
+</p>
 
-- Source of truth: this repository's own `.aiworkhub/tasking/task_queue.sqlite`
-  (created/repaired by **Init Repo**, never a path outside the checkout)
-- MCP transport: stdio (no HTTP listener anywhere in the runtime)
-- Default mode: read-only and launch-disabled until explicitly enabled
-- Multi-repository isolation: one MCP stdio child and one `.aiworkhub/`
-  state directory per opened repository; nothing is shared across repos
-- Explicit legacy context import: a verified manager may dry-run, apply or
-  rollback one selected repo-relative Session/AI Memory/KB SQLite source;
-  there is no global discovery, canonical overwrite or unsafe rollback of
-  rows changed after import
-- Local model adapters: Claude Code CLI, Codex CLI, and `deepseek_copilot_cli`
-  (official GitHub Copilot CLI driven in BYOK mode against DeepSeek's
-  OpenAI-compatible API)
-- DeepSeek adapter: `deepseek_copilot_cli` is the local-launch adapter for every
-  `deepseek_*` runner; `deepseek_manual` remains an explicit non-launchable
-  fallback only
+<p align="center">
+  <a href="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/shrec/AIWorkHub/releases"><img alt="Release" src="https://img.shields.io/github/v/release/shrec/AIWorkHub?include_prereleases&sort=semver"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2dd4bf.svg"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-38bdf8.svg">
+  <img alt="VS Code 1.93+" src="https://img.shields.io/badge/VS%20Code-1.93%2B-0ea5e9.svg">
+</p>
+
+## What AIWorkHub is
+
+AIWorkHub turns a Git repository into a durable AI engineering workspace. It
+coordinates coding models through a repository-scoped MCP runtime while
+keeping the plan, task queue, Source Graph, sessions, memory, knowledge and
+review evidence bound to that exact repository.
+
+It is not another chat panel and it is not a hosted agent service. AIWorkHub is
+the orchestration layer between your repository and the AI tools you already
+use in VS Code.
+
+| Product capability | What it provides |
+| --- | --- |
+| **Repository-native task orchestration** | Dependency-aware planning, isolated workers, truthful terminal states and manager review. |
+| **Source Graph** | Bounded structural code discovery that reduces repeated raw-source scanning and records actual tool use. |
+| **Durable project context** | Session Manager, AI Memory and KB keep decisions and handoffs inside the repository boundary. |
+| **Evidence-first acceptance** | Diffs, tests, logs, artifacts and approval history travel with each completed task. |
+| **Multi-model workforce** | Route work across available model adapters using readiness, capability and observed outcomes. |
+| **Local-first isolation** | One `.aiworkhub/` authority per repository; stdio MCP transport; no AIWorkHub cloud account or network listener. |
+
+### Why teams use it
+
+- **Less repeated context:** agents query the Source Graph and durable context
+  layers instead of rediscovering the same code and decisions every turn.
+- **More trustworthy automation:** every running task reaches review with its
+  real outcome; a manager accepts or rejects the evidence.
+- **Clean multi-repository operation:** task state, callbacks, indexes and
+  memories stay within the repository that owns them.
+- **Works where VS Code works:** Linux, macOS, Windows, WSL and Remote-SSH are
+  covered by the release qualification matrix.
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    A[VS Code / MCP client] --> B[AIWorkHub repository runtime]
+    B --> C[Plan DAG + Task Queue]
+    B --> D[Source Graph]
+    B --> E[Session + Memory + KB]
+    C --> F[Isolated model workers]
+    F --> G[Evidence bundle]
+    G --> H[Manager review]
+    H -->|accept / rework| C
+```
 
 ## Five-Minute Quickstart (VS Code)
 
@@ -81,44 +112,9 @@ See [Getting Started](docs/GETTING_STARTED.md) for the full walkthrough
 (including headless/CLI-only setup) and [Architecture](docs/ARCHITECTURE.md)
 for how the pieces fit together.
 
-## 0.6.31 coordinator lifecycle and callback reliability
-
-- Claude callback **channel** (`aiworkhub-callback-channel`): a native Claude
-  Code channel that pushes terminal review callbacks into a live session with
-  no polling -- the Claude-side analog of the Codex sideband push. Research
-  preview; live delivery must still be confirmed against a real
-  `claude --channels` session.
-- The callback channel push loop backs off when idle instead of spinning a CPU
-  core when the session is not a verified manager or no callback is due.
-- Coordinator task lifecycle: a repository-local, owner-only coordinator token
-  is the capability for the repository owner (no separately exported env token
-  required); new `archive`/`supersede` commands; and `reject-review` takes an
-  explicit disposition (pending | blocked | archived | superseded). All are
-  coordinator-capability gated and atomic.
-- A readonly task may declare `allowed_writes: []` on purpose; only a missing
-  key is rejected. The validator reports a cached/zero-hit Source Graph as
-  stale rather than contradicting a successful call. Terminal substatuses
-  (dependency-blocked, liveness-lost, required-output-unchanged) map to the
-  correct callback transition instead of silently becoming review-ready.
-- A dependency's declared outputs are materialized into a dependent's isolated
-  worktree so a promoted-but-uncommitted artifact is visible to it. The
-  callback dispatcher fails closed on an unresolved repository identity and
-  recovers through a watchdog.
-
-## 0.6.30 reliability and quality foundation
-
-- Callback delivery is authorized by an expiring per-window, per-repository
-  route lease. A window renews and removes only its own record; ambiguous,
-  expired, or foreign-repository routes fail closed.
-- Windows MCP launch preflights repository virtual environments and safely
-  falls back through `py -3` and `python`, with `shell=false` and support for
-  paths containing spaces.
-- Source Graph, Session Manager, AI Memory, and KB are canonical repo-local
-  authorities and are available to both managers and workers.
-- The Quality Evidence Engine detects declared project tooling without
-  installing dependencies and normalizes test, SARIF, coverage, benchmark,
-  and read-only AI-review evidence. `not_available` is never treated as
-  `passed`.
+For the security and authority boundaries behind this flow, see
+[Architecture](docs/ARCHITECTURE.md). For release-by-release changes, use the
+[Changelog](CHANGELOG.md) rather than historical implementation notes.
 
 ## Install For Local Development (headless / no VS Code)
 
@@ -703,82 +699,27 @@ Every blocked write attempt is recorded to an append-only JSONL audit log.
 - Log write failures print a warning to stderr but never crash the server.
 - `AIWORKHUB_ALLOW_WRITES` default remains `0` (off) — the audit log does not enable writes.
 
-## Smoke Test
+## Development and verification
 
 ```bash
-bash tests/smoke.sh
+python3 -m pytest tests/ -q
+npm --prefix vscode-extension install
+npm --prefix vscode-extension test
+npm --prefix vscode-extension run package
 ```
 
-Broader local verification:
-
-```bash
-python3 -m pytest -q tests
-bash tests/test_mcp_stdio_subprocess_client_smoke_b109_v1.sh
-bash tests/test_mcp_queue_request_tool_b286_v1.sh
-bash tests/test_mcp_stale_recovery_orchestrator_b287_v1.sh
-bash tests/test_mcp_cost_ledger_aggregator_b288_v1.sh
-python3 -m pytest -q tests/test_runtime_adapters.py tests/test_process_launcher.py tests/test_dashboard.py
-python3 -m pytest -q tests/test_deepseek_copilot_adapter_b343_v1.py
-python3 -m pytest -q tests/test_callback_bridge.py
-python3 -m pytest -q ../../AITools/test_taskctl_origin_thread_callback_b366_v1.py ../../AITools/test_taskctl_origin_thread_callback_b384_v1.py
-```
-
-## Write-Gate Audit Smoke Test
-
-```bash
-bash tests/test_write_gate_audit_v1.sh
-```
-
-## Roadmap: Concepts Under Consideration (Kimi-Atlas-Inspired)
-
-This section tracks a set of Kimi-Atlas-inspired design ideas against the
-current codebase. Not all of them are done -- each item below is marked
-explicitly as implemented or still roadmap-only; absence of a mark elsewhere
-in this document is not a claim of completion.
-
-**Implemented:**
-
-- **Deterministic lifecycle FSM** -- today's status transitions
-  (`pending` -> `processing` -> `review` -> `done`/`blocked`) run through an
-  explicit, exhaustively enumerated finite-state machine so every transition
-  is provably reachable and every non-transition is provably rejected.
-- **Plan-DAG dependencies/readiness** -- `depends_on` edges gate task
-  readiness, with write-overlap blocker detection against in-flight
-  dependencies and an immutable plan snapshot captured at dispatch time (see
-  [Task Dispatch, Validation & Acceptance](#task-dispatch-validation--acceptance)
-  above).
-- **Deterministic verification lenses** -- named, composable verification
-  passes produce independent pass/fail verdicts as part of the coordinator's
-  independent re-validation, instead of one monolithic validation script.
-- **Independent coordinator accept** -- the coordinator re-validates and
-  hash-gates a worker's changed files against its own rerun, independent of
-  the worker's self-reported validation, before promoting any file out of
-  the worker's isolated workspace.
-
-**Still roadmap -- design ideas only, not implemented:**
-
-- **Combined-tree differential gate** -- diff the worker's full changed-file
-  tree against `allowed_writes` in a single pass, instead of today's
-  per-file allowlist check, to catch cross-file leakage in one shot.
-- **Read-time context graph** -- build the Source Graph/KB/session context
-  bundle lazily at the moment a worker actually requests it, rather than
-  precomputing and freezing a snapshot at dispatch time.
-- **SAFE untrusted-output wrapper** -- wrap worker/model output in a
-  structured, explicitly-untrusted envelope before any coordinator surface
-  consumes it, instead of treating worker text as directly actionable.
-- **Forward-only recovery** -- when a worker's task is interrupted (crash,
-  stale lease), recover by replaying forward from the last confirmed
-  checkpoint instead of rewinding task state, so a partially completed
-  worktree is never silently discarded.
-
-The still-roadmap items above are not scheduled or gated; they remain
-candidates to evaluate against the existing dispatch/validation/acceptance
-model described above.
+The cross-platform CI matrix qualifies Python, the extension and a fresh VSIX
+on Linux, macOS, Windows and the Remote-SSH contract. See
+[Contributing](CONTRIBUTING.md) for the contributor workflow and the
+[Product Roadmap](docs/PRODUCT_ROADMAP.md) for planned architecture work.
 
 ## Documentation
 
 - [Getting Started](docs/GETTING_STARTED.md) -- install, Init Repo, first task
 - [Architecture](docs/ARCHITECTURE.md) -- how the pieces fit together
+- [Architecture Decisions](docs/adr/README.md) -- durable authority contracts
+- [Product Roadmap](docs/PRODUCT_ROADMAP.md) -- shipped, partial and planned work
+- [Brand Guide](docs/BRAND.md) -- name, positioning, visual identity and voice
 - [Publishing](docs/PUBLISHING.md) -- release preflight and tag-driven CI release
 - [Changelog](CHANGELOG.md)
 
@@ -787,6 +728,7 @@ model described above.
 - [Contributing](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Security Policy](SECURITY.md)
+- [Support](SUPPORT.md)
 - [License](LICENSE) -- MIT
 - [GitHub Issues](https://github.com/shrec/AIWorkHub/issues) /
   [Pull Requests](https://github.com/shrec/AIWorkHub/pulls)

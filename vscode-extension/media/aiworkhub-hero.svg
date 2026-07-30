@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">AIWorkHub</title>
+  <desc id="desc">Repository-native control plane for AI software development</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/><stop offset="0.55" stop-color="#0b1d31"/><stop offset="1" stop-color="#0b2630"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="360" rx="28" fill="url(#background)"/>
+  <circle cx="1030" cy="62" r="190" fill="#0ea5e9" opacity="0.06"/><circle cx="1110" cy="320" r="220" fill="#14b8a6" opacity="0.06"/>
+  <g transform="translate(92 52) scale(.86)" fill="none" stroke="url(#brand)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M128 34 73 69v44m55-79 55 35v44"/><path d="m73 113-31 19v65l54 32 49-28m38-88 31 19v65l-54 32-53-31"/><path d="M128 92v59m0 0-32-19-24 14v34l28 16m28-45 32-19 25 14v34l-25 16-32-19"/>
+  </g>
+  <g transform="translate(92 52) scale(.86)" fill="#67e8f9">
+    <circle cx="128" cy="34" r="12"/><circle cx="73" cy="113" r="12"/><circle cx="183" cy="113" r="12"/><circle cx="42" cy="197" r="12"/><circle cx="214" cy="197" r="12"/>
+  </g>
+  <text x="365" y="145" fill="#f8fafc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="72" font-weight="750" letter-spacing="-2">AIWorkHub</text>
+  <text x="370" y="202" fill="#a5f3fc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="25" font-weight="600" letter-spacing="2">REPOSITORY-NATIVE AI ORCHESTRATION</text>
+  <text x="370" y="254" fill="#cbd5e1" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="24">Plan. Delegate. Verify. Remember.</text>
+  <rect x="370" y="284" width="430" height="4" rx="2" fill="url(#brand)"/>
+</svg>
