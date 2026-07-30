@@ -307,9 +307,11 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
         dashboard_mcp_app.SESSION_TOOL_NAME,
         dashboard_mcp_app.KB_TOOL_NAME,
         dashboard_mcp_app.STORAGE_RETENTION_PREVIEW_TOOL_NAME,
+        dashboard_mcp_app.TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
         dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
     expected_names.update(dashboard_mcp_app.STORAGE_RETENTION_WRITE_TOOLS)
+    expected_names.update(dashboard_mcp_app.TERMINAL_LOG_RETENTION_WRITE_TOOLS)
     assert set(names) == expected_names
     assert set(fake_mcp.registered) == expected_names
     assert fake_mcp.registered["aiworkhub_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view
@@ -342,6 +344,34 @@ def test_storage_retention_tools_preserve_read_write_authority(monkeypatch):
     )
     monkeypatch.setattr(dashboard_mcp_app.storage_observability, "invalidate", lambda _root: None)
     written = dashboard_mcp_app.storage_quarantine_view("a" * 64, confirm=True)
+    assert written["ok"] is True
+    assert written["authority_flags"]["readonly"] is False
+    assert written["authority_flags"]["storage_write"] is True
+
+
+def test_terminal_log_retention_tools_preserve_read_write_authority(monkeypatch):
+    monkeypatch.setattr(dashboard_mcp_app.core, "repo_root", lambda: Path("/repo"))
+    monkeypatch.setattr(
+        dashboard_mcp_app.terminal_log_retention,
+        "preview",
+        lambda _root: {"ok": True, "candidate_count": 0, "preview_digest": "b" * 64},
+    )
+    monkeypatch.setattr(
+        dashboard_mcp_app.terminal_log_retention,
+        "list_batches",
+        lambda _root: {"ok": True, "batches": []},
+    )
+    preview = dashboard_mcp_app.terminal_log_retention_preview_view()
+    assert preview["authority_flags"]["readonly"] is True
+    assert preview["authority_flags"].get("storage_write", False) is False
+
+    monkeypatch.setattr(
+        dashboard_mcp_app.terminal_log_retention,
+        "quarantine",
+        lambda *_args, **_kwargs: {"ok": True, "quarantined": 4},
+    )
+    monkeypatch.setattr(dashboard_mcp_app.storage_observability, "invalidate", lambda _root: None)
+    written = dashboard_mcp_app.terminal_log_quarantine_view("b" * 64, confirm=True)
     assert written["ok"] is True
     assert written["authority_flags"]["readonly"] is False
     assert written["authority_flags"]["storage_write"] is True

@@ -35,6 +35,9 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestStorageCleanup",
   "requestStorageRestore",
   "requestStoragePurge",
+  "requestTerminalLogCleanup",
+  "requestTerminalLogRestore",
+  "requestTerminalLogPurge",
 ]);
 
 // Outbound message types the extension host posts into the Webview.
@@ -115,6 +118,12 @@ const STORAGE_RETENTION_TOOLS = Object.freeze({
   quarantine: "aiworkhub_dashboard_storage_quarantine",
   restore: "aiworkhub_dashboard_storage_restore",
   purge: "aiworkhub_dashboard_storage_purge",
+});
+const TERMINAL_LOG_RETENTION_TOOLS = Object.freeze({
+  preview: "aiworkhub_dashboard_terminal_log_retention_preview",
+  quarantine: "aiworkhub_dashboard_terminal_log_quarantine",
+  restore: "aiworkhub_dashboard_terminal_log_restore",
+  purge: "aiworkhub_dashboard_terminal_log_purge",
 });
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
@@ -4255,6 +4264,88 @@ async function runStoragePurge(view, batchId) {
   }
 }
 
+async function runTerminalLogCleanup(view) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const preview = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.preview, {});
+    if (!preview || preview.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "terminal_log_preview_failed" });
+      return;
+    }
+    const count = Math.max(0, Number(preview.candidate_count || 0));
+    if (!count) {
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: "No policy-aged terminal logs are eligible" });
+      return;
+    }
+    const bytes = Math.max(0, Number(preview.candidate_bytes || 0));
+    const choice = await vscode.window.showWarningMessage(
+      `Move ${count} terminal run(s) (${bytes} bytes) into the 7-day AIWorkHub quarantine? The canonical process ledger, active/review work and each task's latest 10 runs remain protected.`,
+      { modal: true },
+      "Quarantine Logs",
+    );
+    if (choice !== "Quarantine Logs") return;
+    const result = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.quarantine, {
+      preview_digest: String(preview.preview_digest || ""),
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "terminal_log_quarantine_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Quarantined ${Number(result.quarantined || 0)} terminal log file(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTerminalLogRestore(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showInformationMessage(
+    `Restore terminal-log batch ${batchId}? Existing files are never overwritten.`,
+    { modal: true },
+    "Restore Logs",
+  );
+  if (choice !== "Restore Logs") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.restore, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "terminal_log_restore_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${Number(result.restored || 0)} terminal log file(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTerminalLogPurge(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Permanently purge expired terminal-log batch ${batchId}? This cannot be undone.`,
+    { modal: true },
+    "Permanently Purge Logs",
+  );
+  if (choice !== "Permanently Purge Logs") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TERMINAL_LOG_RETENTION_TOOLS.purge, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "terminal_log_purge_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: "Expired terminal-log batch permanently purged" });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
 // The sole initialization trigger: one bounded MCP tool call, tied to the
 // active repo_id/window/claim episode -- the window/claim-episode binding is
 // implicit in the AIWORKHUB_WINDOW_ID/AIWORKHUB_CLAIM_EPISODE env vars the
@@ -4407,6 +4498,19 @@ function handleInboundMessage(view, message) {
     case "requestStoragePurge": {
       const batchId = String(message.batchId || "");
       if (STORAGE_BATCH_ID_RE.test(batchId)) runStoragePurge(view, batchId);
+      break;
+    }
+    case "requestTerminalLogCleanup":
+      runTerminalLogCleanup(view);
+      break;
+    case "requestTerminalLogRestore": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runTerminalLogRestore(view, batchId);
+      break;
+    }
+    case "requestTerminalLogPurge": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runTerminalLogPurge(view, batchId);
       break;
     }
     default:
@@ -4791,6 +4895,7 @@ function getHtmlForWebview(webview, extensionUri) {
           <div class="tab-panel" role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden>
             <div class="storage-action-bar">
               <button id="storage-cleanup-preview" type="button" title="Recompute the repository-scoped retention preview and quarantine eligible worktrees after confirmation">Preview &amp; Quarantine</button>
+              <button id="terminal-log-cleanup-preview" type="button" title="Preview and quarantine only policy-aged terminal run logs; canonical ledgers and active work remain protected">Terminal Logs</button>
             </div>
             <div class="stat-list" id="storage-list"></div>
           </div>

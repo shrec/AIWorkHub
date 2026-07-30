@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import repo_policy, storage_retention, worktree_storage
+from . import repo_policy, storage_retention, terminal_log_retention, worktree_storage
 
 SCAN_TTL_SECONDS = 60.0
 
@@ -93,6 +93,20 @@ def _measure(repo_root: Path) -> dict[str, Any]:
     except storage_retention.StorageRetentionError:
         quarantine_batches = []
     quarantine_bytes = sum(int(item.get("bytes") or 0) for item in quarantine_batches)
+    try:
+        terminal_logs = terminal_log_retention.preview(repo_root)
+        terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        terminal_logs = {
+            "ok": False,
+            "error": str(exc)[:160],
+            "current_bytes": 0,
+            "candidate_count": 0,
+            "candidate_bytes": 0,
+            "protected_count": 0,
+            "projected_bytes": 0,
+        }
+        terminal_log_batches = []
     return {
         "scan_status": "ready",
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -118,6 +132,8 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "orphaned_excluded": True,
         },
         "quarantine_batches": quarantine_batches,
+        "terminal_log_retention": terminal_logs,
+        "terminal_log_quarantine_batches": terminal_log_batches,
         "errors": [],
     }
 
@@ -205,6 +221,16 @@ def snapshot(repo_root: Path | str) -> dict[str, Any]:
                 "orphaned_excluded": True,
             },
             "quarantine_batches": [],
+            "terminal_log_retention": {
+                "ok": True,
+                "dry_run": True,
+                "current_bytes": 0,
+                "candidate_count": 0,
+                "candidate_bytes": 0,
+                "protected_count": 0,
+                "projected_bytes": 0,
+            },
+            "terminal_log_quarantine_batches": [],
             "errors": [],
         }
     elif running:

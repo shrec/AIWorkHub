@@ -149,9 +149,18 @@ do not override this current priority ledger.
         fail closed. Canonical local evidence: storage/dashboard tests (`48
         passed`), complete Python suite (`1489 passed, 18 skipped`) and complete
         extension suite on 2026-07-30.
-      - [ ] Extend the same preview/quarantine/restore contract to rotated
-        terminal logs, superseded Source Graph generations and obsolete
-        extension/runtime caches with their owning lease authorities.
+      - [x] Terminal-run log lifecycle: the append-only process ledger stays
+        canonical; only exact per-request output/metadata files for finished or
+        archived tasks become eligible after the repo policy age, while active,
+        review, blocked, pending and unknown authority plus the latest ten runs
+        per task stay protected. Preview digest, same-volume repo quarantine,
+        restore and separately confirmed expired purge are exposed in MCP and
+        the Storage dashboard. Canonical local evidence: complete Python suite
+        (`1494 passed, 18 skipped`) and complete extension suite on 2026-07-30.
+      - [ ] Extend the same contract to superseded Source Graph generations
+        and obsolete extension/runtime caches with their owning lease
+        authorities. The current Source Graph uses one canonical SQLite
+        generation, so no second generation may be invented merely for GC.
 
 ### P2 — Maintainability, distribution and ecosystem
 

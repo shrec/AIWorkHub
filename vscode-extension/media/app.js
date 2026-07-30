@@ -120,6 +120,7 @@ const elements = {
   usageList: document.querySelector("#usage-list"),
   storageList: document.querySelector("#storage-list"),
   storageCleanupPreview: document.querySelector("#storage-cleanup-preview"),
+  terminalLogCleanupPreview: document.querySelector("#terminal-log-cleanup-preview"),
   systemLogList: document.querySelector("#system-log-list"),
   systemLogCopy: document.querySelector("#system-log-copy"),
   systemLogClear: document.querySelector("#system-log-clear"),
@@ -1075,6 +1076,30 @@ function renderStorage(snapshot) {
       "Preview only. Unsaved, unpushed, active, foreign-repository and orphaned worktrees are protected.",
     ));
   }
+  const terminalLogs = usage.terminal_log_retention && typeof usage.terminal_log_retention === "object"
+    ? usage.terminal_log_retention
+    : null;
+  if (terminalLogs) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Terminal log retention"));
+    for (const [label, value] of [
+      ["Policy", `keep ${formatCount(terminalLogs.logs_days)} days · latest ${formatCount(terminalLogs.keep_last_per_task)} runs/task`],
+      ["Current", formatBytes(terminalLogs.current_bytes)],
+      ["Eligible", `${formatCount(terminalLogs.candidate_count)} runs · ${formatBytes(terminalLogs.candidate_bytes)}`],
+      ["After quarantine", formatBytes(terminalLogs.projected_bytes)],
+      ["Protected", `${formatCount(terminalLogs.protected_count)} runs`],
+    ]) {
+      const row = createElement("div", "storage-row storage-retention-row");
+      row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+      fragment.appendChild(row);
+    }
+    fragment.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      terminalLogs.ok === false
+        ? `Terminal log scan degraded: ${String(terminalLogs.error || "unknown")}`
+        : "The append-only process ledger and active/review task output are never cleanup candidates.",
+    ));
+  }
   const batches = asArray(usage.quarantine_batches)
     .filter((item) => item && typeof item === "object");
   if (batches.length) {
@@ -1101,6 +1126,34 @@ function renderStorage(snapshot) {
         const purge = createElement("button", "danger-button", "Purge");
         purge.type = "button";
         purge.dataset.purgeBatch = String(batch.batch_id || "");
+        actions.appendChild(purge);
+      }
+      row.append(detail, actions);
+      fragment.appendChild(row);
+    }
+  }
+  const terminalBatches = asArray(usage.terminal_log_quarantine_batches)
+    .filter((item) => item && typeof item === "object");
+  if (terminalBatches.length) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Terminal log quarantine"));
+    for (const batch of terminalBatches) {
+      const row = createElement("div", "storage-batch-row");
+      const detail = createElement("div", "storage-batch-detail");
+      detail.append(
+        createElement("strong", "", String(batch.batch_id || "batch")),
+        createElement("span", "storage-label", `${formatCount(batch.quarantined_count)} runs · ${formatBytes(batch.bytes)} · restore until ${batch.restore_deadline ? new Date(batch.restore_deadline).toLocaleString() : "unknown"}`),
+      );
+      const actions = createElement("div", "storage-batch-actions");
+      if (numberValue(batch.quarantined_count) > 0) {
+        const restore = createElement("button", "secondary-button", "Restore logs");
+        restore.type = "button";
+        restore.dataset.restoreTerminalLogBatch = String(batch.batch_id || "");
+        actions.appendChild(restore);
+      }
+      if (batch.purge_eligible) {
+        const purge = createElement("button", "danger-button", "Purge logs");
+        purge.type = "button";
+        purge.dataset.purgeTerminalLogBatch = String(batch.batch_id || "");
         actions.appendChild(purge);
       }
       row.append(detail, actions);
@@ -2706,7 +2759,20 @@ elements.headerStorage.addEventListener("click", () => {
 elements.storageCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestStorageCleanup" });
 });
+elements.terminalLogCleanupPreview.addEventListener("click", () => {
+  vscode.postMessage({ type: "requestTerminalLogCleanup" });
+});
 elements.storageList.addEventListener("click", (event) => {
+  const restoreLogs = event.target.closest("[data-restore-terminal-log-batch]");
+  if (restoreLogs) {
+    vscode.postMessage({ type: "requestTerminalLogRestore", batchId: restoreLogs.dataset.restoreTerminalLogBatch });
+    return;
+  }
+  const purgeLogs = event.target.closest("[data-purge-terminal-log-batch]");
+  if (purgeLogs) {
+    vscode.postMessage({ type: "requestTerminalLogPurge", batchId: purgeLogs.dataset.purgeTerminalLogBatch });
+    return;
+  }
   const restore = event.target.closest("[data-restore-batch]");
   if (restore) {
     vscode.postMessage({ type: "requestStorageRestore", batchId: restore.dataset.restoreBatch });

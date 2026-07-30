@@ -22,6 +22,7 @@ for (const token of [
   'id="header-kb"',
   'id="header-preflight"',
   'id="storage-cleanup-preview"',
+  'id="terminal-log-cleanup-preview"',
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -49,6 +50,10 @@ for (const token of [
   "requestStorageRestore",
   "requestStoragePurge",
   "Quarantine batches",
+  "Terminal log retention",
+  "requestTerminalLogCleanup",
+  "requestTerminalLogRestore",
+  "requestTerminalLogPurge",
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }

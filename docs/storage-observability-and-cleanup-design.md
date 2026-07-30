@@ -1,10 +1,12 @@
 # AIWorkHub Storage Observability and Cleanup
 
-Status: retained-worktree inventory/preview/quarantine/restore/expired-purge is
-implemented; terminal-log, superseded-graph and obsolete-runtime adapters are
-still planned. Automatic cleanup remains off by default. This design is
-local-only and assumes no collaboration, RBAC, cloud service, telemetry upload,
-or external account.
+Status: retained-worktree and terminal-run-log inventory/preview/quarantine/
+restore/expired-purge are implemented. The canonical process ledger is never a
+cleanup candidate. Superseded-graph and obsolete-runtime adapters remain
+planned; the current Source Graph has one canonical SQLite generation and must
+not fabricate a generation lifecycle merely to report reclaimable bytes.
+Automatic cleanup remains off by default. This design is local-only and assumes
+no collaboration, RBAC, cloud service, telemetry upload, or external account.
 
 ## Safety contract
 

@@ -30,6 +30,7 @@ from aiworkhub import (
     storage_registry,
     storage_retention,
     task_store,
+    terminal_log_retention,
 )
 
 
@@ -524,6 +525,64 @@ def storage_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
     return response
 
 
+def terminal_log_retention_preview_view() -> dict[str, Any]:
+    """READ-ONLY: terminal-run log preview; the canonical ledger is excluded."""
+    try:
+        root = core.repo_root()
+        response = terminal_log_retention.preview(root)
+        response["quarantine"] = terminal_log_retention.list_batches(root)
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_terminal_log_retention_preview"
+    response["authority_flags"] = _readonly_authority_flags()
+    return response
+
+
+def terminal_log_quarantine_view(preview_digest: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: move one exact set of terminal files to repo-local quarantine."""
+    try:
+        root = core.repo_root()
+        response = terminal_log_retention.quarantine(
+            root, preview_digest=str(preview_digest or "")[:128], confirm=confirm is True
+        )
+        storage_observability.invalidate(root)
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_terminal_log_quarantine"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def terminal_log_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: restore one terminal-log quarantine batch without overwrite."""
+    try:
+        root = core.repo_root()
+        response = terminal_log_retention.restore(
+            root, batch_id=str(batch_id or "")[:128], confirm=confirm is True
+        )
+        storage_observability.invalidate(root)
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_terminal_log_restore"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def terminal_log_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: permanently purge one expired terminal-log batch."""
+    try:
+        root = core.repo_root()
+        response = terminal_log_retention.purge(
+            root, batch_id=str(batch_id or "")[:128], confirm=confirm is True
+        )
+        storage_observability.invalidate(root)
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_terminal_log_purge"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
 def health_view() -> dict[str, Any]:
     """READ-ONLY: cheap liveness check for the Webview's connection banner.
 
@@ -761,6 +820,15 @@ STORAGE_RETENTION_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_storage_restore": storage_restore_view,
     "aiworkhub_dashboard_storage_purge": storage_purge_view,
 }
+TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME = "aiworkhub_dashboard_terminal_log_retention_preview"
+TERMINAL_LOG_RETENTION_READ_TOOLS: dict[str, Any] = {
+    TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME: terminal_log_retention_preview_view,
+}
+TERMINAL_LOG_RETENTION_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_terminal_log_quarantine": terminal_log_quarantine_view,
+    "aiworkhub_dashboard_terminal_log_restore": terminal_log_restore_view,
+    "aiworkhub_dashboard_terminal_log_purge": terminal_log_purge_view,
+}
 
 
 def register(mcp: Any) -> tuple[str, ...]:
@@ -790,6 +858,10 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_WRITE_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in TERMINAL_LOG_RETENTION_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in TERMINAL_LOG_RETENTION_WRITE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in INITIALIZE_TOOLS.items():
         mcp.tool(name=name)(fn)
     return READONLY_TOOL_NAMES + (
@@ -798,4 +870,9 @@ def register(mcp: Any) -> tuple[str, ...]:
         SESSION_TOOL_NAME,
         KB_TOOL_NAME,
         STORAGE_RETENTION_PREVIEW_TOOL_NAME,
-    ) + tuple(STORAGE_RETENTION_WRITE_TOOLS) + (INITIALIZE_TOOL_NAME,)
+        TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
+    ) + (
+        tuple(STORAGE_RETENTION_WRITE_TOOLS)
+        + tuple(TERMINAL_LOG_RETENTION_WRITE_TOOLS)
+        + (INITIALIZE_TOOL_NAME,)
+    )
