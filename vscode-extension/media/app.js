@@ -81,6 +81,9 @@ const elements = {
   headerKb: document.querySelector("#header-kb"),
   headerKbValue: document.querySelector("#header-kb-value"),
   headerKbDetail: document.querySelector("#header-kb-detail"),
+  headerPreflight: document.querySelector("#header-preflight"),
+  headerPreflightValue: document.querySelector("#header-preflight-value"),
+  headerPreflightDetail: document.querySelector("#header-preflight-detail"),
   sourceAlert: document.querySelector("#source-alert"),
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
@@ -358,6 +361,26 @@ function renderSummary(snapshot) {
     if (card) card.title = telemetry
       ? `${formatCount(telemetry.requested_tasks)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} hits · ${degraded} degraded`
       : "Context telemetry unavailable";
+  }
+  const preflight = snapshot && snapshot.environment_preflight
+    && typeof snapshot.environment_preflight === "object"
+    ? snapshot.environment_preflight
+    : null;
+  if (elements.headerPreflightValue && elements.headerPreflightDetail) {
+    const errors = preflight ? asArray(preflight.errors) : [];
+    const providers = preflight ? asArray(preflight.providers) : [];
+    const readyProviders = providers.filter((item) => item && item.launchable).length;
+    elements.headerPreflightValue.textContent = preflight
+      ? (preflight.ok ? "Ready" : "Blocked")
+      : "Unavailable";
+    elements.headerPreflightDetail.textContent = preflight
+      ? `${readyProviders}/${providers.length} adapters · ${errors.length} blockers`
+      : "No evidence";
+    if (elements.headerPreflight) {
+      elements.headerPreflight.title = preflight
+        ? (errors.length ? errors.join(" · ") : "Repository, policy and runtime preflight passed")
+        : "Unified preflight unavailable";
+    }
   }
 }
 

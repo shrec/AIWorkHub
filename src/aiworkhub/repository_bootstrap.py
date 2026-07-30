@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import source_graph, source_graph_daemon, task_store
+from . import repo_policy, source_graph, source_graph_daemon, task_store
 
 
 def canonicalize_workspace_root(root: str | Path) -> Path:
@@ -81,6 +81,12 @@ def initialize_repository_full(
         provisioned.append("task_queue_db")
     else:
         provisioned.append("task_queue_db_verified")
+
+    # Policy-as-Code is repository-local, non-executable JSON.  InitRepo
+    # creates the safe default once and every later initialization validates
+    # the user's retained policy without overwriting it.
+    _policy_path, policy_created = repo_policy.ensure_policy(repo_root)
+    provisioned.append("repo_policy" if policy_created else "repo_policy_verified")
 
     # The one authority this wrapper adds beyond task_store's own call:
     # ensure the Source Graph database directory exists. resolve_db_path

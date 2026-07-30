@@ -109,8 +109,21 @@ do not override this current priority ledger.
       redacted. Canonical local evidence: dashboard/task/process tests (`40
       passed`), complete Python suite (`1470 passed, 18 skipped`) and complete
       extension suite on 2026-07-30.
-- [ ] Unified environment/provider preflight and repo-local Policy-as-Code for
+- [x] Unified environment/provider preflight and repo-local Policy-as-Code for
       provider scope, forbidden commands, required validation and retention.
+      InitRepo now creates one bounded, non-executable
+      `.aiworkhub/config/policy.json`; subsequent initialization validates but
+      never overwrites it. The launch gate enforces adapter scope, mandatory
+      Source Graph context on canonical code cards and configured quality-check
+      identities before claim/start. Mandatory `grep`/`rg`/`find`/`tree`
+      discovery denies cannot be removed. Retention limits are schema-bounded
+      and exposed to the storage lifecycle without accepting shell fragments.
+      The unified MCP/dashboard preflight reconciles repository authority,
+      policy, Source Graph freshness, quality config and every local adapter;
+      an installed CLI remains `installed_unverified_access` until a bridge or
+      credential authority actually observes access. Canonical local evidence:
+      policy/init/launch/dashboard tests (`44 passed`), complete Python suite
+      (`1475 passed, 18 skipped`) and complete extension suite on 2026-07-30.
 - [ ] Manager-editable model workforce inventory/scoring based on observed task
       outcomes, without fabricating provider quota/limit data unavailable from
       the provider extension API.

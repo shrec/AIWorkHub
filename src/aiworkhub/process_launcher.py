@@ -35,6 +35,7 @@ from . import context_write_intents
 from . import context_writes
 from .platform_io import chmod_fd, lock_fd, unlock_fd
 from . import quality_evidence
+from . import repo_policy
 from . import task_engine
 try:
     from . import project_context
@@ -2060,7 +2061,9 @@ class ProcessManager:
         else:
             return None, model
 
-    def _preflight_card(self, task_id: str, runner: str, topic: str) -> dict[str, Any]:
+    def _preflight_card(
+        self, task_id: str, runner: str, topic: str, adapter_id: str
+    ) -> dict[str, Any]:
         # B314_F006 (reviewed, accepted-by-design): there is a TOCTOU window
         # between this preflight read and the atomic core.claim_start_exact()
         # call made later in _launch_isolated -- a second MCP server process
@@ -2093,6 +2096,9 @@ class ProcessManager:
             raise LaunchRejected(f"task_already_claimed:{card.get('claimed_by')}")
         _validate_scope(self.repo, card)
         _validate_required_outputs_contract(card)
+        policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
+        if not policy_result.get("ok"):
+            raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
         collision = self._collision_guard(print_json=True)
         if collision.get("returncode") != 0:
             raise LaunchRejected("collision_guard_failed")
@@ -2183,7 +2189,9 @@ class ProcessManager:
             # committed) outputs into this dependent's isolated worktree by
             # declaring them as immutable inputs before create_workspace and the
             # B919 input-drift snapshot see the card.
-            card = self._with_dependency_inputs(self._preflight_card(task_id, runner, topic))
+            card = self._with_dependency_inputs(
+                self._preflight_card(task_id, runner, topic, adapter_id)
+            )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = project_context.collect_project_context(self.repo, card)
@@ -2588,7 +2596,7 @@ class ProcessManager:
         provider_env: dict[str, str] | None = None
         try:
             _validate_adapter_identity(runner, adapter_id)
-            card = self._preflight_card(task_id, runner, topic)
+            card = self._preflight_card(task_id, runner, topic, adapter_id)
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             context_result = project_context.collect_project_context(self.repo, card)
             provider_env, model = self._resolve_provider_env(adapter_id, model)

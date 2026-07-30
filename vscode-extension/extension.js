@@ -4418,6 +4418,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <strong id="header-kb-value">—</strong>
         <span class="header-insight-detail" id="header-kb-detail">No evidence</span>
       </div>
+
+      <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
+        <span class="header-storage-label">Preflight</span>
+        <strong id="header-preflight-value">Checking</strong>
+        <span class="header-insight-detail" id="header-preflight-detail">No evidence</span>
+      </div>
     </div>
   </header>
 

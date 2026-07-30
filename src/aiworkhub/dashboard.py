@@ -25,6 +25,7 @@ from aiworkhub import (
     cost_ledger,
     deepseek_credentials,
     process_launcher,
+    repo_policy,
     repository_state,
     storage_observability,
     task_plan,
@@ -838,6 +839,10 @@ class DashboardProvider:
         """Read-only worker-adapter readiness (never exposes any secret)."""
         return deepseek_credentials.adapter_readiness(repo=self.repo_root)
 
+    def get_environment_preflight(self) -> dict[str, Any]:
+        """Unified repository, policy, Source Graph and provider readiness."""
+        return repo_policy.build_preflight(self.repo_root)
+
     def get_callback_bridge_health(self) -> dict[str, Any]:
         """Read-only, redacted-safe callback bridge health: bound/unbound
         task counts and per-state outbox counts, sourced from the canonical
@@ -1113,6 +1118,18 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         })
         adapter_readiness = {}
 
+    preflight_reader = getattr(data_provider, "get_environment_preflight", lambda: {})
+    environment_preflight = _safe_read(
+        "environment_preflight", preflight_reader, errors, {}
+    )
+    if not isinstance(environment_preflight, Mapping):
+        errors.append({
+            "source": "environment_preflight",
+            "kind": "DashboardReadError",
+            "message": "environment preflight provider returned a non-object",
+        })
+        environment_preflight = {}
+
     callback_reader = getattr(
         data_provider,
         "get_callback_bridge_health",
@@ -1259,6 +1276,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "collision_report": dict(collision_report),
         "agent_processes": dict(process_report),
         "adapter_readiness": dict(adapter_readiness),
+        "environment_preflight": dict(environment_preflight),
         "source_graph_telemetry": _source_graph_telemetry(process_report),
         "project_context_telemetry": _project_context_telemetry(process_report),
         "callback_bridge_health": dict(callback_bridge_health),

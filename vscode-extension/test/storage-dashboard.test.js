@@ -20,6 +20,7 @@ for (const token of [
   'id="header-session-manager"',
   'id="header-ai-memory"',
   'id="header-kb"',
+  'id="header-preflight"',
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -38,10 +39,12 @@ for (const token of [
   "elements.headerSessionManagerValue",
   "elements.headerAiMemoryValue",
   "elements.headerKbValue",
+  "elements.headerPreflightValue",
+  "snapshot.environment_preflight",
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }
 assert.ok(css.includes(".storage-row"), "storage dashboard styling is missing");
-assert.ok(css.includes("grid-template-columns: repeat(5"), "AI infrastructure cards must share one full-width row");
+assert.ok(css.includes("grid-template-columns: repeat(6"), "AI infrastructure cards must share one full-width row");
 assert.ok(css.includes("align-items: center"), "AI infrastructure cards must be centered");
 console.log("storage dashboard contract: ok");

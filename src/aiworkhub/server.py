@@ -268,6 +268,7 @@ from . import task_engine
 from . import worker_ai_tools_mcp
 from . import dependency_autolaunch
 from . import quality_evidence
+from . import repo_policy
 from . import shared_router
 
 
@@ -1420,6 +1421,18 @@ def aiworkhub_quality_evidence_packet(changed_paths: list[str] | None = None) ->
     passed), and the cross-provider read-only quality_reviewer contract."""
 
     return quality_evidence.build_evidence_packet(core.repo_root(), changed_paths=changed_paths)
+
+
+@mcp.tool()
+def aiworkhub_environment_preflight(adapter_id: str | None = None) -> dict[str, Any]:
+    """READ-ONLY: unified repository/policy/Source Graph/provider readiness.
+
+    Provider access is reported as observed only when an adapter-specific
+    bridge or credential readiness source proves it; installed CLI binaries
+    alone remain ``installed_unverified_access``.
+    """
+
+    return repo_policy.build_preflight(core.repo_root(), adapter_id=adapter_id)
 
 
 def main() -> None:

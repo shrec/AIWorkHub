@@ -262,6 +262,13 @@ write scope, validation tools, and callback capability. Versioned repository
 policy defines tool requirements, forbidden commands, validation, retention,
 and quality gates.
 
+**0.8.0 closure:** InitRepo provisions validated, non-executable repository
+policy JSON; launch applies its adapter, Source Graph and required-check gates
+before claim/start. A unified MCP/dashboard preflight reports repository,
+policy, Source Graph, quality and adapter readiness while distinguishing an
+installed executable from actually observed provider access. Retention policy
+is bounded here and consumed by the separate storage-lifecycle workstream.
+
 ## P2 — Storage lifecycle, analytics, and integrations (0.9.x)
 
 - Ship inventory-only storage accounting first, then preview, quarantine,
