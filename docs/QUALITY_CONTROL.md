@@ -104,6 +104,12 @@ AIWorkHub must test its gates, not only the code behind them:
 - Historical calibration may tune reviewer/model selection, but never rewrite
   old evidence or silently weaken a repository policy.
 
+The shipped `aiworkhub_quality_calibration_report` runs this fold-only matrix
+without repository or model side effects. Its current baseline is 26 cases
+(3 positive, 23 targeted negative), with reviewer overflow treated as a
+blocking schema error rather than silently truncated. Cross-platform CI runs
+the same matrix so a platform-specific false green or false red blocks release.
+
 ## What we adopt from kimi-atlas
 
 The useful transferable mechanisms are its falsifiable named lenses, pure

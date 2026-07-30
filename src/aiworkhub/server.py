@@ -268,6 +268,7 @@ from . import task_engine
 from . import worker_ai_tools_mcp
 from . import dependency_autolaunch
 from . import quality_evidence
+from . import quality_calibration
 from . import repo_policy
 from . import shared_router
 
@@ -1507,6 +1508,13 @@ def aiworkhub_quality_evidence_packet(changed_paths: list[str] | None = None) ->
     passed), and the cross-provider read-only quality_reviewer contract."""
 
     return quality_evidence.build_evidence_packet(core.repo_root(), changed_paths=changed_paths)
+
+
+@mcp.tool()
+def aiworkhub_quality_calibration_report() -> dict[str, Any]:
+    """READ-ONLY: run the deterministic positive/negative gate matrix."""
+
+    return quality_calibration.run_calibration()
 
 
 @mcp.tool()

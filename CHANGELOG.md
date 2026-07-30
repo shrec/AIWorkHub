@@ -30,6 +30,9 @@ noted by package/extension version and release tag.
   lifecycle-blocked counts and exact task-ID populations.
 - Added reproducible Ruff correctness and mypy typed-kernel gates to repository
   policy, pull-request CI and tag releases through a declared `dev` extra.
+- Added a read-only 26-case Quality Gate calibration report with false-green,
+  false-red and expected-blocker metrics, required across the platform CI
+  matrix; excess reviewer reports now fail closed instead of silent truncation.
 - Release metadata verification now fails when the canonical version has no
   corresponding changelog section.
 - Replaced the implementation-history README with an outcome-first public

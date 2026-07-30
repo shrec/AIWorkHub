@@ -186,9 +186,14 @@ do not override this current priority ledger.
             identity and anti-anchored evidence packets.
       - [x] Produce and enforce combined-tree differential evidence before
             manager promotion for medium-and-higher risk tasks.
-      - [ ] Expand calibration to one positive and targeted negative fixture
-            for every blocking predicate and report false-green/false-red
-            rates across the platform matrix.
+      - [x] Expand calibration to reference positives and a targeted negative
+            for every pure-verdict blocker family. The canonical read-only MCP
+            report exposes 26 cases, expected blocker observability, false-
+            green/false-red rates and uncalibrated IDs; reviewer-report
+            overflow now fails closed instead of truncating silently. The same
+            test is required by Linux, Windows, macOS and Remote-SSH CI.
+            Canonical local evidence: focused quality tests (`60 passed`) on
+            2026-07-30 with 0 false greens and 0 false reds.
 - [ ] Split `core.py` and `process_launcher.py` along lifecycle, authority,
       review and context boundaries without changing public MCP contracts.
 - [ ] Modularize the VS Code extension in TypeScript with deterministic bundle

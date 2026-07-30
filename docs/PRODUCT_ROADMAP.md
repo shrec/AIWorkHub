@@ -244,8 +244,10 @@ raises task requirements from declared/observed signals but never lets a worker
 lower them. Read-only reviewer reports use a bounded strict schema, missing
 required reviewer/combined-tree evidence fails closed, and the dashboard shows
 effective risk, verdict, refinement requirement and bounded lens status. The
-first positive/negative fixture matrix proves syntax and unavailable-required-
-check failures; full predicate calibration remains open.
+canonical calibration matrix now covers every pure-verdict blocker family
+with 3 reference positives and 23 targeted negatives. It reports expected
+blocker observability, false-green/false-red rates and uncalibrated case IDs;
+the same test is required in Linux, Windows, macOS and Remote-SSH CI.
 
 Manager acceptance now materializes a fresh `aiworkhub.combined_tree.v1`
 workspace for medium-and-higher risk. It overlays the current canonical

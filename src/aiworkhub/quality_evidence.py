@@ -305,7 +305,10 @@ def _normalize_reviewer_reports(
 
     normalized: list[dict[str, Any]] = []
     errors: list[str] = []
-    for index, report in enumerate(list(reports)[:MAX_REVIEW_REPORTS]):
+    report_rows = list(reports)
+    if len(report_rows) > MAX_REVIEW_REPORTS:
+        errors.append("reviewer_schema:too_many_reports")
+    for index, report in enumerate(report_rows[:MAX_REVIEW_REPORTS]):
         if not isinstance(report, Mapping):
             errors.append(f"reviewer_schema:{index}:not_object")
             continue
