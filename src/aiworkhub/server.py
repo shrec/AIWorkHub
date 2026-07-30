@@ -1203,7 +1203,11 @@ def aiworkhub_agent_cancel_task(
 
 
 @mcp.tool()
-def aiworkhub_agent_accept_review(request_id: str, task_id: str) -> dict[str, Any]:
+def aiworkhub_agent_accept_review(
+    request_id: str,
+    task_id: str,
+    confirm_destructive_change: bool = False,
+) -> dict[str, Any]:
     """COORDINATOR/WRITE-GATED: accept one ``review_ready`` request, phase 2.
 
     Re-runs scope, required-output, and validation gates against the
@@ -1215,7 +1219,11 @@ def aiworkhub_agent_accept_review(request_id: str, task_id: str) -> dict[str, An
     request again returns ``already_accepted`` instead of re-promoting.
     """
 
-    return process_launcher.default_manager().accept_review(request_id, task_id)
+    return process_launcher.default_manager().accept_review(
+        request_id,
+        task_id,
+        confirm_destructive_change=confirm_destructive_change,
+    )
 
 
 @mcp.tool()

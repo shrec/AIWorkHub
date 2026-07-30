@@ -485,3 +485,47 @@ def test_accept_review_guard_is_noop_without_declared_immutable_inputs(
     assert result["ok"] is True
     assert promote_calls == [["out/result.txt"]]
     assert len(accept_review_calls) == 1
+
+
+def test_accept_review_requires_explicit_manager_confirmation_for_destructive_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    blocker = process_launcher.quality_evidence.EvidenceCheck(
+        check_id="builtin:destructive_diff:src/engine.py",
+        kind="static_analysis",
+        status=process_launcher.quality_evidence.STATUS_FAILED,
+        affected_paths=("src/engine.py",),
+        summary="baseline_lines=4000; candidate_lines=80; public_symbols=40->1",
+        provenance="builtin:manager_accept_destructive_diff",
+        error="explicit confirmation required",
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "run_destructive_diff_checks",
+        lambda *_args, **_kwargs: [blocker],
+    )
+
+    blocked = manager.accept_review(request_id, task_id)
+
+    assert blocked["ok"] is False
+    assert "destructive_diff_requires_manager_confirmation" in blocked["error"]
+    assert promote_calls == []
+    assert accept_review_calls == []
+    assert card["status"] == "review"
+
+    accepted = manager.accept_review(
+        request_id,
+        task_id,
+        confirm_destructive_change=True,
+    )
+
+    assert accepted["ok"] is True
+    assert promote_calls == [["out/result.txt"]]
+    assert len(accept_review_calls) == 1
+    quality = accept_review_calls[0]["evidence"]["quality_gate"]
+    assert quality["destructive_diff_blockers"] == [blocker.check_id]
+    assert quality["destructive_change_confirmed"] is True

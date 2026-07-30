@@ -3944,7 +3944,13 @@ class ProcessManager:
             }
         return {"ok": True, "request_id": request_id, "state": event["state"]}
 
-    def accept_review(self, request_id: str, task_id: str) -> dict[str, Any]:
+    def accept_review(
+        self,
+        request_id: str,
+        task_id: str,
+        *,
+        confirm_destructive_change: bool = False,
+    ) -> dict[str, Any]:
         """Coordinator/write-gated acceptance of one ``review_ready`` request.
 
         This is Phase 2 of the review-first lifecycle: ``_finalize_isolated_request``
@@ -4182,6 +4188,27 @@ class ProcessManager:
                     blockers = quality_gate.get("blocking_checks") or []
                     reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
                     raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
+                destructive_checks = quality_evidence.run_destructive_diff_checks(
+                    self.repo,
+                    workspace.path,
+                    changed_paths=changed,
+                )
+                destructive_rows = [check.to_dict() for check in destructive_checks]
+                destructive_blockers = [
+                    check.check_id
+                    for check in destructive_checks
+                    if check.status == quality_evidence.STATUS_FAILED
+                ]
+                quality_gate["destructive_diff_checks"] = destructive_rows
+                quality_gate["destructive_diff_blockers"] = destructive_blockers
+                quality_gate["destructive_change_confirmed"] = bool(
+                    confirm_destructive_change and destructive_blockers
+                )
+                if destructive_blockers and not confirm_destructive_change:
+                    raise WorkspaceError(
+                        "destructive_diff_requires_manager_confirmation:"
+                        + ",".join(destructive_blockers)[:300]
+                    )
                 validations = run_validations(workspace, card.get("validation") or [])
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(

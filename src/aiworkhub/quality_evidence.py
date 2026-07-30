@@ -33,6 +33,12 @@ CONFIG_RELATIVE_PATH = ".aiworkhub/quality.json"
 MAX_AFFECTED_PATHS = 200
 MAX_SUMMARY_CHARS = 2000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+DESTRUCTIVE_SOURCE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".bash"})
+DESTRUCTIVE_MIN_BASELINE_LINES = 200
+DESTRUCTIVE_MIN_REMOVED_LINES = 100
+DESTRUCTIVE_MAX_RETAINED_RATIO = 0.50
+DESTRUCTIVE_MIN_PUBLIC_SYMBOLS = 4
+DESTRUCTIVE_MAX_RETAINED_SYMBOL_RATIO = 0.50
 
 # Repository-declared checks are intentionally broader than ordinary CI
 # labels.  This lets a repository make CodeQL/Semgrep/SAST, dependency,
@@ -458,6 +464,101 @@ def run_completion_quality_gate(
         "config_error": config_error,
         "optional_gates": optional,
     }
+
+
+def _public_python_symbols(source: str) -> set[str]:
+    """Return bounded top-level public API names, or an empty set on parse failure."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("_"):
+                names.add(node.name)
+    return names
+
+
+def run_destructive_diff_checks(
+    baseline_root: Path | str,
+    candidate_root: Path | str,
+    *,
+    changed_paths: Iterable[str],
+) -> list[EvidenceCheck]:
+    """Detect high-confidence module replacement using multiple signals.
+
+    This deliberately does not rely on one brittle line threshold. A source
+    path blocks only when it is a substantial existing file, loses both a
+    large absolute and relative amount of content, and (for Python modules
+    with a measurable API) loses most public top-level symbols. The manager
+    can explicitly confirm an intentional destructive refactor at accept
+    time; workers cannot self-authorize it through their own tests/config.
+    """
+    baseline = Path(baseline_root)
+    candidate = Path(candidate_root)
+    changed = tuple(sorted({str(path).replace("\\", "/") for path in changed_paths}))
+    tests_changed = any(
+        path.startswith("tests/") or "/test" in path or Path(path).name.startswith("test_")
+        for path in changed
+    )
+    checks: list[EvidenceCheck] = []
+    for relative in changed[:MAX_AFFECTED_PATHS]:
+        if Path(relative).suffix.lower() not in DESTRUCTIVE_SOURCE_SUFFIXES:
+            continue
+        before_path = baseline / relative
+        after_path = candidate / relative
+        if not before_path.is_file():
+            continue
+        try:
+            before = before_path.read_text(encoding="utf-8")
+            after = after_path.read_text(encoding="utf-8") if after_path.is_file() else ""
+        except (OSError, UnicodeError):
+            continue
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
+        baseline_lines = len(before_lines)
+        candidate_lines = len(after_lines)
+        removed_lines = max(0, baseline_lines - candidate_lines)
+        retained_ratio = candidate_lines / max(1, baseline_lines)
+        signals = {
+            "substantial_baseline": baseline_lines >= DESTRUCTIVE_MIN_BASELINE_LINES,
+            "large_absolute_loss": removed_lines >= DESTRUCTIVE_MIN_REMOVED_LINES,
+            "large_relative_loss": retained_ratio <= DESTRUCTIVE_MAX_RETAINED_RATIO,
+        }
+        before_symbols: set[str] = set()
+        after_symbols: set[str] = set()
+        if Path(relative).suffix.lower() == ".py":
+            before_symbols = _public_python_symbols(before)
+            after_symbols = _public_python_symbols(after)
+            if len(before_symbols) >= DESTRUCTIVE_MIN_PUBLIC_SYMBOLS:
+                signals["public_api_loss"] = (
+                    len(after_symbols & before_symbols) / len(before_symbols)
+                    <= DESTRUCTIVE_MAX_RETAINED_SYMBOL_RATIO
+                )
+        blocking = all(
+            signals.get(name, False)
+            for name in ("substantial_baseline", "large_absolute_loss", "large_relative_loss")
+        ) and ("public_api_loss" not in signals or signals["public_api_loss"])
+        checks.append(EvidenceCheck(
+            check_id=f"builtin:destructive_diff:{relative}",
+            kind="static_analysis",
+            status=STATUS_FAILED if blocking else STATUS_PASSED,
+            affected_paths=(relative,),
+            summary=(
+                f"baseline_lines={baseline_lines}; candidate_lines={candidate_lines}; "
+                f"removed_lines={removed_lines}; retained_ratio={retained_ratio:.3f}; "
+                f"public_symbols={len(before_symbols)}->{len(after_symbols)}; "
+                f"tests_changed={str(tests_changed).lower()}; signals="
+                + ",".join(name for name, active in signals.items() if active)
+            ),
+            provenance="builtin:manager_accept_destructive_diff",
+            error=(
+                "high-confidence destructive module replacement requires explicit manager confirmation"
+                if blocking else ""
+            ),
+        ))
+    return checks
 
 
 # ---------------------------------------------------------------------------

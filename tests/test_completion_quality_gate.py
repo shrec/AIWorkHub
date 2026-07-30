@@ -66,3 +66,48 @@ def test_completion_quality_gate_accepts_codeql_like_static_analysis_kind(tmp_pa
     declared = next(row for row in packet["checks"] if row["check_id"] == "bounded-sast")
     assert declared["kind"] == "static_analysis"
     assert declared["status"] == "passed"
+
+
+def test_destructive_diff_blocks_multi_signal_module_replacement(tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    for root in (baseline, candidate):
+        (root / "src").mkdir(parents=True)
+        (root / "tests").mkdir(parents=True)
+    functions = "\n".join(
+        f"def public_{index}():\n    return {index}\n" for index in range(120)
+    )
+    (baseline / "src" / "engine.py").write_text(functions, encoding="utf-8")
+    (candidate / "src" / "engine.py").write_text(
+        "def public_0():\n    return 0\n", encoding="utf-8"
+    )
+    (candidate / "tests" / "test_engine.py").write_text(
+        "def test_small():\n    assert True\n", encoding="utf-8"
+    )
+
+    checks = quality_evidence.run_destructive_diff_checks(
+        baseline,
+        candidate,
+        changed_paths=["src/engine.py", "tests/test_engine.py"],
+    )
+
+    blocker = next(row for row in checks if row.check_id.endswith("src/engine.py"))
+    assert blocker.status == "failed"
+    assert "tests_changed=true" in blocker.summary
+    assert "public_api_loss" in blocker.summary
+
+
+def test_destructive_diff_allows_small_or_nonshrinking_edit(tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    baseline.mkdir()
+    candidate.mkdir()
+    before = "\n".join(f"value_{index} = {index}" for index in range(250)) + "\n"
+    (baseline / "engine.py").write_text(before, encoding="utf-8")
+    (candidate / "engine.py").write_text(before + "new_value = 1\n", encoding="utf-8")
+
+    checks = quality_evidence.run_destructive_diff_checks(
+        baseline, candidate, changed_paths=["engine.py"]
+    )
+
+    assert [row.status for row in checks] == ["passed"]
