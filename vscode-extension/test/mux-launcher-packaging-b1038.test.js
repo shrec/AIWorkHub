@@ -12,7 +12,7 @@ function testCmdSemantics() {
   const cmd = fs.readFileSync(
     path.join(REPO_ROOT, "scripts", "aiworkhub-app-server-mux.cmd"),
     "utf8"
-  );
+  ).replace(/\r\n/g, "\n");
 
   // preamble
   if (!cmd.includes("@echo off\nsetlocal")) {
