@@ -15,4 +15,5 @@ node_modules/
 *.sqlite
 *.sqlite3
 *.db
-.aiworkhub/
+.aiworkhub/*
+!.aiworkhub/quality.json

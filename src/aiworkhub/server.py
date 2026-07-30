@@ -1478,10 +1478,26 @@ def aiworkhub_quality_run_checks(changed_paths: list[str] | None = None) -> dict
 
     root = core.repo_root()
     try:
+        config_status = quality_evidence.repo_config_status(root)
+        if config_status["status"] != "configured":
+            return {
+                "ok": False,
+                "status": "unverified",
+                "error": config_status["reason"],
+                "schema_id": quality_evidence.SCHEMA_ID,
+                "checks": [],
+                "repository_quality_policy": config_status,
+            }
         checks = quality_evidence.run_declared_checks(root, changed_paths=changed_paths)
     except quality_evidence.MalformedConfigError as exc:
         return {"ok": False, "error": str(exc), "schema_id": quality_evidence.SCHEMA_ID}
-    return {"ok": True, "schema_id": quality_evidence.SCHEMA_ID, "checks": [c.to_dict() for c in checks]}
+    return {
+        "ok": True,
+        "status": "verified" if all(c.status == quality_evidence.STATUS_PASSED for c in checks) else "unverified",
+        "schema_id": quality_evidence.SCHEMA_ID,
+        "checks": [c.to_dict() for c in checks],
+        "repository_quality_policy": config_status,
+    }
 
 
 @mcp.tool()

@@ -153,6 +153,55 @@ def test_missing_config_is_empty_not_error(tmp_path):
     assert config == {"checks": []}
 
 
+def test_missing_or_empty_config_status_is_explicitly_unverified(tmp_path):
+    repo = _repo(tmp_path)
+    assert qe.repo_config_status(repo) == {
+        "config_present": False,
+        "declared_check_count": 0,
+        "status": "unverified",
+        "reason": "quality_config_missing",
+    }
+    (repo / ".aiworkhub").mkdir()
+    (repo / ".aiworkhub" / "quality.json").write_text(
+        json.dumps({"checks": []}), encoding="utf-8"
+    )
+    assert qe.repo_config_status(repo) == {
+        "config_present": True,
+        "declared_check_count": 0,
+        "status": "unverified",
+        "reason": "quality_checks_empty",
+    }
+
+
+def test_portable_python_placeholder_uses_current_interpreter(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / ".aiworkhub").mkdir()
+    (repo / ".aiworkhub" / "quality.json").write_text(
+        json.dumps(
+            {
+                "checks": [
+                    {
+                        "id": "portable-python",
+                        "kind": "test",
+                        "command": ["{python}", "-c", "raise SystemExit(0)"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks = qe.run_declared_checks(repo)
+    assert checks[0].status == qe.STATUS_PASSED
+
+
+def test_evidence_packet_never_reports_missing_policy_as_green(tmp_path):
+    repo = _repo(tmp_path)
+    packet = qe.build_evidence_packet(repo)
+    assert packet["ok"] is False
+    assert packet["status"] == "unverified"
+    assert packet["repository_quality_policy"]["reason"] == "quality_config_missing"
+
+
 # --- command array safety (shell=False only) ----------------------------
 
 

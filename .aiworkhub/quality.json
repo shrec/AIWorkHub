@@ -1,0 +1,36 @@
+{
+  "checks": [
+    {
+      "id": "quality-gate-regression",
+      "kind": "test",
+      "command": [
+        "{python}",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_completion_quality_gate.py",
+        "tests/test_quality_verdict_v2.py",
+        "tests/test_combined_tree_workspace.py"
+      ]
+    },
+    {
+      "id": "extension-regression",
+      "kind": "test",
+      "command": [
+        "npm",
+        "--prefix",
+        "vscode-extension",
+        "test"
+      ]
+    },
+    {
+      "id": "release-metadata",
+      "kind": "build",
+      "command": [
+        "{python}",
+        "scripts/release_metadata.py",
+        "check"
+      ]
+    }
+  ]
+}

@@ -4,6 +4,7 @@ import json
 import ast
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -577,6 +578,28 @@ def load_repo_config(repo_root: Path | str) -> dict[str, Any]:
     return data
 
 
+def repo_config_status(repo_root: Path | str) -> dict[str, Any]:
+    """Return explicit repository quality-policy truth without executing it."""
+
+    root = Path(repo_root)
+    path = root / CONFIG_RELATIVE_PATH
+    if not path.is_file():
+        return {
+            "config_present": False,
+            "declared_check_count": 0,
+            "status": "unverified",
+            "reason": "quality_config_missing",
+        }
+    config = load_repo_config(root)
+    count = len(config.get("checks") or [])
+    return {
+        "config_present": True,
+        "declared_check_count": count,
+        "status": "configured" if count else "unverified",
+        "reason": "" if count else "quality_checks_empty",
+    }
+
+
 def _validate_declared_check(entry: Any) -> None:
     if not isinstance(entry, dict):
         raise MalformedConfigError("each declared check must be a JSON object")
@@ -601,7 +624,7 @@ def _run_command_array(
 ) -> tuple[str, str, str, float]:
     """Run one exact argv array, shell=False. Returns (status, stdout, stderr, duration)."""
 
-    argv = list(command)
+    argv = [sys.executable if part == "{python}" else part for part in command]
     start = time.monotonic()
     try:
         completed = subprocess.run(
@@ -804,6 +827,15 @@ def run_completion_quality_gate(
     root = Path(repo_root)
     affected = tuple(sorted(str(p) for p in (changed_paths or ())))
     try:
+        config_status = repo_config_status(root)
+    except MalformedConfigError as exc:
+        config_status = {
+            "config_present": True,
+            "declared_check_count": 0,
+            "status": "unverified",
+            "reason": str(exc)[:MAX_SUMMARY_CHARS],
+        }
+    try:
         checks = run_builtin_static_checks(root, changed_paths=affected)
         declared = run_declared_checks(root, changed_paths=affected)
         config_error = ""
@@ -850,6 +882,12 @@ def run_completion_quality_gate(
         "optional_gates": optional,
         "risk_profile": risk_profile,
         "quality_verdict": verdict,
+        "repository_quality_policy": config_status,
+        "verification_scope": (
+            "repository_policy"
+            if config_status["status"] == "configured"
+            else "builtin_and_task_contract_only"
+        ),
     }
 
 
@@ -1189,11 +1227,18 @@ def build_evidence_packet(
 
     root = Path(repo_root)
     try:
+        config_status = repo_config_status(root)
         declared_checks = [
             c.to_dict() for c in declared_check_descriptors(root, changed_paths=changed_paths)
         ]
         config_error = ""
     except MalformedConfigError as exc:
+        config_status = {
+            "config_present": True,
+            "declared_check_count": 0,
+            "status": "unverified",
+            "reason": str(exc)[:MAX_SUMMARY_CHARS],
+        }
         declared_checks = []
         config_error = str(exc)
     optional_gates = [
@@ -1204,6 +1249,9 @@ def build_evidence_packet(
         "repo_root": str(root),
         "profile": build_zero_config_profile(root),
         "declared_checks": declared_checks,
+        "repository_quality_policy": config_status,
+        "status": config_status["status"],
+        "ok": config_status["status"] == "configured",
         "config_error": config_error,
         "optional_gates": optional_gates,
         "quality_reviewer_contract": quality_reviewer_contract(),

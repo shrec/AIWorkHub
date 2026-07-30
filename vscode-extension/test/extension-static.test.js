@@ -16,6 +16,7 @@ function absent(haystack, values, label) {
 
 assert.strictEqual(pkg.name, "aiworkhub");
 assert.strictEqual(pkg.displayName, "AIWorkHub");
+assert.strictEqual(pkg.scripts.test, "node test/run-all.js");
 assert.ok(ext.includes(`EXPECTED_MCP_PACKAGE_VERSION = "${pkg.version}"`));
 assert.deepStrictEqual(pkg.extensionKind, ["workspace"]);
 assert.strictEqual(pkg.icon, "media/aiworkhub-icon.png");

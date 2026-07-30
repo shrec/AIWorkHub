@@ -195,6 +195,18 @@ do not override this current priority ledger.
       output and restored-tab/reload E2E coverage.
 - [ ] Centralize pytest fixtures/state isolation and organize unit/integration/
       E2E suites; add Ruff, type checking and pre-commit quality gates.
+- [ ] Close the 2026-07-30 operational-truth audit in measured order:
+      - [x] Missing/empty repository quality policy is explicitly
+            `unverified`; public check execution cannot return an empty green.
+            AIWorkHub itself carries three portable declared checks.
+      - [ ] Account for canonical, legacy, orphaned and prunable-worktree bytes
+            in one retention preview and reclaim workflow.
+      - [ ] Rotate/stream the terminal ledger and bound each worker stdout log.
+      - [ ] Bind deterministic verification to claim epoch and separate DAG-
+            dependency blocking from lifecycle-blocked counts.
+      - [x] Discover and execute every extension `*.test.js` sequentially;
+            CI no longer depends on a hand-maintained filename chain.
+      - [ ] Add calibrated Ruff/type gates and close stale repository artifacts.
 - [x] Make version metadata a single source of truth and enforce Linux/Windows/
       macOS release CI plus reproducible VSIX checksums. Canonical authority is
       `src/aiworkhub/_version.py`; projections, tag identity, repeated VSIX

@@ -8,6 +8,10 @@ noted by package/extension version and release tag.
 
 ### Added
 
+- Added a tracked repository quality policy with portable `{python}` command
+  resolution and explicit configured/unverified policy status.
+- Added deterministic extension test discovery so every `*.test.js` file is
+  executed in CI without maintaining a filename chain.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.
@@ -29,10 +33,29 @@ noted by package/extension version and release tag.
 
 ### Changed
 
+- Missing or empty `.aiworkhub/quality.json` can no longer produce an empty
+  `ok: true`; evidence surfaces identify builtin-only versus repository-policy
+  verification explicitly.
 - Reframed the repository landing page around user outcomes and the current
   product architecture instead of historical implementation notes.
 - Corrected the security and issue-reporting guidance to reflect the native
   stdio dashboard and repository-local runtime.
+
+## [0.8.0] - 2026-07-30
+
+### Added
+
+- Added manager-reviewed context-write intents and safe legacy Session/Memory/
+  KB import into canonical repository storage.
+- Added a four-platform fresh-install qualification matrix and reproducible
+  VSIX/package release checks.
+
+### Fixed
+
+- Made repository handoff and worker relaunch atomic across manager changes.
+- Preserved archived terminal lifecycle truth and blocked destructive review
+  false-greens before promotion.
+- Stabilized Linux, Windows, macOS and Remote-SSH release qualification.
 
 ## [0.7.9] - 2026-07-30
 

@@ -14,6 +14,8 @@ def test_completion_quality_gate_passes_valid_changed_sources(tmp_path) -> None:
     assert packet["blocking_checks"] == []
     assert {row["status"] for row in packet["checks"]} == {"passed"}
     assert all(row["status"] in {"skipped", "not_available"} for row in packet["optional_gates"])
+    assert packet["repository_quality_policy"]["status"] == "unverified"
+    assert packet["verification_scope"] == "builtin_and_task_contract_only"
 
 
 def test_completion_quality_gate_blocks_invalid_python(tmp_path) -> None:
