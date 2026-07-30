@@ -5,13 +5,13 @@ whose task lifecycle, source context, sessions, memory, knowledge, review and
 callback routing work consistently in every supported VS Code environment.
 
 Current canonical baseline (2026-07-30): standalone GitHub repository,
-release `0.7.9`, native repo-local `.aiworkhub` storage, multi-repository
+release `0.8.0`, native repo-local `.aiworkhub` storage, multi-repository
 manager routing, isolated workers, review-first promotion, callback outbox,
 Source Graph daemon, Session/AI Memory/KB manager read-write surfaces, and a
 native VS Code dashboard. Historical phase notes below remain as evidence but
 do not override this current priority ledger.
 
-## Current Priority Ledger — Post-0.7.9
+## Current Priority Ledger — Post-0.8.0
 
 ### P0 — Stable product closure
 
@@ -52,8 +52,11 @@ do not override this current priority ledger.
       Canonical green evidence: GitHub Actions run `30548398008` on commit
       `5f57fa5` (Linux, Remote-SSH contract, Windows and macOS qualification
       artifacts, plus Python 3.10/3.11/3.12, VSIX and distribution jobs).
-- [ ] Cut the next stable release only after the matrix is green and the
-      bundled runtime/extension/source version hashes agree.
+- [x] Cut the next stable release only after the matrix is green and the
+      bundled runtime/extension/source version hashes agree. `v0.8.0` was
+      published from commit `d0b1b7a` by release run `30549137880`; its four
+      qualification lanes, version lock, complete package tests and final
+      VSIX/wheel/sdist asset verification all passed.
 
 ### P1 — Context economy and orchestration UX
 
