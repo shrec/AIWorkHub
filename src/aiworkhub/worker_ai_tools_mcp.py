@@ -86,7 +86,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 try:
     from .platform_io import chmod_fd
@@ -115,6 +115,7 @@ ENV_SOURCE_GRAPH_TARGETS = "AIWORKHUB_WORKER_MCP_SOURCE_GRAPH_TARGETS"
 ENV_SESSION_TOPIC = "AIWORKHUB_WORKER_MCP_SESSION_TOPIC"
 ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
+ENV_QUALITY_REVIEW_PACKET_PATH = "AIWORKHUB_WORKER_MCP_QUALITY_REVIEW_PACKET_PATH"
 # The interpreter's own import-path variable (never an AIWORKHUB_* identity
 # binding) -- carries the portable ".../src" import root so `python -m
 # aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
@@ -142,6 +143,8 @@ MIN_LIMIT = 1
 MAX_LIMIT = 20
 MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
+MAX_QUALITY_REVIEW_PACKET_BYTES = 256 * 1024
+MAX_QUALITY_REVIEW_FINDINGS = 50
 SQLITE_QUERY_TIMEOUT_SECONDS = 5
 SESSION_SNIPPET_CHARS = 280
 
@@ -164,6 +167,7 @@ class WorkerToolContext:
     session_topic: str
     audit_ledger_path: Path | None
     audit_hmac_key_path: Path | None
+    quality_review_packet_path: Path | None = None
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -199,6 +203,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
     ) if isinstance(targets_parsed, list) else ()
     ledger_raw = source.get(ENV_AUDIT_LEDGER_PATH) or ""
     key_raw = source.get(ENV_AUDIT_HMAC_KEY_PATH) or ""
+    review_packet_raw = source.get(ENV_QUALITY_REVIEW_PACKET_PATH) or ""
     return WorkerToolContext(
         task_id=str(source[ENV_TASK_ID]),
         runner=str(source[ENV_RUNNER]),
@@ -210,6 +215,9 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         session_topic=str(source.get(ENV_SESSION_TOPIC) or source[ENV_TOPIC]),
         audit_ledger_path=Path(str(ledger_raw)) if ledger_raw else None,
         audit_hmac_key_path=Path(str(key_raw)) if key_raw else None,
+        quality_review_packet_path=(
+            Path(str(review_packet_raw)) if review_packet_raw else None
+        ),
     )
 
 
@@ -469,6 +477,7 @@ def _append_audit(
     violation: str = "",
     authority_source: str = "",
     authority_state: str = "",
+    payload: Mapping[str, Any] | None = None,
 ) -> None:
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
         return
@@ -493,6 +502,13 @@ def _append_audit(
         "authority_state": authority_state[:64],
         "authority_repo": str(ctx.authority_repo),
     }
+    if payload is not None:
+        encoded_payload = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        if len(encoded_payload) > MAX_TOOL_OUTPUT_BYTES:
+            return
+        entry["payload"] = dict(payload)
     digest = _hmac_entry(entry, key)
     line = json.dumps({**entry, "hmac_sha256": digest}, ensure_ascii=False, sort_keys=True) + "\n"
     try:
@@ -536,6 +552,7 @@ def verify_audit_ledger(
         "source_graph_zero_hit_calls": 0,
         "source_graph_failed_calls": 0,
         "authority_index_identity": [],
+        "verified_payloads": [],
         "reason": "",
     }
     try:
@@ -611,6 +628,14 @@ def verify_audit_ledger(
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
         if authority_source or authority_state:
             authority_seen.add((tool, authority_source, authority_state, authority_repo))
+        payload = entry.get("payload")
+        if (
+            tool == "quality_review_submit"
+            and entry.get("ok")
+            and isinstance(payload, dict)
+            and len(result["verified_payloads"]) < 12
+        ):
+            result["verified_payloads"].append(payload)
         # A "live" source_graph call must be a genuinely fresh, non-empty,
         # successful authoritative lookup -- a cache hit or a zero-hit
         # response is real telemetry but must NOT satisfy the completion
@@ -1233,6 +1258,119 @@ def kb_write_intent(
     )
 
 
+def quality_review_submit(
+    ctx: WorkerToolContext,
+    *,
+    packet_sha256: str,
+    lens: str,
+    findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Submit findings for the exact coordinator-bound review packet.
+
+    This tool is inert for ordinary workers: the launcher must bind one
+    immutable packet path into the worker runtime. The model cannot choose a
+    target task/provider, and the signed audit payload carries the worker's
+    immutable request/task identity rather than caller-supplied identity.
+    """
+
+    from . import quality_evidence, quality_reviewer
+
+    tool = "quality_review_submit"
+    path = ctx.quality_review_packet_path
+    if path is None:
+        return _violation(ctx, tool, "quality_review_packet_not_bound")
+    try:
+        if path.is_symlink() or not path.is_file():
+            return _violation(ctx, tool, "quality_review_packet_invalid")
+        if path.stat().st_size > MAX_QUALITY_REVIEW_PACKET_BYTES:
+            return _violation(ctx, tool, "quality_review_packet_too_large")
+        packet = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _violation(ctx, tool, "quality_review_packet_unreadable")
+    if not isinstance(packet, dict) or packet.get("schema_id") != quality_reviewer.PACKET_SCHEMA_ID:
+        return _violation(ctx, tool, "quality_review_packet_schema_mismatch")
+    if packet.get("packet_sha256") != packet_sha256:
+        return _violation(ctx, tool, "quality_review_packet_digest_mismatch")
+    try:
+        # Recompute the digest instead of trusting the file's digest field.
+        quality_reviewer.verify_reviewer_receipt(
+            {
+                "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
+                "packet_sha256": packet_sha256,
+                "target": dict(packet.get("target") or {}),
+                "reviewer": {
+                    "request_id": ctx.request_id,
+                    "task_id": ctx.task_id,
+                    "provider": ctx.runner,
+                },
+                "report": {
+                    "lens": lens,
+                    "read_only": True,
+                    "can_mutate_repo": False,
+                    "findings": findings,
+                },
+            },
+            packet=packet,
+            expected_reviewer_request_id=ctx.request_id,
+            expected_reviewer_task_id=ctx.task_id,
+            observed_provider=ctx.runner,
+            observed_terminal_state="review_ready",
+            audit_verified=True,
+        )
+    except quality_reviewer.ReviewerEvidenceError as exc:
+        return _violation(ctx, tool, str(exc))
+    normalized, errors = quality_evidence.normalize_reviewer_reports(
+        [
+            {
+                "lens": lens,
+                "provider": ctx.runner,
+                "read_only": True,
+                "can_mutate_repo": False,
+                "findings": findings,
+            }
+        ]
+    )
+    if errors or len(normalized) != 1:
+        return _violation(ctx, tool, (errors[0] if errors else "reviewer_report_invalid"))
+    receipt = {
+        "schema_id": quality_reviewer.RECEIPT_SCHEMA_ID,
+        "packet_sha256": packet_sha256,
+        "target": {
+            key: (packet.get("target") or {}).get(key)
+            for key in ("request_id", "task_id", "claim_epoch")
+        },
+        "reviewer": {
+            "request_id": ctx.request_id,
+            "task_id": ctx.task_id,
+        },
+        "report": {
+            **normalized[0],
+            # The provider is deliberately omitted from the signed model
+            # report. The coordinator inserts the adapter/provider observed
+            # in its own process registry during receipt verification.
+            "provider": "",
+        },
+    }
+    _append_audit(
+        ctx,
+        tool=tool,
+        ok=True,
+        cache_hit=False,
+        hit_count=len(findings),
+        bytes_returned=0,
+        authority_source="runtime",
+        authority_state="process_bound",
+        payload=receipt,
+    )
+    return {
+        "ok": True,
+        "tool": tool,
+        "status": "submitted",
+        "packet_sha256": packet_sha256,
+        "finding_count": len(findings),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-request MCP runtime generation (host-side; called BEFORE the sandboxed
 # adapter process starts, so it may write freely under the isolated home)
@@ -1301,6 +1439,7 @@ def generate_worker_mcp_runtime(
     session_topic: str,
     package_import_root: Path,
     python_executable: str | None = None,
+    quality_review_packet_path: Path | None = None,
 ) -> WorkerMcpRuntime:
     """Provision this request's isolated MCP config, env and audit ledger.
 
@@ -1370,6 +1509,8 @@ def generate_worker_mcp_runtime(
         ENV_AUDIT_LEDGER_PATH: str(ledger_path),
         ENV_AUDIT_HMAC_KEY_PATH: str(key_path),
     }
+    if quality_review_packet_path is not None:
+        env[ENV_QUALITY_REVIEW_PACKET_PATH] = str(quality_review_packet_path)
 
     module_file = Path(__file__).resolve()
     package_module = f"{module_file.parent.name}.{module_file.stem}"
@@ -1442,6 +1583,7 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_session_write_intent",
     "aiworkhub_worker_ai_memory_write_intent",
     "aiworkhub_worker_kb_write_intent",
+    "aiworkhub_worker_quality_review_submit",
 )
 
 
@@ -1531,6 +1673,20 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
             provenance=provenance,
         )
 
+    @mcp.tool(name="aiworkhub_worker_quality_review_submit")
+    def _quality_review_submit(
+        packet_sha256: str,
+        lens: str,
+        findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Submit findings for the exact bound anti-anchored packet."""
+        return quality_review_submit(
+            ctx,
+            packet_sha256=packet_sha256,
+            lens=lens,
+            findings=findings,
+        )
+
     return MCP_TOOL_NAMES
 
 
@@ -1571,6 +1727,7 @@ __all__ = [
     "ENV_SOURCE_GRAPH_TARGETS",
     "ENV_TASK_ID",
     "ENV_TOPIC",
+    "ENV_QUALITY_REVIEW_PACKET_PATH",
     "MCP_TOOL_NAMES",
     "RUNTIME_SCHEMA_ID",
     "SERVER_NAME",
@@ -1591,6 +1748,7 @@ __all__ = [
     "session_write_intent",
     "ai_memory_write_intent",
     "kb_write_intent",
+    "quality_review_submit",
     "resolve_host_package_import_root",
     "session_current_state",
     "source_graph_query",

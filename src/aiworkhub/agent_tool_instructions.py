@@ -98,6 +98,7 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_session_write_intent",
     "aiworkhub_worker_ai_memory_write_intent",
     "aiworkhub_worker_kb_write_intent",
+    "aiworkhub_worker_quality_review_submit",
 )
 
 

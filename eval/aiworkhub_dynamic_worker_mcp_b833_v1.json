@@ -16,7 +16,8 @@
     "aiworkhub_worker_kb_related",
     "aiworkhub_worker_session_write_intent",
     "aiworkhub_worker_ai_memory_write_intent",
-    "aiworkhub_worker_kb_write_intent"
+    "aiworkhub_worker_kb_write_intent",
+    "aiworkhub_worker_quality_review_submit"
   ],
   "bound_env_vars": [
     "AIWORKHUB_WORKER_MCP_TASK_ID",

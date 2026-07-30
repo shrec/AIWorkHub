@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from aiworkhub import quality_reviewer as qr
+from aiworkhub import worker_ai_tools_mcp as worker_tools
+
+
+def _packet() -> dict[str, object]:
+    return qr.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=3,
+        worker_provider="deepseek_v4pro",
+        changed_path_hashes={"src/aiworkhub/core.py": "a" * 64},
+        acceptance=["acceptance contract only"],
+        required_outputs=["src/aiworkhub/core.py"],
+        validation=[["python", "-m", "pytest", "-q"]],
+        mechanical_checks=[
+            {
+                "check_id": "pytest",
+                "kind": "test",
+                "status": "passed",
+                "provenance": "exact validation",
+                "summary": "worker-provided prose must not survive normalization",
+            }
+        ],
+    )
+
+
+def _receipt(packet: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_id": qr.RECEIPT_SCHEMA_ID,
+        "packet_sha256": packet["packet_sha256"],
+        "target": {
+            "request_id": "target-request-1",
+            "task_id": "TARGET_TASK_1",
+            "claim_epoch": 3,
+        },
+        "reviewer": {
+            "request_id": "review-request-1",
+            "task_id": "REVIEW_TASK_1",
+            "provider": "claude_sonnet5",
+        },
+        "report": {
+            "lens": "correctness",
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings": [],
+        },
+    }
+
+
+def _verify(receipt: dict[str, object], packet: dict[str, object]) -> dict[str, object]:
+    return qr.verify_reviewer_receipt(
+        receipt,
+        packet=packet,
+        expected_reviewer_request_id="review-request-1",
+        expected_reviewer_task_id="REVIEW_TASK_1",
+        observed_provider="claude_sonnet5",
+        observed_terminal_state="review_ready",
+        audit_verified=True,
+    )
+
+
+def test_packet_is_deterministic_and_anti_anchored() -> None:
+    first = _packet()
+    second = _packet()
+    assert first == second
+    serialized = repr(first)
+    assert "worker-provided prose" not in serialized
+    assert "result" not in first
+    assert "verdict" not in first
+    assert "rationale" not in first
+
+
+def test_receipt_is_bound_to_process_observed_identity() -> None:
+    packet = _packet()
+    verified = _verify(_receipt(packet), packet)
+    assert verified["authority"] == {
+        "process_identity_verified": True,
+        "audit_verified": True,
+        "terminal_state": "review_ready",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (lambda row: row["reviewer"].update(provider="forged_provider"), "reviewer_provider_spoofed"),
+        (lambda row: row["target"].update(claim_epoch=4), "reviewer_target_claim_epoch_mismatch"),
+        (lambda row: row.update(packet_sha256="b" * 64), "reviewer_packet_digest_mismatch"),
+    ],
+)
+def test_receipt_identity_and_digest_mismatches_fail_closed(mutation, error: str) -> None:
+    packet = _packet()
+    receipt = copy.deepcopy(_receipt(packet))
+    mutation(receipt)
+    with pytest.raises(qr.ReviewerEvidenceError, match=error):
+        _verify(receipt, packet)
+
+
+def test_tampered_packet_fails_before_receipt_is_trusted() -> None:
+    packet = _packet()
+    packet["contract"]["acceptance"] = ["changed after digest"]
+    with pytest.raises(qr.ReviewerEvidenceError, match="review_packet_digest_invalid"):
+        _verify(_receipt(packet), packet)
+
+
+def test_unverified_audit_and_nonterminal_process_fail_closed() -> None:
+    packet = _packet()
+    receipt = _receipt(packet)
+    with pytest.raises(qr.ReviewerEvidenceError, match="reviewer_audit_unverified"):
+        qr.verify_reviewer_receipt(
+            receipt,
+            packet=packet,
+            expected_reviewer_request_id="review-request-1",
+            expected_reviewer_task_id="REVIEW_TASK_1",
+            observed_provider="claude_sonnet5",
+            observed_terminal_state="review_ready",
+            audit_verified=False,
+        )
+    with pytest.raises(qr.ReviewerEvidenceError, match="reviewer_terminal_state_invalid"):
+        qr.verify_reviewer_receipt(
+            receipt,
+            packet=packet,
+            expected_reviewer_request_id="review-request-1",
+            expected_reviewer_task_id="REVIEW_TASK_1",
+            observed_provider="claude_sonnet5",
+            observed_terminal_state="validation_failed",
+            audit_verified=True,
+        )
+
+
+def _worker_context(tmp_path: Path, packet_path: Path | None) -> worker_tools.WorkerToolContext:
+    ledger = tmp_path / "audit.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    key = tmp_path / "audit.key"
+    key.write_bytes(b"k" * 32)
+    return worker_tools.WorkerToolContext(
+        task_id="REVIEW_TASK_1",
+        runner="claude_sonnet5",
+        topic="quality_review",
+        request_id="a" * 32,
+        repo=tmp_path,
+        authority_repo=tmp_path,
+        source_graph_targets=(),
+        session_topic="quality_review",
+        audit_ledger_path=ledger,
+        audit_hmac_key_path=key,
+        quality_review_packet_path=packet_path,
+    )
+
+
+def test_worker_submission_is_packet_bound_and_hmac_audited(tmp_path: Path) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )
+    assert result["ok"] is True
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert audit["ok"] is True
+    assert audit["call_count_by_tool"] == {"quality_review_submit": 1}
+    assert len(audit["verified_payloads"]) == 1
+    payload = audit["verified_payloads"][0]
+    assert payload["target"] == {
+        "request_id": "target-request-1",
+        "task_id": "TARGET_TASK_1",
+        "claim_epoch": 3,
+    }
+    assert payload["reviewer"] == {
+        "request_id": "a" * 32,
+        "task_id": "REVIEW_TASK_1",
+    }
+
+
+def test_ordinary_worker_cannot_submit_unbound_review(tmp_path: Path) -> None:
+    ctx = _worker_context(tmp_path, None)
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256="a" * 64,
+        lens="correctness",
+        findings=[],
+    )
+    assert result == {
+        "ok": False,
+        "tool": "quality_review_submit",
+        "reason": "quality_review_packet_not_bound",
+    }

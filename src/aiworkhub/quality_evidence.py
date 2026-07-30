@@ -293,7 +293,7 @@ def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalize_reviewer_reports(
+def normalize_reviewer_reports(
     reports: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Normalize read-only reviewer evidence; never accept reviewer verdicts.
@@ -425,7 +425,7 @@ def fold_quality_verdict(
         if status in {STATUS_FAILED, STATUS_NOT_AVAILABLE}:
             blockers.append(check_id)
 
-    normalized_reports, schema_errors = _normalize_reviewer_reports(reviewer_reports)
+    normalized_reports, schema_errors = normalize_reviewer_reports(reviewer_reports)
     blockers.extend(schema_errors)
     reports_by_lens: dict[str, list[dict[str, Any]]] = {}
     refine_required = False
