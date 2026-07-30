@@ -325,6 +325,9 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     # B834: a cache hit must NOT count toward the live-call gate -- only the
     # first, genuinely fresh call does.
     assert verification["live_source_graph_calls"] == 1
+    assert verification["source_graph_hit_count"] == first["hit_count"] * 2
+    assert verification["source_graph_zero_hit_calls"] == 0
+    assert verification["source_graph_failed_calls"] == 0
     assert verification["bounded_bytes_returned"] > 0
 
 

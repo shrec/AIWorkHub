@@ -330,7 +330,7 @@ function renderSummary(snapshot) {
       ? `${live}/${gated} live · ${injected} injected-only`
       : "No gated tasks";
     elements.headerSourceGraph.title = sourceGraph
-      ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${formatBytes(sourceGraph.source_graph_bytes)} · ${violations} policy violations`
+      ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${numberValue(sourceGraph.source_graph_hit_count)} hits · ${numberValue(sourceGraph.source_graph_zero_hit_calls)} zero-hit · ${formatBytes(sourceGraph.source_graph_bytes)} measured return bytes · ${violations} MCP contract violations`
       : "Source Graph telemetry unavailable";
   }
   const contextTelemetry = snapshot && snapshot.project_context_telemetry
@@ -748,8 +748,13 @@ function renderToolUse(snapshot) {
       + numberValue(telemetry.source_graph_stale_or_cached_tasks),
     )],
     ["SG calls", formatCount(telemetry.source_graph_calls)],
+    ["Entity hits", formatCount(telemetry.source_graph_hit_count)],
+    ["Zero-hit calls", formatCount(telemetry.source_graph_zero_hit_calls)],
+    ["Failed calls", formatCount(telemetry.source_graph_failed_calls)],
     ["SG bytes", formatBytes(telemetry.source_graph_bytes)],
-    ["Violations", formatCount(telemetry.policy_violations)],
+    ["MCP violations", formatCount(telemetry.policy_violations)],
+    ["Raw discovery denied", formatCount(telemetry.raw_discovery_denials)],
+    ["Denial evidence", `${formatCount(telemetry.provider_denial_evidence_tasks)}/${formatCount(telemetry.gated_tasks)} tasks`],
     ["Tampered", formatCount(telemetry.tampered_ledger_tasks)],
   ];
   for (const [label, value] of overviewValues) {
@@ -758,6 +763,32 @@ function renderToolUse(snapshot) {
     overview.appendChild(metric);
   }
   fragment.appendChild(overview);
+  fragment.appendChild(createElement(
+    "div",
+    "telemetry-note",
+    "Bytes are authenticated bounded tool return bytes. They are not inferred token or cost savings. Denial counts appear only when the provider emitted structured denial evidence.",
+  ));
+
+  const blockedReasons = telemetry.blocked_reason_counts
+    && typeof telemetry.blocked_reason_counts === "object"
+    ? Object.entries(telemetry.blocked_reason_counts)
+      .map(([reason, count]) => ({ reason, count: numberValue(count) }))
+      .filter((item) => item.count > 0)
+      .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason))
+      .slice(0, 5)
+    : [];
+  for (const item of blockedReasons) {
+    const row = createElement("div", "stat-row tool-use-row");
+    const main = createElement("div", "stat-main");
+    const labels = createElement("div", "stat-labels");
+    labels.append(
+      createElement("span", "stat-name", "Blocked tool-use gate"),
+      createElement("span", "stat-breakdown", item.reason),
+    );
+    main.appendChild(labels);
+    row.append(main, createElement("strong", "stat-total", formatCount(item.count)));
+    fragment.appendChild(row);
+  }
 
   const byAdapter = telemetry.by_adapter && typeof telemetry.by_adapter === "object"
     ? telemetry.by_adapter
@@ -770,7 +801,7 @@ function renderToolUse(snapshot) {
     const gated = numberValue(item.gated_tasks);
     const live = numberValue(item.live_tasks);
     const row = createElement("div", "stat-row tool-use-row");
-    row.title = `${numberValue(item.source_graph_calls)} Source Graph calls · ${numberValue(item.policy_violations)} policy violations`;
+    row.title = `${numberValue(item.source_graph_calls)} Source Graph calls · ${numberValue(item.source_graph_hit_count)} hits · ${numberValue(item.source_graph_zero_hit_calls)} zero-hit · ${numberValue(item.source_graph_failed_calls)} failed · ${numberValue(item.raw_discovery_denials)} raw discovery denials · ${numberValue(item.policy_violations)} MCP contract violations`;
     const main = createElement("div", "stat-main");
     const labels = createElement("div", "stat-labels");
     labels.append(

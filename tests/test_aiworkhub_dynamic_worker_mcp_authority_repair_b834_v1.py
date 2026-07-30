@@ -390,6 +390,9 @@ def test_zero_hit_call_does_not_satisfy_the_live_call_gate(
     # Exactly one live call recorded (the first, non-empty one); the zero-hit
     # call must not count even though it was ok=true and not cached.
     assert verification["live_source_graph_calls"] == 1
+    assert verification["source_graph_zero_hit_calls"] == 1
+    assert verification["source_graph_failed_calls"] == 0
+    assert verification["source_graph_hit_count"] == result["hit_count"]
 
 
 def test_cache_hit_call_does_not_satisfy_the_live_call_gate(

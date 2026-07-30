@@ -893,6 +893,86 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
     return result
 
 
+def _provider_tool_denials_from_output(path: Path) -> dict[str, Any]:
+    """Extract only bounded denial counts from provider JSON/JSONL output.
+
+    Providers may expose ``permission_denials`` (or the camelCase/tool-denial
+    equivalents) in their terminal result.  The raw payload can contain
+    commands, paths or prompt fragments, so it is never persisted.  This
+    parser returns only counts and a fixed allowlist of raw-discovery labels.
+    Absence of a denial field means *not observed*, never proof of zero
+    attempts.
+    """
+
+    result: dict[str, Any] = {
+        "schema_id": "aiworkhub.provider_tool_denials.v1",
+        "evidence_observed": False,
+        "permission_denials_total": 0,
+        "raw_discovery_denials": 0,
+        "raw_discovery_labels": [],
+    }
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 32 * 1024 * 1024:
+            return result
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return result
+
+    candidates: list[Any] = []
+    try:
+        candidates.append(json.loads(raw))
+    except json.JSONDecodeError:
+        for line in raw.splitlines():
+            try:
+                candidates.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    denial_keys = {
+        "permission_denials", "permissionDenials", "tool_denials", "toolDenials",
+    }
+    patterns = {
+        "grep": re.compile(r"(?<![a-z0-9_])grep(?![a-z0-9_])", re.IGNORECASE),
+        "glob": re.compile(r"(?<![a-z0-9_])glob(?![a-z0-9_])", re.IGNORECASE),
+        "rg": re.compile(r"(?<![a-z0-9_])rg(?![a-z0-9_])", re.IGNORECASE),
+        "find": re.compile(r"(?<![a-z0-9_])find(?![a-z0-9_])", re.IGNORECASE),
+        "tree": re.compile(r"(?<![a-z0-9_])tree(?![a-z0-9_])", re.IGNORECASE),
+    }
+    labels: set[str] = set()
+
+    def record(value: Any) -> None:
+        rows = value if isinstance(value, list) else [value]
+        for row in rows[:256]:
+            result["permission_denials_total"] += 1
+            try:
+                bounded = json.dumps(row, ensure_ascii=False, sort_keys=True)[:4096]
+            except (TypeError, ValueError):
+                bounded = str(row)[:4096]
+            matched = {name for name, pattern in patterns.items() if pattern.search(bounded)}
+            if matched:
+                result["raw_discovery_denials"] += 1
+                labels.update(matched)
+
+    def walk(value: Any, *, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            for key, nested in list(value.items())[:256]:
+                if key in denial_keys:
+                    result["evidence_observed"] = True
+                    record(nested)
+                else:
+                    walk(nested, depth=depth + 1)
+        elif isinstance(value, list):
+            for nested in value[:256]:
+                walk(nested, depth=depth + 1)
+
+    for candidate in candidates[:2048]:
+        walk(candidate)
+    result["raw_discovery_labels"] = sorted(labels)
+    return result
+
+
 def _ledger_input_tokens(usage: dict[str, Any], adapter_id: str) -> int:
     """Return taskctl's total input count without double-counting cache hits."""
     base = int(usage.get("input_tokens") or 0)
@@ -3559,6 +3639,7 @@ class ProcessManager:
                     (metadata.get("project_context") or {}).get("bundle_sha256") or ""
                 ),
             )
+            provider_tool_denials = _provider_tool_denials_from_output(stdout_path)
             event = self._append_event({
                 "request_id": request_id,
                 "task_id": metadata["task_id"],
@@ -3605,6 +3686,7 @@ class ProcessManager:
                 "project_context": metadata.get("project_context"),
                 "project_context_delivery": metadata.get("project_context_delivery"),
                 "project_context_acknowledgement": context_ack,
+                "provider_tool_denials": provider_tool_denials,
                 "worker_mcp_gate": worker_mcp_gate,
                 "quality_gate": quality_gate,
             })

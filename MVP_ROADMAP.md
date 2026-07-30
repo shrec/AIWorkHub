@@ -73,10 +73,21 @@ do not override this current priority ledger.
       completion synchronization and passes with `GITHUB_ACTIONS=true`.
       Canonical local evidence: 65 focused Source Graph tests and the complete
       suite (`1465 passed, 18 skipped`) on 2026-07-30.
-- [ ] Per-task tool-use telemetry: Source Graph calls/hits/zero-hits, bounded
+- [x] Per-task tool-use telemetry: Source Graph calls/hits/zero-hits, bounded
       fallback reason, raw-discovery violations, bytes returned and conservative
       context-savings labels. Dashboard must distinguish measured bytes from
       token/cost truth.
+      The worker HMAC ledger now independently measures total/live/cached/
+      zero-hit/failed Source Graph calls, entity hits and bounded return bytes;
+      latest-run task/adapter aggregation retains bounded gate blocker reasons.
+      Provider JSON/JSONL permission-denial evidence is reduced to counts plus
+      a fixed raw-discovery label allowlist, never raw commands, paths or prompt
+      fragments. Missing provider denial fields remain explicitly unobserved,
+      not a fabricated zero. Dashboard copy labels bytes as authenticated tool
+      return bytes and makes no inferred token/cost-savings claim. Canonical
+      local evidence: focused telemetry/worker tests (`64 passed`), complete
+      Python suite (`1467 passed, 18 skipped`) and complete extension suite on
+      2026-07-30.
 - [ ] Visual Plan DAG with dependencies, blockers, ready capacity and critical
       path; retain the existing dependency-safe autolaunch authority.
 - [ ] Review Inbox 2.0: pagination, bounded filters, terminal summaries and a

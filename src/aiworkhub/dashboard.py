@@ -77,11 +77,13 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     delivery = event.get("project_context_delivery")
     ack = event.get("project_context_acknowledgement")
     gate = event.get("worker_mcp_gate")
+    provider_denials = event.get("provider_tool_denials")
     if (
         not isinstance(context, Mapping)
         and not isinstance(delivery, Mapping)
         and not isinstance(ack, Mapping)
         and not isinstance(gate, Mapping)
+        and not isinstance(provider_denials, Mapping)
     ):
         return {}
 
@@ -135,6 +137,13 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "source_graph_successful_calls": int(successful.get("source_graph") or 0)
             if isinstance(successful, Mapping) else 0,
             "source_graph_live_calls": int(verification.get("live_source_graph_calls") or 0),
+            "source_graph_hit_count": int(verification.get("source_graph_hit_count") or 0),
+            "source_graph_zero_hit_calls": int(
+                verification.get("source_graph_zero_hit_calls") or 0
+            ),
+            "source_graph_failed_calls": int(
+                verification.get("source_graph_failed_calls") or 0
+            ),
             "source_graph_bytes": int(bytes_by_tool.get("source_graph") or 0)
             if isinstance(bytes_by_tool, Mapping) else 0,
             "source_graph_cache_hits": int(cache_by_tool.get("source_graph") or 0)
@@ -167,6 +176,19 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "reason": str(ack.get("reason") or "")[:160] if isinstance(ack, Mapping) else "",
         },
         "estimate": estimate,
+        "provider_tool_denials": {
+            "evidence_observed": bool(provider_denials.get("evidence_observed")),
+            "permission_denials_total": int(
+                provider_denials.get("permission_denials_total") or 0
+            ),
+            "raw_discovery_denials": int(
+                provider_denials.get("raw_discovery_denials") or 0
+            ),
+            "raw_discovery_labels": [
+                str(value)[:32]
+                for value in (provider_denials.get("raw_discovery_labels") or [])[:16]
+            ],
+        } if isinstance(provider_denials, Mapping) else {},
         "tool_use": tool_use,
     }
 
@@ -199,11 +221,20 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_missing_tasks": 0,
         "source_graph_calls": 0,
         "source_graph_live_calls": 0,
+        "source_graph_hit_count": 0,
+        "source_graph_zero_hit_calls": 0,
+        "source_graph_failed_calls": 0,
         "source_graph_bytes": 0,
         "source_graph_cache_hits": 0,
         "policy_violation_tasks": 0,
         "policy_violations": 0,
+        "provider_permission_denials": 0,
+        "raw_discovery_denials": 0,
+        "raw_discovery_denial_tasks": 0,
+        "provider_denial_evidence_tasks": 0,
         "tampered_ledger_tasks": 0,
+        "blocked_reason_counts": {},
+        "measurement_label": "authenticated_calls_and_returned_bytes_only_no_token_or_cost_claim",
         "live_rate": 0.0,
         "any_rate": 0.0,
         "gate_satisfaction_rate": 0.0,
@@ -219,7 +250,12 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 "injected_only_tasks": 0,
                 "missing_or_stale_tasks": 0,
                 "source_graph_calls": 0,
+                "source_graph_hit_count": 0,
+                "source_graph_zero_hit_calls": 0,
+                "source_graph_failed_calls": 0,
                 "policy_violations": 0,
+                "provider_permission_denials": 0,
+                "raw_discovery_denials": 0,
             }
         return buckets[adapter]
 
@@ -232,26 +268,53 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         adapter = str(row.get("adapter_id") or "unknown")[:120]
         bucket = bucket_for(adapter)
         bucket["gated_tasks"] += 1
+        provider_denials = infra.get("provider_tool_denials")
+        if isinstance(provider_denials, Mapping):
+            permission_denials = int(
+                provider_denials.get("permission_denials_total") or 0
+            )
+            raw_denials = int(provider_denials.get("raw_discovery_denials") or 0)
+            totals["provider_permission_denials"] += permission_denials
+            totals["raw_discovery_denials"] += raw_denials
+            bucket["provider_permission_denials"] += permission_denials
+            bucket["raw_discovery_denials"] += raw_denials
+            if provider_denials.get("evidence_observed"):
+                totals["provider_denial_evidence_tasks"] += 1
+            if raw_denials:
+                totals["raw_discovery_denial_tasks"] += 1
         if tool_use.get("satisfied"):
             totals["satisfied_tasks"] += 1
 
         calls = int(tool_use.get("source_graph_calls") or 0)
         live_calls = int(tool_use.get("source_graph_live_calls") or 0)
+        hit_count = int(tool_use.get("source_graph_hit_count") or 0)
+        zero_hits = int(tool_use.get("source_graph_zero_hit_calls") or 0)
+        failed_calls = int(tool_use.get("source_graph_failed_calls") or 0)
         source_bytes = int(tool_use.get("source_graph_bytes") or 0)
         cache_hits = int(tool_use.get("source_graph_cache_hits") or 0)
         violations = int(tool_use.get("policy_violations") or 0)
         satisfaction = str(tool_use.get("source_graph_satisfaction") or "")
         totals["source_graph_calls"] += calls
         totals["source_graph_live_calls"] += live_calls
+        totals["source_graph_hit_count"] += hit_count
+        totals["source_graph_zero_hit_calls"] += zero_hits
+        totals["source_graph_failed_calls"] += failed_calls
         totals["source_graph_bytes"] += source_bytes
         totals["source_graph_cache_hits"] += cache_hits
         totals["policy_violations"] += violations
         bucket["source_graph_calls"] += calls
+        bucket["source_graph_hit_count"] += hit_count
+        bucket["source_graph_zero_hit_calls"] += zero_hits
+        bucket["source_graph_failed_calls"] += failed_calls
         bucket["policy_violations"] += violations
         if violations:
             totals["policy_violation_tasks"] += 1
         if int(tool_use.get("entries_tampered") or 0):
             totals["tampered_ledger_tasks"] += 1
+        if not tool_use.get("satisfied"):
+            reason = str(tool_use.get("reason") or "unspecified")[:240]
+            reason_counts = totals["blocked_reason_counts"]
+            reason_counts[reason] = int(reason_counts.get(reason) or 0) + 1
 
         if live_calls > 0:
             totals["source_graph_any_tasks"] += 1

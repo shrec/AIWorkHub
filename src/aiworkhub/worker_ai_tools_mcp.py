@@ -532,6 +532,9 @@ def verify_audit_ledger(
         "cache_hits_by_tool": {},
         "policy_violations": 0,
         "live_source_graph_calls": 0,
+        "source_graph_hit_count": 0,
+        "source_graph_zero_hit_calls": 0,
+        "source_graph_failed_calls": 0,
         "authority_index_identity": [],
         "reason": "",
     }
@@ -581,6 +584,13 @@ def verify_audit_ledger(
         result["entries_verified"] += 1
         tool = str(entry.get("tool") or "unknown")
         call_count[tool] = call_count.get(tool, 0) + 1
+        if tool == "source_graph":
+            source_hits = max(0, int(entry.get("hit_count") or 0))
+            result["source_graph_hit_count"] += source_hits
+            if source_hits == 0:
+                result["source_graph_zero_hit_calls"] += 1
+            if not entry.get("ok"):
+                result["source_graph_failed_calls"] += 1
         returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
         result["bounded_bytes_returned"] += returned_bytes
         bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes

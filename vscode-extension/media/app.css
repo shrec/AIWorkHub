@@ -333,6 +333,13 @@ select:focus-visible,
   line-height: 1.2;
 }
 
+.telemetry-note {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 0 2px 8px;
+}
+
 #header-source-graph-detail,
 .header-insight-detail {
   color: var(--muted);
