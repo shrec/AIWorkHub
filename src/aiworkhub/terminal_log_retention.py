@@ -29,6 +29,8 @@ PROCESS_LOG_RELATIVE_PATH = Path(".aiworkhub/runtime/process_logs/process_events
 PROCESS_FILES_RELATIVE_PATH = Path(".aiworkhub/runtime/process_logs/processes")
 QUARANTINE_RELATIVE_PATH = Path(".aiworkhub/runtime/storage/terminal-log-quarantine")
 AUDIT_RELATIVE_PATH = Path(".aiworkhub/runtime/storage/terminal-log-retention.audit.jsonl")
+LEGACY_PROCESS_LOG_RELATIVE_PATH = Path("logs/process_events.jsonl")
+LEGACY_PROCESS_FILES_RELATIVE_PATH = Path("logs/processes")
 MANIFEST_NAME = "manifest.json"
 UNDO_DAYS = 7
 KEEP_LAST_PER_TASK = 10
@@ -73,6 +75,42 @@ def _owned_regular_file(path: Path, parent: Path) -> os.stat_result | None:
     return info
 
 
+def _legacy_store_identity(root: Path) -> dict[str, int]:
+    """Return a bounded identity for the fixed legacy ``logs/`` tree."""
+
+    legacy_root = root / Path("logs")
+    try:
+        info = legacy_root.lstat()
+    except OSError:
+        return {"file_count": 0, "size_bytes": 0, "newest_mtime_ns": 0}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return {"file_count": 0, "size_bytes": 0, "newest_mtime_ns": 0}
+    file_count = 0
+    size_bytes = 0
+    newest_mtime_ns = 0
+    for directory, dirnames, filenames in os.walk(legacy_root, followlinks=False):
+        parent = Path(directory)
+        dirnames[:] = [
+            name for name in dirnames if not (parent / name).is_symlink()
+        ]
+        for name in filenames:
+            path = parent / name
+            try:
+                item = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode):
+                continue
+            file_count += 1
+            size_bytes += int(item.st_size)
+            newest_mtime_ns = max(newest_mtime_ns, int(item.st_mtime_ns))
+    return {
+        "file_count": file_count,
+        "size_bytes": size_bytes,
+        "newest_mtime_ns": newest_mtime_ns,
+    }
+
+
 def _latest_rows(root: Path) -> dict[str, dict[str, Any]]:
     ledger = root / PROCESS_LOG_RELATIVE_PATH
     try:
@@ -113,22 +151,46 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=_logs_days(root))
     protected: list[dict[str, Any]] = []
     eligible_by_task: dict[str, list[dict[str, Any]]] = {}
-    current_bytes = 0
-    for request_id, row in _latest_rows(root).items():
-        task_id = str(row.get("task_id") or "")
-        files: list[dict[str, Any]] = []
-        for suffix in _OWNED_SUFFIXES:
-            name = f"{request_id}{suffix}"
-            path = process_root / name
+    inventory: dict[str, list[dict[str, Any]]] = {}
+    if process_root.is_dir():
+        for path in process_root.iterdir():
             info = _owned_regular_file(path, process_root)
             if info is None:
                 continue
-            current_bytes += int(info.st_size)
-            files.append({
-                "name": name,
+            request_id = next(
+                (
+                    path.name[: -len(suffix)]
+                    for suffix in _OWNED_SUFFIXES
+                    if path.name.endswith(suffix)
+                ),
+                "",
+            )
+            if not _REQUEST_RE.fullmatch(request_id):
+                continue
+            inventory.setdefault(request_id, []).append({
+                "name": path.name,
                 "size_bytes": int(info.st_size),
                 "mtime_ns": int(info.st_mtime_ns),
             })
+    process_file_bytes = sum(
+        int(item["size_bytes"])
+        for files in inventory.values()
+        for item in files
+    )
+    ledger_path = root / PROCESS_LOG_RELATIVE_PATH
+    try:
+        ledger_info = ledger_path.lstat()
+        ledger_bytes = (
+            int(ledger_info.st_size)
+            if stat.S_ISREG(ledger_info.st_mode) and not stat.S_ISLNK(ledger_info.st_mode)
+            else 0
+        )
+    except OSError:
+        ledger_bytes = 0
+    latest_rows = _latest_rows(root)
+    for request_id, row in latest_rows.items():
+        task_id = str(row.get("task_id") or "")
+        files = sorted(inventory.pop(request_id, []), key=lambda item: item["name"])
         if not files:
             continue
         newest_ns = max(item["mtime_ns"] for item in files)
@@ -150,6 +212,26 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
             protected.append({**item, "reason": "active_or_unverified_authority"})
             continue
         eligible_by_task.setdefault(task_id, []).append(item)
+
+    orphan_file_bytes = 0
+    for request_id, files in sorted(inventory.items()):
+        if not files:
+            continue
+        orphan_file_bytes += sum(int(item["size_bytes"]) for item in files)
+        protected.append({
+            "request_id": request_id,
+            "task_id": "",
+            "state": "unknown",
+            "task_status": "unknown",
+            "modified_at": datetime.fromtimestamp(
+                max(item["mtime_ns"] for item in files) / 1_000_000_000,
+                timezone.utc,
+            ).isoformat(),
+            "modified_at_ns": max(item["mtime_ns"] for item in files),
+            "size_bytes": sum(int(item["size_bytes"]) for item in files),
+            "files": files,
+            "reason": "ledger_row_missing",
+        })
 
     candidates: list[dict[str, Any]] = []
     for rows in eligible_by_task.values():
@@ -174,6 +256,45 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         json.dumps(digest_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     candidate_bytes = sum(int(item["size_bytes"]) for item in candidates)
+    canonical_current_bytes = process_file_bytes + ledger_bytes
+    legacy_identity = _legacy_store_identity(root)
+    legacy_current_bytes = int(legacy_identity["size_bytes"])
+    legacy_modified = (
+        datetime.fromtimestamp(
+            int(legacy_identity["newest_mtime_ns"]) / 1_000_000_000,
+            timezone.utc,
+        )
+        if legacy_identity["newest_mtime_ns"]
+        else None
+    )
+    legacy_candidate = None
+    if legacy_current_bytes and legacy_modified is not None and legacy_modified <= cutoff:
+        legacy_candidate = {
+            "store": "legacy_logs",
+            **legacy_identity,
+            "modified_at": legacy_modified.isoformat(),
+        }
+    elif legacy_current_bytes:
+        protected.append({
+            "request_id": "legacy_logs",
+            "task_id": "",
+            "state": "legacy",
+            "task_status": "unknown",
+            "modified_at": legacy_modified.isoformat() if legacy_modified else "",
+            "modified_at_ns": int(legacy_identity["newest_mtime_ns"]),
+            "size_bytes": legacy_current_bytes,
+            "files": [],
+            "reason": "legacy_retention_age_not_met",
+        })
+    if legacy_candidate is not None:
+        digest_source["legacy_candidate"] = legacy_candidate
+        digest = hashlib.sha256(
+            json.dumps(digest_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    observed_current_bytes = canonical_current_bytes + legacy_current_bytes
+    total_candidate_bytes = candidate_bytes + (
+        int(legacy_candidate["size_bytes"]) if legacy_candidate else 0
+    )
     return {
         "ok": True,
         "schema_id": SCHEMA_ID,
@@ -181,10 +302,18 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         "repository_scoped": True,
         "logs_days": _logs_days(root),
         "keep_last_per_task": KEEP_LAST_PER_TASK,
-        "current_bytes": current_bytes,
-        "projected_bytes": max(0, current_bytes - candidate_bytes),
-        "candidate_count": len(candidates),
-        "candidate_bytes": candidate_bytes,
+        "current_bytes": observed_current_bytes,
+        "canonical_current_bytes": canonical_current_bytes,
+        "legacy_current_bytes": legacy_current_bytes,
+        "ledger_bytes": ledger_bytes,
+        "process_file_bytes": process_file_bytes,
+        "orphan_file_count": sum(len(files) for files in inventory.values()),
+        "orphan_file_bytes": orphan_file_bytes,
+        "legacy_status": "present_unmanaged" if legacy_current_bytes else "absent_or_empty",
+        "legacy_candidate": legacy_candidate,
+        "projected_bytes": max(0, observed_current_bytes - total_candidate_bytes),
+        "candidate_count": len(candidates) + (1 if legacy_candidate else 0),
+        "candidate_bytes": total_candidate_bytes,
         "protected_count": len(protected),
         "preview_digest": digest,
         "candidates": candidates,
@@ -269,7 +398,7 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
     current = _candidate_payload(root)
     if preview_digest != current["preview_digest"]:
         raise TerminalLogRetentionError("terminal_log_preview_stale")
-    if not current["candidates"]:
+    if not current["candidates"] and not current.get("legacy_candidate"):
         return {"ok": True, "quarantined": 0, "bytes": 0, "batch_id": "", "no_op": True}
     now = datetime.now(timezone.utc)
     batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{preview_digest[:12]}"
@@ -284,6 +413,11 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         "preview_digest": preview_digest,
         "status": "quarantining",
         "items": [dict(item, state="planned") for item in current["candidates"]],
+        "legacy_store": (
+            dict(current["legacy_candidate"], state="planned")
+            if current.get("legacy_candidate")
+            else None
+        ),
     }
     manifest_path = batch / MANIFEST_NAME
     _atomic_json(manifest_path, manifest)
@@ -319,6 +453,33 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
             moved_bytes += int(expected["size_bytes"])
         item["state"] = "quarantined"
         _atomic_json(manifest_path, manifest)
+    legacy = manifest.get("legacy_store")
+    if isinstance(legacy, dict) and legacy.get("state") == "planned":
+        source = root / "logs"
+        destination = batch / "legacy-logs"
+        current_identity = _legacy_store_identity(root)
+        expected_identity = {
+            key: int(legacy.get(key) or 0)
+            for key in ("file_count", "size_bytes", "newest_mtime_ns")
+        }
+        try:
+            source_info = source.lstat()
+        except OSError:
+            source_info = None
+        if (
+            source_info is None
+            or stat.S_ISLNK(source_info.st_mode)
+            or not stat.S_ISDIR(source_info.st_mode)
+            or destination.exists()
+            or current_identity != expected_identity
+        ):
+            legacy["state"] = "skipped_identity_changed"
+        else:
+            os.replace(source, destination)
+            legacy["state"] = "quarantined"
+            moved_files += int(legacy["file_count"])
+            moved_bytes += int(legacy["size_bytes"])
+        _atomic_json(manifest_path, manifest)
     manifest["status"] = "quarantined" if moved_files else "empty"
     manifest["quarantined_files"] = moved_files
     manifest["quarantined_bytes"] = moved_bytes
@@ -342,6 +503,9 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
         except (TerminalLogRetentionError, ValueError):
             continue
         states = [item.get("state") for item in value.get("items") or [] if isinstance(item, dict)]
+        legacy = value.get("legacy_store")
+        if isinstance(legacy, dict):
+            states.append(legacy.get("state"))
         rows.append({
             "batch_id": entry.name,
             "created_at": str(value.get("created_at") or ""),
@@ -381,6 +545,17 @@ def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str,
                 os.replace(source, process_root / source.name)
                 restored += 1
         item["state"] = "restored"
+        _atomic_json(manifest_path, manifest)
+    legacy = manifest.get("legacy_store")
+    if isinstance(legacy, dict) and legacy.get("state") == "quarantined":
+        source = batch / "legacy-logs"
+        destination = root / "logs"
+        if source.is_dir() and not source.is_symlink() and not destination.exists():
+            os.replace(source, destination)
+            legacy["state"] = "restored"
+            restored += int(legacy.get("file_count") or 0)
+        else:
+            legacy["state"] = "restore_conflict"
         _atomic_json(manifest_path, manifest)
     manifest["status"] = "restored" if restored else manifest.get("status", "quarantined")
     _atomic_json(manifest_path, manifest)

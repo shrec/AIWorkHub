@@ -71,7 +71,7 @@ def _git(cwd: Path, *args: str) -> tuple[int, str]:
     return result.returncode, result.stdout.strip()
 
 
-def _dir_size_bytes(path: Path) -> int:
+def directory_size_bytes(path: Path) -> int:
     """Apparent size of ``path`` in bytes (symlinks never followed)."""
     total = 0
     for root, dirs, files in os.walk(path, followlinks=False):
@@ -84,6 +84,10 @@ def _dir_size_bytes(path: Path) -> int:
             except OSError:
                 continue
     return total
+
+
+# Backward-compatible private alias for older callers/tests.
+_dir_size_bytes = directory_size_bytes
 
 
 def _repo_name(origin_url: str) -> str:
@@ -192,7 +196,7 @@ def scan_worktrees(
                 {
                     "id": entry.name,
                     "path": str(entry),
-                    "size_bytes": _dir_size_bytes(entry) if with_sizes else None,
+                    "size_bytes": directory_size_bytes(entry) if with_sizes else None,
                     "repo": _repo_name(git_state["origin"]),
                     "origin": git_state["origin"],
                     "head": git_state["head"],

@@ -12,6 +12,10 @@ noted by package/extension version and release tag.
   resolution and explicit configured/unverified policy status.
 - Added deterministic extension test discovery so every `*.test.js` file is
   executed in CI without maintaining a filename chain.
+- Added complete retention footprint accounting for canonical runtime, legacy
+  logs, orphan request files and repository/shared worktree populations.
+- Added reversible quarantine, restore and delayed purge for the aged legacy
+  root `logs/` store, guarded by an exact preview identity and confirmation.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.
@@ -36,6 +40,9 @@ noted by package/extension version and release tag.
 - Missing or empty `.aiworkhub/quality.json` can no longer produce an empty
   `ok: true`; evidence surfaces identify builtin-only versus repository-policy
   verification explicitly.
+- Storage previews now report the measured total footprint and name unmanaged
+  legacy/unattributed populations instead of presenting a partial total as
+  repository health.
 - Reframed the repository landing page around user outcomes and the current
   product architecture instead of historical implementation notes.
 - Corrected the security and issue-reporting guidance to reflect the native

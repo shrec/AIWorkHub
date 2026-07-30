@@ -237,5 +237,12 @@ rewritten after remediation.
 - **P2-8 closed:** `npm test` now discovers every `*.test.js` file
   deterministically and runs them sequentially. The previously omitted
   `mux-launcher-packaging-b1038.test.js` is included.
-- **P1-2/P1-3, P2-4/P2-5, P2-6/P2-7 and P3-9/P3-10 remain open** and are
-  tracked in `MVP_ROADMAP.md` in operational-risk order.
+- **P1-2 accounting closed:** the same host now reports `7,446,715,570` bytes
+  observed rather than ~370 MB, split into canonical runtime, legacy logs,
+  repository-owned worktrees and shared/unattributed worktrees.
+- **P1-3 lifecycle closed, cleanup pending confirmation:** the 3.84 GB aged
+  legacy `logs/` store is now one exact preview candidate with reversible
+  quarantine/restore and delayed purge; no data was moved automatically.
+- **Shared-worktree attribution/pruning, P2-4/P2-5, P2-6/P2-7 and
+  P3-9/P3-10 remain open** and are tracked in `MVP_ROADMAP.md` in
+  operational-risk order.

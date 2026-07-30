@@ -56,6 +56,27 @@ def test_preview_is_repo_scoped_deterministic_and_side_effect_free(retained) -> 
     assert "base" not in first
 
 
+def test_preview_accounts_for_global_worktrees_runtime_and_legacy_logs(retained) -> None:
+    foreign = retained["base"] / "unattributed-orphan"
+    foreign.mkdir()
+    (foreign / "payload.bin").write_bytes(b"x" * 4096)
+    legacy = retained["repo"] / "logs" / "processes"
+    legacy.mkdir(parents=True)
+    (legacy / "old.stdout.log").write_bytes(b"l" * 2048)
+    runtime = retained["repo"] / ".aiworkhub" / "runtime" / "extra"
+    runtime.mkdir(parents=True)
+    (runtime / "state.bin").write_bytes(b"r" * 1024)
+
+    result = storage_retention.preview(retained["repo"], base=retained["base"])
+    footprint = result["footprint"]
+
+    assert footprint["global_worktree_bytes"] >= footprint["repository_worktree_bytes"] + 4096
+    assert footprint["unattributed_or_foreign_worktree_bytes"] >= 4096
+    assert footprint["legacy_log_bytes"] >= 2048
+    assert footprint["canonical_runtime_bytes"] >= 1024
+    assert result["current_bytes"] == footprint["observed_total_bytes"]
+
+
 def test_quarantine_and_restore_roundtrip(retained) -> None:
     preview = storage_retention.preview(retained["repo"], base=retained["base"])
 

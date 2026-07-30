@@ -199,8 +199,13 @@ do not override this current priority ledger.
       - [x] Missing/empty repository quality policy is explicitly
             `unverified`; public check execution cannot return an empty green.
             AIWorkHub itself carries three portable declared checks.
-      - [ ] Account for canonical, legacy, orphaned and prunable-worktree bytes
-            in one retention preview and reclaim workflow.
+      - [x] Account for canonical runtime, legacy logs, orphan request files,
+            repository-owned and shared/unattributed worktree bytes in bounded
+            retention previews. On the audited host this corrects 370 MB to
+            7.45 GB observed. Aged legacy `logs/` now has preview/quarantine/
+            restore/delayed-purge support with exact identity revalidation.
+      - [ ] Attribute/prune stale shared-worktree registrations and execute the
+            explicit legacy quarantine after owner confirmation.
       - [ ] Rotate/stream the terminal ledger and bound each worker stdout log.
       - [ ] Bind deterministic verification to claim epoch and separate DAG-
             dependency blocking from lifecycle-blocked counts.

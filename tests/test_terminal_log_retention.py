@@ -70,6 +70,56 @@ def test_preview_keeps_last_ten_and_protects_nonterminal_task(tmp_path: Path) ->
     assert (repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH).is_file()
 
 
+def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    orphan_id = "a" * 32
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    orphan = process_root / f"{orphan_id}.stdout.log"
+    orphan.write_bytes(b"o" * 3072)
+    legacy = repo / terminal_log_retention.LEGACY_PROCESS_FILES_RELATIVE_PATH
+    legacy.mkdir(parents=True)
+    (legacy / "old.stdout.log").write_bytes(b"l" * 4096)
+
+    result = terminal_log_retention.preview(repo)
+
+    assert result["orphan_file_count"] == 1
+    assert result["orphan_file_bytes"] == 3072
+    assert result["legacy_current_bytes"] >= 4096
+    assert result["legacy_status"] == "present_unmanaged"
+    assert result["current_bytes"] >= 7168
+    assert result["protected_count"] == 2
+
+
+def test_aged_legacy_store_quarantine_and_restore_roundtrip(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    legacy = repo / "logs" / "processes"
+    legacy.mkdir(parents=True)
+    payload = legacy / "old.stdout.log"
+    payload.write_bytes(b"legacy" * 1024)
+    old = time.time() - 20 * 86400
+    os.utime(payload, (old, old))
+
+    preview = terminal_log_retention.preview(repo)
+    assert preview["legacy_candidate"]["size_bytes"] == payload.stat().st_size
+    moved = terminal_log_retention.quarantine(
+        repo,
+        preview_digest=preview["preview_digest"],
+        confirm=True,
+    )
+
+    assert moved["no_op"] is False
+    assert moved["bytes"] == len(b"legacy" * 1024)
+    assert not (repo / "logs").exists()
+    restored = terminal_log_retention.restore(
+        repo,
+        batch_id=moved["batch_id"],
+        confirm=True,
+    )
+    assert restored["restored"] == 1
+    assert payload.read_bytes() == b"legacy" * 1024
+
+
 def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):

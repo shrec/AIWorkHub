@@ -29,6 +29,8 @@ SCHEMA_ID = "aiworkhub.storage_retention.v1"
 MANIFEST_NAME = "manifest.json"
 QUARANTINE_DIRNAME = ".aiworkhub-quarantine"
 AUDIT_RELATIVE_PATH = Path(".aiworkhub/runtime/storage/retention.audit.jsonl")
+LEGACY_LOG_RELATIVE_PATH = Path("logs")
+CANONICAL_RUNTIME_RELATIVE_PATH = Path(".aiworkhub/runtime")
 UNDO_DAYS = 7
 MAX_MANIFEST_BYTES = 512 * 1024
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -110,6 +112,22 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         with_sizes=True,
         repo_root=repo_root,
     )
+    global_scan = worktree_storage.scan_worktrees(base, with_sizes=True)
+    repository_worktree_bytes = int(scan.get("summary", {}).get("total_bytes") or 0)
+    global_worktree_bytes = int(global_scan.get("summary", {}).get("total_bytes") or 0)
+    legacy_log_root = repo_root / LEGACY_LOG_RELATIVE_PATH
+    canonical_runtime_root = repo_root / CANONICAL_RUNTIME_RELATIVE_PATH
+    legacy_log_bytes = (
+        worktree_storage.directory_size_bytes(legacy_log_root)
+        if legacy_log_root.is_dir() and not legacy_log_root.is_symlink()
+        else 0
+    )
+    canonical_runtime_bytes = (
+        worktree_storage.directory_size_bytes(canonical_runtime_root)
+        if canonical_runtime_root.is_dir() and not canonical_runtime_root.is_symlink()
+        else 0
+    )
+    observed_total_bytes = global_worktree_bytes + legacy_log_bytes + canonical_runtime_bytes
     plan = worktree_storage.plan_cleanup(
         scan,
         include_orphaned=False,
@@ -142,10 +160,24 @@ def _preview_payload(repo_root: Path, base: Path) -> dict[str, Any]:
         "repository_scoped": True,
         "policy_days": policy_days,
         "max_bytes": max_bytes,
-        "current_bytes": int(scan.get("summary", {}).get("total_bytes") or 0),
+        "current_bytes": observed_total_bytes,
+        "worktree_current_bytes": repository_worktree_bytes,
+        "footprint": {
+            "observed_total_bytes": observed_total_bytes,
+            "canonical_runtime_bytes": canonical_runtime_bytes,
+            "legacy_log_bytes": legacy_log_bytes,
+            "global_worktree_bytes": global_worktree_bytes,
+            "repository_worktree_bytes": repository_worktree_bytes,
+            "unattributed_or_foreign_worktree_bytes": max(
+                0, global_worktree_bytes - repository_worktree_bytes
+            ),
+            "legacy_log_status": (
+                "present_unmanaged" if legacy_log_bytes else "absent_or_empty"
+            ),
+        },
         "projected_bytes": max(
             0,
-            int(scan.get("summary", {}).get("total_bytes") or 0)
+            observed_total_bytes
             - sum(item["size_bytes"] for item in candidates),
         ),
         "candidate_count": len(candidates),
