@@ -17,6 +17,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: Static quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install development quality tools
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff correctness gate
+        run: ruff check src/aiworkhub scripts tests
+      - name: Mypy typed-kernel gate
+        run: mypy
+
   cross-platform:
     name: Fresh install (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -116,7 +133,7 @@ jobs:
 
   python-package:
     name: Python package
-    needs: [python-ci, cross-platform]
+    needs: [python-ci, cross-platform, quality]
     runs-on: ubuntu-latest
 
     steps:

@@ -39,6 +39,10 @@ def _fixture(root: Path, *, canonical: str = "1.2.3", projected: str = "0.0.1") 
         f'const EXPECTED_MCP_PACKAGE_VERSION = "{projected}";\n',
         encoding="utf-8",
     )
+    (root / "CHANGELOG.md").write_text(
+        f"# Changelog\n\n## [{canonical}] - 2026-01-01\n",
+        encoding="utf-8",
+    )
 
 
 def test_live_release_metadata_projections_match_canonical_version() -> None:
@@ -64,6 +68,14 @@ def test_tag_mismatch_fails_without_mutating_projections(tmp_path: Path) -> None
     result = release_metadata.check(tmp_path, tag="v1.2.4")
     assert result["ok"] is False
     assert result["mismatches"] == {"release-tag": "1.2.4"}
+
+
+def test_missing_changelog_release_section_fails(tmp_path: Path) -> None:
+    _fixture(tmp_path, canonical="1.2.3", projected="1.2.3")
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+    result = release_metadata.check(tmp_path)
+    assert result["ok"] is False
+    assert result["mismatches"]["CHANGELOG.md"] == "missing [1.2.3] section"
 
 
 def test_checksums_are_deterministic_sorted_and_basename_only(tmp_path: Path) -> None:
@@ -100,7 +112,13 @@ def test_ci_and_release_enforce_metadata_reproducibility_and_checksums() -> None
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "scripts/release_metadata.py check" in ci
+    assert 'python -m pip install -e ".[dev]"' in ci
+    assert "ruff check src/aiworkhub scripts tests" in ci
+    assert "mypy" in ci
     assert "Verify reproducible VSIX bytes" in ci
     assert "scripts/release_metadata.py check --tag" in release
+    assert 'python -m pip install -e ".[dev]"' in release
+    assert "ruff check src/aiworkhub scripts tests" in release
+    assert "mypy" in release
     assert "Verify reproducible VSIX bytes" in release
     assert "release-assets/SHA256SUMS" in release

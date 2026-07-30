@@ -22,6 +22,11 @@ RUNTIME_LITERAL = re.compile(
 VALID_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 
 
+def changelog_versions(root: Path) -> set[str]:
+    text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    return set(re.findall(r"^## \[([^]]+)\]", text, re.MULTILINE))
+
+
 def canonical_version(root: Path) -> str:
     source = (root / "src" / "aiworkhub" / "_version.py").read_text(encoding="utf-8")
     match = VERSION_LITERAL.search(source)
@@ -57,6 +62,8 @@ def check(root: Path, *, tag: str = "") -> dict[str, object]:
     normalized_tag = tag[1:] if tag.startswith("v") else tag
     if tag and normalized_tag != canonical:
         mismatches["release-tag"] = normalized_tag
+    if canonical not in changelog_versions(root):
+        mismatches["CHANGELOG.md"] = f"missing [{canonical}] section"
     return {
         "ok": not mismatches,
         "canonical_source": "src/aiworkhub/_version.py",

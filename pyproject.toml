@@ -37,6 +37,13 @@ dependencies = [
   "mcp>=1.0.0,<2"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.14,<2",
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+]
+
 [project.urls]
 Homepage = "https://github.com/shrec/AIWorkHub"
 Documentation = "https://github.com/shrec/AIWorkHub#readme"
@@ -68,3 +75,26 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["eval", ".aiworkhub", "archive"]
+
+[tool.ruff.lint]
+# Start with correctness-critical rules that are green across the inherited
+# tree. Broader style/import families are expanded only with a measured
+# baseline so quality automation never lands as permanent CI noise.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+follow_imports = "skip"
+show_error_codes = true
+files = [
+  "src/aiworkhub/_version.py",
+  "src/aiworkhub/process_event_ledger.py",
+  "src/aiworkhub/task_fsm.py",
+  "src/aiworkhub/task_plan.py",
+]

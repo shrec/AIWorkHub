@@ -251,6 +251,10 @@ rewritten after remediation.
   carry the exact claim epoch; episode-local truth is cleared on rejection and
   acceptance fails closed on an epoch mismatch. Plan snapshots expose total,
   DAG-dependency and lifecycle-blocked counts and IDs separately.
-- **Shared-worktree attribution/pruning and
-  P3-9/P3-10 remain open** and are tracked in `MVP_ROADMAP.md` in
+- **P3-9 baseline closed:** CI and release now install the repository `dev`
+  extra, run correctness-critical Ruff rules over all Python paths, and run
+  mypy over the first explicit typed lifecycle kernel. Expansion is incremental
+  and measured rather than a permanently-red 699-error gate.
+- **Shared-worktree attribution/pruning and P3-10 artifact disposition remain
+  open** and are tracked in `MVP_ROADMAP.md` in
   operational-risk order.

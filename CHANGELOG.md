@@ -25,6 +25,10 @@ noted by package/extension version and release tag.
   acceptance from another execution episode.
 - Split Plan DAG blockage observability into total, dependency-blocked and
   lifecycle-blocked counts and exact task-ID populations.
+- Added reproducible Ruff correctness and mypy typed-kernel gates to repository
+  policy, pull-request CI and tag releases through a declared `dev` extra.
+- Release metadata verification now fails when the canonical version has no
+  corresponding changelog section.
 - Added the canonical AIWorkHub brand system, repository hero, positioning,
   public support guide, Marketplace-ready extension page and package discovery
   metadata.

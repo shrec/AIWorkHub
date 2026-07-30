@@ -222,7 +222,13 @@ do not override this current priority ledger.
             18 skipped`) and complete 24-file extension suite on 2026-07-30.
       - [x] Discover and execute every extension `*.test.js` sequentially;
             CI no longer depends on a hand-maintained filename chain.
-      - [ ] Add calibrated Ruff/type gates and close stale repository artifacts.
+      - [x] Add calibrated static gates: correctness-critical Ruff rules cover
+            all Python source/scripts/tests and mypy gates the initial typed
+            lifecycle kernel. Both CI and tag releases install the declared
+            `dev` extra and execute the same repository policy commands.
+      - [ ] Expand the typed kernel by measured module groups and disposition
+            historical scripts/eval artifacts without deleting owner-owned
+            untracked reports or active rollback evidence.
 - [x] Make version metadata a single source of truth and enforce Linux/Windows/
       macOS release CI plus reproducible VSIX checksums. Canonical authority is
       `src/aiworkhub/_version.py`; projections, tag identity, repeated VSIX
