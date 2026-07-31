@@ -1,4 +1,4 @@
-# AIWorkHub MCP MVP Roadmap
+# Archived AIWorkHub MCP MVP Roadmap
 
 Goal: provide a repository-native, model-agnostic development orchestrator
 whose task lifecycle, source context, sessions, memory, knowledge, review and

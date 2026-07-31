@@ -1,4 +1,4 @@
-# AIWorkHub Project Audit — 2026-07-30
+# Archived AIWorkHub Project Audit — 2026-07-30
 
 **Scope:** full repository audit of `/home/shrek/AIWorkHub` at `4e487a5` (branch `main`, version `0.8.0`).
 **Method:** canonical AIWorkHub MCP read-only surfaces (task health, plan snapshot, source-graph health, storage/terminal retention previews, quality profile, environment preflight) plus direct test execution and bounded source inspection.

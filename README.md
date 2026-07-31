@@ -23,6 +23,24 @@ It connects the models already available in VS Code to a repository-scoped task
 queue, Source Graph, Session Manager, AI Memory, knowledge base and review
 inbox. No AIWorkHub cloud account or HTTP service is required.
 
+## Supported models
+
+AIWorkHub routes by runner family and adapter. Editor routes use models already
+visible in VS Code; CLI routes reuse that CLI's own authenticated session.
+AIWorkHub does not copy editor or CLI credentials.
+
+| Runner family | Supported route | Install requirement | Credential |
+| --- | --- | --- | --- |
+| `codex_*` | `codex_cli` or VS Code LM | Codex CLI/extension, or a VS Code LM provider | Existing Codex login, or one-time VS Code model consent |
+| `claude_*` | `claude_cli` or VS Code LM | Claude Code CLI/extension, or a VS Code LM provider | Existing Claude subscription login, or one-time VS Code model consent |
+| `deepseek_*` | DeepSeek V4 Pro/Flash through VS Code LM; Copilot CLI BYOK fallback | DeepSeek-capable VS Code provider; fallback requires GitHub Copilot CLI | VS Code model consent; fallback uses `aiworkhub-deepseek-credential set` |
+| `glm_*` | GLM 5.2 through VS Code LM; Copilot CLI BYOK fallback | GLM 5.2 visible in VS Code; fallback requires GitHub Copilot CLI | VS Code model consent; fallback uses `python -m aiworkhub.glm_credentials setup` |
+| `copilot_*` | Public VS Code Language Model API | GitHub Copilot extension | GitHub sign-in and one-time model consent |
+
+Exact model availability is discovered at runtime because subscriptions and
+editor model catalogs differ. The dashboard preflight reports which adapters
+are installed, authorized and launchable before a task is claimed.
+
 ## Why AIWorkHub
 
 - **Spend less context.** Agents query a structural Source Graph and durable
@@ -55,6 +73,12 @@ disabled by default. Credentials stay outside the repository, callback events
 are durable and repository state remains local.
 
 <div align="center">
+  <img src="docs/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task to worker to evidence to manager review loop" width="100%">
+  <br>
+  <em>A 20-second view of the repository-scoped task, worker, evidence and review loop.</em>
+</div>
+
+<div align="center">
   <img src="docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub dashboard orchestrating AIWorkHub development" width="100%">
   <br>
   <em>AIWorkHub orchestrating its own development with repository-scoped context, tasks and review callbacks.</em>
@@ -80,8 +104,10 @@ Initialization is explicit and idempotent. It creates `.aiworkhub/`, starts the
 first Source Graph index and keeps the index fresh. The packaged extension runs
 on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
-Marketplace, Open VSX and PyPI publication paths are release-automated; see
-[Publishing](docs/PUBLISHING.md) for registry-owner setup and current channels.
+**Current public channel: GitHub Release VSIX only.** Marketplace, Open VSX and
+PyPI publication jobs exist but are not enabled yet. Use the release VSIX (or
+its attached wheel) until those registry pages are live; see
+[Publishing](docs/PUBLISHING.md) for the owner setup.
 
 ## Headless development install
 
@@ -163,11 +189,7 @@ Start with [Getting Started](docs/GETTING_STARTED.md), then use the
 ## Acknowledgements
 
 Thanks to [null0xxx](https://github.com/null0xxx) for sharing
-[kimi-atlas](https://github.com/null0xxx/kimi-atlas) and its thoughtful ideas
-around multi-agent orchestration, deterministic quality gates and
-evidence-driven verification. Those ideas helped inform parts of AIWorkHub's
-design exploration. AIWorkHub's repository Context Graph is an original
-AIWorkHub concept; AIWorkHub remains an independent project with no official
-affiliation or endorsement implied.
+[kimi-atlas](https://github.com/null0xxx/kimi-atlas) and useful ideas about
+multi-agent orchestration and evidence-driven verification.
 
 AIWorkHub is open source under the [MIT License](LICENSE).

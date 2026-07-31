@@ -12,6 +12,14 @@ The extension can also be published to the VS Code Marketplace and Open VSX
 Registry when the corresponding repository secrets are configured. PyPI uses
 GitHub OIDC Trusted Publishing and requires no long-lived upload token.
 
+## Current public channels
+
+As of 2026-07-31, GitHub Releases is the only enabled public distribution
+channel. Each release provides a VSIX, Python wheel, source distribution and
+checksums. Marketplace, Open VSX and PyPI publication steps remain disabled
+until their owner credentials/environments are configured; a skipped registry
+job is not evidence that a package was published there.
+
 ## Release Preflight
 
 Run from the standalone repository root:
