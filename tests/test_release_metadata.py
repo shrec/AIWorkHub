@@ -47,9 +47,11 @@ def _fixture(root: Path, *, canonical: str = "1.2.3", projected: str = "0.0.1") 
 
 def test_live_release_metadata_projections_match_canonical_version() -> None:
     result = release_metadata.check(ROOT)
+    canonical = release_metadata.canonical_version(ROOT)
     assert result["ok"] is True
     assert result["canonical_source"] == "src/aiworkhub/_version.py"
-    assert result["canonical_version"] == "0.8.10"
+    assert result["canonical_version"] == canonical
+    assert set(result["projections"].values()) == {canonical}
     extension_manifest = json.loads(
         (ROOT / "vscode-extension" / "package.json").read_text(encoding="utf-8")
     )
