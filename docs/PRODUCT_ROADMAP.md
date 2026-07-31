@@ -42,6 +42,10 @@ AIWorkHub telemetry.
   relations, bounded search and exact transcript-range recovery. Manager
   Session writes are captured atomically when enabled; worker sessions are
   excluded.
+- Passive Codex manager transcript capture from authoritative completed
+  user/assistant items, with asynchronous storage, exact live route
+  verification and deterministic deduplication. Internal reasoning, tools,
+  commands, approvals and deltas are excluded.
 - Storage observability, bounded system logs, and local dashboard views for
   task operations and context systems.
 - Safe repository worktree, terminal-run and extension-runtime retention with
@@ -73,10 +77,11 @@ AIWorkHub telemetry.
 - Codex push callbacks currently include an optional compatibility adapter over
   a non-public App Server boundary. Manager inbox remains the portable fallback;
   each supported Codex release needs a compatibility qualification matrix.
-- Context Graph does not yet claim complete external-chat capture. The
-  repository ledger/projection/retrieval runtime is shipped; supported,
-  consented Codex/Claude/Copilot transcript adapters remain an explicit
-  follow-up and must not depend on scraping private plugin storage.
+- Context Graph does not yet claim complete cross-provider chat capture. The
+  repository ledger/projection/retrieval runtime and Codex final-message
+  adapter are shipped; supported, consented Claude/Copilot manager adapters
+  remain an explicit follow-up and must not depend on scraping private plugin
+  storage.
 
 ## P0 — Stable multi-repository product (0.7.9)
 

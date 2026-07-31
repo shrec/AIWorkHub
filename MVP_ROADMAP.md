@@ -66,9 +66,12 @@ do not override this current priority ledger.
       retrieval, manager MCP tools and atomic manager Session capture. Worker
       sessions are structurally excluded. Repository initialization provisions
       the schema but capture remains default-off until the user enables it.
-- [ ] Add supported-provider transcript adapters so complete Codex/Claude/
-      Copilot chat events can be captured automatically without asking the
-      manager model to rewrite its own conversation. Adapters must be
+- [x] Add a passive Codex manager transcript adapter over authoritative final
+      App Server user/assistant items. The bounded background sink verifies the
+      exact live repo/thread route, is replay-safe and excludes reasoning,
+      tool output, commands, approvals, deltas and every worker session.
+- [ ] Add supported Claude/Copilot manager transcript adapters without asking
+      the manager model to rewrite its own conversation. Adapters must remain
       repository/thread bound, consented, replay-safe and must never scrape a
       foreign extension's private storage.
 - [x] Source Graph language-complete first indexing (including PHP), automatic

@@ -181,6 +181,12 @@ def status(repo: Path | str) -> dict[str, Any]:
             "ready": True,
             "schema_id": SCHEMA_ID,
             "repo_id": repo_id,
+            "capture_scope": "manager_only",
+            "capture_adapters": {
+                "codex": "final_items",
+                "claude": "not_configured",
+                "copilot": "not_configured",
+            },
             "events": counts["conversation_events"],
             "nodes": counts["context_nodes"],
             "edges": counts["context_edges"],

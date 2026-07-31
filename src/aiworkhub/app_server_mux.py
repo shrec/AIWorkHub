@@ -62,7 +62,11 @@ Sideband trust model (fail-closed, local-only, no fallback):
   spawns a second/separate App Server as a fallback -- that reintroduces
   the exact B407/B409 hidden-turn defect this module exists to close.
 - No token, thread id, or prompt/turn text is ever written to a log file
-  or printed by this module.
+  or printed by this module. When the repository owner explicitly enables
+  Manager Context Graph, authoritative final ``userMessage``/``agentMessage``
+  items are asynchronously persisted in that repository's canonical
+  transcript database; reasoning, tool output and streaming deltas are never
+  captured.
 
 B472: several VS Code extension-host windows run concurrent mux processes
 against the SAME ``sideband_dir``. A fixed shared socket/capability path
@@ -200,6 +204,20 @@ def extension_host_parent_pid() -> int:
 APP_SERVER_ARG = "app-server"
 
 SIDEBAND_ALLOWED_METHODS = frozenset({"thread/resume", "turn/steer", "turn/start"})
+
+
+def _create_manager_transcript_capture(repo_id: str, extension_host_pid: int) -> Any | None:
+    """Load the optional context adapter without coupling callback imports to it."""
+    if not __package__:
+        return None
+    try:
+        from .manager_transcript_capture import ManagerTranscriptCapture
+    except ImportError:
+        return None
+    return ManagerTranscriptCapture(
+        repo_id=repo_id,
+        extension_host_pid=extension_host_pid,
+    )
 SIDEBAND_ALLOWED_REQUEST_KEYS = frozenset({"cap", "method", "params"})
 SIDEBAND_REQUIRED_REQUEST_KEYS = frozenset({"cap", "method", "params"})
 
@@ -875,6 +893,10 @@ class AppServerMux:
 
         self._dedup_lock = threading.Lock()
         self._dedup_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._transcript_capture = _create_manager_transcript_capture(
+            self._repo_id,
+            self._parent_pid,
+        )
 
     def _assign_instance_paths(self) -> None:
         self._instance_id = secrets.token_hex(SIDEBAND_INSTANCE_ID_BYTES)
@@ -932,6 +954,8 @@ class AppServerMux:
             stderr=None,  # inherited -- transparent stderr proxy, no active pumping needed
             bufsize=0,
         )
+        if self._transcript_capture is not None:
+            self._transcript_capture.start()
         for target in (
             self._pump_extension_to_child,
             self._pump_child_to_extension,
@@ -951,6 +975,8 @@ class AppServerMux:
         return returncode
 
     def shutdown(self) -> None:
+        if self._transcript_capture is not None:
+            self._transcript_capture.close()
         self._stop_event.set()
         self._fail_all_pending("mux_shutdown")
         if self._server_socket is not None:
@@ -1005,6 +1031,7 @@ class AppServerMux:
                 raw_line = child_stdout.readline()
                 if not raw_line:
                     break
+                self._observe_child_message(raw_line)
                 if not self._route_child_message(raw_line):
                     self._write_to_extension(raw_line)
         except (OSError, ValueError):
@@ -1052,6 +1079,13 @@ class AppServerMux:
             self._active_thread_observed_at = time.time()
         self._write_registry()
 
+    def _observe_child_message(self, raw_line: bytes) -> None:
+        if self._transcript_capture is None:
+            return
+        message = _try_parse_json_object(raw_line)
+        if message is not None:
+            self._transcript_capture.offer(message)
+
     def _write_registry(self) -> None:
         with self._owned_thread_lock:
             owned = list(self._owned_thread_ids)
@@ -1072,6 +1106,11 @@ class AppServerMux:
             "heartbeat_at": time.time(),
             "owner_lease_seconds": SIDEBAND_OWNER_LEASE_SECONDS,
             "ready": self.ready,
+            "manager_transcript_capture": (
+                self._transcript_capture.status()
+                if self._transcript_capture is not None
+                else {"state": "unavailable"}
+            ),
         }
         _write_registry_descriptor(self._registry_path, descriptor)
 

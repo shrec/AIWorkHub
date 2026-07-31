@@ -2655,7 +2655,8 @@ function renderSettings(payload) {
     const detail = document.createElement("small");
     if (key === "context_graph" && payload.context_graph_runtime?.ok === true) {
       const runtime = payload.context_graph_runtime;
-      detail.textContent = `${description} ${Number(runtime.events || 0)} events · ${Number(runtime.nodes || 0)} nodes · ${Number(runtime.edges || 0)} edges.`;
+      const codexCapture = runtime.capture_adapters?.codex === "final_items" ? "Codex auto-capture" : "manual capture";
+      detail.textContent = `${description} ${codexCapture} · ${Number(runtime.events || 0)} events · ${Number(runtime.nodes || 0)} nodes · ${Number(runtime.edges || 0)} edges.`;
     } else {
       detail.textContent = description;
     }

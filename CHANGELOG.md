@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-07-31
+
+### Added
+
+- Added passive Codex manager transcript capture from authoritative App Server
+  `item/completed` user/assistant messages into the enabled repository Manager
+  Context Graph.
+- Added a bounded background capture queue, exact repo/thread route
+  verification, deterministic idempotency and capture health counters so
+  transcript persistence never blocks the visible chat transport.
+
+### Security
+
+- Capture remains repository opt-in and manager-only. Reasoning, tool output,
+  commands, approvals, streaming deltas and worker traffic are excluded.
+- Failed or ambiguous repository/thread routes fail closed without writing
+  content or scraping another extension's private storage.
+
 ## [0.8.3] - 2026-07-31
 
 ### Fixed

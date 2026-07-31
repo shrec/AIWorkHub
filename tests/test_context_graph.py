@@ -88,6 +88,8 @@ def test_event_ingestion_is_idempotent_searchable_and_repo_local(tmp_path: Path)
     assert local["results"][0]["content"] == "alpha routing decision"
     runtime = context_graph.status(first_repo)
     assert runtime["ready"] is True
+    assert runtime["capture_scope"] == "manager_only"
+    assert runtime["capture_adapters"]["codex"] == "final_items"
     assert runtime["events"] == 1
     assert runtime["nodes"] == 6
     assert runtime["edges"] == 5
