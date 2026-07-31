@@ -41,7 +41,10 @@ from aiworkhub import (
 # single MCP stdio response. This defends the transport only -- it never
 # changes what build_snapshot()/build_task_detail() compute, only how much of
 # it survives one tool call. Every drop is reported, never silent.
-MAX_SNAPSHOT_RESPONSE_BYTES = 4 * 1024 * 1024
+# A dashboard refresh is a control-plane heartbeat, not a history export.
+# Keep it comfortably below common MCP/Webview message thresholds; detailed
+# task, log, memory, session and KB data already have dedicated bounded tools.
+MAX_SNAPSHOT_RESPONSE_BYTES = 512 * 1024
 MAX_TASK_DETAIL_RESPONSE_BYTES = 1 * 1024 * 1024
 
 # Largest / least essential first. status_counts, tasks, and row_counts are

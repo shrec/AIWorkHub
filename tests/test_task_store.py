@@ -65,6 +65,21 @@ def test_archive_removes_pending_card_from_active_lists_and_preserves_events(tmp
     assert task_store.get_task_events(repo, "TASK_ARCHIVE_B891")[0]["event"] == "archived"
 
 
+def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_BATCH_A", status="pending")
+    _insert_task(repo, "TASK_BATCH_B", status="processing")
+
+    cards = task_store.list_task_cards(repo, limit=10)
+
+    assert {card["task_id"] for card in cards} == {"TASK_BATCH_A", "TASK_BATCH_B"}
+    assert all(card["allowed_writes"] == ["out.txt"] for card in cards)
+    by_id = {card["task_id"]: card for card in cards}
+    assert by_id["TASK_BATCH_A"] == task_store.get_task(repo, "TASK_BATCH_A")
+    assert by_id["TASK_BATCH_B"] == task_store.get_task(repo, "TASK_BATCH_B")
+
+
 def test_supersede_removes_processing_orphan_without_deleting_audit(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

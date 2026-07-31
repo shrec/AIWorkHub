@@ -49,7 +49,7 @@ def test_live_release_metadata_projections_match_canonical_version() -> None:
     result = release_metadata.check(ROOT)
     assert result["ok"] is True
     assert result["canonical_source"] == "src/aiworkhub/_version.py"
-    assert result["canonical_version"] == "0.8.9"
+    assert result["canonical_version"] == "0.8.10"
     extension_manifest = json.loads(
         (ROOT / "vscode-extension" / "package.json").read_text(encoding="utf-8")
     )

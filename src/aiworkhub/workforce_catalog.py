@@ -240,12 +240,7 @@ def _percentile(values: list[float], fraction: float) -> float | None:
 
 
 def _canonical_cards(root: Path) -> list[dict[str, Any]]:
-    cards: list[dict[str, Any]] = []
-    for row in task_store.list_tasks(root, status=None, limit=5000):
-        card = task_store.get_task(root, str(row.get("task_id") or ""))
-        if isinstance(card, dict):
-            cards.append(card)
-    return cards
+    return task_store.list_task_cards(root, limit=5000)
 
 
 def build_catalog(

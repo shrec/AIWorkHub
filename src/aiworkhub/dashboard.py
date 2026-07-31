@@ -36,6 +36,7 @@ from aiworkhub import (
 
 DEFAULT_TASK_LIMIT = 500
 DEFAULT_PROCESS_LIMIT = 200
+DEFAULT_SNAPSHOT_PROCESS_LIMIT = 50
 MAX_PROCESS_LOG_BYTES = 4 * 1024 * 1024
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
@@ -774,8 +775,7 @@ class DashboardProvider:
 
     def get_cost_ledger(self) -> dict[str, Any]:
         by_runner: dict[str, dict[str, Any]] = {}
-        for row in task_store.list_tasks(self.repo_root, status=None, limit=5000):
-            card = task_store.get_task(self.repo_root, str(row.get("task_id") or "")) or {}
+        for card in task_store.list_task_cards(self.repo_root, limit=5000):
             summary = card.get("usage_summary") or {}
             if isinstance(summary, str):
                 try:
@@ -828,7 +828,7 @@ class DashboardProvider:
         }
 
     def get_agent_processes(self) -> dict[str, Any]:
-        return read_process_runs(limit=DEFAULT_PROCESS_LIMIT)
+        return read_process_runs(limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT)
 
     def get_exact_status_counts(self) -> dict[str, int]:
         """Exact per-status totals across the whole canonical queue (see
@@ -846,9 +846,10 @@ class DashboardProvider:
 
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""
-        process_report = read_process_runs(limit=5000)
+        process_report = read_process_runs(limit=DEFAULT_PROCESS_LIMIT)
         return workforce_catalog.build_catalog(
             self.repo_root,
+            cards=task_store.list_task_cards(self.repo_root, limit=5000),
             process_rows=process_report.get("processes") or [],
         )
 
@@ -861,11 +862,7 @@ class DashboardProvider:
 
     def get_task_plan(self) -> dict[str, Any]:
         """Read-only Plan-DAG projection from full canonical cards."""
-        cards: list[dict[str, Any]] = []
-        for row in task_store.list_tasks(self.repo_root, status=None, limit=5000):
-            card = task_store.get_task(self.repo_root, str(row.get("task_id") or ""))
-            if card is not None:
-                cards.append(card)
+        cards = task_store.list_task_cards(self.repo_root, limit=5000)
         return {
             "ok": True,
             "schema_id": "aiworkhub.task_plan_snapshot.v1",

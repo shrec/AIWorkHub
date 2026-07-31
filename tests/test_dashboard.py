@@ -535,11 +535,16 @@ def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path
         calls.append(("task_store.get_task", repo_root, task_id))
         return {"task_id": task_id}
 
+    def fake_list_task_cards(repo_root, limit=500):
+        calls.append(("task_store.list_task_cards", repo_root, limit))
+        return []
+
     def forbidden_legacy_provider(*_args, **_kwargs):
         raise AssertionError("canonical dashboard must not call a legacy provider")
 
     monkeypatch.setattr(dashboard.task_store, "list_tasks", fake_list_tasks)
     monkeypatch.setattr(dashboard.task_store, "get_task", fake_get_task)
+    monkeypatch.setattr(dashboard.task_store, "list_task_cards", fake_list_task_cards)
     monkeypatch.setattr(
         dashboard.completion_inbox, "build_completion_inbox", forbidden_legacy_provider
     )

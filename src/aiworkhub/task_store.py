@@ -624,16 +624,7 @@ def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500)
     return result
 
 
-def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
-    """Canonical detail for exactly one bounded task_id, or None if unknown."""
-    _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path, readonly=True)
-    try:
-        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        return None
+def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     card = dict(row)
     try:
         card_json = json.loads(card.get("card_json") or "{}")
@@ -647,6 +638,41 @@ def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
             card["origin_thread_id"] = card_json["origin_thread_id"]
     card["status"] = canonical_status(card)
     return card
+
+
+def list_task_cards(root: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Return bounded canonical task cards with one readiness check/query.
+
+    Dashboard aggregates previously performed ``list_tasks`` followed by one
+    ``get_task`` connection and SQLite ``quick_check`` per row. On mature
+    repositories that N+1 pattern made every dashboard refresh take tens of
+    seconds. This batch reader preserves the identical canonical card decode
+    while keeping the operation to one verified database snapshot.
+    """
+    _readiness, db_path = _require_ready(root)
+    bounded_limit = max(1, min(int(limit), 5000))
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM tasks ORDER BY updated_at DESC LIMIT ?",
+            (bounded_limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_decode_task_card(row) for row in rows]
+
+
+def get_task(root: str | Path, task_id: str) -> dict[str, Any] | None:
+    """Canonical detail for exactly one bounded task_id, or None if unknown."""
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return _decode_task_card(row)
 
 
 def callback_bridge_health(root: str | Path) -> dict[str, Any]:

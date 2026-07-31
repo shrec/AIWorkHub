@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-07-31
+
+### Fixed
+
+- Replaced three per-task N+1 dashboard scans with one canonical batch-card
+  read. On the live GeoAI repository the snapshot build fell from 23.5s to
+  0.83s and from 764KB to 310KB, keeping it inside the extension request
+  deadline instead of opening the recovery circuit.
+- Limited the refresh snapshot to 50 recent process rows and a 512KB transport
+  budget. Full task details, live output, logs, memory, sessions and KB remain
+  available through their dedicated bounded tools.
+
 ## [0.8.9] - 2026-07-31
 
 ### Fixed
