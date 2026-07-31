@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-07-31
+
+### Fixed
+
+- Moved CPU-heavy Source Graph builds out of every MCP stdio process and
+  into a dedicated, cancellable indexing subprocess. Large repository
+  indexing can no longer starve dashboard snapshots, callback delivery or
+  health requests behind the Python GIL.
+- Coalesced dispatcher startup, route promotion and watchdog convergence on
+  one repository-bound operation, preventing concurrent `ensure_started`
+  calls from blocking the MCP channel and leaving the dashboard on
+  `Connecting` / `mcp_recovery_circuit_open`.
+- Added production subprocess-indexing coverage while retaining deterministic
+  in-process test injection for Source Graph lifecycle unit tests.
+
 ## [0.8.8] - 2026-07-31
 
 ### Fixed

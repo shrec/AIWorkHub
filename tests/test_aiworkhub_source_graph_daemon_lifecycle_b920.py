@@ -27,6 +27,21 @@ if str(_SRC) not in sys.path:
 from aiworkhub import core, repository_bootstrap, server, source_graph, source_graph_daemon, task_store  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def in_process_builds_for_monkeypatches(monkeypatch):
+    """Keep unit-test monkeypatches in-process.
+
+    Production defaults to a dedicated indexing subprocess so a CPU-heavy
+    repository scan cannot starve MCP stdio. These unit tests deliberately
+    replace ``source_graph.build_index`` with local closures/events, which
+    cannot cross a process boundary.
+    """
+    monkeypatch.setenv(
+        source_graph_daemon.BUILD_EXECUTION_ENV,
+        source_graph_daemon.BUILD_EXECUTION_THREAD,
+    )
+
+
 @pytest.fixture
 def cleanup_daemons():
     """Stop every daemon this test registered, even on failure -- a stray
@@ -93,6 +108,21 @@ def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
     assert health["status"] == source_graph_daemon.STATUS_EMPTY
     assert health["last_report"]["files_seen"] == 0
     assert health["last_report"]["entities_written"] == 0
+
+
+def test_production_default_build_runs_in_dedicated_subprocess(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    (root / "app.py").write_text("def live_probe():\n    return 1\n", encoding="utf-8")
+    monkeypatch.delenv(source_graph_daemon.BUILD_EXECUTION_ENV, raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(_SRC))
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+
+    assert daemon._build_execution == source_graph_daemon.BUILD_EXECUTION_SUBPROCESS
+    assert daemon._run_one_build() is True
+    health = daemon.health()
+    assert health["ok"] is True
+    assert health["status"] == source_graph_daemon.STATUS_READY
+    assert health["last_report"]["files_seen"] == 1
 
 
 def test_old_success_is_truthfully_stale_until_next_success(tmp_path, monkeypatch):

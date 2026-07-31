@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.8";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.9";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -771,7 +771,7 @@ async function runDispatcherWatchdogTick() {
   try {
     const client = getMcpClient();
     await client.ensureStarted();
-    const health = await client._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
+    const health = await client.ensureDispatcherStarted(5000);
     if (!health || health.ok !== true) {
       outputChannel.appendLine(
         `[mcp] callback dispatcher watchdog did not converge: ${sanitizeErrorMessage(
@@ -834,9 +834,12 @@ function startStartupRouteConvergence(repoInfo) {
       // immediately instead of waiting for a later dashboard refresh/reload.
       try {
         const client = getMcpClient();
-        client.ensureStarted().then(() => (
-          client._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000)
-        )).catch((err) => {
+        client.ensureStarted().then(async () => {
+          if (client.backgroundConvergencePromise) {
+            await client.backgroundConvergencePromise;
+          }
+          return client.ensureDispatcherStarted(5000);
+        }).catch((err) => {
           outputChannel.appendLine(`[mcp] sideband dispatcher promotion failed: ${sanitizeErrorMessage(err)}`);
         });
       } catch (err) {
@@ -1184,6 +1187,8 @@ class McpStdioClient {
     // lifecycle fact instead of issuing a redundant tools/list + health pair
     // while dispatcher/Source Graph startup calls are already in flight.
     this.runtimePreflight = null;
+    this.dispatcherEnsurePromise = null;
+    this.backgroundConvergencePromise = null;
     this.restartAttempts = 0;
     this.intentionalStop = false;
     // B893: how many bounded runtime-repair restarts this client has spent
@@ -1385,6 +1390,8 @@ class McpStdioClient {
     this.intentionalStop = false;
     this.initialized = false;
     this.runtimePreflight = null;
+    this.dispatcherEnsurePromise = null;
+    this.backgroundConvergencePromise = null;
     this.buffer = "";
     this.nextId = 1;
     this.pending.clear();
@@ -1471,10 +1478,23 @@ class McpStdioClient {
     return extractToolResult(await this.request("tools/call", { name, arguments: args || {} }, timeoutMs));
   }
 
+  ensureDispatcherStarted(timeoutMs = 5000) {
+    if (this.dispatcherEnsurePromise) return this.dispatcherEnsurePromise;
+    const operation = this._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, timeoutMs);
+    this.dispatcherEnsurePromise = operation;
+    operation.finally(() => {
+      if (this.dispatcherEnsurePromise === operation) {
+        this.dispatcherEnsurePromise = null;
+      }
+    }).catch(() => {});
+    return operation;
+  }
+
   _convergeBackgroundServices() {
+    if (this.backgroundConvergencePromise) return this.backgroundConvergencePromise;
     const run = async () => {
       try {
-        await this._callToolRaw(DISPATCHER_TOOLS.ensureStarted, {}, 5000);
+        await this.ensureDispatcherStarted(5000);
       } catch (err) {
         this.outputChannel.appendLine(`[mcp] callback dispatcher background convergence failed: ${sanitizeErrorMessage(err)}`);
       }
@@ -1484,9 +1504,16 @@ class McpStdioClient {
         this.outputChannel.appendLine(`[mcp] source graph background convergence failed: ${sanitizeErrorMessage(err)}`);
       }
     };
-    run().catch((err) => {
+    const operation = run();
+    this.backgroundConvergencePromise = operation;
+    operation.catch((err) => {
       this.outputChannel.appendLine(`[mcp] background service convergence failed: ${sanitizeErrorMessage(err)}`);
+    }).finally(() => {
+      if (this.backgroundConvergencePromise === operation) {
+        this.backgroundConvergencePromise = null;
+      }
     });
+    return operation;
   }
 
   _onStdout(emittingChild, chunk) {
@@ -1551,6 +1578,8 @@ class McpStdioClient {
     this._clearLifecycleOwnership(exitedChild);
     this.initialized = false;
     this.runtimePreflight = null;
+    this.dispatcherEnsurePromise = null;
+    this.backgroundConvergencePromise = null;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
     this._failPendingForChild(exitedChild, failure);
 
@@ -1683,6 +1712,8 @@ class McpStdioClient {
     this.child = null;
     this.initialized = false;
     this.runtimePreflight = null;
+    this.dispatcherEnsurePromise = null;
+    this.backgroundConvergencePromise = null;
     this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
     this._terminateOwnedChild(child);
   }

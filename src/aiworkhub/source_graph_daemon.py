@@ -32,6 +32,10 @@ to this tool never share or interfere with each other's daemon.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +47,9 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 300.0
 MIN_REFRESH_INTERVAL_SECONDS = 30.0
 DEFAULT_STALE_MULTIPLIER = 3.0
 MIN_STALE_AFTER_SECONDS = 120.0
+BUILD_EXECUTION_ENV = "AIWORKHUB_SOURCE_GRAPH_BUILD_EXECUTION"
+BUILD_EXECUTION_SUBPROCESS = "subprocess"
+BUILD_EXECUTION_THREAD = "thread"
 
 STATUS_STOPPED = "stopped"
 STATUS_INDEXING = "indexing"
@@ -51,6 +58,23 @@ STATUS_EMPTY = "empty"
 STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
 STATUS_STALE = "stale"
+
+
+def _build_once_payload(repo_root: Path | str, *, incremental: bool) -> dict[str, Any]:
+    """Run one index build and return a JSON-safe outcome.
+
+    This function is also the entry point used by the dedicated indexing
+    subprocess. Keeping CPU-heavy parsing outside the MCP stdio process is a
+    correctness requirement: a large repository build must never starve MCP
+    health, dashboard snapshot or callback requests behind the Python GIL.
+    """
+    try:
+        report = source_graph.build_index(Path(repo_root), incremental=incremental)
+        return {"kind": "success", "report": report.to_json()}
+    except source_graph.SourceGraphBuildInProgressError:
+        return {"kind": "standby"}
+    except Exception as exc:  # noqa: BLE001 -- serialized for daemon health
+        return {"kind": "error", "error": f"{type(exc).__name__}:{exc}"[:500]}
 
 
 def _utcnow() -> str:
@@ -102,6 +126,82 @@ class SourceGraphDaemon:
         self._last_success_at: str = ""
         self._started_at: str = ""
         self._build_completed = threading.Event()
+        configured_execution = os.environ.get(
+            BUILD_EXECUTION_ENV, BUILD_EXECUTION_SUBPROCESS
+        ).strip().lower()
+        self._build_execution = (
+            BUILD_EXECUTION_THREAD
+            if configured_execution == BUILD_EXECUTION_THREAD
+            else BUILD_EXECUTION_SUBPROCESS
+        )
+        self._process_lock = threading.Lock()
+        self._build_process: subprocess.Popen[str] | None = None
+
+    def _terminate_build_process(self) -> None:
+        with self._process_lock:
+            process = self._build_process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2.0)
+
+    def _run_build_subprocess(self, *, incremental: bool) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            "-m",
+            "aiworkhub.source_graph_daemon",
+            "--build-once",
+            str(self.repo_root),
+            "--incremental" if incremental else "--full",
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        with self._process_lock:
+            self._build_process = process
+        try:
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self._stop_event.is_set():
+                        self._terminate_build_process()
+                        stdout, stderr = process.communicate()
+                        return {"kind": "stopped"}
+            if process.returncode != 0:
+                detail = (stderr or stdout or f"exit_{process.returncode}").strip()
+                return {"kind": "error", "error": f"index_subprocess:{detail}"[:500]}
+            try:
+                payload = json.loads(stdout)
+            except (TypeError, json.JSONDecodeError):
+                return {"kind": "error", "error": "index_subprocess:invalid_result"}
+            if not isinstance(payload, dict) or payload.get("kind") not in {
+                "success", "standby", "error"
+            }:
+                return {"kind": "error", "error": "index_subprocess:invalid_contract"}
+            return payload
+        finally:
+            with self._process_lock:
+                if self._build_process is process:
+                    self._build_process = None
+
+    def _execute_build(self, *, incremental: bool) -> dict[str, Any]:
+        if self._build_execution == BUILD_EXECUTION_THREAD:
+            return _build_once_payload(self.repo_root, incremental=incremental)
+        try:
+            return self._run_build_subprocess(incremental=incremental)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"kind": "error", "error": f"index_subprocess:{type(exc).__name__}:{exc}"[:500]}
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -151,16 +251,32 @@ class SourceGraphDaemon:
                 # as degraded and retried, never escape the daemon thread and
                 # strand health at ``indexing`` with ``running=false``.
                 incremental = self._has_prior_build()
-                report = source_graph.build_index(self.repo_root, incremental=incremental)
+                outcome = self._execute_build(incremental=incremental)
+                kind = outcome.get("kind")
+                if kind == "standby":
+                    with self._state_lock:
+                        self._status = STATUS_STANDBY
+                        self._last_error = ""
+                        self._last_run_at = _utcnow()
+                    return True
+                if kind == "stopped":
+                    with self._state_lock:
+                        self._status = STATUS_STOPPED
+                        self._last_error = ""
+                        self._last_run_at = _utcnow()
+                    return True
+                if kind != "success":
+                    raise RuntimeError(str(outcome.get("error") or "index_build_failed"))
+                report = outcome["report"]
                 with self._state_lock:
                     # A successful SQLite transaction is not the same thing
                     # as a usable Source Graph.  Keep empty repositories
                     # truthful so code-task gates cannot mistake a zero-row
                     # database for an indexed project.
                     self._status = (
-                        STATUS_READY if report.files_seen > 0 else STATUS_EMPTY
+                        STATUS_READY if int(report.get("files_seen", 0)) > 0 else STATUS_EMPTY
                     )
-                    self._last_report = report.to_json()
+                    self._last_report = report
                     self._last_error = ""
                     self._last_run_at = _utcnow()
                     self._last_success_at = self._last_run_at
@@ -208,6 +324,7 @@ class SourceGraphDaemon:
 
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop_event.set()
+        self._terminate_build_process()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout)
@@ -413,3 +530,20 @@ __all__ = [
     "stop_all_daemons",
     "stop_daemon",
 ]
+
+
+def _main() -> int:
+    if len(sys.argv) != 4 or sys.argv[1] != "--build-once" or sys.argv[3] not in {
+        "--incremental", "--full"
+    }:
+        return 2
+    payload = _build_once_payload(
+        Path(sys.argv[2]), incremental=sys.argv[3] == "--incremental"
+    )
+    sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
