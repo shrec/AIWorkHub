@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-07-31
+
+### Changed
+
+- Set the canonical VS Code Marketplace publisher to `IvaneChkheidze`; release
+  qualification now fails if future extension manifests drift to another
+  publisher identity.
+
+### Documentation
+
+- Added English and Georgian launch articles, platform-specific publication
+  copy and a truth-preserving publishing checklist.
+
 ## [0.8.6] - 2026-07-31
 
 ### Added
