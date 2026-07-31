@@ -28,7 +28,8 @@ Order:
 4. manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state.
 5. manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search.
 6. manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related.
-7. execute exact card action and validation.
+7. manager uses aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled; workers never access Context Graph.
+8. execute exact card action and validation.
 Adaptive use:
 - Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.
 - Task MCP receipt is always required; Source Graph is required for code tasks.
@@ -45,6 +46,10 @@ Exact-command exception:
 Session Manager:
 - Recover current state before non-trivial assumptions and preserve the returned session identity in the handoff.
 - Never store secrets or fabricate session evidence.
+Manager Context Graph:
+- Manager-only when enabled: search for non-trivial continuation, compaction/handoff recovery or prior-conversation facts; use range/related only from returned evidence.
+- Workers never query or write Context Graph; durable context uses Session/AI Memory/KB write intents.
+- Disabled or zero-hit is not failure; no empty ceremonial calls.
 AI Memory:
 - After session recovery, issue one bounded task-specific query.
 - Reuse returned durable decisions/lessons.

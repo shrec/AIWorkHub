@@ -39,8 +39,19 @@ def repo(tmp_path: Path) -> Path:
     (root / "out").mkdir()
     (root / "read" / "input.txt").write_text("input-v1\n", encoding="utf-8")
     (root / "out" / "result.txt").write_text("result-v1\n", encoding="utf-8")
+    (root / "AGENTS.md").write_text("agents-v1\n", encoding="utf-8")
     (root / "parent-secret.txt").write_text("secret\n", encoding="utf-8")
-    assert _git(root, "add", "read/input.txt", "out/result.txt", "parent-secret.txt").returncode == 0
+    assert (
+        _git(
+            root,
+            "add",
+            "read/input.txt",
+            "out/result.txt",
+            "AGENTS.md",
+            "parent-secret.txt",
+        ).returncode
+        == 0
+    )
     assert _git(root, "commit", "-qm", "fixture").returncode == 0
     return root
 
@@ -198,6 +209,69 @@ print('landlock-denied-parent-git-and-metadata')
         assert parent_secret.read_text(encoding="utf-8") == "secret\n"
         assert stat.S_IMODE(parent_secret.stat().st_mode) == parent_mode
         assert (workspace.path / ".git").is_file()
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 3,
+    reason="Root-file replacement requires Landlock truncate support",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock workers",
+)
+def test_landlock_root_file_allows_in_place_save_but_denies_sibling_temp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "landlock-root-file",
+        {
+            "allowed_writes": ["AGENTS.md"],
+            "read_first": ["read/input.txt"],
+        },
+        "validation",
+    )
+    script = """
+from pathlib import Path
+Path('AGENTS.md').write_text('agents-v2\\n', encoding='utf-8')
+denied = 0
+for target in (Path('.AGENTS.md.editor-temp'), Path('.git')):
+    try:
+        target.write_text('forbidden\\n', encoding='utf-8')
+    except PermissionError:
+        denied += 1
+if denied != 2:
+    raise SystemExit(17)
+print('landlock-root-file-bounded')
+"""
+    argv = worker_workspace.sandbox_argv(
+        workspace,
+        "validation",
+        [sys.executable, "-c", script],
+        backend="landlock",
+    )
+    try:
+        result = subprocess.run(
+            argv,
+            cwd="/",
+            env=worker_workspace.sanitized_env("validation", home=workspace.home),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            shell=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "landlock-root-file-bounded" in result.stdout
+        assert (workspace.path / "AGENTS.md").read_text(encoding="utf-8") == "agents-v2\n"
+        assert not (workspace.path / ".AGENTS.md.editor-temp").exists()
+        assert (workspace.path / ".git").is_file()
+        assert worker_workspace.enforce_scope(workspace) == ["AGENTS.md"]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 

@@ -22,7 +22,8 @@ def test_canonical_order_is_exact_and_compact() -> None:
         "4. manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state.",
         "5. manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search.",
         "6. manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related.",
-        "7. execute exact card action and validation.",
+        "7. manager uses aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled; workers never access Context Graph.",
+        "8. execute exact card action and validation.",
     ]
     positions = [text.index(item) for item in expected]
     assert positions == sorted(positions)
@@ -62,6 +63,18 @@ def test_session_memory_kb_are_tool_use_only_and_zero_hit_is_bounded() -> None:
     assert "Do not query legacy memory files directly." in text
     assert "After a zero hit, do not repeat the query unless task scope changes." in text
     assert "authoritative project contracts/docs" in text
+
+
+def test_context_graph_is_manager_only_and_adaptive() -> None:
+    text = instr.render_canonical()
+    assert "Manager Context Graph:" in text
+    for tool_name in instr.MANAGER_CONTEXT_GRAPH_TOOL_NAMES:
+        assert tool_name in text
+    for trigger in ("non-trivial continuation", "compaction", "handoff", "prior-conversation"):
+        assert trigger in text
+    assert "Workers never query or write Context Graph" in text
+    assert "Disabled or zero-hit is not failure" in text
+    assert "no empty ceremonial calls" in text
 
 
 def test_three_provider_projections_derive_from_same_policy_and_stay_bounded() -> None:

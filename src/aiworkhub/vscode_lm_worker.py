@@ -47,12 +47,37 @@ def _matches(path: str, patterns: list[str]) -> bool:
 
 
 def _write_atomic(workspace: Path, relative: str, content: str) -> None:
-    target = (workspace / relative).resolve(strict=False)
+    workspace = workspace.resolve()
+    lexical_target = workspace / relative
+    cursor = workspace
+    for part in PurePosixPath(relative).parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise RuntimeError(f"bridge_output_symlink:{relative}")
+    target = lexical_target.resolve(strict=False)
     if target != workspace and workspace not in target.parents:
         raise RuntimeError(f"bridge_output_path_escape:{relative}")
-    if target.is_symlink():
-        raise RuntimeError(f"bridge_output_symlink:{relative}")
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Landlock intentionally does not grant repository-root directory mutation
+    # rights: doing so would also permit renaming or unlinking the detached
+    # worktree's ``.git`` metadata file.  A declared root file already has
+    # WRITE_FILE/TRUNCATE rights, so save it through a no-follow file descriptor
+    # instead of creating a sibling temporary file.  Nested outputs keep the
+    # atomic replacement path because their bounded parent directory is writable.
+    if target.parent == workspace:
+        flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, flags)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(fd)
+        return
+
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
         # ``mkstemp`` creates the file with owner-only permissions (0600).

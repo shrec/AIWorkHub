@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-CANONICAL_MAX_BYTES = 2600
-PROJECTION_MAX_BYTES = 3000
+CANONICAL_MAX_BYTES = 3000
+PROJECTION_MAX_BYTES = 3200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -30,6 +30,7 @@ class ToolPolicy:
     source_graph: tuple[str, ...]
     validation: tuple[str, ...]
     session: tuple[str, ...]
+    context_graph: tuple[str, ...]
     memory: tuple[str, ...]
     kb: tuple[str, ...]
     finish: str
@@ -44,6 +45,7 @@ POLICY = ToolPolicy(
         "manager uses aiworkhub_manager_session_current_state; worker uses aiworkhub_worker_session_current_state",
         "manager uses aiworkhub_manager_ai_memory_search; worker uses aiworkhub_worker_ai_memory_search",
         "manager uses aiworkhub_manager_kb_search/get/related; worker uses aiworkhub_worker_kb_search/get/related",
+        "manager uses aiworkhub_manager_context_graph_search, aiworkhub_manager_context_graph_range and aiworkhub_manager_context_graph_related when enabled; workers never access Context Graph",
         "execute exact card action and validation",
     ),
     adaptive=(
@@ -65,6 +67,11 @@ POLICY = ToolPolicy(
     session=(
         "Recover current state before non-trivial assumptions and preserve the returned session identity in the handoff.",
         "Never store secrets or fabricate session evidence.",
+    ),
+    context_graph=(
+        "Manager-only when enabled: search for non-trivial continuation, compaction/handoff recovery or prior-conversation facts; use range/related only from returned evidence.",
+        "Workers never query or write Context Graph; durable context uses Session/AI Memory/KB write intents.",
+        "Disabled or zero-hit is not failure; no empty ceremonial calls.",
     ),
     memory=(
         "After session recovery, issue one bounded task-specific query.",
@@ -101,6 +108,12 @@ WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_quality_review_submit",
 )
 
+MANAGER_CONTEXT_GRAPH_TOOL_NAMES: tuple[str, ...] = (
+    "aiworkhub_manager_context_graph_search",
+    "aiworkhub_manager_context_graph_range",
+    "aiworkhub_manager_context_graph_related",
+)
+
 
 def _lines(policy: ToolPolicy = POLICY) -> list[str]:
     return [
@@ -115,6 +128,8 @@ def _lines(policy: ToolPolicy = POLICY) -> list[str]:
         *[f"- {item}" for item in policy.validation],
         "Session Manager:",
         *[f"- {item}" for item in policy.session],
+        "Manager Context Graph:",
+        *[f"- {item}" for item in policy.context_graph],
         "AI Memory:",
         *[f"- {item}" for item in policy.memory],
         "KB:",
@@ -217,6 +232,7 @@ def diff_projection(provider: Provider, owner_text: str, policy: ToolPolicy = PO
 __all__ = [
     "CANONICAL_MAX_BYTES",
     "END",
+    "MANAGER_CONTEXT_GRAPH_TOOL_NAMES",
     "POLICY",
     "PROJECTION_MAX_BYTES",
     "PROVIDERS",

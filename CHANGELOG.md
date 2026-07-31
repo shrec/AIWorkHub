@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-07-31
+
+### Added
+
+- Generated manager instructions now bind the repository Context Graph's
+  bounded search, range and related-evidence tools into the normal manager
+  workflow while keeping workers outside the manager transcript graph.
+
+### Fixed
+
+- VS Code Language Model workers can now update an explicitly allowed
+  repository-root file under Landlock without requesting broad write access to
+  the repository root. Nested outputs retain atomic replacement and `.git`
+  metadata remains protected.
+- Tightened output-path symlink checks before model edits are materialized.
+- Corrected the public acknowledgement so AIWorkHub's original Context Graph
+  concept is not attributed to another project.
+
 ## [0.8.4] - 2026-07-31
 
 ### Added

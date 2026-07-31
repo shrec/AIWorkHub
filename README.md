@@ -164,9 +164,10 @@ Start with [Getting Started](docs/GETTING_STARTED.md), then use the
 
 Thanks to [null0xxx](https://github.com/null0xxx) for sharing
 [kimi-atlas](https://github.com/null0xxx/kimi-atlas) and its thoughtful ideas
-around multi-agent orchestration, ContextGraph, deterministic quality gates and
+around multi-agent orchestration, deterministic quality gates and
 evidence-driven verification. Those ideas helped inform parts of AIWorkHub's
-design exploration; AIWorkHub remains an independent project with no official
+design exploration. AIWorkHub's repository Context Graph is an original
+AIWorkHub concept; AIWorkHub remains an independent project with no official
 affiliation or endorsement implied.
 
 AIWorkHub is open source under the [MIT License](LICENSE).
