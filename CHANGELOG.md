@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-07-31
+
+### Added
+
+- Added public documentation for the distinct Source Graph and manager-only
+  Context Graph authorities, including capture scope, retrieval operations,
+  privacy boundaries, relationships to Session/Memory/KB and measurable
+  recovery outcomes.
+
+### Fixed
+
+- Packaged stdlib MCP schemas now emit an `items` contract for every array,
+  including the `aiworkhub_agent_accept_review` reviewer fields required by
+  Copilot's MCP validator.
+- Rebuilt the public workflow GIF from five complete opaque frames, removing
+  the corrupt/missing-frame sequence that flashed black on GitHub.
+
 ## [0.8.5] - 2026-07-31
 
 ### Added
@@ -21,8 +38,8 @@ noted by package/extension version and release tag.
   the repository root. Nested outputs retain atomic replacement and `.git`
   metadata remains protected.
 - Tightened output-path symlink checks before model edits are materialized.
-- Corrected the public acknowledgement so AIWorkHub's original Context Graph
-  concept is not attributed to another project.
+- Corrected the public acknowledgement so Context Graph is not attributed to
+  another project.
 
 ## [0.8.4] - 2026-07-31
 

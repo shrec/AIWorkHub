@@ -63,3 +63,13 @@ def test_worker_mcp_starts_without_optional_mcp_package(tmp_path: Path) -> None:
     source_schema = tools["aiworkhub_worker_source_graph_query"]["inputSchema"]
     assert source_schema["properties"]["budget"]["type"] == "integer"
     assert source_schema["properties"]["target"]["type"] == "string"
+    for tool in tools.values():
+        stack = [tool["inputSchema"]]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                if value.get("type") == "array":
+                    assert "items" in value
+                stack.extend(value.values())
+            elif isinstance(value, list):
+                stack.extend(value)

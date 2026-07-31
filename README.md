@@ -54,6 +54,32 @@ are installed, authorized and launchable before a task is claimed.
 - **Use multiple models.** Route work by capability, readiness, cost and
   observed quality without moving project authority into a hosted service.
 
+## Source intelligence and durable context
+
+AIWorkHub has two graphs with different authority. They are complementary,
+not alternate names for the same feature.
+
+| Surface | What it represents | Who uses it |
+| --- | --- | --- |
+| **Source Graph** | An automatically refreshed structural index of repository code, used to return bounded code context instead of repeatedly scanning the tree | Managers and workers |
+| **Manager Context Graph** | An opt-in, append-only ledger and deterministic graph of manager conversation evidence across repository, thread, session and task identities | Verified managers only |
+
+The Manager Context Graph can search an earlier decision, recover the exact
+bounded transcript range around it and follow deterministic relations to its
+thread, session or task. It does not replace Session Manager (current state and
+handoffs), AI Memory (durable lessons), KB (curated project knowledge), or the
+Source Graph (code intelligence). Current passive capture supports completed
+Codex user/assistant messages; reasoning, streaming deltas, tool output,
+commands and approvals are excluded. Claude and Copilot capture adapters are
+not yet claimed as shipped.
+
+AIWorkHub reports context evidence rather than making an unverifiable savings
+claim: requested/delivered bytes, acknowledged tool receipts, truncation and
+degraded reasons remain distinguishable. See the
+[Manager Context Graph](docs/CONTEXT_GRAPH.md) and
+[Source Graph economics](docs/PRODUCT_ROADMAP.md#p1--source-graph-economics-and-enforcement-080)
+contract.
+
 ## How it works
 
 ```mermaid
@@ -183,6 +209,7 @@ npm --prefix vscode-extension test
 
 Start with [Getting Started](docs/GETTING_STARTED.md), then use the
 [Architecture](docs/ARCHITECTURE.md), [Product Roadmap](docs/PRODUCT_ROADMAP.md),
+[Manager Context Graph](docs/CONTEXT_GRAPH.md),
 [Publishing Guide](docs/PUBLISHING.md), [Brand Guide](docs/BRAND.md) and
 [Contributing Guide](CONTRIBUTING.md).
 

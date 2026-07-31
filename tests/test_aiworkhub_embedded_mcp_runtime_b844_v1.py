@@ -175,10 +175,38 @@ def test_stdlib_fallback_engages_and_registers_canonical_dashboard_tools(fallbac
 
 def test_stdlib_fallback_schema_generation_covers_every_registered_tool(fallback_server_module):
     server_module = fallback_server_module
+
+    def assert_array_items(fragment):
+        if isinstance(fragment, dict):
+            if fragment.get("type") == "array":
+                assert "items" in fragment
+            for value in fragment.values():
+                assert_array_items(value)
+        elif isinstance(fragment, list):
+            for value in fragment:
+                assert_array_items(value)
+
     for name, func in server_module.mcp._tools.items():
         schema = server_module._stdio_schema_for(func)
         assert schema["type"] == "object"
         assert isinstance(schema["properties"], dict)
+        assert_array_items(schema)
+
+
+def test_stdlib_fallback_accept_review_arrays_have_copilot_compatible_items(
+    fallback_server_module,
+):
+    server_module = fallback_server_module
+    func = server_module.mcp._tools["aiworkhub_agent_accept_review"]
+    properties = server_module._stdio_schema_for(func)["properties"]
+    assert properties["risk_signals"] == {"type": "array", "items": {"type": "string"}}
+    assert properties["reviewer_request_ids"] == {
+        "type": "array", "items": {"type": "string"},
+    }
+    assert properties["reviewer_reports"] == {
+        "type": "array",
+        "items": {"type": "object", "additionalProperties": {}},
+    }
 
 
 def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_module):

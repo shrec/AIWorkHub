@@ -57,6 +57,8 @@ def _json_schema_for_annotation(annotation: Any) -> dict[str, Any]:
     string makes agents guess accepted operation names and waste tool calls.
     """
 
+    if annotation is Any:
+        return {}
     origin = typing.get_origin(annotation)
     if origin is typing.Literal:
         values = list(typing.get_args(annotation))
@@ -68,6 +70,20 @@ def _json_schema_for_annotation(annotation: Any) -> dict[str, Any]:
         args = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
         if len(args) == 1:
             return _json_schema_for_annotation(args[0])
+    if origin in (list, tuple) or annotation in (list, tuple):
+        args = typing.get_args(annotation)
+        item_annotation = args[0] if args else Any
+        return {
+            "type": "array",
+            "items": _json_schema_for_annotation(item_annotation),
+        }
+    if origin is dict or annotation is dict:
+        args = typing.get_args(annotation)
+        value_annotation = args[1] if len(args) == 2 else Any
+        return {
+            "type": "object",
+            "additionalProperties": _json_schema_for_annotation(value_annotation),
+        }
     return {"type": _json_type(annotation)}
 
 
