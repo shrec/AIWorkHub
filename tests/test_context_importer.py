@@ -69,6 +69,23 @@ def _canonical(repo: Path, component: str) -> Path:
     return storage_registry.resolve_database_path(registry, db_id)
 
 
+def _replace_with_rich_transcript_schema(repo: Path) -> None:
+    con = sqlite3.connect(_canonical(repo, "session"))
+    try:
+        con.executescript(
+            "DROP TABLE documents_fts; DROP TABLE documents;"
+            "CREATE TABLE documents("
+            "doc_id INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,"
+            "source_id TEXT NOT NULL,session_id INTEGER,timestamp TEXT,kind TEXT,"
+            "speaker TEXT,content TEXT NOT NULL,tags TEXT);"
+            "CREATE VIRTUAL TABLE documents_fts USING fts5("
+            "content,kind,tags,content='documents',content_rowid='doc_id');"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 @pytest.mark.parametrize("component", ["session", "memory", "kb"])
 def test_explicit_context_import_dry_apply_idempotent_and_rollback(tmp_path, component):
     repo = _repo(tmp_path)
@@ -162,6 +179,33 @@ def test_context_import_reports_conflict_without_overwrite(tmp_path):
     con = sqlite3.connect(canonical)
     try:
         assert con.execute("SELECT value FROM memories WHERE key='one'").fetchone()[0] == "canonical"
+    finally:
+        con.close()
+
+
+def test_session_import_supports_adopted_rich_transcript_schema(tmp_path):
+    repo = _repo(tmp_path)
+    _replace_with_rich_transcript_schema(repo)
+    source = _legacy(repo, "session")
+    applied = context_importer.import_context(
+        repo,
+        component="session",
+        operation="apply",
+        source_path=str(source.relative_to(repo)),
+        idempotency_key="context-import:session:rich:0001",
+        actor_id="manager-thread",
+        provider="codex",
+        provenance="rich transcript compatibility regression",
+    )
+    assert applied["inserted"] == 2
+    con = sqlite3.connect(_canonical(repo, "session"))
+    try:
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents WHERE source='legacy_import' AND speaker='legacy'"
+        ).fetchone()[0] == 2
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'first'"
+        ).fetchone()[0] == 1
     finally:
         con.close()
 

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import repository_state, storage_registry
+from . import repository_state, storage_registry, transcript_store
 
 
 Component = Literal["session", "memory", "kb"]
@@ -166,12 +166,16 @@ def _plan(con: sqlite3.Connection, component: str, rows: list[dict[str, str]]) -
 
 def _insert(con: sqlite3.Connection, component: str, row: dict[str, str]) -> tuple[int, str]:
     if component == "session":
-        cur = con.execute(
-            "INSERT INTO documents(source_id,timestamp,kind,content) VALUES(?,?,?,?)",
-            (row["source_id"], row["timestamp"], row["kind"], row["content"]),
+        entity_id = transcript_store.insert_document(
+            con,
+            source_id=row["source_id"],
+            timestamp=row["timestamp"],
+            kind=row["kind"],
+            content=row["content"],
+            source="legacy_import",
+            speaker="legacy",
+            tags="legacy_import",
         )
-        entity_id = int(cur.lastrowid)
-        con.execute("INSERT INTO documents_fts(rowid,content) VALUES(?,?)", (entity_id, row["content"]))
         return entity_id, f"document:{entity_id}"
     if component == "memory":
         cur = con.execute(
@@ -238,7 +242,10 @@ def _rollback(
             raise ContextImportError(f"rollback_entity_changed:{entity_id}")
     for item in items:
         entity_id = int(item["entity_id"])
-        con.execute(f"DELETE FROM {fts} WHERE rowid=?", (entity_id,))
+        if component == "session":
+            transcript_store.delete_document_index(con, entity_id)
+        else:
+            con.execute(f"DELETE FROM {fts} WHERE rowid=?", (entity_id,))
         con.execute(f"DELETE FROM {table} WHERE {id_col}=?", (entity_id,))
         con.execute(
             "DELETE FROM context_entity_state WHERE entity_type=? AND entity_id=?",

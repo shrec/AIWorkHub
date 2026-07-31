@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import context_graph, feature_settings, storage_registry
+from . import context_graph, feature_settings, storage_registry, transcript_store
 
 
 SessionAction = Literal["start", "event", "checkpoint", "state", "handoff", "close"]
@@ -136,12 +136,16 @@ def session_write(
             return _idempotent(prior)
         timestamp = datetime.now(timezone.utc).isoformat()
         source_id = f"{identity['role']}:{identity['provider']}:{identity['session_id']}:{topic}"
-        cur = con.execute(
-            "INSERT INTO documents(source_id,timestamp,kind,content) VALUES(?,?,?,?)",
-            (source_id, timestamp, action, content),
+        doc_id = transcript_store.insert_document(
+            con,
+            source_id=source_id,
+            timestamp=timestamp,
+            kind=action,
+            content=content,
+            source="aiworkhub",
+            speaker=identity["role"],
+            tags=topic,
         )
-        doc_id = int(cur.lastrowid)
-        con.execute("INSERT INTO documents_fts(rowid,content) VALUES(?,?)", (doc_id, content))
         if manager_graph_capture:
             registry = storage_registry.load_storage_registry(repo)
             context_graph.append_session_document_in_transaction(

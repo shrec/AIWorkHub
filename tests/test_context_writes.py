@@ -25,6 +25,27 @@ def _actor() -> dict[str, str]:
     }
 
 
+def _replace_with_rich_transcript_schema(repo: Path) -> Path:
+    db = storage_registry.resolve_database_path(
+        storage_registry.load_storage_registry(repo), "transcript"
+    )
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(
+            "DROP TABLE documents_fts; DROP TABLE documents;"
+            "CREATE TABLE documents("
+            "doc_id INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,"
+            "source_id TEXT NOT NULL,session_id INTEGER,timestamp TEXT,kind TEXT,"
+            "speaker TEXT,content TEXT NOT NULL,tags TEXT);"
+            "CREATE VIRTUAL TABLE documents_fts USING fts5("
+            "content,kind,tags,content='documents',content_rowid='doc_id');"
+        )
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
 def test_session_write_is_canonical_audited_and_idempotent(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     kwargs = dict(
@@ -41,6 +62,32 @@ def test_session_write_is_canonical_audited_and_idempotent(tmp_path: Path) -> No
     try:
         assert con.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
         assert con.execute("SELECT COUNT(*) FROM context_mutations").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_session_write_supports_adopted_rich_transcript_schema(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = _replace_with_rich_transcript_schema(repo)
+    result = context_writes.session_write(
+        repo,
+        actor=_actor(),
+        action="event",
+        topic="legacy-compatible",
+        content="indexed rich transcript",
+        idempotency_key="session:test:rich:0001",
+        provenance="schema compatibility regression",
+    )
+    assert result["ok"]
+    con = sqlite3.connect(db)
+    try:
+        assert con.execute(
+            "SELECT source,speaker,tags FROM documents WHERE doc_id=?",
+            (result["document_id"],),
+        ).fetchone() == ("aiworkhub", "manager", "legacy-compatible")
+        assert con.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'indexed'"
+        ).fetchone()[0] == 1
     finally:
         con.close()
 

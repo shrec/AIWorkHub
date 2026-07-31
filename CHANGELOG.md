@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-07-31
+
+### Fixed
+
+- Restored canonical Session Manager writes and explicit session imports for
+  repositories that adopted the richer legacy transcript schema. The shared
+  adapter now supplies provenance fields and updates either standalone or
+  external-content FTS indexes without replacing historical databases.
+- Added regression coverage for both fresh minimal transcript stores and
+  migrated rich transcript stores, including audited writes, imports, search
+  indexing and rollback-compatible entity ownership.
+
 ## [0.8.10] - 2026-07-31
 
 ### Fixed
