@@ -54,6 +54,12 @@ The MCP server uses stdio only. Writes and process launches are independently
 disabled by default. Credentials stay outside the repository, callback events
 are durable and repository state remains local.
 
+<div align="center">
+  <img src="docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub dashboard orchestrating AIWorkHub development" width="100%">
+  <br>
+  <em>AIWorkHub orchestrating its own development with repository-scoped context, tasks and review callbacks.</em>
+</div>
+
 ## Install the VS Code extension
 
 Download the VSIX from the latest
@@ -153,5 +159,14 @@ Start with [Getting Started](docs/GETTING_STARTED.md), then use the
 [Architecture](docs/ARCHITECTURE.md), [Product Roadmap](docs/PRODUCT_ROADMAP.md),
 [Publishing Guide](docs/PUBLISHING.md), [Brand Guide](docs/BRAND.md) and
 [Contributing Guide](CONTRIBUTING.md).
+
+## Acknowledgements
+
+Thanks to [null0xxx](https://github.com/null0xxx) for sharing
+[kimi-atlas](https://github.com/null0xxx/kimi-atlas) and its thoughtful ideas
+around multi-agent orchestration, ContextGraph, deterministic quality gates and
+evidence-driven verification. Those ideas helped inform parts of AIWorkHub's
+design exploration; AIWorkHub remains an independent project with no official
+affiliation or endorsement implied.
 
 AIWorkHub is open source under the [MIT License](LICENSE).
