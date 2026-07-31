@@ -60,6 +60,16 @@ do not override this current priority ledger.
 
 ### P1 — Context economy and orchestration UX
 
+- [x] Add an opt-in repository-local Context Graph foundation: append-only
+      conversation ledger, deterministic rebuildable projection, exact bounded
+      transcript-range recovery, related-node retrieval, manager MCP tools and
+      atomic Session Manager capture. Repository initialization provisions the
+      schema but capture remains default-off until the user enables it.
+- [ ] Add supported-provider transcript adapters so complete Codex/Claude/
+      Copilot chat events can be captured automatically without asking the
+      manager model to rewrite its own conversation. Adapters must be
+      repository/thread bound, consented, replay-safe and must never scrape a
+      foreign extension's private storage.
 - [x] Source Graph language-complete first indexing (including PHP), automatic
       InitRepo indexing, bounded incremental file-change/periodic refresh,
       configurable generated/vendor/archive ignore rules and stale-index health.

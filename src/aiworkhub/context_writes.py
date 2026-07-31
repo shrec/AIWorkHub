@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from . import storage_registry
+from . import context_graph, feature_settings, storage_registry
 
 
 SessionAction = Literal["start", "event", "checkpoint", "state", "handoff", "close"]
@@ -122,6 +122,9 @@ def session_write(
     topic = _bounded(topic, field="topic", max_bytes=256)
     content = _bounded(content, field="content", max_bytes=MAX_CONTENT_BYTES)
     provenance = _bounded(provenance, field="provenance", max_bytes=MAX_PROVENANCE_BYTES)
+    context_graph_enabled = feature_settings.enabled(repo, "context_graph")
+    if context_graph_enabled:
+        context_graph.ensure_schema(repo)
     con = _open(repo, "transcript")
     try:
         prior = _begin(con, idempotency_key=idempotency_key)
@@ -136,6 +139,22 @@ def session_write(
         )
         doc_id = int(cur.lastrowid)
         con.execute("INSERT INTO documents_fts(rowid,content) VALUES(?,?)", (doc_id, content))
+        if context_graph_enabled:
+            registry = storage_registry.load_storage_registry(repo)
+            context_graph.append_session_document_in_transaction(
+                con,
+                repo_id=registry.repo.manifest.repo_id,
+                thread_id=identity["session_id"],
+                session_id=identity["session_id"],
+                provider=identity["provider"],
+                role=identity["role"],
+                action=action,
+                topic=topic,
+                content=content,
+                document_id=doc_id,
+                task_id=identity["task_id"],
+                occurred_at=timestamp,
+            )
         _record(
             con, idempotency_key=idempotency_key, component="session", action=action,
             entity_key=f"document:{doc_id}", actor=identity, provenance=provenance,

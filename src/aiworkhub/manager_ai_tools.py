@@ -15,6 +15,7 @@ from typing import Any, Callable
 from . import core
 from . import context_writes
 from . import context_importer
+from . import context_graph
 from . import feature_settings
 from . import storage_registry
 from . import workforce_catalog
@@ -129,6 +130,88 @@ def kb_get(*, key: str) -> dict[str, Any]:
 
 def kb_related(*, key: str) -> dict[str, Any]:
     return _invoke(lambda ctx: worker_tools.kb_related(ctx, key=key))
+
+
+def context_graph_search(*, query: str, limit: int = 12) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is None:
+        return manager
+    try:
+        result = context_graph.search(context.authority_repo, query, limit=limit)
+    except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    return {**result, "manager": manager, "surface": "manager_mcp"}
+
+
+def context_graph_range(
+    *, thread_id: str, around_event_id: int, before: int = 5, after: int = 5,
+) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is None:
+        return manager
+    try:
+        result = context_graph.get_range(
+            context.authority_repo,
+            thread_id=thread_id,
+            around_event_id=around_event_id,
+            before=before,
+            after=after,
+        )
+    except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    return {**result, "manager": manager, "surface": "manager_mcp"}
+
+
+def context_graph_related(*, node_id: str, limit: int = 20) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is None:
+        return manager
+    try:
+        result = context_graph.related(context.authority_repo, node_id=node_id, limit=limit)
+    except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    return {**result, "manager": manager, "surface": "manager_mcp"}
+
+
+def context_graph_event_write(
+    *, role: str, event_type: str, content: str, source_ref: str,
+    idempotency_key: str, task_id: str = "", metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is None:
+        return manager
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "manager": manager, "surface": "manager_mcp"}
+    try:
+        result = context_graph.append_event(
+            context.authority_repo,
+            thread_id=manager["session_id"],
+            session_id=manager["session_id"],
+            provider=manager["provider"],
+            role=role,
+            event_type=event_type,
+            content=content,
+            source_ref=source_ref,
+            idempotency_key=idempotency_key,
+            task_id=task_id,
+            metadata=metadata,
+        )
+    except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    return {**result, "manager": manager, "surface": "manager_mcp"}
+
+
+def context_graph_rebuild() -> dict[str, Any]:
+    context, manager = _manager_context()
+    if context is None:
+        return manager
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed", "manager": manager, "surface": "manager_mcp"}
+    try:
+        result = context_graph.rebuild_projection(context.authority_repo)
+    except (context_graph.ContextGraphError, OSError, sqlite3.Error) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    return {**result, "manager": manager, "surface": "manager_mcp"}
 
 
 def _workforce_process_rows(repo: Path) -> list[dict[str, Any]]:
@@ -283,6 +366,11 @@ __all__ = [
     "ai_memory_related",
     "ai_memory_search",
     "ai_memory_write",
+    "context_graph_event_write",
+    "context_graph_range",
+    "context_graph_rebuild",
+    "context_graph_related",
+    "context_graph_search",
     "context_import",
     "kb_get",
     "kb_related",

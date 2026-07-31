@@ -350,6 +350,61 @@ def aiworkhub_manager_kb_related(key: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def aiworkhub_manager_context_graph_search(query: str, limit: int = 12) -> dict[str, Any]:
+    """MANAGER READ: search exact transcript-backed Context Graph evidence."""
+
+    return manager_ai_tools.context_graph_search(query=query, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_context_graph_range(
+    thread_id: str, around_event_id: int, before: int = 5, after: int = 5,
+) -> dict[str, Any]:
+    """MANAGER READ: retrieve an exact bounded transcript range around one event."""
+
+    return manager_ai_tools.context_graph_range(
+        thread_id=thread_id, around_event_id=around_event_id, before=before, after=after,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_context_graph_related(node_id: str, limit: int = 20) -> dict[str, Any]:
+    """MANAGER READ: retrieve bounded deterministic relations for one graph node."""
+
+    return manager_ai_tools.context_graph_related(node_id=node_id, limit=limit)
+
+
+@mcp.tool()
+def aiworkhub_manager_context_graph_event_write(
+    role: str,
+    event_type: str,
+    content: str,
+    source_ref: str,
+    idempotency_key: str,
+    task_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """MANAGER WRITE: append one exact current-thread conversation event."""
+
+    return manager_ai_tools.context_graph_event_write(
+        role=role,
+        event_type=event_type,
+        content=content,
+        source_ref=source_ref,
+        idempotency_key=idempotency_key,
+        task_id=task_id,
+        metadata=metadata,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_context_graph_rebuild() -> dict[str, Any]:
+    """MANAGER WRITE: rebuild derived graph state from the immutable ledger."""
+
+    return manager_ai_tools.context_graph_rebuild()
+
+
+@mcp.tool()
 def aiworkhub_manager_workforce_catalog() -> dict[str, Any]:
     """MANAGER READ: configured models joined to observed canonical outcomes."""
 

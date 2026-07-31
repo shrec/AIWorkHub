@@ -22,6 +22,7 @@ from typing import Any, Mapping
 from aiworkhub import (
     __version__,
     core,
+    context_graph,
     dashboard,
     feature_settings,
     process_launcher,
@@ -125,8 +126,15 @@ def _storage_write_authority_flags() -> dict[str, bool]:
 def settings_view() -> dict[str, Any]:
     """READ-ONLY: repository-local feature switches and capabilities."""
     try:
-        result = feature_settings.load(core.repo_root())
-    except feature_settings.FeatureSettingsError as exc:
+        root = core.repo_root()
+        result = feature_settings.load(root)
+        result["context_graph_runtime"] = context_graph.status(root)
+    except (
+        context_graph.ContextGraphError,
+        feature_settings.FeatureSettingsError,
+        OSError,
+        sqlite3.Error,
+    ) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     result["server_tool"] = "aiworkhub_dashboard_settings"
     result["authority_flags"] = _readonly_authority_flags()
@@ -149,7 +157,15 @@ def settings_update_view(changes: dict[str, bool], expected_revision: int) -> di
                 else core.source_graph_stop()
             )
             result["source_graph_lifecycle"] = lifecycle
-    except (feature_settings.FeatureSettingsError, OSError, ValueError) as exc:
+        if changes.get("context_graph") is True:
+            result["context_graph_runtime"] = context_graph.ensure_schema(root)
+    except (
+        context_graph.ContextGraphError,
+        feature_settings.FeatureSettingsError,
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     result["server_tool"] = "aiworkhub_dashboard_settings_update"
     result["authority_flags"] = _storage_write_authority_flags()

@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-31
+
+### Added
+
+- Added an opt-in, append-only repository conversation ledger in the canonical
+  transcript database with deterministic Context Graph nodes and relations.
+- Added bounded manager MCP operations for Context Graph search, exact
+  transcript ranges, related-node retrieval, event ingestion and projection
+  rebuild.
+- Canonical Session Manager writes now feed the Context Graph atomically when
+  the repository feature is enabled.
+- Settings now reports exact repository-local Context Graph event, node and
+  edge counts.
+
+### Changed
+
+- Context Graph is now a real repository runtime behind the existing
+  revision-guarded feature switch instead of a dormant configuration entry.
+- Fresh repository initialization provisions the rebuildable Context Graph
+  schema without enabling transcript capture by default.
+
 ## [0.8.1] - 2026-07-30
 
 ### Added

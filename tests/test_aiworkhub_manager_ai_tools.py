@@ -9,7 +9,14 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from aiworkhub import core, manager_ai_tools, server, shared_router, task_store  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    core,
+    feature_settings,
+    manager_ai_tools,
+    server,
+    shared_router,
+    task_store,
+)
 
 
 def _manager_route(root: Path) -> dict:
@@ -115,6 +122,11 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_manager_context_write_intents",
         "aiworkhub_manager_context_write_intent_dispose",
         "aiworkhub_manager_context_import",
+        "aiworkhub_manager_context_graph_search",
+        "aiworkhub_manager_context_graph_range",
+        "aiworkhub_manager_context_graph_related",
+        "aiworkhub_manager_context_graph_event_write",
+        "aiworkhub_manager_context_graph_rebuild",
         "aiworkhub_manager_workforce_catalog",
         "aiworkhub_manager_workforce_rank",
         "aiworkhub_manager_workforce_upsert",
@@ -123,6 +135,43 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_repo_switch",
     ):
         assert callable(getattr(server, name))
+
+
+def test_manager_context_graph_is_repo_bound_and_write_gated(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    feature_settings.update(
+        root,
+        changes={"context_graph": True},
+        expected_revision=0,
+    )
+    monkeypatch.setattr(core, "manager_bootstrap", lambda: _manager_route(root))
+    monkeypatch.setattr(core, "writes_allowed", lambda: False)
+    denied = manager_ai_tools.context_graph_event_write(
+        role="manager",
+        event_type="checkpoint",
+        content="not written",
+        source_ref="test:denied",
+        idempotency_key="context-manager-denied-0001",
+    )
+    assert denied["error"] == "write_gate_closed"
+
+    monkeypatch.setattr(core, "writes_allowed", lambda: True)
+    written = manager_ai_tools.context_graph_event_write(
+        role="manager",
+        event_type="checkpoint",
+        content="manager context graph evidence",
+        source_ref="test:allowed",
+        idempotency_key="context-manager-allowed-0001",
+        task_id="TASK-1",
+    )
+    found = manager_ai_tools.context_graph_search(query="graph evidence")
+
+    assert written["ok"] is True
+    assert written["manager"]["repo"] == str(root)
+    assert found["count"] == 1
+    assert found["results"][0]["task_id"] == "TASK-1"
 
 
 def test_manager_workforce_reads_only_authority_repo_process_log(tmp_path, monkeypatch):

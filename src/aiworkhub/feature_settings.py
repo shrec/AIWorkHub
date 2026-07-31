@@ -31,9 +31,8 @@ DEFAULT_FEATURES: dict[str, bool] = {
     "session_manager": True,
     "ai_memory": True,
     "knowledge_base": True,
-    # The transcript-backed Context Graph runtime is introduced separately.
-    # Persist the opt-in now without claiming that an unavailable runtime is
-    # active.
+    # Transcript capture remains an explicit repository opt-in even though
+    # the runtime is available.
     "context_graph": False,
 }
 
@@ -55,7 +54,7 @@ def _public_payload(*, features: Mapping[str, bool], revision: int, configured: 
         "configured": configured,
         "features": {key: bool(features[key]) for key in FEATURE_KEYS},
         "capabilities": {
-            "context_graph_runtime": False,
+            "context_graph_runtime": True,
             "task_orchestration_locked_on": True,
             "callback_routing_locked_on": True,
         },

@@ -2629,7 +2629,7 @@ const FEATURE_LABELS = Object.freeze({
   session_manager: ["Session Manager", "Preserves checkpoints and active development continuity."],
   ai_memory: ["AI Memory", "Stores and retrieves durable project lessons and decisions."],
   knowledge_base: ["Knowledge Base", "Provides authoritative repository facts and contracts."],
-  context_graph: ["Context Graph", "Transcript-linked operational graph. The switch is ready; runtime support is the next milestone."],
+  context_graph: ["Context Graph", "Append-only conversation ledger with deterministic graph projection and bounded retrieval."],
 });
 
 function renderSettings(payload) {
@@ -2653,7 +2653,12 @@ function renderSettings(payload) {
     const title = document.createElement("strong");
     title.textContent = label;
     const detail = document.createElement("small");
-    detail.textContent = description;
+    if (key === "context_graph" && payload.context_graph_runtime?.ok === true) {
+      const runtime = payload.context_graph_runtime;
+      detail.textContent = `${description} ${Number(runtime.events || 0)} events · ${Number(runtime.nodes || 0)} nodes · ${Number(runtime.edges || 0)} edges.`;
+    } else {
+      detail.textContent = description;
+    }
     copy.append(title, detail);
     const control = document.createElement("span");
     control.className = "switch-control";

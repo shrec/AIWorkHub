@@ -37,6 +37,10 @@ AIWorkHub telemetry.
   preflight and evidence-backed adaptive workforce scoring.
 - Canonical manager/worker Session Manager, AI Memory and KB read/write
   surfaces with provenance, idempotency and audited soft lifecycle operations.
+- Opt-in canonical Context Graph foundation: append-only conversation events,
+  deterministic rebuildable repository/thread/session/task relations, bounded
+  search and exact transcript-range recovery. Session Manager writes are
+  captured atomically when enabled.
 - Storage observability, bounded system logs, and local dashboard views for
   task operations and context systems.
 - Safe repository worktree, terminal-run and extension-runtime retention with
@@ -68,6 +72,10 @@ AIWorkHub telemetry.
 - Codex push callbacks currently include an optional compatibility adapter over
   a non-public App Server boundary. Manager inbox remains the portable fallback;
   each supported Codex release needs a compatibility qualification matrix.
+- Context Graph does not yet claim complete external-chat capture. The
+  repository ledger/projection/retrieval runtime is shipped; supported,
+  consented Codex/Claude/Copilot transcript adapters remain an explicit
+  follow-up and must not depend on scraping private plugin storage.
 
 ## P0 — Stable multi-repository product (0.7.9)
 

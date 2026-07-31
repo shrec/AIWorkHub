@@ -307,10 +307,13 @@ def _initialize_auxiliary_schema(db_id: str, path: Path) -> None:
             from . import source_graph
             conn.executescript(source_graph.SCHEMA)
         elif db_id == "transcript":
+            from . import context_graph
+
             conn.executescript(
                 "CREATE TABLE IF NOT EXISTS documents(doc_id INTEGER PRIMARY KEY,source_id TEXT,timestamp TEXT,kind TEXT,content TEXT);"
                 "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(content);"
             )
+            conn.executescript(context_graph.SCHEMA)
         elif db_id == "memory":
             conn.executescript(
                 "CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"

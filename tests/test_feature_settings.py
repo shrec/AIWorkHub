@@ -91,8 +91,13 @@ def test_dashboard_update_stops_and_restarts_source_graph(
     )
     assert disabled["ok"] is True
     assert disabled["features"]["context_graph"] is True
+    assert disabled["context_graph_runtime"]["ready"] is True
     assert disabled["source_graph_lifecycle"]["stopped"] is True
     assert core.source_graph_health()["status"] == "disabled"
+
+    loaded = dashboard_mcp_app.settings_view()
+    assert loaded["context_graph_runtime"]["ready"] is True
+    assert loaded["context_graph_runtime"]["events"] == 0
 
     enabled = dashboard_mcp_app.settings_update_view({"source_graph": True}, 1)
     assert enabled["ok"] is True
