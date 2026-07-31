@@ -24,6 +24,7 @@ from aiworkhub import (
     core,
     repository_bootstrap,
     source_graph,
+    source_graph_daemon,
     task_engine,
     task_store,
 )
@@ -160,9 +161,19 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     # zero-file regression, not optional coverage).
     (repo_a / "app.py").write_text("def python_probe():\n    return 1\n", encoding="utf-8")
     (repo_a / "app.php").write_text("<?php function php_probe() { return 1; }\n", encoding="utf-8")
-    indexed = source_graph.build_index(repo_a, incremental=True)
-    assert indexed.errors == []
-    assert indexed.files_changed == 2
+    # InitRepo owns automatic indexing.  Synchronize with that canonical
+    # daemon instead of racing it with a second direct writer: on a fast host
+    # the first build can already include both files, while on a slower host a
+    # follow-up refresh indexes them.  Both outcomes are correct; the portable
+    # release invariant is a ready, queryable graph containing both surfaces.
+    daemon = source_graph_daemon.get_daemon(repo_a)
+    assert daemon is not None
+    assert daemon.wait_for_first_build(timeout=10), "initial Source Graph build never completed"
+    refreshed = daemon.refresh_now()
+    assert refreshed["ok"] is True, refreshed
+    assert refreshed["status"] == source_graph_daemon.STATUS_READY, refreshed
+    assert refreshed["last_report"]["errors"] == [], refreshed
+    assert refreshed["last_report"]["files_seen"] == 2, refreshed
     graph = source_graph.connect(source_graph.resolve_db_path(repo_a))
     try:
         assert source_graph.func(graph, "python_probe")
