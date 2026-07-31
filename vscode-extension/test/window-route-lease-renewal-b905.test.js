@@ -54,6 +54,19 @@ class FakeChild extends EventEmitter {
     if (message.method === "notifications/initialized") {
       return;
     }
+    if (message.method === "tools/list") {
+      this._send({ tools: [
+        "aiworkhub_dashboard_snapshot",
+        "aiworkhub_dashboard_task_detail",
+        "aiworkhub_dashboard_health",
+        "aiworkhub_dashboard_task_live_output",
+        "aiworkhub_dashboard_memory",
+        "aiworkhub_dashboard_sessions",
+        "aiworkhub_dashboard_kb",
+        "aiworkhub_dashboard_settings",
+      ].map((name) => ({ name })) }, message.id);
+      return;
+    }
     if (message.method !== "tools/call") {
       this._send({}, message.id);
       return;

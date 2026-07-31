@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-07-31
+
+### Fixed
+
+- Prevented the dashboard runtime status check from racing the asynchronous
+  MCP startup sequence. Runtime version and dashboard capabilities are now
+  verified once during the child handshake and reused for that exact child
+  lifecycle, so a healthy repository-bound runtime is never restarted into a
+  false `mcp_version_mismatch_after_repair` / `mcp_recovery_circuit_open`
+  state while callback and Source Graph services converge in the background.
+- Extended the multi-repository, reloadless-repair and route-lease regression
+  harnesses to exercise the same handshake capability contract as the live
+  extension.
+
 ## [0.8.7] - 2026-07-31
 
 ### Changed

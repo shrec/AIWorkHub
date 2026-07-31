@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.7";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.8";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 
 // ── Webview <-> extension host message contract ────────────────────────────
@@ -1179,6 +1179,11 @@ class McpStdioClient {
     this.pendingChildren = new Map();
     this.initialized = false;
     this.startingPromise = null;
+    // Exact version/capability evidence established during this child's
+    // post-initialize preflight. Dashboard runtimeInfo reuses this immutable
+    // lifecycle fact instead of issuing a redundant tools/list + health pair
+    // while dispatcher/Source Graph startup calls are already in flight.
+    this.runtimePreflight = null;
     this.restartAttempts = 0;
     this.intentionalStop = false;
     // B893: how many bounded runtime-repair restarts this client has spent
@@ -1299,7 +1304,10 @@ class McpStdioClient {
         return;
       } catch (err) {
         const message = sanitizeErrorMessage(err);
-        if (!message.includes("mcp_version_mismatch_pre_service")) throw err;
+        if (
+          !message.includes("mcp_version_mismatch_pre_service")
+          && !message.includes("mcp_capability_mismatch_pre_service")
+        ) throw err;
         if (this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS) {
           this.runtimeRepairBlockedReason = `runtime_repair_budget_exhausted:${message}`;
           this.recovery.category = "runtime_mismatch";
@@ -1376,6 +1384,7 @@ class McpStdioClient {
 
     this.intentionalStop = false;
     this.initialized = false;
+    this.runtimePreflight = null;
     this.buffer = "";
     this.nextId = 1;
     this.pending.clear();
@@ -1433,13 +1442,26 @@ class McpStdioClient {
 
 
   async _assertRuntimeVersionBeforeServices() {
+    let tools;
     let health;
     try {
+      const listed = await this.request("tools/list", {});
+      tools = Array.isArray(listed && listed.tools) ? listed.tools : [];
       health = extractToolResult(await this.request("tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} }));
     } catch (err) {
       throw new Error(`mcp_health_preflight_failed:${sanitizeErrorMessage(err)}`);
     }
+    const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
+    const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));
     const runtimeVersion = String((health && (health.server_version || health.version || health.package_version)) || "unavailable");
+    this.runtimePreflight = {
+      matches: missing.length === 0 && runtimeVersion === EXPECTED_MCP_PACKAGE_VERSION,
+      missing: [...missing],
+      runtimeVersion,
+    };
+    if (missing.length) {
+      throw new Error(`mcp_capability_mismatch_pre_service:${missing.join(",")}`);
+    }
     if (runtimeVersion !== EXPECTED_MCP_PACKAGE_VERSION) {
       throw new Error(`mcp_version_mismatch_pre_service:${runtimeVersion}`);
     }
@@ -1528,6 +1550,7 @@ class McpStdioClient {
     this.child = null;
     this._clearLifecycleOwnership(exitedChild);
     this.initialized = false;
+    this.runtimePreflight = null;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
     this._failPendingForChild(exitedChild, failure);
 
@@ -1659,6 +1682,7 @@ class McpStdioClient {
     const child = this.lifecycleChild;
     this.child = null;
     this.initialized = false;
+    this.runtimePreflight = null;
     this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
     this._terminateOwnedChild(child);
   }
@@ -3935,6 +3959,26 @@ function runtimeStatusPayload({ runtimeVersion, degraded, repaired, repairAttemp
 // One bounded tools/list + health round trip against `client`. Never mutates
 // client state; callers decide what to do with the result.
 async function checkRuntimeHealth(client) {
+  // Activation intentionally starts MCP without blocking the extension host.
+  // `initialized` flips true immediately after the MCP initialize exchange,
+  // while the version/capability preflight is still completing under the
+  // shared startup promise. Always join that promise first: otherwise the
+  // dashboard can issue a second tools/list + health pair in the narrow gap,
+  // race background service convergence, and restart a perfectly healthy
+  // child as a false mismatch.
+  await client.ensureStarted();
+  // _handshake() establishes this exact evidence before ensureStarted()
+  // resolves. It is valid only for the currently-owned live child and is
+  // cleared on every stop/exit/restart. Reusing it prevents runtimeInfo from
+  // racing the deliberately background-only dispatcher/indexer convergence
+  // calls and opening a false mismatch recovery circuit on a healthy child.
+  if (client.running && client.initialized && client.runtimePreflight) {
+    return {
+      matches: Boolean(client.runtimePreflight.matches),
+      missing: [...client.runtimePreflight.missing],
+      runtimeVersion: client.runtimePreflight.runtimeVersion,
+    };
+  }
   const tools = await client.listTools();
   const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
   const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));

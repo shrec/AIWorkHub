@@ -64,6 +64,10 @@ class FakeChild extends EventEmitter {
   }
 
   _message(message) {
+    this.spawnRecord.requests.push({
+      method: message.method,
+      tool: message.params && message.params.name,
+    });
     if (this.generation.dieBeforeInitialize && message.method === "initialize") {
       this.kill();
       return;
@@ -173,6 +177,7 @@ function installSpawnFake(generationsByRoot) {
       repoRoot: options.env.AIWORKHUB_REPO_ROOT,
       repoId: options.env.AIWORKHUB_REPO_ID,
       windowId: options.env.AIWORKHUB_WINDOW_ID,
+      requests: [],
     };
     spawns.push(spawnRecord);
     const canonicalRoot = path.normalize(fs.realpathSync.native(spawnRecord.repoRoot));
@@ -229,6 +234,59 @@ async function testSelfHealsAndReconnectsWithoutReload(tmp) {
     const snapshotMsg = messages.find((m) => m.type === "snapshot");
     assert.ok(snapshotMsg, "an already-open dashboard tab must reconnect automatically after startup repair");
     assert.strictEqual(snapshotMsg.payload.repo_id, "repo_selfheal00000000000000000000001");
+
+    await host.extension.deactivate();
+  } finally {
+    fake.restore();
+  }
+}
+
+async function testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence(tmp) {
+  const repoRoot = path.join(tmp, "preflight-cache");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_preflightcache000000000000000006", "preflight-cache");
+
+  const fake = installSpawnFake(new Map([[repoRoot, [
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+  ]]]));
+  try {
+    const host = loadExtensionHost(repoRoot);
+    await host.extension.activate(host.context);
+    const client = host.extension.__testInternals.getMcpClient(host.context);
+    assert.strictEqual(
+      fake.spawns.length,
+      1,
+      `healthy activation unexpectedly spawned ${fake.spawns.length} children: ${JSON.stringify(client.runtimePreflight)}`,
+    );
+    assert.strictEqual(client.running, true, "healthy activation must keep its child running");
+    assert.strictEqual(
+      host.extension.__testInternals.getMcpClient(host.context),
+      client,
+      "runtime info must resolve the same repo-bound client that completed the handshake",
+    );
+    const { view, messages } = makeView(host);
+    await host.extension.__testInternals.pushRuntimeInfo(view);
+
+    assert.strictEqual(fake.spawns.length, 1, "a healthy handshaken child must never be restarted by a redundant dashboard probe");
+    assert.strictEqual(
+      fake.spawns[0].requests.filter((request) => request.method === "tools/list").length,
+      1,
+      "runtime info must reuse the handshake tools/list evidence",
+    );
+    assert.strictEqual(
+      fake.spawns[0].requests.filter(
+        (request) => request.method === "tools/call" && request.tool === "aiworkhub_dashboard_health",
+      ).length,
+      1,
+      "runtime info must reuse the handshake health evidence",
+    );
+    assert.ok(client.runtimePreflight, "runtime info must join startup and retain handshake evidence");
+    assert.strictEqual(client.runtimePreflight.matches, true, "handshake evidence must match the packaged runtime");
+    const last = messages.filter((m) => m.type === "runtimeInfo").pop();
+    assert.ok(last, "runtimeInfo must be emitted from cached handshake evidence");
+    assert.strictEqual(last.payload.degraded, false);
+    assert.strictEqual(last.payload.runtimeVersion, EXPECTED_VERSION);
+    assert.strictEqual(client.recoveryStatus().open, false);
 
     await host.extension.deactivate();
   } finally {
@@ -455,6 +513,7 @@ function testPlatformPythonResolution(tmp) {
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
   await testSelfHealsAndReconnectsWithoutReload(tmp);
+  await testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence(tmp);
   await testBoundedRetryOnPersistentMismatch(tmp);
   await testFailedRestartDegradesWithoutCrossRepoFallback(tmp);
   await testTwoWorkspacesRepairInIsolation(tmp);
