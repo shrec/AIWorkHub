@@ -49,7 +49,7 @@ def test_live_release_metadata_projections_match_canonical_version() -> None:
     result = release_metadata.check(ROOT)
     assert result["ok"] is True
     assert result["canonical_source"] == "src/aiworkhub/_version.py"
-    assert result["canonical_version"] == "0.8.2"
+    assert result["canonical_version"] == "0.8.3"
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'dynamic = ["version"]' in pyproject
     assert 'version = { attr = "aiworkhub._version.__version__" }' in pyproject

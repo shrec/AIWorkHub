@@ -160,3 +160,29 @@ def test_session_write_atomically_feeds_context_graph(tmp_path: Path) -> None:
     assert found["results"][0]["thread_id"] == "thread-9"
     assert found["results"][0]["task_id"] == "TASK-9"
     assert found["results"][0]["source_ref"] == f"session_document:{written['document_id']}"
+
+
+def test_worker_session_write_never_enters_manager_context_graph(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _enable(repo)
+    worker = {
+        "role": "worker",
+        "actor_id": "worker-1",
+        "task_id": "TASK-10",
+        "provider": "deepseek",
+        "session_id": "worker-session-1",
+    }
+
+    written = context_writes.session_write(
+        repo,
+        actor=worker,
+        action="checkpoint",
+        topic="worker evidence",
+        content="worker-only session evidence",
+        idempotency_key="session:worker-context-graph:0001",
+        provenance="test",
+    )
+
+    assert written["ok"] is True
+    assert context_graph.search(repo, "worker-only")["count"] == 0
+    assert context_graph.status(repo)["events"] == 0

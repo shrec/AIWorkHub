@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-07-31
+
+### Fixed
+
+- Restricted automatic Context Graph capture to verified manager Session
+  writes. Worker Session/Memory/KB activity remains available through its
+  canonical tools but never enters the Manager Context Graph.
+- Renamed the Settings surface to `Manager Context Graph` and documented the
+  manager-only boundary explicitly.
+
 ## [0.8.2] - 2026-07-31
 
 ### Added

@@ -37,10 +37,11 @@ AIWorkHub telemetry.
   preflight and evidence-backed adaptive workforce scoring.
 - Canonical manager/worker Session Manager, AI Memory and KB read/write
   surfaces with provenance, idempotency and audited soft lifecycle operations.
-- Opt-in canonical Context Graph foundation: append-only conversation events,
-  deterministic rebuildable repository/thread/session/task relations, bounded
-  search and exact transcript-range recovery. Session Manager writes are
-  captured atomically when enabled.
+- Opt-in canonical Manager Context Graph foundation: manager-only append-only
+  conversation events, deterministic rebuildable repository/thread/session/task
+  relations, bounded search and exact transcript-range recovery. Manager
+  Session writes are captured atomically when enabled; worker sessions are
+  excluded.
 - Storage observability, bounded system logs, and local dashboard views for
   task operations and context systems.
 - Safe repository worktree, terminal-run and extension-runtime retention with

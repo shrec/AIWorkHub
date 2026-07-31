@@ -2629,7 +2629,7 @@ const FEATURE_LABELS = Object.freeze({
   session_manager: ["Session Manager", "Preserves checkpoints and active development continuity."],
   ai_memory: ["AI Memory", "Stores and retrieves durable project lessons and decisions."],
   knowledge_base: ["Knowledge Base", "Provides authoritative repository facts and contracts."],
-  context_graph: ["Context Graph", "Append-only conversation ledger with deterministic graph projection and bounded retrieval."],
+  context_graph: ["Manager Context Graph", "Manager-only append-only conversation ledger with deterministic graph projection and bounded retrieval. Worker sessions are excluded."],
 });
 
 function renderSettings(payload) {

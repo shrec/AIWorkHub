@@ -60,11 +60,12 @@ do not override this current priority ledger.
 
 ### P1 — Context economy and orchestration UX
 
-- [x] Add an opt-in repository-local Context Graph foundation: append-only
-      conversation ledger, deterministic rebuildable projection, exact bounded
-      transcript-range recovery, related-node retrieval, manager MCP tools and
-      atomic Session Manager capture. Repository initialization provisions the
-      schema but capture remains default-off until the user enables it.
+- [x] Add an opt-in repository-local Manager Context Graph foundation:
+      manager-only append-only conversation ledger, deterministic rebuildable
+      projection, exact bounded transcript-range recovery, related-node
+      retrieval, manager MCP tools and atomic manager Session capture. Worker
+      sessions are structurally excluded. Repository initialization provisions
+      the schema but capture remains default-off until the user enables it.
 - [ ] Add supported-provider transcript adapters so complete Codex/Claude/
       Copilot chat events can be captured automatically without asking the
       manager model to rewrite its own conversation. Adapters must be

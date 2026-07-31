@@ -122,8 +122,11 @@ def session_write(
     topic = _bounded(topic, field="topic", max_bytes=256)
     content = _bounded(content, field="content", max_bytes=MAX_CONTENT_BYTES)
     provenance = _bounded(provenance, field="provenance", max_bytes=MAX_PROVENANCE_BYTES)
-    context_graph_enabled = feature_settings.enabled(repo, "context_graph")
-    if context_graph_enabled:
+    manager_graph_capture = (
+        identity["role"] == "manager"
+        and feature_settings.enabled(repo, "context_graph")
+    )
+    if manager_graph_capture:
         context_graph.ensure_schema(repo)
     con = _open(repo, "transcript")
     try:
@@ -139,7 +142,7 @@ def session_write(
         )
         doc_id = int(cur.lastrowid)
         con.execute("INSERT INTO documents_fts(rowid,content) VALUES(?,?)", (doc_id, content))
-        if context_graph_enabled:
+        if manager_graph_capture:
             registry = storage_registry.load_storage_registry(repo)
             context_graph.append_session_document_in_transaction(
                 con,
