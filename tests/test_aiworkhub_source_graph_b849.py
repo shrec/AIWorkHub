@@ -219,6 +219,42 @@ def test_cpp_json_xml_build_and_query_are_non_empty(tmp_path):
         conn.close()
 
 
+def test_build_report_counts_persisted_edges_after_deduplication(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "pkg" / "duplicate.py"
+    _write(target, "pass\n")
+    source_hash = sgast.sha256_bytes(target.read_bytes())
+    edge = sgast.Edge(
+        kind="calls",
+        src_qualname="pkg/duplicate.py::caller",
+        dst_name="target",
+        dst_qualname=None,
+        file_path="pkg/duplicate.py",
+        line=1,
+        evidence_label=sgast.AMBIGUOUS,
+        extractor=sgast.EXTRACTOR_ID,
+        confidence=0.5,
+        source_hash=source_hash,
+        build_revision=sg.BUILD_REVISION,
+    )
+    extraction = sgast.FileExtraction(
+        file_path="pkg/duplicate.py",
+        language="python",
+        status="ok",
+        source_hash=source_hash,
+        edges=(edge, edge),
+    )
+    monkeypatch.setattr(sgast, "extract_file", lambda *_args, **_kwargs: extraction)
+
+    report = sg.build_index(repo, incremental=False)
+    assert report.edges_written == 1
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "native" / "math.cpp", "int helper(int x) { return x + 1; }\n")

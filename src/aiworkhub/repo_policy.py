@@ -16,7 +16,13 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import quality_evidence, runtime_adapters, source_graph_daemon, task_store
+from . import (
+    quality_evidence,
+    runtime_adapters,
+    source_graph_daemon,
+    task_store,
+    workspace_hygiene,
+)
 
 try:
     from . import deepseek_credentials, glm_credentials, vscode_lm_bridge
@@ -316,6 +322,24 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         callback_health = task_store.callback_bridge_health(root) if readiness.ready else {}
     except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
         callback_health = {"ok": False, "reason": "callback_health_unavailable"}
+    try:
+        # Preflight is called on every dashboard refresh. Use persisted slot
+        # accounting only; explicit hygiene preview performs the potentially
+        # expensive recursive byte/rogue-tree scan on demand.
+        hygiene = workspace_hygiene.inventory(root, refresh_sizes=False)
+        hygiene_status = {
+            "ok": True,
+            "slot_count": int(hygiene.get("slot_count") or 0),
+            "total_bytes": int(hygiene.get("total_bytes") or 0),
+            "effective_bytes": int(hygiene.get("effective_bytes") or 0),
+            "sizes_refreshed": False,
+            "explicit_preview_required": True,
+        }
+    except (OSError, RuntimeError, ValueError, workspace_hygiene.WorkspaceHygieneError) as exc:
+        hygiene_status = {
+            "ok": False,
+            "reason": f"workspace_hygiene_unavailable:{type(exc).__name__}",
+        }
     return {
         "ok": not errors,
         "schema_id": PREFLIGHT_SCHEMA_ID,
@@ -357,6 +381,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             )
             if key in callback_health
         },
+        "workspace_hygiene": hygiene_status,
         "providers": providers,
         "selected_adapter": selected,
     }

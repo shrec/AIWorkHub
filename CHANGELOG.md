@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Added
+
+- Added the repository-isolated Workspace Build Hygiene foundation ported from
+  the proven donor design: external scratch slots, quota reservations,
+  cryptographic lease release, real byte accounting, digest-bound explicit
+  cleanup, rogue in-repository build-tree reporting, CLI access and bounded
+  environment-preflight observability.
+
+### Fixed
+
+- Source Graph build reports now count the unique edge rows actually persisted
+  after writer deduplication instead of the larger pre-dedup extractor
+  population. Dashboard/index statistics therefore reconcile with SQLite.
+
 ## [0.8.26] - 2026-08-01
 
 ### Added

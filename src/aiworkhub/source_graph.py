@@ -569,7 +569,17 @@ def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
     conn.execute("DELETE FROM files WHERE file_path=?", (rel,))
 
 
-def _write_extraction(conn: sqlite3.Connection, extraction: sgast.FileExtraction) -> None:
+def _write_extraction(
+    conn: sqlite3.Connection,
+    extraction: sgast.FileExtraction,
+) -> tuple[int, int]:
+    """Persist one extraction and return the rows actually inserted.
+
+    Extractors may conservatively emit the same edge more than once.  The
+    database writer deliberately deduplicates those identities, so callers
+    must report the inserted population rather than the pre-dedup candidate
+    population.
+    """
     conn.execute(
         "INSERT INTO files(file_path, language, status, source_hash, indexed_at, build_revision) "
         "VALUES (?,?,?,?,?,?)",
@@ -608,6 +618,7 @@ def _write_extraction(conn: sqlite3.Connection, extraction: sgast.FileExtraction
              edge.line, edge.evidence_label, edge.extractor, edge.confidence,
              edge.source_hash, edge.build_revision),
         )
+    return len(extraction.entities), len(seen_edges)
 
 
 def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
@@ -675,10 +686,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     unchanged += 1
                     continue
                 _invalidate_file(conn, extraction.file_path)
-                _write_extraction(conn, extraction)
+                inserted_entities, inserted_edges = _write_extraction(conn, extraction)
                 changed += 1
-                entities_written += len(extraction.entities)
-                edges_written += len(extraction.edges)
+                entities_written += inserted_entities
+                edges_written += inserted_edges
                 if extraction.status != "ok" and extraction.error:
                     errors.append({
                         "file": extraction.file_path, "status": extraction.status,

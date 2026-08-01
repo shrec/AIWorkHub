@@ -223,6 +223,24 @@ model usage records.
 
 ## P1 — Orchestration and evidence (0.8.x)
 
+### Proven donor capability consolidation
+
+Port repository-neutral capabilities from the UltrafastSecp256k1 engineering
+toolkit without importing its product semantics or legacy databases. The
+canonical disposition and sequencing live in
+[`DONOR_CAPABILITY_PORT.md`](DONOR_CAPABILITY_PORT.md).
+
+- Source Graph's polyglot adapters and six compact query modes are shipped.
+- Workspace Build Hygiene's cross-platform core is implemented: bounded
+  external scratch slots, quota/reservation accounting, lease-safe cleanup,
+  rogue in-repo build-tree detection and bounded preflight evidence. Dashboard
+  preview/apply controls and task-launch allocation remain.
+- Then add optional change-sensitive compiler/CUDA checks as Quality Evidence
+  adapters, not core dependencies.
+- Existing Task, Callback, Session, AI Memory, KB, DAG and collision
+  authorities supersede donor scripts with equivalent responsibilities; no
+  parallel database or duplicate lifecycle is permitted.
+
 ### Review Inbox 2.0
 
 Pagination, task/model/status/time filters, bounded default payloads, recent
