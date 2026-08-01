@@ -19,7 +19,7 @@ test("dashboard exposes KPI operations view as the default tab", () => {
 test("KPI renderer separates worker outcomes from explicit manager decisions", () => {
   assert.match(appSource, /function renderKpis\(snapshot\)/);
   assert.match(appSource, /worker outcomes and explicit manager decisions are separate/i);
-  assert.match(appSource, /No token-savings or causal quality claim is inferred/);
+  assert.match(appSource, /no token-savings or causal quality claim is inferred/i);
   assert.match(appSource, /renderKpis\(snapshot\)/);
 });
 
@@ -28,4 +28,14 @@ test("KPI visualizations include responsive chart and bar primitives", () => {
   assert.match(cssSource, /\.kpi-daily-chart/);
   assert.match(cssSource, /\.kpi-bar-track/);
   assert.match(cssSource, /@media \(max-width: 820px\)/);
+});
+
+test("KPI v2 renders Source Graph workflow stages, modes, latency and truthful byte economics", () => {
+  assert.match(appSource, /aiworkhub\.kpi\.dashboard\.v2/);
+  assert.match(appSource, /Source Graph workflow stages/);
+  assert.match(appSource, /Source Graph modes/);
+  assert.match(appSource, /Tool-use cohorts/);
+  assert.match(appSource, /Context compression/);
+  assert.match(appSource, /Source Graph latency p50/);
+  assert.match(appSource, /Byte compression uses declared raw paths/);
 });

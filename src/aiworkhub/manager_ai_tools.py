@@ -91,11 +91,12 @@ def source_graph_query(
     budget: int = 64,
     target: str | None = None,
     bundle_type: worker_tools.SourceGraphBundleType = "explore",
+    workflow_stage: worker_tools.WorkflowStage = "unspecified",
 ) -> dict[str, Any]:
     return _invoke(
         lambda ctx: worker_tools.source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
-            target=target, bundle_type=bundle_type,
+            target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
         ),
         target=target,
     )

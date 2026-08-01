@@ -36,7 +36,7 @@ structural test mapping is not reported as line or branch coverage.
 
 ## Language coverage
 
-AIWorkHub registers 33 language families. Semantic adapters currently extract
+AIWorkHub registers 34 code, data and documentation families. Semantic adapters currently extract
 modules, imports, declarations, functions or methods, inheritance and observed
 calls for:
 
@@ -46,7 +46,8 @@ calls for:
 - JavaScript and TypeScript (including JSX/TSX);
 - Rust, Go, Java and C#.
 
-The remaining registered families, including JSON, XML, YAML and TOML, are
+The remaining registered families, including JSON, XML, YAML, TOML and
+Markdown/MDX repository documentation, are
 indexed with truthful path/language/size/hash evidence instead of fabricated
 symbols. Generated trees, dependency caches and build outputs are excluded by
 the repository ignore policy before indexing.
@@ -60,10 +61,12 @@ Ambiguous cross-file targets are left unresolved rather than attached to an
 arbitrary symbol.
 
 For code tasks, Source Graph usage is continuous rather than a one-time prompt
-injection. The authenticated tool-use ledger records query stage, hits, bytes,
-latency, generation and any bounded fallback reason. Review can therefore
-distinguish continuous graph use from injected-only context and unsupported
-targets.
+injection. Each worker query accepts an explicit bounded `workflow_stage`
+(`orientation`, `implementation`, `validation`, `review` or `rework`). The
+authenticated tool-use ledger records that stage together with mode, hits,
+bytes, latency, cache state and authority identity. Review can therefore
+distinguish multi-stage continuous use from a live single-stage call,
+injected-only context and missing/stale use without guessing old metadata.
 
 ## Repository isolation
 

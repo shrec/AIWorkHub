@@ -38,7 +38,9 @@ from aiworkhub import (
 DEFAULT_TASK_LIMIT = 500
 DEFAULT_PROCESS_LIMIT = 200
 DEFAULT_SNAPSHOT_PROCESS_LIMIT = 50
+DEFAULT_KPI_HISTORY_PROCESS_LIMIT = 1000
 MAX_PROCESS_LOG_BYTES = 4 * 1024 * 1024
+MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
@@ -205,6 +207,37 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "source_graph_mode_sequence": list(
                 verification.get("source_graph_mode_sequence") or []
             )[:64],
+            "source_graph_stage_counts": bounded_counter(
+                verification.get("source_graph_stage_counts")
+            ),
+            "source_graph_stage_sequence": [
+                str(value)[:32]
+                for value in (verification.get("source_graph_stage_sequence") or [])[:64]
+            ],
+            "source_graph_mode_stage_counts": {
+                str(stage)[:32]: bounded_counter(counts)
+                for stage, counts in list(
+                    (verification.get("source_graph_mode_stage_counts") or {}).items()
+                )[:8]
+                if isinstance(counts, Mapping)
+            },
+            "source_graph_stage_attributed_calls": int(
+                verification.get("source_graph_stage_attributed_calls") or 0
+            ),
+            "source_graph_latency": {
+                "count": int((verification.get("source_graph_latency") or {}).get("count") or 0),
+                "total_ms": float((verification.get("source_graph_latency") or {}).get("total_ms") or 0.0),
+                "samples_ms": [
+                    round(float(value), 3)
+                    for value in (
+                        (verification.get("source_graph_latency") or {}).get("samples_ms") or []
+                    )[:64]
+                    if isinstance(value, (int, float)) and 0 <= float(value) <= 3_600_000
+                ],
+                "samples_truncated": bool(
+                    (verification.get("source_graph_latency") or {}).get("samples_truncated")
+                ),
+            },
             "call_count_by_tool": bounded_counter(calls),
             "successful_call_count_by_tool": bounded_counter(successful),
             "bounded_bytes_by_tool": bounded_counter(bytes_by_tool),
@@ -294,6 +327,16 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_mode_unattributed_calls": 0,
         "source_graph_distinct_modes": 0,
         "source_graph_mode_attribution_rate": 0.0,
+        "source_graph_stage_counts": {},
+        "source_graph_stage_sequence": [],
+        "source_graph_mode_stage_counts": {},
+        "source_graph_stage_attributed_calls": 0,
+        "source_graph_stage_unattributed_calls": 0,
+        "source_graph_stage_attribution_rate": 0.0,
+        "source_graph_latency": {
+            "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
+            "p50_ms": None, "p95_ms": None, "samples_truncated": False,
+        },
         "tool_call_counts": {},
         "tool_success_counts": {},
         "tool_bytes": {},
@@ -328,6 +371,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 "source_graph_zero_hit_calls": 0,
                 "source_graph_failed_calls": 0,
                 "source_graph_mode_counts": {},
+                "source_graph_stage_counts": {},
                 "source_graph_mode_attributed_calls": 0,
                 "source_graph_mode_unattributed_calls": 0,
                 "policy_violations": 0,
@@ -429,6 +473,49 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 if len(totals["source_graph_mode_sequence"]) >= 128:
                     break
                 totals["source_graph_mode_sequence"].append(str(mode)[:40])
+        stage_counts = tool_use.get("source_graph_stage_counts")
+        if isinstance(stage_counts, Mapping):
+            for stage, count in stage_counts.items():
+                safe_stage = str(stage)[:32]
+                safe_count = max(0, int(count or 0))
+                totals["source_graph_stage_counts"][safe_stage] = (
+                    int(totals["source_graph_stage_counts"].get(safe_stage) or 0)
+                    + safe_count
+                )
+                bucket_stages = bucket["source_graph_stage_counts"]
+                bucket_stages[safe_stage] = int(bucket_stages.get(safe_stage) or 0) + safe_count
+        stage_sequence = tool_use.get("source_graph_stage_sequence")
+        if isinstance(stage_sequence, list):
+            for stage in stage_sequence:
+                if len(totals["source_graph_stage_sequence"]) >= 128:
+                    break
+                totals["source_graph_stage_sequence"].append(str(stage)[:32])
+        mode_stage_counts = tool_use.get("source_graph_mode_stage_counts")
+        if isinstance(mode_stage_counts, Mapping):
+            for stage, modes in mode_stage_counts.items():
+                if not isinstance(modes, Mapping):
+                    continue
+                destination = totals["source_graph_mode_stage_counts"].setdefault(
+                    str(stage)[:32], {}
+                )
+                for mode, count in modes.items():
+                    safe_mode = str(mode)[:40]
+                    destination[safe_mode] = (
+                        int(destination.get(safe_mode) or 0) + max(0, int(count or 0))
+                    )
+        latency = tool_use.get("source_graph_latency")
+        if isinstance(latency, Mapping):
+            samples = latency.get("samples_ms")
+            if isinstance(samples, list):
+                aggregate_samples = totals["source_graph_latency"].setdefault("samples_ms", [])
+                for value in samples:
+                    if len(aggregate_samples) >= 512:
+                        totals["source_graph_latency"]["samples_truncated"] = True
+                        break
+                    if isinstance(value, (int, float)) and 0 <= float(value) <= 3_600_000:
+                        aggregate_samples.append(round(float(value), 3))
+            if latency.get("samples_truncated"):
+                totals["source_graph_latency"]["samples_truncated"] = True
         if violations:
             totals["policy_violation_tasks"] += 1
         if int(tool_use.get("entries_tampered") or 0):
@@ -463,6 +550,36 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     totals["source_graph_mode_unattributed_calls"] = max(
         0, totals["source_graph_calls"] - attributed_calls
     )
+    stage_attributed = sum(
+        max(0, int(count or 0))
+        for stage, count in totals["source_graph_stage_counts"].items()
+        if stage != "unspecified"
+    )
+    totals["source_graph_stage_attributed_calls"] = stage_attributed
+    totals["source_graph_stage_unattributed_calls"] = max(
+        0, totals["source_graph_calls"] - stage_attributed
+    )
+    if totals["source_graph_calls"]:
+        totals["source_graph_stage_attribution_rate"] = round(
+            100.0 * stage_attributed / totals["source_graph_calls"], 1
+        )
+    latency_samples = sorted(totals["source_graph_latency"].pop("samples_ms", []))
+    if latency_samples:
+        def latency_percentile(fraction: float) -> float:
+            index = min(
+                len(latency_samples) - 1,
+                max(0, int(round((len(latency_samples) - 1) * fraction))),
+            )
+            return latency_samples[index]
+
+        totals["source_graph_latency"].update({
+            "count": len(latency_samples),
+            "total_ms": round(sum(latency_samples), 3),
+            "min_ms": latency_samples[0],
+            "max_ms": latency_samples[-1],
+            "p50_ms": latency_percentile(0.50),
+            "p95_ms": latency_percentile(0.95),
+        })
     totals["source_graph_distinct_modes"] = sum(
         1 for count in totals["source_graph_mode_counts"].values() if int(count or 0) > 0
     )
@@ -1000,6 +1117,17 @@ class DashboardProvider:
     def get_agent_processes(self) -> dict[str, Any]:
         return read_process_runs(limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT)
 
+    def get_kpi_processes(self) -> dict[str, Any]:
+        """Larger bounded history used only for aggregate KPI projections.
+
+        Raw rows are never returned as a second browser payload; the snapshot
+        exposes only the bounded aggregates and their truncation metadata.
+        """
+        return read_process_runs(
+            limit=DEFAULT_KPI_HISTORY_PROCESS_LIMIT,
+            max_bytes=MAX_KPI_HISTORY_LOG_BYTES,
+        )
+
     def get_exact_status_counts(self) -> dict[str, int]:
         """Exact per-status totals across the whole canonical queue (see
         ``exact_status_counts``) -- independent of ``task_limit``, never a
@@ -1288,6 +1416,23 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         })
         process_report = {}
 
+    kpi_process_reader = getattr(data_provider, "get_kpi_processes", None)
+    if kpi_process_reader is None:
+        kpi_process_report = process_report
+        kpi_process_limit = DEFAULT_SNAPSHOT_PROCESS_LIMIT
+    else:
+        kpi_process_report = _safe_read(
+            "kpi_process_history", kpi_process_reader, errors, process_report
+        )
+        if not isinstance(kpi_process_report, Mapping):
+            errors.append({
+                "source": "kpi_process_history",
+                "kind": "DashboardReadError",
+                "message": "KPI process history provider returned a non-object",
+            })
+            kpi_process_report = process_report
+        kpi_process_limit = DEFAULT_KPI_HISTORY_PROCESS_LIMIT
+
     adapter_reader = getattr(
         data_provider,
         "get_adapter_readiness",
@@ -1445,12 +1590,12 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
     project_context_telemetry = _project_context_telemetry(process_report)
     cost_totals = _cost_totals(ledger)
     kpi_analytics = dashboard_kpis.build_kpi_snapshot(
-        process_report=process_report,
-        source_graph=source_graph_telemetry,
-        project_context=project_context_telemetry,
+        process_report=kpi_process_report,
+        source_graph=_source_graph_telemetry(kpi_process_report),
+        project_context=_project_context_telemetry(kpi_process_report),
         callback_health=callback_bridge_health,
         cost_totals=cost_totals,
-        process_limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT,
+        process_limit=kpi_process_limit,
     )
 
     return {

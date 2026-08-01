@@ -173,7 +173,9 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     assert refreshed["ok"] is True, refreshed
     assert refreshed["status"] == source_graph_daemon.STATUS_READY, refreshed
     assert refreshed["last_report"]["errors"] == [], refreshed
-    assert refreshed["last_report"]["files_seen"] == 2, refreshed
+    # Two code surfaces plus the three repository instruction documents
+    # projected by InitRepo and indexed as documentation evidence.
+    assert refreshed["last_report"]["files_seen"] == 5, refreshed
     graph = source_graph.connect(source_graph.resolve_db_path(repo_a))
     try:
         assert source_graph.func(graph, "python_probe")

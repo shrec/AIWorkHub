@@ -307,11 +307,13 @@ def aiworkhub_manager_source_graph_query(
     budget: int = 64,
     target: str | None = None,
     bundle_type: worker_ai_tools_mcp.SourceGraphBundleType = "explore",
+    workflow_stage: worker_ai_tools_mcp.WorkflowStage = "unspecified",
 ) -> dict[str, Any]:
     """MANAGER READ: bounded canonical Source Graph query for this repository."""
 
     return manager_ai_tools.source_graph_query(
-        mode=mode, query=query, budget=budget, target=target, bundle_type=bundle_type
+        mode=mode, query=query, budget=budget, target=target,
+        bundle_type=bundle_type, workflow_stage=workflow_stage,
     )
 
 

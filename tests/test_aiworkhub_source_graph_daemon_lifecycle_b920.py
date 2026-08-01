@@ -91,13 +91,15 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
     health = daemon.health()
 
     assert health["status"] == source_graph_daemon.STATUS_READY
-    assert health["last_report"]["files_seen"] == 1
+    # InitRepo also projects the three manager instruction documents; the
+    # documentation family intentionally indexes those repository contracts.
+    assert health["last_report"]["files_seen"] == 4
     assert health["last_report"]["incremental"] is False
     assert health["language_capabilities"]["php"] == "semantic_lexical"
     assert ".php" in health["indexed_extensions"]
 
 
-def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
+def test_initialized_repo_indexes_instruction_documents_without_source_files(tmp_path):
     root = _init_repo(tmp_path)
     daemon = source_graph_daemon.SourceGraphDaemon(root)
 
@@ -105,9 +107,9 @@ def test_successful_zero_file_build_is_truthful_empty_not_ready(tmp_path):
     health = daemon.health()
 
     assert health["ok"] is True
-    assert health["status"] == source_graph_daemon.STATUS_EMPTY
-    assert health["last_report"]["files_seen"] == 0
-    assert health["last_report"]["entities_written"] == 0
+    assert health["status"] == source_graph_daemon.STATUS_READY
+    assert health["last_report"]["files_seen"] == 3
+    assert health["last_report"]["entities_written"] == 3
 
 
 def test_production_default_build_runs_in_dedicated_subprocess(tmp_path, monkeypatch):
@@ -122,7 +124,7 @@ def test_production_default_build_runs_in_dedicated_subprocess(tmp_path, monkeyp
     health = daemon.health()
     assert health["ok"] is True
     assert health["status"] == source_graph_daemon.STATUS_READY
-    assert health["last_report"]["files_seen"] == 1
+    assert health["last_report"]["files_seen"] == 4
 
 
 def test_old_success_is_truthfully_stale_until_next_success(tmp_path, monkeypatch):

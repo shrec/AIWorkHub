@@ -307,6 +307,13 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
     assert invalid_bundle["allowed_bundle_types"] == [
         "bugfix", "feature", "refactor", "audit", "optimize", "explore",
     ]
+    invalid_stage = w.source_graph_query(
+        ctx, mode="focus", query="x", workflow_stage="guessing"
+    )
+    assert invalid_stage["reason"].startswith("invalid_workflow_stage")
+    assert invalid_stage["allowed_workflow_stages"] == [
+        "orientation", "implementation", "validation", "review", "rework", "unspecified",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +326,16 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     _stub_source_graph_engine(monkeypatch)
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
 
-    first = w.source_graph_query(ctx, mode="focus", query="ignored", budget=32)
+    first = w.source_graph_query(
+        ctx, mode="focus", query="ignored", budget=32, workflow_stage="orientation"
+    )
     assert first["ok"] is True
     assert first["hit_count"] > 0
     assert first["cache_hit"] is False
 
-    second = w.source_graph_query(ctx, mode="focus", query="ignored", budget=32)
+    second = w.source_graph_query(
+        ctx, mode="focus", query="ignored", budget=32, workflow_stage="validation"
+    )
     assert second["cache_hit"] is True
     assert second["content"] == first["content"]
 
@@ -341,6 +352,15 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert verification["source_graph_zero_hit_calls"] == 0
     assert verification["source_graph_failed_calls"] == 0
     assert verification["bounded_bytes_returned"] > 0
+    assert verification["source_graph_stage_counts"] == {
+        "orientation": 1, "validation": 1,
+    }
+    assert verification["source_graph_stage_attributed_calls"] == 2
+    assert verification["source_graph_mode_stage_counts"] == {
+        "orientation": {"focus": 1}, "validation": {"focus": 1},
+    }
+    assert verification["source_graph_latency"]["count"] == 2
+    assert verification["source_graph_latency"]["p50_ms"] is not None
 
 
 def test_session_ai_memory_and_kb_tools_are_bounded_and_audited(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

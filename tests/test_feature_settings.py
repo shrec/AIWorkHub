@@ -133,15 +133,15 @@ def test_dashboard_exposes_and_updates_source_graph_languages(
 
     viewed = dashboard_mcp_app.settings_view()
     policy = viewed["source_graph_policy"]
-    assert policy["language_count"] == 33
-    assert policy["enabled_count"] == 33
+    assert policy["language_count"] == 34
+    assert policy["enabled_count"] == 34
 
     changed = dashboard_mcp_app.source_graph_settings_update_view(
         {"cpp": False, "json": False},
         policy["revision"],
     )
     assert changed["ok"] is True
-    assert changed["enabled_count"] == 31
+    assert changed["enabled_count"] == 32
     assert changed["source_graph_refresh"]["triggered"] is True
     enabled = {row["id"]: row["enabled"] for row in changed["languages"]}
     assert enabled["cpp"] is False

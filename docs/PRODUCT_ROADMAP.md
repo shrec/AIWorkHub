@@ -82,11 +82,12 @@ AIWorkHub telemetry.
   digest-bound, explicitly confirmed and foreign-stale fail-closed.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
-- Task/tool telemetry now authenticates generic MCP calls as well as Source
-  Graph calls, and the first truthful bounded KPI dashboard is shipped. Stage
-  attribution, latency distributions, durable historical windows and
-  task-class outcome cohorts remain the next economics closure rather than
-  inferred statistics.
+- Task/tool telemetry authenticates generic MCP calls as well as Source Graph
+  calls. KPI v2 ships authenticated mode/workflow-stage attribution, bounded
+  latency distributions, an aggregate-only 1,000-run history, topic/tool-use
+  cohorts and measured raw-path-versus-delivered-bundle byte economics.
+  Durable daily rollups beyond retained process logs, normalized task classes,
+  tokenizer-bound counterfactuals and accepted-change-per-dollar remain open.
 - The brand foundation, concise public README and registry workflows are
   present. Registry-owner setup, public screenshots/GIF and long-form launch
   material remain open.
@@ -182,10 +183,12 @@ is used throughout the task, not merely injected at prompt start.
 Report locally, by repository/task/run/model/adapter:
 
 - Source Graph calls, successful hits, zero hits, cached hits, stale calls,
-  returned bytes, entities/edges returned, latency, and index generation.
-- Calls by workflow stage: orientation, implementation, validation, review,
-  and rework. A task with only the initial receipt is `injected-only`, never
-  `continuous-use`.
+  returned bytes and bounded latency are shipped; per-call entities/edges and
+  index-generation timelines remain open.
+- Calls by authenticated workflow stage (orientation, implementation,
+  validation, review and rework) are shipped. A task with only the initial
+  receipt is `injected-only`; KPI cohorts require at least two attributed
+  stages before labeling a task `continuous_use`.
 - Time and model-turn gaps between Source Graph calls; highlight long code-work
   intervals with no graph evidence.
 - Raw discovery fallback count and reason (`unsupported`, `unindexed`, exact

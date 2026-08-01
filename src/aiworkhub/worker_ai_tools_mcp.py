@@ -83,6 +83,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -151,6 +152,12 @@ SourceGraphMode = Literal[
     "looprisks", "deadmethods", "duplicates", "gaps",
 ]
 SourceGraphBundleType = Literal["bugfix", "feature", "refactor", "audit", "optimize", "explore"]
+WORKFLOW_STAGES: tuple[str, ...] = (
+    "orientation", "implementation", "validation", "review", "rework", "unspecified",
+)
+WorkflowStage = Literal[
+    "orientation", "implementation", "validation", "review", "rework", "unspecified",
+]
 MAX_QUERY_BYTES = 512
 MAX_KEY_BYTES = 256
 MIN_BUDGET = 8
@@ -570,6 +577,14 @@ def verify_audit_ledger(
         "source_graph_failed_calls": 0,
         "source_graph_mode_counts": {},
         "source_graph_mode_sequence": [],
+        "source_graph_stage_counts": {},
+        "source_graph_stage_sequence": [],
+        "source_graph_mode_stage_counts": {},
+        "source_graph_stage_attributed_calls": 0,
+        "source_graph_latency": {
+            "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
+            "p50_ms": None, "p95_ms": None,
+        },
         "authority_index_identity": [],
         "verified_payloads": [],
         "reason": "",
@@ -590,6 +605,7 @@ def verify_audit_ledger(
     bounded_bytes_by_tool: dict[str, int] = {}
     cache_hits_by_tool: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str, str]] = set()
+    source_graph_latencies: list[float] = []
     for raw_line in lines:
         raw_line = raw_line.strip()
         if not raw_line:
@@ -634,6 +650,24 @@ def verify_audit_ledger(
                 mode_counts[mode] = int(mode_counts.get(mode) or 0) + 1
                 if len(result["source_graph_mode_sequence"]) < 64:
                     result["source_graph_mode_sequence"].append(mode)
+            stage = (
+                str(payload.get("workflow_stage") or "unspecified")
+                if isinstance(payload, dict) else "unspecified"
+            )
+            if stage not in WORKFLOW_STAGES:
+                stage = "unspecified"
+            stage_counts = result["source_graph_stage_counts"]
+            stage_counts[stage] = int(stage_counts.get(stage) or 0) + 1
+            if stage != "unspecified":
+                result["source_graph_stage_attributed_calls"] += 1
+            if len(result["source_graph_stage_sequence"]) < 64:
+                result["source_graph_stage_sequence"].append(stage)
+            if mode in SOURCE_GRAPH_MODES:
+                mode_stage = result["source_graph_mode_stage_counts"].setdefault(stage, {})
+                mode_stage[mode] = int(mode_stage.get(mode) or 0) + 1
+            latency = payload.get("latency_ms") if isinstance(payload, dict) else None
+            if isinstance(latency, (int, float)) and 0 <= float(latency) <= 3_600_000:
+                source_graph_latencies.append(round(float(latency), 3))
         returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
         result["bounded_bytes_returned"] += returned_bytes
         bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes
@@ -697,6 +731,26 @@ def verify_audit_ledger(
     result["authority_index_identity"] = sorted(
         f"{t}:{src}:{state}:{repo}" for t, src, state, repo in authority_seen
     )
+    if source_graph_latencies:
+        ordered = sorted(source_graph_latencies)
+
+        def percentile(fraction: float) -> float:
+            index = min(
+                len(ordered) - 1,
+                max(0, int(round((len(ordered) - 1) * fraction))),
+            )
+            return ordered[index]
+
+        result["source_graph_latency"] = {
+            "count": len(ordered),
+            "total_ms": round(sum(ordered), 3),
+            "min_ms": ordered[0],
+            "max_ms": ordered[-1],
+            "p50_ms": percentile(0.50),
+            "p95_ms": percentile(0.95),
+            "samples_ms": ordered[:64],
+            "samples_truncated": len(ordered) > 64,
+        }
     result["ok"] = True
     return result
 
@@ -774,6 +828,7 @@ def source_graph_query(
     budget: int = 64,
     target: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
+    workflow_stage: WorkflowStage = "unspecified",
 ) -> dict[str, Any]:
     """Bounded Source Graph discovery and repository analytics.
 
@@ -788,6 +843,7 @@ def source_graph_query(
     """
 
     tool = "source_graph"
+    started = time.perf_counter()
     from . import feature_settings
 
     if not feature_settings.enabled(ctx.authority_repo, "source_graph"):
@@ -800,6 +856,10 @@ def source_graph_query(
     if bundle_type not in SOURCE_GRAPH_BUNDLE_TYPES:
         result = _violation(ctx, tool, f"invalid_bundle_type:{bundle_type}")
         result["allowed_bundle_types"] = list(SOURCE_GRAPH_BUNDLE_TYPES)
+        return result
+    if workflow_stage not in WORKFLOW_STAGES:
+        result = _violation(ctx, tool, f"invalid_workflow_stage:{workflow_stage}")
+        result["allowed_workflow_stages"] = list(WORKFLOW_STAGES)
         return result
     bounded_query = _bounded_query(query)
     if bounded_query is None:
@@ -828,7 +888,11 @@ def source_graph_query(
             ctx, tool=tool, ok=True, cache_hit=True,
             hit_count=cached["hit_count"], bytes_returned=cached["bytes"],
             authority_source=cached["authority_source"], authority_state=cached["authority_state"],
-            payload={"mode": mode},
+            payload={
+                "mode": mode,
+                "workflow_stage": workflow_stage,
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            },
         )
         return {**cached["result"], "cache_hit": True}
 
@@ -907,7 +971,11 @@ def source_graph_query(
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=binding.authority_source, authority_state=binding.authority_state,
-        payload={"mode": mode},
+        payload={
+            "mode": mode,
+            "workflow_stage": workflow_stage,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        },
     )
     return result
 
@@ -1712,11 +1780,12 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     def _source_graph_query(
         mode: SourceGraphMode, query: str, budget: int = 64,
         target: str | None = None, bundle_type: SourceGraphBundleType = "explore",
+        workflow_stage: WorkflowStage = "unspecified",
     ) -> dict[str, Any]:
         """Bounded Source Graph discovery for this task."""
         return source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
-            target=target, bundle_type=bundle_type,
+            target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
         )
 
     @mcp.tool(name="aiworkhub_worker_session_current_state")

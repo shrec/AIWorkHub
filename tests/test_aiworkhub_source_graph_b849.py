@@ -143,9 +143,9 @@ def test_unregistered_language_is_explicit_fail_closed_not_regex_approximated(tm
     assert extraction.edges == ()
 
 
-def test_language_registry_exposes_all_33_families() -> None:
-    assert len(sg.LANGUAGE_CAPABILITIES) == 33
-    assert {"cpp", "json", "xml"}.issubset(sg.LANGUAGE_CAPABILITIES)
+def test_language_registry_exposes_all_34_families() -> None:
+    assert len(sg.LANGUAGE_CAPABILITIES) == 34
+    assert {"cpp", "json", "xml", "documentation"}.issubset(sg.LANGUAGE_CAPABILITIES)
     assert sg.LANGUAGE_CAPABILITIES["cpp"] == "semantic_lexical"
 
 
@@ -168,6 +168,25 @@ def test_json_xml_are_indexed_as_truthful_file_evidence(
     assert len(extraction.entities) == 1
     assert extraction.entities[0].evidence_label == sgast.FILE_EVIDENCE
     assert extraction.edges == ()
+
+
+def test_markdown_is_indexed_as_truthful_repository_document_evidence(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "docs" / "PRODUCT_ROADMAP.md"
+    _write(target, "# Product roadmap\n\nStage attribution remains open.\n")
+
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+
+    assert extraction.status == "file_evidence_only"
+    assert extraction.language == "documentation"
+    assert len(extraction.entities) == 1
+    assert extraction.entities[0].evidence_label == sgast.FILE_EVIDENCE
+
+    report = sg.build_index(repo, incremental=False)
+    assert report.files_seen == 1
+    literal = sg.bodygrep_query(repo, "Stage attribution remains open", budget=16)
+    assert literal["candidate_files"] == ["docs/PRODUCT_ROADMAP.md"]
+    assert literal["matches"]
 
 
 def test_cpp_cuda_semantic_lexical_extraction_records_symbols_bodies_and_calls(tmp_path):
@@ -495,7 +514,7 @@ def test_repo_language_policy_disables_and_reenables_cpp_incrementally(tmp_path)
         language_changes={"cpp": False},
         expected_revision=initial["revision"],
     )
-    assert disabled["enabled_count"] == 32
+    assert disabled["enabled_count"] == 33
     second = sg.build_index(repo, incremental=True)
     assert second.files_seen == 1
     assert second.files_removed == 1
@@ -505,7 +524,7 @@ def test_repo_language_policy_disables_and_reenables_cpp_incrementally(tmp_path)
         language_changes={"cpp": True},
         expected_revision=disabled["revision"],
     )
-    assert enabled["enabled_count"] == 33
+    assert enabled["enabled_count"] == 34
     third = sg.build_index(repo, incremental=True)
     assert third.files_seen == 2
     assert third.files_changed == 1

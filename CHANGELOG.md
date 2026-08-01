@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.35] - 2026-08-01
+
+### Added
+
+- Added Source Graph workflow-stage and latency telemetry backed by the
+  authenticated worker ledger, plus mode/stage/cohort KPI visualizations over
+  an aggregate-only bounded history of up to 1,000 process runs.
+- Added truthful context-byte economics from declared raw repository paths
+  versus the delivered project-context bundle. Token savings remain explicitly
+  unavailable without a tokenizer-bound counterfactual baseline.
+- Added Markdown and MDX as a configurable documentation
+  family, bringing Source Graph coverage to 34 code/data/documentation
+  families and making repository roadmaps and contracts searchable.
+
 ## [0.8.34] - 2026-08-01
 
 ### Added

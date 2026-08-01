@@ -26,7 +26,7 @@ TERMINAL_STATES = frozenset(
     }
 )
 NON_GREEN_STATES = TERMINAL_STATES - {"review_ready"}
-MAX_DAILY_BUCKETS = 14
+MAX_DAILY_BUCKETS = 30
 
 
 def _count(value: Any) -> int:
@@ -114,6 +114,20 @@ def build_kpi_snapshot(
             "source_graph_calls": 0,
         }
     )
+    topics: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"runs": 0, "terminal_runs": 0, "review_ready_runs": 0,
+                 "validation_failed_runs": 0, "source_graph_live_tasks": 0}
+    )
+    usage_cohorts: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"runs": 0, "terminal_runs": 0, "review_ready_runs": 0,
+                 "validation_failed_runs": 0}
+    )
+    economics = {
+        "measured_tasks": 0,
+        "raw_context_bytes": 0,
+        "delivered_bundle_bytes": 0,
+        "estimated_context_bytes_avoided": 0,
+    }
     for row in runs:
         state = str(row.get("state") or "unknown")
         adapter = str(row.get("adapter_id") or "unknown")[:120]
@@ -144,6 +158,55 @@ def build_kpi_snapshot(
         adapter_row["source_graph_calls"] += calls
         if live_calls:
             adapter_row["source_graph_live_tasks"] += 1
+
+        topic = str(row.get("topic") or "unknown")[:120]
+        topic_row = topics[topic]
+        topic_row["runs"] += 1
+        if state in TERMINAL_STATES:
+            topic_row["terminal_runs"] += 1
+        if state == "review_ready":
+            topic_row["review_ready_runs"] += 1
+        elif state == "validation_failed":
+            topic_row["validation_failed_runs"] += 1
+        if live_calls:
+            topic_row["source_graph_live_tasks"] += 1
+
+        stage_counts = tool_use.get("source_graph_stage_counts") if isinstance(tool_use, Mapping) else {}
+        attributed_stages = {
+            str(stage) for stage, count in (stage_counts.items() if isinstance(stage_counts, Mapping) else [])
+            if stage != "unspecified" and _count(count) > 0
+        }
+        satisfaction = str(tool_use.get("source_graph_satisfaction") or "") if isinstance(tool_use, Mapping) else ""
+        if live_calls and len(attributed_stages) >= 2:
+            cohort_name = "continuous_use"
+        elif live_calls:
+            cohort_name = "live_single_stage"
+        elif satisfaction == "injected_receipt":
+            cohort_name = "injected_only"
+        elif calls:
+            cohort_name = "stale_cached_or_zero_hit"
+        else:
+            cohort_name = "missing"
+        cohort = usage_cohorts[cohort_name]
+        cohort["runs"] += 1
+        if state in TERMINAL_STATES:
+            cohort["terminal_runs"] += 1
+        if state == "review_ready":
+            cohort["review_ready_runs"] += 1
+        elif state == "validation_failed":
+            cohort["validation_failed_runs"] += 1
+
+        estimate = infra.get("estimate") if isinstance(infra, Mapping) else None
+        if isinstance(estimate, Mapping):
+            raw_bytes = _count(estimate.get("raw_context_bytes"))
+            bundle_bytes = _count(estimate.get("bundle_bytes"))
+            if raw_bytes > 0:
+                economics["measured_tasks"] += 1
+                economics["raw_context_bytes"] += raw_bytes
+                economics["delivered_bundle_bytes"] += bundle_bytes
+                economics["estimated_context_bytes_avoided"] += max(
+                    0, raw_bytes - bundle_bytes
+                )
 
         day = _date_bucket(row)
         if day is None:
@@ -176,6 +239,21 @@ def build_kpi_snapshot(
         adapter_rows.append(row)
     adapter_rows.sort(key=lambda row: (-row["runs"], row["name"].lower()))
 
+    topic_rows = []
+    for name, values in topics.items():
+        row = {"name": name, **values}
+        row["review_ready_rate"] = _rate(values["review_ready_runs"], values["terminal_runs"])
+        row["source_graph_live_rate"] = _rate(values["source_graph_live_tasks"], values["runs"])
+        topic_rows.append(row)
+    topic_rows.sort(key=lambda row: (-row["runs"], row["name"].lower()))
+
+    cohort_rows = []
+    for name, values in usage_cohorts.items():
+        row = {"name": name, **values}
+        row["review_ready_rate"] = _rate(values["review_ready_runs"], values["terminal_runs"])
+        cohort_rows.append(row)
+    cohort_rows.sort(key=lambda row: (-row["runs"], row["name"]))
+
     callback_states = callback_health.get("by_state")
     callback_states = callback_states if isinstance(callback_states, Mapping) else {}
     delivered = _count(callback_states.get("delivered"))
@@ -186,6 +264,22 @@ def build_kpi_snapshot(
     source_failed = _count(source_graph.get("source_graph_failed_calls"))
     source_successful = max(0, source_calls - source_failed)
     mode_attributed = _count(source_graph.get("source_graph_mode_attributed_calls"))
+    stage_attributed = _count(source_graph.get("source_graph_stage_attributed_calls"))
+    latency = source_graph.get("source_graph_latency")
+    latency = latency if isinstance(latency, Mapping) else {}
+
+    mode_rows = [
+        {"name": str(name), "calls": _count(count)}
+        for name, count in (source_graph.get("source_graph_mode_counts") or {}).items()
+        if _count(count) > 0
+    ] if isinstance(source_graph.get("source_graph_mode_counts"), Mapping) else []
+    mode_rows.sort(key=lambda row: (-row["calls"], row["name"]))
+    stage_rows = [
+        {"name": str(name), "calls": _count(count)}
+        for name, count in (source_graph.get("source_graph_stage_counts") or {}).items()
+        if _count(count) > 0
+    ] if isinstance(source_graph.get("source_graph_stage_counts"), Mapping) else []
+    stage_rows.sort(key=lambda row: (-row["calls"], row["name"]))
 
     context_rows = []
     for key, label in (
@@ -216,8 +310,23 @@ def build_kpi_snapshot(
     ordered_days = sorted(daily)[-MAX_DAILY_BUCKETS:]
     daily_rows = [{"date": day, **daily[day]} for day in ordered_days]
 
+    raw_context_bytes = economics["raw_context_bytes"]
+    context_compression_rate = (
+        round(
+            100.0 * economics["estimated_context_bytes_avoided"] / raw_context_bytes,
+            1,
+        )
+        if raw_context_bytes > 0 else None
+    )
+    economics.update({
+        "context_compression_rate": context_compression_rate,
+        "measurement_label": "declared_raw_context_paths_vs_delivered_project_context_bundle_bytes",
+        "token_savings_available": False,
+        "token_savings_reason": "no_tokenizer_bound_counterfactual_baseline",
+    })
+
     return {
-        "schema_id": "aiworkhub.kpi.dashboard.v1",
+        "schema_id": "aiworkhub.kpi.dashboard.v2",
         "measurement": "bounded_worker_outcomes_and_explicit_manager_decisions",
         "window": {
             "label": f"latest {process_limit} process runs",
@@ -242,6 +351,11 @@ def build_kpi_snapshot(
             "source_graph_gate_satisfaction_rate": source_graph.get("gate_satisfaction_rate"),
             "source_graph_useful_call_rate": _rate(source_successful, source_calls),
             "source_graph_mode_attribution_rate": _rate(mode_attributed, source_calls),
+            "source_graph_stage_attribution_rate": _rate(stage_attributed, source_calls),
+            "source_graph_latency_p50_ms": latency.get("p50_ms"),
+            "source_graph_latency_p95_ms": latency.get("p95_ms"),
+            "context_compression_rate": context_compression_rate,
+            "estimated_context_bytes_avoided": economics["estimated_context_bytes_avoided"],
             "callback_delivery_rate": _rate(delivered, callback_terminal),
             "callback_backlog": _count(callback_health.get("backlog_count")),
             "callback_retries": _count(callback_health.get("retry_count")),
@@ -257,6 +371,11 @@ def build_kpi_snapshot(
         ],
         "daily": daily_rows,
         "adapters": adapter_rows,
+        "topics": topic_rows[:12],
+        "source_graph_modes": mode_rows,
+        "source_graph_stages": stage_rows,
+        "tool_use_cohorts": cohort_rows,
+        "economics": economics,
         "context": context_rows,
         "data_quality": {
             "acceptance_rate_available": manager_decisions > 0,
@@ -268,6 +387,9 @@ def build_kpi_snapshot(
             "process_window_truncated": truncated,
             "invalid_timestamp_rows": invalid_timestamps,
             "source_graph_unattributed_calls": max(0, source_calls - mode_attributed),
+            "source_graph_stage_unattributed_calls": max(0, source_calls - stage_attributed),
+            "source_graph_latency_samples": _count(latency.get("count")),
+            "source_graph_latency_samples_truncated": bool(latency.get("samples_truncated")),
             "sample_size": observed,
         },
     }

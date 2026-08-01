@@ -1011,7 +1011,7 @@ function renderKpis(snapshot) {
   const kpis = snapshot && snapshot.kpi_analytics && typeof snapshot.kpi_analytics === "object"
     ? snapshot.kpi_analytics
     : null;
-  if (!kpis || kpis.schema_id !== "aiworkhub.kpi.dashboard.v1") {
+  if (!kpis || !["aiworkhub.kpi.dashboard.v1", "aiworkhub.kpi.dashboard.v2"].includes(kpis.schema_id)) {
     elements.kpiDashboard.replaceChildren(
       createElement("div", "panel-list-empty", "No KPI evidence in this snapshot"),
     );
@@ -1041,6 +1041,8 @@ function renderKpis(snapshot) {
     ["Validation failed", kpiPercent(headline.validation_failed_rate), `${formatCount(headline.validation_failed_runs)} terminal outcomes`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
     ["Source Graph live", kpiPercent(headline.source_graph_live_rate), "authenticated live-task rate", "accent"],
     ["SG call success", kpiPercent(headline.source_graph_useful_call_rate), "calls without a recorded failure", "accent"],
+    ["SG workflow stages", kpiPercent(headline.source_graph_stage_attribution_rate), "calls carrying authenticated workflow-stage metadata", "accent"],
+    ["Context compression", kpiPercent(headline.context_compression_rate), `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`, "accent"],
     ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
     ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
   ];
@@ -1127,6 +1129,55 @@ function renderKpis(snapshot) {
   }
   chartGrid.appendChild(adapterPanel);
 
+  const stagePanel = createElement("section", "kpi-chart-panel");
+  stagePanel.appendChild(createElement("h3", "kpi-chart-title", "Source Graph workflow stages"));
+  const stages = asArray(kpis.source_graph_stages);
+  const stageMax = Math.max(1, ...stages.map((item) => numberValue(item.calls)));
+  if (stages.length) {
+    for (const item of stages) {
+      stagePanel.appendChild(kpiBarRow(
+        String(item.name || "unspecified").replaceAll("_", " "),
+        item.calls,
+        stageMax,
+        item.name === "unspecified" ? "neutral" : "accent",
+      ));
+    }
+  } else {
+    stagePanel.appendChild(createElement("div", "panel-list-empty", "No workflow-stage attribution yet"));
+  }
+  chartGrid.appendChild(stagePanel);
+
+  const modesPanel = createElement("section", "kpi-chart-panel");
+  modesPanel.appendChild(createElement("h3", "kpi-chart-title", "Source Graph modes"));
+  const modes = asArray(kpis.source_graph_modes);
+  const modeMax = Math.max(1, ...modes.map((item) => numberValue(item.calls)));
+  if (modes.length) {
+    for (const item of modes.slice(0, 12)) {
+      modesPanel.appendChild(kpiBarRow(item.name || "unknown", item.calls, modeMax, "accent"));
+    }
+  } else {
+    modesPanel.appendChild(createElement("div", "panel-list-empty", "No authenticated mode metadata yet"));
+  }
+  chartGrid.appendChild(modesPanel);
+
+  const cohortPanel = createElement("section", "kpi-chart-panel");
+  cohortPanel.appendChild(createElement("h3", "kpi-chart-title", "Tool-use cohorts"));
+  const cohorts = asArray(kpis.tool_use_cohorts);
+  if (cohorts.length) {
+    for (const item of cohorts) {
+      cohortPanel.appendChild(kpiBarRow(
+        String(item.name || "unknown").replaceAll("_", " "),
+        item.review_ready_rate,
+        100,
+        item.name === "continuous_use" ? "good" : "neutral",
+        `${kpiPercent(item.review_ready_rate)} · ${formatCount(item.terminal_runs)} terminal`,
+      ));
+    }
+  } else {
+    cohortPanel.appendChild(createElement("div", "panel-list-empty", "No cohort evidence yet"));
+  }
+  chartGrid.appendChild(cohortPanel);
+
   const contextPanel = createElement("section", "kpi-chart-panel");
   contextPanel.appendChild(createElement("h3", "kpi-chart-title", "Context execution"));
   for (const item of asArray(kpis.context)) {
@@ -1145,7 +1196,7 @@ function renderKpis(snapshot) {
   fragment.appendChild(createElement(
     "div",
     `kpi-disclosure${quality.process_window_truncated || numberValue(quality.invalid_timestamp_rows) ? " warning" : ""}`,
-    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} Source Graph calls lack mode attribution; ${formatCount(quality.invalid_timestamp_rows)} invalid timestamps. No token-savings or causal quality claim is inferred.`,
+    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} calls lack mode attribution; ${formatCount(quality.source_graph_stage_unattributed_calls)} lack workflow-stage attribution; Source Graph latency p50 ${headline.source_graph_latency_p50_ms == null ? "—" : `${Number(headline.source_graph_latency_p50_ms).toFixed(1)} ms`} / p95 ${headline.source_graph_latency_p95_ms == null ? "—" : `${Number(headline.source_graph_latency_p95_ms).toFixed(1)} ms`}. Byte compression uses declared raw paths versus delivered bundle bytes; no token-savings or causal quality claim is inferred.`,
   ));
   elements.kpiDashboard.replaceChildren(fragment);
 }

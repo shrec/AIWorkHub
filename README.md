@@ -61,7 +61,7 @@ not alternate names for the same feature.
 
 | Surface | What it represents | Who uses it |
 | --- | --- | --- |
-| **Source Graph** | An automatically refreshed structural index with 33 configurable language/data families and 31 bounded query modes, used to return code context instead of repeatedly scanning the tree | Managers and workers |
+| **Source Graph** | An automatically refreshed structural index with 34 configurable code/data/documentation families and 31 bounded query modes, used to return repository context instead of repeatedly scanning the tree | Managers and workers |
 | **Manager Context Graph** | An opt-in, append-only ledger and deterministic graph of manager conversation evidence across repository, thread, session and task identities | Verified managers only |
 
 The Manager Context Graph can search an earlier decision, recover the exact
@@ -177,17 +177,18 @@ never inherit the manager launch capability.
 | Area | Current capability |
 | --- | --- |
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
-| Source Graph | 33 configurable language/data families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
+| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
 | Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
 | Platforms | Linux, Windows, macOS and Remote-SSH release qualification |
 
 The KPI view separates explicit manager decisions from worker terminal
-outcomes and plots only bounded repository evidence. Every rate carries its
-sample window or denominator; Source Graph and context-tool charts come from
-authenticated worker receipts, while token savings and causal quality gains
-are deliberately not inferred.
+outcomes and plots only bounded repository evidence. Its larger aggregate-only
+history shows Source Graph modes, workflow stages, latency, tool-use cohorts
+and deterministic raw-path-versus-delivered-bundle byte economics. Every rate
+carries its sample window or denominator; token savings and causal quality
+gains are deliberately not inferred.
 
 The canonical combined review surface is `aiworkhub_completion_inbox`. Tool
 availability and write authority are reported by the live MCP runtime; clients

@@ -22,9 +22,10 @@ class LanguageSpec:
     capability: str = "file_evidence"
 
 
-# Exactly 33 repository language/file families.  Families keep the dashboard
+# Exactly 34 repository language/file families.  Families keep the dashboard
 # usable (for example one C/C++ switch) while covering the extensions users
-# expect from a polyglot repository, including structured JSON/XML inputs.
+# expect from a polyglot repository, including structured JSON/XML inputs and
+# the Markdown documents that carry repository contracts and roadmaps.
 LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("python", "Python", (".py", ".pyi"), "semantic_ast"),
     LanguageSpec("php", "PHP", (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8"), "semantic_lexical"),
@@ -59,6 +60,7 @@ LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("toml", "TOML", (".toml",)),
     LanguageSpec("xml", "XML", (".xml", ".xsd", ".xsl", ".xslt", ".svg")),
     LanguageSpec("web", "Web markup / styles", (".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue", ".svelte")),
+    LanguageSpec("documentation", "Markdown documentation", (".md", ".markdown", ".mdx")),
 )
 
 LANGUAGE_BY_ID: dict[str, LanguageSpec] = {spec.id: spec for spec in LANGUAGE_SPECS}
@@ -72,8 +74,8 @@ LANGUAGE_CAPABILITIES: dict[str, str] = {
     spec.id: spec.capability for spec in LANGUAGE_SPECS
 }
 
-if len(LANGUAGE_BY_ID) != 33:  # pragma: no cover - import-time invariant
-    raise RuntimeError("source_graph_language_registry_must_have_33_families")
+if len(LANGUAGE_BY_ID) != 34:  # pragma: no cover - import-time invariant
+    raise RuntimeError("source_graph_language_registry_must_have_34_families")
 if len(LANGUAGE_BY_EXTENSION) != sum(len(spec.extensions) for spec in LANGUAGE_SPECS):
     raise RuntimeError("source_graph_language_extension_collision")
 

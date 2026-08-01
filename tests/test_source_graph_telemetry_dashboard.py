@@ -41,6 +41,18 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
                     "source_graph_cache_hits": 1,
                     "source_graph_mode_counts": {"focus": 1, "bodygrep": 2},
                     "source_graph_mode_sequence": ["focus", "bodygrep", "bodygrep"],
+                    "source_graph_stage_counts": {"orientation": 1, "implementation": 1, "validation": 1},
+                    "source_graph_stage_sequence": ["orientation", "implementation", "validation"],
+                    "source_graph_mode_stage_counts": {
+                        "orientation": {"focus": 1},
+                        "implementation": {"bodygrep": 1},
+                        "validation": {"bodygrep": 1},
+                    },
+                    "source_graph_latency": {
+                        "count": 3,
+                        "samples_ms": [2.0, 5.0, 9.0],
+                        "samples_truncated": False,
+                    },
                     "call_count_by_tool": {
                         "source_graph": 3, "session_current_state": 1, "kb": 2,
                     },
@@ -138,6 +150,16 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_mode_unattributed_calls"] == 1
     assert result["source_graph_distinct_modes"] == 2
     assert result["source_graph_mode_attribution_rate"] == 75.0
+    assert result["source_graph_stage_counts"] == {
+        "orientation": 1, "implementation": 1, "validation": 1,
+    }
+    assert result["source_graph_stage_attributed_calls"] == 3
+    assert result["source_graph_stage_unattributed_calls"] == 1
+    assert result["source_graph_stage_attribution_rate"] == 75.0
+    assert result["source_graph_mode_stage_counts"]["orientation"] == {"focus": 1}
+    assert result["source_graph_latency"]["count"] == 3
+    assert result["source_graph_latency"]["p50_ms"] == 5.0
+    assert result["source_graph_latency"]["p95_ms"] == 9.0
     assert result["tool_call_counts"] == {
         "source_graph": 4, "session_current_state": 1, "kb": 2,
     }
