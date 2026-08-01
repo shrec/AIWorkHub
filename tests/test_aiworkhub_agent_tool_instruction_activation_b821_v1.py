@@ -67,6 +67,15 @@ def test_preview_single_provider_dry_run(tmp_repo):
     assert len(result["providers"]) == 1
 
 
+def test_mcp_target_annotation_is_a_filename_enum() -> None:
+    import typing
+
+    hints = typing.get_type_hints(mcp_surface._mcp_preview)
+    union_args = typing.get_args(hints["provider"])
+    literal = next(value for value in union_args if typing.get_origin(value) is typing.Literal)
+    assert typing.get_args(literal) == instr.PROVIDERS
+
+
 def test_inspect_on_missing_file(tmp_repo):
     """Inspect reports missing file without error."""
     result = mcp_surface.inspect_document(

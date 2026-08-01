@@ -298,6 +298,37 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert bundled["insights"]["ranked_symbols"]
 
 
+def test_multi_term_find_and_indexed_body_modes_are_non_empty(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "telemetry.py",
+        "def collect_graph_metrics():\n"
+        "    live_source_graph_calls = 3\n"
+        "    return live_source_graph_calls\n",
+    )
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        assert sg.find(conn, "collect graph metrics")
+    finally:
+        conn.close()
+
+    exact_body = sg.body_query(repo, "collect_graph_metrics", budget=16)
+    assert exact_body["matches"]
+    assert "live_source_graph_calls" in exact_body["matches"][0]["source"]
+
+    literal = sg.bodygrep_query(repo, "live_source_graph_calls", budget=16)
+    assert literal["matches"]
+    assert literal["candidate_files"] == ["pkg/telemetry.py"]
+    assert literal["files_scanned"] == 1
+    assert literal["scan_truncated"] is False
+
+    assert sg.file_query(repo, "pkg/telemetry.py", budget=16)["matches"]
+    assert sg.function_query(repo, "collect_graph_metrics", budget=16)["matches"]
+    assert sg.class_query(repo, "MissingClass", budget=16)["matches"] == []
+    assert sg.deps_query(repo, "collect_graph_metrics", budget=16)["mode"] == "deps"
+
+
 # ---------------------------------------------------------------------------
 # B881: truthful bounded JS/TS semantic lexical evidence
 # ---------------------------------------------------------------------------
@@ -979,7 +1010,8 @@ def test_all_repository_neutral_analytics_are_bounded_and_canonical(tmp_path):
     sg.build_index(repo, incremental=True)
 
     analytic_modes = set(sg.SOURCE_GRAPH_MODES) - {
-        "focus", "slice", "context", "impact", "trace", "bundle",
+        "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
+        "impact", "trace", "deps", "bundle",
     }
     assert analytic_modes == {
         "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",

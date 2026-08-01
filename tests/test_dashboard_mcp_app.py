@@ -309,12 +309,14 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
         dashboard_mcp_app.SETTINGS_TOOL_NAME,
         dashboard_mcp_app.STORAGE_RETENTION_PREVIEW_TOOL_NAME,
         dashboard_mcp_app.TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
+        dashboard_mcp_app.TASK_RETENTION_PREVIEW_TOOL_NAME,
         dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
     expected_names.update(dashboard_mcp_app.SETTINGS_UPDATE_TOOLS)
     expected_names.update(dashboard_mcp_app.SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
     expected_names.update(dashboard_mcp_app.STORAGE_RETENTION_WRITE_TOOLS)
     expected_names.update(dashboard_mcp_app.TERMINAL_LOG_RETENTION_WRITE_TOOLS)
+    expected_names.update(dashboard_mcp_app.TASK_RETENTION_WRITE_TOOLS)
     assert set(names) == expected_names
     assert set(fake_mcp.registered) == expected_names
     assert fake_mcp.registered["aiworkhub_dashboard_snapshot"] is dashboard_mcp_app.snapshot_view

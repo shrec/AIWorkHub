@@ -115,6 +115,7 @@ class SourceGraphDaemon:
         )
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._refresh_event = threading.Event()
         # Non-overlapping guard: the periodic loop and an explicit
         # refresh_now() never build this repository's database concurrently.
         self._build_lock = threading.Lock()
@@ -310,7 +311,11 @@ class SourceGraphDaemon:
 
     def _loop(self) -> None:
         self._run_one_build()
-        while not self._stop_event.wait(self.refresh_interval_seconds):
+        while not self._stop_event.is_set():
+            self._refresh_event.wait(self.refresh_interval_seconds)
+            self._refresh_event.clear()
+            if self._stop_event.is_set():
+                break
             self._run_one_build()
 
     def start(self) -> None:
@@ -323,6 +328,7 @@ class SourceGraphDaemon:
             if self.is_running():
                 return
             self._stop_event.clear()
+            self._refresh_event.clear()
             self._started_at = _utcnow()
             thread = threading.Thread(
                 target=self._loop,
@@ -334,6 +340,7 @@ class SourceGraphDaemon:
 
     def stop(self, *, timeout: float = 5.0) -> None:
         self._stop_event.set()
+        self._refresh_event.set()
         self._terminate_build_process()
         thread = self._thread
         if thread is not None:
@@ -358,6 +365,29 @@ class SourceGraphDaemon:
         if not triggered:
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
         return {**health, "triggered": True}
+
+    def request_refresh(self) -> dict[str, Any]:
+        """Queue an immediate refresh without running indexing on the caller.
+
+        MCP stdio request handling must stay responsive while a large source
+        tree is parsed. Multiple requests coalesce into one wake-up and the
+        existing build lock still guarantees that periodic and requested
+        builds never overlap.
+        """
+
+        if not self.is_running():
+            self.start()
+        already_queued = self._refresh_event.is_set()
+        self._refresh_event.set()
+        health = self.health()
+        return {
+            **health,
+            "ok": True,
+            "triggered": True,
+            "queued": True,
+            "coalesced": already_queued,
+            "reason": "refresh_queued",
+        }
 
     def wait_for_first_build(self, *, timeout: float = 10.0) -> bool:
         """Wait for the first build attempt without polling or sleeping.

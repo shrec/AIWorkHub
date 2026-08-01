@@ -34,7 +34,12 @@ LEGACY_PROCESS_LOG_RELATIVE_PATH = Path("logs/process_events.jsonl")
 LEGACY_PROCESS_FILES_RELATIVE_PATH = Path("logs/processes")
 MANIFEST_NAME = "manifest.json"
 UNDO_DAYS = 7
-KEEP_LAST_PER_TASK = 10
+# Completed task output is retained by age, not forever by per-task position.
+# The canonical append-only event ledger remains available after these bounded
+# stdout/stderr/request artifacts enter quarantine.  Active and review tasks
+# still fail closed below, so removing this historical keep-last exemption does
+# not discard evidence that a manager has not adjudicated yet.
+KEEP_LAST_PER_TASK = 0
 # Compatibility constant for callers/tests.  Writers rotate at 48 MiB and the
 # reader streams every immutable segment, so this is no longer a failure cap.
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
@@ -204,14 +209,15 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         eligible_by_task.setdefault(task_id, []).append(item)
 
     orphan_file_bytes = 0
+    orphan_candidates: list[dict[str, Any]] = []
     for request_id, files in sorted(inventory.items()):
         if not files:
             continue
         orphan_file_bytes += sum(int(item["size_bytes"]) for item in files)
-        protected.append({
+        orphan_item = {
             "request_id": request_id,
             "task_id": "",
-            "state": "unknown",
+            "state": "orphaned",
             "task_status": "unknown",
             "modified_at": datetime.fromtimestamp(
                 max(item["mtime_ns"] for item in files) / 1_000_000_000,
@@ -220,8 +226,12 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
             "modified_at_ns": max(item["mtime_ns"] for item in files),
             "size_bytes": sum(int(item["size_bytes"]) for item in files),
             "files": files,
-            "reason": "ledger_row_missing",
-        })
+        }
+        orphan_modified = datetime.fromisoformat(orphan_item["modified_at"])
+        if orphan_modified <= cutoff:
+            orphan_candidates.append(orphan_item)
+        else:
+            protected.append({**orphan_item, "reason": "orphan_retention_age_not_met"})
 
     candidates: list[dict[str, Any]] = []
     for rows in eligible_by_task.values():
@@ -234,6 +244,7 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
                 protected.append({**item, "reason": "retention_age_not_met"})
             else:
                 candidates.append(item)
+    candidates.extend(orphan_candidates)
     candidates.sort(key=lambda item: item["request_id"])
     digest_source = {
         "schema_id": SCHEMA_ID,

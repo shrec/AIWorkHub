@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import core
+from . import claude_auth
 from . import context_write_intents
 from . import context_writes
 from .platform_io import chmod_fd, lock_fd, unlock_fd
@@ -1975,6 +1976,14 @@ class ProcessManager:
             except deepseek_credentials.CredentialError as exc:
                 raise LaunchRejected(f"deepseek_credential_missing:{exc.reason}") from exc
             return credential.provider_env(resolved_model), resolved_model
+        if adapter_id == "claude_cli":
+            status = claude_auth.auth_status()
+            if not status.get("launchable"):
+                raise LaunchRejected(
+                    "claude_authentication_unavailable:"
+                    + str(status.get("blocker_reason") or "authentication_required")
+                )
+            return None, model
         if adapter_id == runtime_adapters.VSCODE_LM_ADAPTER:
             if not isinstance(model, str) or not model.strip():
                 raise LaunchRejected("vscode_lm_model_required")

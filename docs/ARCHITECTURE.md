@@ -60,6 +60,15 @@ handle registry verification and the one-way cutover from any legacy
 JSONL/SQLite layout to the canonical schema -- a fresh repository never
 re-imports historical rows.
 
+`task_retention.py` owns archived-task cleanup. It selects only archived rows
+older than the repository policy threshold, excludes tasks whose callback is
+still pending or in flight, and binds the preview to the exact candidate list
+with a digest. Confirmed cleanup first copies the task, events and callback
+records into canonical quarantine tables. Restore is available for seven days
+and refuses identity collisions; expired payload purge is a separate action,
+while the compact retention audit remains durable. No dashboard action deletes
+an active, processing or review task through this lifecycle.
+
 ## MCP server surface
 
 `server.py` wires the read-only and write-gated tool sets over
@@ -125,6 +134,12 @@ structural queries without `grep`. `project_context.py` /
 Source Graph + Session + AI Memory + KB bundle a code task receives, and
 report requested-vs-executed hit counts, bytes, and hashes rather than
 claiming injected context was consumed.
+
+Authenticated worker receipts feed both Source Graph-specific economics and a
+generic per-tool ledger. Dashboard aggregation therefore distinguishes calls,
+successful calls, bounded bytes and cache hits for Source Graph, Session
+Manager, AI Memory, KB and other MCP tools without treating a prompt-time
+injected bundle as continuous use.
 
 ## VS Code extension
 

@@ -2799,8 +2799,12 @@ def create_task(
         return _lifecycle_error("invalid_title_or_objective", 2)
     if priority not in ("low", "normal", "high", "critical"):
         return _lifecycle_error("invalid_priority", 2)
-    if task_type not in ("code", "data_classification", "research"):
-        return _lifecycle_error("invalid_task_type", 2)
+    allowed_task_types = ("code", "data_classification", "research")
+    if task_type not in allowed_task_types:
+        result = _lifecycle_error("invalid_task_type", 2)
+        result["allowed_task_types"] = list(allowed_task_types)
+        result["received_task_type"] = task_type[:80]
+        return result
 
     def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
         if not isinstance(value, list) or (required and not value) or len(value) > 128:
@@ -4669,7 +4673,11 @@ def source_graph_refresh_now() -> dict[str, Any]:
     daemon = module.get_daemon(root)
     if daemon is None:
         daemon = module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
-    return daemon.refresh_now()
+    # Never run repository parsing on the MCP stdio request thread. The
+    # daemon coalesces repeated requests and executes the build in its own
+    # background loop/subprocess while health, callbacks and dashboard calls
+    # remain responsive.
+    return daemon.request_refresh()
 
 
 def source_graph_stop() -> dict[str, Any]:

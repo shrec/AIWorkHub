@@ -221,11 +221,14 @@ def test_server_main_bootstraps_source_graph_before_stdio(monkeypatch):
     calls: list[str] = []
 
     monkeypatch.setattr(core, "source_graph_ensure_started", lambda: calls.append("source_graph"))
+    monkeypatch.setattr(server.core, "repo_root", lambda: Path("/repo"))
+    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda _repo: calls.append("reconciler"))
+    monkeypatch.setattr(server.task_reconciler, "stop_reconciler", lambda _repo: calls.append("reconciler_stop"))
     monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
 
     server.main()
 
-    assert calls == ["source_graph", "mcp"]
+    assert calls == ["source_graph", "reconciler", "mcp", "reconciler_stop"]
 
 
 def test_server_main_keeps_mcp_available_when_source_graph_bootstrap_fails(monkeypatch):
@@ -236,11 +239,14 @@ def test_server_main_keeps_mcp_available_when_source_graph_bootstrap_fails(monke
         raise RuntimeError("indexer_failed")
 
     monkeypatch.setattr(core, "source_graph_ensure_started", fail_start)
+    monkeypatch.setattr(server.core, "repo_root", lambda: Path("/repo"))
+    monkeypatch.setattr(server.task_reconciler, "ensure_started", lambda _repo: calls.append("reconciler"))
+    monkeypatch.setattr(server.task_reconciler, "stop_reconciler", lambda _repo: calls.append("reconciler_stop"))
     monkeypatch.setattr(server.mcp, "run", lambda: calls.append("mcp"))
 
     server.main()
 
-    assert calls == ["source_graph", "mcp"]
+    assert calls == ["source_graph", "reconciler", "mcp", "reconciler_stop"]
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +293,38 @@ def test_periodic_and_refresh_now_never_overlap(tmp_path, monkeypatch, cleanup_d
         daemon.stop()
 
     assert call_count["n"] == 1
+
+
+def test_core_refresh_queues_without_blocking_mcp_caller(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    daemon = source_graph_daemon.ensure_started(root)
+    assert daemon.wait_for_first_build(timeout=10)
+
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def blocking_build(repo_root, *, incremental=True, db_path=None):
+        build_started.set()
+        release_build.wait(timeout=5)
+        return source_graph.BuildReport(
+            repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
+            files_seen=0, files_changed=0, files_unchanged=0, files_removed=0,
+            entities_written=0, edges_written=0, errors=[],
+            build_revision="test", finished_at="t",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", blocking_build)
+    result = core.source_graph_refresh_now()
+    assert result["ok"] is True
+    assert result["queued"] is True
+    assert result["reason"] == "refresh_queued"
+    assert build_started.wait(timeout=5), "queued refresh did not reach daemon"
+    release_build.set()
 
 
 def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_daemons):

@@ -47,6 +47,7 @@ const state = {
   sessionEntries: [],
   kbEntries: [],
   featureSettings: null,
+  settingsTab: "features",
   returnPage: 0,
   returnSearch: "",
   returnTopic: "all",
@@ -144,6 +145,7 @@ const elements = {
   storageCleanupPreview: document.querySelector("#storage-cleanup-preview"),
   storageRegistrationPrune: document.querySelector("#storage-registration-prune"),
   terminalLogCleanupPreview: document.querySelector("#terminal-log-cleanup-preview"),
+  taskCleanupPreview: document.querySelector("#task-cleanup-preview"),
   runtimeCleanupPreview: document.querySelector("#runtime-cleanup-preview"),
   systemLogList: document.querySelector("#system-log-list"),
   systemLogCopy: document.querySelector("#system-log-copy"),
@@ -190,6 +192,8 @@ const elements = {
   detailEmpty: document.querySelector("#detail-empty"),
   detailContent: document.querySelector("#detail-content"),
   detailObjective: document.querySelector("#detail-objective"),
+  detailArchiveTask: document.querySelector("#detail-archive-task"),
+  detailRestoreTask: document.querySelector("#detail-restore-task"),
   detailMetadata: document.querySelector("#detail-metadata"),
   detailValidation: document.querySelector("#detail-validation"),
   detailResult: document.querySelector("#detail-result"),
@@ -787,7 +791,11 @@ function renderToolUse(snapshot) {
     && typeof snapshot.source_graph_telemetry === "object"
     ? snapshot.source_graph_telemetry
     : null;
-  if (!telemetry || !numberValue(telemetry.gated_tasks)) {
+  const observedToolCounts = telemetry && telemetry.tool_call_counts
+    && typeof telemetry.tool_call_counts === "object"
+    ? telemetry.tool_call_counts
+    : {};
+  if (!telemetry || (!numberValue(telemetry.gated_tasks) && !Object.keys(observedToolCounts).length)) {
     elements.toolUseList.replaceChildren(
       createElement("div", "panel-list-empty", "No authenticated worker tool-use evidence yet"),
     );
@@ -825,6 +833,63 @@ function renderToolUse(snapshot) {
     "telemetry-note",
     "Bytes are authenticated bounded tool return bytes. They are not inferred token or cost savings. Denial counts appear only when the provider emitted structured denial evidence.",
   ));
+
+  const toolCounts = observedToolCounts;
+  const toolSuccess = telemetry.tool_success_counts && typeof telemetry.tool_success_counts === "object"
+    ? telemetry.tool_success_counts
+    : {};
+  const toolBytes = telemetry.tool_bytes && typeof telemetry.tool_bytes === "object"
+    ? telemetry.tool_bytes
+    : {};
+  const toolCache = telemetry.tool_cache_hits && typeof telemetry.tool_cache_hits === "object"
+    ? telemetry.tool_cache_hits
+    : {};
+  const toolRows = Object.entries(toolCounts)
+    .map(([name, calls]) => ({
+      name,
+      calls: numberValue(calls),
+      success: numberValue(toolSuccess[name]),
+      bytes: numberValue(toolBytes[name]),
+      cache: numberValue(toolCache[name]),
+    }))
+    .sort((left, right) => right.calls - left.calls || left.name.localeCompare(right.name));
+  if (toolRows.length) {
+    fragment.appendChild(createElement("h3", "telemetry-section-title", "Authenticated MCP tools"));
+    for (const item of toolRows) {
+      const row = createElement("div", "stat-row tool-use-row");
+      const main = createElement("div", "stat-main");
+      const labels = createElement("div", "stat-labels");
+      labels.append(
+        createElement("span", "stat-name", item.name),
+        createElement(
+          "span",
+          "stat-breakdown",
+          `${item.success}/${item.calls} successful · ${formatBytes(item.bytes)} · ${item.cache} cache`,
+        ),
+      );
+      main.appendChild(labels);
+      row.append(main, createElement("strong", "stat-total", formatCount(item.calls)));
+      fragment.appendChild(row);
+    }
+  }
+
+  const modeCounts = telemetry.source_graph_mode_counts
+    && typeof telemetry.source_graph_mode_counts === "object"
+    ? Object.entries(telemetry.source_graph_mode_counts)
+      .map(([name, count]) => ({ name, count: numberValue(count) }))
+      .filter((item) => item.count > 0)
+      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+    : [];
+  if (modeCounts.length) {
+    fragment.appendChild(createElement("h3", "telemetry-section-title", "Source Graph modes"));
+    const modeGrid = createElement("div", "telemetry-mode-grid");
+    for (const item of modeCounts) {
+      const badge = createElement("span", "telemetry-mode-badge");
+      badge.append(createElement("span", "", item.name), createElement("strong", "", formatCount(item.count)));
+      modeGrid.appendChild(badge);
+    }
+    fragment.appendChild(modeGrid);
+  }
 
   const blockedReasons = telemetry.blocked_reason_counts
     && typeof telemetry.blocked_reason_counts === "object"
@@ -1145,6 +1210,29 @@ function renderStorage(snapshot) {
         : "The append-only process ledger and active/review task output are never cleanup candidates.",
     ));
   }
+  const archivedTasks = usage.task_retention && typeof usage.task_retention === "object"
+    ? usage.task_retention
+    : null;
+  if (archivedTasks) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Archived task retention"));
+    for (const [label, value] of [
+      ["Default policy", `keep ${formatCount(archivedTasks.policy_days || 90)} days after archive`],
+      ["Archived", formatCount(archivedTasks.archived_total)],
+      ["Eligible now", `${formatCount(archivedTasks.candidate_count)} shown · ${formatCount(archivedTasks.candidate_total)} total`],
+      ["Callback-protected", formatCount(archivedTasks.protected_callback_count)],
+    ]) {
+      const row = createElement("div", "storage-row storage-retention-row");
+      row.append(createElement("span", "storage-label", label), createElement("strong", "storage-value", value));
+      fragment.appendChild(row);
+    }
+    fragment.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      archivedTasks.ok === false
+        ? `Archived task scan degraded: ${String(archivedTasks.error || "unknown")}`
+        : "Only already-archived, policy-aged tasks with no pending callback can enter seven-day undo quarantine. Active, Processing and Review tasks are protected.",
+    ));
+  }
   const runtimeStorage = snapshot && snapshot.extension_runtime_storage
     && typeof snapshot.extension_runtime_storage === "object"
     ? snapshot.extension_runtime_storage
@@ -1224,6 +1312,34 @@ function renderStorage(snapshot) {
         const purge = createElement("button", "danger-button", "Purge logs");
         purge.type = "button";
         purge.dataset.purgeTerminalLogBatch = String(batch.batch_id || "");
+        actions.appendChild(purge);
+      }
+      row.append(detail, actions);
+      fragment.appendChild(row);
+    }
+  }
+  const taskBatches = asArray(usage.task_retention_batches)
+    .filter((item) => item && typeof item === "object");
+  if (taskBatches.length) {
+    fragment.appendChild(createElement("div", "storage-section-title", "Archived task quarantine"));
+    for (const batch of taskBatches) {
+      const row = createElement("div", "storage-batch-row");
+      const detail = createElement("div", "storage-batch-detail");
+      detail.append(
+        createElement("strong", "", String(batch.batch_id || "batch")),
+        createElement("span", "storage-label", `${formatCount(batch.task_count)} tasks · ${formatBytes(batch.bytes)} · ${batch.restored ? "restored" : `restore until ${batch.restore_deadline ? new Date(batch.restore_deadline).toLocaleString() : "unknown"}`}`),
+      );
+      const actions = createElement("div", "storage-batch-actions");
+      if (!batch.restored) {
+        const restore = createElement("button", "secondary-button", "Restore tasks");
+        restore.type = "button";
+        restore.dataset.restoreTaskBatch = String(batch.batch_id || "");
+        actions.appendChild(restore);
+      }
+      if (batch.purge_eligible) {
+        const purge = createElement("button", "danger-button", "Purge tasks");
+        purge.type = "button";
+        purge.dataset.purgeTaskBatch = String(batch.batch_id || "");
         actions.appendChild(purge);
       }
       row.append(detail, actions);
@@ -1969,6 +2085,11 @@ function renderTaskDetail(card) {
   elements.detailStatus.className = `status-badge ${status}`;
   elements.detailStatus.hidden = false;
   elements.detailObjective.textContent = card.objective || "No objective recorded";
+  const taskId = String(card.task_id || state.selectedTaskId || "");
+  elements.detailArchiveTask.dataset.taskId = taskId;
+  elements.detailRestoreTask.dataset.taskId = taskId;
+  elements.detailArchiveTask.hidden = status === "processing" || status === "review" || status === "archived";
+  elements.detailRestoreTask.hidden = status !== "archived";
   detailMetadata(card);
 
   const validation = String(card.validation_status || "unreported");
@@ -2666,6 +2787,26 @@ function renderSettings(payload) {
   state.featureSettings = payload;
   elements.settingsSummary.textContent = `Repository-local · revision ${Number(payload.revision || 0)}`;
   const fragment = document.createDocumentFragment();
+  const tabs = createElement("div", "settings-tabs");
+  const sections = {};
+  for (const [id, label] of [
+    ["features", "Features"],
+    ["source-graph", "Source Graph"],
+    ["retention", "Retention"],
+    ["telemetry", "Telemetry"],
+  ]) {
+    const button = createElement("button", "settings-tab", label);
+    button.type = "button";
+    button.dataset.settingsTab = id;
+    button.classList.toggle("is-active", state.settingsTab === id);
+    button.setAttribute("aria-pressed", String(state.settingsTab === id));
+    tabs.appendChild(button);
+    const section = createElement("section", "settings-tab-panel");
+    section.dataset.settingsPanel = id;
+    section.hidden = state.settingsTab !== id;
+    sections[id] = section;
+  }
+  fragment.appendChild(tabs);
   for (const [key, [label, description]] of Object.entries(FEATURE_LABELS)) {
     const row = document.createElement("label");
     row.className = "settings-row";
@@ -2693,7 +2834,7 @@ function renderSettings(payload) {
     track.className = "switch-track";
     control.append(input, track);
     row.append(copy, control);
-    fragment.append(row);
+    sections[key === "source_graph" ? "source-graph" : "features"].append(row);
   }
   const policy = payload.source_graph_policy;
   if (policy && policy.ok === true && Array.isArray(policy.languages)) {
@@ -2704,7 +2845,7 @@ function renderSettings(payload) {
     const detail = document.createElement("small");
     detail.textContent = "Repository-local indexing families. Semantic capability is shown explicitly; file evidence records exact path, size and hash without fabricating symbols.";
     heading.append(title, detail);
-    fragment.append(heading);
+    sections["source-graph"].append(heading);
     const grid = document.createElement("div");
     grid.className = "settings-language-grid";
     for (const language of policy.languages) {
@@ -2732,8 +2873,46 @@ function renderSettings(payload) {
       row.append(copy, control);
       grid.append(row);
     }
-    fragment.append(grid);
+    sections["source-graph"].append(grid);
   }
+  const retention = payload.retention_policy && typeof payload.retention_policy === "object"
+    ? payload.retention_policy
+    : {};
+  const retentionOverview = createElement("div", "settings-metric-grid");
+  for (const [label, value, detail] of [
+    ["Worker logs", `${numberValue(retention.logs_days) || 7} days`, "Finished task output; active/review evidence remains protected"],
+    ["Terminal worktrees", `${numberValue(retention.terminal_runs_days) || 30} days`, "Clean, pushed and repository-owned worktrees only"],
+    ["Archived tasks", `${numberValue(retention.archived_tasks_days) || 90} days`, "Then eligible for seven-day undo quarantine; callbacks remain protected"],
+    ["Graph generations", formatCount(retention.source_graph_generations || 3), "Latest immutable index generations retained"],
+    ["Worktree ceiling", formatBytes(retention.worktree_max_bytes), "Repository-local storage warning threshold"],
+  ]) {
+    const card = createElement("div", "settings-metric-card");
+    card.append(createElement("span", "usage-label", label), createElement("strong", "", value), createElement("small", "", detail));
+    retentionOverview.appendChild(card);
+  }
+  sections.retention.append(retentionOverview, createElement(
+    "div", "telemetry-note", "Cleanup is preview-first: quarantine, seven-day undo, then explicit permanent purge. Processing and Review tasks are never purge candidates.",
+  ));
+
+  const telemetry = state.snapshot && state.snapshot.source_graph_telemetry
+    && typeof state.snapshot.source_graph_telemetry === "object"
+    ? state.snapshot.source_graph_telemetry
+    : {};
+  const telemetryOverview = createElement("div", "settings-metric-grid");
+  for (const [label, value, detail] of [
+    ["Continuous live use", `${numberValue(telemetry.live_rate).toFixed(1)}%`, `${formatCount(telemetry.source_graph_live_tasks)}/${formatCount(telemetry.gated_tasks)} gated tasks`],
+    ["Fresh use", `${numberValue(telemetry.fresh_rate).toFixed(1)}%`, `${formatCount(telemetry.source_graph_fresh_calls)} authenticated calls`],
+    ["Zero-hit", formatCount(telemetry.source_graph_zero_hit_calls), "Visible misses; never silently counted as useful context"],
+    ["Policy violations", formatCount(telemetry.policy_violations), `${formatCount(telemetry.raw_discovery_denials)} raw-discovery denials observed`],
+  ]) {
+    const card = createElement("div", "settings-metric-card");
+    card.append(createElement("span", "usage-label", label), createElement("strong", "", value), createElement("small", "", detail));
+    telemetryOverview.appendChild(card);
+  }
+  sections.telemetry.append(telemetryOverview, createElement(
+    "div", "telemetry-note", "Only HMAC-verified worker MCP receipts are counted. Model prose, injected-only context and inferred token savings are reported separately.",
+  ));
+  for (const section of Object.values(sections)) fragment.appendChild(section);
   elements.settingsList.replaceChildren(fragment);
 }
 
@@ -2979,10 +3158,23 @@ elements.storageRegistrationPrune.addEventListener("click", () => {
 elements.terminalLogCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestTerminalLogCleanup" });
 });
+elements.taskCleanupPreview.addEventListener("click", () => {
+  vscode.postMessage({ type: "requestTaskCleanup" });
+});
 elements.runtimeCleanupPreview.addEventListener("click", () => {
   vscode.postMessage({ type: "requestRuntimeCleanup" });
 });
 elements.storageList.addEventListener("click", (event) => {
+  const restoreTasks = event.target.closest("[data-restore-task-batch]");
+  if (restoreTasks) {
+    vscode.postMessage({ type: "requestTaskQuarantineRestore", batchId: restoreTasks.dataset.restoreTaskBatch });
+    return;
+  }
+  const purgeTasks = event.target.closest("[data-purge-task-batch]");
+  if (purgeTasks) {
+    vscode.postMessage({ type: "requestTaskQuarantinePurge", batchId: purgeTasks.dataset.purgeTaskBatch });
+    return;
+  }
   const restoreRuntimes = event.target.closest("[data-restore-runtime-batch]");
   if (restoreRuntimes) {
     vscode.postMessage({ type: "requestRuntimeRestore", batchId: restoreRuntimes.dataset.restoreRuntimeBatch });
@@ -3012,6 +3204,16 @@ elements.storageList.addEventListener("click", (event) => {
   if (purge) {
     vscode.postMessage({ type: "requestStoragePurge", batchId: purge.dataset.purgeBatch });
   }
+});
+
+elements.detailArchiveTask.addEventListener("click", () => {
+  const taskId = String(elements.detailArchiveTask.dataset.taskId || "");
+  if (TASK_ID_RE.test(taskId)) vscode.postMessage({ type: "requestTaskArchive", taskId });
+});
+
+elements.detailRestoreTask.addEventListener("click", () => {
+  const taskId = String(elements.detailRestoreTask.dataset.taskId || "");
+  if (TASK_ID_RE.test(taskId)) vscode.postMessage({ type: "requestTaskRestore", taskId });
 });
 
 elements.systemLogCopy.addEventListener("click", () => {
@@ -3075,6 +3277,20 @@ elements.settingsList.addEventListener("change", (event) => {
     enabled: Boolean(input.checked),
     expectedRevision: Number(state.featureSettings.revision || 0),
   });
+});
+
+elements.settingsList.addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-settings-tab]");
+  if (!tab) return;
+  state.settingsTab = tab.dataset.settingsTab || "features";
+  for (const button of elements.settingsList.querySelectorAll("[data-settings-tab]")) {
+    const active = button.dataset.settingsTab === state.settingsTab;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const panel of elements.settingsList.querySelectorAll("[data-settings-panel]")) {
+    panel.hidden = panel.dataset.settingsPanel !== state.settingsTab;
+  }
 });
 
 elements.kbSearch.addEventListener("input", renderKbEntries);

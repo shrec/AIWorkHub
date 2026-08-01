@@ -49,6 +49,14 @@ def test_source_graph_required_blocks_raw_discovery_fallback() -> None:
     assert "record that reason" in text
 
 
+def test_source_graph_policy_requires_continuous_adaptive_use() -> None:
+    text = instr.render_canonical()
+    assert "Re-query whenever the active symbol" in text
+    assert "Start with focus/slice" in text
+    assert "bodygrep for indexed literal/body text" in text
+    assert "one preflight query is not continuous use" in text
+
+
 def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:
     text = instr.render_canonical()
     assert "Exact validation/build/test commands named by the card are allowed." in text

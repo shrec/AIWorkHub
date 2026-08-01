@@ -822,6 +822,33 @@ def test_task_create_polling_only_succeeds_while_route_is_pending(tmp_path, monk
     assert task_store.get_task(root, "TASK_POLLING_ONLY")["origin_thread_id"] == ""
 
 
+def test_task_create_invalid_type_enumerates_supported_values(tmp_path, monkeypatch):
+    root = tmp_path / "repo_invalid_type"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: {
+        "provider": "claude", "session_id": "session", "window_id": "window",
+    })
+    monkeypatch.setattr(core, "_verify_coordinator_capability", lambda runner: (True, "ok"))
+    result = core.create_task(
+        task_id="TASK_INVALID_TYPE",
+        title="Invalid type",
+        runner="claude_worker",
+        topic="task_mcp",
+        objective="Reject with an actionable schema hint.",
+        acceptance=["Rejected."],
+        allowed_writes=[],
+        callback_required=False,
+        task_type="coding",
+    )
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_task_type"
+    assert result["allowed_task_types"] == ["code", "data_classification", "research"]
+    assert result["received_task_type"] == "coding"
+
+
 def test_codex_shared_repo_route_manager_identity_without_window_env(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()

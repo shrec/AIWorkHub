@@ -711,6 +711,32 @@ def test_task_rows_receive_last_activity_and_liveness_from_process_report(monkey
     assert processing_row["last_activity_at"] == "2026-07-09T02:00:00+00:00"
 
 
+def test_task_row_exposes_structured_provider_root_error_without_secrets():
+    class FailedProvider(FakeProvider):
+        def get_agent_processes(self):
+            return {
+                "ok": True,
+                "processes": [{
+                    "task_id": "TASK_PENDING_B12_V1",
+                    "state": "launch_failed",
+                    "adapter_id": "claude_cli",
+                    "model": "claude-sonnet-5",
+                    "blocked_reason": (
+                        "401 authentication_failed token=super-secret-provider-token"
+                    ),
+                }],
+            }
+
+    snapshot = dashboard.build_snapshot(FailedProvider())
+    row = snapshot["tasks"]["pending"][0]
+    terminal = row["provider_terminal"]
+    assert terminal["state"] == "launch_failed"
+    assert terminal["category"] == "provider_authentication_failed"
+    assert terminal["retryable"] is True
+    assert terminal["adapter_id"] == "claude_cli"
+    assert "super-secret-provider-token" not in json.dumps(terminal)
+
+
 def test_task_detail_uses_actual_process_model_and_adapter():
     class ModelProvider(FakeProvider):
         def get_agent_processes(self):

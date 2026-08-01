@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import (
+    claude_auth,
     quality_evidence,
     runtime_adapters,
     source_graph_daemon,
@@ -51,6 +52,7 @@ DEFAULT_POLICY: dict[str, Any] = {
     "retention": {
         "logs_days": 7,
         "terminal_runs_days": 30,
+        "archived_tasks_days": 90,
         "source_graph_generations": 3,
         "worktree_max_bytes": 5 * 1024 * 1024 * 1024,
     },
@@ -121,6 +123,15 @@ def validate_policy(value: Any) -> dict[str, Any]:
             "logs_days": _bounded_int(retention.get("logs_days"), "logs_days", 1, 7),
             "terminal_runs_days": _bounded_int(
                 retention.get("terminal_runs_days"), "terminal_runs_days", 1, 365
+            ),
+            "archived_tasks_days": _bounded_int(
+                retention.get(
+                    "archived_tasks_days",
+                    DEFAULT_POLICY["retention"]["archived_tasks_days"],
+                ),
+                "archived_tasks_days",
+                7,
+                3650,
             ),
             "source_graph_generations": _bounded_int(
                 retention.get("source_graph_generations"),
@@ -268,6 +279,8 @@ def _provider_status(repo_root: Path, adapter_id: str, policy: Mapping[str, Any]
                 model=runtime_adapters.GLM_DEFAULT_MODEL,
                 adapter_id=adapter_id,
             )
+        elif adapter_id == "claude_cli":
+            readiness = claude_auth.auth_status(resolution.executable)
     except (OSError, RuntimeError, ValueError):
         readiness = None
     if isinstance(readiness, Mapping):

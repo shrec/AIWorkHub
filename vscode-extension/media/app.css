@@ -322,6 +322,39 @@ select:focus-visible,
   background: var(--review-soft);
 }
 
+.telemetry-section-title {
+  margin: 14px 0 7px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.telemetry-mode-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.telemetry-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--surface-subtle) 86%, var(--accent) 14%);
+  font-size: 10px;
+}
+
+.telemetry-mode-badge strong {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
 .header-tool-use {
   text-align: center;
 }
@@ -1700,6 +1733,56 @@ tbody tr.is-selected td:first-child {
   padding: 10px;
 }
 
+.settings-tabs {
+  position: sticky;
+  top: -10px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  padding: 10px 0 8px;
+  margin-bottom: 4px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-tab {
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.settings-tab:hover,
+.settings-tab.is-active {
+  color: var(--ink);
+  border-color: var(--line);
+  background: var(--accent-soft);
+}
+
+.settings-tab-panel[hidden] { display: none; }
+
+.settings-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+  padding: 6px 0 10px;
+}
+
+.settings-metric-card {
+  display: grid;
+  gap: 4px;
+  min-height: 92px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+}
+
+.settings-metric-card strong { font-size: 15px; }
+.settings-metric-card small { color: var(--muted); font-size: 9px; }
+
 .settings-row {
   display: flex;
   min-height: 58px;
@@ -2167,4 +2250,11 @@ tbody tr.is-selected td:first-child {
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.task-retention-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 0 0 12px;
 }

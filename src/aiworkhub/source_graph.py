@@ -61,7 +61,8 @@ IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
 MAX_POLICY_BYTES = 64 * 1024
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
-    "focus", "slice", "context", "impact", "trace", "bundle",
+    "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
+    "impact", "trace", "deps", "bundle",
     *sganalytics.ANALYTIC_MODES,
 )
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
@@ -768,13 +769,32 @@ def _fts_phrase(term: str) -> str:
     return f'"{cleaned}"*' if cleaned else '""'
 
 
+def _fts_terms(term: str, *, operator: str) -> str:
+    """Build a safe token query without treating whitespace as one phrase.
+
+    FTS5 phrase-prefix lookup is still the first and highest-precision pass.
+    The token passes repair the common natural-language query case where a
+    manager names several related symbols that do not occur contiguously in a
+    single indexed field.
+    """
+
+    tokens = [token for token in term.split() if token]
+    escaped = [f'"{token.replace(chr(34), chr(34) * 2)}"*' for token in tokens]
+    return f" {operator} ".join(escaped)
+
+
 def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[str, Any]]:
     term = (term or "").strip()
     if not term:
         return []
     limit = max(1, min(int(limit), MAX_BUDGET_ROWS))
-    try:
-        rows = conn.execute(
+    rows = []
+    expressions = [_fts_phrase(term)]
+    if len(term.split()) > 1:
+        expressions.extend((_fts_terms(term, operator="AND"), _fts_terms(term, operator="OR")))
+    for expression in expressions:
+        try:
+            rows = conn.execute(
             "SELECT e.file_path, e.kind, e.name, e.qualname, e.line_start, e.line_end, "
             "e.signature, e.evidence_label, e.confidence FROM entities_fts f "
             "JOIN entities e ON e.id = f.entity_id WHERE entities_fts MATCH ? "
@@ -783,10 +803,12 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
             "CASE WHEN e.kind IN ('function','method','class','struct','union','enum') "
             "THEN 0 WHEN e.kind='file' THEN 1 ELSE 2 END, "
             "bm25(entities_fts), e.file_path, e.line_start LIMIT ?",
-            (_fts_phrase(term), term, f"{term}%", limit),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+                (expression, term, f"{term}%", limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        if rows:
+            break
     if not rows:
         like = f"%{term}%"
         rows = conn.execute(
@@ -796,6 +818,192 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
             (like, like, limit),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def bodygrep_query(repo_root: Path, term: str, budget: int = 64) -> dict[str, Any]:
+    """Search literal/body text only inside canonical indexed source files.
+
+    The graph stores symbols and edges, not whole file bodies.  This bounded
+    mode closes that deliberate storage gap without shelling out to grep or
+    silently scanning ignored/unindexed paths.  It reports scan limits so a
+    zero hit remains truthful rather than looking like full-repository proof.
+    """
+
+    term = (term or "").strip()
+    if not term:
+        return {
+            "mode": "bodygrep", "query": term, "budget": 0, "matches": [],
+            "candidate_files": [], "files_scanned": 0, "bytes_scanned": 0,
+            "scan_truncated": False, "truncated": False,
+        }
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    byte_cap = max(512, budget * 512)
+    scan_file_cap = max(64, min(4000, budget * 32))
+    scan_byte_cap = max(1_048_576, min(32 * 1_048_576, budget * 262_144))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        paths = [
+            str(row["file_path"])
+            for row in conn.execute(
+                "SELECT file_path FROM files ORDER BY file_path LIMIT ?",
+                (scan_file_cap + 1,),
+            )
+        ]
+    finally:
+        conn.close()
+
+    scan_truncated = len(paths) > scan_file_cap
+    paths = paths[:scan_file_cap]
+    repo_root = repo_root.resolve()
+    needle = term.casefold()
+    matches: list[dict[str, Any]] = []
+    files_scanned = 0
+    bytes_scanned = 0
+    for file_path in paths:
+        target = (repo_root / file_path).resolve()
+        if not target.is_relative_to(repo_root):
+            continue
+        try:
+            raw = target.read_bytes()
+        except OSError:
+            continue
+        if bytes_scanned + len(raw) > scan_byte_cap:
+            scan_truncated = True
+            break
+        bytes_scanned += len(raw)
+        files_scanned += 1
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if needle not in line.casefold():
+                continue
+            matches.append({
+                "file_path": file_path,
+                "kind": "body_match",
+                "name": term,
+                "qualname": f"{file_path}:{line_number}",
+                "line_start": line_number,
+                "line_end": line_number,
+                "signature": line.strip()[:320],
+                "evidence_label": "EXTRACTED",
+                "confidence": 1.0,
+            })
+            if len(matches) >= budget:
+                scan_truncated = True
+                break
+        if len(matches) >= budget:
+            break
+    rows, output_truncated = _bounded_rows(matches, budget, byte_cap)
+    payload = {
+        "mode": "bodygrep", "query": term, "budget": budget,
+        "matches": rows,
+        "candidate_files": _candidate_files(rows, limit=min(16, budget)),
+        "files_scanned": files_scanned,
+        "bytes_scanned": bytes_scanned,
+        "scan_file_cap": scan_file_cap,
+        "scan_byte_cap": scan_byte_cap,
+        "scan_truncated": scan_truncated,
+        "truncated": bool(output_truncated or scan_truncated),
+    }
+    return _fit_payload_bytes(payload, byte_cap)
+
+
+def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
+    """Return the bounded body of one exact indexed symbol."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        match = body(conn, repo_root, name)
+    finally:
+        conn.close()
+    matches = [match] if match else []
+    return _fit_payload_bytes({
+        "mode": "body", "query": name, "budget": budget,
+        "matches": matches,
+        "candidate_files": _candidate_files(matches, limit=1),
+        "truncated": False,
+    }, max(512, budget * 512))
+
+
+def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, Any]:
+    """Return exact canonical context for one indexed repository path."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        payload = context(conn, file_path)
+    finally:
+        conn.close()
+    if payload.get("found"):
+        entity_limit = max(1, min(16, budget // 2))
+        edge_limit = max(1, min(16, budget // 2))
+        payload["entities"] = payload["entities"][:entity_limit]
+        payload["edges"] = payload["edges"][:edge_limit]
+        file_match = {
+            **dict(payload.get("file") or {}),
+            "kind": "file",
+            "name": Path(file_path).name,
+            "qualname": file_path,
+            "line_start": 1,
+            "line_end": 1,
+        }
+    else:
+        file_match = None
+    return _fit_payload_bytes({
+        "mode": "file", "query": file_path, "budget": budget,
+        "matches": [file_match] if file_match else [],
+        "contexts": [payload] if payload.get("found") else [],
+        "candidate_files": [file_path] if payload.get("found") else [],
+        "truncated": False,
+    }, max(4096, budget * 768))
+
+
+def function_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
+    """Return exact function/method authorities, including bounded bodies."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = func(conn, name, limit=budget)
+        for match in matches:
+            match["source"] = _source_snippet(repo_root, match)
+    finally:
+        conn.close()
+    return _fit_payload_bytes({
+        "mode": "function", "query": name, "budget": budget,
+        "matches": matches,
+        "candidate_files": _candidate_files(matches, limit=min(16, budget)),
+        "truncated": len(matches) >= budget,
+    }, max(512, budget * 512))
+
+
+def class_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
+    """Return exact class/struct/enum authorities, including bounded bodies."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = struct(conn, name, limit=budget)
+        for match in matches:
+            match["source"] = _source_snippet(repo_root, match)
+    finally:
+        conn.close()
+    return _fit_payload_bytes({
+        "mode": "class", "query": name, "budget": budget,
+        "matches": matches,
+        "candidate_files": _candidate_files(matches, limit=min(16, budget)),
+        "truncated": len(matches) >= budget,
+    }, max(512, budget * 512))
+
+
+def deps_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
+    """Expose the bidirectional call/import dependency surface explicitly."""
+
+    payload = trace(repo_root, query, budget)
+    return {**payload, "mode": "deps"}
 
 
 def func(conn: sqlite3.Connection, name: str, *, limit: int = 24) -> list[dict[str, Any]]:
@@ -1131,26 +1339,31 @@ def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, An
         files = [query] if exact else _candidate_files(matches, limit=min(8, budget))
         contexts: list[dict[str, Any]] = []
         remaining = budget
-        for path in files:
+        for path in files[:4]:
             item = context(conn, path)
-            item["entities"] = item["entities"][:remaining]
-            for entity in item["entities"][: min(6, remaining)]:
+            per_file = max(1, min(8, remaining))
+            item["entities"] = item["entities"][:per_file]
+            item["edges"] = item["edges"][:per_file]
+            for entity in item["entities"][: min(4, per_file)]:
                 if entity.get("kind") in {"function", "method", "class", "struct"}:
-                    entity["source"] = _source_snippet(repo_root, {**entity, "file_path": path})
+                    entity["source"] = _source_snippet(
+                        repo_root, {**entity, "file_path": path}, max_chars=800
+                    )
             contexts.append(item)
-            remaining -= len(item["entities"])
+            remaining -= len(item["entities"]) + len(item["edges"])
             if remaining <= 0:
                 break
-        rows, truncated = _bounded_rows(contexts, budget, max(512, budget * 512))
+        rows, truncated = _bounded_rows(contexts, budget, max(4096, budget * 768))
         insights = sginsights.slice_insights(
             conn, repo_root, matches, budget=min(budget, 32),
         ) if matches else {}
         return _fit_payload_bytes({
             "mode": "context", "query": query, "budget": budget,
-            "matches": matches[: min(budget, 16)], "contexts": rows,
+            "matches": matches[: min(budget, 8)], "contexts": rows,
+            "candidate_files": files[:4],
             "insights": insights,
             "truncated": truncated,
-        }, max(512, budget * 512))
+        }, max(4096, budget * 768))
     finally:
         conn.close()
 
@@ -1331,7 +1544,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("summary")
 
-    for name in ("focus", "slice", "trace", "impact", *sganalytics.ANALYTIC_MODES):
+    for name in (
+        "file", "function", "class", "body-query", "focus", "slice",
+        "bodygrep", "trace", "impact", "deps", *sganalytics.ANALYTIC_MODES,
+    ):
         p = sub.add_parser(name)
         p.add_argument("term")
         p.add_argument("budget", type=int, nargs="?", default=64)
@@ -1372,16 +1588,28 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(context(conn, args.term))
         elif args.command == "summary":
             _print_json(summary(conn))
+        elif args.command == "file":
+            _print_json(file_query(repo_root, args.term, args.budget))
+        elif args.command == "function":
+            _print_json(function_query(repo_root, args.term, args.budget))
+        elif args.command == "class":
+            _print_json(class_query(repo_root, args.term, args.budget))
+        elif args.command == "body-query":
+            _print_json(body_query(repo_root, args.term, args.budget))
         elif args.command == "focus":
             _print_json(focus(repo_root, args.term, args.budget))
         elif args.command == "slice":
             _print_json(slice_(repo_root, args.term, args.budget))
+        elif args.command == "bodygrep":
+            _print_json(bodygrep_query(repo_root, args.term, args.budget))
         elif args.command == "context-query":
             _print_json(context_query(repo_root, args.term, args.budget))
         elif args.command == "trace":
             _print_json(trace(repo_root, args.term, args.budget))
         elif args.command == "impact":
             _print_json(impact(repo_root, args.term, args.budget))
+        elif args.command == "deps":
+            _print_json(deps_query(repo_root, args.term, args.budget))
         elif args.command in sganalytics.ANALYTIC_MODES:
             _print_json(analytics_query(repo_root, args.command, args.term, args.budget))
         elif args.command == "bundle":
@@ -1411,6 +1639,9 @@ __all__ = [
     "SOURCE_GRAPH_MODES",
     "SourceGraphError",
     "body",
+    "body_query",
+    "bodygrep_query",
+    "class_query",
     "build_index",
     "bundle",
     "analytics_query",
@@ -1423,9 +1654,12 @@ __all__ = [
     "update_language_policy",
     "connect",
     "context",
+    "deps_query",
     "context_query",
     "find",
+    "file_query",
     "focus",
+    "function_query",
     "func",
     "impact",
     "slice_",

@@ -281,6 +281,7 @@ from . import process_launcher
 from . import review_summarizer
 from . import stale_recovery
 from . import task_engine
+from . import task_reconciler
 from . import worker_ai_tools_mcp
 from . import dependency_autolaunch
 from . import quality_evidence
@@ -1640,7 +1641,18 @@ def main() -> None:
         # MCP must remain available so health/InitRepo can explain or repair
         # indexing; startup indexing failure must not kill the whole server.
         pass
-    mcp.run()
+    root = core.repo_root()
+    try:
+        task_reconciler.ensure_started(root)
+    except Exception:
+        # As with Source Graph, reconciliation startup must never make MCP
+        # unavailable. Its health remains diagnosable and the next reload can
+        # retry registration.
+        pass
+    try:
+        mcp.run()
+    finally:
+        task_reconciler.stop_reconciler(root)
 
 
 if __name__ == "__main__":

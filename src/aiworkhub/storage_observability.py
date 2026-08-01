@@ -16,7 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import repo_policy, storage_retention, terminal_log_retention, worktree_storage
+from . import (
+    repo_policy,
+    storage_retention,
+    task_retention,
+    task_store,
+    terminal_log_retention,
+    worktree_storage,
+)
 
 SCAN_TTL_SECONDS = 60.0
 
@@ -108,6 +115,19 @@ def _measure(repo_root: Path) -> dict[str, Any]:
             "projected_bytes": 0,
         }
         terminal_log_batches = []
+    try:
+        archived_tasks = task_retention.preview(repo_root)
+        task_retention_batches = task_retention.list_batches(repo_root).get("batches") or []
+    except (task_retention.TaskRetentionError, task_store.TaskStoreError) as exc:
+        archived_tasks = {
+            "ok": False,
+            "error": str(exc)[:160],
+            "candidate_count": 0,
+            "candidate_total": 0,
+            "archived_total": 0,
+            "protected_callback_count": 0,
+        }
+        task_retention_batches = []
     return {
         "scan_status": "ready",
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -136,6 +156,8 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         "quarantine_batches": quarantine_batches,
         "terminal_log_retention": terminal_logs,
         "terminal_log_quarantine_batches": terminal_log_batches,
+        "task_retention": archived_tasks,
+        "task_retention_batches": task_retention_batches,
         "errors": [],
     }
 
@@ -233,6 +255,15 @@ def snapshot(repo_root: Path | str) -> dict[str, Any]:
                 "projected_bytes": 0,
             },
             "terminal_log_quarantine_batches": [],
+            "task_retention": {
+                "ok": True,
+                "dry_run": True,
+                "candidate_count": 0,
+                "candidate_total": 0,
+                "archived_total": 0,
+                "protected_callback_count": 0,
+            },
+            "task_retention_batches": [],
             "errors": [],
         }
     elif running:

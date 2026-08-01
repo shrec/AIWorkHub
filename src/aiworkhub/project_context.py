@@ -35,7 +35,8 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     "kb": {"bytes": 4 * 1024, "rows": 8},
 }
 SOURCE_GRAPH_MODES = (
-    "focus", "slice", "context", "impact", "trace", "bundle",
+    "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
+    "impact", "trace", "deps", "bundle",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -85,7 +86,10 @@ def _task_context_kind(card: dict[str, Any], raw: dict[str, Any]) -> str:
     explicit = raw.get("task_type") or raw.get("context_kind")
     if explicit is not None:
         if explicit not in TASK_CONTEXT_KINDS:
-            raise ProjectContextError("project_context.task_type_invalid")
+            raise ProjectContextError(
+                "project_context.task_type_invalid:allowed="
+                + "|".join(TASK_CONTEXT_KINDS)
+            )
         return str(explicit)
     mode = str(card.get("mode") or "").lower()
     objective = str(card.get("objective") or "").lower()

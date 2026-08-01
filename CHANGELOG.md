@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.30] - 2026-08-01
+
+### Added
+
+- Added reversible archived-task retention: age-based preview, protection for
+  pending callback delivery, digest-bound quarantine, seven-day undo,
+  collision-safe restore, separately confirmed purge and a durable compact
+  audit trail. Dashboard task details now expose archive/restore actions and
+  Storage exposes cleanup and quarantine controls.
+- Expanded authenticated tool-use accounting beyond Source Graph with
+  per-tool calls, successful calls, bounded bytes and cache hits in the
+  dashboard.
+- Added bounded first-party Claude CLI subscription preflight using the CLI's
+  own redacted auth-status command. Claude subscription auth remains distinct
+  from Copilot/VS Code model consent and no credential is copied.
+
+### Fixed
+
+- Preserved exact Source Graph file/context results under mature-repository
+  output budgets instead of allowing an oversized nested context to erase the
+  entire match.
+- Made terminal-log expiration follow configured age limits without retaining
+  an unbounded per-task tail after completion; active and review evidence
+  remains protected.
+- Added a bounded liveness reconciler so abandoned processing rows reach
+  truthful review dispositions instead of silently accumulating.
+
 ## [0.8.29] - 2026-08-01
 
 ### Fixed

@@ -130,7 +130,8 @@ BOUND_ENV_VARS: tuple[str, ...] = (
 STORAGE_REGISTRY_RELATIVE_PATH = Path(".aiworkhub") / "config" / "storage.json"
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
-    "focus", "slice", "context", "impact", "trace", "bundle",
+    "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
+    "impact", "trace", "deps", "bundle",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -141,7 +142,8 @@ SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
 SourceGraphMode = Literal[
-    "focus", "slice", "context", "impact", "trace", "bundle",
+    "focus", "slice", "context", "file", "function", "class", "body", "bodygrep",
+    "impact", "trace", "deps", "bundle",
     "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
     "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
     "stats", "summarize", "pipeline",
@@ -561,10 +563,13 @@ def verify_audit_ledger(
         "cache_hits": 0,
         "cache_hits_by_tool": {},
         "policy_violations": 0,
+        "fresh_source_graph_calls": 0,
         "live_source_graph_calls": 0,
         "source_graph_hit_count": 0,
         "source_graph_zero_hit_calls": 0,
         "source_graph_failed_calls": 0,
+        "source_graph_mode_counts": {},
+        "source_graph_mode_sequence": [],
         "authority_index_identity": [],
         "verified_payloads": [],
         "reason": "",
@@ -615,6 +620,7 @@ def verify_audit_ledger(
         result["entries_verified"] += 1
         tool = str(entry.get("tool") or "unknown")
         call_count[tool] = call_count.get(tool, 0) + 1
+        payload = entry.get("payload")
         if tool == "source_graph":
             source_hits = max(0, int(entry.get("hit_count") or 0))
             result["source_graph_hit_count"] += source_hits
@@ -622,6 +628,12 @@ def verify_audit_ledger(
                 result["source_graph_zero_hit_calls"] += 1
             if not entry.get("ok"):
                 result["source_graph_failed_calls"] += 1
+            mode = str(payload.get("mode") or "") if isinstance(payload, dict) else ""
+            if mode in SOURCE_GRAPH_MODES:
+                mode_counts = result["source_graph_mode_counts"]
+                mode_counts[mode] = int(mode_counts.get(mode) or 0) + 1
+                if len(result["source_graph_mode_sequence"]) < 64:
+                    result["source_graph_mode_sequence"].append(mode)
         returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
         result["bounded_bytes_returned"] += returned_bytes
         bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes
@@ -642,7 +654,6 @@ def verify_audit_ledger(
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
         if authority_source or authority_state:
             authority_seen.add((tool, authority_source, authority_state, authority_repo))
-        payload = entry.get("payload")
         if (
             tool == "quality_review_submit"
             and entry.get("ok")
@@ -650,6 +661,21 @@ def verify_audit_ledger(
             and len(result["verified_payloads"]) < 12
         ):
             result["verified_payloads"].append(payload)
+        authoritative_source_graph = (
+            authority_source == "canonical"
+            and authority_state in {"canonical_active", "sole_authority"}
+        )
+        # A fresh call is real tool-use telemetry even when its bounded query
+        # returns zero rows.  Keep it distinct from the non-empty "live" count
+        # used by the fail-closed completion gate.
+        if (
+            tool == "source_graph"
+            and entry.get("ok")
+            and not entry.get("violation")
+            and not entry.get("cache_hit")
+            and authoritative_source_graph
+        ):
+            result["fresh_source_graph_calls"] += 1
         # A "live" source_graph call must be a genuinely fresh, non-empty,
         # successful authoritative lookup -- a cache hit or a zero-hit
         # response is real telemetry but must NOT satisfy the completion
@@ -658,8 +684,10 @@ def verify_audit_ledger(
         if (
             tool == "source_graph"
             and entry.get("ok")
+            and not entry.get("violation")
             and not entry.get("cache_hit")
             and int(entry.get("hit_count") or 0) > 0
+            and authoritative_source_graph
         ):
             result["live_source_graph_calls"] += 1
     result["call_count_by_tool"] = call_count
@@ -800,6 +828,7 @@ def source_graph_query(
             ctx, tool=tool, ok=True, cache_hit=True,
             hit_count=cached["hit_count"], bytes_returned=cached["bytes"],
             authority_source=cached["authority_source"], authority_state=cached["authority_state"],
+            payload={"mode": mode},
         )
         return {**cached["result"], "cache_hit": True}
 
@@ -816,10 +845,22 @@ def source_graph_query(
             payload = _source_graph_mod.slice_(ctx.authority_repo, bounded_query, budget)
         elif mode == "context":
             payload = _source_graph_mod.context_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "file":
+            payload = _source_graph_mod.file_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "function":
+            payload = _source_graph_mod.function_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "class":
+            payload = _source_graph_mod.class_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "body":
+            payload = _source_graph_mod.body_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "bodygrep":
+            payload = _source_graph_mod.bodygrep_query(ctx.authority_repo, bounded_query, budget)
         elif mode == "impact":
             payload = _source_graph_mod.impact(ctx.authority_repo, bounded_query, budget)
         elif mode == "trace":
             payload = _source_graph_mod.trace(ctx.authority_repo, bounded_query, budget)
+        elif mode == "deps":
+            payload = _source_graph_mod.deps_query(ctx.authority_repo, bounded_query, budget)
         elif mode == "focus":
             payload = _source_graph_mod.focus(ctx.authority_repo, bounded_query, budget)
         else:
@@ -866,6 +907,7 @@ def source_graph_query(
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=binding.authority_source, authority_state=binding.authority_state,
+        payload={"mode": mode},
     )
     return result
 

@@ -793,6 +793,27 @@ def test_daemon_runs_bounded_iterations_and_scans_repeatedly(tmp_path):
     assert all(scan["ok"] for scan in scans)
 
 
+def test_repo_bound_reconciler_service_is_idempotent_and_stoppable(tmp_path, monkeypatch):
+    repo = tmp_path / "repo_service"
+    (repo / ".aiworkhub/runtime/process_logs").mkdir(parents=True)
+    scans = []
+    monkeypatch.setattr(
+        task_reconciler,
+        "run_scan",
+        lambda manager=None, repo=None: scans.append(str(repo)) or {"ok": True},
+    )
+    service = task_reconciler.ensure_started(repo)
+    again = task_reconciler.ensure_started(repo)
+    assert service is again
+    deadline = time.time() + 2
+    while not scans and time.time() < deadline:
+        time.sleep(0.01)
+    assert scans == [str(repo.resolve())]
+    assert service.health()["running"] is True
+    assert task_reconciler.stop_reconciler(repo) is True
+    assert task_reconciler.reconciler_health(repo)["running"] is False
+
+
 def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monkeypatch):
     """The reconciler daemon itself (not a never-shipped systemd unit file)
     is what must be able to write lifecycle transitions and see isolated

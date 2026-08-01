@@ -155,14 +155,25 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
         "bridge_readiness",
         lambda *args, **kwargs: {"launchable": True, "blocker_reason": ""},
     )
+    monkeypatch.setattr(
+        repo_policy.claude_auth,
+        "auth_status",
+        lambda executable=None: {
+            "launchable": True,
+            "authenticated": True,
+            "auth_method": "claude.ai",
+            "subscription_type": "max",
+            "blocker_reason": "",
+        },
+    )
 
     report = repo_policy.build_preflight(root)
     assert report["ok"] is True
     by_adapter = {item["adapter_id"]: item for item in report["providers"]}
     assert by_adapter["deepseek_copilot_cli"]["status"] == "ready"
     assert by_adapter["glm_vscode_lm"]["access_observed"] is True
-    assert by_adapter["claude_cli"]["status"] == "installed_unverified_access"
-    assert by_adapter["claude_cli"]["access_observed"] is False
+    assert by_adapter["claude_cli"]["status"] == "ready"
+    assert by_adapter["claude_cli"]["access_observed"] is True
     assert report["callback"]["backlog_count"] == 0
     serialized = json.dumps(report, sort_keys=True)
     assert "/private/host" not in serialized

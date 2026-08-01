@@ -180,12 +180,27 @@ never inherit the manager launch capability.
 | Source Graph | 33 configurable language/data families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
-| Operations | Review Inbox, callbacks, live output, logs, storage retention and workforce scoring |
+| Operations | Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
 | Platforms | Linux, Windows, macOS and Remote-SSH release qualification |
 
 The canonical combined review surface is `aiworkhub_completion_inbox`. Tool
 availability and write authority are reported by the live MCP runtime; clients
 should discover the schema rather than copy a frozen tool list from docs.
+
+### Archive and storage lifecycle
+
+AIWorkHub does not require repositories to keep task history forever. The
+Storage view can preview archived tasks older than 30, 90, 180 or 365 days,
+move an exact digest-bound batch into repository-local quarantine, restore it
+during a seven-day undo window, and separately purge expired quarantine
+payloads. Tasks with undelivered callbacks are protected, active/review tasks
+cannot enter this cleanup path, and a compact audit record survives payload
+purge. Individual completed tasks can also be archived or restored from the
+task detail view.
+
+Retention defaults are repository-local and configurable in Settings. Preview
+never mutates data; quarantine and permanent purge require separate explicit
+confirmation.
 
 ## Security model
 

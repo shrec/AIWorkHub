@@ -32,6 +32,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,6 +125,112 @@ def run_scan(
         "scanned_at": _utcnow(),
         **result,
     }
+
+
+class ReconcilerService:
+    """Repo-bound in-process reconciler lifecycle for an MCP child."""
+
+    def __init__(self, repo: Path, *, scan_interval_seconds: float | None = None) -> None:
+        self.repo = repo.resolve()
+        raw_interval = scan_interval_seconds if scan_interval_seconds is not None else _scan_interval_seconds()
+        self.scan_interval_seconds = max(
+            MIN_SCAN_INTERVAL_SECONDS, min(float(raw_interval), MAX_SCAN_INTERVAL_SECONDS)
+        )
+        self._manager = process_launcher.ProcessManager(repo=self.repo)
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._last_scan: dict[str, Any] = {}
+        self._last_error = ""
+
+    def is_running(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                result = run_scan(self._manager, repo=self.repo)
+                with self._state_lock:
+                    self._last_scan = result
+                    self._last_error = ""
+            except Exception as exc:  # noqa: BLE001 -- lifecycle safety net
+                with self._state_lock:
+                    self._last_error = f"{type(exc).__name__}:{exc}"[:500]
+            if self._stop_event.wait(self.scan_interval_seconds):
+                break
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self.is_running():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._loop,
+                name=f"aiworkhub-task-reconciler:{self.repo.name}",
+                daemon=True,
+            )
+            thread = self._thread
+        thread.start()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        with self._state_lock:
+            if self._thread is thread and not thread.is_alive():
+                self._thread = None
+
+    def health(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "ok": self.is_running() and not self._last_error,
+                "running": self.is_running(),
+                "repo": str(self.repo),
+                "scan_interval_seconds": self.scan_interval_seconds,
+                "last_scan": dict(self._last_scan),
+                "last_error": self._last_error,
+            }
+
+
+_SERVICES: dict[str, ReconcilerService] = {}
+_SERVICES_LOCK = threading.Lock()
+
+
+def ensure_started(repo: Path | str) -> ReconcilerService:
+    """Start exactly one reconciliation service per canonical repository."""
+
+    root = Path(repo).resolve()
+    key = str(root)
+    with _SERVICES_LOCK:
+        service = _SERVICES.get(key)
+        if service is None:
+            service = ReconcilerService(root)
+            _SERVICES[key] = service
+        service.start()
+        return service
+
+
+def stop_reconciler(repo: Path | str) -> bool:
+    key = str(Path(repo).resolve())
+    with _SERVICES_LOCK:
+        service = _SERVICES.pop(key, None)
+    if service is None:
+        return False
+    service.stop()
+    return True
+
+
+def reconciler_health(repo: Path | str) -> dict[str, Any]:
+    key = str(Path(repo).resolve())
+    with _SERVICES_LOCK:
+        service = _SERVICES.get(key)
+    if service is None:
+        return {
+            "ok": False, "running": False, "repo": key,
+            "last_scan": {}, "last_error": "reconciler_unregistered",
+        }
+    return service.health()
 
 
 def _install_stop_handler(stop_flag: dict[str, bool]) -> None:

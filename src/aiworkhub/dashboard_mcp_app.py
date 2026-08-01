@@ -27,12 +27,14 @@ from aiworkhub import (
     dashboard,
     feature_settings,
     process_launcher,
+    repo_policy,
     repository_bootstrap,
     shared_router,
     source_graph,
     storage_observability,
     storage_registry,
     storage_retention,
+    task_retention,
     task_store,
     terminal_log_retention,
 )
@@ -182,9 +184,12 @@ def settings_view() -> dict[str, Any]:
         result = feature_settings.load(root)
         result["context_graph_runtime"] = context_graph.status(root)
         result["source_graph_policy"] = source_graph.source_graph_policy_view(root)
+        policy = repo_policy.load_policy(root)
+        result["retention_policy"] = dict(policy.get("retention") or {})
     except (
         context_graph.ContextGraphError,
         feature_settings.FeatureSettingsError,
+        repo_policy.RepoPolicyError,
         OSError,
         sqlite3.Error,
     ) as exc:
@@ -750,6 +755,127 @@ def terminal_log_purge_view(batch_id: str, confirm: bool = False) -> dict[str, A
     return response
 
 
+def task_retention_preview_view(older_than_days: int | None = None) -> dict[str, Any]:
+    """READ-ONLY: old archived-task cleanup preview and undo batches."""
+    try:
+        root = core.repo_root()
+        response = task_retention.preview(root, older_than_days=older_than_days)
+        response["quarantine"] = task_retention.list_batches(root)
+    except (task_retention.TaskRetentionError, ValueError, TypeError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_retention_preview"
+    response["authority_flags"] = _readonly_authority_flags()
+    return response
+
+
+def task_archive_view(task_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: archive one non-active task without deleting its evidence."""
+    candidate = str(task_id or "")
+    if confirm is not True:
+        response = {"ok": False, "error": "task_archive_confirmation_required"}
+    elif not dashboard._TASK_ID_RE.fullmatch(candidate):
+        response = {"ok": False, "error": "invalid_task_id"}
+    else:
+        try:
+            root = core.repo_root()
+            task = task_store.get_task(root, candidate)
+            if task is None:
+                response = {"ok": False, "error": "task_not_found"}
+            elif task_store.canonical_status(task) in {"processing", "review"}:
+                response = {"ok": False, "error": "task_archive_active_or_review_forbidden"}
+            else:
+                ok, status = task_store.archive_task(
+                    root,
+                    candidate,
+                    actor="dashboard_user",
+                    reason=str(reason or "")[:200],
+                )
+                response = {"ok": ok, "task_id": candidate, "status": status}
+                storage_observability.invalidate(root)
+        except task_store.TaskStoreError as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_archive"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: restore one still-live archived task to its prior state."""
+    candidate = str(task_id or "")
+    if confirm is not True:
+        response = {"ok": False, "error": "task_restore_confirmation_required"}
+    elif not dashboard._TASK_ID_RE.fullmatch(candidate):
+        response = {"ok": False, "error": "invalid_task_id"}
+    else:
+        try:
+            root = core.repo_root()
+            ok, status = task_store.restore_task(
+                root,
+                candidate,
+                actor="dashboard_user",
+                reason=str(reason or "")[:200],
+            )
+            response = {"ok": ok, "task_id": candidate, "status": status}
+            storage_observability.invalidate(root)
+        except task_store.TaskStoreError as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_restore"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def task_quarantine_view(
+    preview_digest: str,
+    older_than_days: int | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """USER WRITE: quarantine a still-current old archived-task preview."""
+    try:
+        root = core.repo_root()
+        response = task_retention.quarantine(
+            root,
+            preview_digest=str(preview_digest or "")[:128],
+            older_than_days=older_than_days,
+            confirm=confirm is True,
+        )
+        storage_observability.invalidate(root)
+    except (task_retention.TaskRetentionError, ValueError, TypeError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_quarantine"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def task_quarantine_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: restore one archived-task quarantine batch."""
+    try:
+        root = core.repo_root()
+        response = task_retention.restore(
+            root, batch_id=str(batch_id or "")[:128], confirm=confirm is True
+        )
+        storage_observability.invalidate(root)
+    except task_retention.TaskRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_quarantine_restore"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
+def task_quarantine_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: permanently purge one expired archived-task batch."""
+    try:
+        root = core.repo_root()
+        response = task_retention.purge(
+            root, batch_id=str(batch_id or "")[:128], confirm=confirm is True
+        )
+        storage_observability.invalidate(root)
+    except task_retention.TaskRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_task_quarantine_purge"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
 def health_view() -> dict[str, Any]:
     """READ-ONLY: cheap liveness check for the Webview's connection banner.
 
@@ -1009,6 +1135,17 @@ TERMINAL_LOG_RETENTION_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_terminal_log_restore": terminal_log_restore_view,
     "aiworkhub_dashboard_terminal_log_purge": terminal_log_purge_view,
 }
+TASK_RETENTION_PREVIEW_TOOL_NAME = "aiworkhub_dashboard_task_retention_preview"
+TASK_RETENTION_READ_TOOLS: dict[str, Any] = {
+    TASK_RETENTION_PREVIEW_TOOL_NAME: task_retention_preview_view,
+}
+TASK_RETENTION_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_task_archive": task_archive_view,
+    "aiworkhub_dashboard_task_restore": task_restore_view,
+    "aiworkhub_dashboard_task_quarantine": task_quarantine_view,
+    "aiworkhub_dashboard_task_quarantine_restore": task_quarantine_restore_view,
+    "aiworkhub_dashboard_task_quarantine_purge": task_quarantine_purge_view,
+}
 
 
 def register(mcp: Any) -> tuple[str, ...]:
@@ -1048,6 +1185,10 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in TERMINAL_LOG_RETENTION_WRITE_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in TASK_RETENTION_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in TASK_RETENTION_WRITE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in INITIALIZE_TOOLS.items():
         mcp.tool(name=name)(fn)
     return READONLY_TOOL_NAMES + (
@@ -1058,9 +1199,11 @@ def register(mcp: Any) -> tuple[str, ...]:
         SETTINGS_TOOL_NAME,
         STORAGE_RETENTION_PREVIEW_TOOL_NAME,
         TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME,
+        TASK_RETENTION_PREVIEW_TOOL_NAME,
     ) + (
         tuple(STORAGE_RETENTION_WRITE_TOOLS)
         + tuple(TERMINAL_LOG_RETENTION_WRITE_TOOLS)
+        + tuple(TASK_RETENTION_WRITE_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)

@@ -32,12 +32,25 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
                     "satisfied": True,
                     "source_graph_satisfaction": "live_worker_call",
                     "source_graph_calls": 3,
+                    "source_graph_fresh_calls": 3,
                     "source_graph_live_calls": 2,
                     "source_graph_hit_count": 7,
                     "source_graph_zero_hit_calls": 1,
                     "source_graph_failed_calls": 0,
                     "source_graph_bytes": 900,
                     "source_graph_cache_hits": 1,
+                    "source_graph_mode_counts": {"focus": 1, "bodygrep": 2},
+                    "source_graph_mode_sequence": ["focus", "bodygrep", "bodygrep"],
+                    "call_count_by_tool": {
+                        "source_graph": 3, "session_current_state": 1, "kb": 2,
+                    },
+                    "successful_call_count_by_tool": {
+                        "source_graph": 3, "session_current_state": 1, "kb": 2,
+                    },
+                    "bounded_bytes_by_tool": {
+                        "source_graph": 900, "session_current_state": 80, "kb": 120,
+                    },
+                    "cache_hits_by_tool": {"source_graph": 1, "kb": 1},
                     "policy_violations": 0,
                     "entries_tampered": 0,
                 },
@@ -77,6 +90,10 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
                     "source_graph_zero_hit_calls": 1,
                     "source_graph_failed_calls": 1,
                     "source_graph_cache_hits": 1,
+                    "call_count_by_tool": {"source_graph": 1},
+                    "successful_call_count_by_tool": {},
+                    "bounded_bytes_by_tool": {"source_graph": 0},
+                    "cache_hits_by_tool": {"source_graph": 1},
                     "policy_violations": 0,
                     "entries_tampered": 1,
                 },
@@ -108,12 +125,25 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_stale_or_cached_tasks"] == 1
     assert result["source_graph_missing_tasks"] == 0
     assert result["source_graph_calls"] == 4
+    assert result["source_graph_fresh_calls"] == 3
     assert result["source_graph_live_calls"] == 2
     assert result["source_graph_hit_count"] == 7
     assert result["source_graph_zero_hit_calls"] == 2
     assert result["source_graph_failed_calls"] == 1
     assert result["source_graph_bytes"] == 900
     assert result["source_graph_cache_hits"] == 2
+    assert result["source_graph_mode_counts"] == {"focus": 1, "bodygrep": 2}
+    assert result["source_graph_mode_sequence"] == ["focus", "bodygrep", "bodygrep"]
+    assert result["tool_call_counts"] == {
+        "source_graph": 4, "session_current_state": 1, "kb": 2,
+    }
+    assert result["tool_success_counts"] == {
+        "source_graph": 3, "session_current_state": 1, "kb": 2,
+    }
+    assert result["tool_bytes"] == {
+        "source_graph": 900, "session_current_state": 80, "kb": 120,
+    }
+    assert result["tool_cache_hits"] == {"source_graph": 2, "kb": 1}
     assert result["policy_violation_tasks"] == 1
     assert result["policy_violations"] == 1
     assert result["tampered_ledger_tasks"] == 1
@@ -122,6 +152,7 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["raw_discovery_denial_tasks"] == 1
     assert result["provider_denial_evidence_tasks"] == 1
     assert result["live_rate"] == 33.3
+    assert result["fresh_rate"] == 33.3
     assert result["any_rate"] == 100.0
     assert result["gate_satisfaction_rate"] == 66.7
     assert result["measurement_label"] == (
@@ -131,6 +162,7 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["by_adapter"]["claude_cli"]["source_graph_zero_hit_calls"] == 1
     assert result["by_adapter"]["deepseek_copilot_cli"]["live_tasks"] == 1
     assert result["by_adapter"]["deepseek_copilot_cli"]["raw_discovery_denials"] == 1
+    assert result["by_adapter"]["deepseek_copilot_cli"]["tool_call_counts"]["kb"] == 2
     assert result["by_adapter"]["claude_cli"]["injected_only_tasks"] == 1
 
 

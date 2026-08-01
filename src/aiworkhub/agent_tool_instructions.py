@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-CANONICAL_MAX_BYTES = 3000
-PROJECTION_MAX_BYTES = 3200
+CANONICAL_MAX_BYTES = 3800
+PROJECTION_MAX_BYTES = 4000
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -59,6 +59,10 @@ POLICY = ToolPolicy(
         "When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.",
         "Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.",
         "A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.",
+        "Re-query whenever the active symbol, dependency boundary, failure hypothesis, edit scope or validation target materially changes.",
+        "Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.",
+        "Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.",
+        "Final receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.",
     ),
     validation=(
         "Exact validation/build/test commands named by the card are allowed.",

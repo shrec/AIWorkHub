@@ -46,10 +46,17 @@ AIWorkHub telemetry.
   user/assistant items, with asynchronous storage, exact live route
   verification and deterministic deduplication. Internal reasoning, tools,
   commands, approvals and deltas are excluded.
-- Storage observability, bounded system logs, and local dashboard views for
-  task operations and context systems.
+- Storage observability, bounded system logs, authenticated all-tool usage
+  statistics, and local dashboard views for task operations and context
+  systems.
 - Safe repository worktree, terminal-run and extension-runtime retention with
   preview, quarantine, restore and separately confirmed expired purge.
+- Safe archived-task retention with age-based preview, callback-backlog
+  protection, digest-bound quarantine, a seven-day undo window, collision-safe
+  restore, separately confirmed purge and a surviving compact audit trail.
+- First-party Claude CLI subscription preflight is distinct from VS Code /
+  Copilot model consent; an expired Claude session is rejected before task
+  claim without reading or copying credentials.
 - Ubuntu, Windows, and macOS CI/release matrices plus VSIX and Python package
   generation.
 - One canonical Python release-version authority with deterministic extension
@@ -71,6 +78,9 @@ AIWorkHub telemetry.
   digest-bound, explicitly confirmed and foreign-stale fail-closed.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
+- Task/tool telemetry now authenticates generic MCP calls as well as Source
+  Graph calls. Stage attribution, latency distributions and outcome cohorts
+  remain the next economics closure rather than inferred statistics.
 - The brand foundation, concise public README and registry workflows are
   present. Registry-owner setup, public screenshots/GIF and long-form launch
   material remain open.

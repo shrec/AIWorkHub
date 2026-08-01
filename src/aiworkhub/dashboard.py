@@ -165,6 +165,13 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         bytes_by_tool = verification.get("bounded_bytes_by_tool")
         cache_by_tool = verification.get("cache_hits_by_tool")
         satisfaction = gate.get("satisfaction_by_tool")
+        def bounded_counter(value: Any) -> dict[str, int]:
+            if not isinstance(value, Mapping):
+                return {}
+            return {
+                str(name)[:64]: max(0, int(count or 0))
+                for name, count in list(value.items())[:32]
+            }
         tool_use = {
             "gated": bool(gate.get("gated")),
             "satisfied": bool(gate.get("satisfied", True)),
@@ -176,6 +183,9 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(calls, Mapping) else 0,
             "source_graph_successful_calls": int(successful.get("source_graph") or 0)
             if isinstance(successful, Mapping) else 0,
+            "source_graph_fresh_calls": int(
+                verification.get("fresh_source_graph_calls") or 0
+            ),
             "source_graph_live_calls": int(verification.get("live_source_graph_calls") or 0),
             "source_graph_hit_count": int(verification.get("source_graph_hit_count") or 0),
             "source_graph_zero_hit_calls": int(
@@ -188,6 +198,16 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(bytes_by_tool, Mapping) else 0,
             "source_graph_cache_hits": int(cache_by_tool.get("source_graph") or 0)
             if isinstance(cache_by_tool, Mapping) else 0,
+            "source_graph_mode_counts": dict(
+                verification.get("source_graph_mode_counts") or {}
+            ),
+            "source_graph_mode_sequence": list(
+                verification.get("source_graph_mode_sequence") or []
+            )[:64],
+            "call_count_by_tool": bounded_counter(calls),
+            "successful_call_count_by_tool": bounded_counter(successful),
+            "bounded_bytes_by_tool": bounded_counter(bytes_by_tool),
+            "cache_hits_by_tool": bounded_counter(cache_by_tool),
             "policy_violations": int(verification.get("policy_violations") or 0),
             "entries_verified": int(verification.get("entries_verified") or 0),
             "entries_tampered": int(verification.get("entries_tampered") or 0),
@@ -260,12 +280,19 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_stale_or_cached_tasks": 0,
         "source_graph_missing_tasks": 0,
         "source_graph_calls": 0,
+        "source_graph_fresh_calls": 0,
         "source_graph_live_calls": 0,
         "source_graph_hit_count": 0,
         "source_graph_zero_hit_calls": 0,
         "source_graph_failed_calls": 0,
         "source_graph_bytes": 0,
         "source_graph_cache_hits": 0,
+        "source_graph_mode_counts": {},
+        "source_graph_mode_sequence": [],
+        "tool_call_counts": {},
+        "tool_success_counts": {},
+        "tool_bytes": {},
+        "tool_cache_hits": {},
         "policy_violation_tasks": 0,
         "policy_violations": 0,
         "provider_permission_denials": 0,
@@ -276,12 +303,13 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "blocked_reason_counts": {},
         "measurement_label": "authenticated_calls_and_returned_bytes_only_no_token_or_cost_claim",
         "live_rate": 0.0,
+        "fresh_rate": 0.0,
         "any_rate": 0.0,
         "gate_satisfaction_rate": 0.0,
         "by_adapter": {},
     }
 
-    def bucket_for(adapter: str) -> dict[str, int]:
+    def bucket_for(adapter: str) -> dict[str, Any]:
         buckets = totals["by_adapter"]
         if adapter not in buckets:
             buckets[adapter] = {
@@ -290,12 +318,15 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 "injected_only_tasks": 0,
                 "missing_or_stale_tasks": 0,
                 "source_graph_calls": 0,
+                "source_graph_fresh_calls": 0,
                 "source_graph_hit_count": 0,
                 "source_graph_zero_hit_calls": 0,
                 "source_graph_failed_calls": 0,
                 "policy_violations": 0,
                 "provider_permission_denials": 0,
                 "raw_discovery_denials": 0,
+                "tool_call_counts": {},
+                "tool_success_counts": {},
             }
         return buckets[adapter]
 
@@ -326,6 +357,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             totals["satisfied_tasks"] += 1
 
         calls = int(tool_use.get("source_graph_calls") or 0)
+        fresh_calls = int(tool_use.get("source_graph_fresh_calls") or 0)
         live_calls = int(tool_use.get("source_graph_live_calls") or 0)
         hit_count = int(tool_use.get("source_graph_hit_count") or 0)
         zero_hits = int(tool_use.get("source_graph_zero_hit_calls") or 0)
@@ -335,6 +367,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         violations = int(tool_use.get("policy_violations") or 0)
         satisfaction = str(tool_use.get("source_graph_satisfaction") or "")
         totals["source_graph_calls"] += calls
+        totals["source_graph_fresh_calls"] += fresh_calls
         totals["source_graph_live_calls"] += live_calls
         totals["source_graph_hit_count"] += hit_count
         totals["source_graph_zero_hit_calls"] += zero_hits
@@ -343,10 +376,46 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         totals["source_graph_cache_hits"] += cache_hits
         totals["policy_violations"] += violations
         bucket["source_graph_calls"] += calls
+        bucket["source_graph_fresh_calls"] += fresh_calls
         bucket["source_graph_hit_count"] += hit_count
         bucket["source_graph_zero_hit_calls"] += zero_hits
         bucket["source_graph_failed_calls"] += failed_calls
         bucket["policy_violations"] += violations
+        for source_key, total_key in (
+            ("call_count_by_tool", "tool_call_counts"),
+            ("successful_call_count_by_tool", "tool_success_counts"),
+            ("bounded_bytes_by_tool", "tool_bytes"),
+            ("cache_hits_by_tool", "tool_cache_hits"),
+        ):
+            values = tool_use.get(source_key)
+            if not isinstance(values, Mapping):
+                continue
+            destination = totals[total_key]
+            adapter_destination = bucket.get(total_key)
+            for tool_name, value in values.items():
+                safe_name = str(tool_name)[:64]
+                destination[safe_name] = (
+                    int(destination.get(safe_name) or 0) + max(0, int(value or 0))
+                )
+                if isinstance(adapter_destination, dict):
+                    adapter_destination[safe_name] = (
+                        int(adapter_destination.get(safe_name) or 0)
+                        + max(0, int(value or 0))
+                    )
+        mode_counts = tool_use.get("source_graph_mode_counts")
+        if isinstance(mode_counts, Mapping):
+            for mode, count in mode_counts.items():
+                safe_mode = str(mode)[:40]
+                totals["source_graph_mode_counts"][safe_mode] = (
+                    int(totals["source_graph_mode_counts"].get(safe_mode) or 0)
+                    + max(0, int(count or 0))
+                )
+        sequence = tool_use.get("source_graph_mode_sequence")
+        if isinstance(sequence, list):
+            for mode in sequence:
+                if len(totals["source_graph_mode_sequence"]) >= 128:
+                    break
+                totals["source_graph_mode_sequence"].append(str(mode)[:40])
         if violations:
             totals["policy_violation_tasks"] += 1
         if int(tool_use.get("entries_tampered") or 0):
@@ -375,6 +444,13 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     denominator = totals["gated_tasks"]
     if denominator:
         totals["live_rate"] = round(100.0 * totals["source_graph_live_tasks"] / denominator, 1)
+        fresh_tasks = sum(
+            1
+            for row in latest_by_task.values()
+            if isinstance((row.get("ai_infra_context") or {}).get("tool_use"), Mapping)
+            and int((row.get("ai_infra_context") or {})["tool_use"].get("source_graph_fresh_calls") or 0) > 0
+        )
+        totals["fresh_rate"] = round(100.0 * fresh_tasks / denominator, 1)
         totals["any_rate"] = round(100.0 * totals["source_graph_any_tasks"] / denominator, 1)
         totals["gate_satisfaction_rate"] = round(100.0 * totals["satisfied_tasks"] / denominator, 1)
     return totals
@@ -581,6 +657,63 @@ def _merge_process_liveness_into_tasks(
                 target[key] = value
         if process_row.get("ai_infra_context"):
             target["ai_infra_context"] = process_row["ai_infra_context"]
+        terminal = _provider_terminal_status(process_row)
+        if terminal:
+            target["provider_terminal"] = terminal
+
+
+def _provider_terminal_status(process_row: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a bounded provider root cause onto the owning task row.
+
+    Terminal failures already exist in the authenticated process ledger, but
+    previously the task UI exposed only a generic substatus. This classifier
+    keeps the original bounded message, adds a stable category, and never
+    treats an active/healthy run as an error.
+    """
+
+    state = str(process_row.get("state") or "")[:80]
+    if state in process_launcher.ACTIVE_PROCESS_STATES or state in {"review_ready", "exited"}:
+        return {}
+    raw_reason = (
+        process_row.get("blocked_reason")
+        or process_row.get("error")
+        or process_row.get("reason")
+        or ""
+    )
+    message = _portable_text(raw_reason, 500).strip()
+    if not state and not message:
+        return {}
+    lowered = f"{state} {message}".lower()
+    if any(marker in lowered for marker in (
+        "authentication_failed", "unauthorized", "oauth", "token expired", "401",
+    )):
+        category = "provider_authentication_failed"
+        retryable = True
+    elif any(marker in lowered for marker in (
+        "consent", "model_not_visible", "model unavailable", "unknown model",
+    )):
+        category = "provider_model_unavailable"
+        retryable = True
+    elif any(marker in lowered for marker in ("timed_out", "timeout", "deadline")):
+        category = "provider_timeout"
+        retryable = True
+    elif any(marker in lowered for marker in ("enoent", "not found", "executable")):
+        category = "provider_executable_unavailable"
+        retryable = False
+    elif state == "launch_failed":
+        category = "provider_launch_failed"
+        retryable = True
+    else:
+        category = "worker_terminal_failure"
+        retryable = state not in {"scope_rejected", "cancelled"}
+    return {
+        "state": state,
+        "category": category,
+        "message": message,
+        "retryable": retryable,
+        "adapter_id": str(process_row.get("adapter_id") or "")[:120],
+        "model": str(process_row.get("model") or "")[:160],
+    }
 
 
 def read_process_runs(

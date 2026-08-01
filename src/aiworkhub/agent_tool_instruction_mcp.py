@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from aiworkhub import agent_tool_instructions as instr
 from aiworkhub import core
@@ -31,6 +31,9 @@ from aiworkhub import core
 # ---------------------------------------------------------------------------
 
 READONLY: bool = True
+InstructionTarget = Literal[
+    "AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md",
+]
 
 MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_agent_tool_instruction_preview",
@@ -226,23 +229,24 @@ def apply(
 # MCP-bound tool functions (bind to server's active repo_root, reject caller path)
 # ---------------------------------------------------------------------------
 
-def _mcp_preview(provider: str | None = None) -> dict[str, Any]:
+def _mcp_preview(provider: InstructionTarget | None = None) -> dict[str, Any]:
     """MCP-bound: preview using the server's active repository root.
 
     Never accepts a caller-selected ``repo_root``; always binds to
     ``core.repo_root()``.  The CLI may still target an owner-selected
     repository via ``--repo``, but the MCP surface is pinned to the
-    server's active repository.
+    server's active repository. ``provider`` is an instruction-file target,
+    not a model provider; its schema enumerates all valid filenames.
     """
     return preview(repo_root=str(core.repo_root()), provider=provider)
 
 
-def _mcp_inspect(provider: str) -> dict[str, Any]:
+def _mcp_inspect(provider: InstructionTarget) -> dict[str, Any]:
     """MCP-bound: inspect using the server's active repository root."""
     return inspect_document(repo_root=str(core.repo_root()), provider=provider)
 
 
-def _mcp_apply(provider: str, write: bool = False) -> dict[str, Any]:
+def _mcp_apply(provider: InstructionTarget, write: bool = False) -> dict[str, Any]:
     """MCP-bound: apply using the server's active repository root."""
     return apply(repo_root=str(core.repo_root()), provider=provider, write=write)
 

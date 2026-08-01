@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.29";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.30";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -144,6 +144,11 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestTerminalLogCleanup",
   "requestTerminalLogRestore",
   "requestTerminalLogPurge",
+  "requestTaskArchive",
+  "requestTaskRestore",
+  "requestTaskCleanup",
+  "requestTaskQuarantineRestore",
+  "requestTaskQuarantinePurge",
   "requestRuntimeCleanup",
   "requestRuntimeRestore",
   "requestRuntimePurge",
@@ -245,6 +250,14 @@ const TERMINAL_LOG_RETENTION_TOOLS = Object.freeze({
   quarantine: "aiworkhub_dashboard_terminal_log_quarantine",
   restore: "aiworkhub_dashboard_terminal_log_restore",
   purge: "aiworkhub_dashboard_terminal_log_purge",
+});
+const TASK_RETENTION_TOOLS = Object.freeze({
+  preview: "aiworkhub_dashboard_task_retention_preview",
+  archive: "aiworkhub_dashboard_task_archive",
+  restoreTask: "aiworkhub_dashboard_task_restore",
+  quarantine: "aiworkhub_dashboard_task_quarantine",
+  restoreBatch: "aiworkhub_dashboard_task_quarantine_restore",
+  purgeBatch: "aiworkhub_dashboard_task_quarantine_purge",
 });
 // Callback delivery is a separate background service from Source Graph.
 // Both are repo-bound and both must converge after the MCP handshake; neither
@@ -2309,7 +2322,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
     }
     const permittedKeys = new Set(["mode", "query", "budget", "target", "bundle_type"]);
     if (Object.keys(initialSourceGraphRequest).some((key) => !permittedKeys.has(key)) ||
-        !["focus", "slice", "context", "impact", "trace", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"].includes(initialSourceGraphRequest.mode) ||
+        !["focus", "slice", "context", "file", "function", "class", "body", "bodygrep", "impact", "trace", "deps", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"].includes(initialSourceGraphRequest.mode) ||
         typeof initialSourceGraphRequest.query !== "string" || !initialSourceGraphRequest.query.trim() ||
         initialSourceGraphRequest.query.length > 512) {
       throw new Error("vscode_lm_initial_source_graph_request_invalid");
@@ -2329,7 +2342,7 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
       additionalProperties: false,
       required: ["mode", "query"],
       properties: {
-        mode: { type: "string", enum: ["focus", "slice", "context", "impact", "trace", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"] },
+        mode: { type: "string", enum: ["focus", "slice", "context", "file", "function", "class", "body", "bodygrep", "impact", "trace", "deps", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"] },
         query: { type: "string", minLength: 1, maxLength: 512 },
         budget: { type: "integer", minimum: 8, maximum: 160 },
         target: { type: ["string", "null"], maxLength: 256 },
@@ -5029,7 +5042,7 @@ async function runTerminalLogCleanup(view) {
     }
     const bytes = Math.max(0, Number(preview.candidate_bytes || 0));
     const choice = await vscode.window.showWarningMessage(
-      `Move ${count} terminal run(s) (${bytes} bytes) into the 7-day AIWorkHub quarantine? The canonical process ledger, active/review work and each task's latest 10 runs remain protected.`,
+      `Move ${count} policy-aged terminal run(s) (${bytes} bytes) into the 7-day AIWorkHub quarantine? The canonical process ledger and active/review work remain protected.`,
       { modal: true },
       "Quarantine Logs",
     );
@@ -5089,6 +5102,155 @@ async function runTerminalLogPurge(view, batchId) {
       return;
     }
     view.postMessage({ type: OUTBOUND_TYPES.notification, message: "Expired terminal-log batch permanently purged" });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTaskArchive(view, taskId) {
+  if (!TASK_ID_RE.test(taskId)) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Archive task ${taskId}? Its evidence remains available and it can be restored until a later retention cleanup is explicitly confirmed.`,
+    { modal: true },
+    "Archive Task",
+  );
+  if (choice !== "Archive Task") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TASK_RETENTION_TOOLS.archive, {
+      task_id: taskId,
+      reason: "user_archived_from_dashboard",
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_archive_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Archived ${taskId}` });
+    await pushSnapshot(view);
+    await pushTaskDetail(view, taskId);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTaskRestore(view, taskId) {
+  if (!TASK_ID_RE.test(taskId)) return;
+  const choice = await vscode.window.showInformationMessage(
+    `Restore archived task ${taskId} to the live queue?`,
+    { modal: true },
+    "Restore Task",
+  );
+  if (choice !== "Restore Task") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TASK_RETENTION_TOOLS.restoreTask, {
+      task_id: taskId,
+      reason: "user_restored_from_dashboard",
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_restore_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${taskId}` });
+    await pushSnapshot(view);
+    await pushTaskDetail(view, taskId);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTaskCleanup(view) {
+  const choices = [
+    { label: "30 days", days: 30, description: "Archived at least one month" },
+    { label: "90 days", days: 90, description: "Recommended default" },
+    { label: "180 days", days: 180, description: "Archived at least six months" },
+    { label: "365 days", days: 365, description: "Archived at least one year" },
+  ];
+  const selected = await vscode.window.showQuickPick(choices, {
+    title: "Archived task retention",
+    placeHolder: "Choose the minimum archive age",
+  });
+  if (!selected) return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const preview = await client.callTool(TASK_RETENTION_TOOLS.preview, { older_than_days: selected.days });
+    if (!preview || preview.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (preview && preview.error) || "task_retention_preview_failed" });
+      return;
+    }
+    const count = Math.max(0, Number(preview.candidate_count || 0));
+    if (!count) {
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: `No archived tasks older than ${selected.days} days are eligible` });
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `Move ${count} archived task(s) older than ${selected.days} days into seven-day undo quarantine? Active, Processing, Review and undelivered-callback tasks are protected.`,
+      { modal: true },
+      "Quarantine Tasks",
+    );
+    if (choice !== "Quarantine Tasks") return;
+    const result = await client.callTool(TASK_RETENTION_TOOLS.quarantine, {
+      preview_digest: String(preview.preview_digest || ""),
+      older_than_days: selected.days,
+      confirm: true,
+    });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_retention_quarantine_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Quarantined ${Number(result.quarantined || 0)} archived task(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTaskQuarantineRestore(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showInformationMessage(
+    `Restore archived-task batch ${batchId}? Existing task IDs are never overwritten.`,
+    { modal: true },
+    "Restore Tasks",
+  );
+  if (choice !== "Restore Tasks") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TASK_RETENTION_TOOLS.restoreBatch, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_retention_restore_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: `Restored ${Number(result.restored || 0)} archived task(s)` });
+    await pushSnapshot(view);
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+  }
+}
+
+async function runTaskQuarantinePurge(view, batchId) {
+  if (!STORAGE_BATCH_ID_RE.test(batchId)) return;
+  const choice = await vscode.window.showWarningMessage(
+    `Permanently purge archived-task batch ${batchId}? This cannot be undone.`,
+    { modal: true },
+    "Permanently Purge Tasks",
+  );
+  if (choice !== "Permanently Purge Tasks") return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const result = await client.callTool(TASK_RETENTION_TOOLS.purgeBatch, { batch_id: batchId, confirm: true });
+    if (!result || result.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (result && result.error) || "task_retention_purge_failed" });
+      return;
+    }
+    view.postMessage({ type: OUTBOUND_TYPES.notification, message: "Archived-task batch permanently purged" });
     await pushSnapshot(view);
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -5402,6 +5564,29 @@ function handleInboundMessage(view, message) {
     case "requestTerminalLogPurge": {
       const batchId = String(message.batchId || "");
       if (STORAGE_BATCH_ID_RE.test(batchId)) runTerminalLogPurge(view, batchId);
+      break;
+    }
+    case "requestTaskArchive": {
+      const taskId = String(message.taskId || "");
+      if (TASK_ID_RE.test(taskId)) runTaskArchive(view, taskId);
+      break;
+    }
+    case "requestTaskRestore": {
+      const taskId = String(message.taskId || "");
+      if (TASK_ID_RE.test(taskId)) runTaskRestore(view, taskId);
+      break;
+    }
+    case "requestTaskCleanup":
+      runTaskCleanup(view);
+      break;
+    case "requestTaskQuarantineRestore": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runTaskQuarantineRestore(view, batchId);
+      break;
+    }
+    case "requestTaskQuarantinePurge": {
+      const batchId = String(message.batchId || "");
+      if (STORAGE_BATCH_ID_RE.test(batchId)) runTaskQuarantinePurge(view, batchId);
       break;
     }
     case "requestRuntimeCleanup":
@@ -5724,6 +5909,10 @@ function getHtmlForWebview(webview, extensionUri) {
           <div id="detail-empty" class="detail-empty">No task selected</div>
           <div id="detail-content" hidden>
             <p class="task-objective" id="detail-objective"></p>
+            <div class="task-retention-actions" id="detail-task-actions">
+              <button id="detail-archive-task" class="secondary-button" type="button" hidden>Archive task</button>
+              <button id="detail-restore-task" class="secondary-button" type="button" hidden>Restore task</button>
+            </div>
             <dl class="metadata-grid" id="detail-metadata"></dl>
             <div class="result-block">
               <div class="subheading-row">
@@ -5804,6 +5993,7 @@ function getHtmlForWebview(webview, extensionUri) {
               <button id="storage-cleanup-preview" type="button" title="Recompute the repository-scoped retention preview and quarantine eligible worktrees after confirmation">Preview &amp; Quarantine</button>
               <button id="storage-registration-prune" type="button" title="Preview and prune stale Git registrations owned by this repository; no checkout files are deleted">Prune Registrations</button>
               <button id="terminal-log-cleanup-preview" type="button" title="Preview and quarantine only policy-aged terminal run logs; canonical ledgers and active work remain protected">Terminal Logs</button>
+              <button id="task-cleanup-preview" type="button" title="Choose an age, preview old archived tasks, and move only eligible tasks into seven-day undo quarantine">Archived Tasks</button>
               <button id="runtime-cleanup-preview" type="button" title="Preview and quarantine obsolete extension runtime generations; current, rollback and live leased generations stay protected">Runtime Cache</button>
             </div>
             <div class="stat-list" id="storage-list"></div>

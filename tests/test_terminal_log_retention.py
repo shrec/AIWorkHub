@@ -54,7 +54,7 @@ def _run(repo: Path, request_id: str, task_id: str, *, age_days: int = 20) -> No
         }) + "\n")
 
 
-def test_preview_keeps_last_ten_and_protects_nonterminal_task(tmp_path: Path) -> None:
+def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):
         _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20 + index)
@@ -64,9 +64,11 @@ def test_preview_keeps_last_ten_and_protects_nonterminal_task(tmp_path: Path) ->
 
     assert result["dry_run"] is True
     assert result["repository_scoped"] is True
-    assert result["candidate_count"] == 1
-    assert result["candidates"][0]["request_id"] == f"{11:032x}"
-    assert result["protected_count"] == 11
+    assert result["candidate_count"] == 11
+    assert {row["request_id"] for row in result["candidates"]} == {
+        f"{index + 1:032x}" for index in range(11)
+    }
+    assert result["protected_count"] == 1
     assert (repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH).is_file()
 
 
@@ -89,6 +91,28 @@ def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Pa
     assert result["legacy_status"] == "present_unmanaged"
     assert result["current_bytes"] >= 7168
     assert result["protected_count"] == 2
+
+
+def test_preview_expires_aged_orphan_files_without_touching_recent_orphans(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    old_id = "b" * 32
+    recent_id = "c" * 32
+    old_path = process_root / f"{old_id}.stdout.log"
+    recent_path = process_root / f"{recent_id}.stderr.log"
+    old_path.write_bytes(b"old")
+    recent_path.write_bytes(b"recent")
+    old = time.time() - 20 * 86400
+    os.utime(old_path, (old, old))
+
+    result = terminal_log_retention.preview(repo)
+
+    assert result["candidate_count"] == 1
+    assert result["candidates"][0]["request_id"] == old_id
+    assert result["candidates"][0]["state"] == "orphaned"
+    assert recent_id not in {row["request_id"] for row in result["candidates"]}
+    assert result["protected_count"] == 1
 
 
 def test_aged_legacy_store_quarantine_and_restore_roundtrip(tmp_path: Path) -> None:
@@ -130,7 +154,7 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
         repo, preview_digest=preview["preview_digest"], confirm=True
     )
 
-    assert moved["quarantined"] == 4
+    assert moved["quarantined"] == 44
     request_id = preview["candidates"][0]["request_id"]
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     assert not (process_root / f"{request_id}.stdout.log").exists()
@@ -141,7 +165,7 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
     with pytest.raises(terminal_log_retention.TerminalLogRetentionError, match="retention_undo_window_active"):
         terminal_log_retention.purge(repo, batch_id=moved["batch_id"], confirm=True)
     restored = terminal_log_retention.restore(repo, batch_id=moved["batch_id"], confirm=True)
-    assert restored["restored"] == 4
+    assert restored["restored"] == 44
     assert (process_root / f"{request_id}.stdout.log").is_file()
 
 

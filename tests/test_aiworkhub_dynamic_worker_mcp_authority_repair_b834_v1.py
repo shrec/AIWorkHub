@@ -429,6 +429,7 @@ def test_zero_hit_call_does_not_satisfy_the_live_call_gate(
     # Exactly one live call recorded (the first, non-empty one); the zero-hit
     # call must not count even though it was ok=true and not cached.
     assert verification["live_source_graph_calls"] == 1
+    assert verification["fresh_source_graph_calls"] == 2
     assert verification["source_graph_zero_hit_calls"] == 1
     assert verification["source_graph_failed_calls"] == 0
     assert verification["source_graph_hit_count"] == result["hit_count"]
@@ -450,6 +451,9 @@ def test_cache_hit_call_does_not_satisfy_the_live_call_gate(
     )
     assert verification["call_count_by_tool"]["source_graph"] == 2
     assert verification["cache_hits"] == 1
+    assert verification["fresh_source_graph_calls"] == 1
+    assert verification["source_graph_mode_counts"] == {"focus": 2}
+    assert verification["source_graph_mode_sequence"] == ["focus", "focus"]
     # Only the first (live, non-cached) call counts toward the gate.
     assert verification["live_source_graph_calls"] == 1
     # Source Graph is the sole authority since B849 -- never legacy/shadow.

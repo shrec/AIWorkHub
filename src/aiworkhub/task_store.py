@@ -198,6 +198,24 @@ CREATE TABLE IF NOT EXISTS callback_batches (
   last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_task_store_callback_batches_state ON callback_batches(state);
+
+CREATE TABLE IF NOT EXISTS task_retention_batches (
+  batch_id TEXT PRIMARY KEY,
+  task_count INTEGER NOT NULL DEFAULT 0,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  quarantined_at TEXT NOT NULL,
+  restore_deadline TEXT NOT NULL,
+  restored_at TEXT NOT NULL DEFAULT '',
+  purged_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS task_retention_audit (
+  audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  task_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -577,6 +595,12 @@ def _require_ready(root: str | Path) -> tuple[StorageReadiness, Path]:
     if not readiness.ready:
         raise StorageNotReadyError(readiness.reason)
     return readiness, Path(readiness.canonical_db)
+
+
+def canonical_db_path(root: str | Path) -> Path:
+    """Return the verified canonical task database path for repo-local services."""
+    _readiness, path = _require_ready(root)
+    return path
 
 
 def exact_status_counts(root: str | Path) -> dict[str, int]:
@@ -1123,6 +1147,7 @@ __all__ = [
     "archive_task",
     "begin_claim_episode",
     "callback_bridge_health",
+    "canonical_db_path",
     "canonical_status",
     "database_identity",
     "exact_status_counts",
