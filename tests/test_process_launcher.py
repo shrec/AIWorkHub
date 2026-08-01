@@ -72,6 +72,15 @@ def _manager(tmp_path: Path, *, show_task, argv) -> process_launcher.ProcessMana
 def _open_gates(monkeypatch):
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    # Generic launcher tests exercise process lifecycle with an injected
+    # adapter command. Keep them independent of whether the CI host has a
+    # first-party Claude subscription; auth failure/ready behavior has its own
+    # focused tests in test_claude_vscode_lm_preference.py.
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "auth_status",
+        lambda: {"launchable": True, "blocker_reason": ""},
+    )
 
 
 def _wait_terminal(manager, request_id, timeout=5.0):

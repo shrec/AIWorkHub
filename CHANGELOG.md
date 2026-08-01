@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.31] - 2026-08-01
+
+### Fixed
+
+- Made process-launcher lifecycle tests independent of a host-installed Claude
+  subscription while retaining focused fail-closed first-party authentication
+  coverage. Clean Python 3.12, 3.13 and 3.14 CI runners now test the injected
+  adapter lifecycle rather than local account availability.
+
 ## [0.8.30] - 2026-08-01
 
 ### Added
