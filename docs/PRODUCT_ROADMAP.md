@@ -241,6 +241,15 @@ canonical disposition and sequencing live in
   authorities supersede donor scripts with equivalent responsibilities; no
   parallel database or duplicate lifecycle is permitted.
 
+### Local dependency knowledge (Context7-class capability)
+
+Build a repository-local, version-bound Dependency Knowledge Graph from exact
+lockfiles, installed package sources, type stubs, API signatures, bundled docs
+and optional official-document snapshots. Link dependency symbols and versions
+to Source Graph and KB so models retrieve cited API guidance matching the
+project's actual version. Never mix repositories or silently substitute web
+documentation for a different version; offline operation is the baseline.
+
 ### Review Inbox 2.0
 
 Pagination, task/model/status/time filters, bounded default payloads, recent

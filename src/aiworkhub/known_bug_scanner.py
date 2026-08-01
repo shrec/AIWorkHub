@@ -1,0 +1,140 @@
+"""Diff-scoped, dependency-free known bug pattern scanner."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+SCHEMA_ID = "aiworkhub.known_bug_scan.v1"
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_PATHS = 500
+MAX_FINDINGS = 200
+
+
+@dataclass(frozen=True, slots=True)
+class Rule:
+    rule_id: str
+    suffixes: frozenset[str]
+    pattern: re.Pattern[str]
+    severity: str
+    category: str
+    message: str
+    crypto_only: bool = False
+
+
+CRYPTO_CONTEXT = re.compile(
+    r"crypto|cipher|encrypt|decrypt|hash|hmac|secret|private|key|nonce|seed|signature|rng",
+    re.IGNORECASE,
+)
+RULES = (
+    Rule("cpp.dangerous_gets", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}),
+         re.compile(r"\bgets\s*\("), "error", "memory_safety", "unbounded gets() can overflow its destination"),
+    Rule("cpp.unbounded_copy", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}),
+         re.compile(r"\b(?:strcpy|strcat|sprintf)\s*\("), "warning", "memory_safety",
+         "unbounded C string operation requires a destination-size proof"),
+    Rule("crypto.weak_c_rng", frozenset({".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh"}),
+         re.compile(r"\b(?:rand|srand)\s*\("), "error", "cryptography",
+         "rand()/srand() is not a cryptographic random generator", True),
+    Rule("crypto.timing_memcmp", frozenset({".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh"}),
+         re.compile(r"\bmemcmp\s*\([^;]*(?:secret|private|key|mac|tag|signature|digest)", re.I),
+         "warning", "cryptography", "memcmp() may leak timing for secret material"),
+    Rule("python.shell_true", frozenset({".py"}), re.compile(r"\bshell\s*=\s*True\b"),
+         "error", "command_injection", "subprocess shell=True requires a trusted-input boundary"),
+    Rule("python.dynamic_exec", frozenset({".py"}), re.compile(r"\b(?:eval|exec)\s*\("),
+         "warning", "code_injection", "dynamic code execution requires a trusted-input proof"),
+    Rule("python.unsafe_pickle", frozenset({".py"}), re.compile(r"\bpickle\.(?:load|loads)\s*\("),
+         "warning", "deserialization", "pickle is unsafe for untrusted data"),
+    Rule("javascript.eval", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
+         re.compile(r"\beval\s*\("), "warning", "code_injection", "eval() requires a trusted-input proof"),
+    Rule("javascript.tls_disabled", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
+         re.compile(r"\brejectUnauthorized\s*:\s*false\b"), "error", "transport_security",
+         "TLS certificate verification is disabled"),
+    Rule("go.tls_disabled", frozenset({".go"}), re.compile(r"\bInsecureSkipVerify\s*:\s*true\b"),
+         "error", "transport_security", "TLS certificate verification is disabled"),
+    Rule("go.weak_crypto_rng", frozenset({".go"}), re.compile(r'\"math/rand(?:/v2)?\"'),
+         "error", "cryptography", "math/rand is not cryptographically secure", True),
+    Rule("java.ecb_mode", frozenset({".java", ".kt", ".kts"}),
+         re.compile(r'Cipher\.getInstance\s*\(\s*\"[^\"]*ECB', re.I), "error", "cryptography",
+         "ECB mode reveals plaintext block patterns"),
+    Rule("php.dynamic_eval", frozenset({".php", ".phtml"}), re.compile(r"\beval\s*\("),
+         "warning", "code_injection", "eval() requires a trusted-input proof"),
+    Rule("php.unsafe_unserialize", frozenset({".php", ".phtml"}), re.compile(r"\bunserialize\s*\("),
+         "warning", "deserialization", "unserialize() requires a trusted-type boundary"),
+)
+BYTE_PERM_RE = re.compile(r"__byte_perm\s*\(\s*\w+\s*,\s*0\s*,\s*(0x[0-9a-fA-F]+)\s*\)")
+ROTATION_RE = re.compile(r"rotl32\((\d+)\)|rotr32\((\d+)\)")
+
+
+def _rotation(selector: int) -> int | None:
+    known = {0x2103: 8, 0x1032: 16, 0x0321: 24, 0x3210: 0}
+    if selector in known:
+        return known[selector]
+    actual = [(selector >> shift) & 0xF for shift in (0, 4, 8, 12)]
+    for count in range(4):
+        if actual == [(count + index) % 4 for index in range(4)]:
+            return count * 8
+    return None
+
+
+def _finding(rule: Rule, path: str, line: int, column: int, snippet: str) -> dict:
+    digest = hashlib.sha256(f"{rule.rule_id}\0{path}\0{line}\0{snippet}".encode()).hexdigest()
+    return {"rule_id": rule.rule_id, "path": path, "line": line, "column": column,
+            "severity": rule.severity, "category": rule.category, "message": rule.message,
+            "snippet": snippet.strip()[:300], "fingerprint": digest}
+
+
+def scan_file(root: Path, relative: str) -> list[dict]:
+    path = (root / relative).resolve(strict=False)
+    if (path != root and root not in path.parents) or path.is_symlink() or not path.is_file():
+        return []
+    if path.stat().st_size > MAX_FILE_BYTES:
+        return []
+    suffix = path.suffix.lower()
+    rules = [rule for rule in RULES if suffix in rule.suffixes]
+    if not rules and suffix not in {".cu", ".cuh"}:
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    crypto = bool(CRYPTO_CONTEXT.search(relative))
+    findings = []
+    for number, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("//", "/*", "*", "#")):
+            continue
+        source = raw.split("//", 1)[0]
+        crypto = crypto or bool(CRYPTO_CONTEXT.search(source))
+        for rule in rules:
+            if rule.crypto_only and not crypto:
+                continue
+            for match in rule.pattern.finditer(source):
+                findings.append(_finding(rule, relative, number, match.start() + 1, raw))
+        if suffix in {".cu", ".cuh"}:
+            for match in BYTE_PERM_RE.finditer(source):
+                actual = _rotation(int(match.group(1), 16))
+                claim = ROTATION_RE.search("\n".join(lines[max(0, number - 5):number]))
+                claimed = int(claim.group(1) or claim.group(2)) if claim else None
+                if actual is not None and claimed is not None and actual != claimed:
+                    rule = Rule("cuda.byte_perm_rotation_mismatch", frozenset({suffix}), BYTE_PERM_RE,
+                                "error", "correctness",
+                                f"selector produces rotl32({actual}) but nearby code claims {claimed}")
+                    findings.append(_finding(rule, relative, number, match.start() + 1, raw))
+        if len(findings) >= MAX_FINDINGS:
+            break
+    return findings[:MAX_FINDINGS]
+
+
+def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> dict:
+    root = Path(repo_root).resolve()
+    paths = tuple(sorted(dict.fromkeys(map(str, changed_paths))))[:MAX_PATHS]
+    findings = []
+    for relative in paths:
+        findings.extend(scan_file(root, relative))
+        if len(findings) >= MAX_FINDINGS:
+            break
+    errors = sum(row["severity"] == "error" for row in findings)
+    return {"schema_id": SCHEMA_ID, "passed": errors == 0, "errors": errors,
+            "warnings": sum(row["severity"] == "warning" for row in findings),
+            "paths_considered": len(paths), "findings": findings[:MAX_FINDINGS],
+            "truncated": len(findings) > MAX_FINDINGS}

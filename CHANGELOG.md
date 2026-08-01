@@ -13,6 +13,10 @@ noted by package/extension version and release tag.
   cryptographic lease release, real byte accounting, digest-bound explicit
   cleanup, rogue in-repository build-tree reporting, CLI access and bounded
   environment-preflight observability.
+- Added the first diff-scoped Known Bug Scanner rule packs for C/C++/CUDA,
+  cryptographic misuse, Python, JavaScript/TypeScript, Go, Java/Kotlin and PHP.
+  High-confidence findings block Quality Evidence; heuristic warnings remain
+  visible validation evidence without producing false proof of failure.
 
 ### Fixed
 

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from . import known_bug_scanner
+
 # ---------------------------------------------------------------------------
 # 0.6.30 Quality Evidence Engine foundation.
 #
@@ -805,6 +807,19 @@ def run_builtin_static_checks(
             summary="no changed Python/JavaScript/shell source required syntax parsing",
             provenance="builtin:diff_scoped_syntax",
         ))
+    bug_report = known_bug_scanner.scan_changed_paths(root, paths)
+    checks.append(EvidenceCheck(
+        check_id="builtin:known_bug_patterns",
+        kind="security",
+        status=STATUS_PASSED if bug_report["passed"] else STATUS_FAILED,
+        affected_paths=paths,
+        summary=json.dumps({
+            "errors": bug_report["errors"], "warnings": bug_report["warnings"],
+            "findings": bug_report["findings"][:20], "truncated": bug_report["truncated"],
+        }, sort_keys=True)[:MAX_SUMMARY_CHARS],
+        provenance="builtin:diff_scoped_known_bug_registry.v1",
+        error="" if bug_report["passed"] else "high_confidence_known_bug_pattern",
+    ))
     return checks
 
 

@@ -32,7 +32,7 @@ contracts.
 | Parallel write collision guard | Already covered | Keep AIWorkHub's task-plan and allowed-write collision authority. |
 | Completion bridge/watch | Already covered | Keep the durable callback outbox, dispatcher reconciliation and manager inbox. |
 | Legacy Session/AI Memory/KB scripts | Superseded | Preserve useful schema ideas only; never import their SQLite files as a live model interface. |
-| CUDA intrinsic checker | Useful optional quality adapter | Generalize as a change-sensitive CUDA quality check after build hygiene; never make CUDA a core dependency. |
+| CUDA intrinsic checker | Initial generic gate implemented | Exact rotation-claim mismatches now enter the diff-scoped Known Bug Scanner and Quality Evidence; CUDA remains dependency-free and change-sensitive. |
 | Crypto validators, key tools and benchmark generators | Donor-specific | Do not port into the generic product. They can be repository-local quality commands or task templates. |
 
 ## Ordered implementation
