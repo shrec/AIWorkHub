@@ -13,9 +13,9 @@ Design constraints (see task card B849):
   * Extraction is AST-first for Python (:mod:`aiworkhub.source_graph_ast`).
     PHP receives conservative lexical structural extraction (namespaces,
     imports, class-like declarations, functions/methods and inheritance).
-    The JavaScript/TypeScript family gets truthful file-level evidence
-    (path/hash/language/size, no fabricated functions/calls/edges); every
-    other unsupported language fails closed rather than being approximated
+    The other 31 registered language/file families get truthful file-level
+    evidence (path/hash/language/size, no fabricated functions/calls/edges);
+    truly unregistered extensions fail closed rather than being approximated
     with regex heuristics mislabeled as extracted evidence.
   * Incremental indexing removes every entity/edge a changed OR deleted
     file owned before re-indexing it, so renames/deletes never leave a
@@ -34,6 +34,7 @@ import fnmatch
 import json
 import os
 import sqlite3
+import stat
 import sys
 from collections import deque
 from contextlib import contextmanager
@@ -43,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from . import source_graph_ast as sgast
+from . import source_graph_languages as sglanguages
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
 from .storage_registry import (
     StorageRegistryError,
@@ -51,9 +53,11 @@ from .storage_registry import (
 )
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
-BUILD_REVISION = "aiworkhub.source_graph.multilang.v2"
+BUILD_REVISION = "aiworkhub.source_graph.multilang.v3"
 IGNORE_SCHEMA_ID = "aiworkhub.source_graph.ignore.v1"
+POLICY_SCHEMA_ID = "aiworkhub.source_graph.policy.v2"
 IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
+MAX_POLICY_BYTES = 64 * 1024
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = ("focus", "slice", "bundle")
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
@@ -253,13 +257,8 @@ def _now_iso() -> str:
 # File discovery -- generic, repo-agnostic (no project-specific hardcoding)
 # ---------------------------------------------------------------------------
 
-INDEXED_EXTENSIONS: tuple[str, ...] = (".py",) + sgast.JS_TS_EXTENSIONS + sgast.PHP_EXTENSIONS
-LANGUAGE_CAPABILITIES: dict[str, str] = {
-    "python": "semantic_ast",
-    "php": "semantic_lexical",
-    "javascript": "file_evidence",
-    "typescript": "file_evidence",
-}
+INDEXED_EXTENSIONS: tuple[str, ...] = sglanguages.INDEXED_EXTENSIONS
+LANGUAGE_CAPABILITIES: dict[str, str] = dict(sglanguages.LANGUAGE_CAPABILITIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +274,21 @@ class SourceGraphIgnorePolicy:
 
     exclude_dirs: frozenset[str]
     exclude_globs: tuple[str, ...]
+    disabled_languages: frozenset[str] = frozenset()
+    revision: int = 0
+    configured: bool = False
+
+    @property
+    def enabled_languages(self) -> frozenset[str]:
+        return frozenset(sglanguages.LANGUAGE_BY_ID) - self.disabled_languages
+
+    @property
+    def indexed_extensions(self) -> frozenset[str]:
+        return frozenset(
+            extension
+            for language in self.enabled_languages
+            for extension in sglanguages.LANGUAGE_BY_ID[language].extensions
+        )
 
 
 def ignore_config_path(repo_root: Path) -> Path:
@@ -292,9 +306,11 @@ def ensure_ignore_config(repo_root: Path) -> Path:
     path = ignore_config_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_id": IGNORE_SCHEMA_ID,
+        "schema_id": POLICY_SCHEMA_ID,
+        "revision": 1,
         "exclude_dirs": [],
         "exclude_globs": [],
+        "disabled_languages": [],
     }
     try:
         with path.open("x", encoding="utf-8") as handle:
@@ -320,21 +336,125 @@ def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
     if not path.exists():
         return SourceGraphIgnorePolicy(frozenset(DEFAULT_EXCLUDE_DIR_NAMES), ())
     try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SourceGraphError(f"source_graph_ignore_invalid:{path}:regular_file_required")
+        if info.st_size > MAX_POLICY_BYTES:
+            raise SourceGraphError(f"source_graph_ignore_invalid:{path}:too_large")
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SourceGraphError(f"source_graph_ignore_invalid:{path}:{exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema_id") != IGNORE_SCHEMA_ID:
+    if not isinstance(payload, dict) or payload.get("schema_id") not in {
+        IGNORE_SCHEMA_ID, POLICY_SCHEMA_ID,
+    }:
         raise SourceGraphError(f"source_graph_ignore_invalid:{path}:schema_id")
+    is_legacy = payload.get("schema_id") == IGNORE_SCHEMA_ID
+    revision = 0 if is_legacy else payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        if not is_legacy:
+            raise SourceGraphError(f"source_graph_ignore_invalid:{path}:revision")
+        revision = 0
     extra_dirs = _string_list(payload.get("exclude_dirs", []), field="exclude_dirs", config_path=path)
     extra_globs = _string_list(payload.get("exclude_globs", []), field="exclude_globs", config_path=path)
+    disabled_languages = _string_list(
+        payload.get("disabled_languages", []),
+        field="disabled_languages",
+        config_path=path,
+    )
     if any("/" in item or item in {".", ".."} for item in extra_dirs):
         raise SourceGraphError(f"source_graph_ignore_invalid:{path}:exclude_dirs_must_be_basenames")
     if any(item.startswith("/") or item == ".." or item.startswith("../") for item in extra_globs):
         raise SourceGraphError(f"source_graph_ignore_invalid:{path}:exclude_globs_must_be_relative")
+    unknown_languages = set(disabled_languages) - set(sglanguages.LANGUAGE_BY_ID)
+    if unknown_languages:
+        raise SourceGraphError(
+            f"source_graph_ignore_invalid:{path}:unknown_languages:"
+            f"{','.join(sorted(unknown_languages))}"
+        )
     return SourceGraphIgnorePolicy(
         frozenset((*DEFAULT_EXCLUDE_DIR_NAMES, *extra_dirs)),
         tuple(dict.fromkeys(extra_globs)),
+        frozenset(disabled_languages),
+        revision,
+        True,
     )
+
+
+def source_graph_policy_view(repo_root: Path) -> dict[str, Any]:
+    """Return the bounded repository language policy used by discovery."""
+
+    policy = load_ignore_policy(repo_root)
+    languages = sglanguages.public_registry(disabled_languages=policy.disabled_languages)
+    return {
+        "ok": True,
+        "schema_id": POLICY_SCHEMA_ID,
+        "revision": policy.revision,
+        "configured": policy.configured,
+        "language_count": len(languages),
+        "enabled_count": sum(1 for row in languages if row["enabled"]),
+        "languages": languages,
+        "exclude_dirs": sorted(policy.exclude_dirs - DEFAULT_EXCLUDE_DIR_NAMES),
+        "exclude_globs": list(policy.exclude_globs),
+    }
+
+
+def update_language_policy(
+    repo_root: Path,
+    *,
+    language_changes: dict[str, bool],
+    expected_revision: int,
+) -> dict[str, Any]:
+    """Atomically apply bounded per-language switches with optimistic locking."""
+
+    root = repo_root.resolve()
+    if not isinstance(language_changes, dict) or not language_changes:
+        raise SourceGraphError("source_graph_policy_language_changes_required")
+    unknown = set(language_changes) - set(sglanguages.LANGUAGE_BY_ID)
+    if unknown:
+        raise SourceGraphError(f"source_graph_policy_unknown_language:{','.join(sorted(unknown))}")
+    if any(not isinstance(value, bool) for value in language_changes.values()):
+        raise SourceGraphError("source_graph_policy_language_values_must_be_boolean")
+    current = load_ignore_policy(root)
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision != current.revision
+    ):
+        raise SourceGraphError("source_graph_policy_revision_conflict")
+
+    disabled = set(current.disabled_languages)
+    for language, enabled in language_changes.items():
+        if enabled:
+            disabled.discard(language)
+        else:
+            disabled.add(language)
+    revision = current.revision + 1
+    payload = {
+        "schema_id": POLICY_SCHEMA_ID,
+        "revision": revision,
+        "exclude_dirs": sorted(current.exclude_dirs - DEFAULT_EXCLUDE_DIR_NAMES),
+        "exclude_globs": list(current.exclude_globs),
+        "disabled_languages": sorted(disabled),
+    }
+    path = ignore_config_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.is_symlink():
+        raise SourceGraphError("source_graph_policy_regular_file_required")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(temporary, flags, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return source_graph_policy_view(root)
 
 
 def _glob_ignored(relative_path: str, patterns: tuple[str, ...], *, is_dir: bool = False) -> bool:
@@ -357,7 +477,7 @@ def iter_source_files(repo_root: Path) -> list[Path]:
     repo_root = repo_root.resolve()
     policy = load_ignore_policy(repo_root)
     out: list[Path] = []
-    indexed_extensions = frozenset(ext.lower() for ext in INDEXED_EXTENSIONS)
+    indexed_extensions = policy.indexed_extensions
     for current, dirnames, filenames in os.walk(repo_root, followlinks=False):
         current_path = Path(current)
         kept_dirs: list[str] = []
@@ -949,6 +1069,7 @@ __all__ = [
     "BUILD_REVISION",
     "INDEXED_EXTENSIONS",
     "LANGUAGE_CAPABILITIES",
+    "POLICY_SCHEMA_ID",
     "BuildReport",
     "MAX_BUDGET_ROWS",
     "MAX_COMPONENT_NODES",
@@ -963,12 +1084,17 @@ __all__ = [
     "build_index",
     "bundle",
     "component_summary",
+    "ensure_ignore_config",
+    "ignore_config_path",
+    "iter_source_files",
+    "load_ignore_policy",
+    "source_graph_policy_view",
+    "update_language_policy",
     "connect",
     "context",
     "find",
     "focus",
     "func",
-    "iter_source_files",
     "neighbors",
     "resolve_db_path",
     "shortest_path",

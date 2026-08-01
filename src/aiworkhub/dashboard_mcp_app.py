@@ -29,6 +29,7 @@ from aiworkhub import (
     process_launcher,
     repository_bootstrap,
     shared_router,
+    source_graph,
     storage_observability,
     storage_registry,
     storage_retention,
@@ -180,6 +181,7 @@ def settings_view() -> dict[str, Any]:
         root = core.repo_root()
         result = feature_settings.load(root)
         result["context_graph_runtime"] = context_graph.status(root)
+        result["source_graph_policy"] = source_graph.source_graph_policy_view(root)
     except (
         context_graph.ContextGraphError,
         feature_settings.FeatureSettingsError,
@@ -189,6 +191,33 @@ def settings_view() -> dict[str, Any]:
         result = {"ok": False, "error": str(exc)[:240]}
     result["server_tool"] = "aiworkhub_dashboard_settings"
     result["authority_flags"] = _readonly_authority_flags()
+    return result
+
+
+def source_graph_settings_update_view(
+    language_changes: dict[str, bool], expected_revision: int,
+) -> dict[str, Any]:
+    """USER WRITE: atomically update repository Source Graph languages."""
+
+    root = core.repo_root()
+    try:
+        result = source_graph.update_language_policy(
+            root,
+            language_changes=language_changes,
+            expected_revision=expected_revision,
+        )
+        if feature_settings.enabled(root, "source_graph"):
+            result["source_graph_refresh"] = core.source_graph_refresh_now()
+    except (
+        feature_settings.FeatureSettingsError,
+        source_graph.SourceGraphError,
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
+        result = {"ok": False, "error": str(exc)[:240]}
+    result["server_tool"] = "aiworkhub_dashboard_source_graph_settings_update"
+    result["authority_flags"] = _storage_write_authority_flags()
     return result
 
 
@@ -957,6 +986,10 @@ SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
 SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
 SETTINGS_UPDATE_TOOLS: dict[str, Any] = {SETTINGS_UPDATE_TOOL_NAME: settings_update_view}
+SOURCE_GRAPH_SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_source_graph_settings_update"
+SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS: dict[str, Any] = {
+    SOURCE_GRAPH_SETTINGS_UPDATE_TOOL_NAME: source_graph_settings_update_view,
+}
 STORAGE_RETENTION_PREVIEW_TOOL_NAME = "aiworkhub_dashboard_storage_retention_preview"
 STORAGE_RETENTION_READ_TOOLS: dict[str, Any] = {
     STORAGE_RETENTION_PREVIEW_TOOL_NAME: storage_retention_preview_view,
@@ -1005,6 +1038,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_READ_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in STORAGE_RETENTION_WRITE_TOOLS.items():
@@ -1027,5 +1062,6 @@ def register(mcp: Any) -> tuple[str, ...]:
         tuple(STORAGE_RETENTION_WRITE_TOOLS)
         + tuple(TERMINAL_LOG_RETENTION_WRITE_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
+        + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)
     )

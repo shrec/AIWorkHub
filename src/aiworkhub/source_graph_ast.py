@@ -19,8 +19,7 @@ declarations, functions/methods and inheritance. It deliberately emits no
 call edges, because resolving dynamic PHP calls without a full parser would
 overstate authority. Unsupported files remain explicit fail-closed records.
 
-The JavaScript/TypeScript family (``.js .jsx .mjs .cjs .ts .tsx``) is the
-one documented exception: B881 gives these files a truthful *file-level*
+Every other language registered by Source Graph receives truthful *file-level*
 authority record -- one ``kind="file"`` entity carrying the exact
 language, path, byte size and content hash directly observed from disk
 (``FILE_EVIDENCE``) -- without inventing any function/class/call/import
@@ -36,6 +35,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import source_graph_languages as languages
+
 EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v1"
 FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
@@ -48,7 +49,7 @@ FILE_EVIDENCE = "FILE_EVIDENCE"
 ENTITY_KINDS = ("module", "class", "function", "method", "import", "file")
 EDGE_KINDS = ("imports", "calls", "defines", "inherits")
 
-PYTHON_EXTENSIONS = (".py",)
+PYTHON_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["python"].extensions)
 PHP_EXTENSIONS = (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8")
 
 # JS/TS family languages get file-level (not semantic) evidence: real path,
@@ -111,7 +112,7 @@ class FileExtraction:
 
 
 def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> FileExtraction:
-    """Extract entities/edges for one file. Fail-closed for non-Python."""
+    """Extract semantic or truthful file-level evidence for one known file."""
 
     rel = file_path.relative_to(repo_root).as_posix()
     try:
@@ -123,11 +124,10 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
         )
     source_hash = sha256_bytes(raw)
 
-    js_ts_language = JS_TS_LANGUAGE_BY_EXTENSION.get(file_path.suffix)
-    if js_ts_language is not None:
-        return _extract_file_evidence(rel, raw, js_ts_language, source_hash, build_revision)
+    suffix = file_path.suffix.lower()
+    language = languages.language_for_path(file_path)
 
-    if file_path.suffix.lower() in PHP_EXTENSIONS:
+    if suffix in PHP_EXTENSIONS:
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -137,9 +137,11 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
             )
         return _extract_php_lexical(rel, text, source_hash, build_revision)
 
-    if file_path.suffix not in PYTHON_EXTENSIONS:
+    if suffix not in PYTHON_EXTENSIONS:
+        if language is not None:
+            return _extract_file_evidence(rel, raw, language, source_hash, build_revision)
         return FileExtraction(
-            file_path=rel, language=file_path.suffix.lstrip(".") or "unknown",
+            file_path=rel, language=suffix.lstrip(".") or "unknown",
             status="unsupported_fail_closed", source_hash=source_hash,
         )
 

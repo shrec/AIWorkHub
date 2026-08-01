@@ -181,7 +181,10 @@ def test_repository_switch_stops_old_dispatcher_never_shares_with_new(tmp_path):
 
 
 def test_extension_reload_restore_disposes_stale_controller_before_adopting_new_panel():
-    body = _slice(_EXTENSION_JS, "function reviveDashboardPanel(", 1700)
+    # Keep the bounded static check large enough to cover the whole restore
+    # function as lifecycle diagnostics grow; character count is not a
+    # product invariant, the three ordered actions below are.
+    body = _slice(_EXTENSION_JS, "function reviveDashboardPanel(", 2600)
     assert "panel.__aiworkhubViewState.dispose()" in body
     assert "getMcpClient(context)" in body
     assert "pushSnapshot(view)" in body

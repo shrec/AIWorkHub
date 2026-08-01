@@ -133,14 +133,59 @@ def test_ast_extraction_labels_evidence_with_full_provenance(tmp_path):
         assert entity.evidence_label == sgast.EXTRACTED  # def/class/import are always directly observed
 
 
-def test_unsupported_language_is_explicit_fail_closed_not_regex_approximated(tmp_path):
+def test_unregistered_language_is_explicit_fail_closed_not_regex_approximated(tmp_path):
     repo = _new_repo(tmp_path, "repo")
-    target = repo / "pkg" / "native.c"
-    _write(target, "int main(void) { return 0; }\n")
+    target = repo / "pkg" / "native.unknown_extension"
+    _write(target, "opaque\n")
     extraction = sgast.extract_file(repo, target, build_revision="test-rev")
     assert extraction.status == "unsupported_fail_closed"
     assert extraction.entities == ()
     assert extraction.edges == ()
+
+
+def test_language_registry_exposes_all_33_families() -> None:
+    assert len(sg.LANGUAGE_CAPABILITIES) == 33
+    assert {"cpp", "json", "xml"}.issubset(sg.LANGUAGE_CAPABILITIES)
+    assert sg.LANGUAGE_CAPABILITIES["cpp"] == "file_evidence"
+
+
+@pytest.mark.parametrize(
+    "relative,expected_language",
+    [
+        ("native/engine.cpp", "cpp"),
+        ("config/runtime.json", "json"),
+        ("schemas/task.xml", "xml"),
+    ],
+)
+def test_cpp_json_xml_are_indexed_as_truthful_file_evidence(
+    tmp_path, relative, expected_language,
+):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / relative
+    _write(target, "{}\n" if relative.endswith(".json") else "<root/>\n")
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+    assert extraction.status == "file_evidence_only"
+    assert extraction.language == expected_language
+    assert len(extraction.entities) == 1
+    assert extraction.entities[0].evidence_label == sgast.FILE_EVIDENCE
+    assert extraction.edges == ()
+
+
+def test_cpp_json_xml_build_and_query_are_non_empty(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "native" / "engine.cpp", "int main() { return 0; }\n")
+    _write(repo / "config" / "runtime.json", '{"enabled": true}\n')
+    _write(repo / "schemas" / "task.xml", "<task/>\n")
+    report = sg.build_index(repo, incremental=True)
+    assert report.files_seen == 3
+    assert report.entities_written == 3
+    conn = sg.connect(sg.resolve_db_path(repo))
+    try:
+        assert sg.find(conn, "engine.cpp")
+        assert sg.find(conn, "runtime.json")
+        assert sg.find(conn, "task.xml")
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +328,58 @@ def test_repo_ignore_policy_extends_defaults_with_dirs_and_globs(tmp_path):
     _write(repo / "web" / "bundle.min.js", "module.exports = 1;\n")
     rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
     assert rels == {"src/live.py"}
+
+
+def test_repo_language_policy_disables_and_reenables_cpp_incrementally(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "native" / "engine.cpp", "int main() { return 0; }\n")
+    _write(repo / "config" / "runtime.json", "{}\n")
+    first = sg.build_index(repo, incremental=True)
+    assert first.files_seen == 2
+
+    initial = sg.source_graph_policy_view(repo)
+    disabled = sg.update_language_policy(
+        repo,
+        language_changes={"cpp": False},
+        expected_revision=initial["revision"],
+    )
+    assert disabled["enabled_count"] == 32
+    second = sg.build_index(repo, incremental=True)
+    assert second.files_seen == 1
+    assert second.files_removed == 1
+
+    enabled = sg.update_language_policy(
+        repo,
+        language_changes={"cpp": True},
+        expected_revision=disabled["revision"],
+    )
+    assert enabled["enabled_count"] == 33
+    third = sg.build_index(repo, incremental=True)
+    assert third.files_seen == 2
+    assert third.files_changed == 1
+
+
+def test_legacy_ignore_v1_migrates_without_losing_owner_rules(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    config = sg.ensure_ignore_config(repo)
+    config.write_text(json.dumps({
+        "schema_id": sg.IGNORE_SCHEMA_ID,
+        "exclude_dirs": ["vendor"],
+        "exclude_globs": ["generated/**"],
+    }), encoding="utf-8")
+    legacy = sg.source_graph_policy_view(repo)
+    assert legacy["revision"] == 0
+    updated = sg.update_language_policy(
+        repo,
+        language_changes={"xml": False},
+        expected_revision=0,
+    )
+    assert updated["revision"] == 1
+    assert updated["exclude_dirs"] == ["vendor"]
+    assert updated["exclude_globs"] == ["generated/**"]
+    stored = json.loads(config.read_text(encoding="utf-8"))
+    assert stored["schema_id"] == sg.POLICY_SCHEMA_ID
+    assert stored["disabled_languages"] == ["xml"]
 
 
 def test_malformed_repo_ignore_policy_fails_closed(tmp_path):

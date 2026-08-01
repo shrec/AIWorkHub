@@ -2695,6 +2695,45 @@ function renderSettings(payload) {
     row.append(copy, control);
     fragment.append(row);
   }
+  const policy = payload.source_graph_policy;
+  if (policy && policy.ok === true && Array.isArray(policy.languages)) {
+    const heading = document.createElement("div");
+    heading.className = "settings-group-heading";
+    const title = document.createElement("strong");
+    title.textContent = `Source Graph languages · ${Number(policy.enabled_count || 0)}/${Number(policy.language_count || 0)} enabled`;
+    const detail = document.createElement("small");
+    detail.textContent = "Repository-local indexing families. Semantic capability is shown explicitly; file evidence records exact path, size and hash without fabricating symbols.";
+    heading.append(title, detail);
+    fragment.append(heading);
+    const grid = document.createElement("div");
+    grid.className = "settings-language-grid";
+    for (const language of policy.languages) {
+      const row = document.createElement("label");
+      row.className = "settings-row settings-language-row";
+      const copy = document.createElement("span");
+      copy.className = "settings-copy";
+      const languageTitle = document.createElement("strong");
+      languageTitle.textContent = String(language.label || language.id || "Language");
+      const languageDetail = document.createElement("small");
+      const extensions = Array.isArray(language.extensions) ? language.extensions.join(" ") : "";
+      languageDetail.textContent = `${String(language.capability || "file_evidence").replaceAll("_", " ")} · ${extensions}`;
+      copy.append(languageTitle, languageDetail);
+      const control = document.createElement("span");
+      control.className = "switch-control";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = Boolean(language.enabled);
+      input.dataset.sourceGraphLanguage = String(language.id || "");
+      input.dataset.sourceGraphRevision = String(Number(policy.revision || 0));
+      input.setAttribute("aria-label", `${languageTitle.textContent} indexing enabled`);
+      const track = document.createElement("span");
+      track.className = "switch-track";
+      control.append(input, track);
+      row.append(copy, control);
+      grid.append(row);
+    }
+    fragment.append(grid);
+  }
   elements.settingsList.replaceChildren(fragment);
 }
 
@@ -3016,6 +3055,17 @@ elements.openSettings.addEventListener("click", () => {
 });
 
 elements.settingsList.addEventListener("change", (event) => {
+  const languageInput = event.target.closest("[data-source-graph-language]");
+  if (languageInput && state.featureSettings) {
+    languageInput.disabled = true;
+    vscode.postMessage({
+      type: "updateSourceGraphLanguage",
+      language: languageInput.dataset.sourceGraphLanguage,
+      enabled: Boolean(languageInput.checked),
+      expectedRevision: Number(languageInput.dataset.sourceGraphRevision || 0),
+    });
+    return;
+  }
   const input = event.target.closest("[data-feature-setting]");
   if (!input || !state.featureSettings) return;
   input.disabled = true;

@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.23";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.24";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -136,6 +136,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestKb",
   "requestSettings",
   "updateFeatureSetting",
+  "updateSourceGraphLanguage",
   "requestStorageCleanup",
   "requestStorageRegistrationPrune",
   "requestStorageRestore",
@@ -224,6 +225,7 @@ const DASHBOARD_TOOLS = Object.freeze({
   settings: "aiworkhub_dashboard_settings",
 });
 const SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update";
+const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
 const FEATURE_SETTING_KEYS = new Set([
   "source_graph",
   "session_manager",
@@ -4848,8 +4850,37 @@ async function updateFeatureSetting(view, feature, enabled, expectedRevision) {
       return;
     }
     if (view.stillBoundTo(client)) {
-      view.postMessage({ type: OUTBOUND_TYPES.settings, payload: sanitizeWebviewPayload(payload) });
+      await pushSettings(view);
       view.postMessage({ type: OUTBOUND_TYPES.notification, message: `${feature.replaceAll("_", " ")} ${enabled ? "enabled" : "disabled"}` });
+      await pushSnapshot(view);
+    }
+  } catch (err) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
+    await pushSettings(view);
+  }
+}
+
+async function updateSourceGraphLanguage(view, language, enabled, expectedRevision) {
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(language) || typeof enabled !== "boolean" ||
+      !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    view.postMessage({ type: OUTBOUND_TYPES.error, message: "invalid_source_graph_language_update" });
+    return;
+  }
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(SOURCE_GRAPH_SETTINGS_UPDATE_TOOL, {
+      language_changes: { [language]: enabled },
+      expected_revision: expectedRevision,
+    });
+    if (!payload || payload.ok !== true) {
+      view.postMessage({ type: OUTBOUND_TYPES.error, message: (payload && payload.error) || "source_graph_language_update_failed" });
+      await pushSettings(view);
+      return;
+    }
+    if (view.stillBoundTo(client)) {
+      await pushSettings(view);
+      view.postMessage({ type: OUTBOUND_TYPES.notification, message: `${language.replaceAll("_", " ")} indexing ${enabled ? "enabled" : "disabled"}` });
       await pushSnapshot(view);
     }
   } catch (err) {
@@ -5332,6 +5363,14 @@ function handleInboundMessage(view, message) {
       updateFeatureSetting(
         view,
         String(message.feature || ""),
+        message.enabled,
+        Number(message.expectedRevision),
+      );
+      break;
+    case "updateSourceGraphLanguage":
+      updateSourceGraphLanguage(
+        view,
+        String(message.language || ""),
         message.enabled,
         Number(message.expectedRevision),
       );
@@ -5836,7 +5875,7 @@ function getHtmlForWebview(webview, extensionUri) {
     <div class="settings-list" id="settings-list">
       <div class="panel-state">Loading settings</div>
     </div>
-    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code>. Task orchestration and callback routing remain protected core services.</div>
+    <div class="settings-footnote">Stored only in this repository's <code>.aiworkhub/config/features.json</code> and <code>.aiworkhub/config/source_graph.json</code>. Task orchestration and callback routing remain protected core services.</div>
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

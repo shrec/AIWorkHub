@@ -11,7 +11,7 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import core, dashboard_mcp_app, feature_settings, source_graph_daemon, task_store  # noqa: E402
+from aiworkhub import core, dashboard_mcp_app, feature_settings, source_graph, source_graph_daemon, task_store  # noqa: E402
 
 
 def _repo(tmp_path: Path, name: str) -> Path:
@@ -121,3 +121,28 @@ def test_disabled_tool_family_returns_explicit_reason(
         "reason": "disabled_by_repository_settings",
         "repo": str(root.resolve()),
     }
+
+
+def test_dashboard_exposes_and_updates_source_graph_languages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path, "repo")
+    source_graph.ensure_ignore_config(root)
+    monkeypatch.setattr(core, "repo_root", lambda: root)
+    monkeypatch.setattr(core, "source_graph_refresh_now", lambda: {"ok": True, "triggered": True})
+
+    viewed = dashboard_mcp_app.settings_view()
+    policy = viewed["source_graph_policy"]
+    assert policy["language_count"] == 33
+    assert policy["enabled_count"] == 33
+
+    changed = dashboard_mcp_app.source_graph_settings_update_view(
+        {"cpp": False, "json": False},
+        policy["revision"],
+    )
+    assert changed["ok"] is True
+    assert changed["enabled_count"] == 31
+    assert changed["source_graph_refresh"]["triggered"] is True
+    enabled = {row["id"]: row["enabled"] for row in changed["languages"]}
+    assert enabled["cpp"] is False
+    assert enabled["json"] is False

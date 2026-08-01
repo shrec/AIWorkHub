@@ -1484,7 +1484,11 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     runtime record, an unreadable ledger, or zero verified live
     ``source_graph`` calls all resolve to ``satisfied: False``. Source Graph
     must be fresh and non-empty; Session Manager and requested Memory/KB
-    sections must have a successful canonical call. A tampered or
+    sections must have a successful canonical call. A denied malformed or
+    out-of-scope tool request remains visible as policy-warning telemetry but
+    is not itself terminal once every required canonical call is satisfied:
+    the denied request returned no data and granted no capability, so forcing
+    a full worker rerun after recovery only discards valid work. A tampered or
     forged ledger line is dropped by ``verify_audit_ledger`` before it ever
     reaches this count, so a worker cannot satisfy the gate by writing text
     that merely looks like an audit entry.
@@ -1511,6 +1515,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         "reason": "",
         "satisfaction_by_tool": {},
         "injected_context_acknowledged": False,
+        "policy_warning": False,
+        "policy_warning_count": 0,
+        "warnings": [],
     }
     if not gated:
         return result
@@ -1572,15 +1579,19 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["stale_tools"] = stale
     result["satisfaction_by_tool"] = satisfaction_by_tool
     policy_violations = int(verification.get("policy_violations") or 0)
-    if not verification.get("ok") or missing or stale or policy_violations:
+    result["policy_warning"] = policy_violations > 0
+    result["policy_warning_count"] = policy_violations
+    if policy_violations:
+        result["warnings"] = [
+            f"denied_aiworkhub_tool_requests_recovered:{policy_violations}"
+        ]
+    if not verification.get("ok") or missing or stale:
         result["satisfied"] = False
         reasons: list[str] = []
         if missing:
             reasons.append("required_aiworkhub_mcp_calls_missing:" + ",".join(missing))
         if stale:
             reasons.append("source_graph_stale_or_cached:" + ",".join(stale))
-        if policy_violations:
-            reasons.append(f"aiworkhub_tool_policy_violations:{policy_violations}")
         result["reason"] = verification.get("reason") or "; ".join(reasons)
     return result
 
@@ -3670,14 +3681,20 @@ class ProcessManager:
                             ),
                         )
                         worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
+                        # Always collect deterministic validation evidence
+                        # before enforcing the context/tool-use gate. A
+                        # missing MCP call must still block promotion, but it
+                        # must not erase the otherwise useful test evidence or
+                        # force the coordinator to rerun the worker merely to
+                        # learn whether its candidate builds.
+                        validations = run_validations(
+                            workspace, metadata.get("validation") or []
+                        )
                         if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
                             raise WorkspaceError(
                                 "validation_required_aiworkhub_mcp_call_missing:"
                                 + str(worker_mcp_gate.get("reason") or "")
                             )
-                        validations = run_validations(
-                            workspace, metadata.get("validation") or []
-                        )
                         changed = enforce_scope(workspace)
                         # B561: union validated required-output exact paths into
                         # the review candidate set.  validate_required_outputs

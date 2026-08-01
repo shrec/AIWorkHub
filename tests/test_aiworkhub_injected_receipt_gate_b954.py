@@ -191,15 +191,32 @@ def test_no_injection_but_live_calls_pass(tmp_path, monkeypatch):
     assert gate["satisfaction_by_tool"]["session_current_state"] == "live_worker_call"
 
 
-def test_live_calls_with_policy_violation_fail_review_gate(tmp_path, monkeypatch):
+def test_live_calls_with_denied_request_recover_as_policy_warning(tmp_path, monkeypatch):
     _patch_verify(monkeypatch, live_source_graph=1, policy_violations=1)
     stdout = tmp_path / "worker.log"
     stdout.write_text("live worker\n", encoding="utf-8")
     gate = pl._worker_mcp_live_call_gate(
         _metadata(tmp_path, bundle_sha=_sha(), sections=[], stdout=stdout), "req"
     )
+    assert gate["satisfied"] is True
+    assert gate["reason"] == ""
+    assert gate["policy_warning"] is True
+    assert gate["policy_warning_count"] == 1
+    assert gate["warnings"] == ["denied_aiworkhub_tool_requests_recovered:1"]
+
+
+def test_policy_warning_never_overrides_a_missing_required_source_graph_call(tmp_path, monkeypatch):
+    _patch_verify(monkeypatch, policy_violations=1)
+    stdout = tmp_path / "worker.log"
+    stdout.write_text("worker with denied request but no valid source graph call\n", encoding="utf-8")
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(tmp_path, bundle_sha=_sha(), sections=[], stdout=stdout), "req"
+    )
     assert gate["satisfied"] is False
-    assert gate["reason"] == "aiworkhub_tool_policy_violations:1"
+    assert gate["missing_tools"] == ["source_graph"]
+    assert gate["reason"] == "required_aiworkhub_mcp_calls_missing:source_graph"
+    assert gate["policy_warning"] is True
+    assert gate["policy_warning_count"] == 1
 
 
 # --- evidence surfaces the satisfaction source per tool --------------------

@@ -312,6 +312,7 @@ def test_register_binds_readonly_live_output_and_initialize_tools():
         dashboard_mcp_app.INITIALIZE_TOOL_NAME,
     }
     expected_names.update(dashboard_mcp_app.SETTINGS_UPDATE_TOOLS)
+    expected_names.update(dashboard_mcp_app.SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
     expected_names.update(dashboard_mcp_app.STORAGE_RETENTION_WRITE_TOOLS)
     expected_names.update(dashboard_mcp_app.TERMINAL_LOG_RETENTION_WRITE_TOOLS)
     assert set(names) == expected_names

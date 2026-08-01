@@ -1713,6 +1713,29 @@ tbody tr.is-selected td:first-child {
   background: var(--surface-subtle);
 }
 
+.settings-group-heading {
+  display: grid;
+  gap: 4px;
+  padding: 16px 4px 8px;
+  color: var(--ink);
+}
+
+.settings-group-heading small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.settings-language-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+  gap: 7px;
+}
+
+.settings-language-row {
+  margin-bottom: 0;
+}
+
 .settings-copy {
   display: grid;
   min-width: 0;

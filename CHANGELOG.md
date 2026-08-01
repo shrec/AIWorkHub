@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.24] - 2026-08-01
+
+### Added
+
+- Added one canonical 33-family Source Graph language registry. C/C++/CUDA,
+  JSON, XML and the other registered families now receive exact file-level
+  path/hash/size evidence when no semantic parser is available; Python and
+  PHP retain their stronger AST/lexical extraction tiers.
+- Added repository-local Source Graph language switches to Dashboard Settings.
+  Changes are optimistic-lock protected, stored in
+  `.aiworkhub/config/source_graph.json`, and trigger incremental reindexing so
+  disabled families are removed and re-enabled families return automatically.
+
+### Fixed
+
+- Replaced the four-language discovery allowlist that silently skipped C++ and
+  structured data files, while preserving build/cache/archive exclusions and
+  backward-compatible migration from the v1 ignore-only policy.
+- Preserved deterministic validation evidence after a recoverable denied MCP
+  tool request. A denied request remains visible as policy-warning telemetry,
+  but no longer discards later valid Source Graph/Session/Memory/KB receipts;
+  missing required canonical evidence still fails closed.
+
 ## [0.8.23] - 2026-08-01
 
 ### Fixed
