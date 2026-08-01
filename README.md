@@ -76,6 +76,7 @@ not yet claimed as shipped.
 AIWorkHub reports context evidence rather than making an unverifiable savings
 claim: requested/delivered bytes, acknowledged tool receipts, truncation and
 degraded reasons remain distinguishable. See the
+[Source Graph guide](docs/SOURCE_GRAPH.md),
 [Manager Context Graph](docs/CONTEXT_GRAPH.md) and
 [Source Graph economics](docs/PRODUCT_ROADMAP.md#p1--source-graph-economics-and-enforcement-080)
 contract.

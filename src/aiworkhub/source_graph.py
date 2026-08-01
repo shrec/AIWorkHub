@@ -11,16 +11,15 @@ Design constraints (see task card B849):
   * No model/API/network call, no Graphify dependency, no ``graph.json``
     authority, no second external graph product -- SQLite only.
   * Extraction is AST-first for Python (:mod:`aiworkhub.source_graph_ast`).
-    PHP receives conservative lexical structural extraction (namespaces,
-    imports, class-like declarations, functions/methods and inheritance).
-    The other 31 registered language/file families get truthful file-level
-    evidence (path/hash/language/size, no fabricated functions/calls/edges);
-    truly unregistered extensions fail closed rather than being approximated
-    with regex heuristics mislabeled as extracted evidence.
+    PHP and C/C++/CUDA receive conservative semantic lexical extraction.
+    Registered file families without a semantic extractor get truthful
+    file-level evidence (no fabricated functions/calls/edges); truly
+    unregistered extensions fail closed rather than being mislabeled as
+    extracted evidence.
   * Incremental indexing removes every entity/edge a changed OR deleted
     file owned before re-indexing it, so renames/deletes never leave a
     stale edge behind.
-  * ``focus``/``slice``/``bundle`` stay backward compatible with the
+  * ``focus``/``slice``/``context``/``impact``/``trace``/``bundle`` stay backward compatible with the
     existing AIWorkHub project-context/worker-MCP callers: same command
     surface, JSON output, explicit byte/row budgets.
   * ``neighbors``/``shortest_path``/``component_summary`` are deterministic
@@ -44,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from . import source_graph_ast as sgast
+from . import source_graph_insights as sginsights
 from . import source_graph_languages as sglanguages
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
 from .storage_registry import (
@@ -53,13 +53,15 @@ from .storage_registry import (
 )
 
 SCHEMA_ID = "aiworkhub.source_graph.v1"
-BUILD_REVISION = "aiworkhub.source_graph.multilang.v3"
+BUILD_REVISION = "aiworkhub.source_graph.semantic.v5"
 IGNORE_SCHEMA_ID = "aiworkhub.source_graph.ignore.v1"
 POLICY_SCHEMA_ID = "aiworkhub.source_graph.policy.v2"
 IGNORE_CONFIG_RELATIVE_PATH = Path(HUB_DIRNAME) / "config" / "source_graph.json"
 MAX_POLICY_BYTES = 64 * 1024
 
-SOURCE_GRAPH_MODES: tuple[str, ...] = ("focus", "slice", "bundle")
+SOURCE_GRAPH_MODES: tuple[str, ...] = (
+    "focus", "slice", "context", "impact", "trace", "bundle",
+)
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
@@ -141,6 +143,16 @@ CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_qualname);
 CREATE INDEX IF NOT EXISTS idx_edges_dst_name ON edges(dst_name);
 CREATE INDEX IF NOT EXISTS idx_edges_dst_qualname ON edges(dst_qualname);
+
+CREATE TABLE IF NOT EXISTS file_history (
+    file_path TEXT PRIMARY KEY,
+    commit_touches_90d INTEGER NOT NULL DEFAULT 0,
+    lines_added_90d INTEGER NOT NULL DEFAULT 0,
+    lines_deleted_90d INTEGER NOT NULL DEFAULT 0,
+    authors_90d INTEGER NOT NULL DEFAULT 0,
+    primary_author_90d TEXT,
+    evidence TEXT NOT NULL
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
     name, qualname, signature, file_path, entity_id UNINDEXED
@@ -578,7 +590,16 @@ def _write_extraction(conn: sqlite3.Connection, extraction: sgast.FileExtraction
             "VALUES (?,?,?,?,?)",
             (cur.lastrowid, entity.name, entity.qualname, entity.signature, entity.file_path),
         )
+    seen_edges: set[tuple[Any, ...]] = set()
     for edge in extraction.edges:
+        identity = (
+            edge.file_path, edge.kind, edge.src_qualname, edge.dst_name,
+            edge.dst_qualname, edge.line, edge.evidence_label, edge.extractor,
+            edge.confidence, edge.source_hash, edge.build_revision,
+        )
+        if identity in seen_edges:
+            continue
+        seen_edges.add(identity)
         conn.execute(
             "INSERT INTO edges(file_path, kind, src_qualname, dst_name, dst_qualname, line, "
             "evidence_label, extractor, confidence, source_hash, build_revision) "
@@ -587,6 +608,40 @@ def _write_extraction(conn: sqlite3.Connection, extraction: sgast.FileExtraction
              edge.line, edge.evidence_label, edge.extractor, edge.confidence,
              edge.source_hash, edge.build_revision),
         )
+
+
+def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
+    """Resolve lexical-language call/inheritance targets only when unique.
+
+    Lexical extraction proves that call syntax exists but not which overload or
+    translation unit owns the callee.  A unique canonical entity name is safe
+    to bind as inferred evidence; zero or multiple candidates remain visibly
+    unresolved. Recomputing after every build also clears targets made stale by
+    a rename/delete during an incremental refresh.
+    """
+
+    conn.execute(
+        "UPDATE edges SET dst_qualname=NULL WHERE extractor IN (?,?) "
+        "AND kind IN ('calls','inherits')",
+        (sgast.CPP_LEXICAL_EXTRACTOR_ID, sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID),
+    )
+    rows = conn.execute(
+        "SELECT name, MIN(qualname) qualname, COUNT(*) c FROM entities "
+        "WHERE kind IN ('function','method','class','struct','union','enum') "
+        "GROUP BY name HAVING c=1"
+    ).fetchall()
+    resolved = 0
+    for row in rows:
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE extractor IN (?,?) "
+            "AND kind IN ('calls','inherits') AND dst_name=? AND dst_qualname IS NULL",
+            (
+                row["qualname"], sgast.CPP_LEXICAL_EXTRACTOR_ID,
+                sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID, row["name"],
+            ),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
 
 
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
@@ -633,6 +688,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 if rel not in seen_rel:
                     _invalidate_file(conn, rel)
                     removed += 1
+            _resolve_cpp_cross_file_edges(conn)
+            sginsights.materialize_git_metrics(
+                conn, repo_root, sorted(seen_rel), limit=10000,
+            )
             finished_at = _now_iso()
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('last_build', ?) "
@@ -705,8 +764,13 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
         rows = conn.execute(
             "SELECT e.file_path, e.kind, e.name, e.qualname, e.line_start, e.line_end, "
             "e.signature, e.evidence_label, e.confidence FROM entities_fts f "
-            "JOIN entities e ON e.id = f.entity_id WHERE entities_fts MATCH ? LIMIT ?",
-            (_fts_phrase(term), limit),
+            "JOIN entities e ON e.id = f.entity_id WHERE entities_fts MATCH ? "
+            "ORDER BY CASE WHEN lower(e.name)=lower(?) THEN 0 "
+            "WHEN lower(e.name) LIKE lower(?) THEN 1 ELSE 2 END, "
+            "CASE WHEN e.kind IN ('function','method','class','struct','union','enum') "
+            "THEN 0 WHEN e.kind='file' THEN 1 ELSE 2 END, "
+            "bm25(entities_fts), e.file_path, e.line_start LIMIT ?",
+            (_fts_phrase(term), term, f"{term}%", limit),
         ).fetchall()
     except sqlite3.OperationalError:
         rows = []
@@ -736,7 +800,8 @@ def struct(conn: sqlite3.Connection, name: str, *, limit: int = 24) -> list[dict
     limit = max(1, min(int(limit), MAX_BUDGET_ROWS))
     rows = conn.execute(
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
-        "evidence_label, confidence FROM entities WHERE kind = 'class' AND name = ? LIMIT ?",
+        "evidence_label, confidence FROM entities WHERE kind IN "
+        "('class','struct','union','enum','namespace') AND name = ? LIMIT ?",
         (name, limit),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -745,7 +810,8 @@ def struct(conn: sqlite3.Connection, name: str, *, limit: int = 24) -> list[dict
 def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature "
-        "FROM entities WHERE kind IN ('function','method','class') AND name = ? "
+        "FROM entities WHERE kind IN "
+        "('function','method','class','struct','union','enum','namespace') AND name = ? "
         "ORDER BY kind LIMIT 1",
         (name,),
     ).fetchone()
@@ -808,11 +874,15 @@ def summary(conn: sqlite3.Connection) -> dict[str, Any]:
         row["status"]: row["c"]
         for row in conn.execute("SELECT status, COUNT(*) c FROM files GROUP BY status")
     }
+    by_language = {
+        row["language"]: row["c"]
+        for row in conn.execute("SELECT language, COUNT(*) c FROM files GROUP BY language")
+    }
     last_build_row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
     return {
         "files": file_count, "entities": entity_count, "edges": edge_count,
         "entities_by_kind": by_kind, "edges_by_evidence_label": by_evidence,
-        "files_by_status": by_status,
+        "files_by_status": by_status, "files_by_language": by_language,
         "last_build": json.loads(last_build_row["value"]) if last_build_row else None,
     }
 
@@ -935,6 +1005,68 @@ def _bounded_rows(rows: list[dict[str, Any]], row_cap: int, byte_cap: int) -> tu
     return rows, truncated
 
 
+def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]:
+    """Deterministically trim nested optional evidence to the public byte cap."""
+
+    def encoded_size() -> int:
+        return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    while encoded_size() > byte_cap:
+        lists: list[tuple[int, list[Any]]] = []
+        strings: list[tuple[int, dict[str, Any], str]] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, str) and len(item) > 256:
+                        strings.append((len(item), value, key))
+                    else:
+                        visit(item)
+            elif isinstance(value, list):
+                if value:
+                    lists.append((len(json.dumps(value, ensure_ascii=False)), value))
+                for item in value:
+                    visit(item)
+
+        visit(payload)
+        if strings:
+            _, owner, key = max(strings, key=lambda item: item[0])
+            text = str(owner[key])
+            owner[key] = text[: max(256, len(text) // 2)]
+            payload["truncated"] = True
+            continue
+        if lists:
+            _, target = max(lists, key=lambda item: item[0])
+            target.pop()
+            payload["truncated"] = True
+            continue
+        break
+    return payload
+
+
+def _candidate_files(matches: list[dict[str, Any]], *, limit: int) -> list[str]:
+    return sginsights.candidate_files(matches, limit=limit)
+
+
+def _call_edges_for_files(
+    conn: sqlite3.Connection, files: list[str], *, limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    return sginsights.call_edges(conn, files, limit=limit)
+
+
+def _source_snippet(repo_root: Path, row: dict[str, Any], *, max_chars: int = 4000) -> str:
+    try:
+        target = (repo_root / str(row["file_path"])).resolve()
+        if not target.is_relative_to(repo_root.resolve()):
+            return ""
+        lines = target.read_text(encoding="utf-8").splitlines()
+        start = max(0, int(row.get("line_start") or 1) - 1)
+        end = max(start + 1, int(row.get("line_end") or start + 1))
+        return "\n".join(lines[start:end])[:max_chars]
+    except (KeyError, OSError, UnicodeDecodeError, ValueError, TypeError):
+        return ""
+
+
 def _query_payload(repo_root: Path, mode: str, query: str, budget: int) -> dict[str, Any]:
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
@@ -943,14 +1075,25 @@ def _query_payload(repo_root: Path, mode: str, query: str, budget: int) -> dict[
     try:
         matches = find(conn, query, limit=budget)
         matches, truncated = _bounded_rows(matches, budget, byte_cap)
+        files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {
             "mode": mode, "query": query, "budget": budget, "matches": matches,
+            "candidate_files": files,
             "truncated": truncated,
         }
-        if mode == "slice" and matches:
+        if mode == "focus" and matches:
+            payload.update(sginsights.focus_insights(
+                conn, repo_root, matches, budget=budget,
+            ))
+        elif mode == "slice" and matches:
+            payload.update(sginsights.slice_insights(
+                conn, repo_root, matches, budget=budget,
+            ))
             top = matches[0]
-            payload["neighbors"] = neighbors(conn, top["qualname"], depth=1, limit=min(budget, 50))["neighbors"]
-        return payload
+            payload["neighbors"] = neighbors(
+                conn, top["qualname"], depth=1, limit=min(budget, 50)
+            )["neighbors"]
+        return _fit_payload_bytes(payload, byte_cap)
     finally:
         conn.close()
 
@@ -961,6 +1104,111 @@ def focus(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
 
 def slice_(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
     return _query_payload(repo_root, "slice", query, budget)
+
+
+def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
+    """Return exact file context, resolving a semantic term to its top file."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    db_path = resolve_db_path(repo_root)
+    conn = connect(db_path, read_only=True)
+    try:
+        exact = conn.execute("SELECT 1 FROM files WHERE file_path=?", (query,)).fetchone()
+        matches = find(conn, query, limit=budget)
+        files = [query] if exact else _candidate_files(matches, limit=min(8, budget))
+        contexts: list[dict[str, Any]] = []
+        remaining = budget
+        for path in files:
+            item = context(conn, path)
+            item["entities"] = item["entities"][:remaining]
+            for entity in item["entities"][: min(6, remaining)]:
+                if entity.get("kind") in {"function", "method", "class", "struct"}:
+                    entity["source"] = _source_snippet(repo_root, {**entity, "file_path": path})
+            contexts.append(item)
+            remaining -= len(item["entities"])
+            if remaining <= 0:
+                break
+        rows, truncated = _bounded_rows(contexts, budget, max(512, budget * 512))
+        insights = sginsights.slice_insights(
+            conn, repo_root, matches, budget=min(budget, 32),
+        ) if matches else {}
+        return _fit_payload_bytes({
+            "mode": "context", "query": query, "budget": budget,
+            "matches": matches[: min(budget, 16)], "contexts": rows,
+            "insights": insights,
+            "truncated": truncated,
+        }, max(512, budget * 512))
+    finally:
+        conn.close()
+
+
+def trace(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
+    """Build a compact bidirectional symbol/file call trace."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = find(conn, query, limit=budget)
+        files = _candidate_files(matches, limit=min(16, budget))
+        insights = sginsights.trace_insights(conn, matches, budget=budget)
+        payload = {
+            "mode": "trace", "query": query, "budget": budget,
+            "direct_matches": matches, "candidate_files": files,
+            **insights,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        payload["truncated"] = len(encoded) > max(512, budget * 768)
+        if payload["truncated"]:
+            payload["direct_matches"] = matches[: max(1, budget // 3)]
+            payload["outgoing_calls"] = payload["outgoing_calls"][: max(1, budget // 3)]
+            payload["incoming_calls"] = payload["incoming_calls"][: max(1, budget // 3)]
+        return _fit_payload_bytes(payload, max(512, budget * 768))
+    finally:
+        conn.close()
+
+
+def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
+    """Rank likely affected files from symbols and bidirectional call edges."""
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = find(conn, query, limit=budget)
+        files = _candidate_files(matches, limit=min(24, budget))
+        outgoing, incoming = _call_edges_for_files(conn, files, limit=budget * 2)
+        rows: list[dict[str, Any]] = []
+        for path in files:
+            entity_count = int(conn.execute(
+                "SELECT COUNT(*) FROM entities WHERE file_path=?", (path,)
+            ).fetchone()[0])
+            callers = sum(1 for edge in incoming if edge.get("callee_file") == path)
+            callees = sum(1 for edge in outgoing if edge.get("caller_file") == path)
+            stem = Path(path).stem
+            test_rows = conn.execute(
+                "SELECT file_path FROM files WHERE "
+                "(file_path LIKE '%test%' OR file_path LIKE '%spec%') AND file_path LIKE ? "
+                "ORDER BY file_path LIMIT 8",
+                (f"%{stem}%",),
+            ).fetchall()
+            rows.append({
+                "file_path": path, "entities": entity_count,
+                "inbound_call_edges": callers, "outbound_call_edges": callees,
+                "related_tests": [row["file_path"] for row in test_rows],
+                "impact_score": callers * 3 + callees * 2 + min(entity_count, 20),
+            })
+        rows.sort(key=lambda row: (-row["impact_score"], row["file_path"]))
+        insights = sginsights.impact_insights(
+            conn, repo_root, matches, budget=budget,
+        )
+        return _fit_payload_bytes({
+            "mode": "impact", "query": query, "budget": budget,
+            "impacted_files": rows[:budget],
+            "incoming_calls": incoming[:budget],
+            **insights,
+            "truncated": len(rows) > budget or len(incoming) > budget,
+        }, max(512, budget * 768))
+    finally:
+        conn.close()
 
 
 def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -> dict[str, Any]:
@@ -974,18 +1222,45 @@ def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -
         matches = find(conn, query, limit=budget)
         sections: list[dict[str, Any]] = []
         remaining = budget
+        seen_files: set[str] = set()
         for match in matches:
             if remaining <= 0:
                 break
+            if match["file_path"] in seen_files:
+                continue
+            seen_files.add(match["file_path"])
             ctx = context(conn, match["file_path"])
             ctx["entities"] = ctx["entities"][: max(1, remaining)]
+            for entity in ctx["entities"][: min(4, remaining)]:
+                if entity.get("kind") in {"function", "method", "class", "struct"}:
+                    entity["source"] = _source_snippet(
+                        repo_root, {**entity, "file_path": match["file_path"]}, max_chars=2400,
+                    )
             sections.append(ctx)
             remaining -= len(ctx["entities"])
+        files = list(seen_files)
+        outgoing, incoming = _call_edges_for_files(conn, files, limit=min(budget, 40))
         sections, truncated = _bounded_rows(sections, budget, byte_cap)
-        return {
+        insights = sginsights.focus_insights(
+            conn, repo_root, matches, budget=min(budget, 32),
+        ) if matches else {}
+        task_evidence: dict[str, Any] = {}
+        if matches and bundle_type in {"bugfix", "feature", "refactor"}:
+            task_evidence = sginsights.slice_insights(
+                conn, repo_root, matches, budget=min(budget, 32),
+            )
+        if matches and bundle_type in {"feature", "refactor", "audit", "optimize"}:
+            task_evidence["impact"] = sginsights.impact_insights(
+                conn, repo_root, matches, budget=min(budget, 24),
+            )
+        return _fit_payload_bytes({
             "mode": "bundle", "bundle_type": bundle_type, "query": query,
-            "budget": budget, "sections": sections, "truncated": truncated,
-        }
+            "budget": budget, "sections": sections,
+            "outgoing_calls": outgoing, "incoming_calls": incoming,
+            "insights": insights,
+            "task_evidence": task_evidence,
+            "truncated": truncated,
+        }, byte_cap)
     finally:
         conn.close()
 
@@ -1014,11 +1289,16 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("summary")
 
-    for name in ("focus", "slice"):
+    for name in ("focus", "slice", "trace", "impact"):
         p = sub.add_parser(name)
         p.add_argument("term")
         p.add_argument("budget", type=int, nargs="?", default=64)
         p.add_argument("--json", action="store_true", default=True)
+
+    context_query_p = sub.add_parser("context-query")
+    context_query_p.add_argument("term")
+    context_query_p.add_argument("budget", type=int, nargs="?", default=64)
+    context_query_p.add_argument("--json", action="store_true", default=True)
 
     bundle_p = sub.add_parser("bundle")
     bundle_p.add_argument("bundle_type")
@@ -1054,6 +1334,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(focus(repo_root, args.term, args.budget))
         elif args.command == "slice":
             _print_json(slice_(repo_root, args.term, args.budget))
+        elif args.command == "context-query":
+            _print_json(context_query(repo_root, args.term, args.budget))
+        elif args.command == "trace":
+            _print_json(trace(repo_root, args.term, args.budget))
+        elif args.command == "impact":
+            _print_json(impact(repo_root, args.term, args.budget))
         elif args.command == "bundle":
             _print_json(bundle(repo_root, args.bundle_type, args.term, args.max_lines))
     finally:
@@ -1092,7 +1378,15 @@ __all__ = [
     "update_language_policy",
     "connect",
     "context",
+    "context_query",
     "find",
+    "focus",
+    "func",
+    "impact",
+    "slice_",
+    "struct",
+    "summary",
+    "trace",
     "focus",
     "func",
     "neighbors",

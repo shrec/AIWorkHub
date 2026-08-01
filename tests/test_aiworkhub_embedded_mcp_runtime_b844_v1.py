@@ -213,7 +213,9 @@ def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_
     server_module = fallback_server_module
     func = server_module.mcp._tools["aiworkhub_manager_source_graph_query"]
     schema = server_module._stdio_schema_for(func)
-    assert schema["properties"]["mode"]["enum"] == ["focus", "slice", "bundle"]
+    assert schema["properties"]["mode"]["enum"] == [
+        "focus", "slice", "context", "impact", "trace", "bundle",
+    ]
     assert schema["properties"]["bundle_type"]["enum"] == [
         "bugfix", "feature", "refactor", "audit", "optimize", "explore",
     ]

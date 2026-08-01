@@ -6,6 +6,35 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.26] - 2026-08-01
+
+### Added
+
+- Ported the repository-neutral intelligence layer from the proven
+  UltrafastSecp256k1 Source Graph: bounded `focus`, `slice`, `context`,
+  `impact`, `trace` and task-shaped `bundle` queries now include ranked
+  symbols, bidirectional calls, related tests, TODO/risk signals and
+  index-time 90-day churn/ownership evidence.
+- Added conservative semantic adapters for C/C++/CUDA/OpenCL/Metal,
+  JavaScript/TypeScript, Rust, Go, Java and C#. Together with the existing
+  Python and PHP adapters, these produce declarations, imports, functions or
+  methods, inheritance and observed calls while ambiguous targets remain
+  explicitly unresolved. All other registered families retain truthful
+  file-level evidence.
+- Added the public Source Graph guide covering the 33 language families,
+  evidence labels, six MCP query modes, continuous-use accounting and
+  repository isolation.
+
+### Fixed
+
+- Made compact Source Graph payloads strictly byte-bounded, deduplicated call
+  evidence, and prevented commented-out imports/includes from becoming graph
+  facts.
+- Preserved the imported package root when the automatic indexing daemon
+  starts its dedicated child process, so source-checkout/editor test runtimes
+  no longer fail with `ModuleNotFoundError` while packaged installs remain
+  unchanged.
+
 ## [0.8.25] - 2026-08-01
 
 ### Fixed

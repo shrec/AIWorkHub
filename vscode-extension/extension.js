@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.25";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.26";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2309,7 +2309,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
     }
     const permittedKeys = new Set(["mode", "query", "budget", "target", "bundle_type"]);
     if (Object.keys(initialSourceGraphRequest).some((key) => !permittedKeys.has(key)) ||
-        !["focus", "slice", "bundle"].includes(initialSourceGraphRequest.mode) ||
+        !["focus", "slice", "context", "impact", "trace", "bundle"].includes(initialSourceGraphRequest.mode) ||
         typeof initialSourceGraphRequest.query !== "string" || !initialSourceGraphRequest.query.trim() ||
         initialSourceGraphRequest.query.length > 512) {
       throw new Error("vscode_lm_initial_source_graph_request_invalid");
@@ -2329,7 +2329,7 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
       additionalProperties: false,
       required: ["mode", "query"],
       properties: {
-        mode: { type: "string", enum: ["focus", "slice", "bundle"] },
+        mode: { type: "string", enum: ["focus", "slice", "context", "impact", "trace", "bundle"] },
         query: { type: "string", minLength: 1, maxLength: 512 },
         budget: { type: "integer", minimum: 8, maximum: 160 },
         target: { type: ["string", "null"], maxLength: 256 },

@@ -19,8 +19,17 @@ declarations, functions/methods and inheritance. It deliberately emits no
 call edges, because resolving dynamic PHP calls without a full parser would
 overstate authority. Unsupported files remain explicit fail-closed records.
 
-Every other language registered by Source Graph receives truthful *file-level*
-authority record -- one ``kind="file"`` entity carrying the exact
+C/C++/CUDA/OpenCL/Metal files use a conservative lexical adapter derived from
+the proven UltrafastSecp256k1 Source Graph design. It records includes,
+namespaces, classes/structs/enums/macros, function bodies and observed call
+syntax (including CUDA ``<<<...>>>`` launches). Cross-file call targets are
+resolved later by the canonical index builder and stay explicitly inferred
+when the target is ambiguous.
+
+JavaScript/TypeScript, Rust, Go, Java and C# use the same donor-proven adapter
+model with language-specific declaration/import rules and conservative call
+syntax. Every other language registered by Source Graph receives one truthful
+*file-level* authority record -- a ``kind="file"`` entity carrying the exact
 language, path, byte size and content hash directly observed from disk
 (``FILE_EVIDENCE``) -- without inventing any function/class/call/import
 inside the file. No parser dependency is added; nothing about the file's
@@ -40,29 +49,26 @@ from . import source_graph_languages as languages
 EXTRACTOR_ID = "aiworkhub.source_graph_ast.python_stdlib_ast.v1"
 FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
+CPP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.cpp_lexical.v1"
+POLYGLOT_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.polyglot_lexical.v1"
 
 EXTRACTED = "EXTRACTED"
 INFERRED = "INFERRED"
 AMBIGUOUS = "AMBIGUOUS"
 FILE_EVIDENCE = "FILE_EVIDENCE"
 
-ENTITY_KINDS = ("module", "class", "function", "method", "import", "file")
+ENTITY_KINDS = (
+    "module", "namespace", "class", "struct", "enum", "macro",
+    "function", "method", "import", "file",
+)
 EDGE_KINDS = ("imports", "calls", "defines", "inherits")
 
 PYTHON_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["python"].extensions)
 PHP_EXTENSIONS = (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8")
-
-# JS/TS family languages get file-level (not semantic) evidence: real path,
-# hash, size and language, no fabricated entities/edges inside the file.
-JS_TS_LANGUAGE_BY_EXTENSION: dict[str, str] = {
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-}
-JS_TS_EXTENSIONS = tuple(JS_TS_LANGUAGE_BY_EXTENSION)
+CPP_EXTENSIONS = tuple(languages.LANGUAGE_BY_ID["cpp"].extensions)
+POLYGLOT_LEXICAL_LANGUAGES = frozenset({
+    "javascript", "typescript", "rust", "go", "java", "csharp",
+})
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -136,6 +142,28 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
                 source_hash=source_hash, error=str(exc),
             )
         return _extract_php_lexical(rel, text, source_hash, build_revision)
+
+    if suffix in CPP_EXTENSIONS:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return FileExtraction(
+                file_path=rel, language="cpp", status="decode_error_fail_closed",
+                source_hash=source_hash, error=str(exc),
+            )
+        return _extract_cpp_lexical(rel, text, source_hash, build_revision)
+
+    if language in POLYGLOT_LEXICAL_LANGUAGES:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return FileExtraction(
+                file_path=rel, language=language, status="decode_error_fail_closed",
+                source_hash=source_hash, error=str(exc),
+            )
+        return _extract_polyglot_lexical(
+            rel, text, source_hash, build_revision, language=language,
+        )
 
     if suffix not in PYTHON_EXTENSIONS:
         if language is not None:
@@ -387,14 +415,599 @@ def _extract_php_lexical(
     )
 
 
+_CPP_CONTROL_NAMES = frozenset({
+    "if", "for", "while", "switch", "catch", "sizeof", "alignof",
+    "decltype", "return", "new", "delete", "static_assert", "requires",
+})
+
+
+def _mask_c_family_non_code(text: str) -> str:
+    """Mask C-family strings/comments while preserving offsets and lines."""
+
+    chars = list(text)
+    i = 0
+    state = "code"
+    quote = ""
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+            elif ch in {"'", '"', "`"}:
+                state, quote = "string", ch
+                chars[i] = " "
+        elif state == "string":
+            if ch == "\\" and i + 1 < len(chars):
+                if chars[i] != "\n":
+                    chars[i] = " "
+                if chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 1
+            elif ch == quote:
+                chars[i] = " "
+                state = "code"
+            elif ch != "\n":
+                chars[i] = " "
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "code"
+            elif ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _mask_comments_preserve_strings(text: str) -> str:
+    """Mask line/block comments but preserve quoted import/include targets."""
+
+    chars = list(text)
+    i = 0
+    state = "code"
+    quote = ""
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+                chars[i] = chars[i + 1] = " "
+                i += 1
+            elif ch in {"'", '"', "`"}:
+                state, quote = "string", ch
+        elif state == "string":
+            if ch == "\\" and i + 1 < len(chars):
+                i += 1
+            elif ch == quote:
+                state = "code"
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+        elif state == "block_comment":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "code"
+            elif ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def _line_for_offset(text: str, position: int) -> int:
+    return text.count("\n", 0, max(0, position)) + 1
+
+
+def _cpp_signature(text: str, start: int, opening_brace: int) -> str:
+    return " ".join(text[start:opening_brace].strip().split())[:500]
+
+
+def _cpp_qualname(rel: str, name: str, counts: dict[str, int]) -> str:
+    normalized = re.sub(r"\s+", "", name)
+    base = f"{rel}::{normalized}"
+    seen = counts.get(base, 0) + 1
+    counts[base] = seen
+    return base if seen == 1 else f"{base}~{seen}"
+
+
+def _extract_cpp_lexical(
+    rel: str, text: str, source_hash: str, build_revision: str,
+) -> FileExtraction:
+    """Conservatively extract C/C++/CUDA declarations and observed calls.
+
+    This is deliberately lexical: declarations/call syntax are directly
+    observed, while cross-file target identity remains inferred until the
+    canonical builder can prove one unique matching entity.
+    """
+
+    masked = _mask_c_family_non_code(text)
+    line_count = max(1, text.count("\n") + 1)
+    entities: list[Entity] = [Entity(
+        kind="module", name=rel, qualname=rel, file_path=rel,
+        line_start=1, line_end=line_count, signature="",
+        evidence_label=EXTRACTED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+        confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+    )]
+    edges: list[Edge] = []
+    counts: dict[str, int] = {}
+
+    import_text = _mask_comments_preserve_strings(text)
+    for match in re.finditer(
+        r"(?m)^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]", import_text,
+    ):
+        name = match.group(1).strip()
+        line = _line_for_offset(masked, match.start())
+        qualname = _cpp_qualname(rel, f"include::{name}@{line}", counts)
+        entities.append(Entity(
+            kind="import", name=name, qualname=qualname, file_path=rel,
+            line_start=line, line_end=line, signature=f"#include {name}",
+            evidence_label=EXTRACTED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+            confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+        ))
+        edges.append(Edge(
+            kind="imports", src_qualname=rel, dst_name=name, dst_qualname=None,
+            file_path=rel, line=line, evidence_label=EXTRACTED,
+            extractor=CPP_LEXICAL_EXTRACTOR_ID, confidence=1.0,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    for match in re.finditer(r"(?m)^\s*#\s*define\s+([A-Za-z_]\w*)\b([^\n]*)", masked):
+        name = match.group(1)
+        line = _line_for_offset(masked, match.start())
+        entities.append(Entity(
+            kind="macro", name=name, qualname=_cpp_qualname(rel, name, counts),
+            file_path=rel, line_start=line, line_end=line,
+            signature=f"#define {name}{match.group(2)}"[:500],
+            evidence_label=EXTRACTED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+            confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    namespace_ranges: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"\bnamespace\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\{", masked):
+        name = match.group(1)
+        opening = masked.find("{", match.start(), match.end())
+        ending = _matching_delimiter(masked, opening, "{", "}")
+        line = _line_for_offset(masked, match.start())
+        qualname = _cpp_qualname(rel, name, counts)
+        namespace_ranges.append((opening, ending, qualname))
+        entities.append(Entity(
+            kind="namespace", name=name, qualname=qualname, file_path=rel,
+            line_start=line, line_end=_line_for_offset(masked, ending),
+            signature=f"namespace {name}", evidence_label=EXTRACTED,
+            extractor=CPP_LEXICAL_EXTRACTOR_ID, confidence=1.0,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    type_ranges: list[tuple[int, int, str, str]] = []
+    type_pattern = re.compile(
+        r"\b(class|struct|union|enum(?:\s+class)?)\s+([A-Za-z_]\w*)\b([^;{]*)\{"
+    )
+    for match in type_pattern.finditer(masked):
+        raw_kind, name, tail = match.group(1), match.group(2), match.group(3)
+        kind = "enum" if raw_kind.startswith("enum") else ("struct" if raw_kind in {"struct", "union"} else "class")
+        opening = masked.find("{", match.start(), match.end())
+        ending = _matching_delimiter(masked, opening, "{", "}")
+        line = _line_for_offset(masked, match.start())
+        qualname = _cpp_qualname(rel, name, counts)
+        type_ranges.append((opening, ending, name, qualname))
+        entities.append(Entity(
+            kind=kind, name=name, qualname=qualname, file_path=rel,
+            line_start=line, line_end=_line_for_offset(masked, ending),
+            signature=_cpp_signature(text, match.start(), opening),
+            evidence_label=EXTRACTED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+            confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+        ))
+        inheritance = tail.split(":", 1)[1] if ":" in tail and kind in {"class", "struct"} else ""
+        for base in re.findall(r"(?:public|protected|private|virtual|\s)*\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)", inheritance):
+            edges.append(Edge(
+                kind="inherits", src_qualname=qualname, dst_name=base.split("::")[-1],
+                dst_qualname=None, file_path=rel, line=line,
+                evidence_label=INFERRED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+                confidence=0.8, source_hash=source_hash, build_revision=build_revision,
+            ))
+
+    function_pattern = re.compile(
+        r"(?m)(?<![\w])(?:template\s*<[^;{}]*>\s*)?"
+        r"(?:(?:[A-Za-z_][\w:<>,\s*&\[\]~]*?)\s+)?"
+        r"(?P<name>(?:[A-Za-z_]\w*::)*~?[A-Za-z_]\w*|operator\s*[^\s(]+)\s*"
+        r"\((?P<params>[^;{}]*)\)\s*"
+        r"(?:const\b\s*)?(?:noexcept(?:\s*\([^)]*\))?\s*)?"
+        r"(?:override\b\s*)?(?:final\b\s*)?(?:->\s*[^;{]+)?"
+        r"(?:\s*:\s*[^;{}]+)?\s*\{"
+    )
+    call_patterns = (
+        re.compile(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)+)\s*\("),
+        re.compile(r"(?:->|\.)\s*([A-Za-z_]\w*)\s*\("),
+        re.compile(r"\b([A-Za-z_]\w*)\s*<<<[^;{}]*?>>>\s*\("),
+        re.compile(r"\b([A-Za-z_]\w*)\s*\("),
+    )
+    for match in function_pattern.finditer(masked):
+        full_name = re.sub(r"\s+", "", match.group("name"))
+        short_name = full_name.split("::")[-1]
+        if short_name in _CPP_CONTROL_NAMES:
+            continue
+        opening = masked.rfind("{", match.start(), match.end())
+        ending = _matching_delimiter(masked, opening, "{", "}")
+        if ending <= opening:
+            continue
+        owner = next((row for row in type_ranges if row[0] < match.start() < row[1]), None)
+        kind = "method" if "::" in full_name or owner is not None else "function"
+        semantic_name = full_name if "::" in full_name else (f"{owner[2]}::{short_name}" if owner else short_name)
+        qualname = _cpp_qualname(rel, semantic_name, counts)
+        start_line = _line_for_offset(masked, match.start())
+        end_line = _line_for_offset(masked, ending)
+        entities.append(Entity(
+            kind=kind, name=short_name, qualname=qualname, file_path=rel,
+            line_start=start_line, line_end=end_line,
+            signature=_cpp_signature(text, match.start(), opening),
+            evidence_label=EXTRACTED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+            confidence=0.95, source_hash=source_hash, build_revision=build_revision,
+        ))
+        edges.append(Edge(
+            kind="defines", src_qualname=owner[3] if owner else rel,
+            dst_name=short_name, dst_qualname=qualname, file_path=rel,
+            line=start_line, evidence_label=EXTRACTED,
+            extractor=CPP_LEXICAL_EXTRACTOR_ID, confidence=1.0,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+        body_text = masked[opening + 1:ending]
+        observed: set[tuple[str, int]] = set()
+        for pattern in call_patterns:
+            for call in pattern.finditer(body_text):
+                called = call.group(1).split("::")[-1]
+                if called in _CPP_CONTROL_NAMES or called == short_name:
+                    continue
+                absolute = opening + 1 + call.start()
+                call_line = _line_for_offset(masked, absolute)
+                key = (called, call_line)
+                if key in observed:
+                    continue
+                observed.add(key)
+                edges.append(Edge(
+                    kind="calls", src_qualname=qualname, dst_name=called,
+                    dst_qualname=None, file_path=rel, line=call_line,
+                    evidence_label=INFERRED, extractor=CPP_LEXICAL_EXTRACTOR_ID,
+                    confidence=0.7, source_hash=source_hash,
+                    build_revision=build_revision,
+                ))
+
+    return FileExtraction(
+        file_path=rel, language="cpp", status="ok", source_hash=source_hash,
+        entities=tuple(entities), edges=tuple(edges),
+    )
+
+
+_POLYGLOT_CONTROL_NAMES = frozenset({
+    "if", "else", "for", "foreach", "while", "switch", "catch", "case",
+    "return", "throw", "new", "delete", "typeof", "sizeof", "match", "loop",
+    "select", "defer", "go", "function", "class", "interface", "struct",
+})
+
+
+def _polyglot_imports(language: str, text: str) -> list[tuple[str, int, str]]:
+    """Return directly observed import target, offset and signature."""
+
+    patterns: dict[str, tuple[re.Pattern[str], ...]] = {
+        "javascript": (
+            re.compile(r"(?m)^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]"),
+            re.compile(r"(?m)^\s*(?:const|let|var)\s+\w+\s*=\s*require\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        ),
+        "typescript": (
+            re.compile(r"(?m)^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]"),
+            re.compile(r"(?m)^\s*import\s+['\"]([^'\"]+)['\"]"),
+        ),
+        "rust": (re.compile(r"(?m)^\s*use\s+([A-Za-z_][\w:]*)"),),
+        "go": (re.compile(r"(?m)^\s*(?:import\s+)?(?:[A-Za-z_.]\w*\s+)?\"([\w./-]+)\""),),
+        "java": (re.compile(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+)\s*;"),),
+        "csharp": (re.compile(r"(?m)^\s*using\s+(?:static\s+)?([\w.]+)\s*;"),),
+    }
+    rows: list[tuple[str, int, str]] = []
+    for pattern in patterns.get(language, ()):
+        for match in pattern.finditer(text):
+            rows.append((match.group(1), match.start(), " ".join(match.group(0).split())[:500]))
+    rows.sort(key=lambda row: row[1])
+    return rows
+
+
+def _polyglot_type_patterns(language: str) -> tuple[re.Pattern[str], ...]:
+    if language in {"javascript", "typescript"}:
+        return (
+            re.compile(r"\b(?P<kind>class|interface|enum)\s+(?P<name>[$A-Za-z_]\w*)\b(?P<tail>[^;{]*)\{"),
+            re.compile(r"\b(?P<kind>type)\s+(?P<name>[$A-Za-z_]\w*)\b(?P<tail>[^;{=]*)=\s*\{"),
+        )
+    if language == "rust":
+        return (
+            re.compile(r"\b(?P<kind>struct|enum|trait)\s+(?P<name>[A-Za-z_]\w*)\b(?P<tail>[^;{]*)\{"),
+            re.compile(
+                r"\b(?P<kind>impl)(?:\s*<[^>{}]*>)?\s+"
+                r"(?:(?P<trait>[A-Za-z_]\w*(?:::\w+)*)\s+for\s+)?"
+                r"(?P<name>[A-Za-z_]\w*(?:::\w+)*)\b(?P<tail>[^;{]*)\{"
+            ),
+        )
+    if language == "go":
+        return (
+            re.compile(r"\btype\s+(?P<name>[A-Za-z_]\w*)\s+(?P<kind>struct|interface)\s*\{"),
+        )
+    if language == "java":
+        return (
+            re.compile(
+                r"\b(?P<kind>class|interface|enum|record)\s+"
+                r"(?P<name>[A-Za-z_]\w*)\b(?P<tail>[^;{]*)\{"
+            ),
+        )
+    return (
+        re.compile(
+            r"\b(?P<kind>class|interface|struct|enum|record)\s+"
+            r"(?P<name>[A-Za-z_]\w*)\b(?P<tail>[^;{]*)\{"
+        ),
+    )
+
+
+def _polyglot_function_patterns(language: str) -> tuple[re.Pattern[str], ...]:
+    if language in {"javascript", "typescript"}:
+        return (
+            re.compile(
+                r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+"
+                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*\([^;{}]*\)\s*"
+                r"(?:\:\s*[^={]+)?\{"
+            ),
+            re.compile(
+                r"(?m)^\s*(?:module\.exports|exports\.[$A-Za-z_]\w*|[$A-Za-z_]\w*(?:\.[$A-Za-z_]\w*)*)"
+                r"\s*=\s*(?:async\s+)?function\s+(?P<name>[$A-Za-z_]\w*)\s*"
+                r"\([^;{}]*\)\s*\{"
+            ),
+            re.compile(
+                r"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[$A-Za-z_]\w*)"
+                r"(?:\s*:\s*[^=]+)?\s*=\s*(?:async\s+)?(?:\([^;{}]*\)|[$A-Za-z_]\w*)"
+                r"\s*=>\s*\{"
+            ),
+            re.compile(
+                r"(?m)^\s*(?:(?:public|private|protected|static|async|abstract|override|readonly)\s+)*"
+                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*\([^;{}]*\)\s*"
+                r"(?:\:\s*[^={]+)?\{"
+            ),
+        )
+    if language == "rust":
+        return (
+            re.compile(
+                r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?"
+                r"(?:extern\s+\"[^\"]+\"\s+)?fn\s+(?P<name>[A-Za-z_]\w*)"
+                r"\s*(?:<[^>{}]*>)?\s*\([^;{}]*\)[^{;]*\{"
+            ),
+        )
+    if language == "go":
+        return (
+            re.compile(
+                r"(?m)^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)"
+                r"\s*\([^;{}]*\)[^{;]*\{"
+            ),
+        )
+    modifiers = (
+        r"(?:(?:public|private|protected|internal|static|final|abstract|synchronized|"
+        r"native|default|virtual|override|sealed|async|partial|extern|unsafe|readonly)\s+)*"
+    )
+    return (
+        re.compile(
+            rf"(?m)^\s*(?:\[[^\]]+\]\s*|@\w+(?:\([^)]*\))?\s*)*{modifiers}"
+            r"(?:<[^>{}]*>\s*)?(?:[A-Za-z_]\w*(?:[<>,.?\[\]\s]*\w)?\s+)?"
+            r"(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*\)\s*"
+            r"(?:throws\s+[\w,.\s]+)?\{"
+        ),
+    )
+
+
+def _extract_polyglot_lexical(
+    rel: str,
+    text: str,
+    source_hash: str,
+    build_revision: str,
+    *,
+    language: str,
+) -> FileExtraction:
+    """Extract donor-proven structural surfaces for six brace languages."""
+
+    masked = _mask_c_family_non_code(text)
+    line_count = max(1, text.count("\n") + 1)
+    entities: list[Entity] = [Entity(
+        kind="module", name=rel, qualname=rel, file_path=rel,
+        line_start=1, line_end=line_count, signature="",
+        evidence_label=EXTRACTED, extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+        confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+    )]
+    edges: list[Edge] = []
+    counts: dict[str, int] = {}
+
+    import_text = _mask_comments_preserve_strings(text)
+    for target, position, signature in _polyglot_imports(language, import_text):
+        line = _line_for_offset(text, position)
+        qualname = _cpp_qualname(rel, f"import::{target}@{line}", counts)
+        entities.append(Entity(
+            kind="import", name=target.split(".")[-1].split("::")[-1],
+            qualname=qualname, file_path=rel, line_start=line, line_end=line,
+            signature=signature, evidence_label=EXTRACTED,
+            extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID, confidence=1.0,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+        edges.append(Edge(
+            kind="imports", src_qualname=rel, dst_name=target, dst_qualname=None,
+            file_path=rel, line=line, evidence_label=EXTRACTED,
+            extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID, confidence=1.0,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    type_ranges: list[tuple[int, int, str, str]] = []
+    pending_inherits: list[tuple[str, str, int]] = []
+    seen_type_positions: set[tuple[int, str]] = set()
+    type_qualnames: dict[str, str] = {}
+    for pattern in _polyglot_type_patterns(language):
+        for match in pattern.finditer(masked):
+            name = match.group("name").split("::")[-1]
+            identity = (match.start(), name)
+            if identity in seen_type_positions:
+                continue
+            seen_type_positions.add(identity)
+            raw_kind = match.group("kind")
+            opening = masked.rfind("{", match.start(), match.end())
+            ending = _matching_delimiter(masked, opening, "{", "}")
+            line = _line_for_offset(masked, match.start())
+            if raw_kind == "impl":
+                # Rust ``impl Type`` is an owner scope, not a second type
+                # declaration. Reuse the declared type identity when it is
+                # present and keep a stable inferred owner otherwise.
+                qualname = type_qualnames.get(name, f"{rel}::{name}")
+                type_ranges.append((opening, ending, name, qualname))
+                trait = match.groupdict().get("trait")
+                if trait:
+                    pending_inherits.append((qualname, trait.split("::")[-1], line))
+                continue
+            kind = "enum" if raw_kind == "enum" else (
+                "struct" if raw_kind in {"struct", "record", "type"} else "class"
+            )
+            qualname = _cpp_qualname(rel, name, counts)
+            type_qualnames.setdefault(name, qualname)
+            type_ranges.append((opening, ending, name, qualname))
+            entities.append(Entity(
+                kind=kind, name=name, qualname=qualname, file_path=rel,
+                line_start=line, line_end=_line_for_offset(masked, ending),
+                signature=_cpp_signature(text, match.start(), opening),
+                evidence_label=EXTRACTED, extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+                confidence=0.96, source_hash=source_hash, build_revision=build_revision,
+            ))
+            edges.append(Edge(
+                kind="defines", src_qualname=rel, dst_name=name,
+                dst_qualname=qualname, file_path=rel, line=line,
+                evidence_label=EXTRACTED, extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+                confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+            ))
+            tail = match.groupdict().get("tail") or ""
+            trait = match.groupdict().get("trait")
+            if trait:
+                pending_inherits.append((qualname, trait.split("::")[-1], line))
+            for clause in re.findall(r"\b(?:extends|implements)\s+([^\{]+)", tail):
+                for base in re.findall(r"[A-Za-z_]\w*(?:::\w+|\.\w+)*", clause):
+                    pending_inherits.append((qualname, base.split("::")[-1].split(".")[-1], line))
+            if language == "csharp" and ":" in tail:
+                for base in re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", tail.split(":", 1)[1]):
+                    pending_inherits.append((qualname, base.split(".")[-1], line))
+
+    def owner_for(position: int) -> tuple[int, int, str, str] | None:
+        owners = [row for row in type_ranges if row[0] < position < row[1]]
+        return min(owners, key=lambda row: row[1] - row[0]) if owners else None
+
+    function_ranges: list[tuple[int, int, str, str]] = []
+    seen_functions: set[tuple[int, str]] = set()
+    for pattern in _polyglot_function_patterns(language):
+        for match in pattern.finditer(masked):
+            name = match.group("name")
+            if name in _POLYGLOT_CONTROL_NAMES:
+                continue
+            identity = (match.start(), name)
+            if identity in seen_functions:
+                continue
+            seen_functions.add(identity)
+            opening = masked.rfind("{", match.start(), match.end())
+            ending = _matching_delimiter(masked, opening, "{", "}")
+            if opening < 0 or ending <= opening:
+                continue
+            owner = owner_for(match.start())
+            semantic_name = f"{owner[2]}::{name}" if owner else name
+            qualname = _cpp_qualname(rel, semantic_name, counts)
+            line = _line_for_offset(masked, match.start())
+            entities.append(Entity(
+                kind="method" if owner else "function", name=name,
+                qualname=qualname, file_path=rel, line_start=line,
+                line_end=_line_for_offset(masked, ending),
+                signature=_cpp_signature(text, match.start(), opening),
+                evidence_label=EXTRACTED, extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+                confidence=0.93, source_hash=source_hash, build_revision=build_revision,
+            ))
+            edges.append(Edge(
+                kind="defines", src_qualname=owner[3] if owner else rel,
+                dst_name=name, dst_qualname=qualname, file_path=rel, line=line,
+                evidence_label=EXTRACTED, extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+                confidence=1.0, source_hash=source_hash, build_revision=build_revision,
+            ))
+            function_ranges.append((opening, ending, name, qualname))
+
+    local_targets: dict[str, list[str]] = {}
+    for entity in entities:
+        if entity.kind in {"function", "method", "class", "struct", "enum"}:
+            local_targets.setdefault(entity.name, []).append(entity.qualname)
+
+    for src_qualname, base, line in pending_inherits:
+        targets = local_targets.get(base, [])
+        edges.append(Edge(
+            kind="inherits", src_qualname=src_qualname, dst_name=base,
+            dst_qualname=targets[0] if len(targets) == 1 else None,
+            file_path=rel, line=line,
+            evidence_label=EXTRACTED if len(targets) == 1 else INFERRED,
+            extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+            confidence=1.0 if len(targets) == 1 else 0.75,
+            source_hash=source_hash, build_revision=build_revision,
+        ))
+
+    call_patterns = (
+        re.compile(r"(?:\.|->|::)\s*([$A-Za-z_]\w*)\s*[!(]?\s*\("),
+        re.compile(r"\b([$A-Za-z_]\w*)\s*[!(]?\s*\("),
+    )
+    for opening, ending, function_name, qualname in function_ranges:
+        body_text = masked[opening + 1:ending]
+        observed: set[tuple[str, int]] = set()
+        for pattern in call_patterns:
+            for call in pattern.finditer(body_text):
+                called = call.group(1)
+                if called in _POLYGLOT_CONTROL_NAMES or called == function_name:
+                    continue
+                line = _line_for_offset(masked, opening + 1 + call.start())
+                key = (called, line)
+                if key in observed:
+                    continue
+                observed.add(key)
+                targets = local_targets.get(called, [])
+                edges.append(Edge(
+                    kind="calls", src_qualname=qualname, dst_name=called,
+                    dst_qualname=targets[0] if len(targets) == 1 else None,
+                    file_path=rel, line=line,
+                    evidence_label=EXTRACTED if len(targets) == 1 else INFERRED,
+                    extractor=POLYGLOT_LEXICAL_EXTRACTOR_ID,
+                    confidence=1.0 if len(targets) == 1 else 0.65,
+                    source_hash=source_hash, build_revision=build_revision,
+                ))
+
+    return FileExtraction(
+        file_path=rel, language=language, status="ok", source_hash=source_hash,
+        entities=tuple(entities), edges=tuple(edges),
+    )
+
+
 def _extract_file_evidence(
     rel: str, raw: bytes, language: str, source_hash: str, build_revision: str,
 ) -> FileExtraction:
     """One truthful ``kind="file"`` entity: exact path/language/size/hash.
 
-    No function/class/call/import is claimed for the file's contents --
-    there is no JS/TS parser here, so nothing beyond directly observed
-    file facts (line count, byte size, language, hash) is recorded.
+    No function/class/call/import is claimed for the file's contents. This is
+    used only for registered language families without a semantic adapter, so
+    nothing beyond directly observed file facts (line count, byte size,
+    language, hash) is recorded.
     """
 
     line_count = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
@@ -613,6 +1226,8 @@ def _extract_calls(
 
 __all__ = [
     "AMBIGUOUS",
+    "CPP_EXTENSIONS",
+    "CPP_LEXICAL_EXTRACTOR_ID",
     "EDGE_KINDS",
     "ENTITY_KINDS",
     "EXTRACTED",
@@ -620,10 +1235,10 @@ __all__ = [
     "FILE_EVIDENCE",
     "FILE_EVIDENCE_EXTRACTOR_ID",
     "INFERRED",
-    "JS_TS_EXTENSIONS",
-    "JS_TS_LANGUAGE_BY_EXTENSION",
     "PHP_EXTENSIONS",
     "PHP_LEXICAL_EXTRACTOR_ID",
+    "POLYGLOT_LEXICAL_EXTRACTOR_ID",
+    "POLYGLOT_LEXICAL_LANGUAGES",
     "Edge",
     "Entity",
     "FileExtraction",

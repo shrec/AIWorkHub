@@ -158,13 +158,23 @@ class SourceGraphDaemon:
             str(self.repo_root),
             "--incremental" if incremental else "--full",
         ]
+        child_env = os.environ.copy()
+        # A source checkout may be imported by pytest/editor tooling without
+        # being installed into ``sys.executable``. Preserve the exact package
+        # root for the dedicated child; packaged/venv installs simply receive
+        # their already-importable site-packages path again. This also keeps
+        # the daemon independent of the caller's current working directory.
+        package_root = str(Path(__file__).resolve().parent.parent)
+        child_env["PYTHONPATH"] = os.pathsep.join(
+            value for value in (package_root, child_env.get("PYTHONPATH", "")) if value
+        )
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=os.environ.copy(),
+            env=child_env,
         )
         with self._process_lock:
             self._build_process = process

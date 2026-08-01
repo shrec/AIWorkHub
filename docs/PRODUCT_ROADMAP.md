@@ -181,7 +181,8 @@ Report locally, by repository/task/run/model/adapter:
 
 ### Self-describing Source Graph contract
 
-- Publish the supported query modes (`bundle`, `slice`, and `focus`) and bundle
+- Publish the supported query modes (`focus`, `slice`, `context`, `impact`,
+  `trace`, and `bundle`) and bundle
   types as MCP input enums instead of accepting an opaque string.
 - Invalid-mode responses include the bounded allowed-value list and one valid
   example; agents must never spend calls guessing the tool contract.

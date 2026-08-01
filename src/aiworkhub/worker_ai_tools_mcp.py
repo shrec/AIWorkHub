@@ -129,11 +129,13 @@ BOUND_ENV_VARS: tuple[str, ...] = (
 
 STORAGE_REGISTRY_RELATIVE_PATH = Path(".aiworkhub") / "config" / "storage.json"
 
-SOURCE_GRAPH_MODES: tuple[str, ...] = ("focus", "slice", "bundle")
+SOURCE_GRAPH_MODES: tuple[str, ...] = (
+    "focus", "slice", "context", "impact", "trace", "bundle",
+)
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
-SourceGraphMode = Literal["focus", "slice", "bundle"]
+SourceGraphMode = Literal["focus", "slice", "context", "impact", "trace", "bundle"]
 SourceGraphBundleType = Literal["bugfix", "feature", "refactor", "audit", "optimize", "explore"]
 MAX_QUERY_BYTES = 512
 MAX_KEY_BYTES = 256
@@ -728,7 +730,7 @@ def source_graph_query(
     target: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
 ) -> dict[str, Any]:
-    """Bounded Source Graph focus/slice/bundle discovery, scoped to this task.
+    """Bounded Source Graph focus/slice/context/impact/trace/bundle discovery.
 
     ``query`` is ALWAYS the semantic search term passed to Source Graph --
     omitting ``target`` never silently substitutes ``targets[0]`` for it
@@ -795,6 +797,12 @@ def source_graph_query(
             payload = _source_graph_mod.bundle(ctx.authority_repo, bundle_type, bounded_query, budget)
         elif mode == "slice":
             payload = _source_graph_mod.slice_(ctx.authority_repo, bounded_query, budget)
+        elif mode == "context":
+            payload = _source_graph_mod.context_query(ctx.authority_repo, bounded_query, budget)
+        elif mode == "impact":
+            payload = _source_graph_mod.impact(ctx.authority_repo, bounded_query, budget)
+        elif mode == "trace":
+            payload = _source_graph_mod.trace(ctx.authority_repo, bounded_query, budget)
         else:
             payload = _source_graph_mod.focus(ctx.authority_repo, bounded_query, budget)
     except _source_graph_mod.SourceGraphError as exc:
@@ -1641,8 +1649,11 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         mode: SourceGraphMode, query: str, budget: int = 64,
         target: str | None = None, bundle_type: SourceGraphBundleType = "explore",
     ) -> dict[str, Any]:
-        """Bounded Source Graph focus/slice/bundle discovery for this task."""
-        return source_graph_query(ctx, mode=mode, query=query, budget=budget, target=target, bundle_type=bundle_type)
+        """Bounded Source Graph discovery for this task."""
+        return source_graph_query(
+            ctx, mode=mode, query=query, budget=budget,
+            target=target, bundle_type=bundle_type,
+        )
 
     @mcp.tool(name="aiworkhub_worker_session_current_state")
     def _session_current_state(limit: int = 12) -> dict[str, Any]:

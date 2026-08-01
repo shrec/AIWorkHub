@@ -33,7 +33,7 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     "ai_memory": {"bytes": 4 * 1024, "rows": 8},
     "kb": {"bytes": 4 * 1024, "rows": 8},
 }
-SOURCE_GRAPH_MODES = ("focus", "slice", "bundle")
+SOURCE_GRAPH_MODES = ("focus", "slice", "context", "impact", "trace", "bundle")
 SOURCE_GRAPH_BUNDLE_TYPES = ("bugfix", "feature", "refactor", "audit", "optimize", "explore")
 TASK_CONTEXT_KINDS = ("code", "data_classification", "research")
 
@@ -532,6 +532,12 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
             payload = _source_graph_mod.bundle(repo, source["bundle_type"], target, source["budget"])
         elif mode == "slice":
             payload = _source_graph_mod.slice_(repo, target, source["budget"])
+        elif mode == "context":
+            payload = _source_graph_mod.context_query(repo, target, source["budget"])
+        elif mode == "impact":
+            payload = _source_graph_mod.impact(repo, target, source["budget"])
+        elif mode == "trace":
+            payload = _source_graph_mod.trace(repo, target, source["budget"])
         else:
             payload = _source_graph_mod.focus(repo, target, source["budget"])
     except _source_graph_mod.SourceGraphError as exc:

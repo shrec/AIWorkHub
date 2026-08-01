@@ -1,9 +1,9 @@
 """Canonical Source Graph language registry.
 
 The registry is intentionally dependency-free and truthful about capability:
-Python and PHP have structural extractors, while every other registered
-language receives exact file-level evidence until a semantic extractor is
-implemented.  Keeping discovery and capability in one table prevents the
+Python has an AST extractor; PHP, C/C++/CUDA, JavaScript/TypeScript, Rust, Go,
+Java and C# have conservative structural lexical extractors. Every other
+registered language receives exact file-level evidence. Keeping discovery and capability in one table prevents the
 historic bug where VS Code advertised a language but Source Graph silently
 ignored its files.
 """
@@ -28,15 +28,15 @@ class LanguageSpec:
 LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("python", "Python", (".py", ".pyi"), "semantic_ast"),
     LanguageSpec("php", "PHP", (".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8"), "semantic_lexical"),
-    LanguageSpec("javascript", "JavaScript", (".js", ".jsx", ".mjs", ".cjs")),
-    LanguageSpec("typescript", "TypeScript", (".ts", ".tsx", ".mts", ".cts")),
-    LanguageSpec("cpp", "C / C++ / CUDA", (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".cu", ".cuh")),
-    LanguageSpec("csharp", "C#", (".cs",)),
-    LanguageSpec("java", "Java", (".java",)),
+    LanguageSpec("javascript", "JavaScript", (".js", ".jsx", ".mjs", ".cjs"), "semantic_lexical"),
+    LanguageSpec("typescript", "TypeScript", (".ts", ".tsx", ".mts", ".cts"), "semantic_lexical"),
+    LanguageSpec("cpp", "C / C++ / CUDA / OpenCL / Metal", (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp", ".inl", ".cu", ".cuh", ".cl", ".metal"), "semantic_lexical"),
+    LanguageSpec("csharp", "C#", (".cs",), "semantic_lexical"),
+    LanguageSpec("java", "Java", (".java",), "semantic_lexical"),
     LanguageSpec("kotlin", "Kotlin", (".kt", ".kts")),
     LanguageSpec("scala", "Scala", (".scala", ".sc")),
-    LanguageSpec("go", "Go", (".go",)),
-    LanguageSpec("rust", "Rust", (".rs",)),
+    LanguageSpec("go", "Go", (".go",), "semantic_lexical"),
+    LanguageSpec("rust", "Rust", (".rs",), "semantic_lexical"),
     LanguageSpec("swift", "Swift", (".swift",)),
     LanguageSpec("objective_c", "Objective-C", (".m", ".mm")),
     LanguageSpec("ruby", "Ruby", (".rb", ".rake", ".gemspec")),

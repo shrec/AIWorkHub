@@ -146,18 +146,17 @@ def test_unregistered_language_is_explicit_fail_closed_not_regex_approximated(tm
 def test_language_registry_exposes_all_33_families() -> None:
     assert len(sg.LANGUAGE_CAPABILITIES) == 33
     assert {"cpp", "json", "xml"}.issubset(sg.LANGUAGE_CAPABILITIES)
-    assert sg.LANGUAGE_CAPABILITIES["cpp"] == "file_evidence"
+    assert sg.LANGUAGE_CAPABILITIES["cpp"] == "semantic_lexical"
 
 
 @pytest.mark.parametrize(
     "relative,expected_language",
     [
-        ("native/engine.cpp", "cpp"),
         ("config/runtime.json", "json"),
         ("schemas/task.xml", "xml"),
     ],
 )
-def test_cpp_json_xml_are_indexed_as_truthful_file_evidence(
+def test_json_xml_are_indexed_as_truthful_file_evidence(
     tmp_path, relative, expected_language,
 ):
     repo = _new_repo(tmp_path, "repo")
@@ -171,6 +170,37 @@ def test_cpp_json_xml_are_indexed_as_truthful_file_evidence(
     assert extraction.edges == ()
 
 
+def test_cpp_cuda_semantic_lexical_extraction_records_symbols_bodies_and_calls(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "native" / "engine.cu"
+    _write(
+        target,
+        """#include <vector>\n
+#include "engine.hpp"\n
+// #include "fake.hpp"\n
+#define BLOCKS 4\n
+struct Engine : public Base { int run(int x) { return helper(x); } };\n
+int helper(int x) { return x + 1; }\n
+__global__ void kernel(int *out) { out[0] = helper(1); }\n
+void launch(int *out) { kernel<<<BLOCKS, 32>>>(out); }\n
+""",
+    )
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+    assert extraction.status == "ok"
+    assert extraction.language == "cpp"
+    assert {
+        ("struct", "Engine"), ("method", "run"),
+        ("function", "helper"), ("function", "launch"),
+    }.issubset(
+        {(entity.kind, entity.name) for entity in extraction.entities}
+    )
+    assert any(edge.kind == "imports" and edge.dst_name == "vector" for edge in extraction.edges)
+    assert any(edge.kind == "imports" and edge.dst_name == "engine.hpp" for edge in extraction.edges)
+    assert not any(edge.kind == "imports" and edge.dst_name == "fake.hpp" for edge in extraction.edges)
+    assert any(edge.kind == "calls" and edge.dst_name == "kernel" for edge in extraction.edges)
+    assert any(entity.kind == "macro" and entity.name == "BLOCKS" for entity in extraction.entities)
+
+
 def test_cpp_json_xml_build_and_query_are_non_empty(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "native" / "engine.cpp", "int main() { return 0; }\n")
@@ -178,18 +208,62 @@ def test_cpp_json_xml_build_and_query_are_non_empty(tmp_path):
     _write(repo / "schemas" / "task.xml", "<task/>\n")
     report = sg.build_index(repo, incremental=True)
     assert report.files_seen == 3
-    assert report.entities_written == 3
+    assert report.entities_written >= 4
     conn = sg.connect(sg.resolve_db_path(repo))
     try:
         assert sg.find(conn, "engine.cpp")
         assert sg.find(conn, "runtime.json")
         assert sg.find(conn, "task.xml")
+        assert sg.func(conn, "main")
     finally:
         conn.close()
 
 
+def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "native" / "math.cpp", "int helper(int x) { return x + 1; }\n")
+    _write(
+        repo / "native" / "engine.cpp",
+        '#include "math.hpp"\nint run_engine(int x) { return helper(x); }\n',
+    )
+    _write(
+        repo / "tests" / "test_engine.cpp",
+        "int test_engine() { return run_engine(1); }\n",
+    )
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        edge = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE kind='calls' AND dst_name='helper'"
+        ).fetchone()
+        assert edge is not None
+        assert edge["dst_qualname"].endswith("math.cpp::helper")
+    finally:
+        conn.close()
+
+    focus = sg.focus(repo, "run_engine", 32)
+    sliced = sg.slice_(repo, "run_engine", 32)
+    contextual = sg.context_query(repo, "run_engine", 32)
+    traced = sg.trace(repo, "helper", 32)
+    impacted = sg.impact(repo, "helper", 32)
+    bundled = sg.bundle(repo, "bugfix", "run_engine", 32)
+
+    assert focus["matches"] and focus["candidate_files"][0] == "native/engine.cpp"
+    assert focus["ranked_symbols"]
+    assert focus["ranked_symbols"][0]["metrics_evidence"] == "deterministic_lexical_and_graph"
+    assert sliced["outgoing_calls"]
+    assert any(row["file_path"] == "tests/test_engine.cpp" for row in sliced["related_tests"])
+    assert contextual["contexts"][0]["entities"]
+    assert contextual["insights"]["entry_symbols"]
+    assert any(row["caller_symbol"].endswith("run_engine") for row in traced["incoming_calls"])
+    assert {row["file_path"] for row in impacted["impacted_files"]} >= {"native/math.cpp"}
+    assert impacted["impact_evidence"].startswith("bidirectional_resolved_calls")
+    assert bundled["sections"] and bundled["outgoing_calls"]
+    assert bundled["insights"]["ranked_symbols"]
+
+
 # ---------------------------------------------------------------------------
-# B881: truthful bounded JS/TS family file-level evidence (no fabrication)
+# B881: truthful bounded JS/TS semantic lexical evidence
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -199,22 +273,21 @@ def test_cpp_json_xml_build_and_query_are_non_empty(tmp_path):
         (".cjs", "javascript"), (".ts", "typescript"), (".tsx", "typescript"),
     ],
 )
-def test_js_ts_family_gets_file_level_evidence_not_fail_closed(tmp_path, suffix, expected_language):
+def test_js_ts_family_gets_semantic_lexical_evidence(tmp_path, suffix, expected_language):
     repo = _new_repo(tmp_path, "repo")
     target = repo / "pkg" / f"widget{suffix}"
     _write(target, "export function widget() { return 1; }\n")
     extraction = sgast.extract_file(repo, target, build_revision="test-rev")
-    assert extraction.status == "file_evidence_only"
+    assert extraction.status == "ok"
     assert extraction.language == expected_language
     assert len(extraction.source_hash) == 64
-    assert len(extraction.entities) == 1
-    entity = extraction.entities[0]
-    assert entity.kind == "file"
-    assert entity.evidence_label == sgast.FILE_EVIDENCE
-    assert entity.file_path == f"pkg/widget{suffix}"
-    assert entity.signature == f"bytes={len(target.read_bytes())}"
-    # No function/call/import/class is invented from JS/TS source text.
-    assert extraction.edges == ()
+    assert {entity.kind for entity in extraction.entities} >= {"module", "function"}
+    function = next(entity for entity in extraction.entities if entity.kind == "function")
+    assert function.name == "widget"
+    assert function.evidence_label == sgast.EXTRACTED
+    assert function.file_path == f"pkg/widget{suffix}"
+    assert function.extractor == sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID
+    assert any(edge.kind == "defines" and edge.dst_name == "widget" for edge in extraction.edges)
 
 
 def test_former_empty_result_regression_js_target_now_produces_non_empty_slice(tmp_path):
@@ -225,14 +298,15 @@ def test_former_empty_result_regression_js_target_now_produces_non_empty_slice(t
     _write(repo / "extension" / "extension.js", "module.exports = function activate() {};\n")
     report = sg.build_index(repo, incremental=True)
     assert report.errors == []
-    assert report.entities_written == 1
+    assert report.entities_written >= 2
 
     conn = sg.connect(sg.resolve_db_path(repo))
     try:
         matches = sg.find(conn, "extension.js")
         assert matches
         assert matches[0]["file_path"] == "extension/extension.js"
-        assert matches[0]["evidence_label"] == sgast.FILE_EVIDENCE
+        assert matches[0]["evidence_label"] == sgast.EXTRACTED
+        assert sg.func(conn, "activate")
     finally:
         conn.close()
 
@@ -243,11 +317,12 @@ def test_former_empty_result_regression_js_target_now_produces_non_empty_slice(t
     bundle_payload = sg.bundle(repo, "refactor", "extension.js", max_lines=10)
     assert bundle_payload["sections"]
     assert bundle_payload["sections"][0]["file"]["language"] == "javascript"
-    assert bundle_payload["sections"][0]["file"]["status"] == "file_evidence_only"
-    # No fabricated semantic entities/edges beyond the one file-evidence row.
-    assert bundle_payload["sections"][0]["edges"] == []
-    assert len(bundle_payload["sections"][0]["entities"]) == 1
-    assert bundle_payload["sections"][0]["entities"][0]["kind"] == "file"
+    assert bundle_payload["sections"][0]["file"]["status"] == "ok"
+    assert bundle_payload["sections"][0]["edges"]
+    assert any(
+        entity["kind"] == "function" and entity["name"] == "activate"
+        for entity in bundle_payload["sections"][0]["entities"]
+    )
 
 
 def test_js_ts_family_incremental_rename_and_delete_no_stale_evidence(tmp_path):
@@ -491,12 +566,11 @@ def test_js_ts_family_deterministic_byte_cap_on_slice(tmp_path):
     encoded = json.dumps(payload).encode("utf-8")
     assert len(encoded) <= max(512, 5 * 512)
     for match in payload["matches"]:
-        assert match["evidence_label"] == sgast.FILE_EVIDENCE
+        assert match["evidence_label"] == sgast.EXTRACTED
 
 
 def test_python_ast_extraction_unchanged_alongside_js_ts_family(tmp_path):
-    """Preserve the Python semantic graph exactly when JS/TS files coexist
-    in the same repository as the file-level (non-semantic) evidence."""
+    """Preserve the Python semantic graph when JS/TS semantics coexist."""
 
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "pkg" / "core.py", "def caller():\n    return callee()\n\ndef callee():\n    return 1\n")
@@ -520,9 +594,110 @@ def test_python_ast_extraction_unchanged_alongside_js_ts_family(tmp_path):
         assert ts_context["found"] is True
         assert ts_context["edges"] == []
         assert len(ts_context["entities"]) == 1
-        assert ts_context["entities"][0]["kind"] == "file"
+        assert ts_context["entities"][0]["kind"] == "module"
+        assert ts_context["entities"][0]["evidence_label"] == sgast.EXTRACTED
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "filename,language,source,type_name,call_name",
+    [
+        (
+            "engine.rs",
+            "rust",
+            "use crate::util;\n"
+            "struct Engine {}\n"
+            "impl Engine {\n"
+            "    fn run(&self) { helper(); }\n"
+            "}\n"
+            "fn helper() {}\n",
+            "Engine",
+            "helper",
+        ),
+        (
+            "engine.go",
+            "go",
+            "package engine\n"
+            "import \"fmt\"\n"
+            "type Engine struct {}\n"
+            "func (e *Engine) Run() { helper() }\n"
+            "func helper() {}\n",
+            "Engine",
+            "helper",
+        ),
+        (
+            "Engine.java",
+            "java",
+            "import java.util.List;\n"
+            "class Engine extends Base {\n"
+            "    int run() { return helper(); }\n"
+            "    int helper() { return 1; }\n"
+            "}\n",
+            "Engine",
+            "helper",
+        ),
+        (
+            "Engine.cs",
+            "csharp",
+            "using System;\n"
+            "class Engine : Base {\n"
+            "    int Run() { return Helper(); }\n"
+            "    int Helper() { return 1; }\n"
+            "}\n",
+            "Engine",
+            "Helper",
+        ),
+    ],
+)
+def test_polyglot_semantic_adapters_extract_types_functions_imports_and_calls(
+    tmp_path, filename, language, source, type_name, call_name,
+):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "src" / filename
+    _write(target, source)
+
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+
+    assert extraction.status == "ok"
+    assert extraction.language == language
+    assert any(entity.name == type_name for entity in extraction.entities)
+    assert any(entity.name == call_name for entity in extraction.entities)
+    assert any(edge.kind == "imports" for edge in extraction.edges)
+    assert any(
+        edge.kind == "calls"
+        and edge.dst_name == call_name
+        and edge.evidence_label == sgast.EXTRACTED
+        for edge in extraction.edges
+    )
+    assert all(
+        entity.extractor == sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID
+        for entity in extraction.entities
+    )
+
+
+def test_typescript_semantic_adapter_extracts_class_method_arrow_and_import(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "web" / "widget.ts"
+    _write(
+        target,
+        "import { helper } from './util';\n"
+        "// import { fake } from './fake';\n"
+        "export class Widget extends Base {\n"
+        "    run() { return helper(); }\n"
+        "}\n"
+        "export const arrow = () => { return helper(); };\n",
+    )
+
+    extraction = sgast.extract_file(repo, target, build_revision="test-rev")
+
+    names = {(entity.kind, entity.name) for entity in extraction.entities}
+    assert extraction.status == "ok"
+    assert {("class", "Widget"), ("method", "run"), ("function", "arrow")} <= names
+    assert any(edge.kind == "imports" and edge.dst_name == "./util" for edge in extraction.edges)
+    assert not any(edge.kind == "imports" and edge.dst_name == "./fake" for edge in extraction.edges)
+    assert any(edge.kind == "inherits" and edge.dst_name == "Base" for edge in extraction.edges)
+    assert sum(edge.kind == "calls" and edge.dst_name == "helper" for edge in extraction.edges) == 2
 
 
 def test_python_syntax_error_is_explicit_fail_closed(tmp_path):

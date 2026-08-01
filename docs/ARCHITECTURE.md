@@ -116,8 +116,9 @@ for the Codex path when configured; the Claude transport does not use it.
 
 ## Source Graph / Session Manager / AI Memory / KB
 
-`source_graph.py` / `source_graph_ast.py` / `source_graph_migration.py`
-index the repository's own code into `.aiworkhub/source_graph/` so worker
+`source_graph.py` / `source_graph_ast.py` / `source_graph_languages.py` /
+`source_graph_insights.py` / `source_graph_migration.py` index the repository's
+own code into `.aiworkhub/source_graph/` so worker
 context bundles and the `aiworkhub_cli_adapter_*` tools can answer
 structural queries without `grep`. `project_context.py` /
 `context_cache.py` / `context_economics.py` assemble and cache the bounded

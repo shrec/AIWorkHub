@@ -189,7 +189,11 @@ def create_request(
     if source_graph_request:
         mode = str(source_graph_request.get("mode") or "focus")
         query = str(source_graph_request.get("query") or "").strip()
-        if mode not in {"focus", "slice", "bundle"} or not query or len(query) > 512:
+        if (
+            mode not in {"focus", "slice", "context", "impact", "trace", "bundle"}
+            or not query
+            or len(query) > 512
+        ):
             raise BridgeError("bridge_source_graph_request_invalid")
         initial_source_graph_request = {"mode": mode, "query": query}
         for key in ("budget", "target", "bundle_type"):
