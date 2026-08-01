@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">AIWorkHub</title>
+  <desc id="desc">AIWorkHub graph-node mark on an opaque midnight background</desc>
+  <rect width="256" height="256" fill="#07111f"/>
+  <rect x="5" y="5" width="246" height="246" rx="34" fill="none" stroke="#12314a" stroke-width="5"/>
+  <g fill="none" stroke="#2dd4bf" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 34 73 69v44m55-79 55 35v44"/>
+    <path d="m73 113-31 19v65l54 32 49-28m38-88 31 19v65l-54 32-53-31"/>
+    <path d="M128 92v59m0 0-32-19-24 14v34l28 16m28-45 32-19 25 14v34l-25 16-32-19"/>
+  </g>
+  <g fill="#a5f3fc">
+    <circle cx="128" cy="34" r="11"/>
+    <circle cx="73" cy="113" r="11"/>
+    <circle cx="183" cy="113" r="11"/>
+    <circle cx="42" cy="197" r="11"/>
+    <circle cx="214" cy="197" r="11"/>
+  </g>
+</svg>

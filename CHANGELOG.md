@@ -6,6 +6,34 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.28] - 2026-08-01
+
+### Added
+
+- Expanded the Marketplace and VS Code extension description with the shipped
+  33-family/31-mode Source Graph, continuous-use telemetry, repository-local
+  context viewers, deterministic Quality Evidence and multi-language Known Bug
+  Scanner capabilities.
+- Added a dedicated, opaque 256×256 Marketplace icon source and packaged PNG
+  with a new asset path so Marketplace/CDN caches cannot retain the old
+  transparent or missing presentation asset.
+
+### Fixed
+
+- Replaced the Marketplace README's obsolete SVG hero path with the packaged
+  raster presentation already required by VS Code's extension-details view.
+  The previous public Marketplace version was still 0.8.10 and therefore
+  exposed the old SVG reference even though newer GitHub releases contained
+  the corrected PNG documentation.
+- Made optional Marketplace and Open VSX workflow jobs visibly skip when their
+  repository switches are disabled, and fail when enabled without a token,
+  instead of producing a successful job containing only skipped publish steps.
+
+### Documentation
+
+- Documented registry enable switches, public-version verification and the
+  distinct Marketplace, dashboard and editable logo assets.
+
 ## [0.8.27] - 2026-08-01
 
 ### Added

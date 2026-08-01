@@ -14,11 +14,12 @@ GitHub OIDC Trusted Publishing and requires no long-lived upload token.
 
 ## Current public channels
 
-As of 2026-07-31, GitHub Releases is the only enabled public distribution
-channel. Each release provides a VSIX, Python wheel, source distribution and
-checksums. Marketplace, Open VSX and PyPI publication steps remain disabled
-until their owner credentials/environments are configured; a skipped registry
-job is not evidence that a package was published there.
+GitHub Releases and the VS Code Marketplace are public channels. Each GitHub
+release provides a VSIX, Python wheel, source distribution and checksums. The
+tag workflow publishes to a registry only when that registry's explicit
+repository variable is enabled and its credential is present. A skipped
+registry job is not evidence that a package was published there; verify the
+registry's public version after every release.
 
 ## Release Preflight
 
@@ -76,16 +77,19 @@ The `release.yml` workflow will:
    The published release also includes `SHA256SUMS` for the wheel, source
    distribution and VSIX; the canonical build verifies byte-identical repeated
    VSIX packaging before upload.
-6. If `OVSX_TOKEN` is present, publish the VSIX to Open VSX Registry.
-7. If `MARKETPLACE_TOKEN` is present, publish the VSIX to the VS Code
-   Marketplace.
+6. If `OVSX_PUBLISH_ENABLED=true`, require `OVSX_TOKEN` and publish the VSIX to
+   Open VSX Registry; fail clearly when the enabled credential is missing.
+7. If `MARKETPLACE_PUBLISH_ENABLED=true`, require `MARKETPLACE_TOKEN` and
+   publish the VSIX to the VS Code Marketplace; fail clearly when the enabled
+   credential is missing.
 8. If repository variable `PYPI_PUBLISH_ENABLED=true`, publish the wheel and
    source distribution through the `pypi` GitHub environment and PyPI Trusted
    Publisher identity.
 
-All registries are optional. A missing extension secret skips only that
-registry. PyPI publication is skipped unless its repository variable is
-enabled. A configured registry failure fails its job but does not gate GitHub
+All registries are optional. A disabled registry job is visibly skipped. An
+enabled registry with a missing credential or failed upload fails instead of
+reporting a false-green no-op. PyPI publication is skipped unless its
+repository variable is enabled. Registry publication does not gate GitHub
 Release creation.
 
 ### Required Secrets (optional)
@@ -94,6 +98,13 @@ Release creation.
 |--------|---------|
 | `OVSX_TOKEN` | Open VSX Registry publish |
 | `MARKETPLACE_TOKEN` | VS Code Marketplace publish (VS Publisher) |
+
+### Required repository variables (optional registry switches)
+
+| Variable | Purpose |
+|---|---|
+| `OVSX_PUBLISH_ENABLED=true` | Enable the Open VSX job and require `OVSX_TOKEN` |
+| `MARKETPLACE_PUBLISH_ENABLED=true` | Enable the Marketplace job and require `MARKETPLACE_TOKEN` |
 
 ### PyPI trusted publisher setup
 

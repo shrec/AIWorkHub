@@ -263,21 +263,27 @@ jobs:
 
   publish-open-vsx:
     name: Publish to Open VSX Registry
+    if: vars.OVSX_PUBLISH_ENABLED == 'true'
     needs: [build]
     runs-on: ubuntu-latest
     env:
       OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
 
     steps:
+      - name: Require Open VSX token
+        run: |
+          test -n "$OVSX_TOKEN" || {
+            echo "::error::OVSX_PUBLISH_ENABLED is true but OVSX_TOKEN is missing"
+            exit 1
+          }
+
       - name: Download VSIX
-        if: env.OVSX_TOKEN != ''
         uses: actions/download-artifact@v4
         with:
           name: aiworkhub-vsix
           path: registry-assets/
 
       - name: Publish to Open VSX
-        if: env.OVSX_TOKEN != ''
         run: |
           shopt -s nullglob
           vsix=(registry-assets/aiworkhub-*.vsix)
@@ -287,21 +293,27 @@ jobs:
 
   publish-marketplace:
     name: Publish to VS Code Marketplace
+    if: vars.MARKETPLACE_PUBLISH_ENABLED == 'true'
     needs: [build]
     runs-on: ubuntu-latest
     env:
       MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
 
     steps:
+      - name: Require Marketplace token
+        run: |
+          test -n "$MARKETPLACE_TOKEN" || {
+            echo "::error::MARKETPLACE_PUBLISH_ENABLED is true but MARKETPLACE_TOKEN is missing"
+            exit 1
+          }
+
       - name: Download VSIX
-        if: env.MARKETPLACE_TOKEN != ''
         uses: actions/download-artifact@v4
         with:
           name: aiworkhub-vsix
           path: registry-assets/
 
       - name: Publish to Marketplace
-        if: env.MARKETPLACE_TOKEN != ''
         run: |
           shopt -s nullglob
           vsix=(registry-assets/aiworkhub-*.vsix)

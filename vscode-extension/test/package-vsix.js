@@ -153,6 +153,8 @@ for (const rel of [
   "media/app.js",
   "media/app.css",
   "media/aiworkhub-icon.png",
+  "media/aiworkhub-marketplace-icon.svg",
+  "media/aiworkhub-marketplace-icon.png",
   "media/aiworkhub-activity.svg",
   // The README hero must ship as a raster image: VS Code rejects SVG as an
   // image source on the extension details page. The .svg remains the

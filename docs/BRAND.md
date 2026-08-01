@@ -68,7 +68,9 @@ nodes randomly or use the old hexagonal `G` mark.
 Canonical assets:
 
 - Activity icon: `vscode-extension/media/aiworkhub-activity.svg`
-- Marketplace icon: `vscode-extension/media/aiworkhub-icon.png`
+- Marketplace icon source: `vscode-extension/media/aiworkhub-marketplace-icon.svg`
+- Marketplace icon package asset: `vscode-extension/media/aiworkhub-marketplace-icon.png`
+- Dashboard/header mark: `vscode-extension/media/aiworkhub-icon.png`
 - Repository hero: `docs/assets/aiworkhub-hero.svg`
 - Marketplace hero: `vscode-extension/media/aiworkhub-hero.svg`
 

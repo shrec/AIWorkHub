@@ -61,7 +61,7 @@ not alternate names for the same feature.
 
 | Surface | What it represents | Who uses it |
 | --- | --- | --- |
-| **Source Graph** | An automatically refreshed structural index of repository code, used to return bounded code context instead of repeatedly scanning the tree | Managers and workers |
+| **Source Graph** | An automatically refreshed structural index with 33 configurable language/data families and 31 bounded query modes, used to return code context instead of repeatedly scanning the tree | Managers and workers |
 | **Manager Context Graph** | An opt-in, append-only ledger and deterministic graph of manager conversation evidence across repository, thread, session and task identities | Verified managers only |
 
 The Manager Context Graph can search an earlier decision, recover the exact
@@ -177,9 +177,9 @@ never inherit the manager launch capability.
 | Area | Current capability |
 | --- | --- |
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
-| Source Graph | Automatic incremental indexing, bounded structural queries and continuous-use telemetry |
+| Source Graph | 33 configurable language/data families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
-| Quality | Deterministic verification, combined-tree validation and configurable evidence gates |
+| Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
 | Operations | Review Inbox, callbacks, live output, logs, storage retention and workforce scoring |
 | Platforms | Linux, Windows, macOS and Remote-SSH release qualification |
 

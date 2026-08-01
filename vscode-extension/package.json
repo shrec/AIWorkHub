@@ -1,11 +1,11 @@
 {
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
-  "description": "Repository-native AI orchestration for VS Code: plan work, coordinate models, query source intelligence, preserve context and verify results.",
-  "version": "0.8.27",
+  "description": "Repository-native multi-model orchestration with dependency-aware tasks, 31-mode source intelligence, durable context and evidence-first review.",
+  "version": "0.8.28",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
-  "icon": "media/aiworkhub-icon.png",
+  "icon": "media/aiworkhub-marketplace-icon.png",
   "extensionKind": [
     "workspace"
   ],
@@ -24,6 +24,10 @@
     "mcp",
     "multi agent",
     "source graph",
+    "code intelligence",
+    "quality evidence",
+    "context management",
+    "code review",
     "task planning",
     "remote-ssh"
   ],

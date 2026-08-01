@@ -16,11 +16,29 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 
 - Plan and inspect dependency-aware AI tasks from one operational dashboard.
 - Delegate to supported local model adapters and track real terminal outcomes.
-- Replace repeated raw-source discovery with a repository Source Graph.
+- Replace repeated raw-source discovery with a repository Source Graph covering
+  33 configurable language and structured-data families.
+- Use 31 bounded source-intelligence modes for symbols, calls, tests, impact,
+  complexity, ownership, hotspots, gaps and task-shaped context bundles.
 - Preserve continuity through Session Manager, AI Memory and KB.
-- Review diffs, tests, logs, artifacts and approval history before acceptance.
+- Review diffs, tests, logs, artifacts, approval history and deterministic
+  Quality Evidence before acceptance.
+- Run a changed-file Known Bug Scanner across C/C++/CUDA, Python,
+  JavaScript/TypeScript, Go, Java/Kotlin and PHP without treating heuristic
+  warnings as proven failures.
+- Measure whether workers used Source Graph throughout the task through
+  authenticated tool-use receipts and continuous-use telemetry.
 - Keep repositories isolated in separate `.aiworkhub/` authorities.
 - Run on Linux, macOS, native Windows, WSL and Remote-SSH.
+
+## Operational surface
+
+The retained dashboard combines the task DAG, live worker output, Review
+Inbox, callback health, model readiness, tool-use statistics, storage
+retention, Source Graph coverage and bounded viewers for logs, sessions,
+AI Memory and KB. Settings remain repository-local under `.aiworkhub/`, so a
+multi-window installation does not share task or context authority between
+repositories.
 
 ## Get started
 
