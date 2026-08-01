@@ -1011,7 +1011,11 @@ function renderKpis(snapshot) {
   const kpis = snapshot && snapshot.kpi_analytics && typeof snapshot.kpi_analytics === "object"
     ? snapshot.kpi_analytics
     : null;
-  if (!kpis || !["aiworkhub.kpi.dashboard.v1", "aiworkhub.kpi.dashboard.v2"].includes(kpis.schema_id)) {
+  if (!kpis || ![
+    "aiworkhub.kpi.dashboard.v1",
+    "aiworkhub.kpi.dashboard.v2",
+    "aiworkhub.kpi.dashboard.v3",
+  ].includes(kpis.schema_id)) {
     elements.kpiDashboard.replaceChildren(
       createElement("div", "panel-list-empty", "No KPI evidence in this snapshot"),
     );
@@ -1042,6 +1046,8 @@ function renderKpis(snapshot) {
     ["Source Graph live", kpiPercent(headline.source_graph_live_rate), "authenticated live-task rate", "accent"],
     ["SG call success", kpiPercent(headline.source_graph_useful_call_rate), "calls without a recorded failure", "accent"],
     ["SG workflow stages", kpiPercent(headline.source_graph_stage_attribution_rate), "calls carrying authenticated workflow-stage metadata", "accent"],
+    ["SG call gap p95", headline.source_graph_call_gap_p95_seconds == null ? "—" : formatDuration(numberValue(headline.source_graph_call_gap_p95_seconds) * 1000), "time between authenticated Source Graph calls", "accent"],
+    ["SG evidence rows", formatCount(numberValue(headline.source_graph_entity_rows) + numberValue(headline.source_graph_edge_rows) + numberValue(headline.source_graph_file_rows)), `${formatCount(headline.source_graph_entity_rows)} entities · ${formatCount(headline.source_graph_edge_rows)} edges · ${formatCount(headline.source_graph_file_rows)} files`, "accent"],
     ["Context compression", kpiPercent(headline.context_compression_rate), `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`, "accent"],
     ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
     ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
@@ -1160,6 +1166,19 @@ function renderKpis(snapshot) {
   }
   chartGrid.appendChild(modesPanel);
 
+  const generationPanel = createElement("section", "kpi-chart-panel");
+  generationPanel.appendChild(createElement("h3", "kpi-chart-title", "Source Graph index generations"));
+  const generations = asArray(kpis.source_graph_index_revisions);
+  const generationMax = Math.max(1, ...generations.map((item) => numberValue(item.calls)));
+  if (generations.length) {
+    for (const item of generations.slice(0, 8)) {
+      generationPanel.appendChild(kpiBarRow(item.name || "unknown", item.calls, generationMax, "accent"));
+    }
+  } else {
+    generationPanel.appendChild(createElement("div", "panel-list-empty", "No authenticated index-generation metadata yet"));
+  }
+  chartGrid.appendChild(generationPanel);
+
   const cohortPanel = createElement("section", "kpi-chart-panel");
   cohortPanel.appendChild(createElement("h3", "kpi-chart-title", "Tool-use cohorts"));
   const cohorts = asArray(kpis.tool_use_cohorts);
@@ -1196,7 +1215,7 @@ function renderKpis(snapshot) {
   fragment.appendChild(createElement(
     "div",
     `kpi-disclosure${quality.process_window_truncated || numberValue(quality.invalid_timestamp_rows) ? " warning" : ""}`,
-    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} calls lack mode attribution; ${formatCount(quality.source_graph_stage_unattributed_calls)} lack workflow-stage attribution; Source Graph latency p50 ${headline.source_graph_latency_p50_ms == null ? "—" : `${Number(headline.source_graph_latency_p50_ms).toFixed(1)} ms`} / p95 ${headline.source_graph_latency_p95_ms == null ? "—" : `${Number(headline.source_graph_latency_p95_ms).toFixed(1)} ms`}. Byte compression uses declared raw paths versus delivered bundle bytes; no token-savings or causal quality claim is inferred.`,
+    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} calls lack mode attribution; ${formatCount(quality.source_graph_stage_unattributed_calls)} lack workflow-stage attribution; Source Graph latency p50 ${headline.source_graph_latency_p50_ms == null ? "—" : `${Number(headline.source_graph_latency_p50_ms).toFixed(1)} ms`} / p95 ${headline.source_graph_latency_p95_ms == null ? "—" : `${Number(headline.source_graph_latency_p95_ms).toFixed(1)} ms`}; authenticated call-gap sample ${formatCount(quality.source_graph_call_gap_samples)}. Byte compression uses declared raw paths versus delivered bundle bytes; no token-savings or causal quality claim is inferred.`,
   ));
   elements.kpiDashboard.replaceChildren(fragment);
 }

@@ -68,6 +68,15 @@ bytes, latency, cache state and authority identity. Review can therefore
 distinguish multi-stage continuous use from a live single-stage call,
 injected-only context and missing/stale use without guessing old metadata.
 
+Each authenticated response also records the current index revision and
+successful-build timestamp plus unique structural entity, call-edge and file
+evidence counts. The successful-build timestamp is part of the query-cache key:
+an incremental refresh starts a new cache generation and an older cached answer
+cannot be reused against the refreshed graph. Repository KPI v3 aggregates
+bounded latency and inter-call-gap p50/p95 values, evidence-row populations and
+index-generation call counts. These are observed local facts; they do not claim
+token savings or causation.
+
 ## Repository isolation
 
 The database, generations and settings belong to the selected repository's

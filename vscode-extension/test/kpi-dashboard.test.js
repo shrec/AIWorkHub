@@ -30,12 +30,15 @@ test("KPI visualizations include responsive chart and bar primitives", () => {
   assert.match(cssSource, /@media \(max-width: 820px\)/);
 });
 
-test("KPI v2 renders Source Graph workflow stages, modes, latency and truthful byte economics", () => {
-  assert.match(appSource, /aiworkhub\.kpi\.dashboard\.v2/);
+test("KPI v3 renders Source Graph workflow, generations, call gaps and byte economics", () => {
+  assert.match(appSource, /aiworkhub\.kpi\.dashboard\.v3/);
   assert.match(appSource, /Source Graph workflow stages/);
   assert.match(appSource, /Source Graph modes/);
   assert.match(appSource, /Tool-use cohorts/);
   assert.match(appSource, /Context compression/);
   assert.match(appSource, /Source Graph latency p50/);
+  assert.match(appSource, /SG call gap p95/);
+  assert.match(appSource, /SG evidence rows/);
+  assert.match(appSource, /Source Graph index generations/);
   assert.match(appSource, /Byte compression uses declared raw paths/);
 });

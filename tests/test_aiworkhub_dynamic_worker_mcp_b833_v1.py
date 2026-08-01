@@ -332,6 +332,10 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert first["ok"] is True
     assert first["hit_count"] > 0
     assert first["cache_hit"] is False
+    assert first["index_revision"] == source_graph_mod.BUILD_REVISION
+    assert first["evidence_counts"] == {
+        "entity_rows": 0, "edge_rows": 0, "file_rows": 0,
+    }
 
     second = w.source_graph_query(
         ctx, mode="focus", query="ignored", budget=32, workflow_stage="validation"
@@ -361,6 +365,64 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     }
     assert verification["source_graph_latency"]["count"] == 2
     assert verification["source_graph_latency"]["p50_ms"] is not None
+    assert verification["source_graph_call_gaps"]["count"] == 1
+    assert verification["source_graph_index_revision_counts"] == {
+        source_graph_mod.BUILD_REVISION: 2,
+    }
+    assert len(verification["source_graph_index_sequence"]) == 2
+
+
+def test_source_graph_cache_is_invalidated_by_index_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    calls = _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(repo, home=tmp_path / "home")
+    generation = {
+        "build_revision": source_graph_mod.BUILD_REVISION,
+        "finished_at": "2026-08-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(
+        w, "_source_graph_index_identity",
+        lambda db_path, default_revision: dict(generation),
+    )
+
+    first = w.source_graph_query(ctx, mode="focus", query="generation")
+    second = w.source_graph_query(ctx, mode="focus", query="generation")
+    generation["finished_at"] = "2026-08-01T00:05:00+00:00"
+    third = w.source_graph_query(ctx, mode="focus", query="generation")
+
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert third["cache_hit"] is False
+    assert third["index_finished_at"] == "2026-08-01T00:05:00+00:00"
+    assert len(calls) == 2
+
+
+def test_source_graph_evidence_counts_are_unique_and_structural() -> None:
+    payload = {
+        "matches": [
+            {
+                "file_path": "src/a.py", "kind": "function", "qualname": "a.run",
+                "line_start": 3,
+            },
+            {
+                "file_path": "src/a.py", "kind": "function", "qualname": "a.run",
+                "line_start": 3,
+            },
+        ],
+        "neighbors": [
+            {
+                "file_path": "src/a.py", "kind": "calls", "src": "a.run",
+                "dst_name": "b.stop", "line": 5,
+            },
+        ],
+    }
+
+    assert w._source_graph_evidence_counts(payload) == {
+        "entity_rows": 1, "edge_rows": 1, "file_rows": 1,
+    }
 
 
 def test_session_ai_memory_and_kb_tools_are_bounded_and_audited(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

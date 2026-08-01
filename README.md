@@ -185,8 +185,9 @@ never inherit the manager launch capability.
 
 The KPI view separates explicit manager decisions from worker terminal
 outcomes and plots only bounded repository evidence. Its larger aggregate-only
-history shows Source Graph modes, workflow stages, latency, tool-use cohorts
-and deterministic raw-path-versus-delivered-bundle byte economics. Every rate
+history shows Source Graph modes, workflow stages, latency, inter-call gaps,
+returned structural evidence, index generations, tool-use cohorts and
+deterministic raw-path-versus-delivered-bundle byte economics. Every rate
 carries its sample window or denominator; token savings and causal quality
 gains are deliberately not inferred.
 

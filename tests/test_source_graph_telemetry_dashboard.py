@@ -53,6 +53,25 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
                         "samples_ms": [2.0, 5.0, 9.0],
                         "samples_truncated": False,
                     },
+                    "source_graph_call_gaps": {
+                        "count": 2,
+                        "samples_seconds": [12.0, 45.0],
+                        "samples_truncated": False,
+                    },
+                    "source_graph_evidence_rows": {
+                        "entity_rows": 8,
+                        "edge_rows": 5,
+                        "file_rows": 3,
+                    },
+                    "source_graph_index_revision_counts": {
+                        "aiworkhub.source_graph.semantic.v5": 3,
+                    },
+                    "source_graph_index_sequence": [
+                        {
+                            "revision": "aiworkhub.source_graph.semantic.v5",
+                            "finished_at": "2026-08-01T12:00:00Z",
+                        },
+                    ],
                     "call_count_by_tool": {
                         "source_graph": 3, "session_current_state": 1, "kb": 2,
                     },
@@ -160,6 +179,23 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_latency"]["count"] == 3
     assert result["source_graph_latency"]["p50_ms"] == 5.0
     assert result["source_graph_latency"]["p95_ms"] == 9.0
+    assert result["source_graph_call_gaps"]["count"] == 2
+    assert result["source_graph_call_gaps"]["p50_seconds"] == 12.0
+    assert result["source_graph_call_gaps"]["p95_seconds"] == 45.0
+    assert result["source_graph_evidence_rows"] == {
+        "entity_rows": 8,
+        "edge_rows": 5,
+        "file_rows": 3,
+    }
+    assert result["source_graph_index_revision_counts"] == {
+        "aiworkhub.source_graph.semantic.v5": 3,
+    }
+    assert result["source_graph_index_sequence"] == [
+        {
+            "revision": "aiworkhub.source_graph.semantic.v5",
+            "finished_at": "2026-08-01T12:00:00Z",
+        },
+    ]
     assert result["tool_call_counts"] == {
         "source_graph": 4, "session_current_state": 1, "kb": 2,
     }

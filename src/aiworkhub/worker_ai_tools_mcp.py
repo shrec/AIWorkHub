@@ -442,6 +442,99 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
     return AuthorityBinding(db_path=db_path, authority_source="canonical", authority_state="sole_authority")
 
 
+def _source_graph_index_identity(db_path: Path, *, default_revision: str) -> dict[str, str]:
+    """Return bounded canonical index identity without exposing its path.
+
+    ``last_build.finished_at`` changes after every successful incremental
+    refresh, so it is also the cache-generation boundary.  A database created
+    by an older runtime may not have the row yet; that remains a truthful empty
+    timestamp rather than turning a supported query into a false failure.
+    """
+
+    identity = {"build_revision": default_revision[:96], "finished_at": ""}
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return identity
+    if not row or not isinstance(row[0], str):
+        return identity
+    try:
+        payload = json.loads(row[0])
+    except json.JSONDecodeError:
+        return identity
+    if not isinstance(payload, dict):
+        return identity
+    revision = str(payload.get("build_revision") or default_revision)[:96]
+    finished_at = str(payload.get("finished_at") or "")[:64]
+    return {"build_revision": revision, "finished_at": finished_at}
+
+
+def _source_graph_evidence_counts(value: Any) -> dict[str, int]:
+    """Count unique bounded evidence identities returned by one query.
+
+    The result is deliberately structural: it counts only rows that expose a
+    stable file/symbol or call-edge identity.  Generic nested lists are not
+    guessed into entities, and duplicate projections of the same row count
+    once.
+    """
+
+    entities: set[tuple[str, str, str, int]] = set()
+    edges: set[tuple[str, str, str, str, int]] = set()
+    files: set[str] = set()
+
+    def safe_line(raw: Any) -> int:
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def visit(item: Any) -> None:
+        if isinstance(item, list):
+            for child in item:
+                visit(child)
+            return
+        if not isinstance(item, dict):
+            return
+        file_path = str(item.get("file_path") or "")[:512]
+        if file_path:
+            files.add(file_path)
+        src = str(item.get("src_qualname") or item.get("src") or "")[:512]
+        dst = str(
+            item.get("dst_qualname") or item.get("dst_name") or item.get("dst") or ""
+        )[:512]
+        if src and dst:
+            edges.add((
+                file_path,
+                str(item.get("kind") or "")[:64],
+                src,
+                dst,
+                safe_line(item.get("line")),
+            ))
+        else:
+            qualname = str(item.get("qualname") or "")[:512]
+            if file_path and qualname:
+                entities.add((
+                    file_path,
+                    str(item.get("kind") or "")[:64],
+                    qualname,
+                    safe_line(item.get("line_start") or item.get("line")),
+                ))
+        for child in item.values():
+            if isinstance(child, (dict, list)):
+                visit(child)
+
+    visit(value)
+    return {
+        "entity_rows": len(entities),
+        "edge_rows": len(edges),
+        "file_rows": len(files),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-request HMAC-authenticated audit ledger
 # ---------------------------------------------------------------------------
@@ -585,6 +678,15 @@ def verify_audit_ledger(
             "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
             "p50_ms": None, "p95_ms": None,
         },
+        "source_graph_call_gaps": {
+            "count": 0, "total_seconds": 0.0, "min_seconds": None,
+            "max_seconds": None, "p50_seconds": None, "p95_seconds": None,
+        },
+        "source_graph_evidence_rows": {
+            "entity_rows": 0, "edge_rows": 0, "file_rows": 0,
+        },
+        "source_graph_index_revision_counts": {},
+        "source_graph_index_sequence": [],
         "authority_index_identity": [],
         "verified_payloads": [],
         "reason": "",
@@ -606,6 +708,7 @@ def verify_audit_ledger(
     cache_hits_by_tool: dict[str, int] = {}
     authority_seen: set[tuple[str, str, str, str]] = set()
     source_graph_latencies: list[float] = []
+    source_graph_call_times: list[float] = []
     for raw_line in lines:
         raw_line = raw_line.strip()
         if not raw_line:
@@ -668,6 +771,35 @@ def verify_audit_ledger(
             latency = payload.get("latency_ms") if isinstance(payload, dict) else None
             if isinstance(latency, (int, float)) and 0 <= float(latency) <= 3_600_000:
                 source_graph_latencies.append(round(float(latency), 3))
+            evidence_counts = (
+                payload.get("evidence_counts") if isinstance(payload, dict) else None
+            )
+            if isinstance(evidence_counts, dict):
+                for evidence_key in ("entity_rows", "edge_rows", "file_rows"):
+                    result["source_graph_evidence_rows"][evidence_key] += max(
+                        0, int(evidence_counts.get(evidence_key) or 0)
+                    )
+            revision = (
+                str(payload.get("index_revision") or "")[:96]
+                if isinstance(payload, dict) else ""
+            )
+            if revision:
+                revisions = result["source_graph_index_revision_counts"]
+                revisions[revision] = int(revisions.get(revision) or 0) + 1
+                if len(result["source_graph_index_sequence"]) < 64:
+                    result["source_graph_index_sequence"].append({
+                        "revision": revision,
+                        "finished_at": str(payload.get("index_finished_at") or "")[:64],
+                    })
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(entry.get("timestamp") or "").replace("Z", "+00:00")
+                )
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                source_graph_call_times.append(timestamp.timestamp())
+            except (ValueError, OverflowError):
+                pass
         returned_bytes = max(0, int(entry.get("bytes_returned") or 0))
         result["bounded_bytes_returned"] += returned_bytes
         bounded_bytes_by_tool[tool] = bounded_bytes_by_tool.get(tool, 0) + returned_bytes
@@ -750,6 +882,31 @@ def verify_audit_ledger(
             "p95_ms": percentile(0.95),
             "samples_ms": ordered[:64],
             "samples_truncated": len(ordered) > 64,
+        }
+    if len(source_graph_call_times) > 1:
+        ordered_times = sorted(source_graph_call_times)
+        gaps = [
+            round(max(0.0, later - earlier), 3)
+            for earlier, later in zip(ordered_times, ordered_times[1:])
+        ]
+
+        def gap_percentile(fraction: float) -> float:
+            ordered_gaps = sorted(gaps)
+            index = min(
+                len(ordered_gaps) - 1,
+                max(0, int(round((len(ordered_gaps) - 1) * fraction))),
+            )
+            return ordered_gaps[index]
+
+        result["source_graph_call_gaps"] = {
+            "count": len(gaps),
+            "total_seconds": round(sum(gaps), 3),
+            "min_seconds": min(gaps),
+            "max_seconds": max(gaps),
+            "p50_seconds": gap_percentile(0.50),
+            "p95_seconds": gap_percentile(0.95),
+            "samples_seconds": gaps[:64],
+            "samples_truncated": len(gaps) > 64,
         }
     result["ok"] = True
     return result
@@ -878,9 +1035,19 @@ def source_graph_query(
             return _violation(ctx, tool, "target_not_allowed")
         scope = bounded_target
 
+    try:
+        binding = _resolve_source_graph_db(ctx)
+    except WorkerToolError as exc:
+        return _violation(ctx, tool, str(exc)[:160])
+
+    from . import source_graph as _source_graph_mod
+    index_identity = _source_graph_index_identity(
+        binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
+    )
     cache_key = (
         "source_graph", ctx.task_id, ctx.request_id, str(ctx.authority_repo),
         mode, bounded_query, scope, budget, bundle_type,
+        index_identity["build_revision"], index_identity["finished_at"],
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -892,16 +1059,13 @@ def source_graph_query(
                 "mode": mode,
                 "workflow_stage": workflow_stage,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "index_revision": index_identity["build_revision"],
+                "index_finished_at": index_identity["finished_at"],
+                "evidence_counts": cached["evidence_counts"],
             },
         )
         return {**cached["result"], "cache_hit": True}
 
-    try:
-        binding = _resolve_source_graph_db(ctx)
-    except WorkerToolError as exc:
-        return _violation(ctx, tool, str(exc)[:160])
-
-    from . import source_graph as _source_graph_mod
     try:
         if mode == "bundle":
             payload = _source_graph_mod.bundle(ctx.authority_repo, bundle_type, bounded_query, budget)
@@ -947,6 +1111,7 @@ def source_graph_query(
 
     payload = json.loads(text)
     hit_count = _json_hit_count(payload)
+    evidence_counts = _source_graph_evidence_counts(payload)
     bytes_returned = len(text.encode("utf-8"))
     result = {
         "ok": True,
@@ -963,10 +1128,14 @@ def source_graph_query(
         "authority_source": binding.authority_source,
         "authority_state": binding.authority_state,
         "authority_repo": str(ctx.authority_repo),
+        "index_revision": index_identity["build_revision"],
+        "index_finished_at": index_identity["finished_at"],
+        "evidence_counts": evidence_counts,
     }
     _CACHE[cache_key] = {
         "result": result, "hit_count": hit_count, "bytes": bytes_returned,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
+        "evidence_counts": evidence_counts,
     }
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
@@ -975,6 +1144,9 @@ def source_graph_query(
             "mode": mode,
             "workflow_stage": workflow_stage,
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "index_revision": index_identity["build_revision"],
+            "index_finished_at": index_identity["finished_at"],
+            "evidence_counts": evidence_counts,
         },
     )
     return result

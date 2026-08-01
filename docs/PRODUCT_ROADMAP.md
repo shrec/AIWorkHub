@@ -1,6 +1,6 @@
 # AIWorkHub Product Roadmap
 
-Status: canonical product direction after the 0.8.0 repository, orchestration,
+Status: canonical product direction after the 0.8.35 repository, orchestration,
 storage, CI, and tool-use closure. This roadmap separates shipped capability
 from partial capability and planned work. A design document or canary is not a
 shipped feature.
@@ -17,7 +17,7 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
-## Current baseline (0.8.0)
+## Current baseline (0.8.35)
 
 ### Shipped foundations
 
@@ -29,7 +29,7 @@ AIWorkHub telemetry.
   JavaScript/TypeScript file evidence.
 - Isolated worker launch, dependency-aware task planning, review lifecycle,
   callback outbox, and coordinator acceptance boundary.
-- HMAC-authenticated worker tool-use ledger and Source Graph telemetry v1:
+- HMAC-authenticated worker tool-use ledger and Source Graph telemetry v3:
   live calls, cached calls, missing/stale use, bytes returned, policy
   violations, tamper detection, and per-adapter summaries.
 - Quality Evidence Engine foundations and evidence-aware task review.
@@ -52,7 +52,10 @@ AIWorkHub telemetry.
 - Bounded repository KPI charts for explicit manager decisions, worker
   outcomes, validation failures, Source Graph use, callback delivery,
   adapter effectiveness and context-system execution, with visible sample
-  windows, denominators and telemetry-quality disclosures.
+  windows, denominators and telemetry-quality disclosures. Source Graph
+  statistics include authenticated workflow stages, modes, latency, time gaps,
+  structural evidence rows and index generations; cached answers are invalidated
+  when the canonical index generation changes.
 - Safe repository worktree, terminal-run and extension-runtime retention with
   preview, quarantine, restore and separately confirmed expired purge.
 - Safe archived-task retention with age-based preview, callback-backlog
@@ -83,9 +86,10 @@ AIWorkHub telemetry.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
 - Task/tool telemetry authenticates generic MCP calls as well as Source Graph
-  calls. KPI v2 ships authenticated mode/workflow-stage attribution, bounded
-  latency distributions, an aggregate-only 1,000-run history, topic/tool-use
-  cohorts and measured raw-path-versus-delivered-bundle byte economics.
+  calls. KPI v3 ships authenticated mode/workflow-stage attribution, bounded
+  latency and inter-call-gap distributions, returned entity/edge/file evidence,
+  index-generation attribution, an aggregate-only 1,000-run history,
+  topic/tool-use cohorts and measured raw-path-versus-delivered-bundle byte economics.
   Durable daily rollups beyond retained process logs, normalized task classes,
   tokenizer-bound counterfactuals and accepted-change-per-dollar remain open.
 - The brand foundation, concise public README and registry workflows are
@@ -100,7 +104,7 @@ AIWorkHub telemetry.
   remain an explicit follow-up and must not depend on scraping private plugin
   storage.
 
-## P0 — Stable multi-repository product (0.7.9)
+## P0 — Stable multi-repository product (shipped; continuously qualified)
 
 ### 1. Atomic chat repository handoff
 
@@ -183,14 +187,16 @@ is used throughout the task, not merely injected at prompt start.
 Report locally, by repository/task/run/model/adapter:
 
 - Source Graph calls, successful hits, zero hits, cached hits, stale calls,
-  returned bytes and bounded latency are shipped; per-call entities/edges and
-  index-generation timelines remain open.
+  returned bytes, bounded latency, per-call structural entity/edge/file evidence
+  and index-generation attribution are shipped. Index refresh changes the query
+  cache generation, so cached results cannot silently outlive their index.
 - Calls by authenticated workflow stage (orientation, implementation,
   validation, review and rework) are shipped. A task with only the initial
   receipt is `injected-only`; KPI cohorts require at least two attributed
   stages before labeling a task `continuous_use`.
-- Time and model-turn gaps between Source Graph calls; highlight long code-work
-  intervals with no graph evidence.
+- Authenticated time gaps between Source Graph calls are shipped with bounded
+  p50/p95 distributions. Model-turn correlation and explicit long code-work
+  interval alerts remain open.
 - Raw discovery fallback count and reason (`unsupported`, `unindexed`, exact
   known path, or policy violation). Distinguish allowed bounded fallback from
   forbidden broad discovery.

@@ -267,6 +267,10 @@ def build_kpi_snapshot(
     stage_attributed = _count(source_graph.get("source_graph_stage_attributed_calls"))
     latency = source_graph.get("source_graph_latency")
     latency = latency if isinstance(latency, Mapping) else {}
+    call_gaps = source_graph.get("source_graph_call_gaps")
+    call_gaps = call_gaps if isinstance(call_gaps, Mapping) else {}
+    evidence_rows = source_graph.get("source_graph_evidence_rows")
+    evidence_rows = evidence_rows if isinstance(evidence_rows, Mapping) else {}
 
     mode_rows = [
         {"name": str(name), "calls": _count(count)}
@@ -280,6 +284,12 @@ def build_kpi_snapshot(
         if _count(count) > 0
     ] if isinstance(source_graph.get("source_graph_stage_counts"), Mapping) else []
     stage_rows.sort(key=lambda row: (-row["calls"], row["name"]))
+    revision_rows = [
+        {"name": str(name), "calls": _count(count)}
+        for name, count in (source_graph.get("source_graph_index_revision_counts") or {}).items()
+        if _count(count) > 0
+    ] if isinstance(source_graph.get("source_graph_index_revision_counts"), Mapping) else []
+    revision_rows.sort(key=lambda row: (-row["calls"], row["name"]))
 
     context_rows = []
     for key, label in (
@@ -326,7 +336,7 @@ def build_kpi_snapshot(
     })
 
     return {
-        "schema_id": "aiworkhub.kpi.dashboard.v2",
+        "schema_id": "aiworkhub.kpi.dashboard.v3",
         "measurement": "bounded_worker_outcomes_and_explicit_manager_decisions",
         "window": {
             "label": f"latest {process_limit} process runs",
@@ -354,6 +364,12 @@ def build_kpi_snapshot(
             "source_graph_stage_attribution_rate": _rate(stage_attributed, source_calls),
             "source_graph_latency_p50_ms": latency.get("p50_ms"),
             "source_graph_latency_p95_ms": latency.get("p95_ms"),
+            "source_graph_call_gap_p50_seconds": call_gaps.get("p50_seconds"),
+            "source_graph_call_gap_p95_seconds": call_gaps.get("p95_seconds"),
+            "source_graph_entity_rows": _count(evidence_rows.get("entity_rows")),
+            "source_graph_edge_rows": _count(evidence_rows.get("edge_rows")),
+            "source_graph_file_rows": _count(evidence_rows.get("file_rows")),
+            "source_graph_index_revisions": len(revision_rows),
             "context_compression_rate": context_compression_rate,
             "estimated_context_bytes_avoided": economics["estimated_context_bytes_avoided"],
             "callback_delivery_rate": _rate(delivered, callback_terminal),
@@ -374,6 +390,7 @@ def build_kpi_snapshot(
         "topics": topic_rows[:12],
         "source_graph_modes": mode_rows,
         "source_graph_stages": stage_rows,
+        "source_graph_index_revisions": revision_rows,
         "tool_use_cohorts": cohort_rows,
         "economics": economics,
         "context": context_rows,
@@ -390,6 +407,10 @@ def build_kpi_snapshot(
             "source_graph_stage_unattributed_calls": max(0, source_calls - stage_attributed),
             "source_graph_latency_samples": _count(latency.get("count")),
             "source_graph_latency_samples_truncated": bool(latency.get("samples_truncated")),
+            "source_graph_call_gap_samples": _count(call_gaps.get("count")),
+            "source_graph_call_gap_samples_truncated": bool(
+                call_gaps.get("samples_truncated")
+            ),
             "sample_size": observed,
         },
     }

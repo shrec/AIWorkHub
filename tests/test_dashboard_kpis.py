@@ -47,6 +47,19 @@ def _build(processes, *, total_requests=None):
             "source_graph_mode_counts": {"focus": 4, "slice": 2, "impact": 2},
             "source_graph_stage_counts": {"orientation": 3, "implementation": 2, "validation": 2, "unspecified": 3},
             "source_graph_latency": {"count": 10, "p50_ms": 4.5, "p95_ms": 18.0},
+            "source_graph_call_gaps": {
+                "count": 9,
+                "p50_seconds": 12.0,
+                "p95_seconds": 45.0,
+            },
+            "source_graph_evidence_rows": {
+                "entity_rows": 20,
+                "edge_rows": 12,
+                "file_rows": 8,
+            },
+            "source_graph_index_revision_counts": {
+                "aiworkhub.source_graph.semantic.v5": 10,
+            },
             "live_rate": 75.0,
             "gate_satisfaction_rate": 80.0,
         },
@@ -102,11 +115,22 @@ def test_kpis_report_only_explicit_manager_acceptance_decisions():
 def test_kpis_calculate_callback_tool_and_context_denominators():
     result = _build([_run("A", "review_ready", "2026-08-01T12:00:00Z")])
 
+    assert result["schema_id"] == "aiworkhub.kpi.dashboard.v3"
     assert result["headline"]["callback_delivery_rate"] == 90.0
     assert result["headline"]["source_graph_useful_call_rate"] == 80.0
     assert result["headline"]["source_graph_mode_attribution_rate"] == 80.0
     assert result["headline"]["source_graph_stage_attribution_rate"] == 70.0
     assert result["headline"]["source_graph_latency_p95_ms"] == 18.0
+    assert result["headline"]["source_graph_call_gap_p50_seconds"] == 12.0
+    assert result["headline"]["source_graph_call_gap_p95_seconds"] == 45.0
+    assert result["headline"]["source_graph_entity_rows"] == 20
+    assert result["headline"]["source_graph_edge_rows"] == 12
+    assert result["headline"]["source_graph_file_rows"] == 8
+    assert result["headline"]["source_graph_index_revisions"] == 1
+    assert result["source_graph_index_revisions"] == [
+        {"name": "aiworkhub.source_graph.semantic.v5", "calls": 10},
+    ]
+    assert result["data_quality"]["source_graph_call_gap_samples"] == 9
     assert result["context"][0]["execution_rate"] == 75.0
     assert result["context"][2]["execution_rate"] is None
 

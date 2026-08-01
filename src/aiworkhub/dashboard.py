@@ -238,6 +238,36 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
                     (verification.get("source_graph_latency") or {}).get("samples_truncated")
                 ),
             },
+            "source_graph_call_gaps": {
+                "count": int((verification.get("source_graph_call_gaps") or {}).get("count") or 0),
+                "total_seconds": float(
+                    (verification.get("source_graph_call_gaps") or {}).get("total_seconds") or 0.0
+                ),
+                "samples_seconds": [
+                    round(float(value), 3)
+                    for value in (
+                        (verification.get("source_graph_call_gaps") or {}).get("samples_seconds") or []
+                    )[:64]
+                    if isinstance(value, (int, float)) and 0 <= float(value) <= 31_536_000
+                ],
+                "samples_truncated": bool(
+                    (verification.get("source_graph_call_gaps") or {}).get("samples_truncated")
+                ),
+            },
+            "source_graph_evidence_rows": bounded_counter(
+                verification.get("source_graph_evidence_rows")
+            ),
+            "source_graph_index_revision_counts": bounded_counter(
+                verification.get("source_graph_index_revision_counts")
+            ),
+            "source_graph_index_sequence": [
+                {
+                    "revision": str(value.get("revision") or "")[:96],
+                    "finished_at": str(value.get("finished_at") or "")[:64],
+                }
+                for value in (verification.get("source_graph_index_sequence") or [])[:64]
+                if isinstance(value, Mapping)
+            ],
             "call_count_by_tool": bounded_counter(calls),
             "successful_call_count_by_tool": bounded_counter(successful),
             "bounded_bytes_by_tool": bounded_counter(bytes_by_tool),
@@ -337,6 +367,16 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             "count": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None,
             "p50_ms": None, "p95_ms": None, "samples_truncated": False,
         },
+        "source_graph_call_gaps": {
+            "count": 0, "total_seconds": 0.0, "min_seconds": None,
+            "max_seconds": None, "p50_seconds": None, "p95_seconds": None,
+            "samples_truncated": False,
+        },
+        "source_graph_evidence_rows": {
+            "entity_rows": 0, "edge_rows": 0, "file_rows": 0,
+        },
+        "source_graph_index_revision_counts": {},
+        "source_graph_index_sequence": [],
         "tool_call_counts": {},
         "tool_success_counts": {},
         "tool_bytes": {},
@@ -516,6 +556,46 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                         aggregate_samples.append(round(float(value), 3))
             if latency.get("samples_truncated"):
                 totals["source_graph_latency"]["samples_truncated"] = True
+        call_gaps = tool_use.get("source_graph_call_gaps")
+        if isinstance(call_gaps, Mapping):
+            samples = call_gaps.get("samples_seconds")
+            if isinstance(samples, list):
+                aggregate_gaps = totals["source_graph_call_gaps"].setdefault(
+                    "samples_seconds", []
+                )
+                for value in samples:
+                    if len(aggregate_gaps) >= 512:
+                        totals["source_graph_call_gaps"]["samples_truncated"] = True
+                        break
+                    if isinstance(value, (int, float)) and 0 <= float(value) <= 31_536_000:
+                        aggregate_gaps.append(round(float(value), 3))
+            if call_gaps.get("samples_truncated"):
+                totals["source_graph_call_gaps"]["samples_truncated"] = True
+        evidence_rows = tool_use.get("source_graph_evidence_rows")
+        if isinstance(evidence_rows, Mapping):
+            for key in ("entity_rows", "edge_rows", "file_rows"):
+                totals["source_graph_evidence_rows"][key] += max(
+                    0, int(evidence_rows.get(key) or 0)
+                )
+        revision_counts = tool_use.get("source_graph_index_revision_counts")
+        if isinstance(revision_counts, Mapping):
+            for revision, count in revision_counts.items():
+                safe_revision = str(revision)[:96]
+                totals["source_graph_index_revision_counts"][safe_revision] = (
+                    int(totals["source_graph_index_revision_counts"].get(safe_revision) or 0)
+                    + max(0, int(count or 0))
+                )
+        index_sequence = tool_use.get("source_graph_index_sequence")
+        if isinstance(index_sequence, list):
+            for identity in index_sequence:
+                if len(totals["source_graph_index_sequence"]) >= 128:
+                    break
+                if not isinstance(identity, Mapping):
+                    continue
+                totals["source_graph_index_sequence"].append({
+                    "revision": str(identity.get("revision") or "")[:96],
+                    "finished_at": str(identity.get("finished_at") or "")[:64],
+                })
         if violations:
             totals["policy_violation_tasks"] += 1
         if int(tool_use.get("entries_tampered") or 0):
@@ -579,6 +659,23 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             "max_ms": latency_samples[-1],
             "p50_ms": latency_percentile(0.50),
             "p95_ms": latency_percentile(0.95),
+        })
+    gap_samples = sorted(totals["source_graph_call_gaps"].pop("samples_seconds", []))
+    if gap_samples:
+        def gap_percentile(fraction: float) -> float:
+            index = min(
+                len(gap_samples) - 1,
+                max(0, int(round((len(gap_samples) - 1) * fraction))),
+            )
+            return gap_samples[index]
+
+        totals["source_graph_call_gaps"].update({
+            "count": len(gap_samples),
+            "total_seconds": round(sum(gap_samples), 3),
+            "min_seconds": gap_samples[0],
+            "max_seconds": gap_samples[-1],
+            "p50_seconds": gap_percentile(0.50),
+            "p95_seconds": gap_percentile(0.95),
         })
     totals["source_graph_distinct_modes"] = sum(
         1 for count in totals["source_graph_mode_counts"].values() if int(count or 0) > 0

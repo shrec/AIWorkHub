@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.36] - 2026-08-01
+
+### Added
+
+- Added KPI v3 Source Graph observability: authenticated inter-call gap
+  distributions, returned structural entity/edge/file counts and canonical
+  index-generation attribution in the repository dashboard.
+
+### Fixed
+
+- Bound worker Source Graph query caches to the canonical successful index
+  generation, preventing an incremental refresh from returning stale cached
+  results.
+
 ## [0.8.35] - 2026-08-01
 
 ### Added
