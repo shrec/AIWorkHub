@@ -42,6 +42,21 @@ an earlier one, but it may not turn missing or failed evidence into a pass.
    - Mechanical checks use argv arrays with `shell=False`; configuration is
      non-executable repository data.
 
+### Change-sensitive Known Bug Scanner
+
+The dependency-free Known Bug Scanner runs only against declared changed
+paths. Its initial rule packs cover C/C++/CUDA, Python, JavaScript/TypeScript,
+Go, Java/Kotlin, C#, PHP and crypto-sensitive code. High-confidence defects
+such as disabled TLS verification, literal divide-by-zero, unsafe shell mode,
+weak cryptographic RNG use and exact CUDA rotation-claim mismatch block the
+deterministic floor. Lower-confidence lifetime, raw-pointer, unsafe-copy,
+dynamic-code and shell-boundary findings remain warnings for manager review.
+
+Every finding includes rule identity, severity, category, exact path/line,
+bounded snippet and stable fingerprint. Source Graph risk modes are broader
+candidate discovery; they never silently promote a heuristic into this
+blocking gate.
+
 4. **Independent judgment lenses**
    - A read-only reviewer, preferably a different provider for high-risk work,
      examines correctness, code quality and security without seeing the

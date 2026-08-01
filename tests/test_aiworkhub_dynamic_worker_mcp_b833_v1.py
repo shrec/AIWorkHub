@@ -294,6 +294,11 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
     assert invalid_mode["reason"].startswith("invalid_mode")
     assert invalid_mode["allowed_modes"] == [
         "focus", "slice", "context", "impact", "trace", "bundle",
+        "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+        "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+        "stats", "summarize", "pipeline",
+        "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+        "looprisks", "deadmethods", "duplicates", "gaps",
     ]
     assert invalid_mode["example"]["mode"] == "focus"
     invalid_bundle = w.source_graph_query(ctx, mode="focus", query="x", bundle_type="hack")

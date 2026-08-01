@@ -126,6 +126,18 @@ def _test_candidates(
     return results[: max(1, limit)]
 
 
+def test_candidates(
+    conn: sqlite3.Connection,
+    files: list[str],
+    matches: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Public bounded structural test mapping used by analytics modes."""
+
+    return _test_candidates(conn, files, matches, limit=limit)
+
+
 def materialize_git_metrics(
     conn: sqlite3.Connection,
     repo_root: Path,
@@ -308,6 +320,18 @@ def _symbol_metrics(
     return rows[: max(1, limit)]
 
 
+def symbol_metrics(
+    conn: sqlite3.Connection,
+    repo_root: Path,
+    matches: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Public deterministic symbol metrics over canonical graph evidence."""
+
+    return _symbol_metrics(conn, repo_root, matches, limit=limit)
+
+
 def _todos(repo_root: Path, files: list[str], *, limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in files:
@@ -323,6 +347,12 @@ def _todos(repo_root: Path, files: list[str], *, limit: int) -> list[dict[str, A
                 if len(rows) >= max(1, limit):
                     return rows
     return rows
+
+
+def todos(repo_root: Path, files: list[str], *, limit: int) -> list[dict[str, Any]]:
+    """Public bounded TODO/FIXME evidence for repository summaries."""
+
+    return _todos(repo_root, files, limit=limit)
 
 
 def focus_insights(
@@ -432,6 +462,9 @@ __all__ = [
     "focus_insights",
     "impact_insights",
     "materialize_git_metrics",
+    "symbol_metrics",
     "slice_insights",
+    "test_candidates",
+    "todos",
     "trace_insights",
 ]

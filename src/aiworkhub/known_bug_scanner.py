@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -35,6 +37,15 @@ RULES = (
     Rule("cpp.unbounded_copy", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}),
          re.compile(r"\b(?:strcpy|strcat|sprintf)\s*\("), "warning", "memory_safety",
          "unbounded C string operation requires a destination-size proof"),
+    Rule("cpp.unbounded_scanf_string", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}),
+         re.compile(r'\b(?:scanf|sscanf)\s*\(\s*"[^"\n]*%s'), "warning", "memory_safety",
+         "%s without a field width requires a destination-size proof"),
+    Rule("cpp.process_shell", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}),
+         re.compile(r"\b(?:system|popen)\s*\("), "warning", "command_injection",
+         "shell command execution requires a trusted-input boundary"),
+    Rule("cpp.literal_divide_zero", frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh"}),
+         re.compile(r"(?<!/)\/(?![/=*])\s*(?:0|0\.0+)\b"), "error", "correctness",
+         "division by a literal zero is undefined or invalid"),
     Rule("crypto.weak_c_rng", frozenset({".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh"}),
          re.compile(r"\b(?:rand|srand)\s*\("), "error", "cryptography",
          "rand()/srand() is not a cryptographic random generator", True),
@@ -47,25 +58,59 @@ RULES = (
          "warning", "code_injection", "dynamic code execution requires a trusted-input proof"),
     Rule("python.unsafe_pickle", frozenset({".py"}), re.compile(r"\bpickle\.(?:load|loads)\s*\("),
          "warning", "deserialization", "pickle is unsafe for untrusted data"),
+    Rule("python.tls_verify_disabled", frozenset({".py"}), re.compile(r"\bverify\s*=\s*False\b"),
+         "error", "transport_security", "TLS certificate verification is disabled"),
+    Rule("python.unverified_ssl_context", frozenset({".py"}), re.compile(r"\b_create_unverified_context\s*\("),
+         "error", "transport_security", "an unverified TLS context disables certificate validation"),
+    Rule("python.unsafe_yaml_load", frozenset({".py"}),
+         re.compile(r"\byaml\.load\s*\((?![^\n)]*Loader\s*=)"),
+         "warning", "deserialization", "yaml.load without an explicit safe loader can construct arbitrary objects"),
+    Rule("python.insecure_mktemp", frozenset({".py"}), re.compile(r"\btempfile\.mktemp\s*\("),
+         "warning", "filesystem_race", "mktemp() has a create-after-check race; use a securely opened temporary file"),
     Rule("javascript.eval", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
          re.compile(r"\beval\s*\("), "warning", "code_injection", "eval() requires a trusted-input proof"),
     Rule("javascript.tls_disabled", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
          re.compile(r"\brejectUnauthorized\s*:\s*false\b"), "error", "transport_security",
          "TLS certificate verification is disabled"),
+    Rule("javascript.node_tls_env_disabled", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
+         re.compile(r"\bNODE_TLS_REJECT_UNAUTHORIZED\b[^\n]*(?:=|:)\s*['\"]?0['\"]?"),
+         "error", "transport_security", "Node TLS certificate verification is disabled globally"),
+    Rule("javascript.process_shell", frozenset({".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}),
+         re.compile(
+             r"\b(?:child_process|childProcess)\.(?:exec|execSync)\s*\(|"
+             r"\brequire\(\s*['\"]child_process['\"]\s*\)\.(?:exec|execSync)\s*\("
+         ), "warning", "command_injection",
+         "shell execution requires a trusted-input boundary"),
     Rule("go.tls_disabled", frozenset({".go"}), re.compile(r"\bInsecureSkipVerify\s*:\s*true\b"),
          "error", "transport_security", "TLS certificate verification is disabled"),
     Rule("go.weak_crypto_rng", frozenset({".go"}), re.compile(r'\"math/rand(?:/v2)?\"'),
          "error", "cryptography", "math/rand is not cryptographically secure", True),
+    Rule("go.process_shell", frozenset({".go"}),
+         re.compile(r'\bexec\.Command\s*\(\s*"(?:sh|bash|cmd|powershell)(?:\.exe)?"\s*,\s*"(?:-c|/c|/C)"'),
+         "warning", "command_injection", "shell command execution requires a trusted-input boundary"),
     Rule("java.ecb_mode", frozenset({".java", ".kt", ".kts"}),
          re.compile(r'Cipher\.getInstance\s*\(\s*\"[^\"]*ECB', re.I), "error", "cryptography",
          "ECB mode reveals plaintext block patterns"),
+    Rule("java.permissive_hostname_verifier", frozenset({".java", ".kt", ".kts"}),
+         re.compile(r"HostnameVerifier[^\n]*(?:->|return)\s*true\b"), "error", "transport_security",
+         "hostname verification accepts every peer"),
+    Rule("csharp.permissive_certificate_callback", frozenset({".cs"}),
+         re.compile(r"ServerCertificateCustomValidationCallback[^\n]*(?:=>|return)\s*true\b"),
+         "error", "transport_security", "certificate validation accepts every peer"),
     Rule("php.dynamic_eval", frozenset({".php", ".phtml"}), re.compile(r"\beval\s*\("),
          "warning", "code_injection", "eval() requires a trusted-input proof"),
     Rule("php.unsafe_unserialize", frozenset({".php", ".phtml"}), re.compile(r"\bunserialize\s*\("),
          "warning", "deserialization", "unserialize() requires a trusted-type boundary"),
+    Rule("php.tls_verify_disabled", frozenset({".php", ".phtml"}),
+         re.compile(r"CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)\b", re.I),
+         "error", "transport_security", "TLS peer verification is disabled"),
 )
 BYTE_PERM_RE = re.compile(r"__byte_perm\s*\(\s*\w+\s*,\s*0\s*,\s*(0x[0-9a-fA-F]+)\s*\)")
 ROTATION_RE = re.compile(r"rotl32\((\d+)\)|rotr32\((\d+)\)")
+RELEASE_RE = re.compile(
+    r"\bfree\s*\(\s*([A-Za-z_]\w*)\s*\)|"
+    r"\bdelete(?:\s*\[\s*\])?\s+([A-Za-z_]\w*)"
+)
 
 
 def _rotation(selector: int) -> int | None:
@@ -86,6 +131,31 @@ def _finding(rule: Rule, path: str, line: int, column: int, snippet: str) -> dic
             "snippet": snippet.strip()[:300], "fingerprint": digest}
 
 
+def _python_code_lines(text: str) -> list[str]:
+    """Mask Python comments and literals while preserving line/column offsets."""
+
+    lines = text.splitlines()
+    masked = [list(line) for line in lines]
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type not in {tokenize.STRING, tokenize.COMMENT}:
+                continue
+            (start_line, start_col), (end_line, end_col) = token.start, token.end
+            for line_no in range(start_line, end_line + 1):
+                if not (1 <= line_no <= len(masked)):
+                    continue
+                left = start_col if line_no == start_line else 0
+                right = end_col if line_no == end_line else len(masked[line_no - 1])
+                for column in range(max(0, left), min(right, len(masked[line_no - 1]))):
+                    masked[line_no - 1][column] = " "
+    except (IndentationError, tokenize.TokenError):
+        # Syntax validation is a separate Quality Evidence check. Returning
+        # unmodified text keeps this scanner deterministic for partial files.
+        return lines
+    return ["".join(line) for line in masked]
+
+
 def scan_file(root: Path, relative: str) -> list[dict]:
     path = (root / relative).resolve(strict=False)
     if (path != root and root not in path.parents) or path.is_symlink() or not path.is_file():
@@ -96,15 +166,41 @@ def scan_file(root: Path, relative: str) -> list[dict]:
     rules = [rule for rule in RULES if suffix in rule.suffixes]
     if not rules and suffix not in {".cu", ".cuh"}:
         return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    code_lines = _python_code_lines(text) if suffix == ".py" else lines
     crypto = bool(CRYPTO_CONTEXT.search(relative))
     findings = []
+    released: dict[str, int] = {}
     for number, raw in enumerate(lines, 1):
-        stripped = raw.strip()
+        source = code_lines[number - 1] if suffix == ".py" else raw.split("//", 1)[0]
+        stripped = source.strip()
         if not stripped or stripped.startswith(("//", "/*", "*", "#")):
             continue
-        source = raw.split("//", 1)[0]
         crypto = crypto or bool(CRYPTO_CONTEXT.search(source))
+        if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cu", ".cuh"}:
+            for name in tuple(released):
+                if re.search(rf"\b{re.escape(name)}\s*=(?!=)", source):
+                    released.pop(name, None)
+                    continue
+                if re.search(rf"\b{re.escape(name)}\s*->|\*\s*{re.escape(name)}\b", source):
+                    rule = Rule(
+                        "cpp.use_after_release_candidate", frozenset({suffix}), RELEASE_RE,
+                        "warning", "memory_safety",
+                        f"{name} is dereferenced after release on line {released[name]}",
+                    )
+                    findings.append(_finding(rule, relative, number, 1, raw))
+                    released.pop(name, None)
+            for release in RELEASE_RE.finditer(source):
+                name = release.group(1) or release.group(2)
+                if name in released:
+                    rule = Rule(
+                        "cpp.double_release_candidate", frozenset({suffix}), RELEASE_RE,
+                        "warning", "memory_safety",
+                        f"{name} is released again after line {released[name]}",
+                    )
+                    findings.append(_finding(rule, relative, number, release.start() + 1, raw))
+                released[name] = number
         for rule in rules:
             if rule.crypto_only and not crypto:
                 continue

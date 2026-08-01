@@ -949,6 +949,107 @@ def test_bundle_validates_bundle_type_and_stays_bounded(tmp_path):
         sg.bundle(repo, "not_a_real_bundle_type", "bundled_target", max_lines=10)
 
 
+def test_all_repository_neutral_analytics_are_bounded_and_canonical(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def important_service(value):\n"
+        "    if value:\n"
+        "        return helper(value)\n"
+        "    return 0\n\n"
+        "def helper(value):\n"
+        "    return value + 1\n",
+    )
+    _write(
+        repo / "tests" / "test_service.py",
+        "from pkg.service import important_service\n\n"
+        "def test_service():\n"
+        "    assert important_service(1) == 2\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    analytic_modes = set(sg.SOURCE_GRAPH_MODES) - {
+        "focus", "slice", "context", "impact", "trace", "bundle",
+    }
+    assert analytic_modes == {
+        "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+        "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+        "stats", "summarize", "pipeline",
+        "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+        "looprisks", "deadmethods", "duplicates", "gaps",
+    }
+    for mode in sorted(analytic_modes):
+        payload = sg.analytics_query(repo, mode, "important_service", budget=12)
+        assert payload["mode"] == mode
+        assert payload["query"] == "important_service"
+        assert len(json.dumps(payload).encode("utf-8")) <= 12 * 768
+
+
+def test_coverage_and_auditmap_never_fabricate_runtime_coverage(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "core.py", "def covered_target():\n    return 1\n")
+    _write(
+        repo / "tests" / "test_core.py",
+        "from pkg.core import covered_target\n\ndef test_target():\n    assert covered_target() == 1\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    for mode in ("coverage", "testmap", "auditmap"):
+        payload = sg.analytics_query(repo, mode, "covered_target", budget=20)
+        assert payload["structural_mapping"]["status"] == "available"
+        assert payload["structural_mapping"]["claim"] == (
+            "test_relationship_only_not_execution_coverage"
+        )
+        assert payload["runtime_coverage"] == {
+            "status": "not_available",
+            "line_coverage": None,
+            "branch_coverage": None,
+            "reason": "no_runtime_coverage_evidence_imported",
+        }
+
+
+def test_worker_mcp_exposes_dedicated_source_graph_analytics(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "core.py", "def analytics_probe():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+    ctx = w.WorkerToolContext(
+        task_id="t-analytics", runner="r", topic="topic", request_id="req-analytics",
+        repo=repo, authority_repo=repo, source_graph_targets=(),
+        session_topic="topic", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+    result = w.source_graph_query(
+        ctx, mode="complexity", query="analytics_probe", budget=12,
+    )
+    assert result["ok"] is True
+    payload = json.loads(result["content"])
+    assert payload["mode"] == "complexity"
+    assert payload["ranked_symbols"][0]["name"] == "analytics_probe"
+
+
+def test_source_graph_risk_views_are_explicit_nonblocking_candidates(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "native" / "lifetime.cpp",
+        "int risky(Item *item, int divisor) {\n"
+        "    while (true) { item->tick(); }\n"
+        "    return 8 / divisor;\n"
+        "}\n",
+    )
+    sg.build_index(repo, incremental=True)
+
+    loop = sg.analytics_query(repo, "looprisks", "risky", budget=20)
+    assert loop["analysis"]["blocking"] is False
+    assert loop["analysis"]["findings"][0]["evidence_class"] == (
+        "bounded_lexical_candidate_not_proven_defect"
+    )
+    crash = sg.analytics_query(repo, "crashes", "risky", budget=20)
+    assert any(
+        reason.startswith("unchecked_divisor")
+        for row in crash["analysis"]["findings"]
+        for reason in row["reasons"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Migration: verified copy, parity, rollback metadata, idempotent cutover
 # ---------------------------------------------------------------------------

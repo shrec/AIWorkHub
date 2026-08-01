@@ -24,7 +24,8 @@ contracts.
 | --- | --- | --- |
 | Polyglot structural index | Shipped in 0.8.24-0.8.26 | Ported as the canonical 33-family Source Graph registry and conservative semantic/file-evidence adapters. |
 | `focus`, `slice`, `context`, `impact`, `trace`, `bundle` | Shipped in 0.8.26 | Ported with byte bounds, ranked symbols, calls, tests, risks and churn/ownership evidence. |
-| Hotspots, complexity, coverage, ownership, review queue and bottlenecks | Partially represented inside compact insights | Keep one Source Graph authority; expose dedicated bounded analytics only where the current six modes cannot answer the question. |
+| Hotspots, complexity, coverage, ownership, review queue and bottlenecks | Ported | Dedicated bounded modes use the same canonical graph. Structural test mapping never fabricates runtime coverage. |
+| Leak/null/raw-pointer/cast/crash/loop/dead/duplicate/gap scans | Ported as non-blocking analytics | Repository-neutral lexical candidates are explicit heuristics; high-confidence blocking rules live in the diff-scoped Known Bug Scanner. |
 | Decisions and invariants ledger | Already covered | Use canonical KB and Policy as Code; do not create a second Source Graph decision database. |
 | Pipeline/repo map | Mostly covered | Use task-shaped bundles, Visual DAG and project context. Port only a measured missing view. |
 | Bounded external build/scratch pool and rogue build-tree detection | Core port implemented | Workspace Build Hygiene now provides quotas, leases, real byte accounting, preview-first cleanup, cross-platform locking and bounded preflight evidence. Dashboard controls remain the next UI step. |
@@ -32,17 +33,18 @@ contracts.
 | Parallel write collision guard | Already covered | Keep AIWorkHub's task-plan and allowed-write collision authority. |
 | Completion bridge/watch | Already covered | Keep the durable callback outbox, dispatcher reconciliation and manager inbox. |
 | Legacy Session/AI Memory/KB scripts | Superseded | Preserve useful schema ideas only; never import their SQLite files as a live model interface. |
-| CUDA intrinsic checker | Initial generic gate implemented | Exact rotation-claim mismatches now enter the diff-scoped Known Bug Scanner and Quality Evidence; CUDA remains dependency-free and change-sensitive. |
+| CUDA intrinsic and known-bug checkers | Multi-language gate implemented | Exact CUDA rotation-claim mismatches and high-confidence language/security rules enter diff-scoped Quality Evidence; heuristic lifetime and memory candidates remain warnings. |
 | Crypto validators, key tools and benchmark generators | Donor-specific | Do not port into the generic product. They can be repository-local quality commands or task templates. |
 
 ## Ordered implementation
 
-1. Reconcile Source Graph counters and finish dedicated analytics gaps using
-   the existing index, never a parallel database.
+1. Source Graph counter reconciliation and repository-neutral dedicated
+   analytics are complete on the existing index, without a parallel database.
 2. Finish Workspace Build Hygiene UI: the allocator, real byte accounting,
    rogue detection, digest-bound cleanup and preflight evidence are present;
    add dashboard preview/apply controls and task-launch allocation.
-3. Add optional compiler/CUDA quality adapters through Quality Evidence,
-   activated only when the repository declares the relevant toolchain.
+3. Expand optional compiler/CUDA and language-specific Known Bug Scanner rules
+   through Quality Evidence, activated only for relevant changed files or a
+   repository-declared toolchain.
 4. Measure model context use and task outcomes before accepting further donor
    complexity.

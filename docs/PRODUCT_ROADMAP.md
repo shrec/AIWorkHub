@@ -181,9 +181,11 @@ Report locally, by repository/task/run/model/adapter:
 
 ### Self-describing Source Graph contract
 
-- Publish the supported query modes (`focus`, `slice`, `context`, `impact`,
-  `trace`, and `bundle`) and bundle
-  types as MCP input enums instead of accepting an opaque string.
+- Publish discovery, repository analytics and risk modes as MCP input enums
+  instead of accepting an opaque string. The canonical list includes the six
+  compact discovery modes plus tags/symbols, call/test/coverage maps,
+  complexity/hotspots, history/ownership/review queue, bounded risk candidates
+  and the composite pipeline packet.
 - Invalid-mode responses include the bounded allowed-value list and one valid
   example; agents must never spend calls guessing the tool contract.
 - Expose a small read-only capabilities response containing indexer families,
@@ -230,7 +232,8 @@ toolkit without importing its product semantics or legacy databases. The
 canonical disposition and sequencing live in
 [`DONOR_CAPABILITY_PORT.md`](DONOR_CAPABILITY_PORT.md).
 
-- Source Graph's polyglot adapters and six compact query modes are shipped.
+- Source Graph's polyglot adapters, six compact discovery modes and all
+  repository-neutral donor analytics are shipped on one canonical database.
 - Workspace Build Hygiene's cross-platform core is implemented: bounded
   external scratch slots, quota/reservation accounting, lease-safe cleanup,
   rogue in-repo build-tree detection and bounded preflight evidence. Dashboard
@@ -240,15 +243,6 @@ canonical disposition and sequencing live in
 - Existing Task, Callback, Session, AI Memory, KB, DAG and collision
   authorities supersede donor scripts with equivalent responsibilities; no
   parallel database or duplicate lifecycle is permitted.
-
-### Local dependency knowledge (Context7-class capability)
-
-Build a repository-local, version-bound Dependency Knowledge Graph from exact
-lockfiles, installed package sources, type stubs, API signatures, bundled docs
-and optional official-document snapshots. Link dependency symbols and versions
-to Source Graph and KB so models retrieve cited API guidance matching the
-project's actual version. Never mix repositories or silently substitute web
-documentation for a different version; offline operation is the baseline.
 
 ### Review Inbox 2.0
 

@@ -33,7 +33,14 @@ TOOL_CAPS: dict[str, dict[str, int]] = {
     "ai_memory": {"bytes": 4 * 1024, "rows": 8},
     "kb": {"bytes": 4 * 1024, "rows": 8},
 }
-SOURCE_GRAPH_MODES = ("focus", "slice", "context", "impact", "trace", "bundle")
+SOURCE_GRAPH_MODES = (
+    "focus", "slice", "context", "impact", "trace", "bundle",
+    "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+    "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    "stats", "summarize", "pipeline",
+    "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+    "looprisks", "deadmethods", "duplicates", "gaps",
+)
 SOURCE_GRAPH_BUNDLE_TYPES = ("bugfix", "feature", "refactor", "audit", "optimize", "explore")
 TASK_CONTEXT_KINDS = ("code", "data_classification", "research")
 

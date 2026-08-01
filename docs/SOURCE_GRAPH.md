@@ -7,7 +7,9 @@ first index; the repository daemon refreshes changed files incrementally.
 
 ## Query modes
 
-The manager and worker MCP surfaces expose the same six bounded modes:
+The manager and worker MCP surfaces expose the same bounded modes. All modes
+read the one canonical repository database; analytics never create a parallel
+index or decision store.
 
 | Mode | Use |
 | --- | --- |
@@ -17,11 +19,20 @@ The manager and worker MCP surfaces expose the same six bounded modes:
 | `impact` | Bidirectional callers, dependencies and affected files |
 | `trace` | Compact incoming/outgoing execution trace with supporting evidence |
 | `bundle` | Task-shaped evidence bundle for bugfix, feature, refactor, audit, optimize or explore work |
+| `tags`, `symbols`, `summarize`, `stats` | Deterministic symbol classification and repository inventory |
+| `hotspots`, `complexity`, `bottlenecks` | Ranked branch/loop/span and call-centrality views |
+| `calls`, `testmap`, `coverage`, `auditmap` | Call/test relationships with runtime coverage kept explicitly `not_available` unless real execution evidence is imported |
+| `churn`, `ownership`, `reviewqueue` | Index-time 90-day history, ownership concentration and bounded review priorities |
+| `todo`, `gaps` | TODOs, low-confidence relations, missing test mappings and evidence gaps |
+| `leaks`, `nullrisks`, `rawptrs`, `casts`, `crashes`, `looprisks`, `deadmethods`, `duplicates` | Non-blocking lexical risk candidates; confirmed blocking defects belong to Quality Evidence's Known Bug Scanner |
+| `pipeline` | Compact focus → impact → verification planning packet |
 
 Every response is row- and byte-bounded. Evidence labels distinguish directly
 extracted facts (`EXTRACTED`), deterministic unresolved relations
 (`INFERRED`), ambiguous identities (`AMBIGUOUS`) and truthful file-only facts
 (`FILE_EVIDENCE`). Empty, stale and unsupported results remain explicit.
+Risk analytics are candidate generators, not proof of a bug. In particular,
+structural test mapping is not reported as line or branch coverage.
 
 ## Language coverage
 

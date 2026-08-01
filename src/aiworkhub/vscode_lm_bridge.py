@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import repository_state
+from .source_graph import SOURCE_GRAPH_MODES
 try:
     from .platform_io import chmod_fd
 except ImportError:  # pragma: no cover - standalone compatibility
@@ -190,7 +191,7 @@ def create_request(
         mode = str(source_graph_request.get("mode") or "focus")
         query = str(source_graph_request.get("query") or "").strip()
         if (
-            mode not in {"focus", "slice", "context", "impact", "trace", "bundle"}
+            mode not in set(SOURCE_GRAPH_MODES)
             or not query
             or len(query) > 512
         ):

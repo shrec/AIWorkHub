@@ -131,11 +131,23 @@ STORAGE_REGISTRY_RELATIVE_PATH = Path(".aiworkhub") / "config" / "storage.json"
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
     "focus", "slice", "context", "impact", "trace", "bundle",
+    "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+    "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    "stats", "summarize", "pipeline",
+    "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+    "looprisks", "deadmethods", "duplicates", "gaps",
 )
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
 )
-SourceGraphMode = Literal["focus", "slice", "context", "impact", "trace", "bundle"]
+SourceGraphMode = Literal[
+    "focus", "slice", "context", "impact", "trace", "bundle",
+    "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership",
+    "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    "stats", "summarize", "pipeline",
+    "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes",
+    "looprisks", "deadmethods", "duplicates", "gaps",
+]
 SourceGraphBundleType = Literal["bugfix", "feature", "refactor", "audit", "optimize", "explore"]
 MAX_QUERY_BYTES = 512
 MAX_KEY_BYTES = 256
@@ -730,7 +742,7 @@ def source_graph_query(
     target: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
 ) -> dict[str, Any]:
-    """Bounded Source Graph focus/slice/context/impact/trace/bundle discovery.
+    """Bounded Source Graph discovery and repository analytics.
 
     ``query`` is ALWAYS the semantic search term passed to Source Graph --
     omitting ``target`` never silently substitutes ``targets[0]`` for it
@@ -803,8 +815,12 @@ def source_graph_query(
             payload = _source_graph_mod.impact(ctx.authority_repo, bounded_query, budget)
         elif mode == "trace":
             payload = _source_graph_mod.trace(ctx.authority_repo, bounded_query, budget)
-        else:
+        elif mode == "focus":
             payload = _source_graph_mod.focus(ctx.authority_repo, bounded_query, budget)
+        else:
+            payload = _source_graph_mod.analytics_query(
+                ctx.authority_repo, mode, bounded_query, budget,
+            )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)

@@ -19,9 +19,9 @@ Design constraints (see task card B849):
   * Incremental indexing removes every entity/edge a changed OR deleted
     file owned before re-indexing it, so renames/deletes never leave a
     stale edge behind.
-  * ``focus``/``slice``/``context``/``impact``/``trace``/``bundle`` stay backward compatible with the
-    existing AIWorkHub project-context/worker-MCP callers: same command
-    surface, JSON output, explicit byte/row budgets.
+  * Compact discovery modes stay backward compatible, while repository-neutral
+    analytics (hotspots, coverage maps, ownership, review queue, risk
+    candidates and pipeline views) share the same JSON and byte/row budgets.
   * ``neighbors``/``shortest_path``/``component_summary`` are deterministic
     and enforce explicit depth/result caps -- no unbounded traversal.
 """
@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from . import source_graph_ast as sgast
+from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
 from . import source_graph_languages as sglanguages
 from .repository_state import HUB_DIRNAME, RepositoryStateError, inspect_repository
@@ -61,6 +62,7 @@ MAX_POLICY_BYTES = 64 * 1024
 
 SOURCE_GRAPH_MODES: tuple[str, ...] = (
     "focus", "slice", "context", "impact", "trace", "bundle",
+    *sganalytics.ANALYTIC_MODES,
 )
 SOURCE_GRAPH_BUNDLE_TYPES: tuple[str, ...] = (
     "bugfix", "feature", "refactor", "audit", "optimize", "explore",
@@ -1222,6 +1224,35 @@ def impact(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
         conn.close()
 
 
+def analytics_query(
+    repo_root: Path,
+    mode: str,
+    query: str,
+    budget: int = 64,
+) -> dict[str, Any]:
+    """Run one repository-neutral analytic mode over canonical graph rows."""
+
+    if mode not in sganalytics.ANALYTIC_MODES:
+        raise SourceGraphError(f"invalid_analytic_mode:{mode}")
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    byte_cap = max(512, budget * 768)
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = find(conn, query, limit=budget)
+        payload = sganalytics.query(
+            conn,
+            repo_root,
+            mode=mode,
+            query_text=query,
+            matches=matches,
+            budget=budget,
+        )
+        payload["truncated"] = False
+        return _fit_payload_bytes(payload, byte_cap)
+    finally:
+        conn.close()
+
+
 def bundle(repo_root: Path, bundle_type: str, query: str, max_lines: int = 64) -> dict[str, Any]:
     if bundle_type not in SOURCE_GRAPH_BUNDLE_TYPES:
         raise SourceGraphError(f"invalid_bundle_type:{bundle_type}")
@@ -1300,7 +1331,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("summary")
 
-    for name in ("focus", "slice", "trace", "impact"):
+    for name in ("focus", "slice", "trace", "impact", *sganalytics.ANALYTIC_MODES):
         p = sub.add_parser(name)
         p.add_argument("term")
         p.add_argument("budget", type=int, nargs="?", default=64)
@@ -1351,6 +1382,8 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(trace(repo_root, args.term, args.budget))
         elif args.command == "impact":
             _print_json(impact(repo_root, args.term, args.budget))
+        elif args.command in sganalytics.ANALYTIC_MODES:
+            _print_json(analytics_query(repo_root, args.command, args.term, args.budget))
         elif args.command == "bundle":
             _print_json(bundle(repo_root, args.bundle_type, args.term, args.max_lines))
     finally:
@@ -1380,6 +1413,7 @@ __all__ = [
     "body",
     "build_index",
     "bundle",
+    "analytics_query",
     "component_summary",
     "ensure_ignore_config",
     "ignore_config_path",
@@ -1398,12 +1432,7 @@ __all__ = [
     "struct",
     "summary",
     "trace",
-    "focus",
-    "func",
     "neighbors",
     "resolve_db_path",
     "shortest_path",
-    "slice_",
-    "struct",
-    "summary",
 ]
