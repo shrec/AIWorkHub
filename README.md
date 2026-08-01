@@ -113,8 +113,11 @@ are durable and repository state remains local.
 
 ## Install the VS Code extension
 
-Download the VSIX from the latest
-[GitHub release](https://github.com/shrec/AIWorkHub/releases), then run:
+Install from the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub)
+or download the VSIX from the latest
+[GitHub release](https://github.com/shrec/AIWorkHub/releases). For a downloaded
+VSIX, run:
 
 ```bash
 code --install-extension aiworkhub-*.vsix
@@ -131,10 +134,11 @@ Initialization is explicit and idempotent. It creates `.aiworkhub/`, starts the
 first Source Graph index and keeps the index fresh. The packaged extension runs
 on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
-**Current public channel: GitHub Release VSIX only.** Marketplace, Open VSX and
-PyPI publication jobs exist but are not enabled yet. Use the release VSIX (or
-its attached wheel) until those registry pages are live; see
-[Publishing](docs/PUBLISHING.md) for the owner setup.
+**Current public channels:** VS Code Marketplace and signed-by-checksum GitHub
+Release artifacts (VSIX, wheel and source distribution). Marketplace review
+can briefly lag a new GitHub tag; the release page and attached `SHA256SUMS`
+remain the exact artifact authority. Open VSX and PyPI jobs remain opt-in; see
+[Publishing](docs/PUBLISHING.md) for owner setup.
 
 ## Headless development install
 

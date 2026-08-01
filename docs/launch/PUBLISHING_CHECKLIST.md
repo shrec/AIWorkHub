@@ -4,8 +4,10 @@
 
 - Confirm the latest release link resolves and contains a VSIX.
 - Use `https://github.com/shrec/AIWorkHub` as the product link.
-- Say **GitHub Release VSIX only for now** until Marketplace/Open VSX/PyPI are
-  actually live.
+- Link the live
+  [VS Code Marketplace listing](https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub)
+  and the matching GitHub Release. State plainly when Marketplace verification
+  is still processing or lags the newest tag.
 - Do not publish estimated token or cost savings as measured results.
 - Do not claim passive Manager Context Graph capture for Claude or Copilot.
 - Keep the Source Graph and Manager Context Graph as distinct features.
@@ -24,8 +26,8 @@
    issue traffic.
 6. Tailor one Reddit post per community; do not paste the same promotional text
    everywhere at once.
-7. Use Product Hunt after Marketplace/Open VSX is live or the VSIX installation
-   path is demonstrably frictionless for new users.
+7. Use Product Hunt only after the Marketplace build matching the advertised
+   release is verified and first-install telemetry is healthy.
 
 ## Visuals
 
@@ -46,4 +48,3 @@ Suggested alt text:
 - Convert repeated questions into Getting Started or Troubleshooting updates.
 - Track meaningful signals: release downloads, successful first initialization,
   issue quality and returning contributors—not only views or reactions.
-

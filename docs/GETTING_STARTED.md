@@ -8,8 +8,11 @@ and headless (CLI-only MCP client).
 
 ### VS Code (recommended)
 
-Build the extension VSIX (or use a released one -- see
-[Publishing](PUBLISHING.md)):
+Install
+[AIWorkHub from the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub),
+or download a versioned VSIX from the
+[GitHub Releases page](https://github.com/shrec/AIWorkHub/releases). To build a
+development VSIX locally:
 
 ```bash
 npm --prefix vscode-extension install

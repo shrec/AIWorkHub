@@ -6,6 +6,8 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.27] - 2026-08-01
+
 ### Added
 
 - Added the repository-isolated Workspace Build Hygiene foundation ported from
@@ -17,12 +19,31 @@ noted by package/extension version and release tag.
   cryptographic misuse, Python, JavaScript/TypeScript, Go, Java/Kotlin and PHP.
   High-confidence findings block Quality Evidence; heuristic warnings remain
   visible validation evidence without producing false proof of failure.
+- Completed the repository-neutral Source Graph capability port with 31
+  manager/worker MCP modes. Dedicated bounded views now cover tags, symbols,
+  calls, test maps, hotspots, complexity, bottlenecks, churn, ownership,
+  review queues, TODO/gap discovery, pipeline planning and non-blocking
+  leak/null/raw-pointer/cast/crash/loop/dead/duplicate risk candidates.
+- Expanded the Known Bug Scanner with changed-path rules for disabled TLS
+  verification, literal divide-by-zero, unsafe process-shell boundaries,
+  unsafe deserialization/temp-file APIs, permissive certificate callbacks and
+  bounded C/C++ release-lifetime candidates. Python literals/comments and
+  JavaScript RegExp `.exec()` are masked from false matches.
 
 ### Fixed
 
 - Source Graph build reports now count the unique edge rows actually persisted
   after writer deduplication instead of the larger pre-dedup extractor
   population. Dashboard/index statistics therefore reconcile with SQLite.
+- Structural test relationships are no longer presented as execution
+  coverage: line/branch coverage remains explicitly `not_available` until
+  genuine runtime evidence is imported.
+
+### Documentation
+
+- Published the complete Source Graph mode/risk contract, Known Bug Scanner
+  severity boundary, donor-capability disposition and current Marketplace plus
+  GitHub Release installation channels.
 
 ## [0.8.26] - 2026-08-01
 
