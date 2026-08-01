@@ -366,6 +366,10 @@ def build_kpi_snapshot(
             "source_graph_latency_p95_ms": latency.get("p95_ms"),
             "source_graph_call_gap_p50_seconds": call_gaps.get("p50_seconds"),
             "source_graph_call_gap_p95_seconds": call_gaps.get("p95_seconds"),
+            "source_graph_long_call_gap_count": _count(
+                call_gaps.get("long_gap_count")
+            ),
+            "source_graph_long_call_gap_rate": call_gaps.get("long_gap_rate"),
             "source_graph_entity_rows": _count(evidence_rows.get("entity_rows")),
             "source_graph_edge_rows": _count(evidence_rows.get("edge_rows")),
             "source_graph_file_rows": _count(evidence_rows.get("file_rows")),
@@ -410,6 +414,13 @@ def build_kpi_snapshot(
             "source_graph_call_gap_samples": _count(call_gaps.get("count")),
             "source_graph_call_gap_samples_truncated": bool(
                 call_gaps.get("samples_truncated")
+            ),
+            "source_graph_long_call_gap_threshold_seconds": _count(
+                call_gaps.get("long_gap_threshold_seconds")
+            ),
+            "source_graph_call_gap_interpretation": str(
+                call_gaps.get("interpretation")
+                or "observed_inter_call_gap_not_model_inactivity"
             ),
             "sample_size": observed,
         },

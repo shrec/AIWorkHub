@@ -74,8 +74,11 @@ evidence counts. The successful-build timestamp is part of the query-cache key:
 an incremental refresh starts a new cache generation and an older cached answer
 cannot be reused against the refreshed graph. Repository KPI v3 aggregates
 bounded latency and inter-call-gap p50/p95 values, evidence-row populations and
-index-generation call counts. These are observed local facts; they do not claim
-token savings or causation.
+index-generation call counts. A bounded 15-minute informational threshold also
+surfaces unusually long observed inter-call gaps with an exact count, rate and
+sample denominator. A gap may include legitimate testing or reasoning time, so
+it is never treated as proof of model inactivity. These are observed local
+facts; they do not claim token savings or causation.
 
 ## Repository isolation
 

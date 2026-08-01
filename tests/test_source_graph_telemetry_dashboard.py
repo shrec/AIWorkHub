@@ -54,8 +54,8 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
                         "samples_truncated": False,
                     },
                     "source_graph_call_gaps": {
-                        "count": 2,
-                        "samples_seconds": [12.0, 45.0],
+                        "count": 3,
+                        "samples_seconds": [12.0, 45.0, 901.0],
                         "samples_truncated": False,
                     },
                     "source_graph_evidence_rows": {
@@ -179,9 +179,16 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_latency"]["count"] == 3
     assert result["source_graph_latency"]["p50_ms"] == 5.0
     assert result["source_graph_latency"]["p95_ms"] == 9.0
-    assert result["source_graph_call_gaps"]["count"] == 2
-    assert result["source_graph_call_gaps"]["p50_seconds"] == 12.0
-    assert result["source_graph_call_gaps"]["p95_seconds"] == 45.0
+    assert result["source_graph_call_gaps"]["count"] == 3
+    assert result["source_graph_call_gaps"]["p50_seconds"] == 45.0
+    assert result["source_graph_call_gaps"]["p95_seconds"] == 901.0
+    assert result["source_graph_call_gaps"]["long_gap_threshold_seconds"] == 900
+    assert result["source_graph_call_gaps"]["long_gap_count"] == 1
+    assert result["source_graph_call_gaps"]["long_gap_rate"] == 33.3
+    assert result["source_graph_call_gaps"]["alert_state"] == "observed"
+    assert result["source_graph_call_gaps"]["interpretation"] == (
+        "observed_inter_call_gap_not_model_inactivity"
+    )
     assert result["source_graph_evidence_rows"] == {
         "entity_rows": 8,
         "edge_rows": 5,
@@ -241,6 +248,7 @@ def test_source_graph_telemetry_ignores_ungated_tasks() -> None:
     assert result["observed_tasks"] == 1
     assert result["gated_tasks"] == 0
     assert result["live_rate"] == 0.0
+    assert result["source_graph_call_gaps"]["alert_state"] == "not_available"
 
 
 def test_provider_denial_parser_counts_without_persisting_raw_payload(tmp_path) -> None:

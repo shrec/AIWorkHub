@@ -38,6 +38,8 @@ test("KPI v3 renders Source Graph workflow, generations, call gaps and byte econ
   assert.match(appSource, /Context compression/);
   assert.match(appSource, /Source Graph latency p50/);
   assert.match(appSource, /SG call gap p95/);
+  assert.match(appSource, /SG long gaps/);
+  assert.match(appSource, /not proof that the model was inactive/);
   assert.match(appSource, /SG evidence rows/);
   assert.match(appSource, /Source Graph index generations/);
   assert.match(appSource, /Byte compression uses declared raw paths/);

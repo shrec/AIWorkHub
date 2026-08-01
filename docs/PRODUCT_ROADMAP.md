@@ -195,8 +195,9 @@ Report locally, by repository/task/run/model/adapter:
   receipt is `injected-only`; KPI cohorts require at least two attributed
   stages before labeling a task `continuous_use`.
 - Authenticated time gaps between Source Graph calls are shipped with bounded
-  p50/p95 distributions. Model-turn correlation and explicit long code-work
-  interval alerts remain open.
+  p50/p95 distributions and a bounded 15-minute informational long-gap alert.
+  The UI explicitly labels an observed interval as non-proof of model
+  inactivity. Model-turn correlation remains open.
 - Raw discovery fallback count and reason (`unsupported`, `unindexed`, exact
   known path, or policy violation). Distinguish allowed bounded fallback from
   forbidden broad discovery.

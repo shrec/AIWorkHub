@@ -41,6 +41,11 @@ DEFAULT_SNAPSHOT_PROCESS_LIMIT = 50
 DEFAULT_KPI_HISTORY_PROCESS_LIMIT = 1000
 MAX_PROCESS_LOG_BYTES = 4 * 1024 * 1024
 MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
+# Informational observability boundary, not an inactivity or policy verdict.
+# A worker may legitimately spend this long testing or reasoning between two
+# authenticated Source Graph calls, so the dashboard always exposes the
+# denominator and the interpretation label alongside the alert count.
+SOURCE_GRAPH_LONG_CALL_GAP_SECONDS = 15 * 60
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
@@ -370,6 +375,10 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_call_gaps": {
             "count": 0, "total_seconds": 0.0, "min_seconds": None,
             "max_seconds": None, "p50_seconds": None, "p95_seconds": None,
+            "long_gap_threshold_seconds": SOURCE_GRAPH_LONG_CALL_GAP_SECONDS,
+            "long_gap_count": 0, "long_gap_rate": None,
+            "alert_state": "not_available",
+            "interpretation": "observed_inter_call_gap_not_model_inactivity",
             "samples_truncated": False,
         },
         "source_graph_evidence_rows": {
@@ -676,7 +685,19 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             "max_seconds": gap_samples[-1],
             "p50_seconds": gap_percentile(0.50),
             "p95_seconds": gap_percentile(0.95),
+            "long_gap_count": sum(
+                1
+                for value in gap_samples
+                if value >= SOURCE_GRAPH_LONG_CALL_GAP_SECONDS
+            ),
         })
+        long_gap_count = totals["source_graph_call_gaps"]["long_gap_count"]
+        totals["source_graph_call_gaps"]["long_gap_rate"] = round(
+            100.0 * long_gap_count / len(gap_samples), 1
+        )
+        totals["source_graph_call_gaps"]["alert_state"] = (
+            "observed" if long_gap_count else "clear"
+        )
     totals["source_graph_distinct_modes"] = sum(
         1 for count in totals["source_graph_mode_counts"].values() if int(count or 0) > 0
     )

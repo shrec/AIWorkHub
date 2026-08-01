@@ -189,7 +189,9 @@ history shows Source Graph modes, workflow stages, latency, inter-call gaps,
 returned structural evidence, index generations, tool-use cohorts and
 deterministic raw-path-versus-delivered-bundle byte economics. Every rate
 carries its sample window or denominator; token savings and causal quality
-gains are deliberately not inferred.
+gains are deliberately not inferred. Inter-call gaps at or above the bounded
+15-minute informational threshold are surfaced, but never mislabeled as proof
+that a model was inactive.
 
 The canonical combined review surface is `aiworkhub_completion_inbox`. Tool
 availability and write authority are reported by the live MCP runtime; clients

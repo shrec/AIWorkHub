@@ -51,6 +51,10 @@ def _build(processes, *, total_requests=None):
                 "count": 9,
                 "p50_seconds": 12.0,
                 "p95_seconds": 45.0,
+                "long_gap_threshold_seconds": 900,
+                "long_gap_count": 2,
+                "long_gap_rate": 22.2,
+                "interpretation": "observed_inter_call_gap_not_model_inactivity",
             },
             "source_graph_evidence_rows": {
                 "entity_rows": 20,
@@ -123,6 +127,8 @@ def test_kpis_calculate_callback_tool_and_context_denominators():
     assert result["headline"]["source_graph_latency_p95_ms"] == 18.0
     assert result["headline"]["source_graph_call_gap_p50_seconds"] == 12.0
     assert result["headline"]["source_graph_call_gap_p95_seconds"] == 45.0
+    assert result["headline"]["source_graph_long_call_gap_count"] == 2
+    assert result["headline"]["source_graph_long_call_gap_rate"] == 22.2
     assert result["headline"]["source_graph_entity_rows"] == 20
     assert result["headline"]["source_graph_edge_rows"] == 12
     assert result["headline"]["source_graph_file_rows"] == 8
@@ -131,6 +137,10 @@ def test_kpis_calculate_callback_tool_and_context_denominators():
         {"name": "aiworkhub.source_graph.semantic.v5", "calls": 10},
     ]
     assert result["data_quality"]["source_graph_call_gap_samples"] == 9
+    assert result["data_quality"]["source_graph_long_call_gap_threshold_seconds"] == 900
+    assert result["data_quality"]["source_graph_call_gap_interpretation"] == (
+        "observed_inter_call_gap_not_model_inactivity"
+    )
     assert result["context"][0]["execution_rate"] == 75.0
     assert result["context"][2]["execution_rate"] is None
 

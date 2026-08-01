@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.37] - 2026-08-01
+
+### Added
+
+- Added a bounded 15-minute informational Source Graph inter-call-gap alert to
+  KPI telemetry and the dashboard. Counts, rates, thresholds and sample
+  denominators remain visible, and the UI explicitly avoids interpreting an
+  observed gap as proof that a model was inactive.
+
 ## [0.8.36] - 2026-08-01
 
 ### Added
