@@ -165,6 +165,7 @@ const elements = {
   sessionsSearch: document.querySelector("#sessions-search"),
   sessionsList: document.querySelector("#sessions-list"),
   openKb: document.querySelector("#open-kb"),
+  openToolUse: document.querySelector("#open-tool-use"),
   kbDialog: document.querySelector("#kb-dialog"),
   kbSummary: document.querySelector("#kb-summary"),
   kbSearch: document.querySelector("#kb-search"),
@@ -3158,6 +3159,13 @@ function activateOperationTab(tab, focus = false) {
   }
 }
 
+function openToolUseTelemetry() {
+  const toolUseTab = operationTabs.find((tab) => tab.dataset.tab === "tool-use");
+  if (!toolUseTab) return;
+  activateOperationTab(toolUseTab, true);
+  document.querySelector("#panel-tool-use").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 operationTabs.forEach((tab, index) => {
   tab.addEventListener("click", () => activateOperationTab(tab));
   tab.addEventListener("keydown", (event) => {
@@ -3177,6 +3185,9 @@ operationTabs.forEach((tab, index) => {
     }
   });
 });
+
+elements.headerSourceGraph.addEventListener("click", openToolUseTelemetry);
+elements.openToolUse.addEventListener("click", openToolUseTelemetry);
 
 elements.headerStorage.addEventListener("click", () => {
   const storageTab = operationTabs.find((tab) => tab.dataset.tab === "storage");

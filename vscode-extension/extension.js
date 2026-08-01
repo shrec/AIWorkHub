@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.32";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.33";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -5693,11 +5693,11 @@ function getHtmlForWebview(webview, extensionUri) {
         <span id="header-storage-free">Free —</span>
       </button>
 
-      <div class="header-insight-card header-tool-use" id="header-source-graph" title="Authenticated Source Graph use across the latest observed worker task runs">
+      <button class="header-insight-card header-tool-use" id="header-source-graph" type="button" title="Open Source Graph tool-use telemetry">
         <span class="header-storage-label">Source Graph</span>
         <strong id="header-source-graph-rate">—</strong>
         <span id="header-source-graph-detail">No evidence</span>
-      </div>
+      </button>
 
       <div class="header-insight-card" id="header-session-manager" title="Session Manager context recovered across latest task runs">
         <span class="header-storage-label">Session Manager</span>
@@ -5811,6 +5811,9 @@ function getHtmlForWebview(webview, extensionUri) {
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-kb" title="Open Knowledge Base" aria-label="Open Knowledge Base">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/></svg><span>KB</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-tool-use" title="Open model tool-use telemetry" aria-label="Open model tool-use telemetry">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3M2 21h20"/></svg><span>Telemetry</span>
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-settings" title="Open repository settings" aria-label="Open repository settings">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM19 12l2-1-2-3-2 .5-1.5-1L15 5h-6L8 7.5l-1.5 1L4 8l-1 3 2 1v2l-2 1 1 3 2.5-.5 1.5 1L9 21h6l1-2.5 1.5-1L20 18l1-3-2-1z"/></svg><span>Settings</span>

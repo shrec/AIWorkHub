@@ -312,12 +312,14 @@ select:focus-visible,
   text-align: center;
 }
 
-.header-storage {
+.header-storage,
+.header-tool-use {
   cursor: pointer;
   font: inherit;
 }
 
-.header-storage:hover {
+.header-storage:hover,
+.header-tool-use:hover {
   border-color: var(--accent);
   background: var(--review-soft);
 }

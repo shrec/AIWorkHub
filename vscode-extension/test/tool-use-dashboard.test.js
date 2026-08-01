@@ -19,6 +19,9 @@ for (const marker of [
 }
 
 assert.ok(app.includes("function renderToolUse(snapshot)"));
+assert.ok(app.includes("function openToolUseTelemetry()"));
+assert.ok(app.includes('elements.openToolUse.addEventListener("click", openToolUseTelemetry)'));
+assert.ok(app.includes('elements.headerSourceGraph.addEventListener("click", openToolUseTelemetry)'));
 assert.ok(app.includes("source_graph_telemetry"));
 assert.ok(app.includes("source_graph_injected_only_tasks"));
 assert.ok(app.includes("policy_violations"));

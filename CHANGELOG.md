@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.33] - 2026-08-01
+
+### Fixed
+
+- Made model tool-use telemetry discoverable without searching below the task
+  inspector: the top diagnostics strip now has a `Telemetry` action, and the
+  `Source Graph` summary card opens and scrolls directly to the `Tool Use` tab.
+
 ## [0.8.32] - 2026-08-01
 
 ### Added

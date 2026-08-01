@@ -14,6 +14,7 @@ for (const marker of [
   'id="open-sessions"',
   'id="open-ai-memory"',
   'id="open-kb"',
+  'id="open-tool-use"',
   'id="open-settings"',
   'id="sessions-dialog"',
   'id="kb-dialog"',
