@@ -24,6 +24,11 @@ def test_windows_pid_probe_is_non_signalling():
     assert not platform_io.windows_pid_is_alive(child.pid)
 
 
+def test_deadlock_errno_accepts_macos_posix_spelling_without_windows_alias():
+    assert platform_io._deadlock_errno(SimpleNamespace(EDEADLK=35)) == 35
+    assert platform_io._deadlock_errno(SimpleNamespace(EDEADLOCK=36, EDEADLK=35)) == 36
+
+
 def test_posix_lock_round_trip(tmp_path):
     path = tmp_path / "runtime.lock"
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)

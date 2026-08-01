@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.25] - 2026-08-01
+
+### Fixed
+
+- Fixed macOS import failure in the Windows byte-range lock compatibility
+  layer: Darwin exposes the deadlock errno as `EDEADLK`, while Windows may
+  expose `EDEADLOCK`. The runtime now resolves either spelling without
+  weakening lock contention handling on any platform.
+
 ## [0.8.24] - 2026-08-01
 
 ### Added

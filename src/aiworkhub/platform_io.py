@@ -23,7 +23,16 @@ WINDOWS_LOCK_MAX_WAIT_SECONDS = 20.0
 # msvcrt.locking() reports a contended byte range as EDEADLOCK ("resource
 # deadlock avoided") and, on some hosts, EACCES. Neither is a real error for
 # a caller that asked to wait; anything else is.
-_WINDOWS_LOCK_CONTENDED_ERRNOS = frozenset({errno.EDEADLOCK, errno.EACCES})
+def _deadlock_errno(errno_module: object = errno) -> int:
+    """Return the host spelling of the POSIX/Windows deadlock errno."""
+
+    value = getattr(errno_module, "EDEADLOCK", None)
+    if value is None:
+        value = getattr(errno_module, "EDEADLK")
+    return int(value)
+
+
+_WINDOWS_LOCK_CONTENDED_ERRNOS = frozenset({_deadlock_errno(), errno.EACCES})
 
 
 def windows_pid_is_alive(pid: int) -> bool:
