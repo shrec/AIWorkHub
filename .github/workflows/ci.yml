@@ -103,11 +103,11 @@ jobs:
           if-no-files-found: error
 
   python-ci:
-    name: Python (3.10–3.12)
+    name: Python (3.12–3.14)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.12", "3.13", "3.14"]
       fail-fast: false
 
     steps:

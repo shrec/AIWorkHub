@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the supported Python baseline from 3.10 to 3.12 and moved the full CI
+  matrix to Python 3.12, 3.13 and 3.14. This removes security-only legacy
+  branches from the declared product surface and keeps `tomllib` available as
+  a standard-library contract throughout the supported range.
+
 ## [0.8.28] - 2026-08-01
 
 ### Added
