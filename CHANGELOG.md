@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.32] - 2026-08-01
+
+### Added
+
+- Made Source Graph mode telemetry permanently visible in the Dashboard Tool
+  Use view. It now reports authenticated mode attribution, legacy/unattributed
+  calls, distinct modes, the recent mode path, core `focus`/`slice`/`context`/
+  `calls`/`trace`/`impact`/`testmap`/`coverage`/`bundle` counters and a bounded
+  per-runner mode breakdown instead of hiding the section when old ledgers do
+  not contain mode metadata.
+
+### Fixed
+
+- Replaced the Marketplace README's package-relative hero image with its public
+  HTTPS asset and added a release documentation gate that prevents relative
+  Marketplace HTML image URLs from returning.
+
 ## [0.8.31] - 2026-08-01
 
 ### Fixed

@@ -26,6 +26,7 @@ PUBLIC_DOCS = tuple(
     )
 )
 LINK_RE = re.compile(r"!?\[[^]]*\]\(([^)]+)\)")
+HTML_IMAGE_RE = re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)
 FORBIDDEN_README = {
     r"\bB\d{3,}\b": "internal task/bug identifier",
     r"(?:^|[\s`(])AITools/": "legacy host-only AITools path",
@@ -56,6 +57,14 @@ def check(root: Path = ROOT) -> list[str]:
             target = _local_target(document, raw)
             if target is not None and not target.exists():
                 errors.append(f"{document.relative_to(root)}: broken local link {raw!r}")
+
+        if document.relative_to(root) == Path("vscode-extension/README.md"):
+            for raw in HTML_IMAGE_RE.findall(text):
+                if not raw.startswith("https://"):
+                    errors.append(
+                        "vscode-extension/README.md: Marketplace image must use "
+                        f"a public HTTPS URL, got {raw!r}"
+                    )
 
     readme = root / "README.md"
     if readme.is_file():

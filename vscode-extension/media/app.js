@@ -817,6 +817,8 @@ function renderToolUse(snapshot) {
     ["Zero-hit calls", formatCount(telemetry.source_graph_zero_hit_calls)],
     ["Failed calls", formatCount(telemetry.source_graph_failed_calls)],
     ["SG bytes", formatBytes(telemetry.source_graph_bytes)],
+    ["Mode attribution", `${formatCount(telemetry.source_graph_mode_attributed_calls)}/${formatCount(telemetry.source_graph_calls)}`],
+    ["Distinct modes", formatCount(telemetry.source_graph_distinct_modes)],
     ["MCP violations", formatCount(telemetry.policy_violations)],
     ["Raw discovery denied", formatCount(telemetry.raw_discovery_denials)],
     ["Denial evidence", `${formatCount(telemetry.provider_denial_evidence_tasks)}/${formatCount(telemetry.gated_tasks)} tasks`],
@@ -873,22 +875,42 @@ function renderToolUse(snapshot) {
     }
   }
 
-  const modeCounts = telemetry.source_graph_mode_counts
+  const observedModeCounts = telemetry.source_graph_mode_counts
     && typeof telemetry.source_graph_mode_counts === "object"
-    ? Object.entries(telemetry.source_graph_mode_counts)
-      .map(([name, count]) => ({ name, count: numberValue(count) }))
-      .filter((item) => item.count > 0)
-      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+    ? telemetry.source_graph_mode_counts
+    : {};
+  const coreModes = ["focus", "slice", "context", "calls", "trace", "impact", "testmap", "coverage", "bundle"];
+  const extraModes = Object.keys(observedModeCounts)
+    .filter((name) => !coreModes.includes(name) && numberValue(observedModeCounts[name]) > 0)
+    .sort((left, right) => numberValue(observedModeCounts[right]) - numberValue(observedModeCounts[left]) || left.localeCompare(right));
+  const modeCounts = [...coreModes, ...extraModes]
+    .map((name) => ({ name, count: numberValue(observedModeCounts[name]) }));
+  fragment.appendChild(createElement("h3", "telemetry-section-title", "Source Graph modes"));
+  const modeGrid = createElement("div", "telemetry-mode-grid");
+  for (const item of modeCounts) {
+    const badge = createElement("span", `telemetry-mode-badge${item.count ? "" : " is-zero"}`);
+    badge.append(createElement("span", "", item.name), createElement("strong", "", formatCount(item.count)));
+    modeGrid.appendChild(badge);
+  }
+  fragment.appendChild(modeGrid);
+  const attributedCalls = numberValue(telemetry.source_graph_mode_attributed_calls);
+  const unattributedCalls = numberValue(telemetry.source_graph_mode_unattributed_calls);
+  fragment.appendChild(createElement(
+    "div",
+    `telemetry-note${unattributedCalls ? " is-warning" : ""}`,
+    unattributedCalls
+      ? `${formatCount(attributedCalls)}/${formatCount(telemetry.source_graph_calls)} calls include authenticated mode metadata; ${formatCount(unattributedCalls)} older or unattributed calls remain visible without being guessed.`
+      : `${formatCount(attributedCalls)} authenticated Source Graph calls include mode metadata.`,
+  ));
+  const modeSequence = Array.isArray(telemetry.source_graph_mode_sequence)
+    ? telemetry.source_graph_mode_sequence.slice(-16)
     : [];
-  if (modeCounts.length) {
-    fragment.appendChild(createElement("h3", "telemetry-section-title", "Source Graph modes"));
-    const modeGrid = createElement("div", "telemetry-mode-grid");
-    for (const item of modeCounts) {
-      const badge = createElement("span", "telemetry-mode-badge");
-      badge.append(createElement("span", "", item.name), createElement("strong", "", formatCount(item.count)));
-      modeGrid.appendChild(badge);
-    }
-    fragment.appendChild(modeGrid);
+  if (modeSequence.length) {
+    fragment.appendChild(createElement(
+      "div",
+      "telemetry-mode-sequence",
+      `Recent mode path: ${modeSequence.join(" → ")}`,
+    ));
   }
 
   const blockedReasons = telemetry.blocked_reason_counts
@@ -934,6 +956,20 @@ function renderToolUse(snapshot) {
         `${live} live | ${numberValue(item.injected_only_tasks)} injected | ${numberValue(item.missing_or_stale_tasks)} missing/stale`,
       ),
     );
+    const adapterModes = item.source_graph_mode_counts && typeof item.source_graph_mode_counts === "object"
+      ? Object.entries(item.source_graph_mode_counts)
+        .map(([mode, count]) => ({ mode, count: numberValue(count) }))
+        .filter((entry) => entry.count > 0)
+        .sort((left, right) => right.count - left.count || left.mode.localeCompare(right.mode))
+        .slice(0, 6)
+      : [];
+    labels.append(createElement(
+      "span",
+      "stat-breakdown",
+      adapterModes.length
+        ? `modes: ${adapterModes.map((entry) => `${entry.mode} ${formatCount(entry.count)}`).join(" · ")}`
+        : `${formatCount(item.source_graph_mode_unattributed_calls)} calls without mode metadata`,
+    ));
     const track = createElement("div", "stat-track");
     const fill = createElement("span", "stat-fill");
     fill.style.width = `${gated ? Math.max(3, Math.round((live / gated) * 100)) : 0}%`;

@@ -134,6 +134,10 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_cache_hits"] == 2
     assert result["source_graph_mode_counts"] == {"focus": 1, "bodygrep": 2}
     assert result["source_graph_mode_sequence"] == ["focus", "bodygrep", "bodygrep"]
+    assert result["source_graph_mode_attributed_calls"] == 3
+    assert result["source_graph_mode_unattributed_calls"] == 1
+    assert result["source_graph_distinct_modes"] == 2
+    assert result["source_graph_mode_attribution_rate"] == 75.0
     assert result["tool_call_counts"] == {
         "source_graph": 4, "session_current_state": 1, "kb": 2,
     }
@@ -163,6 +167,12 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["by_adapter"]["deepseek_copilot_cli"]["live_tasks"] == 1
     assert result["by_adapter"]["deepseek_copilot_cli"]["raw_discovery_denials"] == 1
     assert result["by_adapter"]["deepseek_copilot_cli"]["tool_call_counts"]["kb"] == 2
+    assert result["by_adapter"]["deepseek_copilot_cli"]["source_graph_mode_counts"] == {
+        "focus": 1,
+        "bodygrep": 2,
+    }
+    assert result["by_adapter"]["deepseek_copilot_cli"]["source_graph_mode_attributed_calls"] == 3
+    assert result["by_adapter"]["claude_cli"]["source_graph_mode_unattributed_calls"] == 1
     assert result["by_adapter"]["claude_cli"]["injected_only_tasks"] == 1
 
 

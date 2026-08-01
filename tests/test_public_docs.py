@@ -25,6 +25,19 @@ def test_broken_local_link_is_rejected(tmp_path: Path) -> None:
     ]
 
 
+def test_marketplace_readme_rejects_relative_html_image(tmp_path: Path) -> None:
+    _fixture(tmp_path, "# Product\n")
+    marketplace_readme = tmp_path / "vscode-extension/README.md"
+    marketplace_readme.write_text(
+        '<img src="media/aiworkhub-hero.png" alt="AIWorkHub">\n',
+        encoding="utf-8",
+    )
+    assert check_public_docs.check(tmp_path) == [
+        "vscode-extension/README.md: Marketplace image must use a public HTTPS "
+        "URL, got 'media/aiworkhub-hero.png'"
+    ]
+
+
 def test_legacy_paths_task_ids_and_wrong_tool_name_are_rejected(tmp_path: Path) -> None:
     _fixture(
         tmp_path,

@@ -355,6 +355,26 @@ select:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.telemetry-mode-badge.is-zero {
+  opacity: .52;
+}
+
+.telemetry-mode-sequence {
+  margin: 0 0 10px;
+  padding: 7px 9px;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+}
+
+.telemetry-note.is-warning {
+  color: var(--pending);
+}
+
 .header-tool-use {
   text-align: center;
 }

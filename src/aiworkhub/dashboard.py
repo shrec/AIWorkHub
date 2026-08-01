@@ -289,6 +289,10 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_cache_hits": 0,
         "source_graph_mode_counts": {},
         "source_graph_mode_sequence": [],
+        "source_graph_mode_attributed_calls": 0,
+        "source_graph_mode_unattributed_calls": 0,
+        "source_graph_distinct_modes": 0,
+        "source_graph_mode_attribution_rate": 0.0,
         "tool_call_counts": {},
         "tool_success_counts": {},
         "tool_bytes": {},
@@ -322,6 +326,9 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 "source_graph_hit_count": 0,
                 "source_graph_zero_hit_calls": 0,
                 "source_graph_failed_calls": 0,
+                "source_graph_mode_counts": {},
+                "source_graph_mode_attributed_calls": 0,
+                "source_graph_mode_unattributed_calls": 0,
                 "policy_violations": 0,
                 "provider_permission_denials": 0,
                 "raw_discovery_denials": 0,
@@ -406,9 +413,14 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         if isinstance(mode_counts, Mapping):
             for mode, count in mode_counts.items():
                 safe_mode = str(mode)[:40]
+                safe_count = max(0, int(count or 0))
                 totals["source_graph_mode_counts"][safe_mode] = (
                     int(totals["source_graph_mode_counts"].get(safe_mode) or 0)
-                    + max(0, int(count or 0))
+                    + safe_count
+                )
+                bucket_modes = bucket["source_graph_mode_counts"]
+                bucket_modes[safe_mode] = (
+                    int(bucket_modes.get(safe_mode) or 0) + safe_count
                 )
         sequence = tool_use.get("source_graph_mode_sequence")
         if isinstance(sequence, list):
@@ -442,6 +454,30 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             bucket["missing_or_stale_tasks"] += 1
 
     denominator = totals["gated_tasks"]
+    attributed_calls = sum(
+        max(0, int(count or 0))
+        for count in totals["source_graph_mode_counts"].values()
+    )
+    totals["source_graph_mode_attributed_calls"] = attributed_calls
+    totals["source_graph_mode_unattributed_calls"] = max(
+        0, totals["source_graph_calls"] - attributed_calls
+    )
+    totals["source_graph_distinct_modes"] = sum(
+        1 for count in totals["source_graph_mode_counts"].values() if int(count or 0) > 0
+    )
+    if totals["source_graph_calls"]:
+        totals["source_graph_mode_attribution_rate"] = round(
+            100.0 * attributed_calls / totals["source_graph_calls"], 1
+        )
+    for bucket in totals["by_adapter"].values():
+        bucket_attributed = sum(
+            max(0, int(count or 0))
+            for count in bucket["source_graph_mode_counts"].values()
+        )
+        bucket["source_graph_mode_attributed_calls"] = bucket_attributed
+        bucket["source_graph_mode_unattributed_calls"] = max(
+            0, bucket["source_graph_calls"] - bucket_attributed
+        )
     if denominator:
         totals["live_rate"] = round(100.0 * totals["source_graph_live_tasks"] / denominator, 1)
         fresh_tasks = sum(
