@@ -180,8 +180,14 @@ never inherit the manager launch capability.
 | Source Graph | 33 configurable language/data families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
-| Operations | Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
+| Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
 | Platforms | Linux, Windows, macOS and Remote-SSH release qualification |
+
+The KPI view separates explicit manager decisions from worker terminal
+outcomes and plots only bounded repository evidence. Every rate carries its
+sample window or denominator; Source Graph and context-tool charts come from
+authenticated worker receipts, while token savings and causal quality gains
+are deliberately not inferred.
 
 The canonical combined review surface is `aiworkhub_completion_inbox`. Tool
 availability and write authority are reported by the live MCP runtime; clients

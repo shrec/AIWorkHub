@@ -23,6 +23,7 @@ from aiworkhub import (
     completion_inbox,
     core,
     cost_ledger,
+    dashboard_kpis,
     deepseek_credentials,
     process_launcher,
     repo_policy,
@@ -1205,6 +1206,14 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "adapter_readiness": {},
             "source_graph_telemetry": _source_graph_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
+            "kpi_analytics": dashboard_kpis.build_kpi_snapshot(
+                process_report={},
+                source_graph=_source_graph_telemetry({}),
+                project_context=_project_context_telemetry({}),
+                callback_health={},
+                cost_totals=_cost_totals(None),
+                process_limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT,
+            ),
             "callback_bridge_health": {},
             "task_plan": {},
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
@@ -1432,6 +1441,18 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         exact = status_counts.get(status, 0)
         row_counts[status] = {"returned": 0, "exact": exact, "truncated": exact > 0}
 
+    source_graph_telemetry = _source_graph_telemetry(process_report)
+    project_context_telemetry = _project_context_telemetry(process_report)
+    cost_totals = _cost_totals(ledger)
+    kpi_analytics = dashboard_kpis.build_kpi_snapshot(
+        process_report=process_report,
+        source_graph=source_graph_telemetry,
+        project_context=project_context_telemetry,
+        callback_health=callback_bridge_health,
+        cost_totals=cost_totals,
+        process_limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT,
+    )
+
     return {
         "schema_version": 1,
         "generated_at": _utc_now(),
@@ -1455,7 +1476,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         },
         "completion_inbox": dict(inbox),
         "cost_usage": {
-            "totals": _cost_totals(ledger),
+            "totals": cost_totals,
             "ledger": dict(ledger),
         },
         "collision_report": dict(collision_report),
@@ -1463,8 +1484,9 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "adapter_readiness": dict(adapter_readiness),
         "environment_preflight": dict(environment_preflight),
         "workforce_catalog": dict(workforce),
-        "source_graph_telemetry": _source_graph_telemetry(process_report),
-        "project_context_telemetry": _project_context_telemetry(process_report),
+        "source_graph_telemetry": source_graph_telemetry,
+        "project_context_telemetry": project_context_telemetry,
+        "kpi_analytics": kpi_analytics,
         "callback_bridge_health": dict(callback_bridge_health),
         "task_plan": dict(task_plan_snapshot),
         "warnings": {

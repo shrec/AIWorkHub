@@ -49,6 +49,10 @@ AIWorkHub telemetry.
 - Storage observability, bounded system logs, authenticated all-tool usage
   statistics, and local dashboard views for task operations and context
   systems.
+- Bounded repository KPI charts for explicit manager decisions, worker
+  outcomes, validation failures, Source Graph use, callback delivery,
+  adapter effectiveness and context-system execution, with visible sample
+  windows, denominators and telemetry-quality disclosures.
 - Safe repository worktree, terminal-run and extension-runtime retention with
   preview, quarantine, restore and separately confirmed expired purge.
 - Safe archived-task retention with age-based preview, callback-backlog
@@ -79,8 +83,10 @@ AIWorkHub telemetry.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
 - Task/tool telemetry now authenticates generic MCP calls as well as Source
-  Graph calls. Stage attribution, latency distributions and outcome cohorts
-  remain the next economics closure rather than inferred statistics.
+  Graph calls, and the first truthful bounded KPI dashboard is shipped. Stage
+  attribution, latency distributions, durable historical windows and
+  task-class outcome cohorts remain the next economics closure rather than
+  inferred statistics.
 - The brand foundation, concise public README and registry workflows are
   present. Registry-owner setup, public screenshots/GIF and long-form launch
   material remain open.

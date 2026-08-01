@@ -137,6 +137,7 @@ const elements = {
   tableLoading: document.querySelector("#table-loading"),
   topicStats: document.querySelector("#topic-stats"),
   runnerStats: document.querySelector("#runner-stats"),
+  kpiDashboard: document.querySelector("#kpi-dashboard"),
   planDag: document.querySelector("#plan-dag"),
   workforceList: document.querySelector("#workforce-list"),
   toolUseList: document.querySelector("#tool-use-list"),
@@ -982,6 +983,173 @@ function renderToolUse(snapshot) {
   elements.toolUseList.replaceChildren(fragment);
 }
 
+function kpiPercent(value) {
+  return value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "—"
+    : `${Number(value).toFixed(1)}%`;
+}
+
+function kpiBarRow(label, value, maximum, tone = "neutral", detail = "") {
+  const safeValue = Math.max(0, numberValue(value));
+  const safeMaximum = Math.max(0, numberValue(maximum));
+  const row = createElement("div", "kpi-bar-row");
+  const heading = createElement("div", "kpi-bar-heading");
+  heading.append(
+    createElement("span", "kpi-bar-label", label),
+    createElement("strong", "kpi-bar-value", detail || formatCount(safeValue)),
+  );
+  const track = createElement("div", "kpi-bar-track");
+  const fill = createElement("span", `kpi-bar-fill ${tone}`);
+  fill.style.width = `${safeMaximum ? Math.max(safeValue ? 2 : 0, Math.round((safeValue / safeMaximum) * 100)) : 0}%`;
+  track.appendChild(fill);
+  row.append(heading, track);
+  return row;
+}
+
+function renderKpis(snapshot) {
+  if (!elements.kpiDashboard) return;
+  const kpis = snapshot && snapshot.kpi_analytics && typeof snapshot.kpi_analytics === "object"
+    ? snapshot.kpi_analytics
+    : null;
+  if (!kpis || kpis.schema_id !== "aiworkhub.kpi.dashboard.v1") {
+    elements.kpiDashboard.replaceChildren(
+      createElement("div", "panel-list-empty", "No KPI evidence in this snapshot"),
+    );
+    return;
+  }
+
+  const headline = kpis.headline && typeof kpis.headline === "object" ? kpis.headline : {};
+  const windowInfo = kpis.window && typeof kpis.window === "object" ? kpis.window : {};
+  const fragment = document.createDocumentFragment();
+  const header = createElement("div", "kpi-heading");
+  const headingText = createElement("div");
+  headingText.append(
+    createElement("h3", "kpi-title", "Repository performance"),
+    createElement(
+      "p",
+      "kpi-subtitle",
+      `${windowInfo.label || "bounded process window"} · ${formatCount(windowInfo.observed_runs)} observed${windowInfo.truncated ? " · truncated" : ""}`,
+    ),
+  );
+  header.appendChild(headingText);
+  fragment.appendChild(header);
+
+  const cards = createElement("div", "kpi-grid");
+  const cardValues = [
+    ["Manager accepted", kpiPercent(headline.manager_acceptance_rate), `${formatCount(headline.accepted_runs)}/${formatCount(headline.manager_decisions)} explicit decisions`, "good"],
+    ["Review-ready", kpiPercent(headline.review_ready_rate), `${formatCount(headline.review_ready_runs)}/${formatCount(headline.terminal_runs)} terminal worker outcomes`, "good"],
+    ["Validation failed", kpiPercent(headline.validation_failed_rate), `${formatCount(headline.validation_failed_runs)} terminal outcomes`, numberValue(headline.validation_failed_runs) ? "bad" : "good"],
+    ["Source Graph live", kpiPercent(headline.source_graph_live_rate), "authenticated live-task rate", "accent"],
+    ["SG call success", kpiPercent(headline.source_graph_useful_call_rate), "calls without a recorded failure", "accent"],
+    ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
+    ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
+  ];
+  for (const [label, value, detail, tone] of cardValues) {
+    const card = createElement("div", `kpi-card ${tone}`);
+    card.append(
+      createElement("span", "kpi-card-label", label),
+      createElement("strong", "kpi-card-value", value),
+      createElement("span", "kpi-card-detail", detail),
+    );
+    cards.appendChild(card);
+  }
+  fragment.appendChild(cards);
+
+  const chartGrid = createElement("div", "kpi-chart-grid");
+  const dailyPanel = createElement("section", "kpi-chart-panel");
+  dailyPanel.appendChild(createElement("h3", "kpi-chart-title", "Daily worker outcomes"));
+  const days = asArray(kpis.daily);
+  if (days.length) {
+    const maxRuns = Math.max(1, ...days.map((item) => numberValue(item.runs)));
+    const chart = createElement("div", "kpi-daily-chart");
+    chart.setAttribute("role", "img");
+    chart.setAttribute("aria-label", "Daily observed worker outcomes: review-ready, validation-failed and other states");
+    for (const day of days) {
+      const total = Math.max(1, numberValue(day.runs));
+      const review = numberValue(day.review_ready);
+      const failed = numberValue(day.validation_failed);
+      const other = Math.max(0, total - review - failed);
+      const column = createElement("div", "kpi-day-column");
+      column.title = `${day.date}: ${total} runs, ${review} review-ready, ${failed} validation-failed`;
+      const stack = createElement("div", "kpi-day-stack");
+      stack.style.height = `${Math.max(6, Math.round((total / maxRuns) * 100))}%`;
+      for (const [count, tone] of [[other, "neutral"], [failed, "bad"], [review, "good"]]) {
+        if (!count) continue;
+        const segment = createElement("span", `kpi-day-segment ${tone}`);
+        segment.style.height = `${Math.max(3, Math.round((count / total) * 100))}%`;
+        stack.appendChild(segment);
+      }
+      column.append(stack, createElement("span", "kpi-day-label", String(day.date || "").slice(5)));
+      chart.appendChild(column);
+    }
+    dailyPanel.appendChild(chart);
+    const legend = createElement("div", "kpi-legend");
+    for (const [tone, label] of [["good", "Review-ready"], ["bad", "Validation failed"], ["neutral", "Other/active"]]) {
+      const item = createElement("span", "kpi-legend-item");
+      item.append(createElement("i", tone), document.createTextNode(label));
+      legend.appendChild(item);
+    }
+    dailyPanel.appendChild(legend);
+  } else {
+    dailyPanel.appendChild(createElement("div", "panel-list-empty", "No timestamped process outcomes"));
+  }
+  chartGrid.appendChild(dailyPanel);
+
+  const outcomePanel = createElement("section", "kpi-chart-panel");
+  outcomePanel.appendChild(createElement("h3", "kpi-chart-title", "Outcome mix"));
+  const outcomes = asArray(kpis.outcome_mix);
+  const outcomeMax = Math.max(1, ...outcomes.map((item) => numberValue(item.count)));
+  if (outcomes.length) {
+    for (const item of outcomes.slice(0, 8)) {
+      const tone = item.state === "review_ready" ? "good" : item.state === "validation_failed" ? "bad" : "neutral";
+      outcomePanel.appendChild(kpiBarRow(String(item.state || "unknown").replaceAll("_", " "), item.count, outcomeMax, tone));
+    }
+  } else {
+    outcomePanel.appendChild(createElement("div", "panel-list-empty", "No process outcomes"));
+  }
+  chartGrid.appendChild(outcomePanel);
+
+  const adapterPanel = createElement("section", "kpi-chart-panel");
+  adapterPanel.appendChild(createElement("h3", "kpi-chart-title", "Worker effectiveness"));
+  const adapters = asArray(kpis.adapters).slice(0, 8);
+  if (adapters.length) {
+    for (const item of adapters) {
+      adapterPanel.appendChild(kpiBarRow(
+        item.name || "unknown",
+        item.review_ready_rate,
+        100,
+        "good",
+        `${kpiPercent(item.review_ready_rate)} · ${formatCount(item.terminal_runs)} terminal`,
+      ));
+    }
+  } else {
+    adapterPanel.appendChild(createElement("div", "panel-list-empty", "No adapter outcomes"));
+  }
+  chartGrid.appendChild(adapterPanel);
+
+  const contextPanel = createElement("section", "kpi-chart-panel");
+  contextPanel.appendChild(createElement("h3", "kpi-chart-title", "Context execution"));
+  for (const item of asArray(kpis.context)) {
+    contextPanel.appendChild(kpiBarRow(
+      item.label || item.key || "Context",
+      item.execution_rate,
+      100,
+      numberValue(item.degraded_tasks) ? "bad" : "accent",
+      `${kpiPercent(item.execution_rate)} · ${formatCount(item.hit_count)} hits`,
+    ));
+  }
+  chartGrid.appendChild(contextPanel);
+  fragment.appendChild(chartGrid);
+
+  const quality = kpis.data_quality && typeof kpis.data_quality === "object" ? kpis.data_quality : {};
+  fragment.appendChild(createElement(
+    "div",
+    `kpi-disclosure${quality.process_window_truncated || numberValue(quality.invalid_timestamp_rows) ? " warning" : ""}`,
+    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} Source Graph calls lack mode attribution; ${formatCount(quality.invalid_timestamp_rows)} invalid timestamps. No token-savings or causal quality claim is inferred.`,
+  ));
+  elements.kpiDashboard.replaceChildren(fragment);
+}
+
 function renderPlanDag(snapshot) {
   if (!elements.planDag) return;
   const plan = snapshot && snapshot.task_plan && typeof snapshot.task_plan === "object"
@@ -1768,6 +1936,7 @@ function renderSnapshot(snapshot) {
   renderTaskTable();
   renderStats(elements.topicStats, snapshot.summaries && snapshot.summaries.topics);
   renderStats(elements.runnerStats, snapshot.summaries && snapshot.summaries.runners);
+  renderKpis(snapshot);
   renderUsage(snapshot);
   renderPlanDag(snapshot);
   renderWorkforce(snapshot);

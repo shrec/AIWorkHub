@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.33";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.34";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -5960,7 +5960,8 @@ function getHtmlForWebview(webview, extensionUri) {
           <div class="panel-heading tabs-heading">
             <h2 id="operations-heading">Operations</h2>
             <div class="tab-list" role="tablist" aria-label="Operational views">
-              <button type="button" role="tab" aria-selected="true" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
+              <button type="button" role="tab" aria-selected="true" aria-controls="panel-kpis" id="tab-kpis" data-tab="kpis">KPIs</button>
+              <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-runners" id="tab-runners" data-tab="runners">Runners</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-plan" id="tab-plan" data-tab="plan">Plan DAG</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-workforce" id="tab-workforce" data-tab="workforce">Workforce</button>
@@ -5973,7 +5974,10 @@ function getHtmlForWebview(webview, extensionUri) {
             </div>
           </div>
 
-          <div class="tab-panel" role="tabpanel" id="panel-topics" aria-labelledby="tab-topics">
+          <div class="tab-panel" role="tabpanel" id="panel-kpis" aria-labelledby="tab-kpis">
+            <div id="kpi-dashboard"></div>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-topics" aria-labelledby="tab-topics" hidden>
             <div class="stat-list" id="topic-stats"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-runners" aria-labelledby="tab-runners" hidden>

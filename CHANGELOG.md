@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.34] - 2026-08-01
+
+### Added
+
+- Added a repository-local KPI Dashboard with responsive charts for explicit
+  manager decisions, bounded worker outcomes, validation failures, Source
+  Graph use, callback delivery, adapter effectiveness and Session/Memory/KB
+  execution.
+- Added visible sample sizes, denominators, truncation and attribution quality
+  disclosures. The dashboard keeps manager acceptance separate from
+  `review_ready` and does not infer token savings or causal quality gains.
+
 ## [0.8.33] - 2026-08-01
 
 ### Fixed
