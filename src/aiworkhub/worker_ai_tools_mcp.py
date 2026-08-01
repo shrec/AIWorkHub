@@ -710,11 +710,16 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
     through untouched.
     """
 
+    normalized_scope = scope.rstrip("/")
+
+    def in_scope(candidate: str) -> bool:
+        return candidate == normalized_scope or candidate.startswith(f"{normalized_scope}/")
+
     if isinstance(value, list):
         kept: list[Any] = []
         for item in value:
             if isinstance(item, str):
-                if item.startswith(scope):
+                if in_scope(item):
                     kept.append(item)
                 continue
             filtered_item = _filter_by_scope(item, scope)
@@ -725,7 +730,7 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
         for key in _SOURCE_GRAPH_FILE_KEYS:
             file_value = value.get(key)
             if isinstance(file_value, str):
-                return value if file_value.startswith(scope) else None
+                return value if in_scope(file_value) else None
         return {
             key: _filter_by_scope(item, scope) if isinstance(item, (list, dict)) else item
             for key, item in value.items()
@@ -823,6 +828,10 @@ def source_graph_query(
             )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
+    if scope is not None:
+        payload = _filter_by_scope(payload, scope) or {}
+        if isinstance(payload, dict) and payload:
+            payload["scope"] = "target"
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     truncated = len(raw_text.encode("utf-8")) > MAX_RAW_TOOL_OUTPUT_BYTES
     try:
@@ -832,9 +841,6 @@ def source_graph_query(
     truncated = truncated or json_truncated
 
     payload = json.loads(text)
-    if scope is not None:
-        payload = _filter_by_scope(payload, scope) or {}
-        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     hit_count = _json_hit_count(payload)
     bytes_returned = len(text.encode("utf-8"))
     result = {

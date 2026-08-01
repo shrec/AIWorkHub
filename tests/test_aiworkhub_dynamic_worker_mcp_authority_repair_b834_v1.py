@@ -349,6 +349,42 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
     payload = json.loads(result["content"])
     assert payload["target"] == "real query text"
     assert payload["relevant_files"] == ["AITools/source_graph.py"]
+    assert payload["scope"] == "target"
+
+
+def test_target_scope_is_applied_before_large_payload_truncation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    ctx = _ctx(
+        repo=authority, authority_repo=authority, home=tmp_path / "home",
+        targets=("eval",),
+    )
+    out_of_scope_blob = "x" * (w.MAX_RAW_TOOL_OUTPUT_BYTES + 1024)
+    monkeypatch.setattr(
+        source_graph_mod,
+        "analytics_query",
+        lambda repo_root, mode, query, budget=64: {
+            "rows": [
+                {"file": "src/out_of_scope.py", "evidence": out_of_scope_blob},
+                {"file": "eval/in_scope.json", "evidence": "kept"},
+                {"file": "eval2/prefix_collision.json", "evidence": "drop"},
+            ],
+        },
+    )
+
+    result = w.source_graph_query(
+        ctx, mode="summarize", query="large analytics payload", target="eval",
+    )
+
+    assert result["ok"] is True
+    assert result["truncated"] is False
+    payload = json.loads(result["content"])
+    assert payload["scope"] == "target"
+    assert payload["rows"] == [
+        {"file": "eval/in_scope.json", "evidence": "kept"},
+    ]
 
 
 def test_target_outside_declared_allowlist_is_rejected_before_any_call(

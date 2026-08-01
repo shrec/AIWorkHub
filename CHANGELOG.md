@@ -6,6 +6,32 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.29] - 2026-08-01
+
+### Fixed
+
+- Added the canonical repository ID to every Task MCP Project Context receipt,
+  so workers can report and validate the exact repository identity instead of
+  inferring it from a filesystem path or leaving it unresolved.
+- Applied Source Graph target scoping before bounded-output truncation and
+  enforced path-component boundaries. Large analytics responses can no longer
+  preserve out-of-scope preview data or treat a sibling such as `eval2` as
+  belonging to the requested `eval` scope.
+- Excluded repository runtime `logs/` from Source Graph indexing by default,
+  preventing generated task events from dominating language/file statistics
+  and broad architectural queries.
+- Split workforce attribution diagnostics into missing-model and unknown
+  adapter/model populations, making historical unattributed process rows
+  explainable without misreporting current worker launches.
+
+### Validation
+
+- Verified the Marketplace-installed 0.8.28 callback route end to end with a
+  live Codex Spark canary; the current manager received the review callback,
+  independently rejected incomplete evidence, and left the review queue empty.
+- Passed 1,628 Python tests with 22 skips, all VS Code extension regressions,
+  and focused Source Graph, Project Context and workforce tests.
+
 ### Changed
 
 - Raised the supported Python baseline from 3.10 to 3.12 and moved the full CI

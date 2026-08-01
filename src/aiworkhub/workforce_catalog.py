@@ -334,6 +334,11 @@ def build_catalog(
             "observed_score": observed_score,
             "effective_score": round(effective_score, 2),
         })
+    unattributed = [
+        process for index, process in enumerate(processes)
+        if index not in attributed_process_ids
+    ]
+    missing_model = sum(1 for process in unattributed if not str(process.get("model") or ""))
     return {
         "ok": True,
         "schema_id": SCHEMA_ID,
@@ -345,7 +350,9 @@ def build_catalog(
             "enabled": sum(1 for item in rows if item["enabled"]),
             "available": sum(1 for item in rows if item["available"]),
             "observed": sum(1 for item in rows if item["outcomes"]["sample_count"]),
-            "unattributed_process_rows": len(processes) - len(attributed_process_ids),
+            "unattributed_process_rows": len(unattributed),
+            "unattributed_missing_model_rows": missing_model,
+            "unattributed_unknown_adapter_or_model_rows": len(unattributed) - missing_model,
         },
         "truth_contract": {
             "provider_quota_fabricated": False,

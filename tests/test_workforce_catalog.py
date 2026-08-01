@@ -121,6 +121,8 @@ def test_catalog_scores_only_attributed_canonical_outcomes(tmp_path: Path) -> No
     assert outcomes["validation_failure_rate"] == 0.5
     assert outcomes["cost_usd_per_1k_tokens"] == 0.1
     assert snapshot["summary"]["unattributed_process_rows"] == 1
+    assert snapshot["summary"]["unattributed_missing_model_rows"] == 0
+    assert snapshot["summary"]["unattributed_unknown_adapter_or_model_rows"] == 1
     assert snapshot["truth_contract"]["provider_quota_fabricated"] is False
     untouched = next(item for item in snapshot["workers"] if item["worker_id"] == "glm-5.2")
     assert untouched["observed_score"] is None

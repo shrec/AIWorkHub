@@ -79,7 +79,7 @@ SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO = 0.20
 DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
     HUB_DIRNAME, ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
-    "dist", "build", "archive",
+    "dist", "build", "archive", "logs",
     # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
     # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
     # "typescript" evidence would be a false language label, not truthful

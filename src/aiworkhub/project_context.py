@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import repository_state
 from . import worker_ai_tools_mcp as _worker_tools
 
 
@@ -606,6 +607,13 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     if contract is None:
         return None
     authority_repo = resolve_task_repository_root(repo, card)
+    try:
+        repo_id = repository_state.inspect_repository(authority_repo).manifest.repo_id
+    except repository_state.RepositoryStateError:
+        # Some unit-level callers intentionally exercise context shaping on an
+        # uninitialized temporary repository. Production Task MCP repositories
+        # are initialized and always provide the concrete identity here.
+        repo_id = ""
     contract["source_graph"]["targets"] = _rebase_targets(
         repo, authority_repo, contract["source_graph"]["targets"]
     )
@@ -739,6 +747,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         "mode": contract["source_graph"]["mode"],
     }
     prompt_payload["repo_identity"] = {
+        "repo_id": repo_id,
         "scope_root": (
             "."
             if authority_repo == repo
@@ -797,6 +806,7 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         "bundle_sha256": _sha256_text(bundle),
         "bundle_bytes": len(bundle.encode("utf-8")),
         "repo_identity": {
+            "repo_id": repo_id,
             "repo_root": str(authority_repo),
             "scope_root": (
                 "."

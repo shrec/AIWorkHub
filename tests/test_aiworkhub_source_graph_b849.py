@@ -32,7 +32,7 @@ from aiworkhub import source_graph as sg
 from aiworkhub import source_graph_ast as sgast
 from aiworkhub import source_graph_migration as sgm
 from aiworkhub import worker_ai_tools_mcp as w
-from aiworkhub.repository_state import HUB_DIRNAME, bootstrap_repository
+from aiworkhub.repository_state import HUB_DIRNAME, bootstrap_repository, inspect_repository
 from aiworkhub.storage_registry import load_storage_registry
 
 
@@ -423,6 +423,16 @@ def test_archive_is_default_excluded_without_repo_config(tmp_path):
     rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
     assert "src/live.py" in rels
     assert "archive/old.py" not in rels
+
+
+def test_runtime_logs_are_default_excluded_without_repo_config(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "live.py", "def live():\n    return 1\n")
+    _write(repo / "logs" / "worker.json", '{"event": "runtime"}\n')
+    _write(repo / "logs" / "nested" / "trace.py", "def runtime_trace():\n    return 0\n")
+    rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
+    assert "src/live.py" in rels
+    assert not any(rel.startswith("logs/") for rel in rels)
 
 
 def test_repo_ignore_policy_extends_defaults_with_dirs_and_globs(tmp_path):
@@ -1204,6 +1214,12 @@ def test_project_context_calls_canonical_module_without_subprocess(tmp_path, mon
     result = pc.collect_project_context(repo, card)
     assert result is not None
     assert "project_ctx_probe" in result.prompt_bundle
+    expected_repo_id = inspect_repository(repo).manifest.repo_id
+    prompt_payload = json.loads(
+        result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1]
+    )
+    assert prompt_payload["repo_identity"]["repo_id"] == expected_repo_id
+    assert result.metadata["repo_identity"]["repo_id"] == expected_repo_id
 
 
 def test_project_context_no_operational_dependency_on_repository_helper_scripts(tmp_path, monkeypatch):
