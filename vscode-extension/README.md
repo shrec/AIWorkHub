@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="media/aiworkhub-hero.svg" alt="AIWorkHub" width="100%">
+  <img src="media/aiworkhub-hero.png" alt="AIWorkHub" width="100%">
 </div>
 
 # AIWorkHub for VS Code

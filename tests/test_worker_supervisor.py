@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import os
 import signal
 import stat
@@ -65,7 +66,7 @@ def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> 
     assert status["exit_code"] == 0
     assert Path(spec["stdout_path"]).read_text(encoding="utf-8").strip() == "worker-ok"
     for key in ("status_path", "stdout_path", "stderr_path"):
-        assert stat.S_IMODE(Path(spec[key]).stat().st_mode) == 0o600
+        assert os.name == "nt" or stat.S_IMODE(Path(spec[key]).stat().st_mode) == 0o600
 
 
 def test_supervisor_spawn_failure_is_never_reported_as_success(tmp_path: Path) -> None:
@@ -144,14 +145,16 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
 
     cancel_path = Path(spec["cancel_path"])
     write_json_0600(cancel_path, {"reason": "test-restart-cancel"})
-    os.kill(process.pid, signal.SIGTERM)
+    if os.name != "nt":
+        os.kill(process.pid, signal.SIGTERM)
     assert process.wait(timeout=5) == 125
     final = _read_status(status_path)
     assert final["state"] == "cancelled"
     assert final["child_pid"] == child_pid
-    assert stat.S_IMODE(status_path.stat().st_mode) == 0o600
+    assert os.name == "nt" or stat.S_IMODE(status_path.stat().st_mode) == 0o600
     assert not cancel_path.exists()
-    with pytest.raises(ProcessLookupError):
+    missing_process_error = OSError if os.name == "nt" else ProcessLookupError
+    with pytest.raises(missing_process_error):
         os.kill(child_pid, 0)
 
 
@@ -181,6 +184,24 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
     assert status.get("state") == "running"
     child_pid = int(status["child_pid"])
 
+    if os.name == "nt":
+        process.kill()
+        assert process.wait(timeout=5) != 0
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            handle = kernel32.OpenProcess(0x1000, False, child_pid)
+            if not handle:
+                break
+            kernel32.CloseHandle(handle)
+            time.sleep(0.02)
+        else:
+            raise AssertionError("worker survived abrupt supervisor loss")
+        return
+
     os.kill(process.pid, signal.SIGKILL)
     assert process.wait(timeout=5) == -signal.SIGKILL
     deadline = time.monotonic() + 5
@@ -200,3 +221,12 @@ def test_supervisor_never_enables_shell_execution() -> None:
     source = Path(worker_supervisor.__file__).read_text(encoding="utf-8")
     assert "shell=True" not in source
     assert "os.system(" not in source
+
+
+def test_posix_worker_spawn_kwargs_are_platform_specific() -> None:
+    linux = worker_supervisor._posix_worker_spawn_kwargs("linux")
+    macos = worker_supervisor._posix_worker_spawn_kwargs("darwin")
+
+    assert linux["start_new_session"] is True
+    assert linux["preexec_fn"] is worker_supervisor._die_with_supervisor
+    assert macos == {"start_new_session": True}

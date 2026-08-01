@@ -38,10 +38,13 @@ def load_or_create_key(key_path: Path) -> bytes:
     if fd is not None:
         try:
             st = os.fstat(fd)
+            # os.getuid() is POSIX-only; on Windows the per-user profile
+            # directory is ACL-protected instead of mode-bit protected, so
+            # owner equivalence is enforced only where mode bits are meaningful.
             if (
                 stat.S_ISREG(st.st_mode)
+                and (os.name == "nt" or st.st_uid == os.getuid())
                 and stat.S_IMODE(st.st_mode) == 0o600
-                and st.st_uid == os.getuid()
             ):
                 with os.fdopen(fd, "rb") as handle:
                     data = handle.read()
@@ -108,7 +111,9 @@ def read_grant(path: Path) -> dict[str, Any]:
         return {}
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         return {}
-    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+    # POSIX enforces owner equivalence via mode bits; Windows relies on the
+    # ACL-protected per-user profile, so os.getuid() is skipped there.
+    if (os.name != "nt" and (st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077)):
         return {}
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):

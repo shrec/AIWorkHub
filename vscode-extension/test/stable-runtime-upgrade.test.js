@@ -2,6 +2,7 @@
 
 const assert = require("assert");
 const fs = require("fs");
+const Module = require("module");
 const path = require("path");
 
 const source = fs.readFileSync(path.resolve(__dirname, "..", "extension.js"), "utf8");
@@ -16,6 +17,8 @@ assert.ok(!source.includes("mux_path"));
 assert.ok(source.includes("materializeStableMuxLauncher(context)"));
 assert.ok(source.includes("ensureCodexCallbackMuxConfigured(context)"));
 assert.ok(source.includes("primeStableMuxRuntimePointer(context)"));
+assert.ok(source.includes("stableRuntime = bundledRuntimeFallback(context)"));
+assert.ok(source.includes('const runtimeLabel = stableRuntime.generationRoot'));
 
 const activateStart = source.indexOf("async function activate(context)");
 const activateEnd = source.indexOf("async function deactivate()", activateStart);
@@ -40,5 +43,31 @@ assert.ok(
     < activateSource.indexOf("materializeStableRuntimeGeneration(context)"),
   "the exact extension-host repo route must exist before the mux starts Codex",
 );
+
+const extensionPath = path.resolve(__dirname, "..", "extension.js");
+const originalLoad = Module._load;
+Module._load = function patchedLoad(request, parent, isMain) {
+  if (request === "vscode") {
+    return {
+      workspace: { workspaceFolders: [], getConfiguration: () => ({ get: () => "" }) },
+      window: { createOutputChannel: () => ({ appendLine() {}, dispose() {} }) },
+      Uri: {},
+    };
+  }
+  return originalLoad.call(this, request, parent, isMain);
+};
+let extension;
+try {
+  extension = require(extensionPath);
+} finally {
+  Module._load = originalLoad;
+}
+const fallback = extension.__testInternals.bundledRuntimeFallback({
+  extensionUri: { fsPath: path.resolve(__dirname, "..") },
+  extension: { packageJSON: { version: require("../package.json").version } },
+});
+assert.ok(fs.existsSync(path.join(fallback.runtimeDir, "aiworkhub", "server.py")));
+assert.strictEqual(fallback.generationRoot, null);
+assert.strictEqual(fallback.storageRoot, null);
 
 console.log("AIWorkHub stable runtime upgrade regression passed");

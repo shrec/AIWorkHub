@@ -101,6 +101,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -125,7 +126,17 @@ ENV_REAL_EXECUTABLE = "AIWORKHUB_APP_SERVER_MUX_REAL_EXECUTABLE"
 DEFAULT_REAL_EXECUTABLE = "codex"
 
 ENV_SIDEBAND_DIR = "AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR"
-DEFAULT_SIDEBAND_DIR = Path.home() / ".aiworkhub" / "app_server_mux"
+
+
+def _default_sideband_dir() -> Path:
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = Path(tempfile.gettempdir())
+    return home / ".aiworkhub" / "app_server_mux"
+
+
+DEFAULT_SIDEBAND_DIR = _default_sideband_dir()
 REAL_EXECUTABLE_CONFIG_NAME = "real_executable"
 
 # B925: the sideband directory is a single machine-wide location shared by
@@ -240,6 +251,7 @@ CAPABILITY_TOKEN_BYTES = 32
 SIDEBAND_INSTANCE_ID_BYTES = 4
 SIDEBAND_INSTANCES_SUBDIR = "instances"
 SIDEBAND_REGISTRY_MAX_BYTES = 64 * 1024
+SIDEBAND_ENDPOINT_MAX_BYTES = 1024
 SIDEBAND_MAX_OWNED_THREAD_IDS = 512
 SIDEBAND_SOCKET_BIND_MAX_ATTEMPTS = 8
 SIDEBAND_OWNER_LEASE_SECONDS = 90.0
@@ -426,6 +438,121 @@ def _write_owner_only_file(path: Path, data: bytes, *, max_bytes: int) -> None:
         raise PermissionError(f"installed {path.name} is not owner-controlled mode 0600")
 
 
+def _write_owner_only_new_file(path: Path, data: bytes, *, max_bytes: int) -> None:
+    """Create a new private endpoint descriptor without replacing a peer.
+
+    The TCP fallback uses a regular file where AF_UNIX would have created a
+    socket node.  O_EXCL preserves the mux's no-clobber collision guarantee
+    even if another process wins the path race after the caller's preflight.
+    """
+    if len(data) > max_bytes:
+        raise ValueError(f"{path.name} payload exceeds bounded size ({max_bytes} bytes)")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        with contextlib.suppress(OSError):
+            chmod_fd(fd, 0o600)
+        os.write(fd, data)
+        os.fsync(fd)
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or not _owned_by_current_user(st)
+            or not _private_mode(st, 0o600)
+        ):
+            raise PermissionError(f"{path.name} is not owner-controlled mode 0600")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    else:
+        os.close(fd)
+
+
+def sideband_uses_unix_socket() -> bool:
+    """Whether this Python runtime exposes local filesystem sockets."""
+    return hasattr(socket, "AF_UNIX")
+
+
+def bind_sideband_listener(path: Path) -> socket.socket:
+    """Bind one private local sideband listener on Unix or Windows.
+
+    Some supported Windows Python builds do not expose ``AF_UNIX``.  In that
+    case the listener binds an ephemeral IPv4 loopback port and stores only
+    that non-secret endpoint in the owner-only ``*.sock`` descriptor.  The
+    separate capability file remains the authentication boundary.
+    """
+    if sideband_uses_unix_socket():
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        previous_umask = os.umask(0o177)
+        try:
+            srv.bind(str(path))
+        except BaseException:
+            srv.close()
+            raise
+        finally:
+            os.umask(previous_umask)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        return srv
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        host, port = srv.getsockname()[:2]
+        endpoint = json.dumps(
+            {"schema_id": "aiworkhub.sideband.endpoint.v1", "host": host, "port": port},
+            separators=(",", ":"),
+        ).encode("ascii")
+        _write_owner_only_new_file(path, endpoint, max_bytes=SIDEBAND_ENDPOINT_MAX_BYTES)
+    except BaseException:
+        srv.close()
+        raise
+    return srv
+
+
+def connect_sideband_socket(path: Path | str, *, timeout: float | None = None) -> socket.socket:
+    """Connect to a sideband endpoint created by ``bind_sideband_listener``."""
+    endpoint_path = Path(path)
+    if sideband_uses_unix_socket():
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect(str(endpoint_path))
+        return sock
+
+    try:
+        st = os.lstat(endpoint_path)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or not _owned_by_current_user(st)
+            or not _private_mode(st, 0o600)
+            or st.st_size > SIDEBAND_ENDPOINT_MAX_BYTES
+        ):
+            raise OSError("sideband endpoint descriptor is not private")
+        endpoint = json.loads(endpoint_path.read_text(encoding="ascii"))
+        host = endpoint.get("host") if isinstance(endpoint, dict) else None
+        port = endpoint.get("port") if isinstance(endpoint, dict) else None
+        if (
+            not isinstance(endpoint, dict)
+            or endpoint.get("schema_id") != "aiworkhub.sideband.endpoint.v1"
+            or host != "127.0.0.1"
+            or isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise OSError("sideband endpoint descriptor is invalid")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise OSError(f"sideband endpoint unavailable: {exc}") from exc
+    return socket.create_connection((host, port), timeout=timeout)
+
+
 def write_capability_token(path: Path, token: str) -> None:
     """Owner-only (0600) capability file for one mux instance."""
     _write_owner_only_file(path, token.encode("utf-8"), max_bytes=4096)
@@ -443,6 +570,30 @@ def _write_registry_descriptor(path: Path, descriptor: dict[str, Any]) -> None:
 
 
 # --- PID-reuse-safe liveness (Linux /proc; best-effort elsewhere) -----------
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Native non-signalling liveness probe for the standalone mux script."""
+
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    open_process.restype = ctypes.c_void_p
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+    get_exit_code.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    handle = open_process(0x1000, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == 5
+    exit_code = ctypes.c_uint32()
+    try:
+        return bool(get_exit_code(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+    finally:
+        close_handle(handle)
 
 def _proc_start_time(pid: int) -> int | None:
     """Field 22 (``starttime``, clock ticks since boot) of ``/proc/<pid>/stat``.
@@ -474,6 +625,12 @@ def _pid_is_live(pid: Any, expected_start_time: Any) -> bool:
     otherwise satisfy for a completely unrelated later process."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+    if os.name == "nt":
+        # Never use os.kill(pid, 0) on Windows: CPython can map it to
+        # TerminateProcess(pid, 0). Windows descriptors do not carry the
+        # Linux /proc start ticks, so the native non-signalling liveness probe
+        # is the strongest available check here.
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1248,27 +1405,12 @@ class AppServerMux:
             if self._socket_path.exists() or self._capability_path.exists() or self._registry_path.exists():
                 self._assign_instance_paths()
                 continue
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            # AF_UNIX bind() takes no mode argument -- the socket file's
-            # permission bits come from the process umask alone. 0o177
-            # yields exactly 0600 (owner rw, no exec, no group/other) for
-            # the kernel's 0777 socket-file base mode. Narrowly scoped and
-            # restored immediately so no other creation on any thread is
-            # affected (mux.start() runs this before any pump/accept
-            # thread exists). The trailing chmod is defense-in-depth on
-            # hosts where a standalone chmod syscall IS available.
-            previous_umask = os.umask(0o177)
             try:
-                srv.bind(str(self._socket_path))
+                srv = bind_sideband_listener(self._socket_path)
             except OSError as exc:
-                os.umask(previous_umask)
-                srv.close()
                 last_error = exc
                 self._assign_instance_paths()
                 continue
-            os.umask(previous_umask)
-            with contextlib.suppress(OSError):
-                os.chmod(self._socket_path, 0o600)
             srv.listen(8)
             srv.settimeout(SIDEBAND_ACCEPT_POLL_SECONDS)
             self._server_socket = srv
@@ -1331,6 +1473,11 @@ class AppServerMux:
         try:
             conn.settimeout(SIDEBAND_REQUEST_DEADLINE_SECONDS)
             if not self._peer_uid_ok(conn):
+                # A TCP peer that is closed while request bytes remain unread
+                # is reset by Winsock, which can discard this bounded error
+                # response. Drain one bounded frame before replying; AF_UNIX
+                # behavior and the authorization decision remain unchanged.
+                self._read_bounded_line(conn)
                 self._send_json(conn, {"ok": False, "error": "unauthorized_peer"})
                 return
             raw, overflowed = self._read_bounded_line(conn)
@@ -1405,6 +1552,20 @@ def run_mux(argv: list[str], *, repo_id: str) -> int:
         return 130
 
 
+def _passthrough_real_executable(real_executable: str, raw_argv: list[str]) -> int:
+    """Run the real CLI transparently on the current host.
+
+    POSIX keeps true process-image replacement. Windows has no exec(2)
+    equivalent: Python's ``os.execvp`` both lost the child's exit code and
+    re-split quoted arguments in practice. A shell-free subprocess preserves
+    the argv vector and returns the real process status there.
+    """
+    if os.name == "nt":
+        return int(subprocess.call([real_executable, *raw_argv], shell=False))
+    os.execvp(real_executable, [real_executable, *raw_argv])
+    return 0  # unreachable on POSIX success
+
+
 def main(argv: list[str] | None = None) -> int:
     """``app_server_mux.py <codex argv...>`` -- transparent Codex CLI
     wrapper for an explicitly verified same-host deployment. AIWorkHub never
@@ -1415,11 +1576,10 @@ def main(argv: list[str] | None = None) -> int:
     real_executable = resolve_real_executable()
     if not is_app_server_invocation(raw_argv):
         try:
-            os.execvp(real_executable, [real_executable, *raw_argv])
+            return _passthrough_real_executable(real_executable, raw_argv)
         except OSError as exc:
             print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
             return 1
-        return 0  # unreachable on success -- execvp replaces this process
     # B925/B944: sideband ownership must never be registered without an
     # immutable repository identity.  The VS Code ``chatgpt.cliExecutable``
     # setting is application-scoped, however, so a launcher selected by one
@@ -1431,11 +1591,10 @@ def main(argv: list[str] | None = None) -> int:
     repo_id = wait_for_repo_id_for_mux()
     if not repo_id:
         try:
-            os.execvp(real_executable, [real_executable, *raw_argv])
+            return _passthrough_real_executable(real_executable, raw_argv)
         except OSError as exc:
             print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
             return 1
-        return 0  # unreachable on success -- execvp replaces this process
     return run_mux(raw_argv, repo_id=repo_id)
 
 
@@ -1453,6 +1612,7 @@ __all__ = [
     "SIDEBAND_ALLOWED_REQUEST_KEYS",
     "SIDEBAND_DEDUP_MAX_ENTRIES",
     "SIDEBAND_DEDUP_TTL_SECONDS",
+    "SIDEBAND_ENDPOINT_MAX_BYTES",
     "SIDEBAND_INSTANCES_SUBDIR",
     "SIDEBAND_INSTANCE_ID_BYTES",
     "SIDEBAND_MAX_OWNED_THREAD_IDS",
@@ -1467,6 +1627,8 @@ __all__ = [
     "SidebandInstance",
     "SidebandNotReady",
     "SidebandRejected",
+    "bind_sideband_listener",
+    "connect_sideband_socket",
     "default_sideband_dir",
     "describe_sideband_owner_freshness",
     "ensure_private_dir",
@@ -1474,9 +1636,11 @@ __all__ = [
     "is_app_server_invocation",
     "list_live_sideband_instances",
     "main",
+    "_passthrough_real_executable",
     "resolve_real_executable",
     "run_mux",
     "sideband_instances_dir",
+    "sideband_uses_unix_socket",
     "write_capability_token",
 ]
 

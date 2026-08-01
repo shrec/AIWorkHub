@@ -113,6 +113,18 @@ function testStrictPackagingLogic() {
     throw new Error("package-vsix must throw on missing .cmd launcher");
   }
 
+  if (!pkgVsix.includes('childProcess.execFileSync("go"')) {
+    throw new Error("package-vsix must synchronously require native launcher compilation");
+  }
+  for (const required of ["windows-x86_64", "windows-aarch64", 'GOOS: "windows"']) {
+    if (!pkgVsix.includes(required)) {
+      throw new Error(`package-vsix is missing required native Windows contract: ${required}`);
+    }
+  }
+  if (!pkgVsix.includes("native Windows mux launcher is missing or invalid")) {
+    throw new Error("package-vsix must fail hard when a native Windows launcher is invalid");
+  }
+
   // The old existsSync check must be gone
   const oldPattern =
     "fs.existsSync(MUX_LAUNCHER_DEST) || !(fs.statSync(MUX_LAUNCHER_DEST).mode & 0o111)";

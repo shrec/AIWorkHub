@@ -144,7 +144,11 @@ function loadExtensionHost(repoRoot) {
   process.env[muxEnvName] = muxDir;
 
   const originalSpawn = childProcess.spawn;
+  const originalExecFile = childProcess.execFile;
   childProcess.spawn = () => new FakeChild();
+  childProcess.execFile = (_command, _args, _options, callback) => {
+    setImmediate(() => callback(null, "", ""));
+  };
 
   const host = loadExtensionHost(repoA);
   try {
@@ -231,6 +235,7 @@ function loadExtensionHost(repoRoot) {
   } finally {
     if (originalMuxDir === undefined) delete process.env[muxEnvName];
     else process.env[muxEnvName] = originalMuxDir;
+    childProcess.execFile = originalExecFile;
     childProcess.spawn = originalSpawn;
   }
   console.log("AIWorkHub window route lease renewal regression passed");

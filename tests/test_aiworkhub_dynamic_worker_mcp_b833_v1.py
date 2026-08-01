@@ -41,9 +41,13 @@ def _mute_chmod(monkeypatch: pytest.MonkeyPatch) -> None:
     ``chmod``/``fchmod`` calls are defense-in-depth only, so muting them here
     (matching the existing ``test_worker_ai_infra_context_b437_v1.py``
     idiom) does not weaken what this test actually verifies.
+
+    ``os.fchmod`` is POSIX-only -- guard the patch so the same helper runs
+    unchanged on Windows where the attribute is absent.
     """
     monkeypatch.setattr(os, "chmod", lambda *args, **kwargs: None)
-    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
+    if hasattr(os, "fchmod"):
+        monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +561,15 @@ def test_generate_worker_mcp_runtime_writes_three_adapter_config_shapes(monkeypa
     assert f"[mcp_servers.{w.SERVER_NAME}.env]" in codex_toml
     assert f'args = ["-m", "{expected_package_module}"]' in codex_toml
     assert w.ENV_TASK_ID in codex_toml and "TASK_B833" in codex_toml
-    assert w.ENV_PYTHONPATH in codex_toml and str(module_file.parents[1]) in codex_toml
+    # TOML escapes backslashes in Windows paths (e.g. ``D:\Dev`` -> ``D:\\Dev``),
+    # so the raw text never contains the bare ``str(path)``. Parse the TOML and
+    # assert on the deserialised value instead, which is platform-independent.
+    import tomllib
+
+    parsed_toml = tomllib.loads(codex_toml)
+    assert parsed_toml["mcp_servers"][w.SERVER_NAME]["env"][w.ENV_PYTHONPATH] == str(
+        module_file.parents[1]
+    )
     assert runtime.codex_config_toml_path == home / ".codex" / "config.toml"
 
     # No credential leakage: the runtime env never carries a provider secret.

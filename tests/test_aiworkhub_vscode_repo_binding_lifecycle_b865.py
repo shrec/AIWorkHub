@@ -187,11 +187,13 @@ def test_extension_reload_restore_disposes_stale_controller_before_adopting_new_
     assert "pushSnapshot(view)" in body
 
 
-def test_extension_handshake_calls_dispatcher_ensure_started():
+def test_extension_first_snapshot_precedes_dispatcher_convergence():
     handshake = _slice(_EXTENSION_JS, "async _handshake()", 1800)
     convergence = _slice(_EXTENSION_JS, "_convergeBackgroundServices()", 1800)
-    assert "this._convergeBackgroundServices()" in handshake
-    assert "DISPATCHER_TOOLS.ensureStarted" in convergence
+    snapshot = _slice(_EXTENSION_JS, "async function pushSnapshotOnce(view)", 1800)
+    assert "this._convergeBackgroundServices()" not in handshake
+    assert "this.ensureDispatcherStarted(5000)" in convergence
+    assert snapshot.index("view.postMessage({") < snapshot.index("client._convergeBackgroundServices()")
 
 
 def test_extension_deactivate_stops_dispatcher_before_terminating_child():

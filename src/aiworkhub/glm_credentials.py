@@ -93,7 +93,8 @@ def credential_path(path: os.PathLike[str] | str | None = None) -> Path:
     override = os.environ.get(CREDENTIAL_PATH_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return Path.home() / _DEFAULT_CREDENTIAL_REL
+    home_override = os.environ.get("HOME", "").strip()
+    return (Path(home_override) if home_override else Path.home()) / _DEFAULT_CREDENTIAL_REL
 
 
 def _within(repo: Path, candidate: Path) -> bool:
@@ -137,9 +138,10 @@ def load_credential(
         raise CredentialError("credential_symlink_rejected")
     if not stat.S_ISREG(lst.st_mode):
         raise CredentialError("credential_not_regular_file")
-    if lst.st_uid != os.getuid():
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None and lst.st_uid != getuid():
         raise CredentialError("credential_wrong_owner")
-    if stat.S_IMODE(lst.st_mode) & 0o077:
+    if os.name != "nt" and stat.S_IMODE(lst.st_mode) & 0o077:
         raise CredentialError("credential_group_or_world_accessible")
     if lst.st_size == 0:
         raise CredentialError("credential_empty_file")
@@ -160,7 +162,7 @@ def load_credential(
         raise CredentialError("credential_file_unreadable") from None
     try:
         mode = stat.S_IMODE(os.fstat(fd).st_mode)
-        if mode & 0o077:
+        if os.name != "nt" and mode & 0o077:
             raise CredentialError("credential_group_or_world_accessible")
         with os.fdopen(fd, "r", closefd=False, encoding="utf-8") as fh:
             raw = fh.read(MAX_CREDENTIAL_FILE_BYTES + 1)
@@ -241,10 +243,13 @@ def bootstrap_credential(
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        os.close(fd)
+        fd = -1
         os.replace(tmp, target)
         os.chmod(target, 0o600)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         try:
             tmp.unlink()
         except FileNotFoundError:

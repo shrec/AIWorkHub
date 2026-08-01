@@ -15,8 +15,10 @@ No test spawns a real ``codex`` binary and no test relies on a mocked
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import queue
 import shutil
 import socket
 import stat
@@ -200,8 +202,17 @@ def test_non_app_server_invocation_execs_real_binary_with_exact_argv_and_exit_co
 
         env = dict(os.environ)
         env[app_server_mux.ENV_REAL_EXECUTABLE] = str(fake_real)
+        mux_args = ["exec", "--foo", "bar baz"]
+        if os.name == "nt":
+            fake_real = fake_real.with_suffix(".py")
+            fake_real.write_text(
+                "import sys, json\nprint(json.dumps(sys.argv[1:]))\nraise SystemExit(37)\n",
+                encoding="utf-8",
+            )
+            env[app_server_mux.ENV_REAL_EXECUTABLE] = sys.executable
+            mux_args = [str(fake_real), *mux_args]
         result = subprocess.run(
-            [sys.executable, str(MUX_MODULE), "exec", "--foo", "bar baz"],
+            [sys.executable, str(MUX_MODULE), *mux_args],
             env=env, capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 37
@@ -216,9 +227,15 @@ def test_non_app_server_invocation_never_touches_sideband_dir():
 
         env = dict(os.environ)
         env[app_server_mux.ENV_REAL_EXECUTABLE] = str(fake_real)
+        mux_args = ["login"]
+        if os.name == "nt":
+            fake_real = fake_real.with_suffix(".py")
+            fake_real.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            env[app_server_mux.ENV_REAL_EXECUTABLE] = sys.executable
+            mux_args = [str(fake_real), *mux_args]
         env[app_server_mux.ENV_SIDEBAND_DIR] = str(sideband_dir)
         result = subprocess.run(
-            [sys.executable, str(MUX_MODULE), "login"],
+            [sys.executable, str(MUX_MODULE), *mux_args],
             env=env, capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 0
@@ -267,7 +284,22 @@ class _MuxHarness:
         )
         self._to_mux = os.fdopen(self._to_mux_write_fd, "wb", buffering=0)
         self._from_mux = os.fdopen(self._from_mux_read_fd, "rb", buffering=0)
+        self._windows_lines: queue.Queue[bytes] | None = None
+        if os.name == "nt":
+            self._windows_lines = queue.Queue()
+            threading.Thread(target=self._read_windows_lines, daemon=True).start()
         self._closed = False
+
+    def _read_windows_lines(self) -> None:
+        assert self._windows_lines is not None
+        while True:
+            try:
+                line = self._from_mux.readline()
+            except (OSError, ValueError):
+                return
+            if not line:
+                return
+            self._windows_lines.put(line)
 
     def start(self) -> None:
         self.mux.start()
@@ -278,6 +310,12 @@ class _MuxHarness:
         self._to_mux.flush()
 
     def recv_as_extension(self, timeout: float = 5.0) -> dict:
+        if self._windows_lines is not None:
+            try:
+                line = self._windows_lines.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError("timed out waiting for mux->extension line") from exc
+            return json.loads(line.decode("utf-8"))
         deadline = time.monotonic() + timeout
         line = self._read_line_with_timeout(self._from_mux, deadline)
         return json.loads(line.decode("utf-8"))
@@ -306,10 +344,8 @@ class _MuxHarness:
         request = {"cap": token, "method": method, "params": params}
         if extra:
             request.update(extra)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock = app_server_mux.connect_sideband_socket(self.mux.socket_path, timeout=10)
         try:
-            sock.connect(str(self.mux.socket_path))
             sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
             sock.shutdown(socket.SHUT_WR)
             chunks = []
@@ -346,12 +382,21 @@ class _MuxHarness:
         if self._closed:
             return
         self._closed = True
-        for fh in (self._to_mux, self._from_mux):
+        # On Windows, closing a pipe while another thread is blocked in
+        # readline can itself block. Stop the writer/child first, close the
+        # harness-owned mux output, then join the reader by closing its end.
+        streams = (self._to_mux,) if os.name == "nt" else (self._to_mux, self._from_mux)
+        for fh in streams:
             try:
                 fh.close()
             except OSError:
                 pass
         self.mux.shutdown()
+        if os.name == "nt":
+            with contextlib.suppress(OSError):
+                self.mux._extension_stdout.close()
+            with contextlib.suppress(OSError):
+                self._from_mux.close()
         if self._owns_sideband_dir:
             shutil.rmtree(self.sideband_dir, ignore_errors=True)
 
@@ -696,10 +741,8 @@ def test_sideband_allowlist_is_exactly_three_methods():
 
 
 def test_sideband_rejects_malformed_json(harness):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock = app_server_mux.connect_sideband_socket(harness.mux.socket_path, timeout=5)
     try:
-        sock.connect(str(harness.mux.socket_path))
         sock.sendall(b"{not json\n")
         sock.shutdown(socket.SHUT_WR)
         raw = sock.recv(4096)
@@ -709,10 +752,8 @@ def test_sideband_rejects_malformed_json(harness):
 
 
 def test_sideband_rejects_oversized_request(harness):
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(5)
+    sock = app_server_mux.connect_sideband_socket(harness.mux.socket_path, timeout=5)
     try:
-        sock.connect(str(harness.mux.socket_path))
         oversized = json.dumps({
             "cap": harness.mux.capability_token, "method": "thread/resume",
             "params": {"threadId": "t" * (app_server_mux.SIDEBAND_MAX_REQUEST_BYTES + 1024)},
@@ -727,22 +768,26 @@ def test_sideband_rejects_oversized_request(harness):
 
 def test_sideband_socket_mode_is_owner_only(harness):
     mode = stat.S_IMODE(os.stat(harness.mux.socket_path).st_mode)
-    assert mode == 0o600
+    assert harness.mux.socket_path.exists()
+    assert os.name == "nt" or mode == 0o600
 
 
 def test_sideband_capability_file_mode_is_owner_only(harness):
     mode = stat.S_IMODE(os.stat(harness.mux.capability_path).st_mode)
-    assert mode == 0o600
+    assert harness.mux.capability_path.exists()
+    assert os.name == "nt" or mode == 0o600
 
 
 def test_sideband_registry_file_mode_is_owner_only(harness):
     mode = stat.S_IMODE(os.stat(harness.mux.registry_path).st_mode)
-    assert mode == 0o600
+    assert harness.mux.registry_path.exists()
+    assert os.name == "nt" or mode == 0o600
 
 
 def test_sideband_directory_mode_is_owner_only(harness):
     mode = stat.S_IMODE(os.stat(harness.sideband_dir).st_mode)
-    assert mode == 0o700
+    assert harness.sideband_dir.is_dir()
+    assert os.name == "nt" or mode == 0o700
 
 
 def test_sideband_rejects_wrong_uid_peer(harness, monkeypatch):
@@ -829,6 +874,9 @@ def test_wait_returns_child_exit_code_and_cleans_up(tmp_path):
         returncode = h.mux.wait()
     finally:
         h._closed = True
+        if os.name == "nt":
+            with contextlib.suppress(OSError):
+                h.mux._extension_stdout.close()
         try:
             h._from_mux.close()
         except OSError:

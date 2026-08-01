@@ -158,6 +158,7 @@ function loadExtensionHost(repoRoot, pythonPath) {
 function installSpawnFake(generationsByRoot) {
   const spawns = [];
   const original = childProcess.spawn;
+  const originalExecFile = childProcess.execFile;
   // extension.js canonicalizes repository roots with realpath before
   // spawning.  macOS commonly rewrites /var -> /private/var and Windows may
   // normalize drive casing, so key the scripted generations by the same
@@ -174,6 +175,8 @@ function installSpawnFake(generationsByRoot) {
       cmd,
       args,
       env: options.env,
+      shell: options.shell,
+      windowsHide: options.windowsHide,
       repoRoot: options.env.AIWORKHUB_REPO_ROOT,
       repoId: options.env.AIWORKHUB_REPO_ID,
       windowId: options.env.AIWORKHUB_WINDOW_ID,
@@ -185,7 +188,16 @@ function installSpawnFake(generationsByRoot) {
     const generation = queue.shift() || { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false };
     return new FakeChild(spawnRecord, generation);
   };
-  return { spawns, restore: () => { childProcess.spawn = original; } };
+  childProcess.execFile = (_cmd, _args, _options, callback) => {
+    setImmediate(() => callback(null, "", ""));
+  };
+  return {
+    spawns,
+    restore: () => {
+      childProcess.execFile = originalExecFile;
+      childProcess.spawn = original;
+    },
+  };
 }
 
 // A real ViewState (not a bare {postMessage} stub) -- pushSnapshot/
@@ -252,13 +264,17 @@ async function testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence
   try {
     const host = loadExtensionHost(repoRoot);
     await host.extension.activate(host.context);
+    assert.strictEqual(fake.spawns.length, 0, "safe activation must not start an MCP child before dashboard demand");
     const client = host.extension.__testInternals.getMcpClient(host.context);
+    await client.ensureStarted();
     assert.strictEqual(
       fake.spawns.length,
       1,
-      `healthy activation unexpectedly spawned ${fake.spawns.length} children: ${JSON.stringify(client.runtimePreflight)}`,
+      `explicit startup unexpectedly spawned ${fake.spawns.length} children: ${JSON.stringify(client.runtimePreflight)}`,
     );
     assert.strictEqual(client.running, true, "healthy activation must keep its child running");
+    assert.strictEqual(fake.spawns[0].shell, false, "MCP child must never use a command shell");
+    assert.strictEqual(fake.spawns[0].windowsHide, true, "MCP child must not create a Windows console window");
     assert.strictEqual(
       host.extension.__testInternals.getMcpClient(host.context),
       client,

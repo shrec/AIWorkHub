@@ -253,7 +253,7 @@ def test_bootstrap_writes_0600_file_and_loads(tmp_path):
     path = tmp_path / "cred.json"
     written = _write_credential(path)
     assert written == path
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert os.name == "nt" or stat.S_IMODE(os.stat(path).st_mode) == 0o600
     cred = dc.load_credential(path=path)
     assert cred.base_url == dc.DEEPSEEK_BASE_URL
     assert cred.provider_type == "openai"
@@ -296,6 +296,8 @@ def test_missing_credential_file_reports_absent(tmp_path):
 
 
 def test_group_or_world_readable_credential_is_rejected(tmp_path):
+    if os.name == "nt":
+        pytest.skip("POSIX mode bits do not represent Windows DACLs")
     path = tmp_path / "cred.json"
     _write_credential(path)
     os.chmod(path, 0o644)
@@ -369,7 +371,11 @@ def test_sanitized_env_only_carries_provider_env_when_given():
     assert merged["COPILOT_PROVIDER_API_KEY"] == FAKE_KEY
     assert merged["COPILOT_PROVIDER_BASE_URL"] == dc.DEEPSEEK_BASE_URL
     # The explicit minimal allowlist is still built from scratch (no broad copy).
-    assert merged["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+    assert merged["PATH"] == (
+        os.environ.get("PATH", str(Path(sys.executable).parent))
+        if os.name == "nt"
+        else "/usr/local/bin:/usr/bin:/bin"
+    )
 
 
 def test_sanitized_env_does_not_read_key_from_os_environ(monkeypatch):

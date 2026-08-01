@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 
 from aiworkhub import platform_io
+
+
+def test_windows_pid_probe_is_non_signalling():
+    if os.name != "nt":
+        return
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert platform_io.windows_pid_is_alive(child.pid)
+        assert child.poll() is None, "liveness probe terminated the target process"
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+    assert not platform_io.windows_pid_is_alive(child.pid)
 
 
 def test_posix_lock_round_trip(tmp_path):

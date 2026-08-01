@@ -184,6 +184,17 @@ def _codex_manager_identity() -> dict[str, str] | None:
     mutable host-global token.  Accept only a same-uid, short ancestor chain
     containing BOTH the Codex App Server and the installed AIWorkHub mux.
     """
+    if os.name == "nt":
+        # Windows has no /proc.  The extension-owned route verifier below uses
+        # a native Toolhelp process snapshot plus process-token SIDs, retaining
+        # the same bounded-ancestry and same-user authority boundary.
+        return (
+            _codex_vscode_env_manager_identity()
+            or _codex_extension_route_manager_identity()
+            or _codex_shared_repo_route_manager_identity()
+            or _codex_route_manager_identity_from_parent_chain()
+        )
+
     pid = os.getppid()
     saw_codex_app_server = False
     mux_pid = 0
@@ -467,6 +478,9 @@ def _codex_route_manager_identity_from_parent_chain() -> dict[str, str] | None:
 
 
 def _pid_in_same_uid_ancestor_chain(target_pid: int, *, max_depth: int) -> bool:
+    if os.name == "nt":
+        return _pid_in_same_windows_user_ancestor_chain(target_pid, max_depth=max_depth)
+
     pid = os.getppid()
     for _ in range(max_depth):
         if pid <= 1:
@@ -481,6 +495,159 @@ def _pid_in_same_uid_ancestor_chain(target_pid: int, *, max_depth: int) -> bool:
             pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
         except (OSError, StopIteration, ValueError):
             return False
+    return False
+
+
+def _windows_process_parent_map() -> dict[int, int] | None:
+    """Return a native Windows PID -> parent PID snapshot."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if snapshot == wintypes.HANDLE(-1).value:
+            return None
+        parents: dict[int, int] = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                if not process_next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            close_handle(snapshot)
+        return parents
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_owner_sid(pid: int) -> str | None:
+    """Return a process token's user SID, failing closed on access errors."""
+
+    if os.name != "nt" or pid <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
+
+        class TOKEN_USER(ctypes.Structure):
+            _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        local_free = kernel32.LocalFree
+        local_free.argtypes = (wintypes.HLOCAL,)
+        local_free.restype = wintypes.HLOCAL
+        open_token = advapi32.OpenProcessToken
+        open_token.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE))
+        open_token.restype = wintypes.BOOL
+        get_token_info = advapi32.GetTokenInformation
+        get_token_info.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        get_token_info.restype = wintypes.BOOL
+        sid_to_string = advapi32.ConvertSidToStringSidW
+        sid_to_string.argtypes = (wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR))
+        sid_to_string.restype = wintypes.BOOL
+
+        process = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return None
+        token = wintypes.HANDLE()
+        try:
+            if not open_token(process, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return None
+            required = wintypes.DWORD()
+            get_token_info(token, 1, None, 0, ctypes.byref(required))  # TokenUser
+            if not required.value:
+                return None
+            buffer = ctypes.create_string_buffer(required.value)
+            if not get_token_info(token, 1, buffer, required.value, ctypes.byref(required)):
+                return None
+            token_user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+            sid_text = wintypes.LPWSTR()
+            if not sid_to_string(token_user.User.Sid, ctypes.byref(sid_text)):
+                return None
+            try:
+                return str(sid_text.value or "") or None
+            finally:
+                local_free(sid_text)
+        finally:
+            if token:
+                close_handle(token)
+            close_handle(process)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _pid_in_same_windows_user_ancestor_chain(
+    target_pid: int,
+    *,
+    max_depth: int,
+    start_pid: int | None = None,
+) -> bool:
+    """Windows equivalent of the same-uid bounded ``/proc`` ancestry check."""
+
+    if target_pid <= 1 or max_depth <= 0:
+        return False
+    current_sid = _windows_process_owner_sid(os.getpid())
+    parents = _windows_process_parent_map()
+    if current_sid is None or parents is None:
+        return False
+    pid = os.getppid() if start_pid is None else start_pid
+    for _ in range(max_depth):
+        if pid <= 1 or _windows_process_owner_sid(pid) != current_sid:
+            return False
+        if pid == target_pid:
+            return True
+        pid = parents.get(pid, 0)
     return False
 
 

@@ -9,6 +9,7 @@ never selects a task by keywords and it never invokes a shell.
 from __future__ import annotations
 
 import fnmatch
+import ctypes
 import hashlib
 import hmac
 import html
@@ -380,10 +381,11 @@ def read_supervisor_status(path: Path) -> dict[str, Any]:
         return {}
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
         return {}
-    if st.st_uid != os.getuid():
-        return {}
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        return {}
+    if os.name != "nt":
+        if st.st_uid != os.getuid():
+            return {}
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            return {}
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -433,7 +435,7 @@ def _configured_limit() -> int:
 
 
 def _safe_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return ""
     # O_NOFOLLOW makes the open itself refuse a symlink atomically -- the
     # is_file() check above is only a pre-filter and cannot close the race
@@ -3475,10 +3477,7 @@ class ProcessManager:
             supervisor_status = self._read_supervisor_status(status_path)
             supervisor_pid = int(latest.get("pid") or 0)
             supervisor_ticks = latest.get("pid_start_ticks")
-            supervisor_alive = bool(
-                supervisor_ticks not in (None, "")
-                and _pid_matches(supervisor_pid, supervisor_ticks)
-            )
+            supervisor_alive = bool(_identity_verified_pid(supervisor_pid, supervisor_ticks))
             # The supervisor process is spawned before its first atomic status
             # write.  A concurrent reconciler can therefore observe the exact
             # live PID while the status file is still absent for a few
@@ -3505,7 +3504,7 @@ class ProcessManager:
                 # matching supervisor/child process group(s). Never act on a
                 # bare "process exists" signal alone.
                 liveness_lost = True
-                if _pid_matches(supervisor_pid, supervisor_ticks):
+                if _identity_verified_pid(supervisor_pid, supervisor_ticks):
                     _terminate_process_group(supervisor_pid, grace_seconds=5.0)
                 supervisor_alive = False
 
@@ -3513,15 +3512,16 @@ class ProcessManager:
             # its child running. Kill only when both PID and proc start time
             # still match the durable status record, preventing PID-reuse
             # termination.
-            child_pid = int(supervisor_status.get("child_pid") or 0)
-            child_ticks = supervisor_status.get("child_pid_start_ticks")
+            verified_child_pid = _identity_verified_pid(
+                supervisor_status.get("child_pid"),
+                supervisor_status.get("child_pid_start_ticks"),
+            )
             if (
                 not supervisor_alive
                 and supervisor_status.get("state") in {"starting", "running"}
-                and child_pid
-                and _pid_matches(child_pid, child_ticks)
+                and verified_child_pid
             ):
-                _terminate_process_group(child_pid, grace_seconds=5.0)
+                _terminate_process_group(verified_child_pid, grace_seconds=5.0)
 
             exit_code = supervisor_status.get("exit_code")
             supervisor_state = str(supervisor_status.get("state") or "")
@@ -5024,6 +5024,17 @@ class ProcessManager:
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return ctypes.get_last_error() == 5  # access denied still proves liveness
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
@@ -5032,9 +5043,36 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _pid_start_ticks(pid: int) -> int | None:
-    """Read Linux proc starttime so a recycled PID cannot be cancelled."""
+    """Read a stable process creation timestamp to guard against PID reuse."""
     if pid <= 0:
         return None
+    if os.name == "nt":
+        class _FileTime(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel = _FileTime()
+        user = _FileTime()
+        try:
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            )
+            if not ok:
+                return None
+            return (int(creation.high) << 32) | int(creation.low)
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         _head, separator, tail = raw.rpartition(")")
@@ -5057,6 +5095,34 @@ def _pid_matches(pid: int, expected_start_ticks: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return _pid_start_ticks(pid) == expected
+
+
+def _identity_verified_pid(pid: Any, ticks: Any) -> int:
+    """Return ``pid`` only when its recorded creation timestamp still matches.
+
+    ``_pid_matches`` deliberately reports a match when no start ticks were
+    recorded, because bare liveness is good enough for *reporting*.  It is
+    never good enough for *termination*: a pid alone is not an identity once
+    the OS has recycled it.
+
+    The blast radius is what makes this platform-specific.  On Linux
+    ``_terminate_process_group`` calls ``os.killpg``, which fails closed with
+    ``ProcessLookupError`` unless the pid really is a process-group leader --
+    and workers get their own session via ``start_new_session=True``.  On
+    Windows there is no ``killpg``, so the same call becomes
+    ``taskkill /PID <pid> /T``, which terminates the pid *and every
+    descendant*.  Handed a recycled pid, that silently destroys an unrelated
+    process tree -- for example a VS Code extension host and the children it
+    owns.  Requiring the creation timestamp closes that hole.
+    """
+
+    try:
+        numeric = int(pid or 0)
+    except (TypeError, ValueError):
+        return 0
+    if numeric <= 0 or ticks in (None, ""):
+        return 0
+    return numeric if _pid_matches(numeric, ticks) else 0
 
 
 def _canonical_task_status(card: dict[str, Any]) -> str:
@@ -5082,6 +5148,29 @@ def _process_proven_dead(pid: int, ticks: Any) -> bool:
 
 
 def _terminate_process_group(pid: int, grace_seconds: float) -> None:
+    if os.name == "nt":
+        # Windows has no killpg(). taskkill /T addresses the exact process
+        # tree created for the worker without involving a command shell.
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            shell=False,
+        )
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.05)
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid), "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            shell=False,
+        )
+        return
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:

@@ -119,7 +119,7 @@ def test_claude_workspace_preseeds_exact_project_trust_without_parent_config(
                 }
             }
         }
-        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        assert os.name == "nt" or stat.S_IMODE(config_path.stat().st_mode) == 0o600
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -322,7 +322,7 @@ def test_sanitized_env_is_allowlisted_and_json_files_are_0600(
     target.write_text("old", encoding="utf-8")
     os.chmod(target, 0o644)
     worker_workspace.write_json_0600(target, {"ok": True})
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert os.name == "nt" or stat.S_IMODE(target.stat().st_mode) == 0o600
     assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
 
 
@@ -617,7 +617,7 @@ def test_allow_unchanged_required_outputs_accepts_exact_baseline_match(
             {
                 "pattern": "out/result.txt",
                 "path": "out/result.txt",
-                "bytes": len("result-v1\n"),
+                "bytes": len((workspace.path / "out" / "result.txt").read_bytes()),
                 "sha256": workspace.workspace_baseline["out/result.txt"],
                 "unchanged_allowed": True,
             }
@@ -753,6 +753,8 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(
     assert worker_workspace.resolve_validation_pythonpath(
         workspace, "bubblewrap", ("read",)
     ) == f"{worker_workspace.SANDBOX_WORKSPACE}/read"
+    if os.name == "nt":
+        return
     approved_site = tmp_path / "approved-site-packages"
     approved_site.mkdir()
     monkeypatch.setattr(
@@ -760,7 +762,8 @@ def test_validation_pythonpath_resolution_is_beneath_worktree(
     )
     approved_site = approved_site.resolve()
     components = worker_workspace.parse_validation_command(
-        f"PYTHONPATH={approved_site}:.:read python3 -m pytest -q x.py"
+        f"PYTHONPATH={os.pathsep.join((str(approved_site), '.', 'read'))} "
+        "python3 -m pytest -q x.py"
     )[1]
     assert worker_workspace.resolve_validation_pythonpath(
         workspace, "landlock", components

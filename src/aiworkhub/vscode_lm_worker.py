@@ -89,9 +89,12 @@ def _write_atomic(workspace: Path, relative: str, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        os.close(fd)
+        fd = -1
         os.replace(tmp_name, target)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         try:
             os.unlink(tmp_name)
         except FileNotFoundError:
@@ -168,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--spec",
-        default=str(Path.home() / ".aiworkhub_vscode_lm_worker.json"),
+        default=str(_default_spec_path()),
     )
     args = parser.parse_args(argv)
     try:
@@ -181,6 +184,20 @@ def main(argv: list[str] | None = None) -> int:
         print(receipt)
     print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def _default_spec_path() -> Path:
+    """Return a usable default even in a deliberately minimal child env.
+
+    ``Path.home()`` raises on Windows when neither USERPROFILE nor a complete
+    HOMEDRIVE/HOMEPATH pair is present.  The launcher normally supplies an
+    explicit ``--spec`` path, so cwd is a safe last-resort default that also
+    lets ``--help`` work in diagnostic subprocesses.
+    """
+    try:
+        return Path.home() / ".aiworkhub_vscode_lm_worker.json"
+    except RuntimeError:
+        return Path.cwd() / ".aiworkhub_vscode_lm_worker.json"
 
 
 if __name__ == "__main__":

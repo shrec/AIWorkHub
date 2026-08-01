@@ -63,6 +63,21 @@ const context = {
   globalStorageUri: { fsPath: globalStorage },
 };
 
+function installFakePackagedWindowsLauncher(extensionRoot = temp) {
+  if (process.platform !== "win32") return "";
+  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+  const native = path.join(extensionRoot, "bin", `windows-${arch}`, "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(native), { recursive: true });
+  fs.writeFileSync(native, Buffer.from("MZ-native-launcher"));
+  return native;
+}
+
+function expectedConfiguredLauncher() {
+  return process.platform === "win32"
+    ? path.join(globalStorage, "bin", "aiworkhub-app-server-mux.exe")
+    : "aiworkhub-app-server-mux";
+}
+
 after(() => fs.rmSync(temp, { recursive: true, force: true }));
 
 test("empty Codex executable remains native and is never configured", async () => {
@@ -74,6 +89,15 @@ test("empty Codex executable remains native and is never configured", async () =
   assert.deepEqual(updates, []);
 });
 
+test("safe mode removes a legacy AIWorkHub-owned Codex executable override", async () => {
+  currentValue = "aiworkhub-app-server-mux";
+  updates.length = 0;
+  const changed = await __testInternals.restoreNativeCodexExecutable();
+  assert.equal(changed, true);
+  assert.equal(currentValue, undefined);
+  assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
+});
+
 test("co-located Codex is configured through one host-local stable mux", async () => {
   const codexRoot = path.join(temp, "openai-chatgpt");
   const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
@@ -81,6 +105,7 @@ test("co-located Codex is configured through one host-local stable mux", async (
   const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
   fs.mkdirSync(path.dirname(executable), { recursive: true });
   fs.writeFileSync(executable, "codex", { mode: 0o755 });
+  installFakePackagedWindowsLauncher();
   fakeVscode.extensions.getExtension = (id) => id === "openai.chatgpt" ? { extensionPath: codexRoot } : null;
   const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
   const testSidebandDir = path.join(temp, "sideband");
@@ -93,7 +118,7 @@ test("co-located Codex is configured through one host-local stable mux", async (
     assert.equal(result.ok, true);
     assert.equal(result.mode, "app_server_sideband");
     assert.equal(result.changed, true);
-    assert.equal(result.launcher, "aiworkhub-app-server-mux");
+    assert.equal(result.launcher, expectedConfiguredLauncher());
     assert.equal(currentValue, result.launcher);
     assert.ok(ignoredSettings.includes("chatgpt.cliExecutable"));
     const pin = fs.readFileSync(path.join(testSidebandDir, "real_executable"), "utf8").trim();
@@ -112,6 +137,7 @@ test("stale equal launcher receives one bounded activation pulse, never a reload
   const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
   fs.mkdirSync(path.dirname(executable), { recursive: true });
   fs.writeFileSync(executable, "codex", { mode: 0o755 });
+  installFakePackagedWindowsLauncher();
   fakeVscode.extensions.getExtension = () => ({ extensionPath: codexRoot });
   const previousSidebandDir = process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR;
   process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR = path.join(temp, "sideband-pulse");
@@ -124,7 +150,7 @@ test("stale equal launcher receives one bounded activation pulse, never a reload
     },
   };
   __testInternals.materializeStableMuxLauncher(pulseContext);
-  currentValue = "aiworkhub-app-server-mux";
+  currentValue = expectedConfiguredLauncher();
   updates.length = 0;
   try {
     const first = await __testInternals.ensureCodexCallbackMuxConfigured(pulseContext);
@@ -167,13 +193,33 @@ test("legacy mux paths from Linux macOS and Windows hosts are all recognized", (
   }
 });
 
-test("machine-neutral AIWorkHub command is never persisted again", async () => {
+test("Windows upgrades a bare mux command to the activation-order-safe native path", async () => {
+  const codexRoot = path.join(temp, "openai-chatgpt-bare-upgrade");
+  const arch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+  const platformName = process.platform === "win32" ? "windows" : process.platform;
+  const executable = path.join(codexRoot, "bin", `${platformName}-${arch}`, process.platform === "win32" ? "codex.exe" : "codex");
+  fs.mkdirSync(path.dirname(executable), { recursive: true });
+  fs.writeFileSync(executable, "codex", { mode: 0o755 });
+  fakeVscode.extensions.getExtension = () => ({ extensionPath: codexRoot });
+  installFakePackagedWindowsLauncher();
   currentValue = "aiworkhub-app-server-mux";
   updates.length = 0;
-  const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
-  assert.equal(result.ok, true);
-  assert.equal(result.changed, false);
-  assert.deepEqual(updates, []);
+  try {
+    const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+    assert.equal(result.ok, true);
+    if (process.platform === "win32") {
+      assert.equal(result.changed, true);
+      assert.equal(currentValue, expectedConfiguredLauncher());
+      assert.deepEqual(updates.filter((entry) => entry.key === "cliExecutable"), [
+        { key: "cliExecutable", value: expectedConfiguredLauncher(), global: 1 },
+      ]);
+    } else {
+      assert.equal(result.changed, false);
+      assert.deepEqual(updates, []);
+    }
+  } finally {
+    fakeVscode.extensions.getExtension = () => null;
+  }
 });
 
 test("unrelated custom Codex executable is never overwritten", async () => {
@@ -219,6 +265,25 @@ test("stable launcher lives outside versioned VSIX and follows runtime current.j
   }
 });
 
+test("macOS uses the executable POSIX launcher instead of a Windows command wrapper", () => {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    const stable = __testInternals.materializeStableMuxLauncher(context);
+    assert.equal(stable, path.join(globalStorage, "bin", "aiworkhub-app-server-mux"));
+    assert.ok(!stable.endsWith(".cmd"));
+  } finally {
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
+});
+
+test("macOS and Linux keep the machine-neutral mux setting", () => {
+  const hostPath = "/Users/alice/Library/Application Support/Code/User/globalStorage/aiworkhub/bin/aiworkhub-app-server-mux";
+  assert.equal(__testInternals.codexMuxLauncherSetting("darwin", hostPath), "aiworkhub-app-server-mux");
+  assert.equal(__testInternals.codexMuxLauncherSetting("linux", hostPath), "aiworkhub-app-server-mux");
+  assert.equal(__testInternals.codexMuxLauncherSetting("win32", "C:\\runtime\\mux.exe"), "C:\\runtime\\mux.exe");
+});
+
 test("bootstrap runtime pointer is available before immutable generation materialization", () => {
   const packagedRuntime = path.join(temp, "runtime");
   fs.mkdirSync(path.join(packagedRuntime, "aiworkhub"), { recursive: true });
@@ -249,7 +314,7 @@ test("manifest-default mux command is materialized on the extension-host PATH", 
   }
 });
 
-test("Windows PATH shim is a command wrapper and never depends on POSIX mode bits", () => {
+test("Windows PATH shim stays in extension-owned storage and never depends on POSIX mode bits", () => {
   const home = path.join(temp, "windows-shim-home");
   const shim = __testInternals.materializePathMuxShim(launcher, {
     platform: "win32",
@@ -258,8 +323,9 @@ test("Windows PATH shim is a command wrapper and never depends on POSIX mode bit
   });
   assert.equal(
     shim,
-    path.join(home, "AppData", "Local", "Microsoft", "WindowsApps", "aiworkhub-app-server-mux.cmd"),
+    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.cmd"),
   );
+  assert.ok(!shim.includes("WindowsApps"));
   const content = fs.readFileSync(shim, "utf8");
   assert.ok(content.startsWith("@echo off"));
   assert.ok(content.includes(launcher));
@@ -278,7 +344,7 @@ test("packaged Windows host installs a native shell-free launcher with an exact 
   });
   assert.equal(
     shim,
-    path.join(home, "AppData", "Local", "Microsoft", "WindowsApps", "aiworkhub-app-server-mux.exe"),
+    path.join(path.dirname(launcher), "aiworkhub-app-server-mux.exe"),
   );
   assert.deepEqual(fs.readFileSync(shim), fs.readFileSync(native));
   assert.equal(
@@ -287,9 +353,8 @@ test("packaged Windows host installs a native shell-free launcher with an exact 
   );
 });
 
-test("package contributes only the machine-neutral Codex mux command", () => {
+test("package never changes the Codex executable without explicit opt-in", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
-  assert.deepEqual(manifest.contributes.configurationDefaults, {
-    "chatgpt.cliExecutable": "aiworkhub-app-server-mux",
-  });
+  assert.equal(manifest.contributes.configurationDefaults, undefined);
+  assert.equal(manifest.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"].default, false);
 });

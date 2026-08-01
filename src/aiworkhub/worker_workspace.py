@@ -708,8 +708,15 @@ def provision_worker_mcp_runtime(
     if not workspace.repo.is_dir():
         raise WorkspaceError(f"authority_repo_not_directory:{workspace.repo}")
     if backend == "bubblewrap":
-        worker_repo = Path(SANDBOX_WORKSPACE)
-        authority_repo = Path(SANDBOX_AUTHORITY_REPO)
+        # Bubblewrap-allocated sandbox aliases are POSIX paths that exist only
+        # inside the sandbox's mount namespace. Use PurePosixPath so their
+        # string representation stays POSIX-shaped (e.g. "/aiworkhub-package-root")
+        # even on Windows, where Path("/") would otherwise normalize to a
+        # drive-relative form ("\\aiworkhub-package-root"). These values are
+        # emitted verbatim into the worker MCP config/env and are never used
+        # to touch the host filesystem directly.
+        worker_repo = PurePosixPath(SANDBOX_WORKSPACE)
+        authority_repo = PurePosixPath(SANDBOX_AUTHORITY_REPO)
     else:
         worker_repo = workspace.path
         authority_repo = workspace.repo
@@ -722,7 +729,7 @@ def provision_worker_mcp_runtime(
             f"package_import_root_not_directory:{host_package_import_root}"
         )
     package_import_root = (
-        Path(SANDBOX_PACKAGE_IMPORT_ROOT) if backend == "bubblewrap" else host_package_import_root
+        PurePosixPath(SANDBOX_PACKAGE_IMPORT_ROOT) if backend == "bubblewrap" else host_package_import_root
     )
 
     worker_review_packet_path: Path | None = None
@@ -731,7 +738,7 @@ def provision_worker_mcp_runtime(
         _require_beneath(workspace.home, host_packet)
         relative_packet = host_packet.relative_to(workspace.home)
         worker_review_packet_path = (
-            Path(bubblewrap_home_env_value()) / relative_packet
+            PurePosixPath(bubblewrap_home_env_value()) / PurePosixPath(*relative_packet.parts)
             if backend == "bubblewrap"
             else host_packet
         )
@@ -1281,13 +1288,9 @@ def sanitized_env(
     else:
         # Bubblewrap provides a private /tmp. Do not chmod or create anything
         # in the caller's real HOME while constructing the child environment.
-        temp_home = Path("/tmp")
-    safe: dict[str, str] = {
+        temp_home = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
+    common: dict[str, str] = {
         "HOME": str(selected_home),
-        "USER": os.environ.get("USER", "shrek"),
-        "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "shrek")),
-        "SHELL": "/bin/bash",
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", os.environ.get("LANG", "C.UTF-8")),
         "PYTHONUNBUFFERED": "1",
@@ -1297,6 +1300,34 @@ def sanitized_env(
         "TMP": str(temp_home),
         "TEMP": str(temp_home),
     }
+    if os.name == "nt":
+        drive, tail = os.path.splitdrive(str(selected_home))
+        username = os.environ.get("USERNAME", os.environ.get("USER", "user"))
+        safe = {
+            **common,
+            "USERPROFILE": str(selected_home),
+            "HOMEDRIVE": drive or os.environ.get("HOMEDRIVE", ""),
+            "HOMEPATH": tail or os.environ.get("HOMEPATH", "\\"),
+            "USERNAME": username,
+            "USER": username,
+            "LOGNAME": username,
+            # Windows process creation and CLI shim discovery require the
+            # native PATH/PATHEXT plus SystemRoot/ComSpec.  None contain
+            # credentials, and dropping them makes even Python and *.cmd
+            # launchers fail before the sandbox can start.
+            "PATH": os.environ.get("PATH", str(Path(sys.executable).parent)),
+        }
+        for key in ("PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC"):
+            if key in os.environ:
+                safe[key] = os.environ[key]
+    else:
+        safe = {
+            **common,
+            "USER": os.environ.get("USER", "shrek"),
+            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "shrek")),
+            "SHELL": "/bin/bash",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+        }
     if isolated_task_queue_db:
         # B328: point any AITools/taskdb.py usage inside the sandbox at the
         # disposable copy provision_isolated_task_queue_db() pre-seeded under
@@ -1995,7 +2026,10 @@ def resolve_validation_pythonpath(
         target = _require_beneath(workspace.path, workspace.path / component)
         if target.is_symlink() or not target.is_dir():
             raise WorkspaceError(f"validation_pythonpath_not_directory:{component}")
-        resolved.append(f"{base}/{PurePosixPath(component).as_posix()}")
+        if backend == "bubblewrap":
+            resolved.append(f"{base}/{PurePosixPath(component).as_posix()}")
+        else:
+            resolved.append(str(workspace.path / Path(*PurePosixPath(component).parts)))
     return os.pathsep.join(resolved)
 
 
@@ -2056,7 +2090,10 @@ def resolve_trusted_pytest_runtime_root() -> Path:
         info = candidate.stat()
     except OSError as exc:
         raise WorkspaceError(f"validation_pytest_runtime_unavailable:{candidate}") from exc
-    if info.st_uid != os.getuid():
+    # The host pytest runtime is only checked for same-owner where POSIX
+    # ownership is meaningful; Windows ACLs protect the user site-packages
+    # tree, and os.getuid() is unavailable there.
+    if os.name != "nt" and info.st_uid != os.getuid():
         raise WorkspaceError(f"validation_pytest_runtime_untrusted_owner:{candidate}")
     if stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError(f"validation_pytest_runtime_world_writable:{candidate}")
@@ -2222,10 +2259,13 @@ def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        os.close(fd)
+        fd = -1
         os.replace(temp, path)
         os.chmod(path, 0o600)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         temp.unlink(missing_ok=True)
 
 

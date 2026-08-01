@@ -6,6 +6,178 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.23] - 2026-08-01
+
+### Fixed
+
+- Fixed a Windows activation-order race where the OpenAI extension launched its bundled `codex.exe` before AIWorkHub could add the callback mux command to the extension-host `PATH`. Windows now persists the exact extension-owned native mux executable path after the same-host and explicit-opt-in gates succeed.
+- Kept the existing POSIX command and `PATH` behavior unchanged, continued excluding `chatgpt.cliExecutable` from Settings Sync, and added a regression for upgrading the unresolved bare Windows command to the stable native launcher.
+
+## [0.8.22] - 2026-08-01
+
+### Fixed
+
+- Replaced Windows `os.kill(pid, 0)` route and mux liveness probes with non-signalling `OpenProcess` plus `GetExitCodeProcess` checks. On Windows, the old probe could terminate the VS Code extension host with exit code 0 while the dashboard was enumerating routes, leaving the Webview stuck on `Connecting`.
+- Preserved the existing POSIX liveness and `/proc` PID-reuse checks unchanged, and added a native Windows regression test proving that probing a live process does not terminate it.
+
+## [0.8.21] - 2026-08-01
+
+### Fixed
+
+- Removed three unguarded `os.getuid()` call sites in
+  `terminal_authority.load_or_create_key`, `terminal_authority.read_grant`
+  and `worker_workspace.resolve_trusted_pytest_runtime_root`. Windows
+  exposes no `os.getuid` (the per-user profile is ACL-protected), so each
+  call raised `AttributeError` on import-resolution paths and crashed the
+  whole MCP surface there. All three now gate owner-equivalence behind
+  `os.name != "nt"` while keeping the strict POSIX mode-bit contract intact.
+- Made `process_event_ledger._rotate` use the cross-platform
+  `atomic_replace` instead of a bare `os.replace`. Dashboard and review
+  readers briefly hold the active ledger open; on Windows that sharing lock
+  turned a normal concurrent read into a `WinError 32` write failure that
+  dropped audit events. The bounded retry in `atomic_replace` tolerates the
+  transient without weakening the existing lock-held exclusion of other
+  writers.
+- Stopped worker MCP test helpers from hard-coding `os.fchmod`. 28
+  `test_aiworkhub_dynamic_worker_mcp_*` tests failed at setup on Windows
+  because `monkeypatch.setattr(os, "fchmod", ...)` raises `AttributeError`
+  where the attribute is absent. The helpers now guard the patch with
+  `hasattr(os, "fchmod")`, matching the no-op `chmod_fd` contract
+  `platform_io` already applies on Windows.
+- Stopped the bubblewrap sandbox-alias provisioning from collapse to a
+  Windows drive-relative path. `provision_worker_mcp_runtime` now builds
+  `/workspace`, `/authority-repo`, `/aiworkhub-package-root` and the
+  home alias as `PurePosixPath` for the bubblewrap backend, so their
+  string form stays POSIX-shaped even on a Windows host (previously
+  `str(Path("/aiworkhub-package-root"))` became `\\aiworkhub-package-root`
+  and the worker MCP env pointed at a non-existent drive-relative root).
+- Made the Codex worker-MCP config assertions platform-independent by
+  parsing the rendered TOML with `tomllib.loads` instead of a raw substring
+  search. TOML escapes backslashes in Windows paths, so the previous
+  `str(path) in toml_text` assertion failed even though the deserialised
+  value was correct.
+
+## [0.8.20] - 2026-08-01
+
+### Fixed
+
+- Stopped the extension host from issuing `taskkill /PID <pid> /T /F` for a
+  child that had already exited. A pid identifies our child only while that
+  child runs; afterwards Windows may hand the same pid to any process, and
+  `/T` kills the target *plus every descendant*. If the recycled pid landed
+  above this extension host, the tree kill took the host down — and with it
+  every other extension in the window (Codex, Copilot, Claude), abruptly and
+  with no chance to log anything. Node still owns the process handle, so
+  `exitCode`/`signalCode` now gate the tree kill. POSIX was unaffected: it
+  uses the exact-child `kill()` path instead.
+- Made `lock_fd(blocking=True)` actually block on Windows. `msvcrt.LK_LOCK`
+  is not the counterpart of `flock(LOCK_EX)`: it retries ten times at
+  one-second intervals and then raises `OSError`, so a lock held longer than
+  ten seconds became a hard failure on Windows while POSIX callers simply
+  waited. It now polls the non-blocking primitive, bounded by
+  `WINDOWS_LOCK_MAX_WAIT_SECONDS`: unlike `flock`, a Windows byte-range lock
+  can be blocked by this same process holding another handle, which waiting
+  can never clear, so an unbounded wait would freeze the caller outright.
+- Made system-log pruning linear. It runs on every recorded line — every
+  `[mcp stderr]` chunk and every tool call — and re-serialized the entire
+  retained array on each iteration of a pop loop. Once the retained set
+  crossed the 1 MiB cap that cost ~89 ms per logged line, so ~100 lines
+  blocked the extension-host thread for ~9 s. A host that stops answering
+  VS Code's ping is terminated, taking every other extension in the window
+  (Codex, Copilot, Claude) with it. Measured 88.83 ms -> 2.10 ms per line
+  with byte-identical output.
+- Restored the README hero image on the extension details page. It pointed at
+  an SVG, which VS Code refuses as an image source ("SVGs are not a valid
+  image source") and the Marketplace strips, so the page rendered a broken
+  image. The same artwork now ships as `media/aiworkhub-hero.png`, rasterized
+  from the unchanged `.svg` master, and the packaging allowlist bundles it.
+
+### Changed
+
+- Replaced the placeholder `Other` Marketplace category with `AI`, so the
+  extension is listed as `AI` + `Visualization` rather than falling into the
+  catch-all bucket.
+
+## [0.8.19] - 2026-08-01
+
+### Fixed
+
+- Stopped worker finalization from terminating a process whose identity was
+  never verified. `_pid_matches` reports a match for any live PID when the
+  supervisor status recorded no `child_pid_start_ticks`, and the child branch
+  of `_finalize_isolated_request` trusted it while the sibling supervisor
+  branch did not. Termination now goes through `_identity_verified_pid`, which
+  requires the recorded process creation timestamp. On Linux the terminator is
+  `os.killpg`, which fails closed on a non-leader PID, so the mistake was
+  nearly inert; on Windows there is no `killpg` and the same call becomes
+  `taskkill /PID <pid> /T`, which kills that PID *and every descendant* — so a
+  recycled PID could destroy an unrelated process tree.
+
+### Added
+
+- Passive extension-host crash diagnostics behind the existing
+  `aiworkhub.debugTracing` setting. Uncaught exceptions, unhandled rejections,
+  exit codes and signals are now recorded to the fsynced trace file. Every
+  extension in a window shares one extension-host process, so a fatal error
+  reached while opening the dashboard also takes Codex, Copilot and Claude
+  down; previously that death left no post-mortem at all. The listeners
+  observe only and add no steady-state cost.
+
+## [0.8.18] - 2026-07-31
+
+### Fixed
+
+- Removed eager `*`/startup activation and the package-level
+  `chatgpt.cliExecutable` override. Installing AIWorkHub no longer starts an
+  MCP child, activates VS Code model providers, or changes Codex before the
+  user opens the dashboard.
+- Made the Codex callback mux and VS Code language-model worker bridge
+  explicit opt-ins. Safe mode also removes legacy AIWorkHub-owned Codex
+  overrides while preserving unrelated custom executables.
+- Kept the first dashboard snapshot available during transient Windows route
+  file contention and added regressions for zero eager children, lazy startup,
+  and callback override cleanup.
+
+## [0.8.17] - 2026-07-31
+
+### Fixed
+
+- Prevented transient Windows routing-file `EPERM`/`EBUSY` failures from
+  blocking the first dashboard snapshot and leaving the Webview permanently
+  on `Connecting`. Routing publication is now best-effort at the snapshot
+  boundary while repository reads continue through the bound MCP child.
+- Made routing JSON temporary names collision-safe for concurrent dashboard,
+  lease-renewal, and startup-convergence writes, with failed temporary files
+  cleaned up. Added a Windows contention regression that proves the dashboard
+  still reaches a live snapshot.
+
+## [0.8.16] - 2026-07-31
+
+### Fixed
+
+- Fixed Windows manager verification and the dashboard's permanent
+  `Connecting` state by replacing the unavailable `/proc` ancestry check with
+  a bounded native Toolhelp process-tree snapshot and same-user token SID
+  validation. The existing Linux `/proc` verification path is unchanged.
+- Fixed Windows Codex identity dispatch so it reaches the verified
+  extension-owned route instead of returning at the first missing `/proc`
+  read. A callback-pending route remains a valid repository-local manager
+  while continuing to fail closed for direct callback delivery.
+
+## [0.8.15] - 2026-07-31
+
+### Fixed
+
+- Fixed first-time repository activation on Windows by publishing the
+  authoritative storage-ready snapshot from the MCP process that performed
+  initialization before changing the manifest identity and rebinding.
+- Added a bounded MCP shutdown/startup handoff and exact owned-process-tree
+  termination for Windows `py.exe`/`python.exe` launch chains, preventing the
+  replacement runtime from colliding with lingering SQLite and repository
+  handles. Linux and macOS retain their existing exact-child shutdown path.
+- Added Windows init/rebind regression coverage and durable pre-rebind
+  readiness logging for future runtime diagnosis.
+
 ## [0.8.11] - 2026-07-31
 
 ### Fixed

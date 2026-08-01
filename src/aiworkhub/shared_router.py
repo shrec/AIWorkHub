@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import repository_state
+from .platform_io import windows_pid_is_alive
 
 
 SCHEMA_ID = "aiworkhub.shared_repo_route.v1"
@@ -45,6 +46,8 @@ def _read_manifest_repo_id(root: Path) -> str:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
         return True

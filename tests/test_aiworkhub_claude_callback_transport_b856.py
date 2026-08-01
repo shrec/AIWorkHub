@@ -349,6 +349,14 @@ def test_claude_cli_transport_requires_repo_and_window_identity_fail_closed():
             CallbackBridge(repo=Path(d), db_path=Path(d) / "q.sqlite", transport="claude_cli")
 
 
+def _outbox_stats(db_path: Path) -> dict:
+    conn = callback_store.open_db(db_path)
+    try:
+        return callback_store.callback_outbox_stats(conn)
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # 7. End-to-end: review_ready -> durable outbox -> Claude transport -> ack -> delivered
 # ---------------------------------------------------------------------------
@@ -387,7 +395,7 @@ def test_e2e_review_ready_outbox_claude_transport_ack_delivered():
         assert "--resume" in calls[0]
         assert session_id in calls[0]
 
-        stats = callback_store.callback_outbox_stats(callback_store.open_db(db_path))
+        stats = _outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 1
         assert stats["by_state"]["pending"] == 0
 
@@ -416,7 +424,7 @@ def test_e2e_busy_session_parks_durably_never_dead_letters():
         result = bridge.run_once()
         assert result["ok"] is False
 
-        stats = callback_store.callback_outbox_stats(callback_store.open_db(db_path))
+        stats = _outbox_stats(db_path)
         assert stats["by_state"]["pending"] == 1
         assert stats["by_state"]["dead_letter"] == 0
 
@@ -444,6 +452,6 @@ def test_e2e_unavailable_cli_stays_pending_not_lost():
         result = bridge.run_once()
         assert result["ok"] is False
 
-        stats = callback_store.callback_outbox_stats(callback_store.open_db(db_path))
+        stats = _outbox_stats(db_path)
         assert stats["by_state"]["pending"] == 1
         assert stats["by_state"]["dead_letter"] == 0

@@ -118,7 +118,7 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
     def _deny_fchmod(_fd: int, _mode: int) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(vscode_lm_worker.os, "fchmod", _deny_fchmod)
+    monkeypatch.setattr(vscode_lm_worker.os, "fchmod", _deny_fchmod, raising=False)
     result = vscode_lm_worker.run(request.worker_spec_path)
     assert result["is_error"] is False
     assert result["changed_paths"] == ["out/result.txt"]

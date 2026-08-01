@@ -167,7 +167,7 @@ def test_js_ts_family_gets_file_level_evidence_not_fail_closed(tmp_path, suffix,
     assert entity.kind == "file"
     assert entity.evidence_label == sgast.FILE_EVIDENCE
     assert entity.file_path == f"pkg/widget{suffix}"
-    assert entity.signature == "bytes=39"
+    assert entity.signature == f"bytes={len(target.read_bytes())}"
     # No function/call/import/class is invented from JS/TS source text.
     assert extraction.edges == ()
 

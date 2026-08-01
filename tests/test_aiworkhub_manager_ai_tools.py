@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -17,6 +18,55 @@ from aiworkhub import (  # noqa: E402
     shared_router,
     task_store,
 )
+
+
+def test_windows_ancestor_chain_accepts_only_same_owner_bounded_path(monkeypatch):
+    parents = {300: 200, 200: 100, 100: 10}
+    monkeypatch.setattr(core, "_windows_process_parent_map", lambda: parents)
+    monkeypatch.setattr(core.os, "getpid", lambda: 400)
+    monkeypatch.setattr(
+        core,
+        "_windows_process_owner_sid",
+        lambda pid: "S-1-test" if pid in {400, 300, 200, 100} else "S-1-other",
+    )
+
+    assert core._pid_in_same_windows_user_ancestor_chain(
+        100, max_depth=3, start_pid=300,
+    )
+    assert not core._pid_in_same_windows_user_ancestor_chain(
+        100, max_depth=2, start_pid=300,
+    )
+    assert not core._pid_in_same_windows_user_ancestor_chain(
+        10, max_depth=4, start_pid=300,
+    )
+
+
+def test_windows_ancestor_chain_fails_closed_without_process_snapshot(monkeypatch):
+    monkeypatch.setattr(core, "_windows_process_parent_map", lambda: None)
+    monkeypatch.setattr(core, "_windows_process_owner_sid", lambda pid: "S-1-test")
+
+    assert not core._pid_in_same_windows_user_ancestor_chain(
+        123, max_depth=4, start_pid=456,
+    )
+
+
+def test_codex_manager_identity_dispatches_to_native_windows_verifier(monkeypatch):
+    expected = {
+        "provider": "codex",
+        "session_id": "episode_windows",
+        "thread_id": "",
+        "window_id": "window_windows",
+    }
+    monkeypatch.setattr(core, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(core, "_codex_vscode_env_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_extension_route_manager_identity", lambda: expected)
+    monkeypatch.setattr(
+        core,
+        "_codex_shared_repo_route_manager_identity",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected fallback")),
+    )
+
+    assert core._codex_manager_identity() == expected
 
 
 def _manager_route(root: Path) -> dict:

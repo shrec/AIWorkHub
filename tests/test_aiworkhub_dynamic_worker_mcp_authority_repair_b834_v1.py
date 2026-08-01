@@ -130,7 +130,10 @@ def _worktree_repo(tmp_path: Path, *, name: str = "worktree") -> Path:
 def _mute_chmod(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
     monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
-    monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
+    # os.fchmod is POSIX-only; guard the patch so the helper runs unchanged
+    # on Windows where the attribute is absent.
+    if hasattr(os, "fchmod"):
+        monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
 
 
 def _ctx(
@@ -529,7 +532,16 @@ def test_all_three_adapters_receive_the_authority_bound_runtime(monkeypatch: pyt
     codex_toml = runtime.codex_config_toml_path.read_text(encoding="utf-8")
     for cfg in (claude_cfg, copilot_cfg):
         assert cfg["mcpServers"][w.SERVER_NAME]["env"][w.ENV_AUTHORITY_REPO] == str(authority)
-    assert w.ENV_AUTHORITY_REPO in codex_toml and str(authority) in codex_toml
+    # TOML escapes backslashes in Windows paths (e.g. ``C:\Users`` -> ``C:\\Users``),
+    # so the raw text never contains the bare ``str(authority)``. Parse the TOML
+    # and assert on the deserialised value instead, which is platform-independent.
+    import tomllib
+
+    parsed_toml = tomllib.loads(codex_toml)
+    assert (
+        parsed_toml["mcp_servers"][w.SERVER_NAME]["env"][w.ENV_AUTHORITY_REPO]
+        == str(authority)
+    )
 
 
 def test_inject_worker_mcp_config_rejects_launch_for_all_launchable_adapters_on_missing_config(

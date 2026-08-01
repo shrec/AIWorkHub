@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .platform_io import chmod_fd, lock_fd, unlock_fd
+from .platform_io import atomic_replace, chmod_fd, lock_fd, unlock_fd
 
 
 ACTIVE_LEDGER_MAX_BYTES = 48 * 1024 * 1024
@@ -74,7 +74,12 @@ def _rotate(path: Path) -> Path:
     archive = path.with_name(
         f"{path.stem}.{stamp}.{os.getpid()}.{uuid.uuid4().hex[:8]}{path.suffix}"
     )
-    os.replace(path, archive)
+    # Use cross-platform atomic_replace instead of bare os.replace: on Windows,
+    # a concurrent dashboard/reader holding the active ledger open can briefly
+    # make os.replace fail with WinError 32 (sharing violation). The bounded
+    # retry in atomic_replace tolerates the transient without weakening the
+    # lock-held exclusion of other writers.
+    atomic_replace(path, archive)
     os.chmod(archive, 0o600)
     return archive
 

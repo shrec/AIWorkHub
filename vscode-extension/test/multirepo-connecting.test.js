@@ -220,6 +220,31 @@ async function snapshotFor(host) {
       assert.strictEqual(route.extension_host_pid, process.pid);
       assert.ok(route.window_id.startsWith("window_"));
     }
+    const originalRenameSync = fs.renameSync;
+    let injectedWindowsRouteRenameFailure = false;
+    fs.renameSync = (source, destination) => {
+      if (
+        !injectedWindowsRouteRenameFailure
+        && String(destination).endsWith(path.join("routing", "coordinator-targets.json"))
+      ) {
+        injectedWindowsRouteRenameFailure = true;
+        const error = new Error("simulated Windows route file contention");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRenameSync(source, destination);
+    };
+    let routeContentionMessages;
+    try {
+      routeContentionMessages = await snapshotFor(hostA);
+    } finally {
+      fs.renameSync = originalRenameSync;
+    }
+    assert.ok(injectedWindowsRouteRenameFailure, "Windows route contention fixture did not execute");
+    assert.ok(
+      routeContentionMessages.some((message) => message.type === "snapshot"),
+      `route contention blocked dashboard snapshot: ${JSON.stringify(routeContentionMessages)}`,
+    );
     const firstMessages = [];
     const coalescedView = new hostA.extension.__testInternals.ViewState((message) => firstMessages.push(message));
     const slowFirst = hostA.extension.__testInternals.pushSnapshot(coalescedView);

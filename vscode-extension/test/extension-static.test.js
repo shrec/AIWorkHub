@@ -27,10 +27,8 @@ assert.ok(css.includes(".brand-logo"));
 assert.ok(ext.includes('getHtmlForNavigatorWebview(webview, extensionUri)'));
 assert.ok(ext.includes('<img class="mark" src="${logoUri}"'));
 assert.ok(!ext.includes('M12 2 21 7v10'));
-assert.ok(
-  pkg.activationEvents.includes("onStartupFinished"),
-  "AIWorkHub callbacks must activate after VS Code startup without opening the dashboard"
-);
+assert.ok(!pkg.activationEvents.includes("*"));
+assert.ok(!pkg.activationEvents.includes("onStartupFinished"));
 
 const commands = new Map(pkg.contributes.commands.map((command) => [command.command, command.title]));
 assert.deepStrictEqual([...commands.keys()].sort(), [
@@ -45,6 +43,9 @@ for (const title of commands.values()) {
 assert.strictEqual(pkg.contributes.viewsContainers.activitybar[0].id, "aiworkhub");
 assert.strictEqual(pkg.contributes.views.aiworkhub[0].id, "aiworkhub.view");
 assert.ok(pkg.contributes.configuration.properties["aiworkhub.refreshIntervalMs"]);
+assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"].default, false);
+assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableVscodeLmBridge"].default, false);
+assert.ok(!pkg.contributes.configurationDefaults);
 
 absent(JSON.stringify(pkg) + ext + app + css, [
   "dashboardUrl",
@@ -100,6 +101,10 @@ assert.ok(!ext.includes('config.update("cliExecutable", launcher, true)'));
 assert.ok(ext.includes('config.update("cliExecutable", undefined, globalTarget)'));
 assert.ok(ext.includes("custom_cli_executable_preserved"));
 assert.ok(ext.includes("retainContextWhenHidden: true"));
+assert.ok(app.includes("persistState();\nsignalReady();"));
+assert.ok(app.includes("READY_MAX_ATTEMPTS = 30"));
+assert.ok(app.includes("stopReadyRetry();"));
+assert.ok(!app.includes('vscode.postMessage({ type: "ready" });\nif (state.selectedTaskId)'));
 assert.ok(ext.includes("getHtmlForNavigatorWebview"));
 assert.ok(ext.includes("Open Dashboard"));
 assert.ok(ext.includes("Select Repository"));
@@ -115,7 +120,10 @@ assert.ok(ext.includes("mcpClient.repositoryRoot !== root"));
 // B865: switching repositories must stop the OLD repo's lifecycle-owned
 // dispatcher (never orphaning a nested app-server subprocess) before the
 // old MCP child is killed -- a bare mcpClient.stop() would skip that.
-assert.ok(ext.includes("mcpClient.stopDispatcherThenTerminate({ restart: false })"));
+assert.ok(ext.includes("startupBarrier = mcpClient.stopDispatcherThenTerminate({"));
+assert.ok(ext.includes("timeoutMs: 3000"));
+assert.ok(ext.includes("mcpClient.startupBarrier = startupBarrier"));
+assert.ok(ext.includes('["/PID", String(ownedPid), "/T", "/F"]'));
 
 // B844: `import aiworkhub` must resolve to this extension's own bundled
 // runtime/ directory -- never a repository checkout, an editable install, or
@@ -181,6 +189,8 @@ assert.ok(ext.includes("pushInitializeStorage"));
 assert.ok(ext.includes("REAL_REPO_ID_RE"));
 assert.ok(ext.includes("no_repository_selected"));
 assert.ok(ext.includes("showQuickPick"));
+assert.ok(ext.includes("[mcp] preflight completed"), "MCP preflight outcome must be present in the plugin's own log");
+assert.ok(ext.includes("Child stderr can race extension-host disposal on Windows"));
 assert.ok(ext.includes("workspaceState.get(WSP_STATE_KEY_REPO_URI"));
 assert.ok(ext.includes("workspaceState.update(WSP_STATE_KEY_REPO_URI"));
 
@@ -196,8 +206,20 @@ assert.ok(!ext.includes(".aiworkinghub"), "the legacy .aiworkinghub path must ne
   const handshakeBody = ext.slice(handshakeStart, handshakeEnd);
   assert.ok(handshakeStart >= 0 && handshakeEnd > handshakeStart);
   assert.ok(!handshakeBody.includes("this.callTool("), "handshake must never recurse through ensureStarted()");
-  assert.ok(handshakeBody.includes("this._convergeBackgroundServices()"));
+  assert.ok(
+    !handshakeBody.includes("this._convergeBackgroundServices()"),
+    "slow background services must not be queued ahead of the first Windows snapshot",
+  );
 }
+
+const firstSnapshotStart = ext.indexOf("async function pushSnapshotOnce(view)");
+const firstSnapshotEnd = ext.indexOf("async function pushSnapshotNoRetry(view)", firstSnapshotStart);
+const firstSnapshotBody = ext.slice(firstSnapshotStart, firstSnapshotEnd);
+assert.ok(firstSnapshotBody.indexOf("view.postMessage({") >= 0);
+assert.ok(
+  firstSnapshotBody.indexOf("view.postMessage({") < firstSnapshotBody.indexOf("client._convergeBackgroundServices()"),
+  "the first snapshot must be posted before background convergence starts",
+);
 
 const deactivateMarker = "async function deactivate()";
 const deactivateBody = ext.slice(ext.indexOf(deactivateMarker), ext.indexOf(deactivateMarker) + 1200);
@@ -235,7 +257,15 @@ assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-icon.png")).size > 100
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-activity.svg")));
 const activityIcon = read("media/aiworkhub-activity.svg");
 assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-hero.svg")));
-assert.ok(read("README.md").includes("media/aiworkhub-hero.svg"));
+// The README hero must be a raster image. VS Code refuses SVG as an image
+// source in an extension README ("SVGs are not a valid image source") and the
+// Marketplace strips them, so an <img> pointing at the .svg renders as a
+// broken image on the extension details page. The .svg stays in the repo as
+// the editable master; aiworkhub-hero.png is what ships in the README.
+assert.ok(fs.existsSync(path.join(root, "media", "aiworkhub-hero.png")));
+assert.ok(fs.statSync(path.join(root, "media", "aiworkhub-hero.png")).size > 1000);
+assert.ok(read("README.md").includes("media/aiworkhub-hero.png"));
+assert.ok(!/<img[^>]+\.svg/i.test(read("README.md")), "README must not embed an SVG image");
 assert.ok(activityIcon.includes('aria-label="AIWorkHub"'));
 assert.ok(activityIcon.includes('stroke="currentColor"'));
 assert.ok(activityIcon.includes('<circle cx="128" cy="34"'));
@@ -246,7 +276,7 @@ assert.ok(!activityIcon.includes('M12 2 21 7v10'));
 // runtime/ directory, sourced from the one canonical src/aiworkhub tree.
 const packageVsix = read("test/package-vsix.js");
 const packageJson = JSON.parse(read("package.json"));
-assert.ok(packageJson.activationEvents.includes("*"));
+assert.ok(!packageJson.activationEvents.includes("*"));
 assert.ok(packageVsix.includes('path.join(root, "..", "src", "aiworkhub")'));
 assert.ok(packageVsix.includes('path.join(extensionDir, "runtime", "aiworkhub")'));
 assert.ok(packageVsix.includes("__pycache__"));

@@ -266,14 +266,14 @@ def test_main_unbound_app_server_execs_real_binary_without_sideband(monkeypatch)
     )
     calls: list[tuple[str, list[str]]] = []
 
-    def fake_execvp(executable, args):
+    def fake_passthrough(executable, args):
         calls.append((executable, list(args)))
         raise SystemExit(0)
 
-    monkeypatch.setattr(os, "execvp", fake_execvp)
+    monkeypatch.setattr(asm, "_passthrough_real_executable", fake_passthrough)
     with pytest.raises(SystemExit):
         asm.main(["app-server", "--listen", "stdio://"])
-    assert calls == [("codex", ["codex", "app-server", "--listen", "stdio://"])]
+    assert calls == [("codex", ["app-server", "--listen", "stdio://"])]
 
 
 def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkeypatch):
@@ -375,11 +375,11 @@ def test_main_non_app_server_invocation_never_requires_repo_id(monkeypatch, tmp_
 
     calls: list[list[str]] = []
 
-    def fake_execvp(executable, args):
-        calls.append(list(args))
+    def fake_passthrough(executable, args):
+        calls.append([executable, *args])
         raise SystemExit(0)
 
-    monkeypatch.setattr(os, "execvp", fake_execvp)
+    monkeypatch.setattr(asm, "_passthrough_real_executable", fake_passthrough)
     with pytest.raises(SystemExit):
         asm.main(["exec", "--foo"])
     assert calls and calls[0][0] == str(fake_real)

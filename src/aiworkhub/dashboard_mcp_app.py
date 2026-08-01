@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from typing import Any, Mapping
 
 from aiworkhub import (
@@ -90,6 +91,53 @@ MAX_CONTEXT_VALUE_CHARS = 4000
 # return False for those so the dashboard never tells a user with a corrupt
 # repository to "just click Init Repo" as though nothing has happened yet.
 _NOT_INITIALIZED_REASON_PREFIXES: tuple[str, ...] = ("manifest_invalid:manifest_missing",)
+
+
+def _debug_trace(event: str, **fields: Any) -> None:
+    trace_file = os.environ.get("AIWORKHUB_DEBUG_TRACE_FILE", "").strip()
+    if not trace_file:
+        return
+    payload = {
+        "schema_id": "aiworkhub.mcp_debug_trace.v1",
+        "timestamp_epoch": time.time(),
+        "monotonic": time.monotonic(),
+        "process": "mcp-server",
+        "pid": os.getpid(),
+        "event": str(event)[:120],
+        **fields,
+    }
+    data = (json.dumps(payload, ensure_ascii=True, default=str) + "\n").encode("utf-8")
+    try:
+        os.makedirs(os.path.dirname(trace_file), exist_ok=True)
+        fd = os.open(trace_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+
+
+def _debug_stage(name: str, operation: Any) -> Any:
+    started = time.perf_counter()
+    _debug_trace("snapshot.stage.begin", stage=name)
+    try:
+        result = operation()
+    except Exception as exc:
+        _debug_trace(
+            "snapshot.stage.error",
+            stage=name,
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            error_type=type(exc).__name__,
+        )
+        raise
+    _debug_trace(
+        "snapshot.stage.end",
+        stage=name,
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
+    return result
 
 
 def is_not_initialized_reason(reason: str) -> bool:
@@ -231,14 +279,16 @@ def snapshot_view() -> dict[str, Any]:
     applies the defensive transport bound documented on
     ``MAX_SNAPSHOT_RESPONSE_BYTES``.
     """
-    snapshot = dict(dashboard.build_snapshot())
+    started = time.perf_counter()
+    _debug_trace("snapshot.begin")
+    snapshot = dict(_debug_stage("dashboard.build_snapshot", dashboard.build_snapshot))
     storage = snapshot.get("storage")
     if isinstance(storage, dict) and not storage.get("ready", True):
         storage = dict(storage)
         storage["not_initialized"] = is_not_initialized_reason(storage.get("reason", ""))
         snapshot["storage"] = storage
     try:
-        manager = core.manager_bootstrap()
+        manager = _debug_stage("core.manager_bootstrap", core.manager_bootstrap)
     except Exception as exc:  # noqa: BLE001 -- dashboard diagnostics must not break the queue view
         manager = {
             "ok": False,
@@ -253,7 +303,7 @@ def snapshot_view() -> dict[str, Any]:
     # owned dispatcher is registered/running, so surface the live dispatcher
     # health from this exact repo-bound MCP child in every snapshot.
     try:
-        snapshot["callback_delivery"] = core.dispatcher_health()
+        snapshot["callback_delivery"] = _debug_stage("core.dispatcher_health", core.dispatcher_health)
     except Exception as exc:  # noqa: BLE001 -- callback diagnostics must not break the queue view
         snapshot["callback_delivery"] = {
             "ok": False,
@@ -264,7 +314,11 @@ def snapshot_view() -> dict[str, Any]:
             "problems": [f"dispatcher_health_failed:{type(exc).__name__}"],
         }
     try:
-        snapshot["known_repositories"] = shared_router.list_known_repositories(current_root=core.repo_root(), limit=32)
+        router_root = _debug_stage("core.repo_root.router", core.repo_root)
+        snapshot["known_repositories"] = _debug_stage(
+            "shared_router.list_known_repositories",
+            lambda: shared_router.list_known_repositories(current_root=router_root, limit=32),
+        )
     except Exception as exc:  # noqa: BLE001 -- shared router diagnostics must not break the active repo view
         snapshot["known_repositories"] = {
             "ok": False,
@@ -274,7 +328,11 @@ def snapshot_view() -> dict[str, Any]:
             "rejects": [],
         }
     try:
-        targets = core.read_selected_coordinator_target(core.repo_root())
+        target_root = _debug_stage("core.repo_root.target", core.repo_root)
+        targets = _debug_stage(
+            "core.read_selected_coordinator_target",
+            lambda: core.read_selected_coordinator_target(target_root),
+        )
         selected = str(targets.get("selected_provider") or "")
         selected_target = targets.get("targets", {}).get(selected, {}) if isinstance(targets.get("targets"), dict) else {}
         wake = selected_target.get("wake", {}) if isinstance(selected_target, dict) else {}
@@ -287,7 +345,13 @@ def snapshot_view() -> dict[str, Any]:
         snapshot["manager_identity_target"] = {}
     snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"
     snapshot["authority_flags"] = _readonly_authority_flags()
-    return _bound_snapshot(snapshot)
+    result = _debug_stage("bound_snapshot", lambda: _bound_snapshot(snapshot))
+    _debug_trace(
+        "snapshot.end",
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        response_bytes=_byte_len(result),
+    )
+    return result
 
 
 def task_detail_view(task_id: str) -> dict[str, Any]:
@@ -776,6 +840,10 @@ def initialize_view(repo_id: str = "") -> dict[str, Any]:
         # the same bounded action ALSO provisions the Source Graph directory
         # (never a second, separate init step) -- see repository_bootstrap.py.
         result = repository_bootstrap.initialize_repository_full(root, expected_repo_id=expected)
+        # A pre-init snapshot can cache usage/readiness observations for this
+        # process. Invalidate them before the caller immediately asks for the
+        # authoritative post-init snapshot.
+        storage_observability.invalidate(root)
     except task_store.InitializationRefusedError as exc:
         return {
             "ok": False,

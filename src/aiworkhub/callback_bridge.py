@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import queue
 import re
 import select
 import socket as _socket
@@ -66,6 +67,7 @@ from . import repository_state
 from .app_server_mux import (
     SIDEBAND_REQUEST_DEADLINE_SECONDS as DEFAULT_SIDEBAND_TIMEOUT,
     SIDEBAND_RESPONSE_MAX_BYTES,
+    connect_sideband_socket,
     default_sideband_dir,
     describe_sideband_owner_freshness,
     find_owning_sideband_instances,
@@ -948,15 +950,13 @@ class SidebandCallbackClient:
     def _call(self, method: str, params: dict[str, Any], *, thread_id: str) -> dict[str, Any]:
         owner = self._resolve_owner(thread_id)
         token = self._read_capability(owner.capability_path)
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        sock.settimeout(self._timeout)
+        try:
+            sock = connect_sideband_socket(owner.socket_path, timeout=self._timeout)
+        except OSError as exc:
+            raise SidebandUnavailableError(f"sideband socket unreachable: {exc}") from exc
         with self._socket_lock:
             self._active_socket = sock
         try:
-            try:
-                sock.connect(str(owner.socket_path))
-            except OSError as exc:
-                raise SidebandUnavailableError(f"sideband socket unreachable: {exc}") from exc
             payload = json.dumps({"cap": token, "method": method, "params": params}, ensure_ascii=False)
             try:
                 sock.sendall((payload + "\n").encode("utf-8"))
@@ -1125,6 +1125,8 @@ class AppServerClient:
         self._repo = Path(repo) if repo else Path.cwd()
         self._timeout = timeout
         self._process: subprocess.Popen[bytes] | None = None
+        self._stdout_queue: queue.Queue[bytes | None] | None = None
+        self._stdout_thread: threading.Thread | None = None
         self._next_request_id = 0
         self._initialized = False
 
@@ -1153,20 +1155,36 @@ class AppServerClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AppServerError("timed out waiting for app server response")
-            if self._process.poll() is not None:
-                raise AppServerError(
-                    f"app server exited with code {self._process.returncode}"
-                )
             stdout = self._process.stdout
             if stdout is None:
                 raise AppServerError("app server stdout pipe is unavailable")
-            try:
-                readable, _, _ = select.select([stdout], [], [], min(remaining, 0.1))
-            except (OSError, ValueError) as exc:
-                raise AppServerError(f"app server stdout wait failed: {exc}") from exc
-            if not readable:
-                continue
-            line = stdout.readline()
+            if os.name == "nt":
+                if self._stdout_queue is None:
+                    raise AppServerError("app server stdout reader is unavailable")
+                try:
+                    line = self._stdout_queue.get(timeout=min(remaining, 0.1))
+                except queue.Empty:
+                    if self._process.poll() is not None:
+                        raise AppServerError(
+                            f"app server exited with code {self._process.returncode}"
+                        )
+                    continue
+                if line is None:
+                    raise AppServerError(
+                        f"app server exited with code {self._process.poll()}"
+                    )
+            else:
+                if self._process.poll() is not None:
+                    raise AppServerError(
+                        f"app server exited with code {self._process.returncode}"
+                    )
+                try:
+                    readable, _, _ = select.select([stdout], [], [], min(remaining, 0.1))
+                except (OSError, ValueError) as exc:
+                    raise AppServerError(f"app server stdout wait failed: {exc}") from exc
+                if not readable:
+                    continue
+                line = stdout.readline()
             if not line:
                 time.sleep(0.01)
                 continue
@@ -1176,6 +1194,22 @@ class AppServerClient:
                 continue
             if isinstance(decoded, dict):
                 return decoded
+
+    def _read_windows_stdout(self, process: subprocess.Popen[bytes]) -> None:
+        output = self._stdout_queue
+        stdout = process.stdout
+        if output is None or stdout is None:
+            return
+        try:
+            while True:
+                line = stdout.readline()
+                if not line:
+                    break
+                output.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            output.put(None)
 
     def _recv_response_for(self, request_id: int, *, timeout: float | None = None) -> dict[str, Any]:
         """Read messages until the response matching ``request_id`` arrives.
@@ -1214,6 +1248,14 @@ class AppServerClient:
                 start_new_session=True,
                 bufsize=0,
             )
+            if os.name == "nt":
+                self._stdout_queue = queue.Queue()
+                self._stdout_thread = threading.Thread(
+                    target=self._read_windows_stdout,
+                    args=(self._process,),
+                    daemon=True,
+                )
+                self._stdout_thread.start()
             self._initialized = False
         except (OSError, ValueError) as exc:
             raise AppServerError(f"failed to start app server: {exc}") from exc
@@ -1232,6 +1274,11 @@ class AppServerClient:
         except (OSError, subprocess.TimeoutExpired):
             pass
         finally:
+            reader = self._stdout_thread
+            if reader is not None:
+                reader.join(timeout=1)
+            self._stdout_thread = None
+            self._stdout_queue = None
             self._process = None
             self._initialized = False
 

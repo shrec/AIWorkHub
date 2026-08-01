@@ -482,6 +482,8 @@ def test_restart_waits_for_write_gate_before_promotion_and_review(
     tmp_path: Path,
     repo: Path,
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("review finalization requires the POSIX secure sandbox backend")
     monkeypatch.delenv(process_launcher.ALLOW_WRITES_ENV, raising=False)
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
     card = _card()
@@ -627,6 +629,8 @@ def test_required_ignored_output_promoted_in_full_finalize_flow(
     exact paths into the promotion set, so a gitignored .bin that
     validate_required_outputs accepts is successfully promoted and appears in
     promoted_paths."""
+    if os.name == "nt":
+        pytest.skip("review finalization requires the POSIX secure sandbox backend")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
     repo = _gitignored_repo(tmp_path)

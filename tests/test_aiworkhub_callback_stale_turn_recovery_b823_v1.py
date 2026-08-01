@@ -59,12 +59,7 @@ class _Endpoint:
         app_server_mux.ensure_private_dir(sideband_instances_dir(self.sideband_dir))
         _write_0600(self.capability_path, self.capability)
         self._write_registry()
-        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old_umask = os.umask(0o177)
-        try:
-            self._server.bind(str(self.socket_path))
-        finally:
-            os.umask(old_umask)
+        self._server = app_server_mux.bind_sideband_listener(self.socket_path)
         self._server.listen(8)
         self._server.settimeout(0.1)
         self._thread = threading.Thread(target=self._accept, daemon=True)

@@ -13,6 +13,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const childProcess = require("node:child_process");
 
 // ── Mock vscode before extension.js loads ────────────────────────────────
 const Module = require("module");
@@ -44,6 +45,7 @@ Module._load = function (request, parent, isMain) {
 
 const { __testInternals } = require("../extension.js");
 const findPythonCommand = __testInternals.findPythonCommand;
+const findPythonCommandForLaunch = __testInternals.findPythonCommandForLaunch;
 const _preflightPythonCandidate = __testInternals._preflightPythonCandidate;
 const _buildPreflightDiagnostic = __testInternals._buildPreflightDiagnostic;
 
@@ -255,6 +257,57 @@ describe("findPythonCommand (Windows)", { skip: posixStubOnly }, () => {
     assert.ok(r.preflightDiagnostic.length <= 1300);
     assert.ok(r.preflightDiagnostic.includes(".venv") || r.preflightDiagnostic.includes("venv"));
   });
+});
+
+test("Windows configuration resolution skips synchronous preflight", () => {
+  const originalPlatform = process.platform;
+  const originalSpawnSync = childProcess.spawnSync;
+  let spawnCalls = 0;
+  Object.defineProperty(process, "platform", { value: "win32" });
+  childProcess.spawnSync = () => {
+    spawnCalls += 1;
+    throw new Error("configuration resolution must not spawn");
+  };
+  try {
+    const resolved = findPythonCommand("C:\\missing-repository", { preflight: false });
+    assert.equal(resolved.command, "py");
+    assert.deepEqual(resolved.argsPrefix, ["-3"]);
+    assert.equal(spawnCalls, 0);
+  } finally {
+    childProcess.spawnSync = originalSpawnSync;
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
+});
+
+test("Windows launch preflight yields the extension-host event loop", async () => {
+  const originalPlatform = process.platform;
+  const originalSpawnSync = childProcess.spawnSync;
+  const originalExecFile = childProcess.execFile;
+  let eventLoopYielded = false;
+  let spawnCalls = 0;
+  let execCalls = 0;
+  Object.defineProperty(process, "platform", { value: "win32" });
+  childProcess.spawnSync = () => {
+    spawnCalls += 1;
+    throw new Error("launch resolution must not block");
+  };
+  childProcess.execFile = (command, args, options, callback) => {
+    execCalls += 1;
+    setImmediate(() => callback(null, "", ""));
+  };
+  setImmediate(() => { eventLoopYielded = true; });
+  try {
+    const resolved = await findPythonCommandForLaunch("C:\\missing-repository");
+    assert.equal(resolved.command, "py");
+    assert.deepEqual(resolved.argsPrefix, ["-3"]);
+    assert.equal(spawnCalls, 0);
+    assert.equal(execCalls, 1);
+    assert.equal(eventLoopYielded, true);
+  } finally {
+    childProcess.execFile = originalExecFile;
+    childProcess.spawnSync = originalSpawnSync;
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  }
 });
 
 test(

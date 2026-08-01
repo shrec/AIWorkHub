@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 try:
-    from .platform_io import chmod_fd
+    from .platform_io import atomic_replace, chmod_fd
 except ImportError:  # direct-script entrypoint
+    from platform_io import atomic_replace
+
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
@@ -36,6 +38,84 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MIN_MAX_OUTPUT_BYTES = 1024
 _TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("read_operations", ctypes.c_uint64),
+        ("write_operations", ctypes.c_uint64),
+        ("other_operations", ctypes.c_uint64),
+        ("read_bytes", ctypes.c_uint64),
+        ("write_bytes", ctypes.c_uint64),
+        ("other_bytes", ctypes.c_uint64),
+    ]
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("per_process_user_time_limit", ctypes.c_int64),
+        ("per_job_user_time_limit", ctypes.c_int64),
+        ("limit_flags", ctypes.c_uint32),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", ctypes.c_uint32),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", ctypes.c_uint32),
+        ("scheduling_class", ctypes.c_uint32),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("basic_limit_information", _JobBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    ]
+
+
+class _WindowsKillOnCloseJob:
+    """Own a Windows Job Object that kills the worker tree on supervisor loss."""
+
+    def __init__(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+        ]
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = _JobExtendedLimitInformation()
+        info.basic_limit_information.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        self._kernel32 = kernel32
+        self._handle: int | None = int(handle)
+
+    def assign(self, child: subprocess.Popen[bytes]) -> None:
+        if self._handle is None or not self._kernel32.AssignProcessToJobObject(
+            self._handle, int(child._handle)  # type: ignore[attr-defined]
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
 
 
 def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
@@ -50,10 +130,13 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        os.close(fd)
+        fd = -1
+        atomic_replace(temp, path)
         os.chmod(path, 0o600)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         temp.unlink(missing_ok=True)
 
 
@@ -69,6 +152,15 @@ def _open_0600(path: Path) -> BinaryIO:
 
 
 def _terminate_child(child: subprocess.Popen[bytes], grace: float = KILL_GRACE_SECONDS) -> int:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(child.pid), "/T"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            shell=False,
+        )
+        return int(child.wait(timeout=grace))
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -107,7 +199,7 @@ def _load_spec(path: Path) -> dict[str, Any]:
     fd = os.open(path, flags)
     try:
         mode = stat.S_IMODE(os.fstat(fd).st_mode)
-        if mode & 0o077:
+        if os.name != "nt" and mode & 0o077:
             raise ValueError(f"insecure_spec_mode:{mode:o}")
         with os.fdopen(fd, "r", closefd=False, encoding="utf-8") as fh:
             payload = json.loads(fh.read())
@@ -127,12 +219,19 @@ def _validated_argv(value: Any) -> list[str]:
 
 
 def _die_with_supervisor() -> None:
-    """Ensure an abruptly killed supervisor cannot orphan its worker."""
+    """Ensure an abruptly killed Linux supervisor cannot orphan its worker."""
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
         os._exit(126)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _posix_worker_spawn_kwargs(platform: str | None = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"start_new_session": True}
+    if (platform or sys.platform) == "linux":
+        kwargs["preexec_fn"] = _die_with_supervisor
+    return kwargs
 
 
 def _pid_start_ticks(pid: int) -> int | None:
@@ -228,6 +327,7 @@ def supervise(spec: dict[str, Any]) -> int:
     deadline_monotonic = time.monotonic() + timeout
     cancel_requested = False
     child: subprocess.Popen[bytes] | None = None
+    windows_job: _WindowsKillOnCloseJob | None = None
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal cancel_requested
@@ -235,6 +335,8 @@ def supervise(spec: dict[str, Any]) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    if os.name == "nt":
+        signal.signal(signal.SIGBREAK, stop)
     _write_json_0600(status_path, {
         "state": "starting",
         "supervisor_pid": supervisor_pid,
@@ -246,18 +348,28 @@ def supervise(spec: dict[str, Any]) -> int:
 
     try:
         try:
-            child = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=os.environ.copy(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                start_new_session=True,
-                preexec_fn=_die_with_supervisor,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "cwd": cwd,
+                "env": os.environ.copy(),
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "shell": False,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                windows_job = _WindowsKillOnCloseJob()
+            else:
+                popen_kwargs.update(_posix_worker_spawn_kwargs())
+            child = subprocess.Popen(argv, **popen_kwargs)
+            if windows_job is not None:
+                windows_job.assign(child)
         except Exception as exc:
+            if child is not None and child.poll() is None:
+                _terminate_child(child)
+            if windows_job is not None:
+                windows_job.close()
+                windows_job = None
             _write_json_0600(status_path, {
                 "state": "spawn_failed",
                 "supervisor_pid": supervisor_pid,
@@ -391,6 +503,8 @@ def supervise(spec: dict[str, Any]) -> int:
         })
         return 126
     finally:
+        if windows_job is not None:
+            windows_job.close()
         cancel_path.unlink(missing_ok=True)
 
     if final_state == "cancelled":

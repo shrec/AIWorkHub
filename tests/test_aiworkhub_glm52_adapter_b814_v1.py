@@ -188,8 +188,8 @@ def test_glm_bootstrap_loads_0600_credential_and_provider_env(tmp_path: Path) ->
     path = tmp_path / "cred.json"
     written = _write_credential(path)
     assert written == path
-    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
+    assert os.name == "nt" or stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert os.name == "nt" or stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
     cred = gc.load_credential(path=path)
     assert cred.base_url == gc.GLM_BASE_URL
     assert cred.provider_type == "openai"

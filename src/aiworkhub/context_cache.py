@@ -168,6 +168,11 @@ def _chmod_owner_only(path: Path, mode: int) -> None:
         os.chmod(path, mode)
     except PermissionError:
         pass
+    # Windows' stat().st_mode exposes DOS read/write bits, not the inherited
+    # DACL that enforces per-user access.  Treating 0666/0777 as POSIX
+    # group/world permissions makes every cache path unusable on Windows.
+    if os.name == "nt":
+        return
     try:
         current = stat.S_IMODE(path.stat().st_mode)
     except OSError as exc:

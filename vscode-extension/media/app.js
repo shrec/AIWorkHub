@@ -23,6 +23,8 @@ const LIVE_OUTPUT_MAX_CLIENT_CHARS = 64 * 1024;
 // only ever running while exactly one task is selected (see
 // startLiveOutputPolling/stopLiveOutputPolling).
 const LIVE_OUTPUT_POLL_MS = 4000;
+const READY_RETRY_MS = 1000;
+const READY_MAX_ATTEMPTS = 30;
 
 const persisted = vscode.getState() || {};
 
@@ -52,12 +54,31 @@ const state = {
   returnPageSize: 20,
 };
 
+let readyRetryTimer = null;
+let readyAttempts = 0;
+let hostConnected = false;
+
 function persistState() {
   vscode.setState({
     selectedTaskId: state.selectedTaskId,
     status: state.status,
     sort: state.sort,
   });
+}
+
+function stopReadyRetry() {
+  hostConnected = true;
+  if (readyRetryTimer !== null) {
+    window.clearTimeout(readyRetryTimer);
+    readyRetryTimer = null;
+  }
+}
+
+function signalReady() {
+  if (hostConnected || readyAttempts >= READY_MAX_ATTEMPTS) return;
+  readyAttempts += 1;
+  vscode.postMessage({ type: "ready" });
+  readyRetryTimer = window.setTimeout(signalReady, READY_RETRY_MS);
 }
 
 const elements = {
@@ -2683,6 +2704,7 @@ window.addEventListener("message", (event) => {
   if (!message || typeof message !== "object") {
     return;
   }
+  stopReadyRetry();
   switch (message.type) {
     case "snapshot":
       renderSnapshot(message.payload);
@@ -2756,6 +2778,13 @@ window.addEventListener("message", (event) => {
       break;
   }
 });
+
+// A fresh panel may not have user-mutated state yet. Persist immediately so
+// VS Code can deserialize and rebind it after an extension-host restart.
+// Retry the ready handshake until the first host response so a listener
+// registration race cannot leave the panel permanently on Connecting.
+persistState();
+signalReady();
 
 elements.refreshButton.addEventListener("click", requestRefresh);
 elements.offlineRetryButton.addEventListener("click", () => {
@@ -3013,7 +3042,6 @@ for (const item of elements.statusFilters.querySelectorAll("[data-status]")) {
 }
 elements.sortOrder.value = state.sort;
 
-vscode.postMessage({ type: "ready" });
 if (state.selectedTaskId) {
   requestTaskDetail(state.selectedTaskId);
 }

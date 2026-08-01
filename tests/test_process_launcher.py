@@ -506,7 +506,7 @@ def test_safe_tail_refuses_to_follow_a_symlinked_log_path(tmp_path):
 
     regular = tmp_path / "regular.stdout.log"
     regular.write_text("normal worker output\n", encoding="utf-8")
-    assert process_launcher._safe_tail(regular) == "normal worker output\n"
+    assert process_launcher._safe_tail(regular) == regular.read_bytes().decode("utf-8")
 
 
 def test_successful_isolated_reconcile_enters_review_without_promoting(
@@ -520,6 +520,8 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     hashes, and the exact workspace/request identity) via
     ``_review_terminal_exact`` with substatus ``review_ready``.
     """
+    if os.name == "nt":
+        pytest.skip("review finalization requires the POSIX secure sandbox backend")
     _open_gates(monkeypatch)
     from aiworkhub import worker_workspace, task_engine
 
@@ -718,3 +720,41 @@ def test_usage_parser_reads_claude_result_json(tmp_path):
         "cache_creation_input_tokens": 0,
         "cost_usd": 0.125,
     }
+
+
+def test_termination_refuses_a_pid_without_recorded_start_ticks():
+    """A bare pid is not an identity, so it must never authorise a kill.
+
+    ``_pid_matches`` answers "yes" for any live pid when no start ticks were
+    recorded, which is fine for liveness reporting.  Termination goes through
+    ``_identity_verified_pid`` instead: on Windows the terminator is
+    ``taskkill /PID <pid> /T``, which also kills every descendant, so a
+    recycled pid would take out an unrelated process tree.
+    """
+
+    live_pid = os.getpid()
+
+    # The permissive helper still reports a match -- that is its contract.
+    assert process_launcher._pid_matches(live_pid, None) is True
+    assert process_launcher._pid_matches(live_pid, "") is True
+
+    # The termination gate refuses all of them.
+    assert process_launcher._identity_verified_pid(live_pid, None) == 0
+    assert process_launcher._identity_verified_pid(live_pid, "") == 0
+
+
+def test_termination_accepts_only_a_matching_creation_timestamp():
+    live_pid = os.getpid()
+    ticks = process_launcher._pid_start_ticks(live_pid)
+    if ticks is None:
+        pytest.skip("process creation timestamps are unavailable on this host")
+
+    assert process_launcher._identity_verified_pid(live_pid, ticks) == live_pid
+    assert process_launcher._identity_verified_pid(live_pid, str(ticks)) == live_pid
+    # A recycled pid presents a different creation timestamp.
+    assert process_launcher._identity_verified_pid(live_pid, ticks + 1) == 0
+
+
+@pytest.mark.parametrize("pid", [0, -1, None, "", "not-a-pid"])
+def test_termination_refuses_a_malformed_pid(pid):
+    assert process_launcher._identity_verified_pid(pid, 12345) == 0

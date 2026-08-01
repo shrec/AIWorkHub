@@ -119,12 +119,7 @@ class _FakeSidebandEndpoint:
         finally:
             os.close(fd)
 
-        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        previous_umask = os.umask(0o177)
-        try:
-            self._server.bind(str(self.socket_path))
-        finally:
-            os.umask(previous_umask)
+        self._server = app_server_mux.bind_sideband_listener(self.socket_path)
         self._server.listen(8)
         self._server.settimeout(0.2)
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -180,6 +175,14 @@ def _fresh_sideband_dir() -> Path:
     # ``test_app_server_mux.py``'s ``_MuxHarness`` for the same
     # constraint/workaround).
     return Path(tempfile.mkdtemp(prefix="b684-"))
+
+
+def _callback_outbox_stats(db_path: Path) -> dict:
+    conn = taskdb.open_db(db_path)
+    try:
+        return taskdb.callback_outbox_stats(conn)
+    finally:
+        conn.close()
 
 
 def _idle_turn_start_ok(turn_id: str = "turn-1"):
@@ -462,7 +465,7 @@ def test_run_once_reproduces_b683_shape_durable_park_never_dead_letters():
                 assert result["action"] == "deferred_or_failed"
                 _clear_not_before(db_path)
 
-            stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+            stats = _callback_outbox_stats(db_path)
             assert stats["by_state"]["dead_letter"] == 0
             assert stats["by_state"]["pending"] == 1
             assert stats["batches"]["by_state"]["dead_letter"] == 0
@@ -521,7 +524,7 @@ def test_run_once_delivers_once_thread_goes_idle_same_durable_batch():
             assert second["action"] == "delivered"
             assert second["task_ids"] == ["E2E_B684_EVENTUAL_IDLE"]
 
-            stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+            stats = _callback_outbox_stats(db_path)
             assert stats["by_state"]["delivered"] == 1
             assert stats["by_state"]["dead_letter"] == 0
             assert stats["batches"]["by_state"]["delivered"] == 1
@@ -561,7 +564,7 @@ def test_run_once_genuine_protocol_failure_still_bounded_dead_letters():
                 assert result["ok"] is False
                 _clear_not_before(db_path)
 
-            stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+            stats = _callback_outbox_stats(db_path)
             assert stats["by_state"]["dead_letter"] == 1
             assert stats["batches"]["by_state"]["dead_letter"] == 1
 

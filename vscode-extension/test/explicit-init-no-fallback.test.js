@@ -77,10 +77,19 @@ assertPresent(
   [
     "const initializedClient = getMcpClient()",
     "view.bindClient(initializedClient)",
+    "client: initializationClient",
+    "authoritative: true",
+    "convergeBackgroundServices: false",
     "SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted",
     "sourceGraphStart.daemon_started !== true",
+    "flushSystemLogs()",
   ],
   "post-init Source Graph convergence",
+);
+assert.ok(
+  pushInitializeMatch[0].indexOf("client: initializationClient")
+    < pushInitializeMatch[0].indexOf("const initializedClient = getMcpClient()"),
+  "post-init storage snapshot must render on the initializing child before Windows MCP process rebind",
 );
 // The initialize tool must be excluded from the read-only contract list
 // checked by pushRuntimeInfo (EXPECTED_DASHBOARD_TOOL_NAMES), i.e. it must
@@ -149,6 +158,7 @@ assertPresent(
     'INITIALIZE_TOOL_NAME = "aiworkhub_dashboard_initialize"',
     "def initialize_view(",
     "repository_bootstrap.initialize_repository_full(",
+    "storage_observability.invalidate(root)",
   ],
   "dashboard_mcp_app.py initialize tool wiring",
 );

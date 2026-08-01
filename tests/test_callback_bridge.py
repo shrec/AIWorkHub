@@ -587,6 +587,22 @@ def _batch_bridge(repo: Path, db_path: Path, **overrides) -> CallbackBridge:
     return CallbackBridge(**kwargs)
 
 
+def _callback_outbox_stats(db_path: Path) -> dict:
+    conn = taskdb.open_db(db_path)
+    try:
+        return taskdb.callback_outbox_stats(conn)
+    finally:
+        conn.close()
+
+
+def _callback_batch_stats(db_path: Path) -> dict:
+    conn = taskdb.open_db(db_path)
+    try:
+        return taskdb.callback_batch_stats(conn)
+    finally:
+        conn.close()
+
+
 def test_eight_simultaneous_events_deliver_as_one_batch_turn():
     """The exact measured B402 failure: eight near-simultaneous review_ready
     events on ONE thread must produce ONE bounded batch/turn, not eight."""
@@ -608,7 +624,7 @@ def test_eight_simultaneous_events_deliver_as_one_batch_turn():
         assert len(result["task_ids"]) == 8
         assert thread_id not in json.dumps(result)
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 8
         assert stats["by_state"]["pending"] == 0
         assert stats["batches"]["by_state"]["delivered"] == 1
@@ -670,7 +686,7 @@ def test_event_arriving_during_turn_forms_next_batch_not_a_redundant_wake():
         delivered = bridge._process_batch(batch)
         assert delivered is True
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 1
         assert stats["by_state"]["pending"] == 1  # the second task, untouched
 
@@ -717,7 +733,7 @@ def test_concurrent_claim_never_forms_a_second_inflight_batch_for_same_thread():
         second_conn.close()
         assert second_claim is None
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["batches"]["by_state"]["inflight"] == 1
         assert stats["batches"]["by_state"]["pending"] == 0
 
@@ -768,7 +784,7 @@ def test_partial_stale_members_pruned_before_delivery():
         assert result["ok"] is True
         assert result["task_ids"] == ["E2E_STILL_VALID"]
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 1
         assert stats["by_state"]["superseded"] == 1
 
@@ -792,7 +808,7 @@ def test_all_members_stale_yields_zero_turns_batch_superseded():
         )
         result = bridge.run_once()
         assert result == {"ok": True, "action": "no_pending"}
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["superseded"] == 3
         assert stats["batches"]["by_state"]["superseded"] == 1
 
@@ -814,7 +830,7 @@ def test_busy_thread_requeues_whole_batch_not_partial():
         assert result["action"] == "deferred_or_failed"
         assert result["batch_size"] == 3
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["pending"] == 3
         assert stats["by_state"]["delivered"] == 0
         assert stats["by_state"]["dead_letter"] == 0
@@ -854,7 +870,7 @@ def test_restart_recovers_same_batch_identity_and_delivers():
         assert result["batch_id"] == original_batch_id
         assert sorted(result["task_ids"]) == ["E2E_RESTART_A", "E2E_RESTART_B"]
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 2
 
 
@@ -888,7 +904,7 @@ def test_dead_letter_recovery_requeues_if_still_matching_else_supersedes():
         ok2, action2 = _recover_via_taskctl(db_path, rows["E2E_DEADLETTER_MOVED_ON"])
         assert ok2 and action2 == "superseded"
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["pending"] == 1
         assert stats["by_state"]["superseded"] == 1
         assert stats["by_state"]["dead_letter"] == 0
@@ -1316,7 +1332,7 @@ def test_run_once_requeues_whole_batch_on_active_turn_not_steerable():
         assert result["action"] == "deferred_or_failed"
         assert result["batch_size"] == 2
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["pending"] == 2
         assert stats["by_state"]["delivered"] == 0
         assert stats["by_state"]["dead_letter"] == 0
@@ -1676,10 +1692,8 @@ def test_sideband_probe_never_registers_ownership_and_cannot_steal_thread():
     try:
         h.do_handshake()
         foreign_thread = f"thread-{uuid.uuid4()}"
-        sock = _raw_socket.socket(_raw_socket.AF_UNIX, _raw_socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock = app_server_mux.connect_sideband_socket(h.mux.socket_path, timeout=5)
         try:
-            sock.connect(str(h.mux.socket_path))
             payload = json.dumps({
                 "cap": h.mux.capability_token, "method": "thread/resume",
                 "params": {"threadId": foreign_thread},
@@ -1897,7 +1911,7 @@ def test_45_inprogress_turns_survive_far_more_than_five_claims_without_dead_lett
             assert result["action"] == "deferred_or_failed"
             _clear_not_before(db_path)
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["dead_letter"] == 0
         assert stats["by_state"]["pending"] == 1
         assert stats["batches"]["by_state"]["dead_letter"] == 0
@@ -1982,7 +1996,7 @@ def test_claim_pending_callback_batch_never_forms_second_batch_for_thread_with_n
         conn.close()
         assert no_claim is None  # nothing claimable: the thread's only batch isn't due yet
 
-        stats = taskdb.callback_batch_stats(taskdb.open_db(db_path))
+        stats = _callback_batch_stats(db_path)
         assert stats["by_state"]["pending"] == 1  # never a second batch
 
         _clear_not_before(db_path)
@@ -2013,7 +2027,7 @@ def test_genuine_transport_failure_still_dead_letters_after_bounded_retries():
             assert result["ok"] is False
             _clear_not_before(db_path)
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["dead_letter"] == 1
         assert stats["batches"]["by_state"]["dead_letter"] == 1
         assert stats["batches"]["pending_genuine_failure_batch_count"] == 0  # dead_letter, not pending
@@ -2086,7 +2100,7 @@ def test_busy_deferred_batch_eventually_delivers_once_due_and_thread_goes_idle()
         assert second["action"] == "delivered"
         assert second["task_ids"] == ["E2E_B416_EVENTUAL_IDLE"]
 
-        stats = taskdb.callback_outbox_stats(taskdb.open_db(db_path))
+        stats = _callback_outbox_stats(db_path)
         assert stats["by_state"]["delivered"] == 1
         assert stats["by_state"]["dead_letter"] == 0
         assert stats["batches"]["by_state"]["delivered"] == 1
@@ -2118,7 +2132,7 @@ def test_callback_batch_stats_distinguishes_waiting_for_thread_idle_from_genuine
         taskdb.fail_batch_transient(conn, fail_claim["batch_id"], "boom", max_retries=5, delay_seconds=300.0)
         conn.close()
 
-        stats = taskdb.callback_batch_stats(taskdb.open_db(db_path))
+        stats = _callback_batch_stats(db_path)
         assert stats["waiting_for_thread_idle_batch_count"] == 1
         assert stats["pending_genuine_failure_batch_count"] == 1
 

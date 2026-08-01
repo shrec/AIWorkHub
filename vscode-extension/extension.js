@@ -10,8 +10,109 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.11";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.23";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
+let extensionDebugTraceFile = "";
+let mcpDebugTraceFile = "";
+let extensionDebugTraceSequence = 0;
+
+function initializeDebugTracing(context) {
+  try {
+    const enabled = vscode.workspace.getConfiguration(EXT_ID).get("debugTracing", true) !== false;
+    const storageRoot = context && context.globalStorageUri && context.globalStorageUri.fsPath;
+    if (!enabled || !storageRoot) return;
+    const traceDir = path.join(storageRoot, "debug");
+    fs.mkdirSync(traceDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const suffix = `${stamp}-${process.pid}-${WINDOW_SCOPE_ID}`;
+    extensionDebugTraceFile = path.join(traceDir, `extension-${suffix}.jsonl`);
+    mcpDebugTraceFile = path.join(traceDir, `mcp-${suffix}.jsonl`);
+    debugTrace("trace.initialized", { platform: process.platform, arch: process.arch });
+    installHostCrashDiagnostics();
+  } catch (_err) {
+    extensionDebugTraceFile = "";
+    mcpDebugTraceFile = "";
+  }
+}
+
+// Record HOW this extension host dies. Every extension in a window shares one
+// extension-host process, so a single fatal error here takes Codex, Copilot
+// and Claude down with the dashboard -- and the post-mortem is otherwise
+// empty, because the host is gone before anything can be written. These
+// listeners are strictly passive observers: VS Code installs its own
+// uncaughtException/unhandledRejection handlers during bootstrap, so Node's
+// default terminate-on-uncaught behaviour is already suppressed and adding
+// another listener changes no control flow. There is no steady-state cost --
+// nothing is written until one of these events actually fires.
+let hostCrashDiagnosticsInstalled = false;
+function installHostCrashDiagnostics() {
+  if (hostCrashDiagnosticsInstalled || !extensionDebugTraceFile) return;
+  hostCrashDiagnosticsInstalled = true;
+  const stackOf = (value) => String((value && value.stack) || "").slice(0, 2000);
+  process.on("uncaughtException", (err, origin) => {
+    debugTrace("host.uncaught_exception", {
+      origin: String(origin || "").slice(0, 40),
+      ...debugErrorFields(err),
+      stack: stackOf(err),
+    });
+  });
+  process.on("unhandledRejection", (reason) => {
+    debugTrace("host.unhandled_rejection", {
+      ...debugErrorFields(reason),
+      stack: stackOf(reason),
+    });
+  });
+  // A clean exit still tells us the code; an abrupt external TerminateProcess
+  // records nothing at all, and that absence is itself the diagnosis.
+  process.on("exit", (code) => debugTrace("host.exit", { code }));
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"]) {
+    try {
+      process.on(signal, () => debugTrace("host.signal", { signal }));
+    } catch (_err) {
+      // Not every signal name is valid on every platform.
+    }
+  }
+}
+
+function debugTrace(event, fields = {}) {
+  if (!extensionDebugTraceFile) return;
+  try {
+    const memory = process.memoryUsage();
+    const payload = {
+      schema_id: "aiworkhub.extension_debug_trace.v1",
+      timestamp: new Date().toISOString(),
+      sequence: ++extensionDebugTraceSequence,
+      process: "extension-host",
+      pid: process.pid,
+      window_id: WINDOW_SCOPE_ID,
+      event: String(event || "unknown").slice(0, 120),
+      memory: {
+        rss: memory.rss,
+        heap_used: memory.heapUsed,
+        heap_total: memory.heapTotal,
+        external: memory.external,
+      },
+      ...fields,
+    };
+    const fd = fs.openSync(extensionDebugTraceFile, "a", 0o600);
+    try {
+      fs.writeSync(fd, `${JSON.stringify(payload)}\n`, null, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (_err) {
+    // Diagnostics must never alter extension-host behavior.
+  }
+}
+
+function debugErrorFields(err) {
+  return {
+    error_name: String((err && err.name) || "Error").slice(0, 80),
+    error_code: String((err && err.code) || "").slice(0, 80),
+    error_message: String((err && err.message) || "unknown").slice(0, 500),
+  };
+}
 
 // ── Webview <-> extension host message contract ────────────────────────────
 // The Webview NEVER receives a coordinator token, an environment value, a
@@ -238,9 +339,21 @@ function canonicalRepositoryRoot(root) {
 
 function atomicWriteJson(file, payload) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tmp, file);
+  // Date.now() alone collides when the dashboard, lease renewal, and startup
+  // convergence publish in the same Windows millisecond.
+  const nonce = crypto.randomBytes(6).toString("hex");
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.${nonce}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {
+      // Best-effort cleanup; preserve the original filesystem failure.
+    }
+    throw err;
+  }
 }
 
 function sharedRepoRouteDir() {
@@ -484,6 +597,47 @@ function _preflightPythonCandidate(command, extraArgs, runtimeDir = extensionRun
   }
 }
 
+function _preflightPythonCandidateAsync(command, extraArgs, runtimeDir = extensionRuntimeDir) {
+  const args = [...(Array.isArray(extraArgs) ? extraArgs : []), "-c", "import aiworkhub.server"];
+  const preflightEnv = { ...process.env };
+  if (runtimeDir) {
+    preflightEnv.PYTHONPATH = [runtimeDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
+  }
+  return new Promise((resolve) => {
+    childProcess.execFile(command, args, {
+      timeout: 15000,
+      encoding: "utf8",
+      windowsHide: true,
+      shell: false,
+      cwd: runtimeDir || undefined,
+      env: preflightEnv,
+      maxBuffer: 64 * 1024,
+    }, (err, _stdout, stderr) => {
+      if (!err) {
+        resolve({ ok: true, candidate: command });
+        return;
+      }
+      const exitCode = Number.isInteger(err.code) ? err.code : null;
+      const stderrTail = _sanitisePreflightStderr(stderr);
+      if (exitCode !== null || (stderr && String(stderr).trim())) {
+        resolve({
+          ok: false,
+          candidate: command,
+          exitCode,
+          stderrTail,
+          signal: err.signal || null,
+        });
+        return;
+      }
+      resolve({
+        ok: false,
+        candidate: command,
+        error: String(err.message || "spawn_failed").slice(0, 200),
+      });
+    });
+  });
+}
+
 // Build a bounded human-readable diagnostic string from an ordered list of
 // per-candidate preflight results. Only failed candidates appear; successful
 // ones are omitted. Limited to 1200 total chars.
@@ -506,7 +660,7 @@ function _buildPreflightDiagnostic(diagnostics) {
   return parts.join("\n");
 }
 
-function findPythonCommand(root) {
+function findPythonCommand(root, options = {}) {
   const configured = vscode.workspace.getConfiguration("aiworkhub").get("pythonPath");
   const isWindows = process.platform === "win32";
   const venvCandidates = isWindows
@@ -525,6 +679,19 @@ function findPythonCommand(root) {
     typeof configured === "string" && configured.trim() ? configured.trim() : null,
     ...venvCandidates,
   ].filter(Boolean);
+
+  // Configuration repair runs during activation and must not block the
+  // extension host on synchronous child-process preflights. The real MCP
+  // launch path retains validation before it starts a server child.
+  if (isWindows && options.preflight === false) {
+    for (const candidate of candidates) {
+      const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+      if (!looksLikePath || fs.existsSync(candidate)) {
+        return { command: candidate, argsPrefix: [] };
+      }
+    }
+    return { command: "py", argsPrefix: ["-3"] };
+  }
 
   // ── Windows: preflight-validate each candidate ─────────────────────────
   if (isWindows) {
@@ -588,6 +755,57 @@ function findPythonCommand(root) {
     }
   }
   return { command: "python3", argsPrefix: [] };
+}
+
+async function findPythonCommandForLaunch(root) {
+  if (process.platform !== "win32") {
+    return findPythonCommand(root);
+  }
+  const configured = vscode.workspace.getConfiguration("aiworkhub").get("pythonPath");
+  const candidates = [
+    typeof configured === "string" && configured.trim() ? configured.trim() : null,
+    path.join(root, ".venv", "Scripts", "python.exe"),
+    path.join(root, "venv", "Scripts", "python.exe"),
+  ].filter(Boolean);
+  const diagnostics = [];
+  for (const candidate of candidates) {
+    const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+    if (!looksLikePath) {
+      diagnostics.push({ ok: false, candidate, reason: "not_a_path" });
+      continue;
+    }
+    if (!fs.existsSync(candidate)) {
+      diagnostics.push({ ok: false, candidate, reason: "not_found" });
+      continue;
+    }
+    const preflight = await _preflightPythonCandidateAsync(candidate, []);
+    diagnostics.push(preflight);
+    if (preflight.ok) {
+      return { command: candidate, argsPrefix: [], preflightDiagnostic: null };
+    }
+  }
+  for (const fallback of [{ cmd: "py", args: ["-3"] }, { cmd: "python", args: [] }]) {
+    const preflight = await _preflightPythonCandidateAsync(fallback.cmd, fallback.args);
+    diagnostics.push(preflight);
+    if (preflight.ok) {
+      return { command: fallback.cmd, argsPrefix: fallback.args, preflightDiagnostic: null };
+    }
+  }
+  for (const candidate of candidates) {
+    const looksLikePath = path.isAbsolute(candidate) || candidate.includes("/") || candidate.includes("\\");
+    if (looksLikePath && fs.existsSync(candidate)) {
+      return {
+        command: candidate,
+        argsPrefix: [],
+        preflightDiagnostic: _buildPreflightDiagnostic(diagnostics),
+      };
+    }
+  }
+  return {
+    command: "py",
+    argsPrefix: ["-3"],
+    preflightDiagnostic: _buildPreflightDiagnostic(diagnostics),
+  };
 }
 
 function ensureRepositoryCoordinatorCapability(root) {
@@ -1182,6 +1400,10 @@ class McpStdioClient {
     this.pendingChildren = new Map();
     this.initialized = false;
     this.startingPromise = null;
+    // A repository-identity replacement can hand this client the previous
+    // client's shutdown promise. The next Windows launcher must not start
+    // until the old py.exe -> python.exe process tree has released the repo.
+    this.startupBarrier = null;
     // Exact version/capability evidence established during this child's
     // post-initialize preflight. Dashboard runtimeInfo reuses this immutable
     // lifecycle fact instead of issuing a redundant tools/list + health pair
@@ -1260,7 +1482,39 @@ class McpStdioClient {
 
   _terminateOwnedChild(candidate) {
     if (!this._ownsChild(candidate)) return false;
+    const ownedPid = candidate.pid;
     this._clearLifecycleOwnership(candidate);
+    // A pid identifies our child ONLY while that child is still running.
+    // Once it exits, Windows is free to hand the same pid to any new
+    // process, and `taskkill /T` kills the target *plus every descendant* --
+    // so a recycled pid would destroy an unrelated process tree. If that
+    // stranger happens to sit above this extension host, the host dies with
+    // it, taking every other extension in the window along. Node still owns
+    // the process handle, so exitCode/signalCode are the authoritative
+    // "is this pid still mine" answer; an already-exited child needs no
+    // tree kill anyway.
+    // Loose null check on purpose: a live ChildProcess reports null for both,
+    // an exited one reports a number/signal name. Anything that exposes
+    // neither field is treated as live, so this never silently skips a
+    // termination it used to perform.
+    const childStillRunning = candidate.exitCode == null && candidate.signalCode == null;
+    if (
+      process.platform === "win32"
+      && childStillRunning
+      && Number.isInteger(ownedPid)
+      && ownedPid > 1
+    ) {
+      try {
+        const result = childProcess.spawnSync(
+          "taskkill",
+          ["/PID", String(ownedPid), "/T", "/F"],
+          { windowsHide: true, encoding: "utf8", timeout: 5000 },
+        );
+        if (!result.error && result.status === 0) return true;
+      } catch (_err) {
+        // Fall through to Node's exact-child termination below.
+      }
+    }
     if (!candidate.killed) {
       try {
         candidate.kill();
@@ -1296,7 +1550,12 @@ class McpStdioClient {
     if (this.running && this.initialized) {
       return Promise.resolve();
     }
-    this.startingPromise = this._startWithVersionRepair().finally(() => {
+    const barrier = this.startupBarrier;
+    this.startupBarrier = null;
+    const startOperation = barrier
+      ? Promise.resolve(barrier).catch(() => {}).then(() => this._startWithVersionRepair())
+      : this._startWithVersionRepair();
+    this.startingPromise = startOperation.finally(() => {
       this.startingPromise = null;
     });
     return this.startingPromise;
@@ -1340,7 +1599,7 @@ class McpStdioClient {
       this._terminateOwnedChild(previouslyOwnedChild);
     }
     const root = this.repositoryRoot;
-    const python = findPythonCommand(root);
+    const python = await findPythonCommandForLaunch(root);
     this._lastPythonResult = python;
     const runtimeDir = extensionRuntimeDir;
     const env = {
@@ -1357,6 +1616,9 @@ class McpStdioClient {
       // the cooperative manager inbox and report direct wake as unavailable.
       AIWORKHUB_CALLBACK_TRANSPORT: "manager_inbox",
     };
+    if (mcpDebugTraceFile) {
+      env.AIWORKHUB_DEBUG_TRACE_FILE = mcpDebugTraceFile;
+    }
     // Extension-local runtime import path: `import aiworkhub` must always
     // resolve to the package this extension bundled under its own
     // `runtime/` directory (see test/package-vsix.js), never to the
@@ -1397,15 +1659,23 @@ class McpStdioClient {
     this.pending.clear();
     this.pendingChildren.clear();
 
+    debugTrace("mcp.spawn.begin", {
+      command: path.basename(python.command),
+      args_prefix: python.argsPrefix,
+    });
     const child = childProcess.spawn(python.command, [...python.argsPrefix, "-m", "aiworkhub.server"], {
       cwd: runtimeDir || root,
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
     });
     this.child = child;
     this.lifecycleChild = child;
     this.lifecyclePid = child.pid;
+    debugTrace("mcp.spawn.end", { child_pid: child.pid || null });
 
+    this._attachChildStreamErrorGuards(child);
     child.stdout.on("data", (chunk) => this._onStdout(child, chunk));
     child.stderr.on("data", (chunk) => {
       this.outputChannel.appendLine(`[mcp stderr] ${sanitizeStderrChunk(chunk)}`);
@@ -1426,6 +1696,16 @@ class McpStdioClient {
     }
   }
 
+  _attachChildStreamErrorGuards(child) {
+    for (const [name, stream] of [["stdin", child.stdin], ["stdout", child.stdout], ["stderr", child.stderr]]) {
+      if (!stream || typeof stream.on !== "function") continue;
+      stream.on("error", (err) => {
+        if (!this._ownsChild(child) || this.intentionalStop) return;
+        this.outputChannel.appendLine(`[mcp] child ${name} stream error: ${sanitizeErrorMessage(err)}`);
+      });
+    }
+  }
+
   async _handshake() {
     await this.request("initialize", {
       protocolVersion: MCP_PROTOCOL_VERSION,
@@ -1439,16 +1719,16 @@ class McpStdioClient {
     // child as ready. A mismatch triggers a bounded restart of only this
     // repo/window child, so users never need to manually kill stale runtimes.
     await this._assertRuntimeVersionBeforeServices();
-    // Dispatcher / Source Graph convergence is deliberately background-only.
-    // A high-level tool call here would recurse through ensureStarted() while
-    // ensureStarted() is already waiting for _handshake(), leaving the Webview
-    // stuck at "MCP runtime checking" / "Loading queue".  Use raw JSON-RPC in
-    // a fire-and-forget task so the dashboard can render health/snapshot first.
-    this._convergeBackgroundServices();
+    // Do not enqueue Dispatcher / Source Graph work here. On Windows the MCP
+    // server can serialize those comparatively slow calls ahead of the first
+    // dashboard snapshot, leaving the Webview stuck at "Connecting" even
+    // though the handshake succeeded. The first successful snapshot starts
+    // background convergence explicitly (see pushSnapshot* below).
   }
 
 
   async _assertRuntimeVersionBeforeServices() {
+    const startedAt = Date.now();
     let tools;
     let health;
     try {
@@ -1456,6 +1736,9 @@ class McpStdioClient {
       tools = Array.isArray(listed && listed.tools) ? listed.tools : [];
       health = extractToolResult(await this.request("tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} }));
     } catch (err) {
+      this.outputChannel.appendLine(
+        `[mcp] preflight failed error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
+      );
       throw new Error(`mcp_health_preflight_failed:${sanitizeErrorMessage(err)}`);
     }
     const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
@@ -1472,6 +1755,9 @@ class McpStdioClient {
     if (runtimeVersion !== EXPECTED_MCP_PACKAGE_VERSION) {
       throw new Error(`mcp_version_mismatch_pre_service:${runtimeVersion}`);
     }
+    this.outputChannel.appendLine(
+      `[mcp] preflight completed version=${runtimeVersion} tools=${tools.length} duration_ms=${Date.now() - startedAt}`,
+    );
   }
 
   async _callToolRaw(name, args, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
@@ -1554,6 +1840,13 @@ class McpStdioClient {
       return;
     }
     const pending = this.pending.get(message.id);
+    debugTrace("mcp.response.received", {
+      child_pid: emittingChild && emittingChild.pid,
+      id: message.id,
+      line_bytes: Buffer.byteLength(line, "utf8"),
+      has_error: Boolean(message.error),
+      pending: Boolean(pending),
+    });
     if (!pending || this.pendingChildren.get(message.id) !== emittingChild) {
       return;
     }
@@ -1568,6 +1861,13 @@ class McpStdioClient {
   }
 
   _onExit(exitedChild, code, signal, spawnError) {
+    debugTrace("mcp.child.exit", {
+      child_pid: exitedChild && exitedChild.pid,
+      code,
+      signal,
+      intentional: this.intentionalStop,
+      ...debugErrorFields(spawnError),
+    });
     // An intentionally replaced child can emit its exit after the new MCP
     // singleton has already started. Ignore that stale event so it cannot
     // tear down the replacement or consume the bounded restart budget.
@@ -1662,6 +1962,15 @@ class McpStdioClient {
     this.nextId += 1;
     const requestChild = this.child;
     const payload = `${JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} })}\n`;
+    const tool = method === "tools/call" ? String((params && params.name) || "") : "";
+    debugTrace("mcp.request.begin", {
+      child_pid: requestChild.pid,
+      id,
+      method,
+      tool,
+      timeout_ms: timeoutMs,
+      payload_bytes: Buffer.byteLength(payload, "utf8"),
+    });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -1670,6 +1979,7 @@ class McpStdioClient {
           this.child = null;
           this._terminateOwnedChild(requestChild);
         }
+        debugTrace("mcp.request.timeout", { child_pid: requestChild.pid, id, method, tool });
         reject(new Error("mcp_request_timeout"));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
@@ -1679,7 +1989,16 @@ class McpStdioClient {
           this.pending.delete(id);
           this.pendingChildren.delete(id);
           clearTimeout(timer);
+          debugTrace("mcp.request.write_error", {
+            child_pid: requestChild.pid,
+            id,
+            method,
+            tool,
+            ...debugErrorFields(err),
+          });
           reject(err);
+        } else {
+          debugTrace("mcp.request.written", { child_pid: requestChild.pid, id, method, tool });
         }
       });
     });
@@ -1690,13 +2009,27 @@ class McpStdioClient {
       return;
     }
     const payload = `${JSON.stringify({ jsonrpc: "2.0", method, params: params || {} })}\n`;
-    this.child.stdin.write(payload);
+    this.child.stdin.write(payload, () => {});
   }
 
   async callTool(name, args) {
-    await this.ensureStarted();
-    const result = await this.request("tools/call", { name, arguments: args || {} });
-    return extractToolResult(result);
+    const startedAt = Date.now();
+    try {
+      await this.ensureStarted();
+      const result = extractToolResult(
+        await this.request("tools/call", { name, arguments: args || {} }),
+      );
+      const status = result && result.ok === false
+        ? `failed error=${sanitizeErrorMessage(result.message || result.error || "tool_reported_failure")}`
+        : `completed ok=${result && result.ok === true ? "true" : "unspecified"}`;
+      this.outputChannel.appendLine(`[mcp] tool=${name} ${status} duration_ms=${Date.now() - startedAt}`);
+      return result;
+    } catch (err) {
+      this.outputChannel.appendLine(
+        `[mcp] tool=${name} failed error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
+      );
+      throw err;
+    }
   }
 
   async listTools() {
@@ -1719,7 +2052,7 @@ class McpStdioClient {
   }
 
   // Best-effort service shutdown followed by exact-object child termination.
-  async stopDispatcherThenTerminate({ restart = false } = {}) {
+  async stopDispatcherThenTerminate({ restart = false, timeoutMs = MCP_REQUEST_TIMEOUT_MS } = {}) {
     this._clearRecoveryTimer();
     const ownedChild = this.lifecycleChild;
     this.intentionalStop = !restart;
@@ -1728,7 +2061,7 @@ class McpStdioClient {
         await this.request(
           "tools/call",
           { name: DISPATCHER_TOOLS.stop, arguments: {} },
-          MCP_REQUEST_TIMEOUT_MS,
+          timeoutMs,
         );
       } catch (_err) {
         // Best-effort -- proceed to terminate the child regardless.
@@ -1737,7 +2070,7 @@ class McpStdioClient {
         await this.request(
           "tools/call",
           { name: SOURCE_GRAPH_DAEMON_TOOLS.stop, arguments: {} },
-          MCP_REQUEST_TIMEOUT_MS,
+          timeoutMs,
         );
       } catch (_err) {
         // Best-effort -- proceed to terminate the child regardless.
@@ -2797,13 +3130,26 @@ function systemLogFile(root) {
   return path.join(root, ".aiworkhub", "runtime", "logs", "dashboard-system.json");
 }
 
+// Single pass, one measurement per entry. The previous shape re-serialized
+// the WHOLE retained array on every iteration of a pop loop, and this runs
+// once per log line -- every `[mcp stderr]` chunk and every tool call. At the
+// 1 MiB cap that is megabytes of JSON per logged line, on the extension-host
+// thread, which is exactly how a host stops answering VS Code's ping and gets
+// terminated -- taking every other extension in the window with it.
+// Entries arrive newest-first, so filling from the front and stopping at the
+// cap keeps the newest and drops the oldest, as before.
 function pruneSystemLogs(entries) {
   const cutoff = Date.now() - SYSTEM_LOG_RETENTION_MS;
-  const retained = entries
-    .filter((entry) => Number.isFinite(Date.parse(entry.timestamp)) && Date.parse(entry.timestamp) >= cutoff)
-    .slice(0, SYSTEM_LOG_MAX_PERSISTED_ENTRIES);
-  while (retained.length > 1 && Buffer.byteLength(JSON.stringify(retained), "utf8") > SYSTEM_LOG_MAX_FILE_BYTES) {
-    retained.pop();
+  const retained = [];
+  let totalBytes = 2; // the enclosing "[]"
+  for (const entry of entries) {
+    if (retained.length >= SYSTEM_LOG_MAX_PERSISTED_ENTRIES) break;
+    const at = Date.parse(entry.timestamp);
+    if (!Number.isFinite(at) || at < cutoff) continue;
+    const size = Buffer.byteLength(JSON.stringify(entry), "utf8") + 1; // + comma
+    if (retained.length > 0 && totalBytes + size > SYSTEM_LOG_MAX_FILE_BYTES) break;
+    retained.push(entry);
+    totalBytes += size;
   }
   return retained;
 }
@@ -2890,7 +3236,12 @@ function createManagedOutputChannel() {
   const channel = vscode.window.createOutputChannel("AIWorkHub");
   const appendLine = channel.appendLine.bind(channel);
   channel.appendLine = (value) => {
-    appendLine(value);
+    try {
+      appendLine(value);
+    } catch (_err) {
+      // Child stderr can race extension-host disposal on Windows. Logging must
+      // never turn a normal reload/close into an extension-host exception.
+    }
     recordSystemLog(value);
   };
   return channel;
@@ -3026,6 +3377,23 @@ function materializeStableRuntimeGeneration(context) {
     updated_at: new Date().toISOString(),
   });
   return { runtimeDir, generationRoot, fingerprint, version, storageRoot };
+}
+
+function bundledRuntimeFallback(context) {
+  const runtimeDir = resolveExtensionRuntimeDir(context.extensionUri.fsPath);
+  if (!fs.existsSync(path.join(runtimeDir, "aiworkhub", "server.py"))) {
+    throw new Error(`bundled_runtime_missing:${runtimeDir}`);
+  }
+  return {
+    runtimeDir,
+    generationRoot: null,
+    fingerprint: "",
+    version: String(
+      (context.extension && context.extension.packageJSON && context.extension.packageJSON.version)
+        || EXPECTED_MCP_PACKAGE_VERSION,
+    ),
+    storageRoot: null,
+  };
 }
 
 /** Publish a usable runtime pointer before any expensive fingerprint/copy work.
@@ -3306,7 +3674,7 @@ function ensureCodexMcpRegistered(context, _repoRoot) {
   // Codex registration is application-global, so it must never point at one
   // repository's disposable virtualenv. Resolve only a stable user/system
   // interpreter; the packaged runtime itself comes from PYTHONPATH.
-  const python = findPythonCommand(os.homedir());
+  const python = findPythonCommand(os.homedir(), { preflight: false });
   const result = ensureCodexMcpRegistrationTomlText(original, runtimeDir, python);
   if (!result.changed) return false;
   try {
@@ -3566,9 +3934,11 @@ raise SystemExit(main())
 /** Install an optional same-host command shim without configuring Codex.
  *
  * A workspace extension runs remotely under Remote-SSH, while Codex may run
- * in the local UI extension host.  The shim is therefore only a local runtime
- * building block; it must never be advertised through an application-scoped
- * setting.  A future UI companion may consume it on a verified same host.
+ * in the local UI extension host. The shim is materialized only after the
+ * co-location gate succeeds. Windows advertises its exact native path because
+ * OpenAI can start before this extension mutates PATH; Settings Sync excludes
+ * that host-local application setting. POSIX keeps command discovery local to
+ * this extension host.
  */
 function materializePathMuxShim(stableLauncher, options = {}) {
   const platform = options.platform || process.platform;
@@ -3577,16 +3947,10 @@ function materializePathMuxShim(stableLauncher, options = {}) {
   const arch = options.arch || process.arch;
   let binDir;
   if (platform === "win32") {
-    const normalizedHome = path.resolve(home).toLowerCase();
-    const candidates = String(env.PATH || "").split(path.delimiter).filter(Boolean);
-    binDir = candidates.find((candidate) => {
-      try {
-        const resolved = path.resolve(candidate).toLowerCase();
-        return resolved === normalizedHome || resolved.startsWith(normalizedHome + path.sep.toLowerCase());
-      } catch (_err) {
-        return false;
-      }
-    }) || path.join(home, "AppData", "Local", "Microsoft", "WindowsApps");
+    // Keep executable materialization in extension-owned global storage.
+    // WindowsApps is an OS-managed execution-alias directory and may reject
+    // writes under Store policy, ACL hardening, or endpoint protection.
+    binDir = path.dirname(stableLauncher);
   } else {
     binDir = path.join(home, ".local", "bin");
   }
@@ -3615,10 +3979,9 @@ function materializePathMuxShim(stableLauncher, options = {}) {
     fs.writeFileSync(shim, `#!/bin/sh\nexec '${escaped}' "$@"\n`, { encoding: "utf8", mode: 0o755 });
     fs.chmodSync(shim, 0o755);
   }
-  // Keep command discovery local to this extension host.  In particular,
-  // never persist this host/user-specific directory in VS Code settings:
-  // application-scoped settings are shared by Remote-SSH windows and may be
-  // synchronized to entirely different Windows/Linux/macOS machines.
+  // Keep POSIX command discovery local to this extension host. Windows uses
+  // the returned absolute native path after the same-host co-location gate,
+  // because OpenAI may launch before this PATH mutation runs.
   const pathEntries = String(env.PATH || "").split(path.delimiter).filter(Boolean);
   const normalizedBin = path.resolve(binDir);
   if (!pathEntries.some((entry) => {
@@ -3636,14 +3999,18 @@ function materializePathMuxShim(stableLauncher, options = {}) {
 function isAiWorkHubMuxExecutable(value) {
   const current = String(value || "").trim();
   if (!current) return false;
-  return /(?:^|[\\/])aiworkhub-app-server-mux(?:\.cmd)?$/i.test(current)
-    || /^aiworkhub-app-server-mux(?:\.cmd)?$/i.test(current);
+  return /(?:^|[\\/])aiworkhub-app-server-mux(?:\.cmd|\.exe)?$/i.test(current)
+    || /^aiworkhub-app-server-mux(?:\.cmd|\.exe)?$/i.test(current);
 }
 
 function isLegacyAiWorkHubMuxPath(value) {
   const current = String(value || "").trim();
   return isAiWorkHubMuxExecutable(current)
     && (path.isAbsolute(current) || /[\\/]/.test(current));
+}
+
+function codexMuxLauncherSetting(platform, pathLauncher) {
+  return platform === "win32" ? pathLauncher : "aiworkhub-app-server-mux";
 }
 
 function colocatedCodexExtension() {
@@ -3715,6 +4082,34 @@ async function keepMuxSettingHostLocal() {
   }
 }
 
+function aiworkhubFeatureEnabled(key) {
+  return vscode.workspace.getConfiguration(EXT_ID).get(key, false) === true;
+}
+
+async function restoreNativeCodexExecutable() {
+  try {
+    const config = vscode.workspace.getConfiguration("chatgpt");
+    const current = String(config.get("cliExecutable", "") || "").trim();
+    if (!isAiWorkHubMuxExecutable(current) || typeof config.update !== "function") {
+      return false;
+    }
+    await config.update(
+      "cliExecutable",
+      undefined,
+      vscode.ConfigurationTarget ? vscode.ConfigurationTarget.Global : true,
+    );
+    if (outputChannel) {
+      outputChannel.appendLine("[codex] restored native Codex executable; callback mux is disabled");
+    }
+    return true;
+  } catch (err) {
+    if (outputChannel) {
+      outputChannel.appendLine(`[codex] failed to restore native Codex executable: ${sanitizeErrorMessage(err)}`);
+    }
+    return false;
+  }
+}
+
 /** Configure direct callbacks only on the host that owns both extensions.
  *
  * `chatgpt.cliExecutable` has application scope, so the stored launcher is
@@ -3751,7 +4146,16 @@ async function ensureCodexCallbackMuxConfigured(context) {
       return { ok: true, changed: true, launcher: "", mode: "native_codex", reason: "codex_extension_not_colocated" };
     }
     const launcher = materializeStableMuxLauncher(context);
-    const launcherSetting = "aiworkhub-app-server-mux";
+    const pathLauncher = materializePathMuxShim(launcher, {
+      extensionFsPath: context && context.extensionUri && context.extensionUri.fsPath,
+    });
+    // The OpenAI extension starts before this workspace extension on Windows,
+    // so a bare command that only becomes discoverable after we prepend PATH
+    // loses the activation-order race and Codex silently stays native. Persist
+    // the extension-owned native launcher path on Windows; Settings Sync is
+    // explicitly told to ignore this host-local application setting. Keep the
+    // existing machine-neutral command on POSIX hosts.
+    const launcherSetting = codexMuxLauncherSetting(process.platform, pathLauncher);
     pinMuxRealExecutable(realExecutable);
     await keepMuxSettingHostLocal();
     const activationMarker = `app_server_sideband.v2:${process.platform}:${launcherSetting}`;
@@ -3873,7 +4277,7 @@ function ensureWorkspaceMcpConfigsRepaired(context) {
   let repaired = 0;
   for (const folder of folders) {
     const repoRoot = canonicalRepositoryRoot(folder.uri.fsPath);
-    const python = findPythonCommand(repoRoot);
+    const python = findPythonCommand(repoRoot, { preflight: false });
     for (const spec of [
       { configPath: path.join(repoRoot, ".vscode", "mcp.json"), container: "servers", label: "VS Code/Copilot" },
       { configPath: path.join(repoRoot, ".mcp.json"), container: "mcpServers", label: "Claude Code" },
@@ -3914,12 +4318,15 @@ function getMcpClient(context) {
   const displayLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], repo.uriStr);
   const identity = { ...repo, label: displayLabel };
   if (!mcpClient || mcpClient.repositoryRoot !== root || mcpClient.repositoryIdentity.repoId !== identity.repoId) {
+    let startupBarrier = null;
     if (mcpClient) {
-      // Fire-and-forget: getMcpClient() is synchronous and must return the
-      // new client immediately; the stale client's dispatcher-stop-then-
-      // terminate cleanup (see stopDispatcherThenTerminate) runs in the
-      // background so it can never block binding to the new repository.
-      mcpClient.stopDispatcherThenTerminate({ restart: false }).catch(() => {});
+      // getMcpClient() remains synchronous, but the replacement client's first
+      // start is gated by this bounded shutdown. This prevents two Windows
+      // Python process trees from opening the same repository during init.
+      startupBarrier = mcpClient.stopDispatcherThenTerminate({
+        restart: false,
+        timeoutMs: 3000,
+      });
     }
     activeClaimEpisode = `episode_${crypto.randomBytes(12).toString("hex")}`;
     activeRepoIdentity = identity;
@@ -3929,9 +4336,16 @@ function getMcpClient(context) {
     // for a dashboard snapshot here would leave callbacks unbound during
     // startup -- exactly when the dispatcher needs this window identity.
     if (REPO_ID_RE.test(identity.repoId)) {
-      refreshCoordinatorRouteOwnership(identity);
+      try {
+        refreshCoordinatorRouteOwnership(identity);
+      } catch (err) {
+        if (outputChannel) {
+          outputChannel.appendLine(`[routing] initial ownership publish deferred: ${sanitizeErrorMessage(err)}`);
+        }
+      }
     }
     mcpClient = new McpStdioClient(root, outputChannel, identity, activeClaimEpisode);
+    mcpClient.startupBarrier = startupBarrier;
   } else {
     activeRepoIdentity = identity;
     activeRepoLabel = displayLabel;
@@ -4122,6 +4536,14 @@ function sanitizeErrorMessage(err) {
   return String((err && err.message) || "mcp_unavailable").slice(0, 200);
 }
 
+function runBackgroundTask(label, operation) {
+  return Promise.resolve().then(operation).catch((err) => {
+    if (outputChannel) {
+      outputChannel.appendLine(`[extension] ${label} failed: ${sanitizeErrorMessage(err)}`);
+    }
+  });
+}
+
 // Host-owned per-webview poll state. Polling lives here (not in the
 // Webview's own timers) so visibility -- a host-side fact -- is what starts
 // and stops it; a hidden panel's timer is always cleared, never left
@@ -4205,9 +4627,26 @@ function pushSnapshot(view) {
   return inFlight;
 }
 
+function refreshCoordinatorRouteBeforeSnapshot() {
+  if (!activeRepoIdentity) return;
+  try {
+    refreshCoordinatorRouteOwnership(activeRepoIdentity);
+  } catch (err) {
+    // Routing publication is callback metadata, not dashboard read authority.
+    // Windows can transiently reject renameSync while another process has the
+    // JSON open; the repo-bound MCP snapshot must still reach the Webview.
+    if (outputChannel) {
+      outputChannel.appendLine(
+        `[routing] snapshot route refresh deferred: ${sanitizeErrorMessage(err)}`,
+      );
+    }
+  }
+}
+
 async function pushSnapshotOnce(view) {
   const requestSeq = ++view.snapshotRequestSeq;
   let lastError = null;
+  debugTrace("snapshot.begin", { request_seq: requestSeq });
   const client = getMcpClient();
   view.bindClient(client);
   for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
@@ -4216,8 +4655,14 @@ async function pushSnapshotOnce(view) {
       await new Promise((resolve) => setTimeout(resolve, MCP_RECOVERY_BACKOFF_MS[attempt - 1]));
     }
     try {
-      if (activeRepoIdentity) refreshCoordinatorRouteOwnership(activeRepoIdentity);
+      debugTrace("snapshot.attempt.begin", { request_seq: requestSeq, attempt: attempt + 1 });
+      refreshCoordinatorRouteBeforeSnapshot();
       const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
+      debugTrace("snapshot.payload.received", {
+        request_seq: requestSeq,
+        attempt: attempt + 1,
+        payload_present: Boolean(payload),
+      });
       if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({
           type: OUTBOUND_TYPES.snapshot,
@@ -4227,11 +4672,20 @@ async function pushSnapshotOnce(view) {
             extension_runtime_storage: runtimeRetentionSnapshot(),
           }),
         });
+        // The storage state is now visible. Only now may slower background
+        // services use this serialized MCP transport.
+        client._convergeBackgroundServices();
+        debugTrace("snapshot.posted", { request_seq: requestSeq, attempt: attempt + 1 });
       } else if (!payload && requestSeq === view.snapshotRequestSeq) {
         view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
       }
       return;
     } catch (err) {
+      debugTrace("snapshot.attempt.error", {
+        request_seq: requestSeq,
+        attempt: attempt + 1,
+        ...debugErrorFields(err),
+      });
       lastError = err;
       client.recovery.category = "snapshot";
       client.recovery.reason = sanitizeErrorMessage(err);
@@ -4246,16 +4700,19 @@ async function pushSnapshotOnce(view) {
       recovery: client.recoveryStatus(),
     });
   }
+  debugTrace("snapshot.offline", { request_seq: requestSeq, ...debugErrorFields(lastError) });
 }
 
-async function pushSnapshotNoRetry(view) {
+async function pushSnapshotNoRetry(view, options = {}) {
   const requestSeq = ++view.snapshotRequestSeq;
+  const authoritative = options.authoritative === true;
+  const convergeBackgroundServices = options.convergeBackgroundServices !== false;
   try {
-    const client = getMcpClient();
+    const client = options.client || getMcpClient();
     view.bindClient(client);
-    if (activeRepoIdentity) refreshCoordinatorRouteOwnership(activeRepoIdentity);
+    refreshCoordinatorRouteBeforeSnapshot();
     const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
-    if (payload && view.stillBoundTo(client) && requestSeq === view.snapshotRequestSeq) {
+    if (payload && view.stillBoundTo(client) && (authoritative || requestSeq === view.snapshotRequestSeq)) {
       view.postMessage({
         type: OUTBOUND_TYPES.snapshot,
         payload: sanitizeWebviewPayload({
@@ -4264,14 +4721,17 @@ async function pushSnapshotNoRetry(view) {
           extension_runtime_storage: runtimeRetentionSnapshot(),
         }),
       });
-    } else if (!payload && requestSeq === view.snapshotRequestSeq) {
+      if (convergeBackgroundServices) client._convergeBackgroundServices();
+      return { posted: true, payload };
+    } else if (!payload && (authoritative || requestSeq === view.snapshotRequestSeq)) {
       view.postMessage({ type: OUTBOUND_TYPES.error, message: "snapshot_unavailable" });
     }
   } catch (err) {
-    if (requestSeq === view.snapshotRequestSeq) {
+    if (authoritative || requestSeq === view.snapshotRequestSeq) {
       view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(err) });
     }
   }
+  return { posted: false, payload: null };
 }
 
 async function pushTaskDetail(view, taskId) {
@@ -4681,20 +5141,65 @@ async function runRuntimePurge(view, batchId) {
 // uninitialized repository is never refused. Never called from activation
 // or repository selection -- only from this explicit user-clicked action.
 async function pushInitializeStorage(view) {
+  let payload = null;
+  let initializeError = "";
+  let initializationClient = null;
   try {
-    const client = getMcpClient();
-    view.bindClient(client);
+    initializationClient = getMcpClient();
+    view.bindClient(initializationClient);
     const repoId = activeRepoIdentity && REAL_REPO_ID_RE.test(String(activeRepoIdentity.repoId || ""))
       ? activeRepoIdentity.repoId
       : "";
-    const payload = await client.callTool(INITIALIZE_TOOL, { repo_id: repoId });
-    if (!payload || payload.ok !== true) {
+    payload = await initializationClient.callTool(INITIALIZE_TOOL, { repo_id: repoId });
+    recordSystemLog(
+      payload && payload.ok === true
+        ? `[initialize] completed repo_id=${sanitizeErrorMessage(payload.repo_id || "unknown")}`
+        : `[initialize] failed ${sanitizeErrorMessage(payload && (payload.message || payload.error) || "initialize_failed")}`,
+    );
+  } catch (err) {
+    // Another window can win the first-initialize race after this window's
+    // stale MCP child has already observed a missing manifest. Always
+    // reconcile from disk below; the fresh snapshot is the authority for
+    // whether initialization actually converged.
+    initializeError = sanitizeErrorMessage(err);
+    recordSystemLog(`[initialize] failed ${initializeError}`);
+  }
+
+  try {
+    // The process that performed initialization is the only process guaranteed
+    // to observe its writes without a Windows launcher/process-tree handoff.
+    // Publish storage readiness from that process before changing repo_id and
+    // spawning the replacement MCP child. Starting the replacement first can
+    // overlap it with the old Source Graph/dispatcher shutdown on Windows and
+    // strand the Webview on Connecting even though project.json already exists.
+    const reconciliation = initializationClient
+      ? await pushSnapshotNoRetry(view, {
+        client: initializationClient,
+        authoritative: true,
+        convergeBackgroundServices: false,
+      })
+      : { posted: false, payload: null };
+    const storageReady = Boolean(
+      reconciliation.payload
+      && reconciliation.payload.storage
+      && reconciliation.payload.storage.ready === true,
+    );
+    recordSystemLog(
+      `[initialize] pre-rebind snapshot posted=${reconciliation.posted ? "true" : "false"} storage_ready=${storageReady ? "true" : "false"}`,
+    );
+    // A fresh repository had no durable log target before project.json was
+    // created. Flush now so the initialize and reconciliation outcomes survive
+    // a later child-process failure or window reload.
+    flushSystemLogs();
+
+    if ((!payload || payload.ok !== true) && !storageReady) {
       view.postMessage({
         type: OUTBOUND_TYPES.error,
-        message: (payload && (payload.message || payload.error)) || "initialize_failed",
+        message: (payload && (payload.message || payload.error)) || initializeError || "initialize_failed",
       });
       return;
     }
+
     const refreshedRepo = getActiveRepositoryRoot(extensionContext);
     activeRepoLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], refreshedRepo.uriStr);
     activeRepoIdentity = { ...refreshedRepo, label: activeRepoLabel };
@@ -4702,13 +5207,15 @@ async function pushInitializeStorage(view) {
     if (vscodeLmBridgeHost) {
       await vscodeLmBridgeHost.start(activeRepoIdentity);
     }
-    // Init changes the repository identity from manifest-missing to its real
-    // repo_id. Rebind immediately, then explicitly converge Source Graph on
-    // the NEW MCP child. Relying only on the old child's bootstrap thread (or
-    // on handshake fire-and-forget convergence) lets that first index vanish
-    // when the identity rebind terminates the old child on a fresh install.
+    // Only after the ready state is visible may the repository identity change
+    // from manifest-missing to its real repo_id and create a replacement child.
     const initializedClient = getMcpClient();
     view.bindClient(initializedClient);
+    pushRepositoryInfo(view, activeRepoIdentity);
+
+    // Storage readiness is already rendered. Source Graph convergence on the
+    // NEW child can now take as long as Windows process/SQLite cleanup needs
+    // without holding the Webview on Connecting.
     const sourceGraphStart = await initializedClient.callTool(
       SOURCE_GRAPH_DAEMON_TOOLS.ensureStarted,
       {},
@@ -4718,10 +5225,6 @@ async function pushInitializeStorage(view) {
       const reason = String((sourceGraphStart && (sourceGraphStart.reason || sourceGraphStart.error || sourceGraphStart.status)) || "source_graph_start_failed");
       outputChannel.appendLine(`[source-graph] post-init automatic index start failed: ${sanitizeErrorMessage(reason)}`);
       view.postMessage({ type: OUTBOUND_TYPES.error, message: `source_graph_start_failed:${sanitizeErrorMessage(reason)}` });
-    }
-    if (view.stillBoundTo(initializedClient)) {
-      pushRepositoryInfo(view, activeRepoIdentity);
-      await pushSnapshot(view);
     }
   } catch (err) {
     view.postMessage({ type: OUTBOUND_TYPES.error, message: sanitizeErrorMessage(err) });
@@ -4737,16 +5240,21 @@ function handleInboundMessage(view, message) {
   }
   switch (message.type) {
     case "ready":
-      pushSettings(view);
-      pushSnapshot(view);
+      // The first snapshot owns transport priority. Settings and background
+      // services must never hold a Windows Webview at "Connecting".
+      recordSystemLog("[webview] ready received");
+      runBackgroundTask("dashboard ready", async () => {
+        await pushSnapshot(view);
+        await pushSettings(view);
+      });
       break;
     case "refresh":
-      pushSnapshot(view);
+      runBackgroundTask("dashboard refresh", () => pushSnapshot(view));
       break;
     case "retry": {
       const client = getMcpClient();
       client.beginExplicitRecovery();
-      pushSnapshot(view);
+      runBackgroundTask("dashboard retry", () => pushSnapshot(view));
       break;
     }
     case "selectTask": {
@@ -5419,7 +5927,7 @@ class DashboardViewProvider {
       webviewView.onDidChangeVisibility(() => {
         view.setVisible(webviewView.visible);
         if (webviewView.visible) {
-          pushSnapshot(view);
+          runBackgroundTask("sidebar visibility refresh", () => pushSnapshot(view));
         }
       });
     }
@@ -5483,6 +5991,7 @@ async function openDashboardCommand(extensionUri) {
     vscode.ViewColumn.Active,
     { retainContextWhenHidden: true }
   );
+  recordSystemLog("[webview] dashboard panel opened");
   applyWebviewOptions(panel.webview, extensionUri);
   panel.webview.html = getHtmlForWebview(panel.webview, extensionUri);
 
@@ -5503,7 +6012,7 @@ async function openDashboardCommand(extensionUri) {
   panel.webview.onDidReceiveMessage((message) => {
     if (message && message.type === "ready") {
       pushRepositoryInfo(view, activeRepoIdentity);
-      pushRuntimeInfo(view);
+      runBackgroundTask("dashboard runtime info", () => pushRuntimeInfo(view));
       pushCoordinatorTargets(view);
     }
   });
@@ -5511,7 +6020,7 @@ async function openDashboardCommand(extensionUri) {
   panel.onDidChangeViewState(() => {
     view.setVisible(panel.visible);
     if (panel.visible) {
-      pushSnapshot(view);
+      runBackgroundTask("dashboard visibility refresh", () => pushSnapshot(view));
     }
   });
   panel.onDidDispose(() => {
@@ -5519,7 +6028,7 @@ async function openDashboardCommand(extensionUri) {
     panel = null;
   });
 
-  pushSnapshot(view);
+  runBackgroundTask("dashboard initial snapshot", () => pushSnapshot(view));
 }
 
 function reviveDashboardPanel(webviewPanel, extensionUri, context) {
@@ -5532,6 +6041,7 @@ function reviveDashboardPanel(webviewPanel, extensionUri, context) {
     panel.__aiworkhubViewState.dispose();
   }
   panel = webviewPanel;
+  recordSystemLog("[webview] dashboard panel revived");
   applyWebviewOptions(panel.webview, extensionUri);
   panel.webview.html = getHtmlForWebview(panel.webview, extensionUri);
   // Re-create a fresh McpStdioClient binding for the revived panel -- the
@@ -5550,26 +6060,26 @@ function reviveDashboardPanel(webviewPanel, extensionUri, context) {
   panel.webview.onDidReceiveMessage((message) => {
     if (message && message.type === "ready") {
       pushRepositoryInfo(view, activeRepoIdentity);
-      pushRuntimeInfo(view);
+      runBackgroundTask("revived dashboard runtime info", () => pushRuntimeInfo(view));
       pushCoordinatorTargets(view);
     }
   });
   panel.onDidChangeViewState(() => {
     view.setVisible(panel.visible);
     if (panel.visible) {
-      pushSnapshot(view);
+      runBackgroundTask("revived dashboard visibility refresh", () => pushSnapshot(view));
     }
   });
   panel.onDidDispose(() => {
     view.dispose();
     panel = null;
   });
-  pushSnapshot(view);
+  runBackgroundTask("revived dashboard snapshot", () => pushSnapshot(view));
 }
 
 function refreshDashboardCommand() {
   if (panel && panel.__aiworkhubViewState) {
-    pushSnapshot(panel.__aiworkhubViewState);
+    runBackgroundTask("dashboard command refresh", () => pushSnapshot(panel.__aiworkhubViewState));
   }
 }
 
@@ -5682,42 +6192,56 @@ async function selectRepositoryCommand() {
   }
   if (panel && panel.__aiworkhubViewState) {
     pushRepositoryInfo(panel.__aiworkhubViewState, activeRepoIdentity);
-    pushRuntimeInfo(panel.__aiworkhubViewState);
+    runBackgroundTask("repository switch runtime info", () => pushRuntimeInfo(panel.__aiworkhubViewState));
   }
   refreshDashboardCommand();
 }
 
 async function activate(context) {
   extensionContext = context;
+  initializeDebugTracing(context);
+  debugTrace("activation.begin", { version: EXPECTED_MCP_PACKAGE_VERSION });
   outputChannel = createManagedOutputChannel();
   context.subscriptions.push(outputChannel);
-  vscodeLmBridgeHost = new VscodeLmBridgeHost(context);
-  context.subscriptions.push(vscodeLmBridgeHost);
+  const codexCallbackMuxEnabled = aiworkhubFeatureEnabled("enableCodexCallbackMux");
+  const vscodeLmBridgeEnabled = aiworkhubFeatureEnabled("enableVscodeLmBridge");
+  debugTrace("activation.features", { codexCallbackMuxEnabled, vscodeLmBridgeEnabled });
+  vscodeLmBridgeHost = vscodeLmBridgeEnabled ? new VscodeLmBridgeHost(context) : null;
+  if (vscodeLmBridgeHost) context.subscriptions.push(vscodeLmBridgeHost);
 
   // Materialize the same-host mux as a fail-open building block before it can
   // be advertised to a co-located Codex extension. The bootstrap pointer is
   // cheap and closes the first-install race where Codex starts the configured
   // launcher before the immutable generation copy has completed.
-  try {
-    const stableMuxLauncher = materializeStableMuxLauncher(context);
-    materializePathMuxShim(stableMuxLauncher, { extensionFsPath: context.extensionUri.fsPath });
-    primeStableMuxRuntimePointer(context);
-  } catch (err) {
-    outputChannel.appendLine(
-      `[codex] optional same-host mux unavailable; native Codex preserved: ${sanitizeErrorMessage(err)}`,
-    );
+  if (codexCallbackMuxEnabled) {
+    try {
+      const stableMuxLauncher = materializeStableMuxLauncher(context);
+      materializePathMuxShim(stableMuxLauncher, { extensionFsPath: context.extensionUri.fsPath });
+      primeStableMuxRuntimePointer(context);
+    } catch (err) {
+      outputChannel.appendLine(
+        `[codex] optional same-host mux unavailable; native Codex preserved: ${sanitizeErrorMessage(err)}`,
+      );
+    }
+  } else {
+    debugTrace("activation.restore_native_codex.begin");
+    await restoreNativeCodexExecutable();
+    debugTrace("activation.restore_native_codex.end");
   }
 
   // Publish this extension-host PID before changing the Codex executable. A
   // newly launched mux waits
   // on this exact repo/PID binding before it starts the real App Server.
   try {
+    debugTrace("activation.repository_bind.begin");
     const repo = getActiveRepositoryRoot(context);
     activeRepoLabel = repositoryLabel(vscode.workspace.workspaceFolders || [], repo.uriStr);
     activeRepoIdentity = { ...repo, label: activeRepoLabel };
     bindSystemLogRepository(repo.root);
     refreshCoordinatorRouteOwnership(activeRepoIdentity);
+    debugTrace("activation.repository_bind.end", { repo_id: repo.repoId });
   } catch (err) {
+    debugTrace("activation.repository_bind.error", debugErrorFields(err));
     if (err.message === "no_repository_selected") {
       activeRepoLabel = "Select a repository";
     } else {
@@ -5729,12 +6253,25 @@ async function activate(context) {
   // extension are actually co-located on the same host. Split-host
   // Remote-SSH keeps native Codex + durable manager inbox and never receives
   // a foreign launcher path. Any legacy host path is repaired here too.
-  await ensureCodexCallbackMuxConfigured(context);
+  if (codexCallbackMuxEnabled) {
+    await ensureCodexCallbackMuxConfigured(context);
+  }
 
   // The callback launcher and repo route are now available.  Materialize the
   // heavier content-addressed runtime generation without blocking Codex from
   // entering the mux.
-  const stableRuntime = materializeStableRuntimeGeneration(context);
+  let stableRuntime;
+  try {
+    debugTrace("activation.runtime_materialize.begin");
+    stableRuntime = materializeStableRuntimeGeneration(context);
+    debugTrace("activation.runtime_materialize.end", { generation: path.basename(stableRuntime.generationRoot || "") });
+  } catch (err) {
+    debugTrace("activation.runtime_materialize.error", debugErrorFields(err));
+    stableRuntime = bundledRuntimeFallback(context);
+    outputChannel.appendLine(
+      `[runtime] immutable generation unavailable; using packaged runtime for this activation: ${sanitizeErrorMessage(err)}`,
+    );
+  }
   extensionRuntimeDir = stableRuntime.runtimeDir;
   try {
     startStableRuntimeLease(stableRuntime);
@@ -5746,14 +6283,19 @@ async function activate(context) {
     };
     outputChannel.appendLine(`[runtime] retention lease unavailable; cleanup disabled: ${sanitizeErrorMessage(err)}`);
   }
-  outputChannel.appendLine(`[runtime] using immutable generation ${path.basename(stableRuntime.generationRoot)}`);
+  const runtimeLabel = stableRuntime.generationRoot
+    ? `immutable generation ${path.basename(stableRuntime.generationRoot)}`
+    : "packaged runtime fallback";
+  outputChannel.appendLine(`[runtime] using ${runtimeLabel}`);
+  debugTrace("activation.config_repair.begin");
   ensureCodexConfigTomlRepaired(context);
   migrateCodexConfigTomlRuntimePath(context);
   ensureCodexMcpRegistered(context, activeRepoIdentity && activeRepoIdentity.root);
   ensureCodexManagerGatesRepaired();
   ensureWorkspaceMcpConfigsRepaired(context);
+  debugTrace("activation.config_repair.end");
 
-  if (activeRepoIdentity && activeRepoIdentity.root) {
+  if (vscodeLmBridgeHost && activeRepoIdentity && activeRepoIdentity.root) {
     await vscodeLmBridgeHost.start(activeRepoIdentity);
   }
 
@@ -5781,11 +6323,12 @@ async function activate(context) {
     vscode.commands.registerCommand(`${EXT_ID}.restartDashboard`, () => restartMcpConnectionCommand()),
     vscode.commands.registerCommand(`${EXT_ID}.selectRepository`, () => selectRepositoryCommand())
   );
+  debugTrace("activation.providers_registered");
 
   // Startup activation is the callback lifecycle owner.  An initialized
   // repository must start its MCP child and dispatcher even when the user
   // never opens the dashboard during this window/session.
-  if (activeRepoIdentity && activeRepoIdentity.root) {
+  if ((codexCallbackMuxEnabled || vscodeLmBridgeEnabled) && activeRepoIdentity && activeRepoIdentity.root) {
     // B1017: publish route_pending first (fail-closed), then immediately
     // re-run route convergence after the MCP child and dispatcher are both
     // alive so a ready/fresh mux descriptor publishes capability_state=
@@ -5806,6 +6349,7 @@ async function activate(context) {
   // ticking and never leaves the current window's lease to lapse silently.
   startWindowRouteRenewalTimer();
   startDispatcherWatchdog();
+  debugTrace("activation.end");
 }
 
 async function deactivate() {
@@ -5839,8 +6383,11 @@ module.exports = {
     pushSnapshot,
     pushSnapshotNoRetry,
     pushRuntimeInfo,
+    runBackgroundTask,
     findPythonCommand,
+    findPythonCommandForLaunch,
     _preflightPythonCandidate,
+    _preflightPythonCandidateAsync,
     _buildPreflightDiagnostic,
     getMcpClient,
     sanitizeErrorMessage,
@@ -5849,11 +6396,15 @@ module.exports = {
     resolveExtensionRuntimeDir,
     primeStableMuxRuntimePointer,
     materializeStableRuntimeGeneration,
+    bundledRuntimeFallback,
     repairCodexConfigTomlText,
     ensureCodexManagerGatesTomlText,
     ensureCodexCallbackMuxConfigured,
+    restoreNativeCodexExecutable,
+    aiworkhubFeatureEnabled,
     isAiWorkHubMuxExecutable,
     isLegacyAiWorkHubMuxPath,
+    codexMuxLauncherSetting,
     materializeStableMuxLauncher,
     materializePathMuxShim,
     recordSystemLog,

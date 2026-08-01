@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-native AI orchestration for VS Code: plan work, coordinate models, query source intelligence, preserve context and verify results.",
-  "version": "0.8.11",
+  "version": "0.8.23",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
   "icon": "media/aiworkhub-icon.png",
@@ -13,7 +13,7 @@
     "vscode": "^1.93.0"
   },
   "categories": [
-    "Other",
+    "AI",
     "Visualization"
   ],
   "keywords": [
@@ -32,13 +32,6 @@
     "theme": "dark"
   },
   "activationEvents": [
-    "*",
-    "onStartupFinished",
-    "onCommand:aiworkhub.openDashboard",
-    "onCommand:aiworkhub.refreshDashboard",
-    "onCommand:aiworkhub.restartDashboard",
-    "onCommand:aiworkhub.selectRepository",
-    "onView:aiworkhub.view",
     "onWebviewPanel:aiworkhub.dashboard"
   ],
   "main": "./extension.js",
@@ -49,9 +42,6 @@
     "package": "node test/package-vsix.js"
   },
   "contributes": {
-    "configurationDefaults": {
-      "chatgpt.cliExecutable": "aiworkhub-app-server-mux"
-    },
     "viewsContainers": {
       "activitybar": [
         {
@@ -110,6 +100,24 @@
           "default": "",
           "scope": "resource",
           "description": "Optional Python executable. Empty uses the selected repository virtual environment when present, otherwise Python from the system PATH."
+        },
+        "aiworkhub.enableCodexCallbackMux": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Opt in to the same-host Codex callback mux. Disabled by default to avoid changing another extension's executable configuration."
+        },
+        "aiworkhub.enableVscodeLmBridge": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Opt in to the VS Code language-model worker bridge. Disabled by default to avoid activating model providers when only the dashboard is needed."
+        },
+        "aiworkhub.debugTracing": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Write bounded, fsynced extension-host and MCP lifecycle traces for diagnosing hangs and crashes."
         }
       }
     }

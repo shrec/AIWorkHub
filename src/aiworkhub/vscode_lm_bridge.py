@@ -80,10 +80,16 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        # Windows refuses to replace a file while this process still holds
+        # the mkstemp handle open (WinError 32).  POSIX permits it, which hid
+        # the bug in the original implementation.
+        os.close(fd)
+        fd = -1
         os.replace(tmp_name, path)
         os.chmod(path, 0o600)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         try:
             os.unlink(tmp_name)
         except FileNotFoundError:
@@ -109,7 +115,11 @@ def bridge_readiness(
     for path in paths[:32]:
         try:
             stat_result = path.stat()
-            if stat_result.st_uid != os.getuid() or stat_result.st_size > 256 * 1024:
+            getuid = getattr(os, "getuid", None)
+            if (
+                (getuid is not None and stat_result.st_uid != getuid())
+                or stat_result.st_size > 256 * 1024
+            ):
                 continue
             if os.name != "nt" and stat.S_IMODE(stat_result.st_mode) != 0o600:
                 continue
