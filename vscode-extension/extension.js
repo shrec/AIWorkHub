@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.39";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.40";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -4073,9 +4073,9 @@ function resolveBundledCodexExecutable(codexExtension) {
   }) || "";
 }
 
-function pinMuxRealExecutable(executable) {
+function pinMuxRealExecutable(executable, options = {}) {
   if (!executable || !path.isAbsolute(executable)) return false;
-  const sidebandDir = appServerMuxSidebandDir();
+  const sidebandDir = options.sidebandDir || appServerMuxSidebandDir();
   fs.mkdirSync(sidebandDir, { recursive: true, mode: 0o700 });
   const pinPath = path.join(sidebandDir, "real_executable");
   fs.writeFileSync(pinPath, `${executable}\n`, { encoding: "utf8", mode: 0o600 });
@@ -4142,7 +4142,7 @@ async function restoreNativeCodexExecutable() {
  * storage on every activation. Split local/Remote-SSH topologies fail open to
  * native Codex + manager inbox; unrelated user overrides remain untouched.
  */
-async function ensureCodexCallbackMuxConfigured(context) {
+async function ensureCodexCallbackMuxConfigured(context, options = {}) {
   try {
     const config = vscode.workspace.getConfiguration("chatgpt");
     const current = String(config.get("cliExecutable", "") || "").trim();
@@ -4173,6 +4173,7 @@ async function ensureCodexCallbackMuxConfigured(context) {
     const launcher = materializeStableMuxLauncher(context);
     const pathLauncher = materializePathMuxShim(launcher, {
       extensionFsPath: context && context.extensionUri && context.extensionUri.fsPath,
+      ...(options.muxShim || {}),
     });
     // The OpenAI extension starts before this workspace extension on Windows,
     // so a bare command that only becomes discoverable after we prepend PATH
@@ -4181,7 +4182,7 @@ async function ensureCodexCallbackMuxConfigured(context) {
     // explicitly told to ignore this host-local application setting. Keep the
     // existing machine-neutral command on POSIX hosts.
     const launcherSetting = codexMuxLauncherSetting(process.platform, pathLauncher);
-    pinMuxRealExecutable(realExecutable);
+    pinMuxRealExecutable(realExecutable, { sidebandDir: options.sidebandDir });
     await keepMuxSettingHostLocal();
     const activationMarker = `app_server_sideband.v2:${process.platform}:${launcherSetting}`;
     const markerKey = "aiworkhub.codexCallbackMuxActivation";

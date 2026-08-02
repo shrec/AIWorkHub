@@ -62,6 +62,20 @@ const context = {
   extensionUri: { fsPath: temp },
   globalStorageUri: { fsPath: globalStorage },
 };
+const testHostHome = path.join(temp, "host-home");
+const testHostEnv = { PATH: "" };
+const defaultTestSidebandDir = path.join(temp, "sideband-default");
+
+function testHostOptions() {
+  return {
+    muxShim: { home: testHostHome, env: testHostEnv },
+    sidebandDir: process.env.AIWORKHUB_APP_SERVER_MUX_SIDEBAND_DIR || defaultTestSidebandDir,
+  };
+}
+
+function ensureConfigured(testContext = context) {
+  return __testInternals.ensureCodexCallbackMuxConfigured(testContext, testHostOptions());
+}
 
 function installFakePackagedWindowsLauncher(extensionRoot = temp) {
   if (process.platform !== "win32") return "";
@@ -83,7 +97,7 @@ after(() => fs.rmSync(temp, { recursive: true, force: true }));
 test("empty Codex executable remains native and is never configured", async () => {
   currentValue = "";
   updates.length = 0;
-  const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+  const result = await ensureConfigured();
   assert.equal(result.ok, true);
   assert.equal(result.changed, false);
   assert.deepEqual(updates, []);
@@ -114,13 +128,18 @@ test("co-located Codex is configured through one host-local stable mux", async (
   ignoredSettings = [];
   updates.length = 0;
   try {
-    const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+    const result = await ensureConfigured();
     assert.equal(result.ok, true);
     assert.equal(result.mode, "app_server_sideband");
     assert.equal(result.changed, true);
     assert.equal(result.launcher, expectedConfiguredLauncher());
     assert.equal(currentValue, result.launcher);
     assert.ok(ignoredSettings.includes("chatgpt.cliExecutable"));
+    if (process.platform !== "win32") {
+      const isolatedShim = path.join(testHostHome, ".local", "bin", "aiworkhub-app-server-mux");
+      assert.ok(fs.existsSync(isolatedShim));
+      assert.ok(fs.readFileSync(isolatedShim, "utf8").includes(globalStorage));
+    }
     const pin = fs.readFileSync(path.join(testSidebandDir, "real_executable"), "utf8").trim();
     assert.equal(pin, executable);
   } finally {
@@ -153,7 +172,7 @@ test("stale equal launcher receives one bounded activation pulse, never a reload
   currentValue = expectedConfiguredLauncher();
   updates.length = 0;
   try {
-    const first = await __testInternals.ensureCodexCallbackMuxConfigured(pulseContext);
+    const first = await ensureConfigured(pulseContext);
     assert.equal(first.activation_refreshed, true);
     assert.deepEqual(
       updates.filter((entry) => entry.key === "cliExecutable"),
@@ -163,7 +182,7 @@ test("stale equal launcher receives one bounded activation pulse, never a reload
       ],
     );
     updates.length = 0;
-    const second = await __testInternals.ensureCodexCallbackMuxConfigured(pulseContext);
+    const second = await ensureConfigured(pulseContext);
     assert.equal(second.changed, false);
     assert.deepEqual(updates, []);
   } finally {
@@ -176,7 +195,7 @@ test("stale equal launcher receives one bounded activation pulse, never a reload
 test("legacy absolute AIWorkHub mux path is removed instead of rewritten", async () => {
   currentValue = path.join(temp, "old", "aiworkhub-app-server-mux");
   updates.length = 0;
-  const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+  const result = await ensureConfigured();
   assert.equal(result.changed, true);
   assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);
   assert.equal(result.launcher, "");
@@ -205,7 +224,7 @@ test("Windows upgrades a bare mux command to the activation-order-safe native pa
   currentValue = "aiworkhub-app-server-mux";
   updates.length = 0;
   try {
-    const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+      const result = await ensureConfigured();
     assert.equal(result.ok, true);
     if (process.platform === "win32") {
       assert.equal(result.changed, true);
@@ -225,7 +244,7 @@ test("Windows upgrades a bare mux command to the activation-order-safe native pa
 test("unrelated custom Codex executable is never overwritten", async () => {
   currentValue = path.join(temp, "custom-codex");
   updates.length = 0;
-  const result = await __testInternals.ensureCodexCallbackMuxConfigured(context);
+  const result = await ensureConfigured();
   assert.equal(result.ok, false);
   assert.equal(result.reason, "custom_cli_executable_preserved");
   assert.deepEqual(updates, []);
@@ -237,7 +256,7 @@ test("legacy cleanup does not depend on the optional mux launcher existing", asy
   const missingContext = {
     extensionUri: { fsPath: path.join(temp, "does-not-exist") },
   };
-  const result = await __testInternals.ensureCodexCallbackMuxConfigured(missingContext);
+  const result = await ensureConfigured(missingContext);
   assert.equal(result.ok, true);
   assert.equal(result.changed, true);
   assert.deepEqual(updates, [{ key: "cliExecutable", value: undefined, global: 1 }]);

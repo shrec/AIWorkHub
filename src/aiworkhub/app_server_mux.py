@@ -993,16 +993,25 @@ class AppServerMux:
         self,
         argv: list[str],
         *,
-        repo_id: str,
+        repo_id: str | None,
+        deferred_repo_binding: bool = False,
         real_executable: str | list[str] | None = None,
         extension_stdin: BinaryIO | None = None,
         extension_stdout: BinaryIO | None = None,
         sideband_dir: Path | str | None = None,
     ) -> None:
-        # B925: fail closed at construction -- an unbound/invalid repo_id
-        # must never silently produce an "unscoped" mux instance that a
-        # repo-scoped lookup could later be tempted to treat as a match.
-        self._repo_id = _validate_repo_id(repo_id)
+        # B925: ordinary construction remains fail-closed.  The one explicit
+        # exception is the CLI's reload-race path: it may proxy the real App
+        # Server immediately while waiting to observe one exact parent-PID
+        # repository route.  Until that succeeds it publishes no endpoint,
+        # capability, registry row, or repository ownership at all.
+        self._deferred_repo_binding = bool(deferred_repo_binding)
+        if repo_id:
+            self._repo_id = _validate_repo_id(repo_id)
+        elif self._deferred_repo_binding:
+            self._repo_id = ""
+        else:
+            self._repo_id = _validate_repo_id(repo_id)
         self._argv = list(argv)
         self._real_executable: str | list[str] = real_executable or resolve_real_executable()
         self._extension_stdin: BinaryIO = extension_stdin if extension_stdin is not None else sys.stdin.buffer
@@ -1024,6 +1033,8 @@ class AppServerMux:
 
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._threads_lock = threading.Lock()
+        self._repo_binding_lock = threading.Lock()
 
         self._capability_token = secrets.token_hex(CAPABILITY_TOKEN_BYTES)
         self._instances_dir = sideband_instances_dir(self._sideband_dir)
@@ -1050,9 +1061,10 @@ class AppServerMux:
 
         self._dedup_lock = threading.Lock()
         self._dedup_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-        self._transcript_capture = _create_manager_transcript_capture(
-            self._repo_id,
-            self._parent_pid,
+        self._transcript_capture = (
+            _create_manager_transcript_capture(self._repo_id, self._parent_pid)
+            if self._repo_id
+            else None
         )
 
     def _assign_instance_paths(self) -> None:
@@ -1097,12 +1109,11 @@ class AppServerMux:
     # --- lifecycle ---
 
     def start(self) -> None:
-        ensure_private_dir(self._sideband_dir)
-        ensure_private_dir(self._instances_dir)
-        gc_stale_sideband_instances(self._sideband_dir)
-        self._bind_socket()
-        write_capability_token(self._capability_path, self._capability_token)
-        self._write_registry()
+        # Start the real App Server before any route wait or sideband setup.
+        # VS Code restores an active Codex editor immediately on reload and
+        # expects initialize to complete promptly.  Blocking here until the
+        # concurrently activating AIWorkHub extension publishes its route
+        # caused the first reload to hang while a second reload succeeded.
         prefix = [self._real_executable] if isinstance(self._real_executable, str) else list(self._real_executable)
         self._child = subprocess.Popen(
             [*prefix, *self._argv],
@@ -1111,23 +1122,104 @@ class AppServerMux:
             stderr=None,  # inherited -- transparent stderr proxy, no active pumping needed
             bufsize=0,
         )
-        if self._transcript_capture is not None:
-            self._transcript_capture.start()
-        for target in (
-            self._pump_extension_to_child,
-            self._pump_child_to_extension,
-            self._accept_sideband_loop,
-            self._heartbeat_registry_loop,
-        ):
-            t = threading.Thread(target=target, daemon=True)
-            t.start()
-            self._threads.append(t)
+        self._start_thread(self._pump_extension_to_child)
+        self._start_thread(self._pump_child_to_extension)
+        if self._repo_id:
+            try:
+                self._activate_repo_binding(self._repo_id)
+            except (OSError, RuntimeError, ValueError):
+                # Sideband setup is an auxiliary capability. A filesystem or
+                # socket failure must not orphan/terminate the already-live
+                # extension-owned Codex App Server; keep proxying and retry
+                # the verified route in the background.
+                self._start_thread(self._deferred_repo_binding_loop)
+        else:
+            self._start_thread(self._deferred_repo_binding_loop)
+
+    def _start_thread(self, target: Any) -> None:
+        thread = threading.Thread(target=target, daemon=True)
+        with self._threads_lock:
+            self._threads.append(thread)
+        thread.start()
+
+    def _activate_repo_binding(self, repo_id: str) -> bool:
+        """Publish sideband ownership exactly once after a verified route.
+
+        The child stdio proxy is already live, so setup latency here can never
+        delay Codex initialization.  A deferred mux stays completely
+        unregistered until this atomic boundary succeeds.
+        """
+
+        validated = _validate_repo_id(repo_id)
+        with self._repo_binding_lock:
+            if self._repo_id and self._server_socket is not None:
+                return self._repo_id == validated
+            if self._stop_event.is_set():
+                return False
+            self._repo_id = validated
+            try:
+                if self._transcript_capture is None:
+                    self._transcript_capture = _create_manager_transcript_capture(
+                        validated,
+                        self._parent_pid,
+                    )
+                ensure_private_dir(self._sideband_dir)
+                ensure_private_dir(self._instances_dir)
+                gc_stale_sideband_instances(self._sideband_dir)
+                self._bind_socket()
+                write_capability_token(self._capability_path, self._capability_token)
+                self._write_registry()
+            except Exception:
+                # Never leave a half-bound identity that a callback resolver
+                # could mistake for a usable owner.
+                self._repo_id = ""
+                if self._server_socket is not None:
+                    with contextlib.suppress(OSError):
+                        self._server_socket.close()
+                    self._server_socket = None
+                for path in (self._socket_path, self._capability_path, self._registry_path):
+                    with contextlib.suppress(FileNotFoundError, OSError):
+                        os.unlink(path)
+                self._transcript_capture = None
+                raise
+            if self._transcript_capture is not None:
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    self._transcript_capture.start()
+            self._start_thread(self._accept_sideband_loop)
+            self._start_thread(self._heartbeat_registry_loop)
+            return True
+
+    def _deferred_repo_binding_loop(self) -> None:
+        """Wait for the exact current extension-host route without blocking.
+
+        Poll quickly during concurrent extension activation, then back off to
+        one second so a dashboard opened much later can still attach callback
+        capability to the already-running, visible Codex App Server.
+        """
+
+        attempts = 0
+        while not self._stop_event.is_set() and not self._repo_id:
+            repo_id = resolve_repo_id_for_mux()
+            if repo_id:
+                try:
+                    self._activate_repo_binding(repo_id)
+                except (OSError, RuntimeError, ValueError):
+                    # Sideband failure degrades callback only; it must never
+                    # take down the foreign App Server process being proxied.
+                    pass
+                if self._repo_id:
+                    return
+            attempts += 1
+            delay = ROUTE_WAIT_POLL_SECONDS if attempts <= 200 else 1.0
+            self._stop_event.wait(delay)
 
     def wait(self) -> int:
         assert self._child is not None
         returncode = self._child.wait()
         self.shutdown()
-        for t in self._threads:
+        with self._threads_lock:
+            threads = list(self._threads)
+        for t in threads:
             t.join(timeout=2)
         return returncode
 
@@ -1244,6 +1336,8 @@ class AppServerMux:
             self._transcript_capture.offer(message)
 
     def _write_registry(self) -> None:
+        if not self._repo_id or self._server_socket is None:
+            return
         with self._owned_thread_lock:
             owned = list(self._owned_thread_ids)
             active_thread_id = self._active_thread_id
@@ -1542,8 +1636,17 @@ def _try_parse_json_object(raw_line: bytes) -> dict[str, Any] | None:
 
 # --- CLI entry point ---------------------------------------------------------
 
-def run_mux(argv: list[str], *, repo_id: str) -> int:
-    mux = AppServerMux(argv, repo_id=repo_id)
+def run_mux(
+    argv: list[str],
+    *,
+    repo_id: str | None,
+    deferred_repo_binding: bool = False,
+) -> int:
+    mux = AppServerMux(
+        argv,
+        repo_id=repo_id,
+        deferred_repo_binding=deferred_repo_binding,
+    )
     mux.start()
     try:
         return mux.wait()
@@ -1584,18 +1687,19 @@ def main(argv: list[str] | None = None) -> int:
     # immutable repository identity.  The VS Code ``chatgpt.cliExecutable``
     # setting is application-scoped, however, so a launcher selected by one
     # initialized window is also inherited by unrelated/uninitialized
-    # windows.  Refusing to start here kills Codex in those windows.  Preserve
-    # the ownership invariant while remaining transparent: an unbound
-    # invocation execs the real App Server byte-for-byte and simply has no
-    # AIWorkHub sideband/callback capability.
-    repo_id = wait_for_repo_id_for_mux()
-    if not repo_id:
-        try:
-            return _passthrough_real_executable(real_executable, raw_argv)
-        except OSError as exc:
-            print(f"app_server_mux: failed to exec real executable: {exc}", file=sys.stderr)
-            return 1
-    return run_mux(raw_argv, repo_id=repo_id)
+    # windows. Refusing to start here kills Codex in those windows. Preserve
+    # the ownership invariant while remaining transparent: an unbound mux
+    # publishes no sideband/callback authority until one exact route appears.
+    # Never block the extension-owned App Server startup on route discovery.
+    # If AIWorkHub has not published the exact parent-PID route yet, the mux
+    # begins as a byte-transparent proxy and attaches its repo-scoped sideband
+    # later.  No unbound registry or callback authority is ever exposed.
+    repo_id = resolve_repo_id_for_mux()
+    return run_mux(
+        raw_argv,
+        repo_id=repo_id or None,
+        deferred_repo_binding=not bool(repo_id),
+    )
 
 
 __all__ = [

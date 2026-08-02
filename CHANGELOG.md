@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.40] - 2026-08-02
+
+### Fixed
+
+- Removed the Codex-active reload race by starting the real App Server before
+  repository-route discovery and attaching the exact repo-scoped sideband in
+  the background. A restored Codex editor no longer needs a second reload,
+  while callback authority remains unpublished until the current extension
+  host's unique repository route is verified.
+- Isolated callback-mux tests from the real host launcher and executable pin.
+  Test fixtures can no longer rewrite `~/.local/bin/aiworkhub-app-server-mux`
+  to a deleted temporary directory and make the next active Codex reload exit
+  with code 127 before AIWorkHub activation can repair it.
+
 ## [0.8.39] - 2026-08-02
 
 ### Added

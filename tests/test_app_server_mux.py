@@ -258,6 +258,7 @@ class _MuxHarness:
     def __init__(
         self, tmp_path: Path, child_args: list[str] | None = None,
         *, sideband_dir: Path | None = None, repo_id: str = _MUX_TEST_REPO_ID,
+        deferred_repo_binding: bool = False,
     ):
         # Drives a REAL AppServerMux + fake App Server subprocess. The stdio/
         # socket handshake round-trips are timing-sensitive and flake
@@ -280,7 +281,8 @@ class _MuxHarness:
             extension_stdin=os.fdopen(ext_read_fd, "rb", buffering=0),
             extension_stdout=os.fdopen(ext_write_fd, "wb", buffering=0),
             sideband_dir=self.sideband_dir,
-            repo_id=repo_id,
+            repo_id=None if deferred_repo_binding else repo_id,
+            deferred_repo_binding=deferred_repo_binding,
         )
         self._to_mux = os.fdopen(self._to_mux_write_fd, "wb", buffering=0)
         self._from_mux = os.fdopen(self._from_mux_read_fd, "rb", buffering=0)
@@ -434,6 +436,37 @@ def test_ready_after_initialize_response_without_legacy_initialized_notification
         if time.monotonic() > deadline:
             raise TimeoutError("mux never became ready after initialize response")
         time.sleep(0.02)
+
+
+def test_deferred_route_binding_never_delays_initialize_and_attaches_sideband_later(
+    monkeypatch, tmp_path,
+):
+    route_published = threading.Event()
+
+    def resolve_route():
+        return _MUX_TEST_REPO_ID if route_published.is_set() else ""
+
+    monkeypatch.setattr(app_server_mux, "resolve_repo_id_for_mux", resolve_route)
+    h = _MuxHarness(tmp_path, deferred_repo_binding=True)
+    h.start()
+    try:
+        started = time.monotonic()
+        h.do_handshake()
+        assert time.monotonic() - started < 2.0
+        assert h.mux.repo_id == ""
+        assert not h.mux.registry_path.exists()
+
+        route_published.set()
+        deadline = time.monotonic() + 5.0
+        while h.mux.repo_id != _MUX_TEST_REPO_ID or not h.mux.registry_path.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("deferred mux never attached the published repository route")
+            time.sleep(0.02)
+
+        result = h.sideband_call("thread/resume", {"threadId": "thread-after-reload"})
+        assert result["ok"] is True
+    finally:
+        h.close()
 
 
 def test_thread_resume_sideband_projection_strips_history_and_keeps_routing_state():

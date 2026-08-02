@@ -177,11 +177,15 @@ def test_app_server_mux_writes_repo_id_into_registry(tmp_path):
     assert mux.repo_id == "geoai-main"
     asm.ensure_private_dir(sideband_dir)
     asm.ensure_private_dir(asm.sideband_instances_dir(sideband_dir))
-    mux._write_registry()
+    mux._bind_socket()
+    try:
+        mux._write_registry()
 
-    descriptor = asm._read_instance_descriptor(mux.registry_path)
-    assert descriptor is not None
-    assert descriptor.repo_id == "geoai-main"
+        descriptor = asm._read_instance_descriptor(mux.registry_path)
+        assert descriptor is not None
+        assert descriptor.repo_id == "geoai-main"
+    finally:
+        mux.shutdown()
     assert descriptor.instance_id == mux.instance_id
 
 
@@ -252,28 +256,26 @@ def test_describe_sideband_owner_freshness_scoped_by_repo_id(tmp_path):
 # main(): unbound global launcher is transparent and never claims a repo
 # ---------------------------------------------------------------------------
 
-def test_main_unbound_app_server_execs_real_binary_without_sideband(monkeypatch):
+def test_main_unbound_app_server_starts_deferred_mux_without_sideband_authority(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
-    monkeypatch.setenv(asm.ENV_ROUTE_WAIT_SECONDS, "0")
     # Hermetic: a developer machine may legitimately pin the extension's
     # absolute Codex binary in ~/.aiworkhub/app_server_mux/real_executable.
-    # This test exercises unbound passthrough shape, not host configuration.
+    # This test exercises unbound deferred-proxy shape, not host configuration.
     monkeypatch.setattr(asm, "resolve_real_executable", lambda: "codex")
     monkeypatch.setattr(
         asm.shared_router,
         "list_known_repositories",
         lambda **_kwargs: {"ok": True, "repositories": []},
     )
-    calls: list[tuple[str, list[str]]] = []
+    calls: list[tuple[list[str], str | None, bool]] = []
 
-    def fake_passthrough(executable, args):
-        calls.append((executable, list(args)))
-        raise SystemExit(0)
+    def fake_run_mux(args, *, repo_id, deferred_repo_binding=False):
+        calls.append((list(args), repo_id, deferred_repo_binding))
+        return 0
 
-    monkeypatch.setattr(asm, "_passthrough_real_executable", fake_passthrough)
-    with pytest.raises(SystemExit):
-        asm.main(["app-server", "--listen", "stdio://"])
-    assert calls == [("codex", ["app-server", "--listen", "stdio://"])]
+    monkeypatch.setattr(asm, "run_mux", fake_run_mux)
+    assert asm.main(["app-server", "--listen", "stdio://"]) == 0
+    assert calls == [(["app-server", "--listen", "stdio://"], None, True)]
 
 
 def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkeypatch):
