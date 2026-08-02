@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.38] - 2026-08-02
+
+### Added
+
+- Moved the complete Operations surface into a dedicated Dashboard dialog,
+  with KPIs as the default tab and direct entry points for Tool Use and
+  Storage. The selected-task inspector now uses the full available width.
+
+### Fixed
+
+- Replaced recursive `collect_result` task/event documents with bounded
+  projections, stable hashes, explicit truncation metadata and a retrieval
+  cursor. Large nested review evidence can no longer inflate a bounded collect
+  response to tens of thousands of tokens.
+- Preserved rejected-review predecessor artifacts through residual rework,
+  materialized declared JSON/JSONL inputs safely, enforced typed residual and
+  contradictory path contracts, and moved broad workspace cleanup out of the
+  synchronous review transition.
+- Hardened canonical context writes against legacy AI Memory schemas and
+  integrity failures while keeping write failures explicit and auditable.
+
 ## [0.8.37] - 2026-08-01
 
 ### Added
