@@ -166,7 +166,9 @@ const elements = {
   sessionsSearch: document.querySelector("#sessions-search"),
   sessionsList: document.querySelector("#sessions-list"),
   openKb: document.querySelector("#open-kb"),
+  openOperations: document.querySelector("#open-operations"),
   openToolUse: document.querySelector("#open-tool-use"),
+  operationsDialog: document.querySelector("#operations-dialog"),
   kbDialog: document.querySelector("#kb-dialog"),
   kbSummary: document.querySelector("#kb-summary"),
   kbSearch: document.querySelector("#kb-search"),
@@ -3402,6 +3404,7 @@ function activateOperationTab(tab, focus = false) {
 function openToolUseTelemetry() {
   const toolUseTab = operationTabs.find((tab) => tab.dataset.tab === "tool-use");
   if (!toolUseTab) return;
+  if (!elements.operationsDialog.open) elements.operationsDialog.showModal();
   activateOperationTab(toolUseTab, true);
   document.querySelector("#panel-tool-use").scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -3432,6 +3435,7 @@ elements.openToolUse.addEventListener("click", openToolUseTelemetry);
 elements.headerStorage.addEventListener("click", () => {
   const storageTab = operationTabs.find((tab) => tab.dataset.tab === "storage");
   if (storageTab) {
+    if (!elements.operationsDialog.open) elements.operationsDialog.showModal();
     activateOperationTab(storageTab, true);
     document.querySelector("#panel-storage").scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
@@ -3535,6 +3539,10 @@ elements.openKb.addEventListener("click", () => {
   elements.kbDialog.showModal();
   elements.kbSummary.textContent = "Loading repository knowledge";
   vscode.postMessage({ type: "requestKb" });
+});
+
+elements.openOperations.addEventListener("click", () => {
+  if (!elements.operationsDialog.open) elements.operationsDialog.showModal();
 });
 
 elements.openSettings.addEventListener("click", () => {

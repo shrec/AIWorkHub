@@ -9,11 +9,16 @@ const extensionSource = fs.readFileSync(path.join(__dirname, "..", "extension.js
 const appSource = fs.readFileSync(path.join(__dirname, "..", "media", "app.js"), "utf8");
 const cssSource = fs.readFileSync(path.join(__dirname, "..", "media", "app.css"), "utf8");
 
-test("dashboard exposes KPI operations view as the default tab", () => {
+test("dashboard exposes the complete operations surface in a dedicated popup", () => {
+  assert.match(extensionSource, /id="open-operations"[^>]+title="Open repository operations"/);
+  assert.match(extensionSource, /class="diagnostic-dialog operations-dialog" id="operations-dialog"/);
+  assert.match(extensionSource, /id="kpi-dashboard"/);
   assert.match(extensionSource, /id="tab-kpis"[^>]+data-tab="kpis"/);
   assert.match(extensionSource, /id="panel-kpis"[^>]+aria-labelledby="tab-kpis"/);
-  assert.match(extensionSource, /id="kpi-dashboard"/);
   assert.match(extensionSource, /aria-selected="false"[^>]+id="tab-topics"/);
+  assert.match(appSource, /elements\.operationsDialog\.showModal\(\)/);
+  assert.match(cssSource, /\.diagnostic-dialog\.operations-dialog/);
+  assert.match(cssSource, /\.operations-dialog \.tab-panel:not\(\[hidden\]\)/);
 });
 
 test("KPI renderer separates worker outcomes from explicit manager decisions", () => {

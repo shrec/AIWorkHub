@@ -5812,6 +5812,9 @@ function getHtmlForWebview(webview, extensionUri) {
         <button class="diagnostic-icon-button" type="button" id="open-kb" title="Open Knowledge Base" aria-label="Open Knowledge Base">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/></svg><span>KB</span>
         </button>
+        <button class="diagnostic-icon-button" type="button" id="open-operations" title="Open repository operations" aria-label="Open repository operations">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V11h3v8zm6 0V5h3v14zm6 0V8h3v11M2 21h20"/></svg><span>Operations</span>
+        </button>
         <button class="diagnostic-icon-button" type="button" id="open-tool-use" title="Open model tool-use telemetry" aria-label="Open model tool-use telemetry">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m6 14v-7m5 7V3M2 21h20"/></svg><span>Telemetry</span>
         </button>
@@ -5956,9 +5959,13 @@ function getHtmlForWebview(webview, extensionUri) {
           </div>
         </section>
 
+        <dialog class="diagnostic-dialog operations-dialog" id="operations-dialog">
         <section class="operations-panel" aria-labelledby="operations-heading">
           <div class="panel-heading tabs-heading">
-            <h2 id="operations-heading">Operations</h2>
+            <div class="operations-heading-row">
+              <div><h2 id="operations-heading">Operations</h2><span>Repository KPIs, planning, workforce, telemetry and retention</span></div>
+              <button type="button" class="dialog-close" data-close-dialog="operations-dialog">Close</button>
+            </div>
             <div class="tab-list" role="tablist" aria-label="Operational views">
               <button type="button" role="tab" aria-selected="true" aria-controls="panel-kpis" id="tab-kpis" data-tab="kpis">KPIs</button>
               <button type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-topics" id="tab-topics" data-tab="topics">Topics</button>
@@ -5975,7 +5982,7 @@ function getHtmlForWebview(webview, extensionUri) {
           </div>
 
           <div class="tab-panel" role="tabpanel" id="panel-kpis" aria-labelledby="tab-kpis">
-            <div id="kpi-dashboard"></div>
+            <div id="kpi-dashboard" aria-live="polite"></div>
           </div>
           <div class="tab-panel" role="tabpanel" id="panel-topics" aria-labelledby="tab-topics" hidden>
             <div class="stat-list" id="topic-stats"></div>
@@ -6021,6 +6028,7 @@ function getHtmlForWebview(webview, extensionUri) {
             <div class="signal-list" id="warning-list"></div>
           </div>
         </section>
+        </dialog>
       </aside>
     </div>
   </main>

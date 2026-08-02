@@ -1197,7 +1197,7 @@ tbody tr.is-selected td:first-child {
   display: grid;
   grid-column: 1 / -1;
   gap: 12px;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .detail-panel,
@@ -1827,6 +1827,42 @@ tbody tr.is-selected td:first-child {
 
 .diagnostic-dialog::backdrop {
   background: rgb(0 0 0 / 55%);
+}
+
+.diagnostic-dialog.operations-dialog {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: 1180px;
+  height: min(820px, calc(100vh - 40px));
+}
+
+.operations-dialog .operations-panel {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.operations-dialog .operations-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.operations-dialog .operations-heading-row span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.operations-dialog .tab-panel:not([hidden]) {
+  box-sizing: border-box;
+  min-height: 0;
+  max-height: none;
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
 }
 
 .dialog-heading {

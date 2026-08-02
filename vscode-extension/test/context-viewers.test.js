@@ -14,11 +14,13 @@ for (const marker of [
   'id="open-sessions"',
   'id="open-ai-memory"',
   'id="open-kb"',
+  'id="open-operations"',
   'id="open-tool-use"',
   'id="open-settings"',
   'id="sessions-dialog"',
   'id="kb-dialog"',
   'id="settings-dialog"',
+  'id="operations-dialog"',
 ]) {
   assert.ok(extension.includes(marker), `missing context viewer marker: ${marker}`);
 }
