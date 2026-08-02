@@ -369,7 +369,11 @@ def test_terminal_log_retention_tools_preserve_read_write_authority(monkeypatch)
     monkeypatch.setattr(
         dashboard_mcp_app.terminal_log_retention,
         "preview",
-        lambda _root: {"ok": True, "candidate_count": 0, "preview_digest": "b" * 64},
+        lambda _root, **_kwargs: {
+            "ok": True,
+            "candidate_count": 0,
+            "preview_digest": "b" * 64,
+        },
     )
     monkeypatch.setattr(
         dashboard_mcp_app.terminal_log_retention,

@@ -359,6 +359,8 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_mode_counts": {},
         "source_graph_mode_sequence": [],
         "source_graph_mode_attributed_calls": 0,
+        "source_graph_mode_eligible_calls": 0,
+        "source_graph_mode_legacy_calls": 0,
         "source_graph_mode_unattributed_calls": 0,
         "source_graph_distinct_modes": 0,
         "source_graph_mode_attribution_rate": 0.0,
@@ -366,6 +368,8 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "source_graph_stage_sequence": [],
         "source_graph_mode_stage_counts": {},
         "source_graph_stage_attributed_calls": 0,
+        "source_graph_stage_eligible_calls": 0,
+        "source_graph_stage_legacy_calls": 0,
         "source_graph_stage_unattributed_calls": 0,
         "source_graph_stage_attribution_rate": 0.0,
         "source_graph_latency": {
@@ -505,6 +509,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                     )
         mode_counts = tool_use.get("source_graph_mode_counts")
         if isinstance(mode_counts, Mapping):
+            totals["source_graph_mode_eligible_calls"] += calls
             for mode, count in mode_counts.items():
                 safe_mode = str(mode)[:40]
                 safe_count = max(0, int(count or 0))
@@ -524,6 +529,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
                 totals["source_graph_mode_sequence"].append(str(mode)[:40])
         stage_counts = tool_use.get("source_graph_stage_counts")
         if isinstance(stage_counts, Mapping):
+            totals["source_graph_stage_eligible_calls"] += calls
             for stage, count in stage_counts.items():
                 safe_stage = str(stage)[:32]
                 safe_count = max(0, int(count or 0))
@@ -637,7 +643,10 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     )
     totals["source_graph_mode_attributed_calls"] = attributed_calls
     totals["source_graph_mode_unattributed_calls"] = max(
-        0, totals["source_graph_calls"] - attributed_calls
+        0, totals["source_graph_mode_eligible_calls"] - attributed_calls
+    )
+    totals["source_graph_mode_legacy_calls"] = max(
+        0, totals["source_graph_calls"] - totals["source_graph_mode_eligible_calls"]
     )
     stage_attributed = sum(
         max(0, int(count or 0))
@@ -646,11 +655,14 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     )
     totals["source_graph_stage_attributed_calls"] = stage_attributed
     totals["source_graph_stage_unattributed_calls"] = max(
-        0, totals["source_graph_calls"] - stage_attributed
+        0, totals["source_graph_stage_eligible_calls"] - stage_attributed
     )
-    if totals["source_graph_calls"]:
+    totals["source_graph_stage_legacy_calls"] = max(
+        0, totals["source_graph_calls"] - totals["source_graph_stage_eligible_calls"]
+    )
+    if totals["source_graph_stage_eligible_calls"]:
         totals["source_graph_stage_attribution_rate"] = round(
-            100.0 * stage_attributed / totals["source_graph_calls"], 1
+            100.0 * stage_attributed / totals["source_graph_stage_eligible_calls"], 1
         )
     latency_samples = sorted(totals["source_graph_latency"].pop("samples_ms", []))
     if latency_samples:
@@ -701,9 +713,9 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
     totals["source_graph_distinct_modes"] = sum(
         1 for count in totals["source_graph_mode_counts"].values() if int(count or 0) > 0
     )
-    if totals["source_graph_calls"]:
+    if totals["source_graph_mode_eligible_calls"]:
         totals["source_graph_mode_attribution_rate"] = round(
-            100.0 * attributed_calls / totals["source_graph_calls"], 1
+            100.0 * attributed_calls / totals["source_graph_mode_eligible_calls"], 1
         )
     for bucket in totals["by_adapter"].values():
         bucket_attributed = sum(
@@ -978,11 +990,20 @@ def _provider_terminal_status(process_row: Mapping[str, Any]) -> dict[str, Any]:
     else:
         category = "worker_terminal_failure"
         retryable = state not in {"scope_rejected", "cancelled"}
+    if state == "validation_failed":
+        recommended_action = "reject_review_to_residual_rework"
+    elif category == "provider_authentication_failed":
+        recommended_action = "repair_provider_authentication_then_retry"
+    elif retryable:
+        recommended_action = "retry_worker_launch"
+    else:
+        recommended_action = "inspect_terminal_evidence"
     return {
         "state": state,
         "category": category,
         "message": message,
         "retryable": retryable,
+        "recommended_action": recommended_action,
         "adapter_id": str(process_row.get("adapter_id") or "")[:120],
         "model": str(process_row.get("model") or "")[:160],
     }
@@ -1252,6 +1273,10 @@ class DashboardProvider:
         per-row payload."""
         return exact_status_counts(self.repo_root)
 
+    def get_manager_decision_counts(self) -> dict[str, int]:
+        """Exact explicit accept/reject totals from canonical task events."""
+        return task_store.manager_decision_counts(self.repo_root)
+
     def get_adapter_readiness(self) -> dict[str, Any]:
         """Read-only worker-adapter readiness (never exposes any secret)."""
         return deepseek_credentials.adapter_readiness(repo=self.repo_root)
@@ -1387,6 +1412,9 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
         "output_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
+        "cost_known_records": 0,
+        "cost_unknown_records": 0,
+        "tokens_with_unknown_cost": 0,
     }
     if not ledger:
         return totals
@@ -1401,7 +1429,11 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
         totals["output_tokens"] += int(bucket.get("output_tokens") or 0)
         totals["total_tokens"] += int(bucket.get("total_tokens") or 0)
         totals["cost_usd"] += float(bucket.get("cost_usd") or 0.0)
+        totals["cost_known_records"] += int(bucket.get("cost_known_records") or 0)
+        totals["cost_unknown_records"] += int(bucket.get("cost_unknown_records") or 0)
+        totals["tokens_with_unknown_cost"] += int(bucket.get("tokens_with_unknown_cost") or 0)
     totals["cost_usd"] = round(totals["cost_usd"], 6)
+    totals["cost_complete"] = totals["cost_unknown_records"] == 0
     return totals
 
 
@@ -1459,6 +1491,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
                 callback_health={},
                 cost_totals=_cost_totals(None),
                 process_limit=DEFAULT_SNAPSHOT_PROCESS_LIMIT,
+                manager_decision_totals={},
             ),
             "callback_bridge_health": {},
             "task_plan": {},
@@ -1714,6 +1747,12 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         callback_health=callback_bridge_health,
         cost_totals=cost_totals,
         process_limit=kpi_process_limit,
+        manager_decision_totals=_safe_read(
+            "manager_decision_counts",
+            getattr(data_provider, "get_manager_decision_counts", lambda: {}),
+            errors,
+            {},
+        ),
     )
 
     return {

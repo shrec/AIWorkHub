@@ -3,8 +3,10 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import threading
 import types
 import typing
+from pathlib import Path
 from typing import Any, Literal
 
 try:
@@ -282,6 +284,7 @@ from . import review_summarizer
 from . import stale_recovery
 from . import task_engine
 from . import task_reconciler
+from . import terminal_log_retention
 from . import worker_ai_tools_mcp
 from . import dependency_autolaunch
 from . import quality_evidence
@@ -291,6 +294,17 @@ from . import shared_router
 
 
 mcp = FastMCP("AIWorkHub MCP")
+
+RiskSignal = Literal[
+    "public_api",
+    "combined_change",
+    "authority_boundary",
+    "concurrency",
+    "destructive_change",
+    "schema_migration",
+    "security_sensitive",
+    "release",
+]
 
 
 @mcp.tool()
@@ -1424,7 +1438,7 @@ def aiworkhub_agent_accept_review(
     task_id: str,
     confirm_destructive_change: bool = False,
     requested_risk_tier: str = quality_evidence.RISK_LOW,
-    risk_signals: list[str] | None = None,
+    risk_signals: list[RiskSignal] | None = None,
     reviewer_reports: list[dict[str, Any]] | None = None,
     reviewer_request_ids: list[str] | None = None,
     confirm_high_risk: bool = False,
@@ -1641,6 +1655,18 @@ def aiworkhub_environment_preflight(adapter_id: str | None = None) -> dict[str, 
     return repo_policy.build_preflight(core.repo_root(), adapter_id=adapter_id)
 
 
+def _enforce_terminal_retention_safely(root: Path) -> None:
+    """Apply retention without ever crashing or polluting MCP stdio startup."""
+
+    try:
+        terminal_log_retention.enforce(root)
+    except Exception:
+        # Retention remains observable through its preview/audit surfaces and
+        # can be retried on the next startup.  A cleanup failure must never
+        # make the task-control MCP unavailable.
+        return
+
+
 def main() -> None:
     # Every independently launched manager MCP child owns its repository's
     # in-process Source Graph daemon.  Dashboard activation already calls the
@@ -1655,6 +1681,14 @@ def main() -> None:
         # indexing; startup indexing failure must not kill the whole server.
         pass
     root = core.repo_root()
+    # Retention is repository policy, not a dashboard-only manual action.
+    # Run it off the MCP stdio thread so startup remains responsive.
+    threading.Thread(
+        target=_enforce_terminal_retention_safely,
+        args=(root,),
+        name=f"aiworkhub-log-retention-{abs(hash(str(root))) & 0xffff:x}",
+        daemon=True,
+    ).start()
     try:
         task_reconciler.ensure_started(root)
     except Exception:

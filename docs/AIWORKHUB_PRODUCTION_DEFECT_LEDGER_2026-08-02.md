@@ -1,12 +1,56 @@
 # AIWorkHub production defect ledger — 2026-08-02
 
-Status: implementation complete locally; cross-platform release CI pending.
+Status: 18/18 defects implemented locally; full regression and cross-platform
+release CI pending.
 
 This ledger records defects observed while AIWorkHub coordinated the B1439
 five-shard Georgian representation annotation wave. It is an implementation
 handoff, not a speculative feature list. GeoAI task state remains in GeoAI's
 own `.aiworkhub/` store; no task cards or canonical context databases are
 copied into this repository.
+
+## Consolidated 18-defect closure
+
+The original nine-item B1439 ledger below is retained as the discovery record.
+The later production pass expanded it to seven P0 and eleven P1 defects. This
+table is the canonical current disposition; “fixed” means code plus focused
+regression evidence, not a cross-platform release claim.
+
+| # | Priority | Defect | Current disposition |
+|---:|:---:|---|---|
+| 1 | P0 | Recursive `card_json` inflated a 64-row card to 343K–615K input tokens | Fixed: persistence strips transport envelopes and process collection emits independent bounded projections/hashes. |
+| 2 | P0 | Residual rework lost predecessor artifact/hash | Fixed by pinned predecessor materialization and residual/non-residual hash enforcement. |
+| 3 | P0 | Isolated worker Source Graph re-query failed against a read-only WAL database | Fixed: canonical graph uses DELETE journaling, including repeated query coverage with a read-only graph directory. |
+| 4 | P0 | AI Memory writes failed opaquely or collided with legacy `UNIQUE(key)` | Fixed: transactional legacy normalization, idempotent writes and structured redacted errors; live manager writes are verified. |
+| 5 | P0 | Context Graph did not durably capture the current manager chat | Verified working through passive manager transcript capture; current user/assistant events are searchable by thread without model-authored copying. |
+| 6 | P0 | Terminal lifecycle appeared to lose `claimed_by` | Canonical lifecycle already preserves it; fixed the bounded collection projection that omitted it. |
+| 7 | P0 | Seven-day retention was manual, leaving 193 runs / ~1.37 GB | Fixed: startup enforcement runs asynchronously, quarantines expired active runs, purges only after the undo window, and cannot crash MCP startup. |
+| 8 | P1 | Retention preview itself returned an unbounded response | Fixed with cursor/limit pagination, 50 default and 200 hard maximum; full-set digest remains stable. |
+| 9 | P1 | KPI could report 100% acceptance and zero rejection | Fixed: explicit accept/reject events in the canonical task ledger are the authority, not the latest process-state projection. |
+| 10 | P1 | Token records with missing provider cost appeared as `$0.0000` | Fixed: `cost_known`/unknown is explicit, unknown-token totals are reported, and zero is never presented as verified free usage. |
+| 11 | P1 | GLM/DeepSeek VS Code visibility and alias matching was unstable | Fixed with canonical aliases applied to discovery, matching and heartbeat advertisements. |
+| 12 | P1 | Source Graph mode/stage KPI used legacy calls in the denominator | Fixed: telemetry-capable eligible calls, unattributed calls and legacy calls are separate populations. |
+| 13 | P1 | Required and forbidden task inputs could contradict | Fixed at task creation and launch preflight with exact conflict evidence. |
+| 14 | P1 | Exact JSONL/NDJSON inputs were not recognized as configured graph languages | Fixed: JSON family includes `.jsonl` and `.ndjson`, with exact declared-input fallback remaining bounded. |
+| 15 | P1 | Rejection/rework transition latency was invisible | Fixed: canonical decision ledger reports rejected-decision p50/p95 latency. |
+| 16 | P1 | `validation_failed` had unclear rework UX | Fixed: task rows expose the terminal root cause and recommend residual-preserving rework instead of pretending success. |
+| 17 | P1 | `risk_signals` MCP array schema omitted a typed item contract | Fixed with an explicit supported-signal enum, preserving compatibility while satisfying strict MCP clients. |
+| 18 | P1 | Large collection surfaces repeated overlapping task/log payloads | Fixed by independent card/event/stdout/stderr bounds, stable hashes, truncation fields and a detail cursor. |
+
+Focused evidence in the current pass:
+
+- core/context/retention/KPI/cost/MCP schema regressions: `105 passed`;
+- Source Graph language/read-only regressions: `73 passed`;
+- dashboard provider/rework/KPI regression subset: `81 passed`;
+- VS Code GLM/DeepSeek alias bridge: passed;
+- JavaScript syntax and `git diff --check`: passed.
+
+Final release qualification below must still replace these focused counts with
+the full-suite and platform-matrix result before the release is tagged.
+
+Current full local qualification: `1679 passed, 22 skipped`; changed-file Ruff,
+the complete VS Code extension suite, JavaScript syntax and `git diff --check`
+all pass. Only the hosted Windows/macOS/Linux release matrix remains external.
 
 ## P0 — review and residual-rework integrity
 
@@ -178,8 +222,8 @@ All nine observed defects now have concrete implementation coverage:
 
 Local verification:
 
-- focused regression set: `179 passed`;
-- full repository suite: `1667 passed, 22 skipped`;
+- focused regression sets: `105`, `73` and `81` passed respectively;
+- full repository suite: `1679 passed, 22 skipped`;
 - Ruff on every changed Python source/test: passed;
 - Python bytecode compilation: passed;
 - `git diff --check`: passed.

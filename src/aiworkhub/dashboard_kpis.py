@@ -76,14 +76,21 @@ def build_kpi_snapshot(
     callback_health: Mapping[str, Any],
     cost_totals: Mapping[str, Any],
     process_limit: int,
+    manager_decision_totals: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return bounded charts and denominators from canonical snapshot inputs."""
     runs = _latest_task_runs(process_report)
     outcome_counts = Counter(
         str(row.get("state") or "unknown") for row in runs
     )
-    accepted = outcome_counts["accepted"]
-    rejected = outcome_counts["rejected"]
+    if manager_decision_totals is None:
+        accepted = outcome_counts["accepted"]
+        rejected = outcome_counts["rejected"]
+        decision_authority = "bounded_process_projection"
+    else:
+        accepted = _count(manager_decision_totals.get("accepted"))
+        rejected = _count(manager_decision_totals.get("rejected"))
+        decision_authority = "canonical_task_event_ledger"
     manager_decisions = accepted + rejected
     terminal_runs = sum(outcome_counts[state] for state in TERMINAL_STATES)
     review_ready = outcome_counts["review_ready"]
@@ -265,6 +272,16 @@ def build_kpi_snapshot(
     source_successful = max(0, source_calls - source_failed)
     mode_attributed = _count(source_graph.get("source_graph_mode_attributed_calls"))
     stage_attributed = _count(source_graph.get("source_graph_stage_attributed_calls"))
+    mode_eligible = (
+        _count(source_graph.get("source_graph_mode_eligible_calls"))
+        if "source_graph_mode_eligible_calls" in source_graph
+        else source_calls
+    )
+    stage_eligible = (
+        _count(source_graph.get("source_graph_stage_eligible_calls"))
+        if "source_graph_stage_eligible_calls" in source_graph
+        else source_calls
+    )
     latency = source_graph.get("source_graph_latency")
     latency = latency if isinstance(latency, Mapping) else {}
     call_gaps = source_graph.get("source_graph_call_gaps")
@@ -351,6 +368,14 @@ def build_kpi_snapshot(
             "accepted_runs": accepted,
             "rejected_runs": rejected,
             "manager_acceptance_rate": _rate(accepted, manager_decisions),
+            "manager_rejection_latency_p50_seconds": (
+                (manager_decision_totals.get("rejected_latency") or {}).get("p50_seconds")
+                if isinstance(manager_decision_totals, Mapping) else None
+            ),
+            "manager_rejection_latency_p95_seconds": (
+                (manager_decision_totals.get("rejected_latency") or {}).get("p95_seconds")
+                if isinstance(manager_decision_totals, Mapping) else None
+            ),
             "terminal_runs": terminal_runs,
             "review_ready_runs": review_ready,
             "review_ready_rate": _rate(review_ready, terminal_runs),
@@ -360,8 +385,8 @@ def build_kpi_snapshot(
             "source_graph_live_rate": source_graph.get("live_rate"),
             "source_graph_gate_satisfaction_rate": source_graph.get("gate_satisfaction_rate"),
             "source_graph_useful_call_rate": _rate(source_successful, source_calls),
-            "source_graph_mode_attribution_rate": _rate(mode_attributed, source_calls),
-            "source_graph_stage_attribution_rate": _rate(stage_attributed, source_calls),
+            "source_graph_mode_attribution_rate": _rate(mode_attributed, mode_eligible),
+            "source_graph_stage_attribution_rate": _rate(stage_attributed, stage_eligible),
             "source_graph_latency_p50_ms": latency.get("p50_ms"),
             "source_graph_latency_p95_ms": latency.get("p95_ms"),
             "source_graph_call_gap_p50_seconds": call_gaps.get("p50_seconds"),
@@ -382,6 +407,9 @@ def build_kpi_snapshot(
             "callback_dead_letters": dead_letter,
             "total_tokens": _count(cost_totals.get("total_tokens")),
             "cost_usd": round(float(cost_totals.get("cost_usd") or 0.0), 6),
+            "cost_complete": bool(cost_totals.get("cost_complete")),
+            "cost_unknown_records": _count(cost_totals.get("cost_unknown_records")),
+            "tokens_with_unknown_cost": _count(cost_totals.get("tokens_with_unknown_cost")),
         },
         "outcome_mix": [
             {"state": state, "count": count}
@@ -401,14 +429,16 @@ def build_kpi_snapshot(
         "data_quality": {
             "acceptance_rate_available": manager_decisions > 0,
             "acceptance_rate_reason": (
-                "bounded_explicit_manager_decisions_only"
+                f"explicit_manager_decisions:{decision_authority}"
                 if manager_decisions
-                else "no_explicit_manager_decisions_in_bounded_snapshot"
+                else f"no_explicit_manager_decisions:{decision_authority}"
             ),
             "process_window_truncated": truncated,
             "invalid_timestamp_rows": invalid_timestamps,
-            "source_graph_unattributed_calls": max(0, source_calls - mode_attributed),
-            "source_graph_stage_unattributed_calls": max(0, source_calls - stage_attributed),
+            "source_graph_unattributed_calls": max(0, mode_eligible - mode_attributed),
+            "source_graph_stage_unattributed_calls": max(0, stage_eligible - stage_attributed),
+            "source_graph_legacy_mode_calls": _count(source_graph.get("source_graph_mode_legacy_calls")),
+            "source_graph_legacy_stage_calls": _count(source_graph.get("source_graph_stage_legacy_calls")),
             "source_graph_latency_samples": _count(latency.get("count")),
             "source_graph_latency_samples_truncated": bool(latency.get("samples_truncated")),
             "source_graph_call_gap_samples": _count(call_gaps.get("count")),

@@ -32,7 +32,7 @@ def _run(
     }
 
 
-def _build(processes, *, total_requests=None):
+def _build(processes, *, total_requests=None, manager_decisions=None):
     return build_kpi_snapshot(
         process_report={
             "processes": processes,
@@ -79,6 +79,7 @@ def _build(processes, *, total_requests=None):
         },
         cost_totals={"total_tokens": 1234, "cost_usd": 0.75},
         process_limit=50,
+        manager_decision_totals=manager_decisions,
     )
 
 
@@ -114,6 +115,19 @@ def test_kpis_report_only_explicit_manager_acceptance_decisions():
     assert result["headline"]["manager_decisions"] == 3
     assert result["headline"]["manager_acceptance_rate"] == 66.7
     assert result["data_quality"]["acceptance_rate_available"] is True
+
+
+def test_kpis_prefer_exact_canonical_manager_decisions_over_process_states():
+    result = _build(
+        [_run("A", "accepted", "2026-08-01T12:00:00Z")],
+        manager_decisions={"accepted": 2, "rejected": 3, "total": 5},
+    )
+
+    assert result["headline"]["manager_decisions"] == 5
+    assert result["headline"]["accepted_runs"] == 2
+    assert result["headline"]["rejected_runs"] == 3
+    assert result["headline"]["manager_acceptance_rate"] == 40.0
+    assert "canonical_task_event_ledger" in result["data_quality"]["acceptance_rate_reason"]
 
 
 def test_kpis_calculate_callback_tool_and_context_denominators():

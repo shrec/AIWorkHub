@@ -55,7 +55,11 @@ LANGUAGE_SPECS: tuple[LanguageSpec, ...] = (
     LanguageSpec("shell", "Shell", (".sh", ".bash", ".zsh", ".fish")),
     LanguageSpec("powershell", "PowerShell", (".ps1", ".psm1", ".psd1")),
     LanguageSpec("sql", "SQL", (".sql",)),
-    LanguageSpec("json", "JSON", (".json", ".jsonc", ".json5", ".geojson")),
+    LanguageSpec(
+        "json",
+        "JSON / JSON Lines",
+        (".json", ".jsonc", ".json5", ".geojson", ".jsonl", ".ndjson"),
+    ),
     LanguageSpec("yaml", "YAML", (".yaml", ".yml")),
     LanguageSpec("toml", "TOML", (".toml",)),
     LanguageSpec("xml", "XML", (".xml", ".xsd", ".xsl", ".xslt", ".svg")),

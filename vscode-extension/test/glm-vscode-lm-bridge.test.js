@@ -34,10 +34,14 @@ const unrelated = { id: "gpt-5.4", family: "gpt-5.4", name: "GPT-5.4", vendor: "
 const deepseek = { id: "deepseek-v4-pro", family: "deepseek-v4-pro", name: "DeepSeek V4 Pro", vendor: "copilot", version: "1", capabilities: { toolCalling: true } };
 const internalClaude = { id: "claude-haiku-4.5", family: "claude-haiku-4.5", name: "Claude Haiku 4.5", vendor: "copilotcli", version: "1", capabilities: { toolCalling: false } };
 const publicClaude = { id: "auto", family: "claude-sonnet-4.6", name: "Auto", vendor: "copilot", version: "claude-sonnet-4.6", capabilities: { toolCalling: false } };
+const aliasedGlm = { id: "custom-auto", family: "glm52", name: "GLM 5.2", vendor: "customendpoint", version: "latest", capabilities: { toolCalling: true } };
+const aliasedDeepseek = { id: "auto", family: "deepseek-v4pro", name: "DeepSeek V4 Pro", vendor: "copilot", version: "latest", capabilities: { toolCalling: true } };
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated, exact]), exact);
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated]), null);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated, deepseek], "deepseek-v4-pro"), deepseek);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated], "deepseek-v4-pro"), null);
+assert.strictEqual(internals.selectVscodeLanguageModel([aliasedGlm], "glm-5.2"), aliasedGlm);
+assert.strictEqual(internals.selectVscodeLanguageModel([aliasedDeepseek], "deepseek-v4-pro"), aliasedDeepseek);
 assert.strictEqual(internals.isCallableVscodeLmProvider(internalClaude), false);
 assert.strictEqual(internals.isCallableVscodeLmProvider(publicClaude), true);
 fakeVscode.lm = { accessInformation: { canSendRequest: (model) => model === exact } };

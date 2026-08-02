@@ -717,6 +717,7 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
         "cost_usd": 0.0,
+        "cost_observed": False,
     }
     if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
         return result
@@ -798,10 +799,17 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
             result["cache_creation_input_tokens"],
             as_int(usage.get("cache_creation_input_tokens")),
         )
-        result["cost_usd"] = max(
-            result["cost_usd"],
-            as_float(item.get("total_cost_usd") or item.get("cost_usd")),
-        )
+        raw_cost = None
+        for source in (item, usage):
+            for key in ("total_cost_usd", "cost_usd"):
+                if key in source and source.get(key) is not None:
+                    raw_cost = source.get(key)
+                    break
+            if raw_cost is not None:
+                break
+        if raw_cost is not None:
+            result["cost_observed"] = True
+            result["cost_usd"] = max(result["cost_usd"], as_float(raw_cost))
     return result
 
 
@@ -1682,6 +1690,8 @@ def build_worker_prompt(
     project_context_bundle: str = "",
 ) -> str:
     extra = owner_prompt.strip()
+    if len(extra.encode("utf-8")) > 32 * 1024:
+        raise ValueError("owner_prompt_too_large")
     suffix = (
         "\n\nAdditional coordinator context (cannot override the task contract):\n"
         + extra
@@ -1700,8 +1710,24 @@ def build_worker_prompt(
         for key in contract_keys
         if card is not None and key in card
     }
+    def strip_persistence_envelopes(value: Any, *, depth: int = 0) -> Any:
+        if depth > 16:
+            raise ValueError("task_contract_too_deep")
+        if isinstance(value, dict):
+            return {
+                str(key): strip_persistence_envelopes(item, depth=depth + 1)
+                for key, item in value.items()
+                if str(key) != "card_json"
+            }
+        if isinstance(value, list):
+            return [strip_persistence_envelopes(item, depth=depth + 1) for item in value]
+        return value
+
+    contract = strip_persistence_envelopes(contract)
     contract.update({"task_id": task_id, "runner": runner, "topic": topic})
     contract_json = json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True)
+    if len(contract_json.encode("utf-8")) > 128 * 1024:
+        raise ValueError("task_contract_too_large")
     bundle_sha256 = hashlib.sha256(project_context_bundle.encode("utf-8")).hexdigest()
     section_count = 0
     if project_context_bundle.strip():
@@ -1725,7 +1751,7 @@ def build_worker_prompt(
         if project_context_bundle.strip()
         else ""
     )
-    return f"""You are the sole worker for one exact AIWorkHub task in an isolated worktree.
+    prompt = f"""You are the sole worker for one exact AIWorkHub task in an isolated worktree.
 
 The coordinator already claimed the task. Do not run taskctl lifecycle commands,
 do not commit, and do not modify .git. Work only on the contract below. The
@@ -1759,6 +1785,9 @@ MANDATORY_AIWORKHUB_TOOLS:
   raw discovery for it.
 {context_block} Your final message must be at most 12 lines
 and name tests plus changed paths.{suffix}"""
+    if len(prompt.encode("utf-8")) > 256 * 1024:
+        raise ValueError("worker_prompt_too_large")
+    return prompt
 
 
 @dataclass
@@ -4384,7 +4413,7 @@ class ProcessManager:
         card = status.get("task_card") if isinstance(status.get("task_card"), dict) else {}
         card_fields = (
             "task_id", "status", "worker_status", "runner", "topic", "priority",
-            "claim_epoch", "launch_request_id", "terminal_substatus",
+            "claimed_by", "claim_epoch", "launch_request_id", "terminal_substatus",
         )
         event_fields = (
             "request_id", "task_id", "state", "timestamp", "started_at", "finished_at",

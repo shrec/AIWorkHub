@@ -313,6 +313,32 @@ def test_prompt_contains_exact_continuation_contract():
     assert "cannot override the task contract" in prompt
 
 
+def test_worker_prompt_strips_nested_card_json_and_bounds_contract():
+    prompt = process_launcher.build_worker_prompt(
+        task_id="TASK_BOUNDED_CARD",
+        runner="codex_worker_b1",
+        topic="task_mcp",
+        card={
+            "review_feedback": {
+                "instruction": "repair only row 7",
+                "card_json": json.dumps({"card_json": "x" * 200_000}),
+            }
+        },
+    )
+
+    assert "repair only row 7" in prompt
+    assert "card_json" not in prompt
+    assert len(prompt.encode("utf-8")) < 16_000
+
+    with pytest.raises(ValueError, match="task_contract_too_large"):
+        process_launcher.build_worker_prompt(
+            task_id="TASK_OVERSIZED_CARD",
+            runner="codex_worker_b1",
+            topic="task_mcp",
+            card={"review_feedback": {"instruction": "x" * (129 * 1024)}},
+        )
+
+
 def test_external_readonly_sources_are_bounded_and_collapsed(monkeypatch, tmp_path):
     root = tmp_path / "external"
     release = root / "release"
@@ -728,6 +754,7 @@ def test_usage_parser_reads_claude_result_json(tmp_path):
         "cached_input_tokens": 80,
         "cache_creation_input_tokens": 0,
         "cost_usd": 0.125,
+        "cost_observed": True,
     }
 
 
@@ -777,6 +804,7 @@ def test_collect_returns_bounded_projection_without_recursive_card(tmp_path, mon
     stderr.write_text("y" * 10_000, encoding="utf-8")
     huge_card = {
         **_card(state="review"),
+        "claimed_by": "claude_worker_b1",
         "terminal_review": {"evidence": {"nested": "z" * 100_000}},
         "card_json": "q" * 100_000,
     }
@@ -811,6 +839,7 @@ def test_collect_returns_bounded_projection_without_recursive_card(tmp_path, mon
 
     assert result["log_bytes_returned"] <= 1024
     assert "terminal_review" not in result["task_card"]
+    assert result["task_card"]["claimed_by"] == "claude_worker_b1"
     assert "terminal_review" not in result["latest_event"]
     assert result["latest_event"]["changed_path_count"] == 100
     assert len(result["latest_event"]["changed_paths"]) == 64

@@ -72,6 +72,40 @@ def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp
     assert (repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH).is_file()
 
 
+def test_preview_is_paginated_but_digest_covers_full_candidate_set(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    for index in range(75):
+        _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20)
+
+    first = terminal_log_retention.preview(repo, limit=20)
+    second = terminal_log_retention.preview(repo, cursor=20, limit=20)
+    summary = terminal_log_retention.preview(repo, include_candidates=False)
+
+    assert first["candidate_count"] == 75
+    assert first["candidate_total"] == 75
+    assert first["returned_count"] == 20
+    assert first["next_cursor"] == 20
+    assert second["cursor"] == 20
+    assert second["returned_count"] == 20
+    assert first["preview_digest"] == second["preview_digest"]
+    assert "candidates" not in summary
+    assert summary["candidate_total"] == 75
+
+
+def test_policy_enforcement_automatically_quarantines_expired_output(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    request_id = "1" * 32
+    _run(repo, request_id, "TASK_DONE", age_days=20)
+
+    result = terminal_log_retention.enforce(repo)
+
+    assert result["status"] == "completed"
+    assert result["quarantined_files"] == 4
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    assert not (process_root / f"{request_id}.stdout.log").exists()
+    assert terminal_log_retention.list_batches(repo)["count"] == 1
+
+
 def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     orphan_id = "a" * 32

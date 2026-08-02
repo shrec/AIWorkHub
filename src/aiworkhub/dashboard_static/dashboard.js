@@ -391,6 +391,14 @@ function renderTaskTable() {
     if (validation && validation.toLowerCase() !== "unreported") {
       signalStack.appendChild(createElement("span", `signal-badge ${validationClass(validation)}`, validation));
     }
+    const terminal = task.provider_terminal && typeof task.provider_terminal === "object" ? task.provider_terminal : null;
+    if (terminal) {
+      const terminalBadge = createElement("span", "signal-badge fail", terminal.state || terminal.category || "terminal failure");
+      terminalBadge.title = [terminal.message, terminal.recommended_action]
+        .filter(Boolean)
+        .join(" | ");
+      signalStack.appendChild(terminalBadge);
+    }
     if (!signalStack.childNodes.length) {
       signalStack.appendChild(createElement("span", "cell-secondary", "None"));
     }

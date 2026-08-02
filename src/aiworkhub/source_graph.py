@@ -207,7 +207,20 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     else:
         conn = sqlite3.connect(str(db_path), timeout=30.0)
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Isolated workers receive read-only access to the canonical graph
+        # directory. WAL readers may still need to create/update ``-shm``
+        # even when the database URI itself uses ``mode=ro``; after a writer
+        # closes and removes the sidecars, a later worker query therefore
+        # fails with ``attempt to write a readonly database``. The rollback
+        # journal keeps SQLite's normal reader/writer locking while requiring
+        # no directory mutation from readers. Existing WAL databases migrate
+        # on the next manager-owned build connection.
+        journal_mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]).lower()
+        if journal_mode != "delete":
+            conn.close()
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_journal_migration_busy:{journal_mode}"
+            )
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
     conn.execute("PRAGMA busy_timeout=30000")

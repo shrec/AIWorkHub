@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.39] - 2026-08-02
+
+### Added
+
+- Added canonical manager accept/reject and rejection-latency KPIs, explicit
+  known-versus-unknown provider cost accounting, telemetry-capable Source
+  Graph denominators, and actionable terminal-failure guidance in task rows.
+- Added bounded, paginated terminal-retention previews and automatic
+  repository startup enforcement with an undo quarantine window.
+
+### Fixed
+
+- Removed recursively persisted `card_json` envelopes from task generations
+  and worker prompts, eliminating the observed 343K–615K token amplification.
+- Made isolated read-only Source Graph queries compatible with SQLite by using
+  DELETE journaling, and enabled JSON Lines/NDJSON language recognition.
+- Preserved `claimed_by` in bounded lifecycle projections and made startup
+  retention failures incapable of terminating or polluting MCP stdio.
+- Stabilized GLM 5.2 and DeepSeek VS Code model discovery through canonical
+  aliases, and published a strict item enum for MCP `risk_signals` arrays.
+
 ## [0.8.38] - 2026-08-02
 
 ### Added

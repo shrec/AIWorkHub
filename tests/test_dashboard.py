@@ -733,8 +733,19 @@ def test_task_row_exposes_structured_provider_root_error_without_secrets():
     assert terminal["state"] == "launch_failed"
     assert terminal["category"] == "provider_authentication_failed"
     assert terminal["retryable"] is True
+    assert terminal["recommended_action"] == "repair_provider_authentication_then_retry"
     assert terminal["adapter_id"] == "claude_cli"
     assert "super-secret-provider-token" not in json.dumps(terminal)
+
+
+def test_validation_failed_terminal_recommends_residual_rework():
+    terminal = dashboard._provider_terminal_status({
+        "state": "validation_failed",
+        "reason": "focused validation failed",
+    })
+
+    assert terminal["retryable"] is True
+    assert terminal["recommended_action"] == "reject_review_to_residual_rework"
 
 
 def test_task_detail_uses_actual_process_model_and_adapter():

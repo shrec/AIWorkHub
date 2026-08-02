@@ -166,15 +166,19 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
     assert result["source_graph_mode_counts"] == {"focus": 1, "bodygrep": 2}
     assert result["source_graph_mode_sequence"] == ["focus", "bodygrep", "bodygrep"]
     assert result["source_graph_mode_attributed_calls"] == 3
-    assert result["source_graph_mode_unattributed_calls"] == 1
+    assert result["source_graph_mode_eligible_calls"] == 3
+    assert result["source_graph_mode_unattributed_calls"] == 0
+    assert result["source_graph_mode_legacy_calls"] == 1
     assert result["source_graph_distinct_modes"] == 2
-    assert result["source_graph_mode_attribution_rate"] == 75.0
+    assert result["source_graph_mode_attribution_rate"] == 100.0
     assert result["source_graph_stage_counts"] == {
         "orientation": 1, "implementation": 1, "validation": 1,
     }
     assert result["source_graph_stage_attributed_calls"] == 3
-    assert result["source_graph_stage_unattributed_calls"] == 1
-    assert result["source_graph_stage_attribution_rate"] == 75.0
+    assert result["source_graph_stage_eligible_calls"] == 3
+    assert result["source_graph_stage_unattributed_calls"] == 0
+    assert result["source_graph_stage_legacy_calls"] == 1
+    assert result["source_graph_stage_attribution_rate"] == 100.0
     assert result["source_graph_mode_stage_counts"]["orientation"] == {"focus": 1}
     assert result["source_graph_latency"]["count"] == 3
     assert result["source_graph_latency"]["p50_ms"] == 5.0

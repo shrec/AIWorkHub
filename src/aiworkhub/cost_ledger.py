@@ -33,6 +33,9 @@ def _parse_usage_stdout(stdout: str) -> list[dict[str, Any]]:
             "output_tokens": int(data["output_tokens"]),
             "total_tokens": int(data["tokens"]),
             "cost_usd": float(data["cost"]),
+            "cost_known": not (
+                int(data["tokens"]) > 0 and float(data["cost"]) == 0.0
+            ),
             "day": "",
         })
     return rows
@@ -61,6 +64,10 @@ def _launch_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             "output_tokens": int(entry.get("usage_output_tokens") or 0),
             "total_tokens": int(entry.get("usage_total_tokens") or 0),
             "cost_usd": float(entry.get("cost_usd") or 0.0),
+            "cost_known": not (
+                int(entry.get("usage_total_tokens") or 0) > 0
+                and float(entry.get("cost_usd") or 0.0) == 0.0
+            ),
             "day": day,
         })
     return rows
@@ -73,6 +80,9 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         "output_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
+        "cost_known_records": 0,
+        "cost_unknown_records": 0,
+        "tokens_with_unknown_cost": 0,
     })
     for row in rows:
         bucket = str(row.get(key) or "unknown")
@@ -81,6 +91,11 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         out[bucket]["output_tokens"] += int(row.get("output_tokens") or 0)
         out[bucket]["total_tokens"] += int(row.get("total_tokens") or 0)
         out[bucket]["cost_usd"] = round(out[bucket]["cost_usd"] + float(row.get("cost_usd") or 0.0), 6)
+        if row.get("cost_known"):
+            out[bucket]["cost_known_records"] += int(row.get("records") or 0)
+        else:
+            out[bucket]["cost_unknown_records"] += int(row.get("records") or 0)
+            out[bucket]["tokens_with_unknown_cost"] += int(row.get("total_tokens") or 0)
     return dict(sorted(out.items()))
 
 
@@ -114,6 +129,16 @@ def build_cost_ledger(
             "usage_rows": len(usage_rows),
             "launch_rows": len(launch_rows),
             "union_rows": len(union_rows),
+        },
+        "cost_quality": {
+            "known_records": sum(int(row.get("records") or 0) for row in union_rows if row.get("cost_known")),
+            "unknown_records": sum(int(row.get("records") or 0) for row in union_rows if not row.get("cost_known")),
+            "tokens_with_unknown_cost": sum(
+                int(row.get("total_tokens") or 0)
+                for row in union_rows if not row.get("cost_known")
+            ),
+            "zero_cost_is_free": False,
+            "reason": "provider_cost_absence_is_unknown_not_zero",
         },
         "aggregates": {
             "by_topic": _aggregate(union_rows, "topic"),

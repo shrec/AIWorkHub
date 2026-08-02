@@ -95,6 +95,37 @@ CURRENT_EPISODE_CARD_FIELDS: tuple[str, ...] = (
     "accept_evidence",
 )
 
+# ``card_json`` is the durable semantic task payload.  ``get_task`` also
+# overlays authoritative SQL lifecycle columns for callers, but that decoded
+# projection must never be written back verbatim: doing so embeds the previous
+# raw ``card_json`` string inside the next ``card_json`` value and doubles the
+# task receipt on every rework episode.
+CARD_PERSISTENCE_ENVELOPE_FIELDS: frozenset[str] = frozenset({
+    "card_json",
+    "created_at",
+    "updated_at",
+    "claimed_at",
+    "started_at",
+    "completed_at",
+    "archived_at",
+})
+
+
+def persistable_card_payload(card: Mapping[str, Any]) -> dict[str, Any]:
+    """Return semantic card fields without the SQLite/read projection.
+
+    This is intentionally shallow.  A historical top-level ``card_json``
+    contains the complete recursive predecessor string, so dropping that one
+    field removes the whole amplification chain while preserving legitimate
+    structured review feedback.
+    """
+
+    return {
+        str(key): value
+        for key, value in card.items()
+        if str(key) not in CARD_PERSISTENCE_ENVELOPE_FIELDS
+    }
+
 
 def begin_claim_episode(card: dict[str, Any]) -> dict[str, Any]:
     """Clear stale current-episode metadata and return bounded audit context.
@@ -482,6 +513,17 @@ def _upgrade_compatible_schema(path: Path) -> bool:
             "WHERE topic='' AND COALESCE(json_extract(card_json, '$.topic'), '')<>''"
         ).rowcount
         changed = bool(changed or updated)
+        # v0.8.38 and earlier could serialize ``task_store.get_task``'s full
+        # decoded row during reject-review.  That projection included the raw
+        # previous card_json string, recursively inflating cards and worker
+        # prompts into hundreds of thousands of tokens.  One json_remove is
+        # sufficient because the entire older chain lives below this key.
+        compacted = conn.execute(
+            "UPDATE tasks SET card_json=json_remove(card_json, '$.card_json') "
+            "WHERE json_valid(card_json)=1 "
+            "AND json_type(card_json, '$.card_json') IS NOT NULL"
+        ).rowcount
+        changed = bool(changed or compacted)
         outbox_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()
         }
@@ -650,11 +692,15 @@ def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500)
 
 def _decode_task_card(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     card = dict(row)
+    raw_card_json = card.pop("card_json", "{}")
     try:
-        card_json = json.loads(card.get("card_json") or "{}")
+        card_json = json.loads(raw_card_json or "{}")
     except json.JSONDecodeError:
         card_json = {}
     if isinstance(card_json, dict):
+        # Repair the public/read projection immediately even before the next
+        # explicit initialize runs the durable compaction migration.
+        card_json.pop("card_json", None)
         card = {**card_json, **card}
         if not card.get("topic") and card_json.get("topic"):
             card["topic"] = card_json["topic"]
@@ -1012,6 +1058,75 @@ def get_task_events(root: str | Path, task_id: str, *, limit: int = 100) -> list
     return [dict(row) for row in rows]
 
 
+def manager_decision_counts(root: str | Path) -> dict[str, Any]:
+    """Return exact review decisions plus bounded review-to-decision latency."""
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        row = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN event='accept_review' THEN 1 ELSE 0 END) accepted, "
+            "SUM(CASE WHEN event='reject_review' THEN 1 "
+            "  WHEN event IN ('archived','superseded') "
+            "   AND json_extract(payload_json, '$.reason') LIKE 'reject_review:%' "
+            "  THEN 1 ELSE 0 END) rejected "
+            "FROM task_events"
+        ).fetchone()
+        accepted = int(row["accepted"] or 0)
+        rejected = int(row["rejected"] or 0)
+        latency_rows = conn.execute(
+            "SELECT d.event, d.payload_json, d.created_at decision_at, "
+            " (SELECT r.created_at FROM task_events r "
+            "  WHERE r.task_id=d.task_id AND r.event='terminal_review' "
+            "    AND r.event_id<d.event_id ORDER BY r.event_id DESC LIMIT 1) review_at "
+            "FROM task_events d WHERE d.event IN ('accept_review','reject_review','archived','superseded') "
+            "ORDER BY d.event_id DESC LIMIT 5000"
+        ).fetchall()
+        latency: dict[str, list[float]] = {"accepted": [], "rejected": []}
+        for item in latency_rows:
+            event = str(item["event"] or "")
+            if event in {"archived", "superseded"}:
+                try:
+                    payload = json.loads(str(item["payload_json"] or "{}"))
+                except json.JSONDecodeError:
+                    continue
+                if not str(payload.get("reason") or "").startswith("reject_review:"):
+                    continue
+                kind = "rejected"
+            else:
+                kind = "accepted" if event == "accept_review" else "rejected"
+            try:
+                decision_at = datetime.fromisoformat(str(item["decision_at"]).replace("Z", "+00:00"))
+                review_at = datetime.fromisoformat(str(item["review_at"]).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            seconds = max(0.0, (decision_at - review_at).total_seconds())
+            latency[kind].append(seconds)
+
+        def latency_summary(values: list[float]) -> dict[str, Any]:
+            ordered = sorted(values)
+            if not ordered:
+                return {"count": 0, "p50_seconds": None, "p95_seconds": None}
+            percentile = lambda fraction: ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))]
+            return {
+                "count": len(ordered),
+                "p50_seconds": round(percentile(0.50), 3),
+                "p95_seconds": round(percentile(0.95), 3),
+            }
+
+        return {
+            "accepted": accepted,
+            "rejected": rejected,
+            "total": accepted + rejected,
+            "accepted_latency": latency_summary(latency["accepted"]),
+            "rejected_latency": latency_summary(latency["rejected"]),
+            "latency_sample_limit": 5000,
+        }
+    finally:
+        conn.close()
+
+
 def _activate_canonical_authority(registry_path: Path, canonical_db: Path) -> dict[str, Any]:
     """Promote task_queue authority to canonical_active for a freshly
     initialized (never-legacy-imported) repository."""
@@ -1155,6 +1270,7 @@ __all__ = [
     "get_task",
     "initialize_repository",
     "list_tasks",
+    "manager_decision_counts",
     "mark_terminal_review",
     "quick_check",
     "restore_task",

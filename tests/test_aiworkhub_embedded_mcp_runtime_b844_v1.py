@@ -199,7 +199,14 @@ def test_stdlib_fallback_accept_review_arrays_have_copilot_compatible_items(
     server_module = fallback_server_module
     func = server_module.mcp._tools["aiworkhub_agent_accept_review"]
     properties = server_module._stdio_schema_for(func)["properties"]
-    assert properties["risk_signals"] == {"type": "array", "items": {"type": "string"}}
+    assert properties["risk_signals"]["type"] == "array"
+    assert properties["risk_signals"]["items"] == {
+        "type": "string",
+        "enum": [
+            "public_api", "combined_change", "authority_boundary", "concurrency",
+            "destructive_change", "schema_migration", "security_sensitive", "release",
+        ],
+    }
     assert properties["reviewer_request_ids"] == {
         "type": "array", "items": {"type": "string"},
     }

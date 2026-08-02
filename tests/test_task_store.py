@@ -65,6 +65,35 @@ def test_archive_removes_pending_card_from_active_lists_and_preserves_events(tmp
     assert task_store.get_task_events(repo, "TASK_ARCHIVE_B891")[0]["event"] == "archived"
 
 
+def test_manager_decision_counts_include_rework_and_review_archival(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_DECISIONS", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = [
+            ("accept_review", "{}"),
+            ("reject_review", '{"to":"pending"}'),
+            ("archived", '{"reason":"reject_review:not useful"}'),
+            ("archived", '{"reason":"dashboard cleanup"}'),
+        ]
+        connection.executemany(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES('TASK_DECISIONS',?,'codex',?,'2026-08-02T00:00:00Z')",
+            rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = task_store.manager_decision_counts(repo)
+    assert {key: result[key] for key in ("accepted", "rejected", "total")} == {
+        "accepted": 1, "rejected": 2, "total": 3,
+    }
+    assert result["rejected_latency"]["count"] == 0
+
+
 def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -78,6 +107,50 @@ def test_list_task_cards_matches_canonical_detail_in_one_bounded_batch(tmp_path:
     by_id = {card["task_id"]: card for card in cards}
     assert by_id["TASK_BATCH_A"] == task_store.get_task(repo, "TASK_BATCH_A")
     assert by_id["TASK_BATCH_B"] == task_store.get_task(repo, "TASK_BATCH_B")
+
+
+def test_decoded_card_omits_recursive_storage_envelope_and_upgrade_compacts_it(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_RECURSIVE_CARD", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    recursive = {
+        "task_id": "TASK_RECURSIVE_CARD",
+        "runner": "codex_worker_b891",
+        "topic": "task_mcp",
+        "allowed_writes": ["out.txt"],
+        "card_json": json.dumps({"card_json": "x" * 200_000}),
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(recursive), "TASK_RECURSIVE_CARD"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    decoded = task_store.get_task(repo, "TASK_RECURSIVE_CARD")
+    assert decoded is not None
+    assert "card_json" not in decoded
+    assert "card_json" not in task_store.persistable_card_payload(decoded)
+
+    assert task_store._upgrade_compatible_schema(db_path) is True
+    conn = sqlite3.connect(db_path)
+    try:
+        compacted = json.loads(
+            conn.execute(
+                "SELECT card_json FROM tasks WHERE task_id=?",
+                ("TASK_RECURSIVE_CARD",),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    assert "card_json" not in compacted
+    assert len(json.dumps(compacted)) < 1_000
 
 
 def test_supersede_removes_processing_orphan_without_deleting_audit(tmp_path: Path) -> None:

@@ -102,7 +102,7 @@ def _measure(repo_root: Path) -> dict[str, Any]:
         quarantine_batches = []
     quarantine_bytes = sum(int(item.get("bytes") or 0) for item in quarantine_batches)
     try:
-        terminal_logs = terminal_log_retention.preview(repo_root)
+        terminal_logs = terminal_log_retention.preview(repo_root, include_candidates=False)
         terminal_log_batches = terminal_log_retention.list_batches(repo_root).get("batches") or []
     except terminal_log_retention.TerminalLogRetentionError as exc:
         terminal_logs = {

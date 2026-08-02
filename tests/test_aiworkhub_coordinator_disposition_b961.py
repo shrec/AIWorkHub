@@ -98,6 +98,22 @@ def test_reject_to_pending_requeues_for_rework(coord):
     assert row["status"] == "pending" and row["worker_status"] == "unclaimed"
 
 
+def test_reject_to_pending_never_repersists_decoded_card_json_envelope(coord):
+    recursive = json.dumps({"card_json": json.dumps({"card_json": "x" * 200_000})})
+    _insert(
+        coord,
+        "T_PEND_BOUNDED",
+        card={"objective": "repair", "card_json": recursive},
+    )
+
+    res = core.reject_review("T_PEND_BOUNDED", "rework this", to="pending")
+
+    assert res["ok"] is True, res
+    persisted = json.loads(_row(coord, "T_PEND_BOUNDED")["card_json"])
+    assert "card_json" not in persisted
+    assert len(json.dumps(persisted)) < 2_000
+
+
 def test_reject_transition_does_not_wait_for_workspace_gc(coord, monkeypatch):
     entered = threading.Event()
     release = threading.Event()

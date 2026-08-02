@@ -17,6 +17,7 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -44,10 +45,13 @@ KEEP_LAST_PER_TASK = 0
 # reader streams every immutable segment, so this is no longer a failure cap.
 MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+DEFAULT_PREVIEW_LIMIT = 50
+MAX_PREVIEW_LIMIT = 200
 
 _REQUEST_RE = re.compile(r"^[a-f0-9]{32}$")
 _BATCH_RE = re.compile(r"^l[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$")
 _OWNED_SUFFIXES = (".request.json", ".stderr.log", ".stdout.log", ".supervisor.json")
+_enforcement_lock = threading.Lock()
 _TERMINAL_STATES = frozenset({
     "review_ready", "exited", "exited_without_review", "timed_out", "cancelled",
     "launch_failed", "worker_failed", "scope_rejected", "validation_failed",
@@ -321,8 +325,32 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
     }
 
 
-def preview(repo_root: Path | str) -> dict[str, Any]:
-    return _candidate_payload(Path(repo_root).resolve())
+def preview(
+    repo_root: Path | str,
+    *,
+    cursor: int = 0,
+    limit: int = DEFAULT_PREVIEW_LIMIT,
+    include_candidates: bool = True,
+) -> dict[str, Any]:
+    """Return one bounded page while hashing the full eligible population."""
+
+    start = max(0, int(cursor))
+    page_limit = max(1, min(MAX_PREVIEW_LIMIT, int(limit)))
+    result = _candidate_payload(Path(repo_root).resolve())
+    candidates = list(result.pop("candidates", []))
+    total = len(candidates)
+    end = min(total, start + page_limit)
+    result.update({
+        "candidate_total": total,
+        "cursor": start,
+        "limit": page_limit,
+        "returned_count": max(0, end - start) if include_candidates else 0,
+        "next_cursor": end if include_candidates and end < total else None,
+        "response_bounded": True,
+    })
+    if include_candidates:
+        result["candidates"] = candidates[start:end]
+    return result
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -582,4 +610,68 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": released}
 
 
-__all__ = ["TerminalLogRetentionError", "list_batches", "preview", "purge", "quarantine", "restore"]
+def enforce(repo_root: Path | str) -> dict[str, Any]:
+    """Apply configured log age and quarantine deadlines once.
+
+    Old active output enters reversible quarantine.  Permanent deletion is
+    limited to batches whose independent seven-day undo window has expired.
+    """
+
+    root = Path(repo_root).resolve()
+    if not _enforcement_lock.acquire(blocking=False):
+        return {"ok": True, "status": "already_running", "repository_scoped": True}
+    try:
+        purged_batches = 0
+        purged_bytes = 0
+        for row in list_batches(root).get("batches") or []:
+            if not row.get("purge_eligible"):
+                continue
+            result = purge(root, batch_id=str(row["batch_id"]), confirm=True)
+            purged_batches += 1
+            purged_bytes += int(result.get("bytes") or 0)
+
+        current = _candidate_payload(root)
+        quarantined_files = 0
+        quarantined_bytes = 0
+        batch_id = ""
+        if current.get("candidate_count"):
+            result = quarantine(
+                root,
+                preview_digest=str(current["preview_digest"]),
+                confirm=True,
+            )
+            quarantined_files = int(result.get("quarantined") or 0)
+            quarantined_bytes = int(result.get("bytes") or 0)
+            batch_id = str(result.get("batch_id") or "")
+        _append_audit(root, {
+            "schema_id": AUDIT_SCHEMA_ID,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "policy_enforcement_completed",
+            "quarantined_files": quarantined_files,
+            "quarantined_bytes": quarantined_bytes,
+            "purged_batches": purged_batches,
+            "purged_bytes": purged_bytes,
+        })
+        return {
+            "ok": True,
+            "status": "completed",
+            "repository_scoped": True,
+            "batch_id": batch_id,
+            "quarantined_files": quarantined_files,
+            "quarantined_bytes": quarantined_bytes,
+            "purged_batches": purged_batches,
+            "purged_bytes": purged_bytes,
+        }
+    finally:
+        _enforcement_lock.release()
+
+
+__all__ = [
+    "TerminalLogRetentionError",
+    "enforce",
+    "list_batches",
+    "preview",
+    "purge",
+    "quarantine",
+    "restore",
+]

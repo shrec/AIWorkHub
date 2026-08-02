@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.38";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.39";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -204,6 +204,12 @@ const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
 const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "claude-sonnet-4.6"]);
+const VSCODE_LM_MODEL_ALIASES = Object.freeze({
+  "glm-5.2": Object.freeze(["glm-5-2", "glm52", "glm-52"]),
+  "deepseek-v4-pro": Object.freeze(["deepseek-v4pro", "deepseek-4-pro", "deepseek-v4-pro"]),
+  "deepseek-v4-flash": Object.freeze(["deepseek-v4flash", "deepseek-4-flash", "deepseek-v4-flash"]),
+  "claude-sonnet-4.6": Object.freeze(["claude-sonnet-46", "sonnet-4-6", "claude-sonnet-4-6"]),
+});
 const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
@@ -2217,7 +2223,10 @@ function normalizedVscodeLmModelName(value) {
 
 function canonicalVscodeLmModelName(value) {
   const normalized = normalizedVscodeLmModelName(value);
-  const known = VSCODE_LM_SUPPORTED_MODELS.find((name) => normalizedVscodeLmModelName(name) === normalized);
+  const known = VSCODE_LM_SUPPORTED_MODELS.find((name) =>
+    normalizedVscodeLmModelName(name) === normalized ||
+    (VSCODE_LM_MODEL_ALIASES[name] || []).some((alias) => normalizedVscodeLmModelName(alias) === normalized)
+  );
   if (known) return known;
   const raw = String(value || "").trim();
   return VSCODE_LM_REQUESTED_MODEL_RE.test(raw) ? raw : "";
@@ -2226,11 +2235,9 @@ function canonicalVscodeLmModelName(value) {
 function isVscodeLanguageModel(model, requestedModel) {
   const requestedCanonical = canonicalVscodeLmModelName(requestedModel);
   if (!requestedCanonical) return false;
-  const requested = normalizedVscodeLmModelName(requestedCanonical);
-  return vscodeLmModelFields(model).some((value) => {
-    const normalized = normalizedVscodeLmModelName(value);
-    return normalized === requested;
-  });
+  return vscodeLmModelFields(model).some((value) =>
+    canonicalVscodeLmModelName(value) === requestedCanonical
+  );
 }
 
 function selectVscodeLanguageModel(models, requestedModel) {
@@ -3025,6 +3032,9 @@ class VscodeLmBridgeHost {
     const models = await this.models();
     const visibleModels = Array.from(new Set([
       ...VSCODE_LM_SUPPORTED_MODELS.filter((name) => selectVscodeLanguageModel(models, name)),
+      ...models.flatMap((model) => vscodeLmModelFields(model))
+        .map(canonicalVscodeLmModelName)
+        .filter((name) => VSCODE_LM_SUPPORTED_MODELS.includes(name)),
       ...models.flatMap((model) => [model && model.id, model && model.family])
         .filter((name) => typeof name === "string" && VSCODE_LM_REQUESTED_MODEL_RE.test(name.trim()))
         .map((name) => name.trim()),

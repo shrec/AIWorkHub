@@ -697,11 +697,14 @@ def storage_purge_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
     return response
 
 
-def terminal_log_retention_preview_view() -> dict[str, Any]:
+def terminal_log_retention_preview_view(
+    cursor: int = 0,
+    limit: int = terminal_log_retention.DEFAULT_PREVIEW_LIMIT,
+) -> dict[str, Any]:
     """READ-ONLY: terminal-run log preview; the canonical ledger is excluded."""
     try:
         root = core.repo_root()
-        response = terminal_log_retention.preview(root)
+        response = terminal_log_retention.preview(root, cursor=cursor, limit=limit)
         response["quarantine"] = terminal_log_retention.list_batches(root)
     except terminal_log_retention.TerminalLogRetentionError as exc:
         response = {"ok": False, "error": str(exc)[:240]}

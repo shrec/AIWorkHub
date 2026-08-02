@@ -3414,7 +3414,15 @@ def reject_review(
     try:
         cur = conn.execute(
             f"UPDATE tasks SET {set_clause} WHERE task_id=? AND worker_status='review'",
-            (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id),
+            (
+                json.dumps(
+                    task_store.persistable_card_payload(card),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+                task_id,
+            ),
         )
         if cur.rowcount != 1:
             conn.rollback()
@@ -3553,12 +3561,7 @@ def release_launch(
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
         callback_store.init_db(conn)
-        try:
-            persisted_card = json.loads(str(card.get("card_json") or "{}"))
-        except json.JSONDecodeError:
-            persisted_card = {}
-        if not isinstance(persisted_card, dict):
-            persisted_card = {}
+        persisted_card = task_store.persistable_card_payload(card)
         persisted_card.update(
             {
                 "terminal_outcome": reason,

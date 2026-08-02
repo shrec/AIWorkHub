@@ -153,6 +153,7 @@ def test_language_registry_exposes_all_34_families() -> None:
     "relative,expected_language",
     [
         ("config/runtime.json", "json"),
+        ("data/events.jsonl", "json"),
         ("schemas/task.xml", "xml"),
     ],
 )
@@ -607,6 +608,31 @@ def test_wal_readonly_query_can_read_during_writer_transaction(tmp_path):
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_isolated_readonly_directory_supports_repeated_queries_without_wal_sidecars(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "src" / "live.py", "def repeated_probe():\n    return 1\n")
+    sg.build_index(repo, incremental=True)
+    db_path = sg.resolve_db_path(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        connection.close()
+
+    graph_dir = db_path.parent
+    original_mode = graph_dir.stat().st_mode
+    graph_dir.chmod(0o555)
+    try:
+        for _ in range(3):
+            reader = sg.connect(db_path, read_only=True)
+            try:
+                assert sg.func(reader, "repeated_probe")
+            finally:
+                reader.close()
+    finally:
+        graph_dir.chmod(original_mode)
 
 
 def test_incremental_build_compacts_large_stale_page_population(tmp_path, monkeypatch):
