@@ -650,6 +650,8 @@ def aiworkhub_task_create(
     priority: str = "normal",
     task_type: str = "code",
     depends_on: list[str] | None = None,
+    read_first: list[str] | None = None,
+    immutable_inputs: list[str] | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -675,6 +677,8 @@ def aiworkhub_task_create(
         priority=priority,
         task_type=task_type,
         depends_on=depends_on,
+        read_first=read_first,
+        immutable_inputs=immutable_inputs,
     )
 
 
@@ -809,13 +813,20 @@ def aiworkhub_task_reject_review(
     task_id: str,
     reason: str,
     to: str = "pending",
+    residual_identities: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
     archived | superseded -- so a task whose real next step is a dependency-
     gated replacement is not silently requeued to pending."""
 
-    return core.reject_review(task_id=task_id, reason=reason, to=to)
+    kwargs: dict[str, Any] = {"task_id": task_id, "reason": reason, "to": to}
+    # Preserve the established public call shape for callers that do not use
+    # the optional typed residual contract.  This also keeps older embedded
+    # runtimes/mocks compatible while newer callers can opt into the field.
+    if residual_identities is not None:
+        kwargs["residual_identities"] = residual_identities
+    return core.reject_review(**kwargs)
 
 
 @mcp.tool()

@@ -113,7 +113,7 @@ def _ensure_aiworkhub_sibling_stubs() -> None:
 
 _ensure_aiworkhub_sibling_stubs()
 
-from aiworkhub import process_launcher  # noqa: E402
+from aiworkhub import process_launcher, project_context  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +180,19 @@ def test_declared_composition_empty_immutable_inputs() -> None:
     }
     declared = _compose_declared(card)
     assert declared == ["docs/a.txt", "out/b.txt"]
+
+
+def test_project_context_targets_include_immutable_jsonl_before_outputs() -> None:
+    card = {
+        "read_first": ["docs/schema.json"],
+        "immutable_inputs": ["eval/blind_bank.jsonl"],
+        "allowed_writes": ["eval/result.json"],
+    }
+    assert project_context._derive_targets(card) == [
+        "docs/schema.json",
+        "eval/blind_bank.jsonl",
+        "eval/result.json",
+    ]
 
 
 # ---------------------------------------------------------------------------

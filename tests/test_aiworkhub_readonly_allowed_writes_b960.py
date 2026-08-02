@@ -17,6 +17,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from aiworkhub import core  # noqa: E402
 from aiworkhub import process_launcher as pl  # noqa: E402
 from aiworkhub import review_summarizer  # noqa: E402
 
@@ -69,3 +70,32 @@ def test_derive_risks_absent_allowed_writes_is_flagged():
 def test_derive_risks_empty_with_required_outputs_is_flagged():
     card = {"allowed_writes": [], "validation": ["run"], "required_outputs": ["out/x"]}
     assert "missing_allowed_writes" in _codes(card)
+
+
+def test_task_card_path_contract_rejects_declared_input_also_forbidden():
+    conflicts = core.task_card_path_conflicts({
+        "read_first": ["data/source.jsonl"],
+        "immutable_inputs": ["protocols/b1344.json"],
+        "required_outputs": ["out/result.json"],
+        "allowed_writes": ["out/result.json"],
+        "forbidden": ["data/**", "protocols/b1344.json", "unrelated prose"],
+        "validation": [],
+        "objective": "classify rows",
+    })
+    assert {row["field"] for row in conflicts} == {"read_first", "immutable_inputs"}
+    assert {row["path"] for row in conflicts} == {
+        "data/source.jsonl",
+        "protocols/b1344.json",
+    }
+
+
+def test_task_card_path_contract_detects_objective_and_validation_reference():
+    conflicts = core.task_card_path_conflicts({
+        "forbidden": ["data/source.jsonl"],
+        "objective": "Read data/source.jsonl and classify it",
+        "validation": ["python verify.py data/source.jsonl"],
+    })
+    assert conflicts == [
+        {"field": "objective", "path": "data/source.jsonl", "forbidden": "data/source.jsonl"},
+        {"field": "validation", "path": "data/source.jsonl", "forbidden": "data/source.jsonl"},
+    ]

@@ -73,6 +73,7 @@ from .worker_workspace import (
     WorkerWorkspace,
     WorkspaceError,
     cleanup_workspace,
+    build_residual_contract_manifest,
     create_combined_validation_workspace,
     create_quality_review_workspace,
     create_workspace,
@@ -84,6 +85,7 @@ from .worker_workspace import (
     select_sandbox_backend,
     sanitized_env as _base_sanitized_env,
     unlink_if_regular,
+    validate_residual_contract,
     write_json_0600,
 )
 from . import worker_workspace as _worker_workspace
@@ -2079,6 +2081,10 @@ class ProcessManager:
             raise LaunchRejected(f"task_already_claimed:{card.get('claimed_by')}")
         _validate_scope(self.repo, card)
         _validate_required_outputs_contract(card)
+        path_conflicts = core.task_card_path_conflicts(card)
+        if path_conflicts:
+            detail = json.dumps(path_conflicts, ensure_ascii=False, separators=(",", ":"))
+            raise LaunchRejected("contradictory_task_path_contract:" + detail[:600])
         policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
         if not policy_result.get("ok"):
             raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
@@ -2295,6 +2301,7 @@ class ProcessManager:
         spec_path: Path | None = None
         authority_path: Path | None = None
         bridge_request: vscode_lm_bridge.BridgeRequest | None = None
+        residual_contract_manifest: list[dict[str, Any]] = []
         claimed = False
         provider_env: dict[str, str] | None = None
         try:
@@ -2373,6 +2380,9 @@ class ProcessManager:
                     )
                 else:
                     workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                    residual_contract_manifest = build_residual_contract_manifest(
+                        workspace, card
+                    )
                 worker_source_graph_targets = _worker_mcp_source_graph_targets(context_result)
                 worker_session_topic = _worker_mcp_session_topic(context_result, topic)
                 worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
@@ -2543,6 +2553,7 @@ class ProcessManager:
                     ),
                     "immutable_inputs": declared_immutable_inputs,
                     "immutable_input_manifest": immutable_input_manifest,
+                    "residual_contract_manifest": residual_contract_manifest,
                     "external_readonly_dirs": external_readonly_dirs,
                     "workspace": workspace.as_metadata(),
                     "quality_review": (
@@ -3351,6 +3362,15 @@ class ProcessManager:
         one current request; only older, different request ids are collected.
         """
         canonical_status = _canonical_task_status(card)
+        if canonical_status == "pending":
+            predecessor = card.get("rework_predecessor")
+            pinned_request_id = (
+                str(predecessor.get("request_id") or "").strip()
+                if isinstance(predecessor, dict)
+                else ""
+            )
+            if pinned_request_id == request_id:
+                return False, "pinned_rework_predecessor"
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
         if canonical_status != "review":
@@ -3577,6 +3597,7 @@ class ProcessManager:
             release_result: dict[str, Any] | None = None
             worker_mcp_gate: dict[str, Any] | None = None
             quality_gate: dict[str, Any] | None = None
+            residual_contract_result: list[dict[str, Any]] = []
             cleanup = True
             try:
                 if terminal_state != "exited":
@@ -3679,6 +3700,10 @@ class ProcessManager:
                                 )[:300]
                             raise _QualityReviewFinalized
                         changed = enforce_scope(workspace)
+                        residual_contract_result = validate_residual_contract(
+                            workspace,
+                            list(metadata.get("residual_contract_manifest") or []),
+                        )
                         required_output_records = validate_required_outputs(
                             workspace,
                             metadata.get("required_outputs") or [],
@@ -3753,6 +3778,7 @@ class ProcessManager:
                                 "immutable_input_manifest": (
                                     metadata.get("immutable_input_manifest") or {}
                                 ),
+                                "residual_contract": residual_contract_result,
                                 "workspace": workspace.as_metadata(),
                                 "request_identity": {
                                     "request_id": request_id,
@@ -3776,7 +3802,9 @@ class ProcessManager:
                 error = str(exc)
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
                     terminal_state = "scope_rejected"
-                elif error.startswith(("validation", "required_output", "quality_gate")):
+                elif error.startswith((
+                    "validation", "required_output", "quality_gate", "residual_contract"
+                )):
                     terminal_state = "validation_failed"
                 elif error.startswith(("parent_changed", "promotion_scope")):
                     terminal_state = "promotion_conflict"
@@ -3817,6 +3845,7 @@ class ProcessManager:
                             "validation": validations,
                             "worker_mcp_gate": worker_mcp_gate,
                             "quality_gate": quality_gate,
+                            "residual_contract": residual_contract_result,
                         },
                     )
                     if not release_result.get("ok"):
@@ -3914,6 +3943,7 @@ class ProcessManager:
                 "provider_tool_denials": provider_tool_denials,
                 "worker_mcp_gate": worker_mcp_gate,
                 "quality_gate": quality_gate,
+                "residual_contract": residual_contract_result,
             })
             if cleanup:
                 try:
@@ -4348,11 +4378,68 @@ class ProcessManager:
         latest = status.get("latest_event") or {}
         stdout_path = Path(str(latest.get("stdout_path") or ""))
         stderr_path = Path(str(latest.get("stderr_path") or ""))
-        limit = max(1024, min(int(max_log_bytes), MAX_LOG_TAIL_BYTES))
+        total_log_limit = max(0, min(int(max_log_bytes), MAX_LOG_TAIL_BYTES))
+        stdout_limit = (total_log_limit + 1) // 2
+        stderr_limit = total_log_limit // 2
+        card = status.get("task_card") if isinstance(status.get("task_card"), dict) else {}
+        card_fields = (
+            "task_id", "status", "worker_status", "runner", "topic", "priority",
+            "claim_epoch", "launch_request_id", "terminal_substatus",
+        )
+        event_fields = (
+            "request_id", "task_id", "state", "timestamp", "started_at", "finished_at",
+            "pid", "exit_code", "runner", "topic", "adapter_id", "model", "error",
+            # Stable public lifecycle evidence used by coordinator/security
+            # consumers.  These are scalar paths, not recursive payloads.
+            "metadata_path", "workspace_retained",
+        )
+        card_summary = {key: card.get(key) for key in card_fields if key in card}
+        event_summary = {key: latest.get(key) for key in event_fields if key in latest}
+        changed_paths = latest.get("changed_paths")
+        if isinstance(changed_paths, list):
+            event_summary["changed_paths"] = changed_paths[:64]
+            event_summary["changed_path_count"] = len(changed_paths)
+        promoted_paths = latest.get("promoted_paths")
+        if isinstance(promoted_paths, list):
+            event_summary["promoted_paths"] = promoted_paths[:64]
+            event_summary["promoted_path_count"] = len(promoted_paths)
+        card_sha256 = hashlib.sha256(
+            json.dumps(card, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest() if card else ""
+        event_sha256 = hashlib.sha256(
+            json.dumps(latest, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest() if latest else ""
+        truncated_fields: list[str] = []
+        if set(card) - set(card_summary):
+            truncated_fields.append("task_card")
+        if set(latest) - set(event_summary):
+            truncated_fields.append("latest_event")
+        stdout_tail = _safe_tail(stdout_path, stdout_limit) if stdout_limit else ""
+        stderr_tail = _safe_tail(stderr_path, stderr_limit) if stderr_limit else ""
         return {
-            **status,
-            "stdout_tail": _safe_tail(stdout_path, limit),
-            "stderr_tail": _safe_tail(stderr_path, limit),
+            "ok": True,
+            "request_id": status.get("request_id"),
+            "task_id": status.get("task_id"),
+            "state": status.get("state"),
+            "process_alive": status.get("process_alive"),
+            "exit_code": status.get("exit_code"),
+            "runner": status.get("runner"),
+            "topic": status.get("topic"),
+            "adapter_id": status.get("adapter_id"),
+            "model": status.get("model"),
+            "task_state": status.get("task_state"),
+            "event_count": status.get("event_count"),
+            "liveness": status.get("liveness"),
+            "task_card": card_summary,
+            "task_card_sha256": card_sha256,
+            "latest_event": event_summary,
+            "latest_event_sha256": event_sha256,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "log_bytes_returned": len(stdout_tail.encode("utf-8")) + len(stderr_tail.encode("utf-8")),
+            "max_log_bytes": total_log_limit,
+            "truncated_fields": truncated_fields,
+            "detail_cursor": {"request_id": request_id},
             "review_ready": status.get("task_state") == "review",
             "terminal": status.get("state") in {
                 *TERMINAL_PROCESS_STATES,
@@ -4622,6 +4709,32 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                 }
+
+            predecessor = card.get("rework_predecessor")
+            residual_identities = (
+                predecessor.get("residual_identities")
+                if isinstance(predecessor, dict)
+                else None
+            )
+            if residual_identities:
+                residual_contract = evidence.get("residual_contract")
+                if not isinstance(residual_contract, list) or not residual_contract:
+                    return {
+                        "ok": False,
+                        "error": "residual_contract_evidence_missing",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
+                if any(
+                    not isinstance(row, dict) or row.get("pass") is not True
+                    for row in residual_contract
+                ):
+                    return {
+                        "ok": False,
+                        "error": "residual_contract_evidence_failed",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
 
             intent_snapshot = self._context_write_intent_snapshot(request_id)
             if intent_snapshot.get("ok"):

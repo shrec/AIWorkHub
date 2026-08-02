@@ -166,6 +166,8 @@ MIN_LIMIT = 1
 MAX_LIMIT = 20
 MAX_TOOL_OUTPUT_BYTES = 16 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
+MAX_DECLARED_INPUT_PREVIEW_BYTES = 12 * 1024
+MAX_DECLARED_INPUT_HASH_BYTES = 8 * 1024 * 1024
 MAX_QUALITY_REVIEW_PACKET_BYTES = 256 * 1024
 MAX_QUALITY_REVIEW_FINDINGS = 50
 SQLITE_QUERY_TIMEOUT_SECONDS = 5
@@ -977,6 +979,84 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
     return value
 
 
+def _declared_input_file_payload(ctx: WorkerToolContext, relative_path: str) -> dict[str, Any] | None:
+    """Return a bounded exact-file receipt from the isolated worker tree.
+
+    Source Graph deliberately indexes structure, so a declared JSON/JSONL/XML
+    input can be a valid task authority while producing no semantic entity.
+    This fallback is intentionally narrower than arbitrary file access: the
+    caller has already passed the exact coordinator allowlist check, the path
+    must equal the ``file`` query, stay beneath the immutable worker root, and
+    contain no symlink component.  It never performs discovery or globbing.
+    """
+
+    if not relative_path or "\x00" in relative_path:
+        return None
+    raw = Path(relative_path)
+    if raw.is_absolute() or ".." in raw.parts:
+        return None
+    root = ctx.repo.resolve()
+    candidate = root / raw
+    current = root
+    try:
+        for part in raw.parts:
+            if part in {"", "."}:
+                continue
+            current = current / part
+            if current.is_symlink():
+                return None
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved == root or root not in resolved.parents or not resolved.is_file():
+        return None
+
+    try:
+        size = resolved.stat().st_size
+        preview = bytearray()
+        digest = hashlib.sha256()
+        hashed_bytes = 0
+        with resolved.open("rb") as handle:
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                if len(preview) < MAX_DECLARED_INPUT_PREVIEW_BYTES:
+                    remaining = MAX_DECLARED_INPUT_PREVIEW_BYTES - len(preview)
+                    preview.extend(chunk[:remaining])
+                if hashed_bytes + len(chunk) <= MAX_DECLARED_INPUT_HASH_BYTES:
+                    digest.update(chunk)
+                    hashed_bytes += len(chunk)
+                else:
+                    hashed_bytes = MAX_DECLARED_INPUT_HASH_BYTES + 1
+                    break
+    except OSError:
+        return None
+
+    hash_complete = hashed_bytes <= MAX_DECLARED_INPUT_HASH_BYTES and hashed_bytes == size
+    preview_text = bytes(preview).decode("utf-8", errors="replace")
+    return {
+        "mode": "file",
+        "query": relative_path,
+        "budget": 1,
+        "matches": [{
+            "file_path": relative_path,
+            "kind": "declared_input_file",
+            "size": size,
+            "sha256": digest.hexdigest() if hash_complete else None,
+            "hash_complete": hash_complete,
+            "preview": preview_text,
+            "preview_bytes": len(preview),
+            "preview_truncated": size > len(preview),
+            "authority": "worker_workspace_declared_input",
+            "fallback_reason": "declared_input_unindexed",
+        }],
+        "candidate_files": [relative_path],
+        "fallback_reason": "declared_input_unindexed",
+        "truncated": size > len(preview),
+    }
+
+
 def source_graph_query(
     ctx: WorkerToolContext,
     *,
@@ -1097,6 +1177,15 @@ def source_graph_query(
             )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
+    if (
+        mode == "file"
+        and scope is not None
+        and bounded_query == scope
+        and _json_hit_count(payload) == 0
+    ):
+        exact_payload = _declared_input_file_payload(ctx, scope)
+        if exact_payload is not None:
+            payload = exact_payload
     if scope is not None:
         payload = _filter_by_scope(payload, scope) or {}
         if isinstance(payload, dict) and payload:

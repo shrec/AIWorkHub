@@ -120,7 +120,12 @@ def _bounded_targets(raw: Any, *, field: str) -> list[str]:
 def _derive_targets(card: dict[str, Any]) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
-    for key in ("read_first", "allowed_writes"):
+    # Immutable/dependency inputs are first-class worker evidence.  They must
+    # be available to the task-scoped Source Graph ``file`` mode even when a
+    # non-code format (JSON/JSONL/XML/etc.) has no semantic entities in the
+    # current index.  Keep them ahead of write scopes so the bounded target
+    # cap cannot accidentally discard declared inputs in favour of outputs.
+    for key in ("read_first", "immutable_inputs", "allowed_writes"):
         value = card.get(key)
         if not isinstance(value, list):
             continue
@@ -142,7 +147,7 @@ def _derive_targets(card: dict[str, Any]) -> list[str]:
 
 def _scope_values(card: dict[str, Any]) -> list[str]:
     values: list[str] = []
-    for key in ("read_first", "allowed_writes"):
+    for key in ("read_first", "immutable_inputs", "allowed_writes"):
         raw = card.get(key)
         if not isinstance(raw, list):
             continue

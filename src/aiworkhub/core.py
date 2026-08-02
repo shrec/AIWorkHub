@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hmac
 import json
 import os
@@ -77,6 +78,8 @@ COORDINATOR_COMMANDS = frozenset({"done", "reject-review", "release-launch", "ar
 # package __init__ (imported above) so existing callers keep working against
 # core.COORDINATOR_TOKEN_ENV unchanged.
 DEFAULT_COORDINATOR_TOKEN_FILE = Path.home() / ".config/aiworkhub/taskctl_coordinator.token"
+_WORKSPACE_GC_JOBS_LOCK = threading.Lock()
+_WORKSPACE_GC_JOBS: set[str] = set()
 # RFC 9562 defines UUID versions 6, 7 and 8 in addition to the historical
 # 1-5 set.  Current Codex thread ids are UUIDv7, so rejecting the version
 # nibble above 5 discards a genuine mux-owned origin thread.
@@ -2742,6 +2745,86 @@ def _repository_switch_locked(repo_id: str) -> dict[str, Any]:
         return {"ok": False, "error": f"repository_switch_failed:{type(exc).__name__}:{str(exc)[:160]}"}
 
 
+def _task_contract_path(raw: Any) -> str:
+    """Return a normalized path-like card value, or ``""`` for prose."""
+    if not isinstance(raw, str):
+        return ""
+    value = raw.strip().replace("\\", "/")
+    if not value or "\x00" in value or any(ch.isspace() for ch in value):
+        return ""
+    leaf = value.rsplit("/", 1)[-1]
+    if not (
+        "/" in value
+        or any(ch in value for ch in "*?[")
+        or value.startswith(".")
+        or "." in leaf
+    ):
+        return ""
+    return value.lstrip("./")
+
+
+def _task_contract_paths_overlap(left: str, right: str) -> bool:
+    if fnmatch.fnmatchcase(left, right) or fnmatch.fnmatchcase(right, left):
+        return True
+    def static_prefix(value: str) -> str:
+        indices = [value.find(ch) for ch in "*?[" if ch in value]
+        stop = min(indices) if indices else len(value)
+        return value[:stop].rstrip("/")
+
+    left_prefix = static_prefix(left)
+    right_prefix = static_prefix(right)
+    if not left_prefix or not right_prefix:
+        return False
+    return (
+        left_prefix == right_prefix
+        or left_prefix.startswith(right_prefix + "/")
+        or right_prefix.startswith(left_prefix + "/")
+    )
+
+
+def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
+    """Return bounded required/forbidden path contradictions in one card."""
+    forbidden = [
+        path
+        for path in (_task_contract_path(v) for v in card.get("forbidden") or [])
+        if path
+    ]
+    if not forbidden:
+        return []
+    conflicts: list[dict[str, str]] = []
+    for field in ("allowed_writes", "required_outputs", "read_first", "immutable_inputs"):
+        values = card.get(field) or []
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            declared = _task_contract_path(raw)
+            if not declared:
+                continue
+            for denied in forbidden:
+                if _task_contract_paths_overlap(declared, denied):
+                    conflicts.append({
+                        "field": field,
+                        "path": declared,
+                        "forbidden": denied,
+                    })
+                    if len(conflicts) >= 32:
+                        return conflicts
+    text_fields = [("objective", str(card.get("objective") or ""))]
+    text_fields.extend(
+        ("validation", str(value)) for value in (card.get("validation") or [])
+    )
+    for field, text in text_fields:
+        normalized_text = text.replace("\\", "/")
+        for denied in forbidden:
+            if denied and denied in normalized_text:
+                row = {"field": field, "path": denied, "forbidden": denied}
+                if row not in conflicts:
+                    conflicts.append(row)
+                    if len(conflicts) >= 32:
+                        return conflicts
+    return conflicts
+
+
 def create_task(
     task_id: str,
     title: str,
@@ -2757,6 +2840,8 @@ def create_task(
     callback_required: bool = True,
     task_type: str = "code",
     depends_on: list[str] | None = None,
+    read_first: list[str] | None = None,
+    immutable_inputs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -2823,12 +2908,27 @@ def create_task(
         forbidden2 = bounded_strings(forbidden or [], "forbidden")
         outputs2 = bounded_strings(required_outputs or [], "required_outputs")
         validation2 = bounded_strings(validation or [], "validation")
+        read_first2 = bounded_strings(read_first or [], "read_first")
+        immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
     for item in writes2:
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:
             return _lifecycle_error("invalid_allowed_write_path", 2)
+    conflicts = task_card_path_conflicts({
+        "objective": objective,
+        "validation": validation2,
+        "allowed_writes": writes2,
+        "required_outputs": outputs2,
+        "read_first": read_first2,
+        "immutable_inputs": immutable_inputs2,
+        "forbidden": forbidden2,
+    })
+    if conflicts:
+        result = _lifecycle_error("contradictory_task_path_contract", 2)
+        result["conflicts"] = conflicts
+        return result
     try:
         depends_on2 = task_plan.normalize_depends_on(depends_on)
     except task_plan.TaskPlanError as exc:
@@ -2888,6 +2988,8 @@ def create_task(
         "allowed_writes": writes2,
         "forbidden": forbidden2,
         "required_outputs": outputs2,
+        "read_first": read_first2,
+        "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "depends_on": depends_on2,
         "project_context": {
@@ -3119,7 +3221,7 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
 
 
 def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
-    """Best-effort immediate GC after a coordinator lifecycle disposition.
+    """Queue best-effort GC outside the lifecycle transition critical path.
 
     The periodic process reconciler remains the durable safety net, but a
     successful done/reject/archive/supersede should not leave a large isolated
@@ -3129,21 +3231,52 @@ def _reconcile_retained_workspaces(result: dict[str, Any]) -> dict[str, Any]:
     """
     if not result.get("ok"):
         return result
-    try:
-        from . import process_launcher  # local import: process_launcher imports core
+    root = repo_root().resolve()
+    key = str(root)
+    with _WORKSPACE_GC_JOBS_LOCK:
+        if key in _WORKSPACE_GC_JOBS:
+            result["workspace_retention"] = {
+                "ok": True,
+                "queued": True,
+                "coalesced": True,
+                "mode": "async_periodic_sweep",
+            }
+            return result
+        _WORKSPACE_GC_JOBS.add(key)
 
-        manager = process_launcher.ProcessManager(repo=repo_root())
-        result["workspace_retention"] = manager._gc_finalized_workspaces()
-    except Exception as exc:  # noqa: BLE001 - lifecycle transition already committed
-        result["workspace_retention"] = {
-            "ok": False,
-            "warning": f"{type(exc).__name__}:{exc}"[:200],
-        }
+    def run_gc() -> None:
+        try:
+            from . import process_launcher  # local import: cycle-safe
+
+            process_launcher.ProcessManager(repo=root)._gc_finalized_workspaces()
+        except Exception:
+            # The durable periodic reconciler retries. A post-commit cleanup
+            # failure must never rewrite the already-returned transition.
+            pass
+        finally:
+            with _WORKSPACE_GC_JOBS_LOCK:
+                _WORKSPACE_GC_JOBS.discard(key)
+
+    threading.Thread(
+        target=run_gc,
+        name=f"aiworkhub-workspace-gc-{abs(hash(key)) & 0xffff:x}",
+        daemon=True,
+    ).start()
+    result["workspace_retention"] = {
+        "ok": True,
+        "queued": True,
+        "coalesced": False,
+        "mode": "async_periodic_sweep",
+    }
     return result
 
 
 def reject_review(
-    task_id: str, reason: str, topic: str | None = None, to: str = "pending"
+    task_id: str,
+    reason: str,
+    topic: str | None = None,
+    to: str = "pending",
+    residual_identities: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -3162,6 +3295,30 @@ def reject_review(
     disposition = str(to or "pending").strip().lower()
     if disposition not in ("pending", "blocked", "archived", "superseded"):
         return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
+    normalized_residuals: list[dict[str, str]] = []
+    if residual_identities is not None:
+        if disposition != "pending" or not isinstance(residual_identities, list):
+            return _lifecycle_error("residual_identities_require_pending_rework", 2)
+        if not residual_identities or len(residual_identities) > 256:
+            return _lifecycle_error("invalid_residual_identities", 2)
+        seen_residuals: set[tuple[str, str]] = set()
+        for row in residual_identities:
+            if not isinstance(row, dict):
+                return _lifecycle_error("invalid_residual_identities", 2)
+            path = _task_contract_path(row.get("path"))
+            pointer = str(row.get("pointer") or "").strip()
+            if (
+                not path
+                or not pointer.startswith("/")
+                or len(pointer) > 1000
+                or "\x00" in pointer
+            ):
+                return _lifecycle_error("invalid_residual_identities", 2)
+            key = (path, pointer)
+            if key in seen_residuals:
+                continue
+            seen_residuals.add(key)
+            normalized_residuals.append({"path": path, "pointer": pointer})
     command = [
         "reject-review", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic),
         "--reason", reason, "--to", disposition,
@@ -3197,6 +3354,49 @@ def reject_review(
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    # A pending disposition means "rework this exact candidate", not "throw
+    # the candidate away and start again from Git HEAD".  Preserve a bounded,
+    # hash-authenticated pointer to the retained review workspace before
+    # begin_claim_episode() clears terminal_review.  ProcessManager's GC keeps
+    # this exact request pinned while the task is pending, and the next
+    # isolated launch materializes only these reviewed changed paths as its
+    # initial baseline.  Legacy/malformed review evidence is left unpinned so
+    # old cards remain rejectable; a new launch then follows the historical
+    # clean-HEAD behavior rather than trusting incomplete evidence.
+    if disposition == "pending":
+        terminal_review = card.get("terminal_review")
+        evidence = (
+            terminal_review.get("evidence")
+            if isinstance(terminal_review, dict)
+            else None
+        )
+        identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+        workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+        changed_hashes = (
+            evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
+        )
+        predecessor_request_id = (
+            str(identity.get("request_id") or "").strip()
+            if isinstance(identity, dict)
+            else ""
+        )
+        if (
+            predecessor_request_id
+            and isinstance(workspace, dict)
+            and str(workspace.get("request_id") or "").strip() == predecessor_request_id
+            and isinstance(changed_hashes, dict)
+            and changed_hashes
+        ):
+            card["rework_predecessor"] = {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": predecessor_request_id,
+                "workspace": workspace,
+                "changed_path_hashes": changed_hashes,
+                "residual_identities": normalized_residuals,
+                "pinned_at": now,
+            }
+        elif normalized_residuals:
+            return _lifecycle_error("residual_contract_requires_review_predecessor", 2)
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
         card.update(status="blocked", worker_status="blocked")

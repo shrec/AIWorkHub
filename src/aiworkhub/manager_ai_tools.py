@@ -77,6 +77,14 @@ def _write_invoke(
         result = dict(call(context.authority_repo, actor))
     except (context_writes.ContextWriteError, workforce_catalog.WorkforceCatalogError) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
+    except sqlite3.IntegrityError as exc:
+        result = {
+            "ok": False,
+            "error": "context_write_integrity_error",
+            "sqlite_errorname": str(getattr(exc, "sqlite_errorname", "SQLITE_CONSTRAINT")),
+            "constraint": str(exc).split(":", 1)[0][:120],
+            "recovery_action": "retry_with_same_idempotency_key_or_use_update",
+        }
     except (OSError, sqlite3.Error, storage_registry.StorageRegistryError) as exc:
         result = {"ok": False, "error": f"context_write_failed:{type(exc).__name__}"}
     result["manager"] = manager

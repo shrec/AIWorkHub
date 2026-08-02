@@ -14,6 +14,7 @@ import os
 import sqlite3
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ if str(SRC) not in sys.path:
 
 import aiworkhub  # noqa: E402
 from aiworkhub import callback_store, core, task_store  # noqa: E402
+from aiworkhub import process_launcher  # noqa: E402
 
 NOW = "2026-07-20T00:00:00+00:00"
 
@@ -94,6 +96,79 @@ def test_reject_to_pending_requeues_for_rework(coord):
     assert res["ok"] is True, res
     row = _row(coord, "T_PEND")
     assert row["status"] == "pending" and row["worker_status"] == "unclaimed"
+
+
+def test_reject_transition_does_not_wait_for_workspace_gc(coord, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_gc(_manager):
+        entered.set()
+        release.wait(timeout=5)
+        return {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+
+    monkeypatch.setattr(
+        process_launcher.ProcessManager,
+        "_gc_finalized_workspaces",
+        slow_gc,
+    )
+    _insert(coord, "T_ASYNC_GC")
+
+    try:
+        res = core.reject_review("T_ASYNC_GC", "rework", to="pending")
+        assert res["ok"] is True, res
+        assert res["workspace_retention"]["queued"] is True
+        assert entered.wait(timeout=1), "background GC did not start"
+        assert not release.is_set(), "transition unexpectedly waited for GC"
+    finally:
+        release.set()
+
+
+def test_reject_to_pending_pins_exact_review_workspace(coord):
+    request_id = "review-request-1"
+    workspace = {
+        "request_id": request_id,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{request_id}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{request_id}/home",
+        "allowed_writes": ["out/result.txt"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    _insert(
+        coord,
+        "T_PIN",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": request_id},
+                    "workspace": workspace,
+                    "changed_path_hashes": {"out/result.txt": "a" * 64},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_PIN",
+        "repair residual only",
+        to="pending",
+        residual_identities=[
+            {"path": "out/result.txt", "pointer": "/rows/3"},
+        ],
+    )
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_PIN")["card_json"])
+    assert card["rework_predecessor"]["request_id"] == request_id
+    assert card["rework_predecessor"]["changed_path_hashes"] == {
+        "out/result.txt": "a" * 64
+    }
+    assert card["rework_predecessor"]["residual_identities"] == [
+        {"path": "out/result.txt", "pointer": "/rows/3"}
+    ]
+    assert "terminal_review" not in card
 
 
 def test_reject_to_blocked_parks_as_blocked(coord):

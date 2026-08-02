@@ -397,6 +397,33 @@ def test_coordinator_disposed_attempt_is_gc_cleaned(tmp_path, monkeypatch, statu
     assert latest["workspace_gc_reason"] == f"disposed_task_status:{status}"
 
 
+def test_pending_rework_predecessor_is_pinned_until_successor_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-pinned-rework"
+    card = _card()
+    card.update({
+        "status": "pending",
+        "worker_status": "unclaimed",
+        "rework_predecessor": {
+            "schema_id": "aiworkhub.rework_predecessor.v1",
+            "request_id": request_id,
+        },
+    })
+    manager = _build_manager(tmp_path, card)
+    path, home, _ = _seed_gc_candidate(
+        manager, tmp_path, card,
+        request_id=request_id,
+        pid=2_147_483_075, pid_start_ticks=999_999_925,
+        state="validation_failed",
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    assert path.exists() and home.exists()
+    assert "workspace_gc" not in manager._request_events(request_id)[-1]
+
+
 def test_current_review_request_is_preserved_but_older_attempt_is_gc_cleaned(tmp_path, monkeypatch):
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
     current_request = "req-current-review"

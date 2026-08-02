@@ -767,3 +767,52 @@ def test_termination_accepts_only_a_matching_creation_timestamp():
 @pytest.mark.parametrize("pid", [0, -1, None, "", "not-a-pid"])
 def test_termination_refuses_a_malformed_pid(pid):
     assert process_launcher._identity_verified_pid(pid, 12345) == 0
+
+
+def test_collect_returns_bounded_projection_without_recursive_card(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, show_task=_show(lambda: _card()), argv=[])
+    stdout = tmp_path / "stdout.log"
+    stderr = tmp_path / "stderr.log"
+    stdout.write_text("x" * 10_000, encoding="utf-8")
+    stderr.write_text("y" * 10_000, encoding="utf-8")
+    huge_card = {
+        **_card(state="review"),
+        "terminal_review": {"evidence": {"nested": "z" * 100_000}},
+        "card_json": "q" * 100_000,
+    }
+    huge_event = {
+        "request_id": "req-bounded",
+        "task_id": "TASK_B1",
+        "state": "review_ready",
+        "stdout_path": str(stdout),
+        "stderr_path": str(stderr),
+        "terminal_review": huge_card["terminal_review"],
+        "changed_paths": [f"out/{index}.json" for index in range(100)],
+    }
+    monkeypatch.setattr(manager, "status", lambda _request_id: {
+        "ok": True,
+        "request_id": "req-bounded",
+        "task_id": "TASK_B1",
+        "state": "review_ready",
+        "process_alive": False,
+        "exit_code": 0,
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": "sonnet",
+        "task_state": "review",
+        "task_card": huge_card,
+        "event_count": 3,
+        "latest_event": huge_event,
+        "liveness": {},
+    })
+
+    result = manager.collect("req-bounded", max_log_bytes=1024)
+
+    assert result["log_bytes_returned"] <= 1024
+    assert "terminal_review" not in result["task_card"]
+    assert "terminal_review" not in result["latest_event"]
+    assert result["latest_event"]["changed_path_count"] == 100
+    assert len(result["latest_event"]["changed_paths"]) == 64
+    assert result["truncated_fields"] == ["task_card", "latest_event"]
+    assert len(json.dumps(result)) < 12_000

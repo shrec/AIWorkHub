@@ -10,6 +10,7 @@ after scope, validation, and parent-content checks.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import errno
 import fnmatch
@@ -515,6 +516,192 @@ def _touch_placeholder(worktree: Path, relative: str) -> None:
     os.close(fd)
 
 
+def _materialize_rework_predecessor(
+    repo: Path,
+    worktree: Path,
+    card: dict[str, Any],
+    allowed_writes: tuple[str, ...],
+) -> list[str]:
+    """Overlay one hash-pinned reviewed candidate into a successor worktree.
+
+    Only paths that the predecessor's terminal evidence recorded as changed
+    and that the successor may write are materialized.  The retained source
+    workspace, request identity, repository identity and every content hash
+    are revalidated before copying.  This makes rework incremental without
+    promoting rejected bytes into the canonical checkout.
+    """
+    predecessor = card.get("rework_predecessor")
+    if predecessor is None:
+        return []
+    if not isinstance(predecessor, dict):
+        raise WorkspaceError("rework_predecessor_invalid")
+    request_id = str(predecessor.get("request_id") or "").strip()
+    workspace_payload = predecessor.get("workspace")
+    hashes = predecessor.get("changed_path_hashes")
+    if (
+        not _REQUEST_ID_RE.fullmatch(request_id)
+        or not isinstance(workspace_payload, dict)
+        or not isinstance(hashes, dict)
+        or not hashes
+    ):
+        raise WorkspaceError("rework_predecessor_invalid")
+    try:
+        source_workspace = WorkerWorkspace.from_metadata(workspace_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkspaceError(f"rework_predecessor_workspace_invalid:{exc}") from exc
+    if source_workspace.repo != repo or source_workspace.request_id != request_id:
+        raise WorkspaceError("rework_predecessor_identity_mismatch")
+    assert_gc_safe_workspace_shape(
+        request_id, source_workspace.path, source_workspace.home
+    )
+    if source_workspace.path.is_symlink() or not source_workspace.path.is_dir():
+        raise WorkspaceError("rework_predecessor_workspace_missing")
+
+    seeded: list[str] = []
+    for raw_relative, raw_expected in sorted(hashes.items()):
+        relative = _relative_repo_path(str(raw_relative))
+        if not _matches(relative, allowed_writes):
+            raise WorkspaceError(f"rework_predecessor_outside_scope:{relative}")
+        if raw_expected is not None and (
+            not isinstance(raw_expected, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", raw_expected)
+        ):
+            raise WorkspaceError(f"rework_predecessor_hash_invalid:{relative}")
+        source = source_workspace.path / relative
+        destination = worktree / relative
+        _require_beneath(source_workspace.path, source)
+        _require_beneath(worktree, destination)
+        if source.is_symlink() or not source.is_file():
+            observed = None
+        else:
+            observed = hashlib.sha256(source.read_bytes()).hexdigest()
+        if observed != raw_expected:
+            raise WorkspaceError(f"rework_predecessor_hash_mismatch:{relative}")
+        if raw_expected is None:
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+            elif destination.exists():
+                raise WorkspaceError(f"rework_predecessor_delete_non_file:{relative}")
+        else:
+            _copy_one(source, destination)
+        seeded.append(relative)
+    return seeded
+
+
+def _json_pointer_parts(pointer: str) -> tuple[str, ...]:
+    if not pointer.startswith("/") or len(pointer) > 1000:
+        raise WorkspaceError(f"residual_pointer_invalid:{pointer[:120]}")
+    return tuple(
+        part.replace("~1", "/").replace("~0", "~")
+        for part in pointer[1:].split("/")
+    )
+
+
+def _mask_json_pointer(document: Any, pointer: str) -> None:
+    parts = _json_pointer_parts(pointer)
+    current = document
+    for part in parts[:-1]:
+        if isinstance(current, list):
+            if not part.isdigit() or int(part) >= len(current):
+                raise WorkspaceError(f"residual_pointer_missing:{pointer}")
+            current = current[int(part)]
+        elif isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            raise WorkspaceError(f"residual_pointer_missing:{pointer}")
+    leaf = parts[-1]
+    sentinel = {"__aiworkhub_residual__": pointer}
+    if isinstance(current, list):
+        if not leaf.isdigit() or int(leaf) >= len(current):
+            raise WorkspaceError(f"residual_pointer_missing:{pointer}")
+        current[int(leaf)] = sentinel
+    elif isinstance(current, dict) and leaf in current:
+        current[leaf] = sentinel
+    else:
+        raise WorkspaceError(f"residual_pointer_missing:{pointer}")
+
+
+def _masked_json_hash(path: Path, pointers: list[str]) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError(f"residual_artifact_missing:{path.name}")
+    if path.stat().st_size > 32 * 1024 * 1024:
+        raise WorkspaceError(f"residual_artifact_too_large:{path.name}")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceError(f"residual_artifact_invalid_json:{path.name}") from exc
+    masked = copy.deepcopy(document)
+    decoded = [(pointer, _json_pointer_parts(pointer)) for pointer in pointers]
+    for index, (pointer, parts) in enumerate(decoded):
+        for other, other_parts in decoded[index + 1:]:
+            shorter, longer = (parts, other_parts) if len(parts) <= len(other_parts) else (other_parts, parts)
+            if longer[:len(shorter)] == shorter:
+                raise WorkspaceError(
+                    f"residual_pointer_overlap:{pointer}:{other}"[:300]
+                )
+    for pointer in sorted(pointers):
+        _mask_json_pointer(masked, pointer)
+    canonical = json.dumps(
+        masked, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def build_residual_contract_manifest(
+    workspace: WorkerWorkspace, card: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Snapshot non-residual JSON content after predecessor materialization."""
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict):
+        return []
+    identities = predecessor.get("residual_identities")
+    if identities in (None, []):
+        return []
+    if not isinstance(identities, list) or len(identities) > 256:
+        raise WorkspaceError("invalid_residual_identities")
+    grouped: dict[str, list[str]] = {}
+    for row in identities:
+        if not isinstance(row, dict):
+            raise WorkspaceError("invalid_residual_identities")
+        relative = _relative_repo_path(str(row.get("path") or ""))
+        pointer = str(row.get("pointer") or "").strip()
+        if not _matches(relative, workspace.allowed_writes):
+            raise WorkspaceError(f"residual_artifact_outside_scope:{relative}")
+        grouped.setdefault(relative, []).append(pointer)
+    manifest: list[dict[str, Any]] = []
+    for relative, pointers in sorted(grouped.items()):
+        unique = sorted(set(pointers))
+        manifest.append({
+            "path": relative,
+            "pointers": unique,
+            "non_residual_sha256": _masked_json_hash(
+                workspace.path / relative, unique
+            ),
+        })
+    return manifest
+
+
+def validate_residual_contract(
+    workspace: WorkerWorkspace, manifest: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Fail when a rework changes content outside declared JSON pointers."""
+    results: list[dict[str, Any]] = []
+    for row in manifest:
+        relative = _relative_repo_path(str(row.get("path") or ""))
+        pointers = [str(value) for value in row.get("pointers") or []]
+        expected = str(row.get("non_residual_sha256") or "")
+        observed = _masked_json_hash(workspace.path / relative, pointers)
+        if not re.fullmatch(r"[0-9a-f]{64}", expected) or observed != expected:
+            raise WorkspaceError(f"residual_contract_non_residual_changed:{relative}")
+        results.append({
+            "path": relative,
+            "pointers": pointers,
+            "non_residual_sha256": expected,
+            "pass": True,
+        })
+    return results
+
+
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(home, 0o700)
@@ -834,6 +1021,10 @@ def create_workspace(
         for relative in allowed:
             if not any(ch in relative for ch in "*?["):
                 _touch_placeholder(path, relative)
+        rework_seeded = _materialize_rework_predecessor(
+            repo, path, card, allowed
+        )
+        seeded = sorted(set(seeded) | set(rework_seeded))
         baseline: dict[str, str | None] = {}
         for relative in _expand_declared(repo, allowed):
             baseline[relative] = _hash_path(repo / relative)

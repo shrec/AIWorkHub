@@ -401,6 +401,75 @@ def test_target_outside_declared_allowlist_is_rejected_before_any_call(
     assert result["reason"] == "target_not_allowed"
 
 
+def test_exact_declared_jsonl_falls_back_to_bounded_workspace_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    declared = worktree / "eval" / "blind.jsonl"
+    declared.parent.mkdir(parents=True)
+    declared.write_text('{"id":1,"text":"ქართული"}\n', encoding="utf-8")
+    monkeypatch.setattr(
+        source_graph_mod,
+        "file_query",
+        lambda repo_root, file_path, budget=64: {
+            "mode": "file", "query": file_path, "matches": [],
+            "contexts": [], "candidate_files": [], "truncated": False,
+        },
+    )
+    ctx = _ctx(
+        repo=worktree, authority_repo=authority, home=tmp_path / "home",
+        targets=("eval/blind.jsonl",),
+    )
+
+    result = w.source_graph_query(
+        ctx, mode="file", query="eval/blind.jsonl", target="eval/blind.jsonl",
+    )
+
+    assert result["ok"] is True
+    payload = json.loads(result["content"])
+    row = payload["matches"][0]
+    assert row["authority"] == "worker_workspace_declared_input"
+    assert row["fallback_reason"] == "declared_input_unindexed"
+    assert row["sha256"]
+    assert "ქართული" in row["preview"]
+
+
+def test_declared_input_fallback_rejects_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    worktree = _worktree_repo(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"secret":true}', encoding="utf-8")
+    link = worktree / "input.json"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    monkeypatch.setattr(
+        source_graph_mod,
+        "file_query",
+        lambda repo_root, file_path, budget=64: {
+            "mode": "file", "query": file_path, "matches": [],
+            "contexts": [], "candidate_files": [], "truncated": False,
+        },
+    )
+    ctx = _ctx(
+        repo=worktree, authority_repo=authority, home=tmp_path / "home",
+        targets=("input.json",),
+    )
+
+    result = w.source_graph_query(
+        ctx, mode="file", query="input.json", target="input.json",
+    )
+
+    assert result["ok"] is True
+    assert json.loads(result["content"])["matches"] == []
+
+
 # ---------------------------------------------------------------------------
 # Live-call gate: zero-hit and cache-hit calls must NOT satisfy it
 # ---------------------------------------------------------------------------

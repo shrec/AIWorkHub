@@ -75,7 +75,47 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
         "entity_type TEXT NOT NULL,entity_id INTEGER NOT NULL,status TEXT NOT NULL,"
         "superseded_by INTEGER,updated_at TEXT NOT NULL,PRIMARY KEY(entity_type,entity_id));"
     )
+    if db_id == "memory":
+        _normalize_memory_schema(con)
     return con
+
+
+def _normalize_memory_schema(con: sqlite3.Connection) -> None:
+    """Remove the legacy UNIQUE(key) constraint without losing memories.
+
+    Supersede/archive semantics retain historical rows with the same logical
+    key.  Early databases declared ``key UNIQUE``; after an archived row was
+    imported, ``remember`` therefore raised an opaque IntegrityError.  Rebuild
+    only when an exact unique-key index is observed, preserve ids, and rebuild
+    the contentless FTS mirror deterministically.
+    """
+    unique_key_index = False
+    for row in con.execute("PRAGMA index_list(memories)"):
+        # seq, name, unique, origin, partial
+        if not bool(row[2]):
+            continue
+        index_name = str(row[1]).replace('"', '""')
+        columns = [
+            str(info[2])
+            for info in con.execute(f'PRAGMA index_info("{index_name}")')
+        ]
+        if columns == ["key"]:
+            unique_key_index = True
+            break
+    if not unique_key_index:
+        return
+    con.executescript(
+        "DROP TABLE IF EXISTS memories_fts;"
+        "ALTER TABLE memories RENAME TO memories_legacy_unique;"
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
+        "INSERT INTO memories(id,key,value,tags,scope) "
+        "SELECT id,key,value,tags,scope FROM memories_legacy_unique;"
+        "DROP TABLE memories_legacy_unique;"
+        "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
+        "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+        "SELECT id,key,value,tags,scope FROM memories;"
+    )
+    con.commit()
 
 
 def _begin(con: sqlite3.Connection, *, idempotency_key: str) -> sqlite3.Row | None:

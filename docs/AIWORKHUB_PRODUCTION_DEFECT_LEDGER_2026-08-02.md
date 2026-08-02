@@ -1,6 +1,6 @@
 # AIWorkHub production defect ledger — 2026-08-02
 
-Status: confirmed from live GeoAI orchestration, ready for implementation.
+Status: implementation complete locally; cross-platform release CI pending.
 
 This ledger records defects observed while AIWorkHub coordinated the B1439
 five-shard Georgian representation annotation wave. It is an implementation
@@ -141,6 +141,52 @@ Required implementation:
 - make `remember` idempotent under its idempotency key;
 - return structured, redacted constraint and recovery diagnostics;
 - add repository/session/task/provider binding tests and duplicate-key tests.
+
+## Local closure evidence — 2026-08-02
+
+All nine observed defects now have concrete implementation coverage:
+
+1. `reject_review(..., to="pending")` pins the exact terminal generation,
+   workspace identity, changed-path hashes and residual contract before any
+   cleanup can make it eligible for deletion.
+2. Rework cards carry typed `{path, pointer}` residual identities. Acceptance
+   verifies a masked non-residual hash and rejects any undeclared change.
+3. Successor workspaces materialize the hash-pinned predecessor candidate
+   before capturing their baseline; rejected bytes are never promoted to the
+   canonical repository merely to make rework possible.
+4. Task creation and launch preflight both reject forbidden-path conflicts
+   against declared reads, immutable inputs, outputs and literal validation or
+   objective path references.
+5. `read_first` and `immutable_inputs` are prioritized in the worker Source
+   Graph allowlist. Exact `file` queries that have no indexed semantic entity
+   receive a bounded, hashed `declared_input_unindexed` receipt from the
+   isolated workspace. Traversal, absolute paths and symlink components remain
+   rejected; broad repository discovery is not enabled by the fallback.
+6. Process collection returns bounded card/event projections, hashes, capped
+   path lists, a shared stdout/stderr byte budget, explicit truncation fields
+   and a detail cursor. Stable lifecycle fields remain backwards compatible.
+7. Review disposition queues a coalesced daemon GC sweep instead of scanning
+   every retained worktree synchronously in the transition.
+8. Truthful terminal substatus remains authoritative for
+   `validation_failed`; coordinator rework disposition now preserves its
+   evidence and pinned baseline while using the same bounded asynchronous GC
+   path.
+9. Legacy AI Memory stores with `UNIQUE(key)` are normalized transactionally
+   so archived/superseded history can coexist with a current value. Remaining
+   SQLite integrity failures return a redacted constraint and recovery action
+   instead of an opaque exception.
+
+Local verification:
+
+- focused regression set: `179 passed`;
+- full repository suite: `1667 passed, 22 skipped`;
+- Ruff on every changed Python source/test: passed;
+- Python bytecode compilation: passed;
+- `git diff --check`: passed.
+
+The skipped tests retain their existing platform/environment guards. The
+ledger is release-closed only after the unchanged Windows/macOS/Linux CI matrix
+passes the release commit.
 
 ## Reproduction summary
 

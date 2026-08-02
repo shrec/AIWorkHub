@@ -112,6 +112,39 @@ def test_memory_write_supports_update_supersede_and_archive(tmp_path: Path) -> N
     assert archived["status"] == "archived"
 
 
+def test_memory_write_migrates_legacy_unique_key_before_reactivation(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    db = storage_registry.resolve_database_path(
+        storage_registry.load_storage_registry(repo), "memory"
+    )
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(
+            "DROP TABLE memories_fts; DROP TABLE memories;"
+            "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT UNIQUE,value TEXT,tags TEXT,scope TEXT);"
+            "INSERT INTO memories(key,value,tags,scope) VALUES('legacy.key','old','','project');"
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
+            "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+            "SELECT id,key,value,tags,scope FROM memories;"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    archived = context_writes.memory_write(
+        repo, actor=_actor(), action="archive", key="legacy.key",
+        idempotency_key="memory:legacy:archive:0001", provenance="migration test",
+    )
+    remembered = context_writes.memory_write(
+        repo, actor=_actor(), action="remember", key="legacy.key", value="new",
+        idempotency_key="memory:legacy:remember:0002", provenance="migration test",
+    )
+
+    assert archived["status"] == "archived"
+    assert remembered["status"] == "active"
+    assert remembered["memory_id"] != archived["memory_id"]
+
+
 def test_kb_write_upserts_supersedes_and_never_hard_deletes(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     base = dict(actor=_actor(), provenance="docs/adr/0001.md", category="architecture", tags="routing", source_refs="ADR-1")

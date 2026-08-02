@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -91,6 +92,105 @@ def test_workspace_is_detached_and_seeded_parent_changes_are_not_worker_changes(
             worker_workspace.enforce_scope(workspace)
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "predecessor",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        candidate.write_text("reviewed candidate\n", encoding="utf-8")
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        successor = worker_workspace.create_workspace(
+            repo,
+            "successor",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "predecessor",
+                    "workspace": predecessor.as_metadata(),
+                    "changed_path_hashes": {"out/result.txt": candidate_hash},
+                },
+            },
+            "validation",
+        )
+        successor_output = successor.path / "out" / "result.txt"
+        assert successor_output.read_text(encoding="utf-8") == "reviewed candidate\n"
+        assert successor.workspace_baseline["out/result.txt"].endswith(candidate_hash)
+        assert worker_workspace.enforce_scope(successor) == []
+
+        successor_output.write_text("reworked candidate\n", encoding="utf-8")
+        assert worker_workspace.enforce_scope(successor) == ["out/result.txt"]
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_residual_contract_allows_only_declared_json_pointer_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "json-predecessor",
+        {"allowed_writes": ["out/result.json"]},
+        "validation",
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.json"
+        candidate.write_text(
+            json.dumps({"rows": [{"id": 1, "value": "keep"}, {"id": 2, "value": "bad"}]}),
+            encoding="utf-8",
+        )
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        card = {
+            "allowed_writes": ["out/result.json"],
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "json-predecessor",
+                "workspace": predecessor.as_metadata(),
+                "changed_path_hashes": {"out/result.json": candidate_hash},
+                "residual_identities": [
+                    {"path": "out/result.json", "pointer": "/rows/1"},
+                ],
+            },
+        }
+        successor = worker_workspace.create_workspace(
+            repo, "json-successor", card, "validation"
+        )
+        manifest = worker_workspace.build_residual_contract_manifest(successor, card)
+        output = successor.path / "out" / "result.json"
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        payload["rows"][1]["value"] = "fixed"
+        output.write_text(json.dumps(payload), encoding="utf-8")
+        assert worker_workspace.validate_residual_contract(successor, manifest)[0]["pass"]
+
+        payload["rows"][0]["value"] = "unexpected"
+        output.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="residual_contract_non_residual_changed",
+        ):
+            worker_workspace.validate_residual_contract(successor, manifest)
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
 def test_claude_workspace_preseeds_exact_project_trust_without_parent_config(
