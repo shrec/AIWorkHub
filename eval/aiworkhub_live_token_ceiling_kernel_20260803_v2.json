@@ -1,0 +1,55 @@
+{
+  "schema_id": "aiworkhub.token_budget.supervisor_evidence.v1",
+  "task_id": "CODEX_GPT55_AIWORKHUB_LIVE_TOKEN_CEILING_KERNEL_20260803_V2",
+  "subject": "provider-neutral live token ceiling kernel candidate",
+  "changed_paths": [
+    "src/aiworkhub/token_budget.py",
+    "tests/test_token_budget.py",
+    "eval/aiworkhub_live_token_ceiling_kernel_20260803_v2.json"
+  ],
+  "claims": {
+    "provider_neutral": true,
+    "token_only_enforcement": true,
+    "dollar_enforcement": false,
+    "telemetry_authorities": [
+      "enforced_live",
+      "posthoc_only",
+      "telemetry_unavailable"
+    ],
+    "report_id_single_use": true,
+    "cumulative_delta_double_count_guard": true,
+    "mixed_cumulative_delta_cumulative_guard": true,
+    "invalid_sample_metadata_fails_closed": true,
+    "live_only_cap_enforcement": true,
+    "unavailable_telemetry_fabricates_tokens_or_dollars": false
+  },
+  "validation": [
+    "python3 -m pytest -q tests/test_token_budget.py",
+    "python3 -m ruff check src/aiworkhub/token_budget.py tests/test_token_budget.py"
+  ],
+  "worker_observed_validation": [
+    {
+      "command": "python3 -m pytest -q tests/test_token_budget.py",
+      "status": "blocked",
+      "reason": "No module named pytest"
+    },
+    {
+      "command": "python3 -m ruff check src/aiworkhub/token_budget.py tests/test_token_budget.py",
+      "status": "blocked",
+      "reason": "No module named ruff"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m py_compile src/aiworkhub/token_budget.py tests/test_token_budget.py",
+      "status": "passed"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY' ... residual semantic checks ... PY",
+      "status": "passed"
+    },
+    {
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 - <<'PY' ... tests.test_token_budget test_* functions ... PY",
+      "status": "passed",
+      "passed_functions": 9
+    }
+  ]
+}

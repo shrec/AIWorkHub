@@ -42,6 +42,37 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 6 * 1024 * 1024
 _REQUEST_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _CONTEXT_RECEIPT_PREFIX = "PROJECT_CONTEXT_RECEIPT:"
+EDITOR_MODEL_ALIASES: dict[str, tuple[str, ...]] = {
+    "deepseek-v4-pro": (
+        "deepseek-v4-pro",
+        "deepseek-v4",
+        "deepseek-chat",
+        "deepseek/deepseek-v4-pro",
+        "deepseek.deepseek-v4-pro",
+    ),
+    "deepseek-v4-flash": (
+        "deepseek-v4-flash",
+        "deepseek-reasoner",
+        "deepseek/deepseek-v4-flash",
+        "deepseek.deepseek-v4-flash",
+    ),
+    "glm-5.2": (
+        "glm-5.2",
+        "glm-5_2",
+        "z-ai/glm-5.2",
+        "zhipu/glm-5.2",
+    ),
+    "claude-sonnet-current": (
+        "claude-sonnet-current",
+        "claude-3.5-sonnet",
+        "claude-3-5-sonnet",
+        "claude-3.7-sonnet",
+        "claude-3-7-sonnet",
+        "claude-sonnet-4",
+        "claude-4-sonnet",
+        "anthropic/claude-sonnet-4",
+    ),
+}
 
 
 class BridgeError(RuntimeError):
@@ -66,6 +97,21 @@ def bridge_root() -> Path:
 def _repo_id(repo: Path) -> str:
     state = repository_state.inspect_repository(repo)
     return state.manifest.repo_id
+
+
+def resolve_editor_model_alias(model: str | None, observed_models: Iterable[str]) -> str | None:
+    """Resolve one requested model only to an editor-observed same-provider alias."""
+    if model is None:
+        return None
+    requested = str(model).strip()
+    observed = [str(value).strip() for value in observed_models if str(value).strip()]
+    if requested in observed:
+        return requested
+    aliases = EDITOR_MODEL_ALIASES.get(requested, (requested,))
+    for alias in aliases:
+        if alias in observed:
+            return alias
+    return None
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -146,11 +192,15 @@ def bridge_readiness(
     live_hosts = [
         item for item in candidates if item["age_seconds"] <= HOST_TTL_SECONDS
     ]
-    matching_hosts = [
-        item
-        for item in live_hosts
-        if model is None or model in item.get("models", [])
-    ]
+    matching_hosts = []
+    resolved_by_host: dict[int, str] = {}
+    for item in live_hosts:
+        models = item.get("models", [])
+        resolved_model = resolve_editor_model_alias(model, models)
+        if model is None or resolved_model is not None:
+            matching_hosts.append(item)
+            if resolved_model is not None:
+                resolved_by_host[id(item)] = resolved_model
     selected = (
         sorted(matching_hosts, key=lambda item: item["age_seconds"])[0]
         if matching_hosts
@@ -179,6 +229,7 @@ def bridge_readiness(
         "kind": "vscode_language_model_api",
         "repo_id": repo_id,
         "model": model,
+        "resolved_model": resolved_by_host.get(id(selected), "") if selected is not None else "",
         "launchable": selected is not None,
         "blocker_reason": blocker_reason,
         "window_id": str((selected or {}).get("window_id") or ""),

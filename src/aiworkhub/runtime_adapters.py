@@ -71,6 +71,7 @@ GLM_SUPPORTED_MODELS: tuple[str, ...] = ("glm-5.2",)
 GLM_DEFAULT_MODEL = "glm-5.2"
 GLM_SECRET_ENV_VAR = "COPILOT_PROVIDER_API_KEY"
 VSCODE_LM_ADAPTER = "vscode_lm"
+WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER = "windows_native_cli_requires_appcontainer_sandbox"
 
 # Codex normally keeps its own workspace-write sandbox.  When Task MCP already
 # places the whole worker under an outer Landlock/bubblewrap filesystem sandbox,
@@ -333,6 +334,10 @@ def _resolve_repo(repo: PathValue) -> tuple[str | None, str | None]:
     return str(resolved), None
 
 
+def _is_windows_host() -> bool:
+    return os.name == "nt"
+
+
 def _resolve_additional_readonly_dirs(
     values: Sequence[PathValue] | None,
 ) -> tuple[list[str], str | None]:
@@ -449,6 +454,12 @@ def build_runtime_command(
         return _invalid_plan(
             adapter_id,
             "vscode_lm_requires_process_launcher_bridge_context",
+            cwd=cwd,
+        )
+    if _is_windows_host() and outer_sandbox_backend != "appcontainer":
+        return _invalid_plan(
+            adapter_id,
+            WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER,
             cwd=cwd,
         )
     if adapter_id == "claude_cli":

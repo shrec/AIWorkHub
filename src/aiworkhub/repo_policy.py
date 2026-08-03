@@ -260,6 +260,10 @@ _VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
 )
 
 
+def _is_windows_host() -> bool:
+    return os.name == "nt"
+
+
 def _provider_status(
     repo_root: Path,
     adapter_id: str,
@@ -268,6 +272,9 @@ def _provider_status(
     sandbox_error: str,
 ) -> dict[str, Any]:
     resolution = runtime_adapters.resolve_executable(adapter_id)
+    native_windows_cli_without_broker = (
+        _is_windows_host() and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
+    )
     result: dict[str, Any] = {
         "adapter_id": adapter_id,
         "policy_allowed": adapter_id in policy["providers"]["allowed_adapters"],
@@ -334,7 +341,12 @@ def _provider_status(
         result["sandbox_backend"] = "vscode_lm_in_process"
     else:
         result["sandbox_backend"] = sandbox_backend
-        if not sandbox_backend:
+        if native_windows_cli_without_broker:
+            result["launchable"] = False
+            result["status"] = "sandbox_unavailable"
+            result["reason"] = runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
+            result["sandbox_backend"] = ""
+        elif not sandbox_backend:
             result["launchable"] = False
             result["status"] = "sandbox_unavailable"
             result["reason"] = sandbox_error or "sandbox_unavailable"

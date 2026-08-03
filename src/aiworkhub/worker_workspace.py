@@ -1751,7 +1751,13 @@ def _bubblewrap_usable(bwrap: Path) -> bool:
     return probe.returncode == 0
 
 
+def _is_windows_host() -> bool:
+    return os.name == "nt"
+
+
 def select_sandbox_backend() -> str:
+    if _is_windows_host():
+        raise WorkspaceError("windows_appcontainer_sandbox_unavailable")
     requested = os.environ.get(SANDBOX_BACKEND_ENV, "auto").strip().lower()
     if requested not in {"auto", "bubblewrap", "landlock"}:
         raise WorkspaceError(f"invalid_sandbox_backend:{requested}")
@@ -1866,6 +1872,13 @@ def _normalize_trusted_validation_executable_argv_with_roots(
     if not argv:
         return [], ()
     head = argv[0]
+    if (
+        len(argv) >= 3
+        and Path(head).name.startswith("python")
+        and argv[1:3] == ["-m", "ruff"]
+    ):
+        executable = _resolve_trusted_validation_executable("ruff", repo)
+        return [str(executable.path), *argv[3:]], (executable.root,)
     if "/" in head or "\\" in head or Path(head).is_absolute():
         return list(argv), ()
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:

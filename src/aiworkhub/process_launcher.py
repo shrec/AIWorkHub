@@ -2285,7 +2285,10 @@ class ProcessManager:
                     "vscode_lm_unavailable:"
                     + str(readiness.get("blocker_reason") or "not_launchable")
                 )
-            return None, resolved_model
+            return (
+                None,
+                str(readiness.get("resolved_model") or "").strip() or resolved_model,
+            )
         if adapter_id == runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER:
             resolved_model, model_error = runtime_adapters.resolve_deepseek_model(model)
             if model_error:
@@ -2301,7 +2304,10 @@ class ProcessManager:
                     "deepseek_vscode_lm_unavailable:"
                     + str(readiness.get("blocker_reason") or "not_launchable")
                 )
-            return None, resolved_model
+            return (
+                None,
+                str(readiness.get("resolved_model") or "").strip() or resolved_model,
+            )
         if adapter_id == runtime_adapters.GLM_COPILOT_ADAPTER:
             resolved_model, model_error = runtime_adapters.resolve_glm_model(model)
             if model_error:
@@ -2320,14 +2326,19 @@ class ProcessManager:
                 raise LaunchRejected(f"glm_model_rejected:{model_error}")
             assert resolved_model is not None
             readiness = vscode_lm_bridge.bridge_readiness(
-                self.repo, model=resolved_model
+                self.repo,
+                model=resolved_model,
+                adapter_id=runtime_adapters.GLM_VSCODE_LM_ADAPTER,
             )
             if not readiness.get("launchable"):
                 raise LaunchRejected(
                     "glm_vscode_lm_unavailable:"
                     + str(readiness.get("blocker_reason") or "not_launchable")
                 )
-            return None, resolved_model
+            return (
+                None,
+                str(readiness.get("resolved_model") or "").strip() or resolved_model,
+            )
         else:
             return None, model
 

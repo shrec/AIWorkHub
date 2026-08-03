@@ -53,6 +53,28 @@ def test_bare_approved_ruff_resolves_to_arbitrary_repo_venv(
     ) == [str(ruff.resolve()), "check", "src"]
 
 
+def test_python_module_ruff_resolves_to_trusted_console_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "project"
+    runtime_root = repo / ".venv"
+    ruff = _executable(runtime_root / "bin" / "ruff")
+    monkeypatch.setattr(
+        worker_workspace,
+        "_trusted_validation_runtime_roots",
+        lambda repo=None: (runtime_root,),
+    )
+
+    argv, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["python3", "-m", "ruff", "check", "src"], repo
+        )
+    )
+
+    assert argv == [str(ruff.resolve()), "check", "src"]
+    assert roots == (runtime_root.resolve(strict=False),)
+
+
 def test_unrelated_home_aiworkhub_runtime_is_not_selected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
