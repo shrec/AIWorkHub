@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.50";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.51";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2233,12 +2233,20 @@ function vscodeLmModelFields(model) {
 function isCallableVscodeLmProvider(model) {
   // `copilotcli` contributes internal agent/picker entries to model
   // discovery, but those entries return empty streams when invoked through
-  // the public VS Code Language Model API. The public Copilot provider uses
-  // vendor=`copilot`; custom endpoints such as GLM use their own vendor.
+  // the public VS Code Language Model API. Copilot also contributes
+  // `copilot-utility*` picker entries whose display name mirrors the selected
+  // model but whose request metadata has no tokenizer. Calling one through
+  // sendRequest fails with `Unknown tokenizer: undefined`. The public
+  // Copilot provider uses vendor=`copilot` with a concrete model id/family;
+  // custom endpoints such as GLM use their own vendor.
+  const id = normalizedVscodeLmModelName(model && model.id);
+  const family = normalizedVscodeLmModelName(model && model.family);
   return Boolean(
     model &&
     typeof model === "object" &&
-    normalizedVscodeLmModelName(model.vendor) !== "copilotcli"
+    normalizedVscodeLmModelName(model.vendor) !== "copilotcli" &&
+    !id.startsWith("copilot-utility") &&
+    !family.startsWith("copilot-utility")
   );
 }
 
@@ -2265,15 +2273,39 @@ function isVscodeLanguageModel(model, requestedModel) {
   );
 }
 
+function vscodeLmModelSelectionRank(model, requestedModel) {
+  const requestedCanonical = canonicalVscodeLmModelName(requestedModel);
+  if (!requestedCanonical) return Number.MAX_SAFE_INTEGER;
+  const requested = normalizedVscodeLmModelName(requestedCanonical);
+  // Stable provider identities outrank mutable display names. This prevents
+  // an internal picker named after the requested model from beating the real
+  // model entry merely because its id sorts first alphabetically.
+  const fields = [
+    [model && model.id, 0],
+    [model && model.family, 10],
+    [model && model.name, 20],
+    [model && model.version, 30],
+    [model && model.vendor, 40],
+  ];
+  let best = Number.MAX_SAFE_INTEGER;
+  for (const [value, base] of fields) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    if (normalizedVscodeLmModelName(value) === requested) best = Math.min(best, base);
+    else if (canonicalVscodeLmModelName(value) === requestedCanonical) best = Math.min(best, base + 1);
+  }
+  return best;
+}
+
 function selectVscodeLanguageModel(models, requestedModel) {
   const requestedCanonical = canonicalVscodeLmModelName(requestedModel);
   if (!requestedCanonical) return null;
-  const requested = normalizedVscodeLmModelName(requestedCanonical);
-  const matches = (Array.isArray(models) ? models : []).filter((model) => isVscodeLanguageModel(model, requested));
+  const matches = (Array.isArray(models) ? models : []).filter(
+    (model) => isCallableVscodeLmProvider(model) && isVscodeLanguageModel(model, requestedCanonical),
+  );
   return matches.sort((left, right) => {
-    const leftExact = vscodeLmModelFields(left).some((value) => normalizedVscodeLmModelName(value) === requested) ? 0 : 1;
-    const rightExact = vscodeLmModelFields(right).some((value) => normalizedVscodeLmModelName(value) === requested) ? 0 : 1;
-    return leftExact - rightExact || String(left.id || "").localeCompare(String(right.id || ""));
+    const leftRank = vscodeLmModelSelectionRank(left, requestedCanonical);
+    const rightRank = vscodeLmModelSelectionRank(right, requestedCanonical);
+    return leftRank - rightRank || String(left.id || "").localeCompare(String(right.id || ""));
   })[0] || null;
 }
 
@@ -6929,6 +6961,7 @@ module.exports = {
     isGlm52LanguageModel,
     selectGlm52LanguageModel,
     isVscodeLanguageModel,
+    vscodeLmModelSelectionRank,
     selectVscodeLanguageModel,
     vscodeLmAccessState,
     vscodeLmPermissionStorageKey,

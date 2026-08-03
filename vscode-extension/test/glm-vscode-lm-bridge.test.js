@@ -36,12 +36,23 @@ const internalClaude = { id: "claude-haiku-4.5", family: "claude-haiku-4.5", nam
 const publicClaude = { id: "auto", family: "claude-sonnet-4.6", name: "Auto", vendor: "copilot", version: "claude-sonnet-4.6", capabilities: { toolCalling: false } };
 const aliasedGlm = { id: "custom-auto", family: "glm52", name: "GLM 5.2", vendor: "customendpoint", version: "latest", capabilities: { toolCalling: true } };
 const aliasedDeepseek = { id: "auto", family: "deepseek-v4pro", name: "DeepSeek V4 Pro", vendor: "copilot", version: "latest", capabilities: { toolCalling: true } };
+const internalDeepseekUtility = { id: "copilot-utility", family: "copilot-utility", name: "DeepSeek V4 Flash", vendor: "copilot", version: "v4", capabilities: { toolCalling: false } };
+const publicDeepseekFlash = { id: "deepseek-v4-flash", family: "deepseek", name: "DeepSeek V4 Flash", vendor: "deepseek", version: "v4", capabilities: { toolCalling: false } };
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated, exact]), exact);
 assert.strictEqual(internals.selectGlm52LanguageModel([unrelated]), null);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated, deepseek], "deepseek-v4-pro"), deepseek);
 assert.strictEqual(internals.selectVscodeLanguageModel([unrelated], "deepseek-v4-pro"), null);
 assert.strictEqual(internals.selectVscodeLanguageModel([aliasedGlm], "glm-5.2"), aliasedGlm);
 assert.strictEqual(internals.selectVscodeLanguageModel([aliasedDeepseek], "deepseek-v4-pro"), aliasedDeepseek);
+assert.strictEqual(internals.isCallableVscodeLmProvider(internalDeepseekUtility), false);
+assert.strictEqual(
+  internals.selectVscodeLanguageModel([internalDeepseekUtility, publicDeepseekFlash], "deepseek-v4-flash"),
+  publicDeepseekFlash,
+);
+assert.ok(
+  internals.vscodeLmModelSelectionRank(publicDeepseekFlash, "deepseek-v4-flash") <
+    internals.vscodeLmModelSelectionRank(internalDeepseekUtility, "deepseek-v4-flash"),
+);
 assert.strictEqual(internals.isCallableVscodeLmProvider(internalClaude), false);
 assert.strictEqual(internals.isCallableVscodeLmProvider(publicClaude), true);
 assert.strictEqual(internals.isCallableVscodeLmProvider(null), false);

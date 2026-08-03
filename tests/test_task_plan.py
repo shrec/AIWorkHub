@@ -153,6 +153,17 @@ def test_snapshot_blocked_count_includes_lifecycle_and_names_dag_subset():
     assert snap["dependency_blocked_task_ids"] == ["dependency"]
     assert snap["lifecycle_blocked_count"] == 1
     assert snap["lifecycle_blocked_task_ids"] == ["lifecycle"]
+    assert snap["active_count"] == 2
+
+
+def test_snapshot_terminal_blocked_task_is_not_active_or_a_critical_path():
+    snap = task_plan.build_snapshot([
+        _card("terminal", status="blocked", worker_status="worker_failed"),
+    ])
+
+    assert snap["active_count"] == 0
+    assert snap["critical_path"] == []
+    assert snap["critical_path_length"] == 0
 
 
 def test_snapshot_legacy_cycle_is_visible_and_has_no_fabricated_critical_path():

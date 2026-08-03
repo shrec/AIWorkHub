@@ -22,6 +22,7 @@ _GLOB_CHARS = frozenset("*?[")
 
 FINISHED_STATES = frozenset({"finished"})
 RETAINED_STATES = frozenset({"processing", "review"})
+ACTIVE_STATES = frozenset({"pending", "processing", "review"})
 _MAX_DEPENDS_ON = 64
 
 
@@ -283,7 +284,7 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
             longest_to[tid] = [*prefix, tid]
         active_candidates = [
             path for tid, path in longest_to.items()
-            if lifecycle.get(tid) != "finished"
+            if lifecycle.get(tid) in ACTIVE_STATES
         ]
         if active_candidates:
             critical_path = max(active_candidates, key=lambda value: (len(value), value))
@@ -325,7 +326,7 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "write_scope_overlaps": write_scope_overlaps,
         "ready": ready,
         "ready_capacity": len(ready),
-        "active_count": sum(1 for value in lifecycle.values() if value != "finished"),
+        "active_count": sum(1 for value in lifecycle.values() if value in ACTIVE_STATES),
         # Backward-compatible total: callers that historically consumed
         # ``blocked_count`` now see every blocked task, not only DAG edges.
         "blocked_count": len(blocked_task_ids),

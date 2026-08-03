@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.51] - 2026-08-03
+
+### Fixed
+
+- Excluded VS Code's internal `copilot-utility*` picker entries from worker
+  model selection and ranked concrete model IDs ahead of mutable display
+  names, preventing `Unknown tokenizer: undefined` failures for DeepSeek V4
+  Flash when its real editor model is available.
+- Counted only pending, processing and review tasks as active in Plan-DAG
+  telemetry; terminal blocked tasks no longer consume active capacity or
+  appear as the current critical path.
+
 ## [0.8.50] - 2026-08-03
 
 ### Added
