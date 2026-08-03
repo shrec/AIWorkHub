@@ -9,6 +9,7 @@ spool is runtime-only and contains no provider credential.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -278,6 +279,7 @@ def create_request(
     model: str,
     allowed_writes: Iterable[str],
     timeout_seconds: int,
+    workspace_parent_baseline: dict[str, str | None] | None = None,
     source_graph_request: dict[str, Any] | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
@@ -299,6 +301,30 @@ def create_request(
     worker_spec_path = workspace_home / ".aiworkhub_vscode_lm_worker.json"
     request_path = bridge_root() / "requests" / repo_id / f"{request_id}.json"
     allowed = [str(value) for value in allowed_writes]
+    parent_baseline = dict(workspace_parent_baseline or {})
+    path_contracts: dict[str, dict[str, Any]] = {}
+    create_paths: list[str] = []
+    for relative in allowed:
+        # Only exact declared paths receive a contract. Glob patterns remain
+        # valid scope declarations but are never expanded by the bridge.
+        if any(marker in relative for marker in ("*", "?", "[")):
+            continue
+        candidate = (workspace_path / relative).resolve(strict=False)
+        try:
+            candidate.relative_to(workspace_path)
+        except ValueError:
+            continue
+        parent_missing = relative in parent_baseline and parent_baseline[relative] is None
+        if parent_missing:
+            create_paths.append(relative)
+        current_sha256 = ""
+        if candidate.is_file() and not candidate.is_symlink():
+            current_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        path_contracts[relative] = {
+            "action": "create" if parent_missing else "edit",
+            "current_sha256": current_sha256,
+            "parent_existed": not parent_missing,
+        }
     deadline = datetime.now(timezone.utc) + timedelta(seconds=int(timeout_seconds))
     initial_source_graph_request: dict[str, Any] | None = None
     if source_graph_request:
@@ -326,6 +352,7 @@ def create_request(
         "model": model,
         "prompt": prompt,
         "allowed_writes": allowed,
+        "path_contracts": path_contracts,
         "initial_source_graph_request": initial_source_graph_request,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deadline": deadline.isoformat(),
@@ -364,6 +391,7 @@ def create_request(
         "workspace_path": str(workspace_path),
         "response_path": str(response_path),
         "allowed_writes": allowed,
+        "create_paths": sorted(create_paths),
         "timeout_seconds": int(timeout_seconds),
         "project_context_receipt": context_receipt,
     }

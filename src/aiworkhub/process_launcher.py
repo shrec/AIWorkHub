@@ -2938,6 +2938,7 @@ class ProcessManager:
                         prompt=prompt,
                         model=str(model or runtime_adapters.GLM_DEFAULT_MODEL),
                         allowed_writes=workspace.allowed_writes,
+                        workspace_parent_baseline=workspace.parent_baseline,
                         timeout_seconds=timeout_seconds,
                         source_graph_request=(
                             (card.get("project_context") or {}).get("source_graph")
@@ -4660,6 +4661,8 @@ class ProcessManager:
             for key in (
                 "request_id", "task_id", "runner", "topic", "adapter_id", "model",
                 "pid", "pid_start_ticks", "stdout_path", "stderr_path", "metadata_path",
+                "supervisor_status_path", "cancel_path", "sandbox_backend", "exit_code",
+                "error",
             ):
                 if event.get(key) is not None:
                     merged[key] = event[key]
@@ -4713,7 +4716,14 @@ class ProcessManager:
         events = self._request_events(request_id)
         if not events:
             return {"ok": False, "request_id": request_id, "state": "not_found"}
-        latest = events[-1]
+        # Disposal/GC events intentionally contain only a small lifecycle
+        # delta.  Treating that final row as the complete request snapshot
+        # drops the request-bound log paths, model, exit code and exact error
+        # that were recorded by the preceding terminal event.  Rehydrate the
+        # stable request identity from the full request lineage while keeping
+        # the final row authoritative for state/disposition.
+        lineage = self._event_identity(events)
+        latest = {**lineage, **events[-1]}
         if (
             latest.get("state") in ACTIVE_PROCESS_STATES | FINALIZATION_PENDING_STATES
             and latest.get("metadata_path")
@@ -4727,7 +4737,8 @@ class ProcessManager:
             ):
                 self._finalize_isolated_request(request_id)
                 events = self._request_events(request_id)
-                latest = events[-1]
+                lineage = self._event_identity(events)
+                latest = {**lineage, **events[-1]}
         with self._lock:
             live = self._live.get(request_id)
             if live is not None:

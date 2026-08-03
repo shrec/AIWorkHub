@@ -236,6 +236,13 @@ async function textProtocolChecks() {
       prompt: "bounded",
       allowedWrites: ["out/result.json"],
       allowed_writes: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          parent_existed: false,
+        },
+      },
       initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
     },
     undefined,
@@ -245,6 +252,8 @@ async function textProtocolChecks() {
   assert.strictEqual(prefetchedCalls.length, 1);
   assert.strictEqual(prefetchedCalls[0].name, "aiworkhub_manager_source_graph_query");
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
+  assert.ok(String(prefetchedOptions[0].messages[0].content).includes('"action":"create"'));
+  assert.ok(String(prefetchedOptions[0].messages[0].content).includes("e3b0c44298fc1c149"));
 
   const wrongPath = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,

@@ -164,7 +164,10 @@ def _validate_v2_counts(edits: Any, creates: Any) -> None:
 
 
 def _v2_planned_outputs(
-    workspace: Path, edit: dict[str, Any], allowed: list[str]
+    workspace: Path,
+    edit: dict[str, Any],
+    allowed: list[str],
+    create_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     edits = edit.get("edits", [])
     creates = edit.get("creates", [])
@@ -248,7 +251,13 @@ def _v2_planned_outputs(
             raise RuntimeError(f"vscode_lm_edit_response_duplicate_path:{relative}")
         seen.add(relative)
         target = _target_path(workspace, relative)
-        if target.exists() or target.is_symlink():
+        precreated_placeholder = (
+            relative in (create_paths or set())
+            and target.is_file()
+            and not target.is_symlink()
+            and target.stat().st_size == 0
+        )
+        if (target.exists() or target.is_symlink()) and not precreated_placeholder:
             raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         content = item["content"]
         if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
@@ -301,7 +310,10 @@ def run(spec_path: Path) -> dict[str, Any]:
     if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
         planned = _v1_planned_outputs(edit, allowed)
     else:
-        planned = _v2_planned_outputs(workspace, edit, allowed)
+        create_paths = {
+            str(value) for value in spec.get("create_paths") or [] if str(value)
+        }
+        planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
     # Scope-validate the complete response before the first mutation.  This
     # prevents a mixed valid/invalid model response from partially applying.
     written: list[str] = []

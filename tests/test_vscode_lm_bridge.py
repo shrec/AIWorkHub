@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -190,6 +191,54 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
     assert (workspace / "out" / "result.txt").read_text(encoding="utf-8") == "ok\n"
     if os.name != "nt":
         assert (workspace / "out" / "result.txt").stat().st_mode & 0o077 == 0
+
+
+def test_request_publishes_hash_pinned_edit_and_create_path_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "f" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "tests").mkdir(parents=True)
+    home.mkdir()
+    current = workspace / "src" / "app.py"
+    current.write_text("print('current')\n", encoding="utf-8")
+    placeholder = workspace / "tests" / "test_new.py"
+    placeholder.write_bytes(b"")
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="bounded",
+        model="glm-5.2",
+        allowed_writes=["src/app.py", "tests/test_new.py", "docs/*.md"],
+        workspace_parent_baseline={
+            "src/app.py": "file:664:prior",
+            "tests/test_new.py": None,
+        },
+        timeout_seconds=30,
+    )
+
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    contracts = published["path_contracts"]
+    assert contracts["src/app.py"] == {
+        "action": "edit",
+        "current_sha256": hashlib.sha256(current.read_bytes()).hexdigest(),
+        "parent_existed": True,
+    }
+    assert contracts["tests/test_new.py"]["action"] == "create"
+    assert contracts["tests/test_new.py"]["current_sha256"] == (
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
+    assert "docs/*.md" not in contracts
+    assert spec["create_paths"] == ["tests/test_new.py"]
 
 
 def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

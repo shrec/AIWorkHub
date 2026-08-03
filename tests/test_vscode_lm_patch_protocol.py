@@ -14,6 +14,7 @@ def _request(
     edit: dict[str, object],
     *,
     allowed: list[str] | None = None,
+    create_paths: list[str] | None = None,
 ) -> tuple[Path, Path]:
     workspace = tmp_path / "worktree"
     home = tmp_path / "home"
@@ -31,6 +32,7 @@ def _request(
                 "response_path": str(response_path),
                 "allowed_writes": allowed
                 or ["src/*.py", "docs/*.md", "out/*.txt"],
+                "create_paths": create_paths or [],
                 "timeout_seconds": 30,
             }
         ),
@@ -162,6 +164,39 @@ def test_v2_create_fails_when_target_exists(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="create_exists"):
         vscode_lm_worker.run(spec)
     assert target.read_text(encoding="utf-8") == "existing\n"
+
+
+def test_v2_create_replaces_only_declared_empty_workspace_placeholder(
+    tmp_path: Path,
+) -> None:
+    spec, workspace = _request(
+        tmp_path,
+        _v2(creates=[{"path": "docs/new.md", "content": "new\n"}]),
+        create_paths=["docs/new.md"],
+    )
+    target = workspace / "docs" / "new.md"
+    target.parent.mkdir()
+    target.write_bytes(b"")
+
+    result = vscode_lm_worker.run(spec)
+
+    assert result["changed_paths"] == ["docs/new.md"]
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+
+def test_v2_create_rejects_nonempty_declared_placeholder(tmp_path: Path) -> None:
+    spec, workspace = _request(
+        tmp_path,
+        _v2(creates=[{"path": "docs/new.md", "content": "new\n"}]),
+        create_paths=["docs/new.md"],
+    )
+    target = workspace / "docs" / "new.md"
+    target.parent.mkdir()
+    target.write_text("unexpected\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="create_exists"):
+        vscode_lm_worker.run(spec)
+    assert target.read_text(encoding="utf-8") == "unexpected\n"
 
 
 def test_v2_validates_every_output_before_first_write(tmp_path: Path) -> None:

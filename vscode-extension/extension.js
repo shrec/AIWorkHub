@@ -2547,7 +2547,7 @@ async function invokeVscodeLmPrivateTool(call, requestId = "") {
   }, VSCODE_LM_WORKER_TOOL_TIMEOUT_MS);
 }
 
-function glmAgentProtocolPrompt(prompt, allowedWrites) {
+function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
   const examplePath = Array.isArray(allowedWrites) && allowedWrites.length
     ? String(allowedWrites[0])
     : "output.json";
@@ -2558,8 +2558,10 @@ function glmAgentProtocolPrompt(prompt, allowedWrites) {
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
     `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}; legacy ${VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1} is accepted only for small complete-file writes.\n` +
     `- v2 edits must name an allowed path, current_sha256 as exact lowercase SHA-256 of current workspace bytes, and bounded exact replacements with nonempty old, nonempty new, and expected_count.\n` +
-    `- v2 creates must name an allowed path and complete UTF-8 content; creates fail when the target already exists.\n` +
+    `- v2 creates must name an allowed path and complete UTF-8 content. A path_contract action=create means the runtime owns an empty placeholder and the final response MUST use creates for that path.\n` +
+    `- For action=edit, copy current_sha256 exactly from path_contracts; do not infer or recompute it from a Source Graph response.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
+    `- path_contracts=${JSON.stringify(pathContracts || {})}\n` +
     `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<lowercase sha256>","replacements":[{"old":"exact current text","new":"replacement text","expected_count":1}]}],"creates":[]}`;
 }
 
@@ -2627,9 +2629,9 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
   return "";
 }
 
-function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false) {
+function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false, pathContracts = {}) {
   const toolNames = VSCODE_LM_PRIVATE_TOOLS.map((tool) => tool.name);
-  return `${glmAgentProtocolPrompt(prompt, allowedWrites)}\n` +
+  return `${glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts)}\n` +
     `This provider does not expose native tool calling. Use the strict JSON transport below.\n` +
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
@@ -2814,7 +2816,7 @@ async function runVscodeLmTextProtocol(
     sourceGraphAcknowledged = true;
   }
   const messages = [vscode.LanguageModelChatMessage.User(
-    glmTextToolProtocolPrompt(request.prompt, request.allowedWrites, sourceGraphAcknowledged) +
+      glmTextToolProtocolPrompt(request.prompt, request.allowedWrites, sourceGraphAcknowledged, request.path_contracts) +
       (sourceGraphAcknowledged
         ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
         : ""),
@@ -2941,7 +2943,7 @@ async function runVscodeLmAgent(
   if (!model.capabilities || !model.capabilities.toolCalling) {
     return runVscodeLmTextProtocol(model, request, cancellationToken);
   }
-  const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites))];
+  const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts))];
   let sourceGraphAcknowledged = false;
   let toolTurns = 0;
   let postSourceTurns = 0;
