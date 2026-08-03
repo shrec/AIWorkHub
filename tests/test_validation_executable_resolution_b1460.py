@@ -245,6 +245,7 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
         captured["shell"] = kwargs.get("shell")
+        captured["env"] = kwargs.get("env")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
 
     monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
@@ -254,6 +255,7 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
     assert result[0]["argv"] == [str(ruff.resolve()), "check", "src"]
     assert captured["argv"] == [str(ruff.resolve()), "check", "src"]
     assert captured["shell"] is False
+    assert captured["env"]["RUFF_CACHE_DIR"] == str(tmp_path / "scratch")
 
 
 def test_run_validations_passes_runtime_root_to_bubblewrap(

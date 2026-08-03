@@ -2563,6 +2563,14 @@ def run_validations(
             env["TMPDIR"] = scratch_env_value
             env["TMP"] = scratch_env_value
             env["TEMP"] = scratch_env_value
+            # Ruff writes its cache below the current working tree by default.
+            # Validation worktrees are intentionally read-only, so that
+            # default turns a clean lint result into a false permission
+            # failure.  Keep Ruff's disposable cache inside the same private,
+            # request-scoped writable scratch used for other validation
+            # temporaries.  Setting this for every validation command is
+            # harmless; only Ruff consumes it.
+            env["RUFF_CACHE_DIR"] = scratch_env_value
             if _is_pytest_validation_command(tokens):
                 # Validation workspaces are intentionally read-only outside
                 # the declared task outputs.  Pytest's cache provider writes
