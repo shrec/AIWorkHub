@@ -1216,6 +1216,50 @@ def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     return None
 
 
+def _provider_timeout_failure_from_output(path: Path) -> dict[str, Any] | None:
+    """Return exact structured VS Code LM timeout evidence.
+
+    The editor bridge owns its response deadline.  It may exit immediately
+    before the outer supervisor's matching deadline, leaving the supervisor
+    with the otherwise ambiguous pair ``state=exited, exit_code=1``.  Trust
+    only the bridge's machine-generated result envelope; never classify model
+    prose containing the word ``timeout`` as lifecycle evidence.
+    """
+
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        return None
+    size = int(st.st_size)
+    if size <= MAX_RECEIPT_SCAN_BYTES:
+        text = _read_byte_range(path, 0, size)
+    else:
+        half = MAX_RECEIPT_SCAN_BYTES // 2
+        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(
+            path, size - half, half
+        )
+    for raw_line in text.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if (
+            event.get("type") == "result"
+            and event.get("is_error") is True
+            and str(event.get("subtype") or "").strip().lower() == "error"
+            and str(event.get("error") or "").strip() == "vscode_lm_response_timeout"
+        ):
+            return {
+                "schema_id": "aiworkhub.provider_timeout_failure.v1",
+                "reason": "vscode_lm_response_timeout",
+            }
+    return None
+
+
 def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
     """Digest and validate one bounded provider stdout as research evidence.
 
@@ -4156,9 +4200,23 @@ class ProcessManager:
                 )
             provider_launch_failure = None
             if terminal_state == "worker_failed":
-                provider_launch_failure = _provider_auth_failure_from_output(
-                    Path(str(metadata["stdout_path"]))
+                provider_output_path = Path(str(metadata["stdout_path"]))
+                provider_timeout_failure = _provider_timeout_failure_from_output(
+                    provider_output_path
                 )
+                if provider_timeout_failure is not None:
+                    terminal_state = "timed_out"
+                    error = (
+                        "worker_timed_out:source="
+                        + str(provider_timeout_failure["reason"])
+                        + ":timeout_seconds="
+                        + str(metadata.get("timeout_seconds") or "unknown")
+                        + f":exit_code={exit_code}"
+                    )
+                else:
+                    provider_launch_failure = _provider_auth_failure_from_output(
+                        provider_output_path
+                    )
                 if provider_launch_failure is not None:
                     terminal_state = "launch_failed"
                     error = (

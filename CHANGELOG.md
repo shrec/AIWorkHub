@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.52] - 2026-08-03
+
+### Fixed
+
+- Rejected validation commands at task creation when the worker's own
+  fail-closed parser cannot execute them, returning the failing command index
+  and safe checked-in-script examples before any provider tokens are spent.
+- Classified the VS Code LM bridge's structured response-deadline event as
+  `timed_out` instead of the generic `worker_failed`, preserving truthful
+  callback, KPI and retry evidence.
+- Routed Ruff's disposable cache into each request's writable validation
+  scratch directory so read-only worker worktrees no longer produce false
+  permission failures.
+
 ## [0.8.51] - 2026-08-03
 
 ### Fixed

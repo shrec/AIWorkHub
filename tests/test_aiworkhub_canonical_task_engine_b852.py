@@ -581,6 +581,41 @@ def test_manager_create_rejects_mutating_code_task_without_validation(
     assert result["stderr"] == "code_task_validation_required"
 
 
+def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
+    writable_repo, monkeypatch
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+
+    result = core.create_task(
+        task_id="TASK_INVALID_VALIDATION_SYNTAX",
+        title="Reject impossible validation",
+        runner="claude_worker",
+        topic="coding",
+        objective="Fail before spending a provider run.",
+        acceptance=["Rejected at creation."],
+        allowed_writes=["docs/result.md"],
+        validation=[
+            "python -c \"from pathlib import Path; assert Path('docs/result.md').exists()\""
+        ],
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"].startswith(
+        "invalid_validation_command:validation_shell_syntax_forbidden:"
+    )
+    assert result["validation_index"] == 0
+    assert result["supported_validation_examples"]
+    assert task_store.get_task(writable_repo, "TASK_INVALID_VALIDATION_SYNTAX") is None
+
+
 def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monkeypatch):
     session_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
     monkeypatch.setattr(

@@ -3003,6 +3003,32 @@ def create_task(
         return _lifecycle_error(str(exc), 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
+    # Parse every validation command before persisting the card.  The worker
+    # uses this exact fail-closed parser later, so accepting syntax here that
+    # can never reach execution only burns a provider run before ending in
+    # validation_failed.  Import lazily to keep core's startup dependency
+    # surface unchanged.
+    from . import worker_workspace
+
+    for validation_index, validation_command in enumerate(validation2):
+        try:
+            worker_workspace.validation_argv(validation_command)
+        except worker_workspace.WorkspaceError as exc:
+            result = _lifecycle_error(
+                f"invalid_validation_command:{exc}",
+                2,
+            )
+            result.update({
+                "validation_index": validation_index,
+                "validation_command": validation_command[:240],
+                "supported_validation_examples": [
+                    "pytest -q tests/test_target.py",
+                    "ruff check src/target.py tests/test_target.py",
+                    "python -m pytest -q tests/test_target.py",
+                    "python scripts/validate_target.py",
+                ],
+            })
+            return result
     for item in writes2:
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:

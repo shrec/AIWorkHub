@@ -450,6 +450,63 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
+def test_vscode_lm_structured_response_timeout_is_terminal_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    card = _card()
+    card.update({
+        "status": "processing",
+        "worker_status": "in_progress",
+        "claimed_by": card["runner"],
+    })
+    manager, workspace, request_id = _persisted_request(
+        monkeypatch,
+        tmp_path,
+        repo,
+        card,
+        status={"state": "exited", "exit_code": 1},
+    )
+    stdout_path = tmp_path / "processes" / f"{request_id}.stdout.log"
+    stdout_path.write_text(
+        json.dumps({
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": "vscode_lm_response_timeout",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    releases: list[tuple[str, str, str]] = []
+
+    def release(repo_root, task_id, runner, substatus, *, evidence=None, request_id=""):
+        assert repo_root == repo
+        releases.append((task_id, runner, substatus))
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", release)
+
+    event = manager._finalize_isolated_request(request_id, supervisor_returncode=1)
+
+    assert event["state"] == "timed_out"
+    assert "source=vscode_lm_response_timeout" in event["error"]
+    assert releases == [(card["task_id"], card["runner"], "timed_out")]
+    assert workspace.path.exists()
+
+
+def test_provider_timeout_evidence_rejects_unstructured_timeout_prose(tmp_path: Path) -> None:
+    output = tmp_path / "provider.jsonl"
+    output.write_text(
+        json.dumps({"type": "assistant", "message": "vscode_lm_response_timeout"})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert process_launcher._provider_timeout_failure_from_output(output) is None
+
+
 def test_success_status_does_not_promote_after_exact_claim_ownership_is_lost(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
