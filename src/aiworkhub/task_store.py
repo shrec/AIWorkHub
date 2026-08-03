@@ -1103,6 +1103,114 @@ def mark_launch_failed(
         conn.close()
 
 
+def mark_terminal_failure(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    substatus: str,
+    evidence: Mapping[str, Any] | None = None,
+    request_id: str = "",
+) -> tuple[bool, str]:
+    """Record a post-launch failure outside the actionable review queue.
+
+    A timed-out/cancelled/crashed worker produced no reviewable candidate by
+    definition.  Preserve its exact evidence and declared gate denominator,
+    emit a truthful terminal substatus, and end in the canonical ``blocked``
+    bucket instead of fabricating ``status=review``.
+    """
+    allowed = {"timed_out", "worker_failed", "cancelled", "liveness_lost"}
+    substatus = str(substatus or "").strip()
+    if substatus not in allowed:
+        return False, f"unsupported_terminal_failure:{substatus}"
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        if canonical_status(dict(row)) != "processing":
+            return False, f"not_processing:current={canonical_status(dict(row))}"
+        if str(row["claimed_by"] or "") != runner:
+            return False, "claim_owner_mismatch"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        attached_request_id = str(card.get("launch_request_id") or "")
+        if request_id:
+            if attached_request_id != request_id:
+                return False, "launch_request_mismatch"
+        elif attached_request_id:
+            return False, "launch_request_id_required"
+
+        evidence_payload = dict(evidence or {})
+        try:
+            claim_epoch = max(0, int(card.get("claim_epoch") or 0))
+        except (TypeError, ValueError):
+            claim_epoch = 0
+        deterministic_verification = task_fsm.deterministic_verification(
+            substatus,
+            evidence_payload.get("validation"),
+            evidence_payload.get("required_outputs"),
+            claim_epoch=claim_epoch,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        terminal = {
+            "substatus": substatus,
+            "evidence": evidence_payload,
+            "deterministic_verification": deterministic_verification,
+            "recorded_at": now,
+            "runner": runner,
+            "claim_epoch": claim_epoch,
+        }
+        card.update(
+            status="blocked",
+            worker_status=substatus,
+            terminal_substatus=substatus,
+            terminal_failure=terminal,
+            deterministic_verification=deterministic_verification,
+            blocker_reason=str(evidence_payload.get("error") or substatus)[:500],
+            blocked_at=now,
+            blocked_by=runner,
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status=?, completed_at=?, "
+            "updated_at=?, card_json=? WHERE task_id=? AND status='processing' "
+            "AND claimed_by=? AND card_json=?",
+            (
+                substatus,
+                now,
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                runner,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "terminal_failure_transition_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_failure', ?, ?, ?)",
+            (task_id, runner, json.dumps(terminal, ensure_ascii=False, sort_keys=True), now),
+        )
+        conn.commit()
+        return True, "blocked"
+    finally:
+        conn.close()
+
+
 def restore_task(
     root: str | Path,
     task_id: str,

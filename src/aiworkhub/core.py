@@ -2624,8 +2624,8 @@ def manager_bootstrap() -> dict[str, Any]:
             ],
             "task_state_machine": {
                 "create": "aiworkhub_task_create creates/reconciles one canonical pending card; it does not run the model",
-                "claim": "aiworkhub_task_auto_pickup claims one dependency-ready non-colliding card",
-                "launch": "aiworkhub_agent_launch_task starts the exact claimed card; only then may runtime truth become processing",
+                "claim": "aiworkhub_task_auto_pickup is an optional explicit claim step for one dependency-ready non-colliding card",
+                "launch": "aiworkhub_agent_launch_task is always required; it atomically claims a pending card or attaches the exact prior claim, then starts the worker; only then may runtime truth become processing",
                 "worker_finish": "the worker submits evidence and stops at review_ready or another truthful terminal substatus",
                 "manager_finish": "the current verified manager independently verifies evidence, then accepts or rejects review",
             },
@@ -2649,7 +2649,8 @@ def manager_bootstrap() -> dict[str, Any]:
         "workflow": [
             "aiworkhub_manager_source_graph_query / session_current_state / ai_memory_search / kb_*",
             "aiworkhub_task_create",
-            "aiworkhub_task_auto_pickup or aiworkhub_agent_launch_task",
+            "aiworkhub_task_auto_pickup (optional exact claim)",
+            "aiworkhub_agent_launch_task (required worker start; may atomically claim pending)",
             "aiworkhub_task_mark_review",
             "provider callback receipt",
             "aiworkhub_task_mark_done or aiworkhub_task_reject_review",

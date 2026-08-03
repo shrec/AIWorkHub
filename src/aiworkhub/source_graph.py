@@ -1109,20 +1109,21 @@ def context(conn: sqlite3.Connection, file_path: str) -> dict[str, Any]:
         (file_path,),
     ).fetchone()
     entities = [
-        dict(row) for row in conn.execute(
+        {**dict(row), "file_path": file_path} for row in conn.execute(
             "SELECT kind, name, qualname, line_start, line_end, signature, evidence_label, "
             "confidence FROM entities WHERE file_path = ? ORDER BY line_start LIMIT ?",
             (file_path, MAX_BUDGET_ROWS),
         )
     ]
     edges = [
-        dict(row) for row in conn.execute(
+        {**dict(row), "file_path": file_path} for row in conn.execute(
             "SELECT kind, src_qualname, dst_name, dst_qualname, line, evidence_label, "
             "confidence FROM edges WHERE file_path = ? ORDER BY line LIMIT ?",
             (file_path, MAX_BUDGET_ROWS),
         )
     ]
     return {
+        "file_path": file_path,
         "file": dict(file_row) if file_row else None,
         "entities": entities,
         "edges": edges,

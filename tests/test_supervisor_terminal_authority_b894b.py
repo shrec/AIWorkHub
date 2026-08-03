@@ -486,22 +486,23 @@ def test_missing_grant_and_closed_ambient_gate_stalls_at_review_pending_never_pe
 # --- failure outcomes never need the grant or ambient writes ---------------
 
 
-def test_failure_outcome_reaches_review_without_ambient_writes_or_any_grant(tmp_path, monkeypatch):
-    """Acceptance: failure outcomes (not just exit-0) must reach review even
-    without ambient AIWORKHUB_ALLOW_WRITES -- and, unlike the success path,
-    without ever needing a terminal-authority grant at all, since a failed
-    run never promotes/writes worker output into the real repo."""
+def test_failure_outcome_reaches_blocked_without_ambient_writes_or_any_grant(tmp_path, monkeypatch):
+    """A no-candidate failure is terminal/blocked, never review work."""
     card = _card()
     manager = _build_manager(tmp_path, card)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
-    review_calls = []
+    failure_calls = []
 
-    def fake_mark_terminal_review(repo, task_id, runner, substatus, *, evidence=None):
-        review_calls.append((task_id, runner, substatus))
-        card.update({"status": "review", "worker_status": "review", "claimed_by": runner})
+    def fake_mark_terminal_failure(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
+        failure_calls.append((task_id, runner, substatus, request_id, evidence))
+        card.update({"status": "blocked", "worker_status": substatus, "claimed_by": runner})
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", fake_mark_terminal_review)
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_terminal_failure", fake_mark_terminal_failure
+    )
 
     request_id = "req-timeout-no-grant"
     dead_pid = 2_147_483_050
@@ -521,9 +522,12 @@ def test_failure_outcome_reaches_review_without_ambient_writes_or_any_grant(tmp_
     result = manager._finalize_isolated_request(request_id)
 
     assert result["state"] == "timed_out"
-    assert review_calls == [(card["task_id"], card["runner"], "timed_out")]
-    assert card["status"] != "pending"
-    assert card["worker_status"] != "unclaimed"
+    assert [(call[0], call[1], call[2], call[3]) for call in failure_calls] == [
+        (card["task_id"], card["runner"], "timed_out", request_id)
+    ]
+    assert failure_calls[0][4]["required_outputs"] == []
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "timed_out"
 
 
 @pytest.mark.parametrize("operation", ["archived", "superseded"])
@@ -538,11 +542,11 @@ def test_failure_outcome_preserves_already_finalized_task(
         "archive_operation": operation,
     })
     manager = _build_manager(tmp_path, card)
-    review_calls = []
+    failure_calls = []
     monkeypatch.setattr(
         process_launcher.task_engine,
-        "mark_terminal_review",
-        lambda *args, **kwargs: review_calls.append((args, kwargs)) or {"ok": True},
+        "mark_terminal_failure",
+        lambda *args, **kwargs: failure_calls.append((args, kwargs)) or {"ok": True},
     )
 
     request_id = f"req-already-{operation}"
@@ -571,7 +575,7 @@ def test_failure_outcome_preserves_already_finalized_task(
     assert result["terminal_review_disposition"] == (
         f"terminal_skipped_already_finalized:{operation}"
     )
-    assert review_calls == []
+    assert failure_calls == []
     assert card["archived_at"]
     assert card["archive_operation"] == operation
 

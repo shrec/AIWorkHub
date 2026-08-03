@@ -329,6 +329,15 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert sliced["outgoing_calls"]
     assert any(row["file_path"] == "tests/test_engine.cpp" for row in sliced["related_tests"])
     assert contextual["contexts"][0]["entities"]
+    assert contextual["contexts"][0]["file_path"] == "native/engine.cpp"
+    assert all(
+        row["file_path"] == "native/engine.cpp"
+        for row in contextual["contexts"][0]["entities"]
+    )
+    assert all(
+        row["file_path"] == "native/engine.cpp"
+        for row in contextual["contexts"][0]["edges"]
+    )
     assert contextual["insights"]["entry_symbols"]
     assert any(row["caller_symbol"].endswith("run_engine") for row in traced["incoming_calls"])
     assert {row["file_path"] for row in impacted["impacted_files"]} >= {"native/math.cpp"}

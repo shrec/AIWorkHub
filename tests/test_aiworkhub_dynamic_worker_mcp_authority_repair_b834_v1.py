@@ -352,6 +352,39 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
     assert payload["scope"] == "target"
 
 
+def test_context_target_drops_entire_mismatched_context_and_keeps_provenance() -> None:
+    payload = {
+        "mode": "context",
+        "contexts": [
+            {
+                "file_path": "src/aiworkhub/task_store.py",
+                "file": {"file_path": "src/aiworkhub/task_store.py"},
+                "entities": [
+                    {"file_path": "src/aiworkhub/task_store.py", "name": "canonical_status"}
+                ],
+                "edges": [],
+            },
+            {
+                "file_path": "tests/test_task_plan.py",
+                "file": {"file_path": "tests/test_task_plan.py"},
+                "entities": [
+                    {"file_path": "tests/test_task_plan.py", "name": "test_unrelated"}
+                ],
+                "edges": [],
+            },
+        ],
+    }
+
+    filtered = w._filter_by_scope(payload, "src/aiworkhub/task_store.py")
+
+    assert [row["file_path"] for row in filtered["contexts"]] == [
+        "src/aiworkhub/task_store.py"
+    ]
+    assert filtered["contexts"][0]["entities"][0]["file_path"] == (
+        "src/aiworkhub/task_store.py"
+    )
+
+
 def test_bodygrep_passes_target_into_bounded_engine_scan(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

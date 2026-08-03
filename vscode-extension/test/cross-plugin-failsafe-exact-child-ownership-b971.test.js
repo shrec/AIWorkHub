@@ -101,4 +101,16 @@ assert.strictEqual(client.recovery.attempts, 0);
 
 assert.strictEqual(internals.constants.MCP_MAX_RUNTIME_REPAIR_ATTEMPTS, 3);
 assert.strictEqual(internals.constants.MCP_SNAPSHOT_RECOVERY_ATTEMPTS, 3);
+assert.ok(
+  internals.constants.VSCODE_LM_WORKER_TOOL_TIMEOUT_MS > internals.constants.MCP_REQUEST_TIMEOUT_MS,
+  "editor-worker tools need a distinct bounded budget from dashboard reads",
+);
+const extensionSource = require("fs").readFileSync(extensionPath, "utf8");
+const snapshotBody = extensionSource.slice(
+  extensionSource.indexOf("async function pushSnapshotOnce"),
+  extensionSource.indexOf("async function pushSnapshotNoRetry"),
+);
+assert.ok(snapshotBody.includes("snapshotRecovery"));
+assert.ok(!snapshotBody.includes("client.recovery.category = \"snapshot\""));
+assert.ok(!snapshotBody.includes("client.recovery.open = true"));
 console.log("cross-plugin exact child ownership B971: ok");

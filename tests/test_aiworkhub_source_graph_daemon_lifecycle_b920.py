@@ -343,6 +343,25 @@ def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_da
     assert health["last_error"] == ""
 
 
+def test_daemon_health_hydrates_fresh_canonical_generation_for_standby(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "standby_reader")
+    report = source_graph.build_index(root, incremental=False)
+    assert report.files_seen > 0
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon._status = source_graph_daemon.STATUS_STANDBY
+    monkeypatch.setattr(source_graph_daemon, "get_daemon", lambda _root: daemon)
+
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["status"] == source_graph_daemon.STATUS_STANDBY
+    assert health["readable_generation"] is True
+    assert health["last_success_at"]
+    assert health["build_revision"] == report.build_revision
+    assert health["files_seen"] == report.files_seen
+
+
 def test_health_exposes_successful_build_identity_at_top_level(tmp_path, cleanup_daemons):
     root = tmp_path / "never_initialized"
     root.mkdir()

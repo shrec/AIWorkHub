@@ -174,6 +174,59 @@ def test_launch_failure_is_blocked_not_review_and_is_request_scoped(tmp_path, mo
     assert card["status"] != "review"
 
 
+def test_timed_out_worker_is_blocked_with_original_gate_denominator(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(
+        repo,
+        "TASK_TIMED_OUT",
+        status="processing",
+        worker_status="claimed",
+        claimed_by=RUNNER,
+        launch_request_id="request-timeout",
+    )
+    card = task_store.get_task(repo, "TASK_TIMED_OUT") or {}
+    card["required_outputs"] = ["out/result.json"]
+    card["validation"] = ["python3 -m pytest -q tests/test_result.py"]
+    conn = sqlite3.connect(task_store.storage_readiness(repo).canonical_db)
+    try:
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card, ensure_ascii=False, sort_keys=True), "TASK_TIMED_OUT"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    evidence = {
+        "error": "worker exceeded deadline",
+        **process_launcher._declared_failure_denominators(card),
+    }
+    result = task_engine.mark_terminal_failure(
+        repo,
+        "TASK_TIMED_OUT",
+        RUNNER,
+        "timed_out",
+        evidence=evidence,
+        request_id="request-timeout",
+    )
+    assert result["ok"] is True, result
+    failed = task_store.get_task(repo, "TASK_TIMED_OUT") or {}
+    assert failed["status"] == "blocked"
+    assert failed["worker_status"] == "timed_out"
+    assert failed["terminal_substatus"] == "timed_out"
+    verdict = failed["deterministic_verification"]["evidence_verdict"]
+    assert verdict["validation_count"] == 1
+    assert verdict["failed_validation_count"] == 1
+    assert verdict["required_output_count"] == 1
+    assert verdict["missing_required_output_count"] == 1
+    assert failed["terminal_failure"]["evidence"]["validation"][0]["not_run"] is True
+    assert failed["terminal_failure"]["evidence"]["required_outputs"][0]["missing"] is True
+
+    review = core.review_queue()
+    assert review["ok"] is True
+    assert "TASK_TIMED_OUT" not in review["stdout"]
+
+
 def test_plan_counts_unattached_processing_as_operational_blocker():
     snapshot = task_plan.build_snapshot(
         [
@@ -197,6 +250,66 @@ def test_plan_counts_unattached_processing_as_operational_blocker():
     }
     assert snapshot["blocked_task_ids"] == ["TASK_ORPHAN"]
     assert snapshot["blocked_count"] == 1
+
+
+def test_plan_surfaces_pending_preclaim_launch_blocker():
+    snapshot = task_plan.build_snapshot(
+        [
+            {
+                "task_id": "TASK_PRECLAIM_BLOCKED",
+                "runner": RUNNER,
+                "topic": TOPIC,
+                "status": "pending",
+                "worker_status": "unclaimed",
+                "allowed_writes": [],
+                "depends_on": [],
+                "created_at": NOW,
+                "operational_blocker": {
+                    "kind": "launch_blocked",
+                    "adapter_id": "vscode_lm",
+                    "reason": "model consent required",
+                },
+            }
+        ]
+    )
+
+    assert snapshot["ready"] == []
+    assert snapshot["operational_blockers"] == {
+        "TASK_PRECLAIM_BLOCKED": "model consent required"
+    }
+    assert snapshot["operational_blocked_count"] == 1
+    assert snapshot["blocked_task_ids"] == ["TASK_PRECLAIM_BLOCKED"]
+
+
+def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(repo, "TASK_RETRYABLE_BLOCKER")
+
+    recorded = task_engine.record_launch_blocker(
+        repo,
+        "TASK_RETRYABLE_BLOCKER",
+        RUNNER,
+        TOPIC,
+        adapter_id="vscode_lm",
+        reason="model consent required",
+    )
+    assert recorded["ok"] is True, recorded
+    blocked_card = task_store.get_task(repo, "TASK_RETRYABLE_BLOCKER") or {}
+    assert blocked_card["status"] == "pending"
+    assert blocked_card["worker_status"] == "unclaimed"
+    assert blocked_card["operational_blocker"]["reason"] == "model consent required"
+
+    claimed = task_engine.claim_start_exact(
+        repo,
+        "TASK_RETRYABLE_BLOCKER",
+        RUNNER,
+        TOPIC,
+        request_id="request-retry",
+    )
+    assert claimed["ok"] is True, claimed
+    retried_card = task_store.get_task(repo, "TASK_RETRYABLE_BLOCKER") or {}
+    assert retried_card["status"] == "processing"
+    assert "operational_blocker" not in retried_card
 
 
 def test_readonly_scope_is_valid_but_required_output_without_scope_is_not(tmp_path):

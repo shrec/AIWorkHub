@@ -464,12 +464,14 @@ def test_supervisor_unresponsive_beyond_grace_is_finalized_as_lost_and_kills_exa
     try:
         manager = _build_manager(tmp_path, card)
         release_calls = []
-        def fake_terminal_review(repo, task_id, runner, substatus, *, evidence=None):
+        def fake_terminal_failure(
+            repo, task_id, runner, substatus, *, evidence=None, request_id=""
+        ):
             release_calls.append((task_id, runner, substatus))
-            card.update({"status": "review", "worker_status": "review", "claimed_by": runner})
+            card.update({"status": "blocked", "worker_status": substatus, "claimed_by": runner})
             return {"ok": True}
         monkeypatch.setattr(
-            process_launcher.task_engine, "mark_terminal_review", fake_terminal_review,
+            process_launcher.task_engine, "mark_terminal_failure", fake_terminal_failure,
         )
         now = time.time()
         stale_heartbeat = now - (
@@ -549,12 +551,14 @@ def test_supervisor_crash_with_surviving_child_is_terminated_and_never_left_pend
     try:
         manager = _build_manager(tmp_path, card)
         release_calls = []
-        def fake_terminal_review(repo, task_id, runner, substatus, *, evidence=None):
+        def fake_terminal_failure(
+            repo, task_id, runner, substatus, *, evidence=None, request_id=""
+        ):
             release_calls.append((task_id, runner, substatus))
-            card.update({"status": "review", "worker_status": "review", "claimed_by": runner})
+            card.update({"status": "blocked", "worker_status": substatus, "claimed_by": runner})
             return {"ok": True}
         monkeypatch.setattr(
-            process_launcher.task_engine, "mark_terminal_review", fake_terminal_review,
+            process_launcher.task_engine, "mark_terminal_failure", fake_terminal_failure,
         )
         dead_pid = 2_147_483_000  # far beyond any realistic live PID in this sandbox
         _seed_request(
@@ -671,19 +675,21 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
         ("spawn_failed", "worker_failed"),
     ],
 )
-def test_non_exited_terminal_states_route_to_review_never_pending_and_enqueue_one_release(
+def test_non_exited_terminal_states_route_to_blocked_never_pending_and_enqueue_one_release(
     tmp_path, monkeypatch, supervisor_state, expected_terminal,
 ):
     card = _card()
     manager = _build_manager(tmp_path, card)
     release_calls = []
 
-    def fake_release(repo, task_id, runner, substatus, *, evidence=None):
+    def fake_release(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
         release_calls.append((task_id, runner, substatus))
-        card.update({"status": "review", "worker_status": "review", "claimed_by": runner})
+        card.update({"status": "blocked", "worker_status": substatus, "claimed_by": runner})
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", fake_release)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", fake_release)
     dead_pid = 2_147_483_010
     _seed_request(
         manager, tmp_path, card,
@@ -703,8 +709,8 @@ def test_non_exited_terminal_states_route_to_review_never_pending_and_enqueue_on
     assert result["state"] == expected_terminal
     assert len(release_calls) == 1
     assert release_calls[0][2] != "pending"
-    assert card["status"] != "pending"
-    assert card["worker_status"] != "unclaimed"
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == expected_terminal
 
     # A duplicate scan must be a pure no-op: already terminal, nothing re-runs.
     again = manager._finalize_isolated_request(f"req-{supervisor_state}")

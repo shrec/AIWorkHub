@@ -1055,3 +1055,46 @@ def test_validation_cd_prefix_changes_child_cwd_under_landlock(
         assert result["stdout_tail"].strip() == str((workspace.path / "read").resolve())
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_validation_batch_retains_each_failed_command_and_bounded_streams(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    workspace = _workspace(monkeypatch, tmp_path, repo, "validation-evidence")
+    scratch = tmp_path / "validation-scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    monkeypatch.setattr(
+        worker_workspace, "provision_validation_exec_scratch", lambda _workspace: scratch
+    )
+    monkeypatch.setattr(worker_workspace, "cleanup_validation_exec_scratch", lambda _path: None)
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda _workspace, _adapter, argv, **_kwargs: list(argv),
+    )
+    monkeypatch.setattr(worker_workspace, "sanitized_env", lambda *_args, **_kwargs: {})
+    outputs = iter(
+        [
+            subprocess.CompletedProcess([], 1, "A" * 9_000, "first-error"),
+            subprocess.CompletedProcess([], 2, "second-out", "B" * 9_000),
+        ]
+    )
+    monkeypatch.setattr(worker_workspace.subprocess, "run", lambda *_args, **_kwargs: next(outputs))
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        worker_workspace.run_validations(
+            workspace,
+            ["python3 -c 'raise SystemExit(1)'", "python3 -c 'raise SystemExit(2)'"],
+        )
+
+    rows = caught.value.results
+    assert [row["returncode"] for row in rows] == [1, 2]
+    assert [row["command"] for row in rows] == [
+        "python3 -c 'raise SystemExit(1)'",
+        "python3 -c 'raise SystemExit(2)'",
+    ]
+    assert rows[0]["stdout_truncated"] is True
+    assert len(rows[0]["stdout_head"]) == 4_096
+    assert len(rows[0]["stdout_tail"]) == 4_096
+    assert rows[1]["stderr_truncated"] is True

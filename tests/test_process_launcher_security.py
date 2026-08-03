@@ -200,8 +200,23 @@ def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]
         })
         return {"ok": True}
 
+    def failure(
+        repo_root, task_id: str, runner: str, substatus: str, *, evidence=None,
+        request_id: str = "",
+    ) -> dict:
+        calls.append(("failure", task_id, runner, substatus, request_id))
+        assert card["claimed_by"] == runner
+        card.update({
+            "status": "blocked",
+            "worker_status": substatus,
+            "terminal_worker": runner,
+            "terminal_outcome": substatus,
+        })
+        return {"ok": True}
+
     monkeypatch.setattr(process_launcher.task_engine, "claim_start_exact", claim)
     monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", review)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", failure)
     return calls
 
 
@@ -308,8 +323,9 @@ def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     assert cancel["state"] == "cancel_requested"
     result = _wait_terminal(restarted, launched["request_id"])
     assert result["state"] == "cancelled"
-    assert card["status"] == "review"
-    assert [call[0] for call in calls] == ["claim", "review"]
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "cancelled"
+    assert [call[0] for call in calls] == ["claim", "failure"]
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
@@ -394,20 +410,23 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     release_enabled = False
     release_calls: list[tuple[str, str, str]] = []
 
-    def release(repo_root, task_id: str, runner: str, substatus: str, *, evidence=None) -> dict:
+    def release(
+        repo_root, task_id: str, runner: str, substatus: str, *, evidence=None,
+        request_id: str = "",
+    ) -> dict:
         nonlocal release_enabled
         assert repo_root == repo
         release_calls.append((task_id, runner, substatus))
         if not release_enabled:
             return {"ok": False, "stderr": "write gate temporarily unavailable"}
         card.update({
-            "status": "review",
-            "worker_status": "review",
+            "status": "blocked",
+            "worker_status": substatus,
             "claimed_by": runner,
         })
         return {"ok": True}
 
-    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_review", release)
+    monkeypatch.setattr(process_launcher.task_engine, "mark_terminal_failure", release)
     restarted = process_launcher.ProcessManager(
         repo=repo,
         process_log_path=tmp_path / "events.jsonl",
@@ -425,9 +444,8 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     assert result["state"] == "worker_failed"
     assert len(release_calls) == 2
     assert all(call[:2] == (card["task_id"], card["runner"]) for call in release_calls)
-    # Coordinator-review-first retains failed-worker evidence until Codex's
-    # explicit accept/reject decision; release no longer silently requeues to
-    # pending and destroys the candidate worktree.
+    # Terminal-failure evidence is retained for diagnosis without inflating
+    # the actionable review queue.
     assert workspace.path.exists()
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 

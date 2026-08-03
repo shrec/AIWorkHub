@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.48";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.49";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -298,6 +298,10 @@ const REAL_REPO_ID_RE = /^repo_[a-f0-9]{32}$/;
 // ── One bounded repo-local Task MCP stdio child + one JSON-RPC session ─────
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const MCP_REQUEST_TIMEOUT_MS = 20000;
+// Worker-side Source Graph/context calls can legitimately take longer than a
+// lightweight dashboard read.  Keep the budget bounded, but do not force the
+// editor model through the dashboard's 20 second latency envelope.
+const VSCODE_LM_WORKER_TOOL_TIMEOUT_MS = 90000;
 const MCP_MAX_PENDING_REQUESTS = 16;
 const MCP_MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MCP_MAX_STDERR_LOG_BYTES = 4096;
@@ -2050,12 +2054,12 @@ class McpStdioClient {
     this.child.stdin.write(payload, () => {});
   }
 
-  async callTool(name, args) {
+  async callTool(name, args, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
     const startedAt = Date.now();
     try {
       await this.ensureStarted();
       const result = extractToolResult(
-        await this.request("tools/call", { name, arguments: args || {} }),
+        await this.request("tools/call", { name, arguments: args || {} }, timeoutMs),
       );
       const status = result && result.ok === false
         ? `failed error=${sanitizeErrorMessage(result.message || result.error || "tool_reported_failure")}`
@@ -2506,7 +2510,7 @@ async function invokeVscodeLmPrivateTool(call, requestId = "") {
     request_id: requestId,
     tool_name: permitted.name,
     tool_input: call.input || {},
-  });
+  }, VSCODE_LM_WORKER_TOOL_TIMEOUT_MS);
 }
 
 function glmAgentProtocolPrompt(prompt, allowedWrites) {
@@ -2992,7 +2996,7 @@ class VscodeLmBridgeHost {
     this.pollTimer = null;
     this.heartbeatTimer = null;
     this.processing = false;
-    this.permissionPrompt = null;
+    this.permissionPrompts = new Map();
     this.disposed = false;
   }
 
@@ -3040,13 +3044,13 @@ class VscodeLmBridgeHost {
 
   modelAccessState(model) {
     const nativeState = vscodeLmAccessState(model);
-    if (nativeState !== "unknown") return nativeState;
+    if (nativeState === "granted") return nativeState;
     const globalState = this.context && this.context.globalState;
     if (globalState && typeof globalState.get === "function" &&
         globalState.get(vscodeLmPermissionStorageKey(model), false)) {
       return "granted_remembered";
     }
-    return "unknown";
+    return nativeState;
   }
 
   async rememberModelPermission(model) {
@@ -3098,17 +3102,29 @@ class VscodeLmBridgeHost {
 
   async ensurePermission(model) {
     if (this.modelAccessState(model).startsWith("granted")) return true;
-    if (!this.permissionPrompt) {
+    const permissionKey = vscodeLmPermissionStorageKey(model);
+    if (!this.permissionPrompts.has(permissionKey)) {
       const label = String((model && (model.name || model.family || model.id)) || "the selected model");
-      this.permissionPrompt = vscode.window.showInformationMessage(
+      const prompt = vscode.window.showInformationMessage(
         `AIWorkHub has a queued worker task for ${label}. Allow this VS Code model?`,
-        { modal: true, detail: "Permission is scoped to this exact VS Code model and is remembered only after a successful non-empty response." },
+        { modal: true, detail: "Permission is scoped to this exact VS Code model and is remembered immediately after approval. Provider failures will not ask again." },
         "Allow VS Code models",
       ).then(async (choice) => {
-        return choice === "Allow VS Code models";
-      }).finally(() => { this.permissionPrompt = null; });
+        if (choice !== "Allow VS Code models") return false;
+        // Persist the user's decision before the provider request.  The old
+        // success-only write created a circular failure: a timeout meant the
+        // approval was forgotten and the same modal appeared on every retry.
+        await this.rememberModelPermission(model);
+        try { await this.publishHeartbeat(); } catch (_err) { /* next heartbeat retries */ }
+        return true;
+      }).finally(() => {
+        if (this.permissionPrompts.get(permissionKey) === prompt) {
+          this.permissionPrompts.delete(permissionKey);
+        }
+      });
+      this.permissionPrompts.set(permissionKey, prompt);
     }
-    return this.permissionPrompt;
+    return this.permissionPrompts.get(permissionKey);
   }
 
   async poll() {
@@ -3139,7 +3155,6 @@ class VscodeLmBridgeHost {
       let diagnostics = null;
       try {
         text = await runVscodeLmAgent(model, request, source.token);
-        if (text) await this.rememberModelPermission(model);
       }
       catch (err) {
         error = sanitizeErrorMessage(err);
@@ -4856,6 +4871,13 @@ async function pushSnapshotOnce(view) {
   debugTrace("snapshot.begin", { request_seq: requestSeq });
   const client = getMcpClient();
   view.bindClient(client);
+  const snapshotRecovery = {
+    category: "snapshot",
+    reason: "",
+    attempts: 0,
+    maxAttempts: MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
+    open: false,
+  };
   for (let attempt = 0; attempt < MCP_SNAPSHOT_RECOVERY_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
       if (client.recovery.open) break;
@@ -4894,17 +4916,20 @@ async function pushSnapshotOnce(view) {
         ...debugErrorFields(err),
       });
       lastError = err;
-      client.recovery.category = "snapshot";
-      client.recovery.reason = sanitizeErrorMessage(err);
-      client.recovery.attempts = attempt + 1;
-      if (attempt + 1 >= MCP_SNAPSHOT_RECOVERY_ATTEMPTS) client.recovery.open = true;
+      // A dashboard read timing out does not prove that the shared MCP child
+      // or any model route is corrupt.  Keep snapshot degradation local to
+      // the Webview; only child/runtime lifecycle failures may open the global
+      // MCP recovery circuit.
+      snapshotRecovery.reason = sanitizeErrorMessage(err);
+      snapshotRecovery.attempts = attempt + 1;
+      snapshotRecovery.open = attempt + 1 >= MCP_SNAPSHOT_RECOVERY_ATTEMPTS;
     }
   }
   if (requestSeq === view.snapshotRequestSeq) {
     view.postMessage({
       type: OUTBOUND_TYPES.offline,
       reason: sanitizeErrorMessage(lastError),
-      recovery: client.recoveryStatus(),
+      recovery: snapshotRecovery,
     });
   }
   debugTrace("snapshot.offline", { request_seq: requestSeq, ...debugErrorFields(lastError) });
@@ -6917,6 +6942,7 @@ module.exports = {
     VSCODE_LM_PRIVATE_TOOLS,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
+      VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
       MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       EXPECTED_MCP_PACKAGE_VERSION,
