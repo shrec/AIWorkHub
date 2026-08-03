@@ -2,7 +2,7 @@
   "name": "aiworkhub",
   "displayName": "AIWorkHub",
   "description": "Repository-native multi-model orchestration with dependency-aware tasks, 31-mode source intelligence, durable context and evidence-first review.",
-  "version": "0.8.42",
+  "version": "0.8.44",
   "publisher": "IvaneChkheidze",
   "license": "MIT",
   "icon": "media/aiworkhub-marketplace-icon.png",
@@ -113,9 +113,9 @@
         },
         "aiworkhub.enableVscodeLmBridge": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "window",
-          "description": "Opt in to the VS Code language-model worker bridge. Disabled by default to avoid activating model providers when only the dashboard is needed."
+          "description": "Expose the models already authorized in this VS Code window to repository workers, including Remote-SSH workspaces. Discovery is automatic and credential-free; model consent is requested only when a queued task first invokes that exact model."
         },
         "aiworkhub.debugTracing": {
           "type": "boolean",

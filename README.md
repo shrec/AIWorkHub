@@ -38,8 +38,14 @@ AIWorkHub does not copy editor or CLI credentials.
 | `copilot_*` | Public VS Code Language Model API | GitHub Copilot extension | GitHub sign-in and one-time model consent |
 
 Exact model availability is discovered at runtime because subscriptions and
-editor model catalogs differ. The dashboard preflight reports which adapters
-are installed, authorized and launchable before a task is claimed.
+editor model catalogs differ. The editor broker starts automatically, performs
+credential-free discovery, and asks for consent only when an exact queued task
+first invokes that model. In Remote-SSH, the workspace extension uses VS
+Code's Language Model API to consume the same model catalog exposed by the
+Windows/macOS/Linux client window; it does not look for a second provider
+credential on the SSH host. The dashboard reports visible **editor models**
+separately from execution **routes**, so a redundant unavailable CLI fallback
+is never presented as a missing model or repository blocker.
 
 ## Why AIWorkHub
 
@@ -136,8 +142,9 @@ on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
 ### First task workflow
 
-1. Confirm **Preflight** is ready for at least one model adapter. Optional
-   unavailable adapters do not block the repository.
+1. Confirm **Preflight** is ready and lists at least one editor model or
+   authenticated CLI route. Optional/redundant unavailable routes do not block
+   the repository.
 2. Ask the manager chat for a bounded task. The canonical card records the
    objective, acceptance criteria, dependencies, write scope and validation.
 3. Launch the exact card. The worker uses repository-local Source Graph and

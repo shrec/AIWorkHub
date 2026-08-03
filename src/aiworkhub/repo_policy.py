@@ -279,6 +279,12 @@ def _provider_status(repo_root: Path, adapter_id: str, policy: Mapping[str, Any]
                 model=runtime_adapters.GLM_DEFAULT_MODEL,
                 adapter_id=adapter_id,
             )
+        elif adapter_id == runtime_adapters.VSCODE_LM_ADAPTER and vscode_lm_bridge:
+            readiness = vscode_lm_bridge.bridge_readiness(
+                repo_root,
+                model=None,
+                adapter_id=adapter_id,
+            )
         elif adapter_id == "claude_cli":
             readiness = claude_auth.auth_status(resolution.executable)
     except (OSError, RuntimeError, ValueError):
@@ -288,6 +294,26 @@ def _provider_status(repo_root: Path, adapter_id: str, policy: Mapping[str, Any]
         result["launchable"] = bool(resolution.ok and readiness.get("launchable"))
         result["status"] = "ready" if result["launchable"] else "access_unavailable"
         result["reason"] = str(readiness.get("blocker_reason") or readiness.get("reason") or "")[:200]
+        # Preserve only bounded, secret-free broker observability.  The UI can
+        # then report real editor model capacity instead of presenting
+        # redundant transports as if they were distinct models.
+        for key in (
+            "window_id",
+            "host_count",
+            "live_host_count",
+            "stale_host_count",
+            "freshest_age_seconds",
+        ):
+            value = readiness.get(key)
+            if value is not None:
+                result[key] = value
+        observed_models = readiness.get("observed_models")
+        if isinstance(observed_models, list):
+            result["observed_models"] = [
+                str(value)[:128]
+                for value in observed_models[:128]
+                if isinstance(value, str) and value
+            ]
     if not result["policy_allowed"]:
         result["launchable"] = False
         result["status"] = "policy_denied"

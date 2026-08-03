@@ -47,6 +47,7 @@ def test_readiness_is_repo_scoped_and_credential_free(tmp_path: Path, monkeypatc
 
     absent = vscode_lm_bridge.bridge_readiness(repo)
     assert absent["launchable"] is False
+    assert absent["blocker_reason"] == "vscode_lm_host_unavailable"
     assert absent["credential_required"] is False
 
     host = _host(root, repo_id, models=["glm-5.2"])
@@ -64,8 +65,41 @@ def test_readiness_is_repo_scoped_and_credential_free(tmp_path: Path, monkeypatc
     )
     assert deepseek_ready["launchable"] is True
     assert deepseek_ready["credential_required"] is False
+    shared = vscode_lm_bridge.bridge_readiness(
+        repo, model=None, adapter_id="vscode_lm"
+    )
+    assert shared["launchable"] is True
+    assert shared["live_host_count"] == 1
+    assert shared["observed_models"] == ["deepseek-v4-pro", "glm-5.2"]
     if os.name != "nt":
         assert host.stat().st_mode & 0o077 == 0
+
+
+def test_readiness_distinguishes_stale_host_from_missing_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    host = _host(root, repo_id, models=["glm-5.2"])
+
+    missing = vscode_lm_bridge.bridge_readiness(
+        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
+    )
+    assert missing["blocker_reason"] == "vscode_lm_model_not_visible"
+    assert missing["live_host_count"] == 1
+
+    stale_at = vscode_lm_bridge.time.time() - vscode_lm_bridge.HOST_TTL_SECONDS - 5
+    os.utime(host, (stale_at, stale_at))
+    stale = vscode_lm_bridge.bridge_readiness(
+        repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
+    )
+    assert stale["launchable"] is False
+    assert stale["blocker_reason"] == "vscode_lm_host_stale"
+    assert stale["live_host_count"] == 0
+    assert stale["stale_host_count"] == 1
+    assert stale["observed_models"] == []
 
 
 def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

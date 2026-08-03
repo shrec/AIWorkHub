@@ -100,10 +100,19 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 def bridge_readiness(
     repo: Path,
     *,
-    model: str = "glm-5.2",
+    model: str | None = "glm-5.2",
     adapter_id: str = "glm_vscode_lm",
 ) -> dict[str, Any]:
-    """Return a secret-free, fail-closed editor-host bridge status."""
+    """Return a secret-free, fail-closed editor-host bridge status.
+
+    ``model=None`` measures the shared VS Code broker itself.  A model-specific
+    query distinguishes three materially different states: no heartbeat ever
+    observed, only expired heartbeats, and a live host whose current model
+    catalog does not contain the requested identity.  Older code collapsed the
+    latter two into ``vscode_lm_model_not_visible``; after a reload that made a
+    healthy Windows/Remote-SSH authorization look like a model entitlement
+    failure merely because a stale JSON file still existed.
+    """
     repo = repo.resolve()
     repo_id = _repo_id(repo)
     hosts_dir = bridge_root() / "hosts" / repo_id
@@ -134,22 +143,53 @@ def bridge_readiness(
         age = max(0.0, now - stat_result.st_mtime)
         models = payload.get("models") if isinstance(payload.get("models"), list) else []
         candidates.append({**payload, "age_seconds": round(age, 3), "models": models})
-    live = [
-        item for item in candidates
-        if item["age_seconds"] <= HOST_TTL_SECONDS and model in item.get("models", [])
+    live_hosts = [
+        item for item in candidates if item["age_seconds"] <= HOST_TTL_SECONDS
     ]
-    selected = sorted(live, key=lambda item: item["age_seconds"])[0] if live else None
+    matching_hosts = [
+        item
+        for item in live_hosts
+        if model is None or model in item.get("models", [])
+    ]
+    selected = (
+        sorted(matching_hosts, key=lambda item: item["age_seconds"])[0]
+        if matching_hosts
+        else None
+    )
+    observed_models = sorted(
+        {
+            str(name)
+            for item in live_hosts
+            for name in item.get("models", [])
+            if isinstance(name, str) and name
+        }
+    )[:128]
+    if selected is not None:
+        blocker_reason = ""
+    elif not candidates:
+        blocker_reason = "vscode_lm_host_unavailable"
+    elif not live_hosts:
+        blocker_reason = "vscode_lm_host_stale"
+    elif model is not None:
+        blocker_reason = "vscode_lm_model_not_visible"
+    else:
+        blocker_reason = "vscode_lm_model_catalog_empty"
     return {
         "adapter_id": adapter_id,
         "kind": "vscode_language_model_api",
         "repo_id": repo_id,
         "model": model,
         "launchable": selected is not None,
-        "blocker_reason": "" if selected else (
-            "vscode_lm_model_not_visible" if candidates else "vscode_lm_host_unavailable"
-        ),
+        "blocker_reason": blocker_reason,
         "window_id": str((selected or {}).get("window_id") or ""),
-        "host_count": len(live),
+        "host_count": len(matching_hosts),
+        "live_host_count": len(live_hosts),
+        "stale_host_count": max(0, len(candidates) - len(live_hosts)),
+        "observed_models": observed_models,
+        "freshest_age_seconds": min(
+            (float(item["age_seconds"]) for item in candidates),
+            default=None,
+        ),
         "credential_required": False,
     }
 

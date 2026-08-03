@@ -409,15 +409,23 @@ function renderSummary(snapshot) {
     const errors = preflight ? asArray(preflight.errors) : [];
     const providers = preflight ? asArray(preflight.providers) : [];
     const readyProviders = providers.filter((item) => item && item.launchable).length;
+    const broker = providers.find((item) => item && item.adapter_id === "vscode_lm") || null;
+    const brokerModels = broker ? asArray(broker.observed_models) : [];
     elements.headerPreflightValue.textContent = preflight
       ? (preflight.ok ? "Ready" : "Blocked")
       : "Unavailable";
     elements.headerPreflightDetail.textContent = preflight
-      ? `${readyProviders}/${providers.length} adapters · ${errors.length} blockers`
+      ? (brokerModels.length
+        ? `${brokerModels.length} editor models · ${readyProviders}/${providers.length} routes · ${errors.length} blockers`
+        : `${readyProviders}/${providers.length} routes · ${errors.length} blockers`)
       : "No evidence";
     if (elements.headerPreflight) {
       elements.headerPreflight.title = preflight
-        ? (errors.length ? errors.join(" · ") : "Repository, policy and runtime preflight passed")
+        ? (errors.length
+          ? errors.join(" · ")
+          : (broker && !broker.launchable
+            ? `Core preflight passed; editor model broker ${broker.reason || "unavailable"}`
+            : "Repository, policy, runtime and editor model broker preflight passed"))
         : "Unified preflight unavailable";
     }
   }

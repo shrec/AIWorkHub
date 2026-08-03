@@ -108,6 +108,19 @@ PID/timeout/cancel tracking and an append-only process-event log.
 sandbox where available) so a launched worker's Source Graph queries and
 writes stay bounded to its declared `allowed_writes`.
 
+The preferred credential-free editor route is
+`vscode_lm_bridge.py` + `VscodeLmBridgeHost`. The extension publishes a
+repo/window-scoped heartbeat containing only bounded public model metadata;
+no credential enters the repository or Python worker. A task request is
+spooled owner-only to the extension host, which invokes the exact visible
+model through `vscode.lm`, proxies bounded worker tools, and returns a strict
+edit envelope to the isolated workspace. VS Code's extension API carries this
+model surface across Remote-SSH: repository state and validation remain on the
+remote workspace host while authorization/consent remains owned by the editor
+provider. Preflight distinguishes no host, stale host and a genuine live-host
+model miss, and workforce routing propagates the effective adapter selected
+from that evidence into the launch decision.
+
 ## Callback bridge
 
 `callback_bridge.py` closes the loop back to the coordinator: when a

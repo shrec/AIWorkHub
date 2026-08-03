@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.42";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.44";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2231,7 +2231,11 @@ function isCallableVscodeLmProvider(model) {
   // discovery, but those entries return empty streams when invoked through
   // the public VS Code Language Model API. The public Copilot provider uses
   // vendor=`copilot`; custom endpoints such as GLM use their own vendor.
-  return normalizedVscodeLmModelName(model && model.vendor) !== "copilotcli";
+  return Boolean(
+    model &&
+    typeof model === "object" &&
+    normalizedVscodeLmModelName(model.vendor) !== "copilotcli"
+  );
 }
 
 function normalizedVscodeLmModelName(value) {
@@ -2996,7 +3000,15 @@ class VscodeLmBridgeHost {
     this.stop();
     if (!repoInfo || !REAL_REPO_ID_RE.test(String(repoInfo.repoId || ""))) return;
     this.repoInfo = { ...repoInfo };
-    await this.publishHeartbeat();
+    // The broker is an optional execution route.  A malformed third-party
+    // model catalog or a transient provider failure must never abort the
+    // dashboard/MCP extension activation.  The timer retries and preflight
+    // reports the missing/stale heartbeat as bounded degraded evidence.
+    try {
+      await this.publishHeartbeat();
+    } catch (err) {
+      recordSystemLog(`[vscode lm bridge] heartbeat unavailable ${sanitizeErrorMessage(err)}`);
+    }
     this.pollTimer = setInterval(() => this.poll().catch((err) => recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`)), VSCODE_LM_POLL_MS);
     this.heartbeatTimer = setInterval(() => this.publishHeartbeat().catch(() => {}), VSCODE_LM_HEARTBEAT_MS);
     if (this.pollTimer && typeof this.pollTimer.unref === "function") this.pollTimer.unref();
@@ -3056,9 +3068,10 @@ class VscodeLmBridgeHost {
         .filter((name) => typeof name === "string" && VSCODE_LM_REQUESTED_MODEL_RE.test(name.trim()))
         .map((name) => name.trim()),
     ])).slice(0, 128);
-    const modelMetadata = visibleModels.slice(0, 64).map((name) => {
+    const modelMetadata = visibleModels.slice(0, 64).flatMap((name) => {
       const model = selectVscodeLanguageModel(models, name);
-      return {
+      if (!model) return [];
+      return [{
         canonical: name,
         id: model.id,
         family: model.family,
@@ -3067,7 +3080,7 @@ class VscodeLmBridgeHost {
         version: model.version,
         maxInputTokens: model.maxInputTokens,
         access_state: this.modelAccessState(model),
-      };
+      }];
     });
     const payload = {
       schema_id: VSCODE_LM_HOST_SCHEMA,
@@ -6631,6 +6644,24 @@ async function activate(context) {
   debugTrace("activation.features", { codexCallbackMuxEnabled, vscodeLmBridgeEnabled });
   vscodeLmBridgeHost = vscodeLmBridgeEnabled ? new VscodeLmBridgeHost(context) : null;
   if (vscodeLmBridgeHost) context.subscriptions.push(vscodeLmBridgeHost);
+  if (typeof vscode.workspace.onDidChangeConfiguration === "function") {
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (!event.affectsConfiguration(`${EXT_ID}.enableVscodeLmBridge`)) return;
+      const enabled = aiworkhubFeatureEnabled("enableVscodeLmBridge");
+      debugTrace("vscode_lm_bridge.configuration", { enabled });
+      if (!enabled) {
+        if (vscodeLmBridgeHost) vscodeLmBridgeHost.stop();
+        return;
+      }
+      if (!vscodeLmBridgeHost) {
+        vscodeLmBridgeHost = new VscodeLmBridgeHost(context);
+        context.subscriptions.push(vscodeLmBridgeHost);
+      }
+      if (activeRepoIdentity && activeRepoIdentity.root) {
+        await vscodeLmBridgeHost.start(activeRepoIdentity);
+      }
+    }));
+  }
 
   // Materialize the same-host mux as a fail-open building block before it can
   // be advertised to a co-located Codex extension. The bootstrap pointer is

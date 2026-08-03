@@ -44,7 +44,11 @@ assert.strictEqual(pkg.contributes.viewsContainers.activitybar[0].id, "aiworkhub
 assert.strictEqual(pkg.contributes.views.aiworkhub[0].id, "aiworkhub.view");
 assert.ok(pkg.contributes.configuration.properties["aiworkhub.refreshIntervalMs"]);
 assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableCodexCallbackMux"].default, false);
-assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableVscodeLmBridge"].default, false);
+assert.strictEqual(pkg.contributes.configuration.properties["aiworkhub.enableVscodeLmBridge"].default, true);
+assert.ok(ext.includes('onDidChangeConfiguration(async (event) =>'));
+assert.ok(ext.includes('event.affectsConfiguration(`${EXT_ID}.enableVscodeLmBridge`)'));
+assert.ok(app.includes("editor models"));
+assert.ok(app.includes("routes"));
 assert.ok(!pkg.contributes.configurationDefaults);
 
 absent(JSON.stringify(pkg) + ext + app + css, [

@@ -153,7 +153,14 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     monkeypatch.setattr(
         repo_policy.vscode_lm_bridge,
         "bridge_readiness",
-        lambda *args, **kwargs: {"launchable": True, "blocker_reason": ""},
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "window_id": "window_test",
+            "live_host_count": 1,
+            "stale_host_count": 0,
+            "observed_models": ["glm-5.2", "deepseek-v4-pro"],
+        },
     )
     monkeypatch.setattr(
         repo_policy.claude_auth,
@@ -172,6 +179,11 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     by_adapter = {item["adapter_id"]: item for item in report["providers"]}
     assert by_adapter["deepseek_copilot_cli"]["status"] == "ready"
     assert by_adapter["glm_vscode_lm"]["access_observed"] is True
+    assert by_adapter["vscode_lm"]["status"] == "ready"
+    assert by_adapter["vscode_lm"]["observed_models"] == [
+        "glm-5.2",
+        "deepseek-v4-pro",
+    ]
     assert by_adapter["claude_cli"]["status"] == "ready"
     assert by_adapter["claude_cli"]["access_observed"] is True
     assert report["callback"]["backlog_count"] == 0

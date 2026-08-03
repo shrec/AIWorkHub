@@ -34,8 +34,16 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 # catalog response; this is routing evidence, not fabricated credential/quota
 # evidence.
 _WORKER_ADAPTER_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "deepseek_vscode_lm": ("deepseek_copilot_cli",),
-    "glm_vscode_lm": ("glm_copilot_cli",),
+    "claude_cli": ("vscode_lm",),
+    "codex_cli": ("vscode_lm",),
+    "deepseek_vscode_lm": ("vscode_lm", "deepseek_copilot_cli"),
+    "glm_vscode_lm": ("vscode_lm", "glm_copilot_cli"),
+}
+
+_EDITOR_MODEL_ALIASES: dict[str, tuple[str, ...]] = {
+    "haiku": ("claude-haiku-4.5",),
+    "sonnet": ("claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5"),
+    "opus": ("claude-opus-5", "claude-opus-4.8-fast", "claude-opus-4.8"),
 }
 
 
@@ -257,13 +265,33 @@ def _resolve_effective_adapter(
     worker: Mapping[str, Any],
     ready_by_adapter: Mapping[str, Mapping[str, Any]],
 ) -> tuple[str, Mapping[str, Any]]:
+    def launchable(adapter_id: str, readiness: Mapping[str, Any]) -> bool:
+        if not readiness.get("launchable"):
+            return False
+        if adapter_id not in {
+            "vscode_lm",
+            "deepseek_vscode_lm",
+            "glm_vscode_lm",
+        }:
+            return True
+        observed = readiness.get("observed_models")
+        # Older/fake preflight receipts have no catalog. Preserve their
+        # explicit launchable verdict; current receipts always include a
+        # bounded observed_models list and therefore get exact model gating.
+        if not isinstance(observed, list):
+            return True
+        visible = {str(value) for value in observed if isinstance(value, str)}
+        model = str(worker.get("model") or "")
+        accepted = {model, *_EDITOR_MODEL_ALIASES.get(model, ())}
+        return bool(visible.intersection(accepted))
+
     declared = str(worker.get("adapter_id") or "")
     candidate = ready_by_adapter.get(declared, {})
-    if candidate.get("launchable"):
+    if launchable(declared, candidate):
         return declared, candidate
     for fallback in _WORKER_ADAPTER_FALLBACKS.get(declared, ()):
         candidate = ready_by_adapter.get(fallback, {})
-        if candidate.get("launchable"):
+        if launchable(fallback, candidate):
             return fallback, candidate
     return declared, ready_by_adapter.get(declared, {})
 
@@ -451,7 +479,7 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
         if not isinstance(outcomes, Mapping):
             outcomes = {}
         workers.append(workforce_router.WorkerCapability.build(
-            worker_id=item["worker_id"], adapter_id=item["adapter_id"], model=item["model"], provider=item["provider"],
+            worker_id=item["worker_id"], adapter_id=item.get("effective_adapter_id") or item["adapter_id"], model=item["model"], provider=item["provider"],
             supports=item["supports"], tools=item["tools"], max_context_tokens=item["max_context_tokens"],
             max_risk=item["max_risk"], quality_ceiling=item["quality_ceiling"],
             available=bool(item["available"]), credential_ok=bool(item["available"]), quota_available=None,

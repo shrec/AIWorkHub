@@ -6,6 +6,40 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.44] - 2026-08-03
+
+### Fixed
+
+- Made the automatic VS Code model broker fail-open during extension
+  activation. Some provider catalogs can transiently return null/malformed
+  model entries or reject discovery; those entries are now ignored and a
+  bounded degraded heartbeat log is recorded instead of taking down the
+  AIWorkHub dashboard and MCP runtime.
+
+## [0.8.43] - 2026-08-03
+
+### Added
+
+- Made the credential-free VS Code Language Model broker active by default.
+  It discovers only models already authorized in the current editor window,
+  requests consent only when an exact queued task first invokes a model, and
+  carries the same model catalog into Remote-SSH repository workers.
+- Added bounded broker observability to preflight: live/stale host counts,
+  freshest heartbeat age, exact visible model identities and a dashboard
+  summary that separates editor models from redundant execution routes.
+
+### Fixed
+
+- Distinguished an expired editor heartbeat from a live host that genuinely
+  cannot see a requested model. Reloads now report `vscode_lm_host_stale`
+  instead of the misleading `vscode_lm_model_not_visible` entitlement error.
+- Added editor-broker fallback for Claude and Codex workers as well as
+  DeepSeek and GLM, with exact per-model visibility checks. Workforce ranking
+  now returns the resolved effective adapter rather than the unavailable
+  declared adapter, closing the rank-success/launch-failure split.
+- Applied VS Code LM bridge setting changes without requiring another window
+  reload.
+
 ## [0.8.42] - 2026-08-03
 
 ### Fixed

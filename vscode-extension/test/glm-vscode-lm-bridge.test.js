@@ -44,6 +44,8 @@ assert.strictEqual(internals.selectVscodeLanguageModel([aliasedGlm], "glm-5.2"),
 assert.strictEqual(internals.selectVscodeLanguageModel([aliasedDeepseek], "deepseek-v4-pro"), aliasedDeepseek);
 assert.strictEqual(internals.isCallableVscodeLmProvider(internalClaude), false);
 assert.strictEqual(internals.isCallableVscodeLmProvider(publicClaude), true);
+assert.strictEqual(internals.isCallableVscodeLmProvider(null), false);
+assert.strictEqual(internals.isCallableVscodeLmProvider(undefined), false);
 fakeVscode.lm = { accessInformation: { canSendRequest: (model) => model === exact } };
 assert.strictEqual(internals.vscodeLmAccessState(exact), "granted");
 assert.strictEqual(internals.vscodeLmAccessState(deepseek), "not_granted");
@@ -262,6 +264,37 @@ async function textProtocolChecks() {
   assert.strictEqual(textChannelResult, finalResponse);
 }
 
+async function malformedCatalogChecks() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-lm-null-catalog-"));
+  const previousRoot = process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+  try {
+    process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = temp;
+    fakeVscode.lm = {
+      selectChatModels: async () => [null, undefined, internalClaude, exact],
+      accessInformation: { canSendRequest: () => false },
+    };
+    const host = new internals.VscodeLmBridgeHost({ globalState: { get: () => false } });
+    const repoInfo = { root: temp, repoId: `repo_${"e".repeat(32)}` };
+    await host.start(repoInfo);
+    const hostsDir = path.join(temp, "hosts", repoInfo.repoId);
+    const files = fs.readdirSync(hostsDir);
+    assert.strictEqual(files.length, 1);
+    const heartbeat = JSON.parse(fs.readFileSync(path.join(hostsDir, files[0]), "utf8"));
+    assert.ok(heartbeat.models.includes("glm-5.2"));
+    assert.ok(heartbeat.model_metadata.every((entry) => entry && typeof entry.id === "string"));
+    host.dispose();
+
+    fakeVscode.lm.selectChatModels = async () => { throw new Error("provider catalog failed"); };
+    const degraded = new internals.VscodeLmBridgeHost({ globalState: { get: () => false } });
+    await degraded.start(repoInfo);
+    degraded.dispose();
+  } finally {
+    if (previousRoot === undefined) delete process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+    else process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = previousRoot;
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 async function nativeProtocolChecks() {
   const finalResponse = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -383,7 +416,7 @@ try {
   fs.rmSync(temp, { recursive: true, force: true });
 }
 
-Promise.all([textProtocolChecks(), nativeProtocolChecks()]).then(() => {
+Promise.all([textProtocolChecks(), nativeProtocolChecks(), malformedCatalogChecks()]).then(() => {
   console.log("GLM VS Code LM bridge: ok");
 }).catch((err) => {
   console.error(err);
