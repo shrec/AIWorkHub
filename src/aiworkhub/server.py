@@ -940,6 +940,31 @@ def aiworkhub_task_reject_review(
 
 @mcp.tool()
 @_serialize_task_lifecycle_write
+def aiworkhub_task_retry_terminal(
+    task_id: str,
+    request_id: str,
+    terminal_substatus: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """COORDINATOR WRITE: retry one exact operational terminal episode.
+
+    Only blocked cancelled/timed-out/launch/worker/process/liveness failures
+    are eligible.  The exact prior request id and substatus are mandatory;
+    semantic validation/review failures remain on their established review
+    workflow.  The same task ID is requeued and its append-only audit history
+    is preserved.
+    """
+
+    return core.retry_terminal_task(
+        task_id=task_id,
+        request_id=request_id,
+        terminal_substatus=terminal_substatus,
+        reason=reason,
+    )
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_archive(
     task_id: str,
     reason: str = "",

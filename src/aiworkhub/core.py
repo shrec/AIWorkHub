@@ -1355,7 +1355,17 @@ RUNNER_TOPIC_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
 # worker tasks; it finalizes (done), exports, reviews, and records usage.
 CODEX_RUNNER = "codex"
 CODEX_ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"archive", "done", "export-jsonl", "restore", "review", "reject-review", "release-launch", "usage"}
+    {
+        "archive",
+        "done",
+        "export-jsonl",
+        "restore",
+        "review",
+        "reject-review",
+        "release-launch",
+        "retry-terminal",
+        "usage",
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -3729,6 +3739,220 @@ def reject_review(
     return _reconcile_retained_workspaces(
         _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
     )
+
+
+_RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "cancelled",
+        "timed_out",
+        "launch_failed",
+        "worker_failed",
+        "process_lost",
+        "liveness_lost",
+    }
+)
+
+
+def retry_terminal_task(
+    task_id: str,
+    request_id: str,
+    terminal_substatus: str,
+    reason: str = "",
+    topic: str | None = None,
+) -> dict[str, Any]:
+    """Requeue one exact operational terminal episode under the same task ID.
+
+    This is deliberately narrower than review rejection.  It accepts only a
+    blocked operational failure, requires the caller to name the exact launch
+    request and terminal substatus, preserves durable review/rework context,
+    and clears only current-episode claim/terminal fields.  Semantic failures
+    (validation/scope/review outcomes), finished tasks and archived tasks must
+    follow their existing coordinator workflows instead.
+    """
+
+    request_id = str(request_id or "").strip()
+    terminal_substatus = str(terminal_substatus or "").strip()
+    bounded_reason = str(reason or "").strip()[:500]
+    if not request_id or len(request_id) > 120:
+        return _lifecycle_error("terminal_retry_request_id_invalid")
+    if terminal_substatus not in _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES:
+        return _lifecycle_error(
+            f"terminal_retry_substatus_not_operational:{terminal_substatus}"
+        )
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = str(card.get("topic") or "")
+    if not live_topic:
+        return _lifecycle_error("task has no exact topic identity")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+
+    prior_retry = card.get("terminal_retry")
+    if (
+        _lifecycle_state(card) == "pending"
+        and str(card.get("worker_status") or "") == "unclaimed"
+        and isinstance(prior_retry, dict)
+        and str(prior_retry.get("request_id") or "") == request_id
+        and str(prior_retry.get("terminal_substatus") or "") == terminal_substatus
+    ):
+        result = _canonical_result(
+            ok=True,
+            returncode=0,
+            stdout=json.dumps(card, ensure_ascii=False, default=str),
+            command=["retry-terminal", task_id],
+        )
+        result["idempotent"] = True
+        result["retried_request_id"] = request_id
+        result["terminal_substatus"] = terminal_substatus
+        return result
+
+    lifecycle = _lifecycle_state(card)
+    worker_status = str(card.get("worker_status") or "")
+    actual_substatus = str(card.get("terminal_substatus") or worker_status).strip()
+    terminal_failure = card.get("terminal_failure")
+    evidence = (
+        terminal_failure.get("evidence")
+        if isinstance(terminal_failure, dict)
+        else None
+    )
+    actual_request_id = str(
+        (evidence.get("request_id") if isinstance(evidence, dict) else "")
+        or card.get("launch_request_id")
+        or ""
+    ).strip()
+    if lifecycle != "blocked":
+        return _lifecycle_error(f"terminal_retry_not_blocked:current={lifecycle}")
+    if worker_status != terminal_substatus or actual_substatus != terminal_substatus:
+        return _lifecycle_error(
+            "terminal_retry_substatus_mismatch:"
+            f"expected={actual_substatus or worker_status}:got={terminal_substatus}"
+        )
+    if actual_request_id != request_id:
+        return _lifecycle_error(
+            f"terminal_retry_request_mismatch:expected={actual_request_id}:got={request_id}"
+        )
+
+    command = [
+        "retry-terminal",
+        task_id,
+        "--request-id",
+        request_id,
+        "--terminal-substatus",
+        terminal_substatus,
+    ]
+    gate = _canonical_write_gate(
+        "retry-terminal",
+        runner=CODEX_RUNNER,
+        topic=live_topic,
+        coordinator_capability=True,
+        task_id=task_id,
+    )
+    if gate is not None:
+        return gate
+
+    now = datetime.now(timezone.utc).isoformat()
+    semantic_card = task_store.persistable_card_payload(card)
+    prior_episode = task_store.begin_claim_episode(semantic_card)
+    for key in (
+        "launch_request_id",
+        "terminal_failure",
+        "blocked_at",
+        "blocked_by",
+        "completed_at",
+        "claimed_at",
+        "started_at",
+    ):
+        semantic_card.pop(key, None)
+    semantic_card.update(
+        status="pending",
+        worker_status="unclaimed",
+        claimed_by=None,
+        terminal_retry={
+            "schema_id": "aiworkhub.terminal_retry.v1",
+            "request_id": request_id,
+            "terminal_substatus": terminal_substatus,
+            "reason": bounded_reason,
+            "retried_at": now,
+        },
+    )
+    encoded_card = json.dumps(semantic_card, ensure_ascii=False, sort_keys=True)
+    try:
+        conn = _canonical_connect()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    try:
+        row = conn.execute(
+            "SELECT status, worker_status, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["status"] or "") != "blocked"
+            or str(row["worker_status"] or "") != terminal_substatus
+        ):
+            conn.rollback()
+            return _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"terminal_retry_transition_conflict:task_id={task_id}",
+                command=command,
+            )
+        raw_card_json = str(row["card_json"] or "{}")
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed', "
+            "claimed_by=NULL, claimed_at=NULL, started_at=NULL, completed_at=NULL, "
+            "card_json=?, updated_at=? "
+            "WHERE task_id=? AND status='blocked' AND worker_status=? AND card_json=?",
+            (
+                encoded_card,
+                now,
+                task_id,
+                terminal_substatus,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return _canonical_result(
+                ok=False,
+                returncode=1,
+                stderr=f"terminal_retry_transition_conflict:task_id={task_id}",
+                command=command,
+            )
+        conn.execute(
+            "INSERT INTO task_events "
+            "(task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id,
+                "retry_terminal",
+                CODEX_RUNNER,
+                json.dumps(
+                    {
+                        "topic": live_topic,
+                        "request_id": request_id,
+                        "terminal_substatus": terminal_substatus,
+                        "reason": bounded_reason,
+                        "transition": "blocked->pending",
+                        "prior_episode": prior_episode,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result["retried_request_id"] = request_id
+    result["terminal_substatus"] = terminal_substatus
+    return _reconcile_retained_workspaces(result)
 
 
 def archive_task(task_id: str, reason: str = "", topic: str | None = None) -> dict[str, Any]:
