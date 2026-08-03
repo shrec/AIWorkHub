@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.52";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.53";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -213,6 +213,7 @@ const VSCODE_LM_MODEL_ALIASES = Object.freeze({
 const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
+const VSCODE_LM_MAX_PARALLEL_REQUESTS = 3;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const VSCODE_LM_MAX_AGENT_TURNS = 24;
 const VSCODE_LM_MAX_TOOL_TURNS = 16;
@@ -3027,7 +3028,9 @@ class VscodeLmBridgeHost {
     this.repoInfo = null;
     this.pollTimer = null;
     this.heartbeatTimer = null;
-    this.processing = false;
+    this.activeClaims = new Set();
+    this.activeSources = new Set();
+    this.maxParallelRequests = VSCODE_LM_MAX_PARALLEL_REQUESTS;
     this.permissionPrompts = new Map();
     this.disposed = false;
   }
@@ -3056,6 +3059,9 @@ class VscodeLmBridgeHost {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.pollTimer = null;
     this.heartbeatTimer = null;
+    for (const source of this.activeSources) {
+      try { source.cancel(); } catch (_err) { /* already disposed */ }
+    }
     if (this.repoInfo && REAL_REPO_ID_RE.test(String(this.repoInfo.repoId || ""))) {
       const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
       try { fs.unlinkSync(hostPath); } catch (_err) { /* absent */ }
@@ -3126,6 +3132,8 @@ class VscodeLmBridgeHost {
       models: visibleModels,
       model_metadata: modelMetadata,
       permission_granted: modelMetadata.some((entry) => entry.access_state.startsWith("granted")),
+      max_parallel_requests: this.maxParallelRequests,
+      active_request_count: this.activeClaims.size,
       updated_at: new Date().toISOString(),
     };
     const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
@@ -3160,26 +3168,46 @@ class VscodeLmBridgeHost {
   }
 
   async poll() {
-    if (this.processing || !this.repoInfo || this.disposed) return;
-    const requestDir = path.join(vscodeLmBridgeRoot(), "requests", this.repoInfo.repoId);
+    if (this.activeClaims.size >= this.maxParallelRequests || !this.repoInfo || this.disposed) return;
+    // A request keeps the repository identity under which it was claimed.
+    // start()/stop() may switch the dashboard to another repository while a
+    // provider call is still in flight; never validate or report that old
+    // request against the new repository identity.
+    const repoInfo = { ...this.repoInfo };
+    const requestDir = path.join(vscodeLmBridgeRoot(), "requests", repoInfo.repoId);
     let names;
     try { names = fs.readdirSync(requestDir).filter((name) => VSCODE_LM_REQUEST_ID_RE.test(path.basename(name, ".json")) && name.endsWith(".json")).sort(); }
     catch (_err) { return; }
     if (!names.length) return;
-    this.processing = true;
     let claimPath = null;
     try {
       const requestPath = path.join(requestDir, names[0]);
       claimPath = `${requestPath}.claim-${WINDOW_SCOPE_ID}`;
       try { fs.renameSync(requestPath, claimPath); } catch (_err) { return; }
+      this.activeClaims.add(claimPath);
+      await this.processClaim(claimPath, repoInfo);
+    } catch (err) {
+      recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`);
+    } finally {
+      if (claimPath) {
+        this.activeClaims.delete(claimPath);
+        try { fs.unlinkSync(claimPath); } catch (_err) { /* absent */ }
+      }
+    }
+  }
+
+  async processClaim(claimPath, repoInfo) {
+    let source = null;
+    try {
       if (!ownerOnlyRegularFile(claimPath)) throw new Error("vscode_lm_request_not_owner_only");
       const payload = JSON.parse(fs.readFileSync(claimPath, "utf8"));
-      const request = validateVscodeLmRequest(payload, this.repoInfo);
+      const request = validateVscodeLmRequest(payload, repoInfo);
       const models = await this.models();
       const model = selectVscodeLanguageModel(models, request.model);
       if (!model) throw new Error("vscode_lm_model_not_visible");
       if (!(await this.ensurePermission(model))) throw new Error("vscode_lm_permission_denied");
-      const source = new vscode.CancellationTokenSource();
+      source = new vscode.CancellationTokenSource();
+      this.activeSources.add(source);
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
       const timer = setTimeout(() => source.cancel(), remainingMs);
       let text = "";
@@ -3203,7 +3231,7 @@ class VscodeLmBridgeHost {
       atomicWriteOwnerJson(request.responsePath, {
         schema_id: VSCODE_LM_RESPONSE_SCHEMA,
         request_id: request.requestId,
-        repo_id: this.repoInfo.repoId,
+        repo_id: repoInfo.repoId,
         model: { id: model.id, family: model.family, name: model.name, vendor: model.vendor, version: model.version },
         text,
         error,
@@ -3213,8 +3241,7 @@ class VscodeLmBridgeHost {
     } catch (err) {
       recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`);
     } finally {
-      if (claimPath) { try { fs.unlinkSync(claimPath); } catch (_err) { /* absent */ } }
-      this.processing = false;
+      if (source) this.activeSources.delete(source);
     }
   }
 }

@@ -6,6 +6,21 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.53] - 2026-08-03
+
+### Fixed
+
+- Replaced the VS Code LM bridge's global single-flight worker queue with a
+  bounded three-request scheduler, so independent editor-model tasks no longer
+  consume their execution deadlines while waiting behind another provider
+  call.
+- Pinned every in-flight editor-model request to the repository identity under
+  which it was atomically claimed and cancel active provider calls on bridge
+  stop, preventing repository switches or reloads from contaminating response
+  routing.
+- Published active and maximum editor-model request counts in the bridge
+  heartbeat for truthful capacity diagnostics.
+
 ## [0.8.52] - 2026-08-03
 
 ### Fixed

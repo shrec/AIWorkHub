@@ -293,6 +293,8 @@ async function malformedCatalogChecks() {
     const heartbeat = JSON.parse(fs.readFileSync(path.join(hostsDir, files[0]), "utf8"));
     assert.ok(heartbeat.models.includes("glm-5.2"));
     assert.ok(heartbeat.model_metadata.every((entry) => entry && typeof entry.id === "string"));
+    assert.strictEqual(heartbeat.max_parallel_requests, 3);
+    assert.strictEqual(heartbeat.active_request_count, 0);
     host.dispose();
 
     fakeVscode.lm.selectChatModels = async () => { throw new Error("provider catalog failed"); };
@@ -327,6 +329,49 @@ async function permissionPersistenceChecks() {
   assert.strictEqual(host.modelAccessState(exact), "granted_remembered");
   assert.strictEqual(await host.ensurePermission(exact), true);
   assert.strictEqual(prompts, 1, "explicit approval must survive provider failure/retry");
+}
+
+async function boundedParallelBridgeChecks() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-lm-parallel-"));
+  const previousRoot = process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+  try {
+    process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = temp;
+    const oldRepoInfo = { root: path.join(temp, "old"), repoId: `repo_${"1".repeat(32)}` };
+    const newRepoInfo = { root: path.join(temp, "new"), repoId: `repo_${"2".repeat(32)}` };
+    const requestDir = path.join(temp, "requests", oldRepoInfo.repoId);
+    fs.mkdirSync(requestDir, { recursive: true });
+    for (const suffix of ["a", "b", "c", "d"]) {
+      fs.writeFileSync(path.join(requestDir, `${suffix.repeat(32)}.json`), "{}\n", { mode: 0o600 });
+    }
+
+    const host = new internals.VscodeLmBridgeHost({});
+    host.repoInfo = oldRepoInfo;
+    const releases = [];
+    const observedRepos = [];
+    host.processClaim = async (_claimPath, repoInfo) => {
+      observedRepos.push(repoInfo.repoId);
+      await new Promise((resolve) => releases.push(resolve));
+    };
+
+    const firstWave = [host.poll(), host.poll(), host.poll()];
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(host.activeClaims.size, 3);
+    assert.strictEqual(releases.length, 3);
+    assert.strictEqual(fs.readdirSync(requestDir).filter((name) => name.endsWith(".json")).length, 1);
+
+    await host.poll();
+    assert.strictEqual(releases.length, 3, "the configured concurrency bound must hold");
+
+    host.repoInfo = newRepoInfo;
+    releases.splice(0).forEach((resolve) => resolve());
+    await Promise.all(firstWave);
+    assert.deepStrictEqual(observedRepos, [oldRepoInfo.repoId, oldRepoInfo.repoId, oldRepoInfo.repoId]);
+    assert.strictEqual(host.activeClaims.size, 0);
+  } finally {
+    if (previousRoot === undefined) delete process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+    else process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = previousRoot;
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 }
 
 async function nativeProtocolChecks() {
@@ -455,6 +500,7 @@ async function main() {
   await nativeProtocolChecks();
   await malformedCatalogChecks();
   await permissionPersistenceChecks();
+  await boundedParallelBridgeChecks();
 }
 
 main().then(() => {
