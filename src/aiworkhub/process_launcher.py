@@ -1106,6 +1106,65 @@ def _research_result_text(event: dict[str, Any]) -> str:
     return ""
 
 
+def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
+    """Return bounded, structured provider-auth evidence without secret text.
+
+    Only provider-owned JSONL fields are authoritative. Model prose and raw
+    error bodies are deliberately ignored so an agent cannot spoof a launch
+    failure or leak credentials into durable task state.
+    """
+
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        return None
+    size = int(st.st_size)
+    if size <= MAX_RECEIPT_SCAN_BYTES:
+        text = _read_byte_range(path, 0, size)
+    else:
+        half = MAX_RECEIPT_SCAN_BYTES // 2
+        text = _read_byte_range(path, 0, half) + "\n" + _read_byte_range(
+            path, size - half, half
+        )
+    for raw_line in text.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        raw_status = event.get("error_status", event.get("api_error_status"))
+        status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else 0
+        error_code = str(event.get("error") or "").strip().lower()
+        subtype = str(event.get("subtype") or "").strip().lower()
+        structured_auth_error = error_code in {
+            "authentication_failed",
+            "unauthorized",
+            "invalid_api_key",
+        }
+        structured_result_error = (
+            event.get("type") == "result"
+            and event.get("is_error") is True
+            and str(event.get("terminal_reason") or "").strip().lower() == "api_error"
+            and status in {401, 403}
+        )
+        structured_retry_error = (
+            event.get("type") == "system"
+            and subtype == "api_retry"
+            and status in {401, 403}
+            and structured_auth_error
+        )
+        if structured_result_error or structured_retry_error:
+            return {
+                "schema_id": "aiworkhub.provider_launch_failure.v1",
+                "reason": "provider_authentication_failed",
+                "http_status": status,
+            }
+    return None
+
+
 def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
     """Digest and validate one bounded provider stdout as research evidence.
 
@@ -3933,6 +3992,17 @@ class ProcessManager:
                 error = error or (
                     f"supervisor_incomplete:state={detail}:rc={supervisor_returncode}"
                 )
+            provider_launch_failure = None
+            if terminal_state == "worker_failed":
+                provider_launch_failure = _provider_auth_failure_from_output(
+                    Path(str(metadata["stdout_path"]))
+                )
+                if provider_launch_failure is not None:
+                    terminal_state = "launch_failed"
+                    error = (
+                        "provider_authentication_failed:http_status="
+                        + str(provider_launch_failure["http_status"])
+                    )
 
             changed: list[str] = []
             promoted: list[str] = []
@@ -3953,24 +4023,33 @@ class ProcessManager:
                     # pending. Retain the isolated worktree/candidate and
                     # logs until Codex's accept/reject decision instead of
                     # deleting the only evidence of what the worker did.
-                    cleanup = False
+                    cleanup = terminal_state == "launch_failed"
                     # A non-exited terminal outcome never promotes/writes and
                     # so never needs the one-task authority grant -- remove
                     # it now so it cannot linger as a stale, unconsumed
                     # artifact for a request that will never reach the
                     # success branch below.
                     unlink_if_regular(self._terminal_authority_grant_path(request_id))
-                    release_result = self._review_terminal_exact(
-                        metadata,
-                        terminal_state,
-                        request_id=request_id,
-                        error=error,
-                        evidence={
-                            "supervisor_state": supervisor_state,
-                            "exit_code": exit_code,
-                            "liveness_lost": liveness_lost,
-                        },
-                    )
+                    if terminal_state == "launch_failed":
+                        release_result = task_engine.mark_launch_failed(
+                            self.repo,
+                            str(metadata["task_id"]),
+                            str(metadata["runner"]),
+                            reason=error,
+                            request_id=request_id,
+                        )
+                    else:
+                        release_result = self._review_terminal_exact(
+                            metadata,
+                            terminal_state,
+                            request_id=request_id,
+                            error=error,
+                            evidence={
+                                "supervisor_state": supervisor_state,
+                                "exit_code": exit_code,
+                                "liveness_lost": liveness_lost,
+                            },
+                        )
                     if not release_result.get("ok"):
                         terminal_state = "release_pending"
                         error = error or (
@@ -4367,6 +4446,8 @@ class ProcessManager:
         to read (e.g. a direct/non-isolated launch, or a request that never
         reached "running"). Never mutates anything -- a pure read + derive.
         """
+        if latest.get("state") not in ACTIVE_PROCESS_STATES | FINALIZATION_PENDING_STATES:
+            return {}
         status_raw = latest.get("supervisor_status_path")
         if not status_raw:
             return {}

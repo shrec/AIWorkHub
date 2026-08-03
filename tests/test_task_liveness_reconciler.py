@@ -712,6 +712,73 @@ def test_non_exited_terminal_states_route_to_review_never_pending_and_enqueue_on
     assert len(release_calls) == 1
 
 
+def test_structured_provider_auth_failure_blocks_without_review_candidate(
+    tmp_path, monkeypatch,
+):
+    card = _card()
+    manager = _build_manager(tmp_path, card)
+    blocked_calls = []
+
+    def fake_launch_failed(repo, task_id, runner, *, reason, request_id=""):
+        blocked_calls.append((task_id, runner, reason, request_id))
+        card.update({"status": "blocked", "worker_status": "launch_failed"})
+        return {"ok": True}
+
+    monkeypatch.setattr(process_launcher.task_engine, "mark_launch_failed", fake_launch_failed)
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_review",
+        lambda *a, **k: pytest.fail("provider auth failure must not enter review"),
+    )
+    monkeypatch.setattr(process_launcher, "cleanup_workspace", lambda *a, **k: None)
+    request_id = "req-provider-auth"
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=2_147_483_011,
+        supervisor_ticks=999_999_996,
+        supervisor_status={
+            "state": "exited",
+            "exit_code": 1,
+            "started_at_epoch": time.time() - 5,
+            "finished_at_epoch": time.time() - 1,
+        },
+    )
+    stdout_path = tmp_path / "processes" / f"{request_id}.stdout.log"
+    stdout_path.write_text(
+        json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "api_error_status": 401,
+                "terminal_reason": "api_error",
+                "result": "secret-bearing provider text must not persist",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = manager._finalize_isolated_request(request_id)
+
+    assert result["state"] == "launch_failed"
+    assert result["workspace_retained"] is False
+    assert result["error"] == "provider_authentication_failed:http_status=401"
+    assert "secret-bearing" not in json.dumps(result)
+    assert blocked_calls == [
+        (
+            card["task_id"],
+            card["runner"],
+            "provider_authentication_failed:http_status=401",
+            request_id,
+        )
+    ]
+    assert card["status"] == "blocked"
+    assert manager.status(request_id)["liveness"] == {}
+
+
 @pytest.mark.parametrize("status,worker_status", [("review", "review_ready"), ("finished", "done")])
 def test_release_exact_is_idempotent_when_canonical_task_is_already_terminal(
     tmp_path, monkeypatch, status, worker_status,
