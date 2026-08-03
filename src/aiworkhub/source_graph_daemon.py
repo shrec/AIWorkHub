@@ -422,6 +422,7 @@ class SourceGraphDaemon:
                 and index_age_seconds > self.stale_after_seconds
             )
             reported_status = STATUS_STALE if stale else status
+            last_report = self._last_report or {}
             return {
                 "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE},
                 "status": reported_status,
@@ -432,6 +433,8 @@ class SourceGraphDaemon:
                 "started_at": self._started_at,
                 "last_run_at": self._last_run_at,
                 "last_success_at": self._last_success_at,
+                "build_revision": str(last_report.get("build_revision") or ""),
+                "files_seen": int(last_report.get("files_seen") or 0),
                 "index_age_seconds": index_age_seconds,
                 "stale_reason": "last_success_exceeded_threshold" if stale else "",
                 "last_report": self._last_report,
@@ -520,6 +523,8 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "started_at": "",
             "last_run_at": "",
             "last_success_at": "",
+            "build_revision": "",
+            "files_seen": 0,
             "index_age_seconds": None,
             "stale_reason": "",
             "last_report": None,

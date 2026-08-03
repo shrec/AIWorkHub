@@ -81,7 +81,9 @@ def claim_start_exact(
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
     try:
         row = conn.execute(
-            "SELECT runner, topic, card_json FROM tasks WHERE task_id=?", (task_id,)
+            "SELECT runner, topic, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
         ).fetchone()
         if row is None:
             conn.rollback()
@@ -101,24 +103,83 @@ def claim_start_exact(
             stored_card = {}
         if not isinstance(stored_card, dict):
             stored_card = {}
-        try:
-            claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
-        except (TypeError, ValueError):
-            claim_epoch = 1
-        prior_episode = task_store.begin_claim_episode(stored_card)
-        stored_card.update(
-            claim_epoch=claim_epoch,
-            launch_request_id=request_id,
-            status="processing",
-            worker_status="claimed",
-            claimed_by=runner,
-        )
-        cur = conn.execute(
-            "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
-            "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
-            "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
-            (json.dumps(stored_card, ensure_ascii=False, sort_keys=True), runner, now, now, now, task_id),
-        )
+        raw_card_json = str(row["card_json"] or "{}")
+        status = str(row["status"] or "").strip().lower()
+        worker_status = str(row["worker_status"] or "").strip().lower()
+        claimed_by = str(row["claimed_by"] or "")
+        attached_request_id = str(stored_card.get("launch_request_id") or "")
+
+        if status == "processing" and worker_status == "claimed" and claimed_by == runner:
+            if not request_id:
+                conn.rollback()
+                return {
+                    "ok": False, "returncode": 1, "command": command, "stdout": "",
+                    "stderr": f"claimed_task_requires_launch_request_id:task_id={task_id}",
+                }
+            if attached_request_id == request_id:
+                conn.rollback()
+                card = task_store.get_task(repo, task_id)
+                stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
+                return {
+                    "ok": True,
+                    "returncode": 0,
+                    "command": command,
+                    "stdout": stdout,
+                    "stderr": "",
+                    "claim_reconciled": True,
+                }
+            if attached_request_id:
+                conn.rollback()
+                return {
+                    "ok": False, "returncode": 1, "command": command, "stdout": "",
+                    "stderr": f"launch_request_conflict:task_id={task_id}",
+                }
+            stored_card["launch_request_id"] = request_id
+            cur = conn.execute(
+                "UPDATE tasks SET card_json=?, updated_at=? "
+                "WHERE task_id=? AND status='processing' AND worker_status='claimed' "
+                "AND claimed_by=? AND card_json=?",
+                (
+                    json.dumps(stored_card, ensure_ascii=False, sort_keys=True),
+                    now,
+                    task_id,
+                    runner,
+                    raw_card_json,
+                ),
+            )
+            event_name = "launch_attach"
+            try:
+                claim_epoch = int(stored_card.get("claim_epoch") or 0)
+            except (TypeError, ValueError):
+                claim_epoch = 0
+            prior_episode: dict[str, Any] = {}
+        else:
+            try:
+                claim_epoch = int(stored_card.get("claim_epoch") or 0) + 1
+            except (TypeError, ValueError):
+                claim_epoch = 1
+            prior_episode = task_store.begin_claim_episode(stored_card)
+            stored_card.update(
+                claim_epoch=claim_epoch,
+                launch_request_id=request_id,
+                status="processing",
+                worker_status="claimed",
+                claimed_by=runner,
+            )
+            cur = conn.execute(
+                "UPDATE tasks SET card_json=?, worker_status='claimed', status='processing', claimed_by=?, "
+                "claimed_at=?, started_at=?, completed_at=NULL, updated_at=? "
+                "WHERE task_id=? AND worker_status='unclaimed' AND status='pending'",
+                (
+                    json.dumps(stored_card, ensure_ascii=False, sort_keys=True),
+                    runner,
+                    now,
+                    now,
+                    now,
+                    task_id,
+                ),
+            )
+            event_name = "claim_start"
         if cur.rowcount != 1:
             conn.rollback()
             return {
@@ -128,7 +189,7 @@ def claim_start_exact(
         conn.execute(
             "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
             (
-                task_id, "claim_start", runner,
+                task_id, event_name, runner,
                 json.dumps(
                     {
                         "runner": runner,
@@ -216,6 +277,70 @@ def mark_terminal_review(
                     provider=provider,
                     episode_id=str(card.get("claim_epoch") or 0),
                     request_id=str((evidence or {}).get("request_id") or ""),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except task_store.TaskStoreError:
+            callback_enqueued = False
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+        "callback_enqueued": callback_enqueued,
+    }
+
+
+def mark_launch_failed(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    *,
+    reason: str,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Truthfully block a task whose worker process never launched."""
+    command = ["launch-failed", task_id, "--runner", runner]
+    try:
+        ok, state = task_store.mark_launch_failed(
+            repo,
+            task_id,
+            runner=runner,
+            reason=reason,
+            request_id=request_id,
+        )
+    except task_store.TaskStoreError as exc:
+        return {
+            "ok": False,
+            "returncode": 1,
+            "command": command,
+            "stdout": "",
+            "stderr": str(exc),
+            "callback_enqueued": False,
+        }
+    callback_enqueued = False
+    if ok:
+        card = task_store.get_task(repo, task_id) or {}
+        try:
+            _readiness, db_path = task_store._require_ready(repo)
+            conn = task_store._connect(db_path)
+            try:
+                callback_store.init_db(conn)
+                origin_thread_id = (
+                    callback_store.read_origin_thread(conn, task_id)
+                    or str(card.get("origin_thread_id") or "").strip()
+                )
+                provider = str(card.get("coordinator_provider") or "").strip().lower()
+                callback_enqueued = callback_store.enqueue_callback(
+                    conn,
+                    task_id,
+                    origin_thread_id,
+                    callback_store.resolve_callback_transition("launch_failed"),
+                    provider=provider,
+                    episode_id=str(card.get("claim_epoch") or 0),
+                    request_id=request_id,
                 )
                 conn.commit()
             finally:
@@ -392,6 +517,6 @@ def archive_task(
 
 
 __all__ = [
-    "show_task", "claim_start_exact", "mark_terminal_review", "accept_review",
+    "show_task", "claim_start_exact", "mark_terminal_review", "mark_launch_failed", "accept_review",
     "archive_task",
 ]

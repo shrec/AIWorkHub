@@ -2358,12 +2358,26 @@ class ProcessManager:
             raise LaunchRejected(f"runner_mismatch:{card.get('runner')}")
         if card.get("topic") != topic:
             raise LaunchRejected(f"topic_mismatch:{card.get('topic')}")
-        if core._lifecycle_state(card) != "pending":
-            raise LaunchRejected(f"task_not_pending:{core._lifecycle_state(card)}")
-        if str(card.get("worker_status") or "unclaimed") != "unclaimed":
-            raise LaunchRejected(f"task_not_unclaimed:{card.get('worker_status')}")
-        if card.get("claimed_by"):
-            raise LaunchRejected(f"task_already_claimed:{card.get('claimed_by')}")
+        lifecycle = core._lifecycle_state(card)
+        worker_status = str(card.get("worker_status") or "unclaimed")
+        claimed_by = str(card.get("claimed_by") or "")
+        launch_request_id = str(card.get("launch_request_id") or "")
+        if lifecycle == "pending":
+            if worker_status != "unclaimed":
+                raise LaunchRejected(f"task_not_unclaimed:{worker_status}")
+            if claimed_by:
+                raise LaunchRejected(f"task_already_claimed:{claimed_by}")
+        elif lifecycle == "processing":
+            if worker_status != "claimed" or claimed_by != runner:
+                raise LaunchRejected(
+                    f"task_claim_owner_mismatch:{claimed_by or 'unclaimed'}"
+                )
+            if launch_request_id:
+                raise LaunchRejected(
+                    f"task_launch_already_attached:{launch_request_id[:120]}"
+                )
+        else:
+            raise LaunchRejected(f"task_not_launchable:{lifecycle}")
         _validate_scope(self.repo, card)
         _validate_required_outputs_contract(card)
         path_conflicts = core.task_card_path_conflicts(card)
@@ -2595,9 +2609,9 @@ class ProcessManager:
             # committed) outputs into this dependent's isolated worktree by
             # declaring them as immutable inputs before create_workspace and the
             # B919 input-drift snapshot see the card.
-            card = self._with_dependency_inputs(
-                self._preflight_card(task_id, runner, topic, adapter_id)
-            )
+            card = self._preflight_card(task_id, runner, topic, adapter_id)
+            claimed = core._lifecycle_state(card) == "processing"
+            card = self._with_dependency_inputs(card)
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = project_context.collect_project_context(self.repo, card)
@@ -3015,31 +3029,23 @@ class ProcessManager:
             }
         except (LaunchRejected, project_context.ProjectContextError, WorkspaceError, OSError, ValueError) as exc:
             reason = str(exc)
-            # Once the public launch path has accepted an exact task identity,
-            # every outcome belongs to the manager review ledger.  Some
-            # failures (context collection, credential resolution, worktree
-            # creation, adapter planning) happen before the normal claim
-            # point; claim the still-pending exact card here so the canonical
-            # terminal transition cannot silently leave it in Pending.
-            if not claimed:
-                terminal_claim = task_engine.claim_start_exact(
-                    self.repo, task_id, runner, topic, request_id=request_id
-                )
-                claimed = bool(terminal_claim.get("ok"))
-                if not claimed:
-                    reason += ":terminal_claim_failed:" + str(
-                        terminal_claim.get("stderr") or terminal_claim.get("stdout") or ""
-                    )[:200]
+            # A pre-claim failure leaves a pending card pending.  Fabricating a
+            # claim merely to manufacture a terminal review was the source of
+            # false review-ready launch failures.  A card already claimed by
+            # auto-pickup, or claimed later in this launch, is instead moved to
+            # the truthful blocked/launch_failed state below.
             if claimed:
-                reviewed = task_engine.mark_terminal_review(
+                blocked_result = task_engine.mark_launch_failed(
                     self.repo,
                     task_id,
                     runner,
-                    "launch_failed",
-                    evidence={"request_id": request_id, "error": reason[:500]},
+                    reason=reason[:500],
+                    request_id=request_id or "",
                 )
-                if not reviewed.get("ok"):
-                    reason += ":terminal_review_failed:" + str(reviewed.get("stderr") or "")[:200]
+                if not blocked_result.get("ok"):
+                    reason += ":launch_failure_transition_failed:" + str(
+                        blocked_result.get("stderr") or ""
+                    )[:200]
             if workspace is not None:
                 try:
                     cleanup_workspace(workspace.repo, workspace.path, workspace.home)

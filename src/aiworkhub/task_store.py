@@ -1002,6 +1002,107 @@ def mark_terminal_review(
         conn.close()
 
 
+def mark_launch_failed(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    reason: str = "",
+    request_id: str = "",
+) -> tuple[bool, str]:
+    """Record a failed launch without fabricating worker review evidence.
+
+    A launch failure is an operational blocker, not a completed worker result.
+    The transition therefore ends at ``blocked/launch_failed`` and is guarded
+    by the exact launch request attached to the claim.  The compare-and-swap
+    update prevents a losing concurrent launcher from blocking the request
+    that actually acquired the card.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        if canonical_status(dict(row)) != "processing":
+            return False, f"not_processing:current={canonical_status(dict(row))}"
+        if str(row["worker_status"] or "") != "claimed":
+            return False, f"not_claimed:current={row['worker_status']}"
+        if str(row["claimed_by"] or "") != runner:
+            return False, "claim_owner_mismatch"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        attached_request_id = str(card.get("launch_request_id") or "")
+        if request_id:
+            if attached_request_id != request_id:
+                return False, "launch_request_mismatch"
+        elif attached_request_id:
+            return False, "launch_request_id_required"
+
+        now = datetime.now(timezone.utc).isoformat()
+        bounded_reason = reason[:500]
+        card.update(
+            status="blocked",
+            worker_status="launch_failed",
+            terminal_substatus="launch_failed",
+            launch_failed=True,
+            launch_error=bounded_reason,
+            blocker_reason=bounded_reason,
+            blocked_at=now,
+            blocked_by=runner,
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='launch_failed', "
+            "completed_at=?, updated_at=?, card_json=? "
+            "WHERE task_id=? AND status='processing' AND worker_status='claimed' "
+            "AND claimed_by=? AND card_json=?",
+            (
+                now,
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                runner,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "launch_failure_transition_conflict"
+        event = {
+            "reason": bounded_reason,
+            "request_id": request_id[:120],
+            "transition": "processing->blocked",
+            "worker_status": "launch_failed",
+            "recorded_at": now,
+            "runner": runner,
+        }
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'launch_failed', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "blocked"
+    finally:
+        conn.close()
+
+
 def restore_task(
     root: str | Path,
     task_id: str,
@@ -1305,6 +1406,7 @@ __all__ = [
     "initialize_repository",
     "list_tasks",
     "manager_decision_counts",
+    "mark_launch_failed",
     "mark_terminal_review",
     "quick_check",
     "restore_task",

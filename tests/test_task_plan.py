@@ -12,7 +12,7 @@ if str(_SRC) not in sys.path:
 from aiworkhub import task_plan  # noqa: E402
 
 
-def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_writes=None, depends_on=None, created_at="2026-01-01T00:00:00Z"):
+def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_writes=None, depends_on=None, created_at="2026-01-01T00:00:00Z", launch_request_id=None):
     return {
         "task_id": task_id,
         "status": status,
@@ -20,6 +20,11 @@ def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_write
         "allowed_writes": allowed_writes or [],
         "depends_on": depends_on or [],
         "created_at": created_at,
+        "launch_request_id": (
+            "request-existing"
+            if launch_request_id is None and status == "processing"
+            else (launch_request_id or "")
+        ),
     }
 
 

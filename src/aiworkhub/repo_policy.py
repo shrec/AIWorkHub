@@ -22,6 +22,7 @@ from . import (
     runtime_adapters,
     source_graph_daemon,
     task_store,
+    worker_workspace,
     workspace_hygiene,
 )
 
@@ -250,7 +251,22 @@ def validate_launch(repo_root: Path | str, card: Mapping[str, Any], adapter_id: 
     return {"ok": True, "reason": "ready", "configured": bool(policy["configured"])}
 
 
-def _provider_status(repo_root: Path, adapter_id: str, policy: Mapping[str, Any]) -> dict[str, Any]:
+_VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
+    {
+        runtime_adapters.VSCODE_LM_ADAPTER,
+        runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+        runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+    }
+)
+
+
+def _provider_status(
+    repo_root: Path,
+    adapter_id: str,
+    policy: Mapping[str, Any],
+    sandbox_backend: str,
+    sandbox_error: str,
+) -> dict[str, Any]:
     resolution = runtime_adapters.resolve_executable(adapter_id)
     result: dict[str, Any] = {
         "adapter_id": adapter_id,
@@ -314,6 +330,14 @@ def _provider_status(repo_root: Path, adapter_id: str, policy: Mapping[str, Any]
                 for value in observed_models[:128]
                 if isinstance(value, str) and value
             ]
+    if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+        result["sandbox_backend"] = "vscode_lm_in_process"
+    else:
+        result["sandbox_backend"] = sandbox_backend
+        if not sandbox_backend:
+            result["launchable"] = False
+            result["status"] = "sandbox_unavailable"
+            result["reason"] = sandbox_error or "sandbox_unavailable"
     if not result["policy_allowed"]:
         result["launchable"] = False
         result["status"] = "policy_denied"
@@ -344,12 +368,22 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     if missing_checks:
         errors.append("required_validation_missing")
     source_health = source_graph_daemon.daemon_health(root)
-    if policy["tools"]["source_graph_required_for_code"] and (
-        not source_health.get("running") or not source_health.get("ok")
-    ):
+    source_graph_ready_for_code = (
+        bool(source_health.get("running"))
+        and source_health.get("status") == source_graph_daemon.STATUS_READY
+        and bool(source_health.get("last_success_at"))
+        and bool(source_health.get("build_revision"))
+    )
+    if policy["tools"]["source_graph_required_for_code"] and not source_graph_ready_for_code:
         errors.append("source_graph_not_ready")
+    try:
+        sandbox_backend = worker_workspace.select_sandbox_backend()
+        sandbox_error = ""
+    except worker_workspace.WorkspaceError as exc:
+        sandbox_backend = ""
+        sandbox_error = str(exc)[:200]
     providers = [
-        _provider_status(root, name, policy)
+        _provider_status(root, name, policy, sandbox_backend, sandbox_error)
         for name in runtime_adapters.LOCAL_ADAPTERS
     ]
     selected = next((item for item in providers if item["adapter_id"] == adapter_id), None)
@@ -404,8 +438,19 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "retention": dict(policy["retention"]),
         },
         "source_graph": {
-            key: source_health.get(key)
-            for key in ("ok", "status", "running", "registered", "last_success_at", "stale_reason")
+            **{
+                key: source_health.get(key)
+                for key in (
+                    "ok", "status", "running", "registered", "last_success_at",
+                    "stale_reason", "build_revision", "files_seen",
+                )
+            },
+            "ready_for_code": source_graph_ready_for_code,
+        },
+        "sandbox": {
+            "backend": sandbox_backend,
+            "enforceable": bool(sandbox_backend),
+            "reason": sandbox_error,
         },
         "callback": {
             key: callback_health.get(key)

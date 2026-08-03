@@ -170,7 +170,7 @@ def test_exact_claim_fails_closed_on_non_pending_task(repo):
     )
     claimed = task_engine.claim_start_exact(repo, "TASK_B882D", CARD_RUNNER, CARD_TOPIC)
     assert claimed["ok"] is False
-    assert "ineligible" in str(claimed.get("stderr") or "")
+    assert "claimed_task_requires_launch_request_id" in str(claimed.get("stderr") or "")
 
 
 def test_exact_claim_is_idempotent_never_double_claims(repo):
@@ -179,7 +179,7 @@ def test_exact_claim_is_idempotent_never_double_claims(repo):
     assert first["ok"] is True
     second = task_engine.claim_start_exact(repo, "TASK_B882E", CARD_RUNNER, CARD_TOPIC, request_id="req-2")
     assert second["ok"] is False
-    assert "ineligible" in str(second.get("stderr") or "")
+    assert "card_scoped_claim_start_ineligible:processing" in str(second.get("stderr") or "")
     row = _row(repo, "TASK_B882E")
     assert row["worker_status"] == "claimed"
     card = json.loads(row["card_json"])

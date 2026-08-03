@@ -1906,6 +1906,17 @@ def _check_card_scoped_write_authority(
         worker_status = str(card.get("worker_status") or "unclaimed")
         if lifecycle == "pending" and worker_status == "unclaimed" and not claimed_by:
             return {"allowed": True, "reason": "card_scoped_claim_start_allowed"}
+        if (
+            lifecycle == "processing"
+            and worker_status == "claimed"
+            and claimed_by == runner
+            and not str(card.get("launch_request_id") or "")
+        ):
+            # ``auto-pickup`` owns the claim but has no process request yet.
+            # Permit only the exact card owner to enter the narrower
+            # claim-start path; task_engine then compare-and-swaps the concrete
+            # launch_request_id and rejects concurrent/different requests.
+            return {"allowed": True, "reason": "card_scoped_launch_attach_allowed"}
         return {"allowed": False, "reason": f"card_scoped_claim_start_ineligible:{lifecycle}"}
     if claimed_by != runner:
         return {"allowed": False, "reason": f"card_scoped_claimed_by_mismatch:{claimed_by}"}

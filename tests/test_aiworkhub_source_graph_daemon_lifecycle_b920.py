@@ -343,6 +343,25 @@ def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_da
     assert health["last_error"] == ""
 
 
+def test_health_exposes_successful_build_identity_at_top_level(tmp_path, cleanup_daemons):
+    root = tmp_path / "never_initialized"
+    root.mkdir()
+    never_registered = source_graph_daemon.daemon_health(root)
+    assert never_registered["build_revision"] == ""
+    assert never_registered["files_seen"] == 0
+
+    real_root = _init_repo(tmp_path, "revision_repo")
+    cleanup_daemons.append(real_root)
+    daemon = source_graph_daemon.SourceGraphDaemon(real_root)
+    assert daemon._run_one_build() is True
+    health = daemon.health()
+    assert health["status"] == source_graph_daemon.STATUS_READY
+    assert health["build_revision"] == health["last_report"]["build_revision"]
+    assert health["build_revision"]
+    assert health["files_seen"] == health["last_report"]["files_seen"]
+    assert health["files_seen"] > 0
+
+
 def test_prior_build_probe_failure_is_degraded_not_dead_indexing(tmp_path, monkeypatch):
     root = _init_repo(tmp_path)
     daemon = source_graph_daemon.SourceGraphDaemon(root)

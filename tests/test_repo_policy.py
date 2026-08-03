@@ -119,7 +119,12 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
             "registered": True,
             "last_success_at": "2026-07-30T14:00:00+00:00",
             "stale_reason": "",
+            "build_revision": "aiworkhub.source_graph.semantic.v5",
+            "files_seen": 4,
         },
+    )
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap"
     )
     monkeypatch.setattr(
         repo_policy.task_store,
@@ -186,6 +191,10 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     ]
     assert by_adapter["claude_cli"]["status"] == "ready"
     assert by_adapter["claude_cli"]["access_observed"] is True
+    assert by_adapter["claude_cli"]["sandbox_backend"] == "bubblewrap"
+    assert by_adapter["vscode_lm"]["sandbox_backend"] == "vscode_lm_in_process"
+    assert report["sandbox"] == {"backend": "bubblewrap", "enforceable": True, "reason": ""}
+    assert report["source_graph"]["ready_for_code"] is True
     assert report["callback"]["backlog_count"] == 0
     serialized = json.dumps(report, sort_keys=True)
     assert "/private/host" not in serialized

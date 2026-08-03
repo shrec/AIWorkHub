@@ -286,11 +286,25 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if active_candidates:
             critical_path = max(active_candidates, key=lambda value: (len(value), value))
 
+    orphaned_processing_task_ids = sorted(
+        tid
+        for tid, value in lifecycle.items()
+        if value == "processing"
+        and not str(by_id[tid].get("launch_request_id") or "").strip()
+    )
+    operational_blockers = {
+        tid: "processing_without_launch_request"
+        for tid in orphaned_processing_task_ids
+    }
     dependency_blocked_ids = sorted(tid for tid, value in blockers.items() if value)
     lifecycle_blocked_ids = sorted(
         tid for tid, value in lifecycle.items() if value == "blocked"
     )
-    blocked_task_ids = sorted(set(dependency_blocked_ids) | set(lifecycle_blocked_ids))
+    blocked_task_ids = sorted(
+        set(dependency_blocked_ids)
+        | set(lifecycle_blocked_ids)
+        | set(orphaned_processing_task_ids)
+    )
 
     return {
         "task_ids": sorted(by_id),
@@ -311,6 +325,9 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "dependency_blocked_task_ids": dependency_blocked_ids,
         "lifecycle_blocked_count": len(lifecycle_blocked_ids),
         "lifecycle_blocked_task_ids": lifecycle_blocked_ids,
+        "operational_blockers": operational_blockers,
+        "orphaned_processing": orphaned_processing_task_ids,
+        "orphaned_processing_count": len(orphaned_processing_task_ids),
         "edge_count": sum(len(value) for value in dependencies.values()),
         "layers": layers,
         "critical_path": critical_path,

@@ -254,6 +254,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
 # ---------------------------------------------------------------------------
 
 _FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_SQLITE_LIKE_ESCAPE_RE = re.compile(r"([%_\\\\])")
 
 
 def _fts_match_expr(raw: str) -> str | None:
@@ -268,6 +269,10 @@ def _fts_match_expr(raw: str) -> str | None:
     if not tokens:
         return None
     return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+
+def _sqlite_like_literal(raw: str) -> str:
+    return _SQLITE_LIKE_ESCAPE_RE.sub(r"\\\1", raw)
 
 
 def _open_readonly_db(path: Path, *, tool: str) -> sqlite3.Connection:
@@ -1461,39 +1466,67 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
     try:
-        rows: list[sqlite3.Row] = []
-        match_expr = _fts_match_expr(ctx.session_topic)
-        if match_expr is not None:
-            try:
-                rows = con.execute(
-                    "SELECT d.source_id AS source_id, d.timestamp AS timestamp, "
-                    "d.kind AS kind, d.content AS content FROM documents d "
-                    "JOIN documents_fts f ON d.doc_id = f.rowid "
-                    "WHERE documents_fts MATCH ? ORDER BY d.timestamp DESC LIMIT ?",
-                    (match_expr, limit),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []
-        if not rows:
+        doc_columns = {
+            str(row[1])
+            for row in con.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        selected_columns = [
+            column for column in (
+                "source", "source_id", "session_id", "timestamp",
+                "kind", "speaker", "content", "tags",
+            )
+            if column in doc_columns
+        ]
+        if not {"source_id", "content"}.issubset(selected_columns):
+            raise WorkerToolError("transcript_schema_missing_core_columns")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if "tags" in doc_columns:
+            clauses.append("tags = ?")
+            params.append(ctx.session_topic)
+        if "source_id" in doc_columns:
+            topic_like = _sqlite_like_literal(ctx.session_topic)
+            clauses.append("(source_id = ? OR source_id LIKE ? ESCAPE '\\')")
+            params.extend((ctx.session_topic, f"%:{topic_like}"))
+        if not clauses:
+            rows = []
+        else:
             rows = con.execute(
-                "SELECT source_id, timestamp, kind, content FROM documents "
+                f"SELECT {','.join(selected_columns)} FROM documents "
+                f"WHERE {' OR '.join(clauses)} "
                 "ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
+                (*params, limit),
             ).fetchall()
     except sqlite3.Error as exc:
         return _violation(ctx, tool, f"tool_query_failed:{tool}:{exc}"[:160])
+    except WorkerToolError as exc:
+        return _violation(ctx, tool, str(exc)[:160])
     finally:
         con.close()
 
     evidence = [
         {
-            "source_id": row["source_id"], "timestamp": row["timestamp"], "kind": row["kind"],
+            "source": row["source"] if "source" in row.keys() else "",
+            "source_id": row["source_id"],
+            "session_id": row["session_id"] if "session_id" in row.keys() else None,
+            "topic": row["tags"] if "tags" in row.keys() else ctx.session_topic,
+            "speaker": row["speaker"] if "speaker" in row.keys() else "",
+            "timestamp": row["timestamp"] if "timestamp" in row.keys() else "",
+            "kind": row["kind"] if "kind" in row.keys() else "",
             "snippet": (row["content"] or "")[:SESSION_SNIPPET_CHARS],
         }
         for row in rows
     ]
-    state = "unknown" if not evidence else ("current" if len(evidence) == 1 else "superseded")
-    payload = {"topic": ctx.session_topic, "state": state, "evidence_count": len(evidence), "evidence": evidence}
+    state = "unknown" if not evidence else "current"
+    payload = {
+        "topic": ctx.session_topic, "state": state, "evidence_count": len(evidence),
+        "evidence": evidence,
+        "authority": {
+            "source": session_binding.authority_source,
+            "state": session_binding.authority_state,
+            "repo": str(ctx.authority_repo),
+        },
+    }
     text, truncated = _bounded_text(
         json.dumps(payload, ensure_ascii=False, sort_keys=True), MAX_TOOL_OUTPUT_BYTES,
     )
