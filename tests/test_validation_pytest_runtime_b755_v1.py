@@ -215,6 +215,25 @@ class TestIsPytestValidationCommand(unittest.TestCase):
         self.assertFalse(worker_workspace._is_pytest_validation_command(["python3", "AITools/taskctl.py", "verify"]))
         self.assertFalse(worker_workspace._is_pytest_validation_command([]))
 
+    def test_console_script_spelling_uses_trusted_running_interpreter(self) -> None:
+        self.assertEqual(
+            worker_workspace._normalize_pytest_validation_argv(
+                ["pytest", "-q", "tests/test_example.py"]
+            ),
+            [
+                worker_workspace.sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_example.py",
+            ],
+        )
+        explicit = ["python3", "-m", "pytest", "--version"]
+        self.assertEqual(
+            worker_workspace._normalize_pytest_validation_argv(explicit),
+            explicit,
+        )
+
 
 # --- 4. run_validations end-to-end: success, fail-closed, unchanged non-pytest, credentials, cleanup ---
 
@@ -224,6 +243,30 @@ class TestIsPytestValidationCommand(unittest.TestCase):
     "GitHub hosted runners cannot execute nested Landlock validation sandboxes",
 )
 class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
+    def test_pytest_console_script_spelling_is_normalized_before_sandbox_exec(self) -> None:
+        fake_root = self.tmp_path / "trusted_site_packages_console"
+        fake_root.mkdir()
+        os.chmod(fake_root, 0o755)
+        _write_fake_pytest_package(fake_root)
+        repo, workspace = _manual_workspace(self.tmp_path, "b755-console-script")
+        try:
+            with mock.patch.object(
+                worker_workspace.site,
+                "getusersitepackages",
+                return_value=str(fake_root),
+            ):
+                results = worker_workspace.run_validations(
+                    workspace, ["pytest --version"]
+                )
+            self.assertEqual(results[0]["returncode"], 0)
+            self.assertEqual(
+                results[0]["argv"][:3],
+                [worker_workspace.sys.executable, "-m", "pytest"],
+            )
+            self.assertIn("FAKE_PYTEST_MAIN_OK --version", results[0]["stdout_tail"])
+        finally:
+            worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
     def test_pytest_command_succeeds_with_trusted_root_prepended_and_project_pythonpath_preserved(self) -> None:
         fake_root = self.tmp_path / "trusted_site_packages"
         fake_root.mkdir()

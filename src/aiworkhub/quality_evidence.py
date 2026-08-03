@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ast
+import fnmatch
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,8 @@ RISK_CRITICAL = "critical"
 RISK_TIERS = (RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL)
 _RISK_RANK = {tier: index for index, tier in enumerate(RISK_TIERS)}
 _RISK_SIGNAL_FLOORS = {
+    "code_change": RISK_MEDIUM,
+    "missing_validation": RISK_HIGH,
     "public_api": RISK_MEDIUM,
     "combined_change": RISK_MEDIUM,
     "authority_boundary": RISK_HIGH,
@@ -74,6 +77,60 @@ _RISK_SIGNAL_FLOORS = {
     "security_sensitive": RISK_HIGH,
     "release": RISK_CRITICAL,
 }
+
+_SOURCE_CODE_SUFFIXES = frozenset({
+    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
+    ".jsx", ".kt", ".php", ".py", ".pyi", ".rb", ".rs", ".swift",
+    ".ts", ".tsx",
+})
+
+
+def derive_risk_signals(
+    card: Mapping[str, Any],
+    changed_paths: Iterable[str],
+    *,
+    destructive_checks: Iterable[EvidenceCheck | Mapping[str, Any]] = (),
+) -> list[str]:
+    """Derive monotonic quality floors from the exact card and candidate diff.
+
+    Manager-supplied signals may add stricter floors later, but cannot erase
+    these observed signals. Detection is deliberately deterministic and
+    path/card based; worker prose is never an authority source.
+    """
+
+    paths = tuple(sorted(dict.fromkeys(str(value) for value in changed_paths)))
+    lowered = tuple(path.replace("\\", "/").lower() for path in paths)
+    signals: set[str] = set()
+    task_type = str(card.get("task_type") or "").strip().lower()
+    if task_type == "code" or any(Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES for path in paths):
+        signals.add("code_change")
+    if task_type == "code" and not (card.get("validation") or []):
+        signals.add("missing_validation")
+    if len(paths) > 1:
+        signals.add("combined_change")
+
+    def path_has(*markers: str) -> bool:
+        return any(any(marker in path for marker in markers) for path in lowered)
+
+    if path_has("/__init__.py", "/api/", "server.py", "runtime_adapters.py", "public/"):
+        signals.add("public_api")
+    if path_has("authority", "permission", "policy", "sandbox", "credential", "identity", "route"):
+        signals.add("authority_boundary")
+    if path_has("thread", "concurr", "callback", "queue", "process_launcher", "worker_workspace"):
+        signals.add("concurrency")
+    if path_has("migration", "schema", "sqlite", "database", "task_store.py", "storage.py"):
+        signals.add("schema_migration")
+    if path_has("security", "crypto", "secret", "token", "credential", "auth", "sandbox", "permission"):
+        signals.add("security_sensitive")
+    if path_has("pyproject.toml", "package.json", "/release", ".github/workflows/"):
+        signals.add("release")
+
+    for check in destructive_checks:
+        payload = check.to_dict() if isinstance(check, EvidenceCheck) else dict(check)
+        if payload.get("status") == STATUS_FAILED:
+            signals.add("destructive_change")
+            break
+    return sorted(signals)
 _RISK_PROFILES: dict[str, dict[str, Any]] = {
     RISK_LOW: {
         "required_reviewer_lenses": (),
@@ -132,6 +189,8 @@ CONFIG_RELATIVE_PATH = ".aiworkhub/quality.json"
 MAX_AFFECTED_PATHS = 200
 MAX_SUMMARY_CHARS = 2000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
+MAX_CHECK_PATH_PATTERNS = 64
+MAX_CHECK_PATH_PATTERN_BYTES = 256
 DESTRUCTIVE_SOURCE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".bash"})
 DESTRUCTIVE_MIN_BASELINE_LINES = 200
 DESTRUCTIVE_MIN_REMOVED_LINES = 100
@@ -619,6 +678,62 @@ def _validate_declared_check(entry: Any) -> None:
         raise MalformedConfigError(
             f"declared check {check_id!r} 'command' must be a non-empty array of strings (shell=False only)"
         )
+    paths = entry.get("paths")
+    if paths is not None:
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or len(paths) > MAX_CHECK_PATH_PATTERNS
+            or not all(isinstance(pattern, str) and pattern.strip() for pattern in paths)
+        ):
+            raise MalformedConfigError(
+                f"declared check {check_id!r} 'paths' must be a bounded non-empty array of patterns"
+            )
+        for pattern in paths:
+            normalized = pattern.strip().replace("\\", "/")
+            if (
+                len(normalized.encode("utf-8")) > MAX_CHECK_PATH_PATTERN_BYTES
+                or normalized.startswith("/")
+                or "\x00" in normalized
+                or ".." in normalized.split("/")
+            ):
+                raise MalformedConfigError(
+                    f"declared check {check_id!r} has unsafe path pattern"
+                )
+    minimum_risk = entry.get("minimum_risk")
+    if minimum_risk is not None and minimum_risk not in _RISK_RANK:
+        raise MalformedConfigError(
+            f"declared check {check_id!r} has invalid 'minimum_risk': {minimum_risk!r}"
+        )
+
+
+def _declared_check_applicability(
+    entry: Mapping[str, Any],
+    *,
+    changed_paths: tuple[str, ...],
+    effective_risk_tier: str,
+) -> tuple[bool, str]:
+    """Return deterministic applicability for one declared check.
+
+    An absent ``paths`` selector preserves the historical always-run policy.
+    Empty changed-path evidence also runs conservatively; filtering is only
+    allowed when the caller supplied an exact task delta.
+    """
+
+    minimum_risk = str(entry.get("minimum_risk") or RISK_LOW)
+    if _RISK_RANK[effective_risk_tier] < _RISK_RANK[minimum_risk]:
+        return False, f"risk_below_minimum:{effective_risk_tier}<{minimum_risk}"
+    patterns = tuple(
+        str(pattern).strip().replace("\\", "/")
+        for pattern in (entry.get("paths") or ())
+    )
+    if not patterns or not changed_paths:
+        return True, ""
+    for relative in changed_paths:
+        normalized = relative.replace("\\", "/")
+        if any(fnmatch.fnmatchcase(normalized, pattern) for pattern in patterns):
+            return True, ""
+    return False, "changed_paths_not_applicable"
 
 
 def _run_command_array(
@@ -688,6 +803,7 @@ def run_declared_checks(
     *,
     changed_paths: Iterable[str] | None = None,
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    effective_risk_tier: str = RISK_LOW,
 ) -> list[EvidenceCheck]:
     """Execute repo-local declared quality/security commands for one task delta.
 
@@ -698,12 +814,32 @@ def run_declared_checks(
 
     root = Path(repo_root)
     config = load_repo_config(root)
+    if effective_risk_tier not in _RISK_RANK:
+        raise MalformedConfigError(
+            f"unknown effective risk tier: {effective_risk_tier!r}"
+        )
     affected = tuple(sorted(str(p) for p in (changed_paths or ())))
     results: list[EvidenceCheck] = []
     for entry in config.get("checks", []):
         check_id = str(entry["id"])
         kind = str(entry["kind"])
         command = tuple(str(part) for part in entry["command"])
+        applies, skip_reason = _declared_check_applicability(
+            entry,
+            changed_paths=affected,
+            effective_risk_tier=effective_risk_tier,
+        )
+        if not applies:
+            results.append(EvidenceCheck(
+                check_id=check_id,
+                kind=kind,
+                status=STATUS_SKIPPED,
+                command=command,
+                affected_paths=affected,
+                summary=skip_reason,
+                provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:applicability",
+            ))
+            continue
         status, stdout, stderr, duration = _run_command_array(
             command, cwd=root, timeout_seconds=timeout_seconds
         )
@@ -854,16 +990,23 @@ def run_completion_quality_gate(
             "reason": str(exc)[:MAX_SUMMARY_CHARS],
         }
     try:
+        risk_profile = resolve_risk_profile(requested_risk_tier, signals=risk_signals)
         checks = run_builtin_static_checks(root, changed_paths=affected)
-        declared = run_declared_checks(root, changed_paths=affected)
+        declared = run_declared_checks(
+            root,
+            changed_paths=affected,
+            effective_risk_tier=str(risk_profile["effective_tier"]),
+        )
         config_error = ""
     except MalformedConfigError as exc:
         checks = []
         declared = []
         config_error = str(exc)
+        risk_profile = {}
     all_checks = [*checks, *declared]
     try:
-        risk_profile = resolve_risk_profile(requested_risk_tier, signals=risk_signals)
+        if not risk_profile:
+            raise MalformedConfigError(config_error or "risk_profile_unavailable")
         verdict = fold_quality_verdict(
             all_checks,
             risk_profile=risk_profile,

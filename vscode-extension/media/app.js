@@ -2788,18 +2788,61 @@ function toolResultEventFromUserMessage(event, rawLine) {
 // reads -- so callers must treat it as supported, ignorable metadata, never
 // as an unrecognized shape. delta.type "text_delta" carries user-visible
 // assistant text and must keep rendering normally.
-function claudeStreamContentBlockDelta(event) {
+function claudeStreamInnerEvent(event) {
   if (!event || typeof event !== "object" || event.type !== "stream_event") {
     return null;
   }
   const inner = event.event && typeof event.event === "object" ? event.event : null;
+  return inner;
+}
+
+function claudeStreamContentBlockDelta(event) {
+  const inner = claudeStreamInnerEvent(event);
   if (!inner || inner.type !== "content_block_delta") {
     return null;
   }
   return inner.delta && typeof inner.delta === "object" ? inner.delta : null;
 }
 
+function claudeStreamNoopEvent(event) {
+  const inner = claudeStreamInnerEvent(event);
+  return Boolean(inner && ["content_block_stop", "message_stop"].includes(inner.type));
+}
+
+function claudeStreamMessageDeltaEvent(event, rawLine) {
+  const inner = claudeStreamInnerEvent(event);
+  if (!inner || inner.type !== "message_delta") {
+    return null;
+  }
+  const delta = inner.delta && typeof inner.delta === "object" ? inner.delta : {};
+  const usage = inner.usage && typeof inner.usage === "object" ? inner.usage : {};
+  const stopReason = firstText(delta.stop_reason);
+  const stopSequence = firstText(delta.stop_sequence);
+  const outputTokens = firstText(usage.output_tokens);
+  const details = [
+    stopReason ? `stop ${redactDisplayText(stopReason, 48)}` : "",
+    stopSequence ? `sequence ${redactDisplayText(stopSequence, 48)}` : "",
+    outputTokens ? `${formatCount(outputTokens)} output tokens` : "",
+  ].filter(Boolean);
+  return {
+    kind: "event",
+    title: "Message delta",
+    label: "message delta",
+    state: stopReason ? "completed" : "running",
+    message: details.join(" | ") || "Message metadata updated",
+    metrics: [],
+    raw: safeRawEvent(rawLine),
+  };
+}
+
 function timelineEventFromObject(event, rawLine) {
+  if (claudeStreamNoopEvent(event)) {
+    return null;
+  }
+  const messageDeltaEvent = claudeStreamMessageDeltaEvent(event, rawLine);
+  if (messageDeltaEvent) {
+    return messageDeltaEvent;
+  }
   const streamDelta = claudeStreamContentBlockDelta(event);
   if (streamDelta && streamDelta.type === "signature_delta") {
     // Internal protocol metadata -- silently dropped from the human-readable

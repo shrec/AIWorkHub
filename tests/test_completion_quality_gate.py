@@ -70,6 +70,60 @@ def test_completion_quality_gate_accepts_codeql_like_static_analysis_kind(tmp_pa
     assert declared["status"] == "passed"
 
 
+def test_declared_check_skips_unrelated_exact_delta(tmp_path) -> None:
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "checks": [{
+            "id": "extension-only",
+            "kind": "test",
+            "command": ["python3", "-c", "raise SystemExit(19)"],
+            "paths": ["vscode-extension/**"],
+        }]
+    }), encoding="utf-8")
+    (tmp_path / "good.py").write_text("value = 1\n", encoding="utf-8")
+
+    packet = quality_evidence.run_completion_quality_gate(
+        tmp_path, changed_paths=["good.py"]
+    )
+
+    assert packet["passed"] is True
+    row = next(check for check in packet["checks"] if check["check_id"] == "extension-only")
+    assert row["status"] == "skipped"
+    assert row["summary"] == "changed_paths_not_applicable"
+
+
+def test_declared_check_runs_for_matching_delta_and_respects_minimum_risk(tmp_path) -> None:
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "checks": [{
+            "id": "high-risk-python",
+            "kind": "test",
+            "command": ["python3", "-c", "raise SystemExit(19)"],
+            "paths": ["src/*.py"],
+            "minimum_risk": "high",
+        }]
+    }), encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "engine.py").write_text("value = 1\n", encoding="utf-8")
+
+    low = quality_evidence.run_declared_checks(
+        tmp_path,
+        changed_paths=["src/engine.py"],
+        effective_risk_tier="low",
+    )
+    high = quality_evidence.run_declared_checks(
+        tmp_path,
+        changed_paths=["src/engine.py"],
+        effective_risk_tier="high",
+    )
+
+    assert low[0].status == "skipped"
+    assert low[0].summary == "risk_below_minimum:low<high"
+    assert high[0].status == "failed"
+
+
 def test_destructive_diff_blocks_multi_signal_module_replacement(tmp_path) -> None:
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"

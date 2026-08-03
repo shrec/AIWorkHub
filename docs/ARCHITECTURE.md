@@ -148,6 +148,14 @@ Source Graph + Session + AI Memory + KB bundle a code task receives, and
 report requested-vs-executed hit counts, bytes, and hashes rather than
 claiming injected context was consumed.
 
+`process_launcher.build_worker_prompt` applies a second envelope around that
+bundle: exact byte ceilings for coordinator context, task contract and total
+prompt; compact canonical contract serialization; and separate initial versus
+residual-rework limits. A rework card points at a retained, hash-pinned
+predecessor workspace and carries only bounded feedback and residual identities.
+The process ledger records the prompt section byte breakdown so dashboard KPI
+comparisons can be measured without presenting byte estimates as token truth.
+
 Authenticated worker receipts feed both Source Graph-specific economics and a
 generic per-tool ledger. Dashboard aggregation therefore distinguishes calls,
 successful calls, bounded bytes and cache hits for Source Graph, Session

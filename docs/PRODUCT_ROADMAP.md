@@ -1,6 +1,6 @@
 # AIWorkHub Product Roadmap
 
-Status: canonical product direction after the 0.8.35 repository, orchestration,
+Status: canonical product direction after the 0.8.45 repository, orchestration,
 storage, CI, and tool-use closure. This roadmap separates shipped capability
 from partial capability and planned work. A design document or canary is not a
 shipped feature.
@@ -83,6 +83,11 @@ AIWorkHub telemetry.
   negative calibration, independent read-only review and combined-tree
   validation. Shared-worktree registration attribution is exact-layout,
   digest-bound, explicitly confirmed and foreign-stale fail-closed.
+- Quality activation is now change-sensitive at the risk-policy boundary:
+  mutating code cards require validation, deterministic card/path/diff signals
+  raise a monotonic risk floor, and the Claude worker contract includes the
+  signed reviewer-submission tool. Mutation/revert-to-red probes and durable
+  post-accept escape metrics remain open.
 - The VS Code authenticated model broker is not fully qualified across every
   provider's first-party and Copilot authorization surface.
 - Task/tool telemetry authenticates generic MCP calls as well as Source Graph
@@ -92,6 +97,18 @@ AIWorkHub telemetry.
   topic/tool-use cohorts and measured raw-path-versus-delivered-bundle byte economics.
   Durable daily rollups beyond retained process logs, normalized task classes,
   tokenizer-bound counterfactuals and accepted-change-per-dollar remain open.
+- Worker prompt budgeting now records exact per-section byte accounting,
+  distinguishes initial from residual rework packets, enforces a smaller
+  rework ceiling, and persists only bounded review feedback plus immutable
+  predecessor/residual references. Tokenizer-bound A/B outcome calibration
+  remains open. Canonical usage now preserves provider/model/attempt identity,
+  cached/cache-creation token populations and explicit cache/cost observation;
+  provider pricing completeness and accepted-change-per-dollar remain open.
+- Structure-aware bounded JSON previews preserve ranked symbols, related tests,
+  risks, todos and recommended next steps under truncation. A provider-neutral
+  token-ceiling kernel is being qualified; live supervisor termination and
+  per-task policy/UI configuration remain open and must not be claimed from
+  post-hoc usage alone.
 - The brand foundation, concise public README and registry workflows are
   present. Registry-owner setup, public screenshots/GIF and long-form launch
   material remain open.
@@ -230,6 +247,14 @@ Report locally, by repository/task/run/model/adapter:
 - compare cohorts (continuous-use vs injected-only vs fallback-heavy) only when
   sample sizes and task classes are shown. Do not claim causation from a raw
   correlation.
+- Exact initial/rework prompt bytes, configured byte ceiling, utilization and
+  contract/project-context/coordinator-context section breakdown are shipped.
+  These remain byte measurements, never token-savings claims. Rework carries
+  bounded feedback and residual identities against a hash-pinned retained
+  predecessor workspace instead of replaying the previous task/result envelope.
+- Canonical cost-ledger rows preserve every retry attempt and aggregate by
+  provider and model. Cache-hit ratios use only rows where the provider
+  actually exposed cache metrics; missing telemetry is unknown, never zero.
 
 No prompt text, source content, credentials, or memory content enters these
 statistics. Retention is bounded and repository-local.
@@ -317,6 +342,12 @@ tracked/untracked delta (including deletions) and then the exact retained
 candidate, executes validations and the deterministic quality floor there,
 and records bounded union evidence before promotion. High/critical profiles
 also fail closed without an explicit manager approval bit.
+
+Repository-declared checks may now state bounded repo-relative `paths` and a
+monotonic `minimum_risk`. Exact changed-path evidence skips only demonstrably
+irrelevant checks; absent selectors and absent delta evidence preserve the
+historical conservative always-run behavior. Skips remain explicit evidence,
+while every applicable declared check is still mandatory and fail-closed.
 
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and

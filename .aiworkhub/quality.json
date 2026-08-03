@@ -11,6 +11,14 @@
         "tests/test_completion_quality_gate.py",
         "tests/test_quality_verdict_v2.py",
         "tests/test_combined_tree_workspace.py"
+      ],
+      "paths": [
+        ".aiworkhub/quality.json",
+        "src/aiworkhub/quality*.py",
+        "src/aiworkhub/known_bug_scanner.py",
+        "src/aiworkhub/worker_workspace.py",
+        "tests/test_*quality*.py",
+        "tests/test_combined_tree_workspace.py"
       ]
     },
     {
@@ -22,6 +30,14 @@
         "src/aiworkhub",
         "scripts",
         "tests"
+      ],
+      "paths": [
+        "*.py",
+        "src/**/*.py",
+        "scripts/*.py",
+        "scripts/**/*.py",
+        "tests/*.py",
+        "tests/**/*.py"
       ]
     },
     {
@@ -29,7 +45,8 @@
       "kind": "typecheck",
       "command": [
         "mypy"
-      ]
+      ],
+      "paths": ["src/aiworkhub/*.py", "src/aiworkhub/**/*.py"]
     },
     {
       "id": "extension-regression",
@@ -39,7 +56,8 @@
         "--prefix",
         "vscode-extension",
         "test"
-      ]
+      ],
+      "paths": ["vscode-extension/**"]
     },
     {
       "id": "release-metadata",
@@ -48,6 +66,13 @@
         "{python}",
         "scripts/release_metadata.py",
         "check"
+      ],
+      "paths": [
+        "pyproject.toml",
+        "src/aiworkhub/__init__.py",
+        "vscode-extension/package.json",
+        "scripts/release_metadata.py",
+        ".github/workflows/release.yml"
       ]
     }
   ]

@@ -124,12 +124,14 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     delivery = event.get("project_context_delivery")
     ack = event.get("project_context_acknowledgement")
     gate = event.get("worker_mcp_gate")
+    prompt_budget = event.get("prompt_budget")
     provider_denials = event.get("provider_tool_denials")
     if (
         not isinstance(context, Mapping)
         and not isinstance(delivery, Mapping)
         and not isinstance(ack, Mapping)
         and not isinstance(gate, Mapping)
+        and not isinstance(prompt_budget, Mapping)
         and not isinstance(provider_denials, Mapping)
     ):
         return {}
@@ -304,6 +306,22 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "reason": str(ack.get("reason") or "")[:160] if isinstance(ack, Mapping) else "",
         },
         "estimate": estimate,
+        "prompt_budget": {
+            "schema_id": str(prompt_budget.get("schema_id") or "")[:96],
+            "mode": str(prompt_budget.get("mode") or "")[:32],
+            "total_bytes": _bounded_int(prompt_budget.get("total_bytes")),
+            "max_bytes": _bounded_int(prompt_budget.get("max_bytes")),
+            "remaining_bytes": _bounded_int(prompt_budget.get("remaining_bytes")),
+            "utilization_percent": float(prompt_budget.get("utilization_percent") or 0.0),
+            "delta_rework": bool(prompt_budget.get("delta_rework")),
+            "byte_labels_are_token_truth": False,
+            "sections": {
+                str(name)[:64]: _bounded_int(value)
+                for name, value in list(
+                    (prompt_budget.get("sections") or {}).items()
+                )[:16]
+            } if isinstance(prompt_budget.get("sections"), Mapping) else {},
+        } if isinstance(prompt_budget, Mapping) else {},
         "provider_tool_denials": {
             "evidence_observed": bool(provider_denials.get("evidence_observed")),
             "permission_denials_total": int(

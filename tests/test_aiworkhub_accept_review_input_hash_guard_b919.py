@@ -532,6 +532,33 @@ def test_accept_review_requires_explicit_manager_confirmation_for_destructive_di
         "run_destructive_diff_checks",
         lambda *_args, **_kwargs: [blocker],
     )
+    # Automatic destructive-change risk now requires a combined-tree
+    # revalidation before the independent-reviewer gate.  Keep this focused
+    # synthetic fixture out of Git/worktree mechanics so the assertion below
+    # reaches the reviewer requirement it owns.
+    monkeypatch.setattr(
+        process_launcher,
+        "create_combined_validation_workspace",
+        lambda workspace, _card, changed: (
+            workspace,
+            {
+                "schema_id": "aiworkhub.combined_tree.v1",
+                "candidate_paths": list(changed),
+            },
+        ),
+    )
+    real_quality_gate = process_launcher.quality_evidence.run_completion_quality_gate
+
+    def _quality_gate(*args: object, **kwargs: object) -> dict:
+        if "risk_signals" in kwargs:
+            return real_quality_gate(*args, **kwargs)
+        return {"passed": True, "blocking_checks": [], "checks": []}
+
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "run_completion_quality_gate",
+        _quality_gate,
+    )
 
     blocked = manager.accept_review(request_id, task_id)
 
@@ -541,18 +568,17 @@ def test_accept_review_requires_explicit_manager_confirmation_for_destructive_di
     assert accept_review_calls == []
     assert card["status"] == "review"
 
-    accepted = manager.accept_review(
+    risk_blocked = manager.accept_review(
         request_id,
         task_id,
         confirm_destructive_change=True,
     )
 
-    assert accepted["ok"] is True
-    assert promote_calls == [["out/result.txt"]]
-    assert len(accept_review_calls) == 1
-    quality = accept_review_calls[0]["evidence"]["quality_gate"]
-    assert quality["destructive_diff_blockers"] == [blocker.check_id]
-    assert quality["destructive_change_confirmed"] is True
+    assert risk_blocked["ok"] is False
+    assert "quality_gate_failed" in risk_blocked["error"]
+    assert "required_reviewer_missing" in risk_blocked["error"]
+    assert promote_calls == []
+    assert accept_review_calls == []
 
 
 def test_accept_review_rejects_caller_supplied_reviewer_identity(

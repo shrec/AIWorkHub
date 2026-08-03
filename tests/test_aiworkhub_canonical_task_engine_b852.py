@@ -506,6 +506,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         acceptance=["created once"],
         allowed_writes=["src/example.py"],
         forbidden=["secrets/**"],
+        validation=["python -m pytest -q"],
     )
     assert created["ok"] is True, created
     card = json.loads(created["stdout"])
@@ -524,6 +525,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         acceptance=["created once"],
         allowed_writes=["src/example.py"],
         forbidden=["secrets/**"],
+        validation=["python -m pytest -q"],
     )
     assert reconciled["ok"] is True, reconciled
     assert reconciled["created"] is False
@@ -538,10 +540,38 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         objective="Must be rejected.",
         acceptance=["rejected"],
         allowed_writes=[],
+        validation=["python -m pytest -q"],
     )
     assert duplicate["ok"] is False
     assert "task_already_exists" in duplicate["stderr"]
     assert "title" in duplicate["conflict_fields"]
+
+
+def test_manager_create_rejects_mutating_code_task_without_validation(
+    writable_repo, monkeypatch
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+
+    result = core.create_task(
+        task_id="TASK_CODE_WITHOUT_VALIDATION",
+        title="Unsafe task",
+        runner="claude_worker",
+        topic="coding",
+        objective="Change code without a behavioral check.",
+        acceptance=["changed"],
+        allowed_writes=["src/example.py"],
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "code_task_validation_required"
 
 
 def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monkeypatch):
@@ -700,8 +730,14 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
             "5",
             "--total-tokens",
             "15",
+            "--cached-input-tokens",
+            "4",
+            "--cache-creation-input-tokens",
+            "2",
+            "--cache-metrics-observed",
             "--cost-usd",
             "0.01",
+            "--cost-observed",
         ],
         allow_write=True,
         runner="claude_coding",
@@ -713,6 +749,11 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
     assert report.returncode == 0
     assert "TASK_USAGE_COMPAT" in report.stdout
     assert "tokens=15" in report.stdout
+    [event] = task_store.list_usage_events(writable_repo)
+    assert event["cached_input_tokens"] == 4
+    assert event["cache_creation_input_tokens"] == 2
+    assert event["cache_metrics_observed"] is True
+    assert event["cost_observed"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import hmac
 import json
 import os
@@ -88,6 +89,14 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _TASK_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
 _PROCESS_REPO_ROOT_OVERRIDE: Path | None = None
+_MAX_REWORK_FEEDBACK_BYTES = 4 * 1024
+
+
+def _bounded_utf8_prefix(value: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
 _REPOSITORY_SWITCH_LOCK = threading.RLock()
 
 # ---------------------------------------------------------------------------
@@ -1837,7 +1846,11 @@ def run_taskctl(
                 input_tokens=_int_value("--input-tokens", 0),
                 output_tokens=_int_value("--output-tokens", 0),
                 total_tokens=_int_value("--total-tokens", 0),
+                cached_input_tokens=_int_value("--cached-input-tokens", 0),
+                cache_creation_input_tokens=_int_value("--cache-creation-input-tokens", 0),
+                cache_metrics_observed="--cache-metrics-observed" in args,
                 cost_usd=float(_value("--cost-usd", "0") or 0),
+                cost_observed="--cost-observed" in args,
             ))
         if cmd == "export-jsonl":
             return _as_result(export_jsonl(runner=_value("--runner", runner), topic=_value("--topic", topic)))
@@ -2965,6 +2978,8 @@ def create_task(
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
+    if task_type == "code" and (writes2 or outputs2) and not validation2:
+        return _lifecycle_error("code_task_validation_required", 2)
     for item in writes2:
         path = Path(item)
         if path.is_absolute() or ".." in path.parts:
@@ -3488,9 +3503,19 @@ def reject_review(
                 continue
             seen_residuals.add(key)
             normalized_residuals.append({"path": path, "pointer": pointer})
+    raw_reason = str(reason or "")
+    reason_bytes = raw_reason.encode("utf-8")
+    bounded_reason, reason_truncated = _bounded_utf8_prefix(
+        raw_reason.strip(), _MAX_REWORK_FEEDBACK_BYTES
+    )
+    reason_identity = {
+        "bytes": len(reason_bytes),
+        "sha256": hashlib.sha256(reason_bytes).hexdigest(),
+        "truncated": reason_truncated,
+    }
     command = [
         "reject-review", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic),
-        "--reason", reason, "--to", disposition,
+        "--reason", bounded_reason, "--to", disposition,
     ]
     blocked = _canonical_write_gate(
         "reject-review", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True
@@ -3566,6 +3591,20 @@ def reject_review(
             }
         elif normalized_residuals:
             return residual_error("residual_contract_requires_review_predecessor")
+        # Rework prompts carry one compact delta, never the previous terminal
+        # envelope or raw worker transcript.  The retained workspace is the
+        # content authority; this object only tells the successor what failed
+        # and which residual identities remain in scope.
+        card["review_feedback"] = {
+            "schema_id": "aiworkhub.rework_feedback_delta.v1",
+            "instruction": bounded_reason,
+            "reason_identity": reason_identity,
+            "predecessor_request_id": predecessor_request_id,
+            "predecessor_changed_paths": sorted(
+                str(path) for path in (changed_hashes or {})
+            )[:256],
+            "residual_identities": normalized_residuals,
+        }
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
         card.update(status="blocked", worker_status="blocked")
@@ -3607,7 +3646,8 @@ def reject_review(
                 json.dumps(
                     {
                         "topic": live_topic,
-                        "reason": reason,
+                        "reason": bounded_reason,
+                        "reason_identity": reason_identity,
                         "to": disposition,
                         "prior_episode": prior_episode,
                     },
@@ -3936,7 +3976,11 @@ def record_usage(
     input_tokens: int = 0,
     output_tokens: int = 0,
     total_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    cache_metrics_observed: bool = False,
     cost_usd: float = 0.0,
+    cost_observed: bool = False,
 ) -> dict[str, Any]:
     """Append one native usage event to the canonical task store.
 
@@ -3971,7 +4015,11 @@ def record_usage(
         "input_tokens": int(input_tokens or 0),
         "output_tokens": int(output_tokens or 0),
         "total_tokens": int(total_tokens or (int(input_tokens or 0) + int(output_tokens or 0))),
+        "cached_input_tokens": int(cached_input_tokens or 0),
+        "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),
+        "cache_metrics_observed": bool(cache_metrics_observed),
         "cost_usd": float(cost_usd or 0.0),
+        "cost_observed": bool(cost_observed),
     }
     now = datetime.now(timezone.utc).isoformat()
     try:

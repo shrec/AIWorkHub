@@ -231,6 +231,12 @@ class WorkerWorkspace:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedValidationExecutable:
+    path: Path
+    root: Path
+
+
 class _LandlockRulesetAttr(ctypes.Structure):
     _fields_ = [("handled_access_fs", ctypes.c_uint64)]
 
@@ -298,6 +304,14 @@ def _matches(path: str, patterns: Iterable[str]) -> bool:
         if normalized == pattern or fnmatch.fnmatchcase(normalized, pattern):
             return True
     return False
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _hash_path(path: Path) -> str | None:
@@ -1753,6 +1767,113 @@ def select_sandbox_backend() -> str:
     raise WorkspaceError(f"secure_sandbox_unavailable:bubblewrap_unusable:{detail}")
 
 
+_TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"ruff"})
+SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
+
+
+def _validation_executable_relative_path(name: str) -> PurePosixPath:
+    if os.name == "nt":
+        return PurePosixPath("Scripts") / f"{name}.exe"
+    return PurePosixPath("bin") / name
+
+
+def _trusted_validation_runtime_roots(repo: Path | None = None) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    if repo is not None:
+        roots.append(repo / ".venv")
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        roots.append(Path(virtual_env))
+    if Path(sys.prefix) != Path(getattr(sys, "base_prefix", sys.prefix)):
+        roots.append(Path(sys.prefix))
+
+    resolved: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root.resolve(strict=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(root)
+    return tuple(resolved)
+
+
+def _resolve_trusted_validation_executable(
+    name: str, repo: Path | None = None
+) -> TrustedValidationExecutable:
+    """Resolve one approved bare validation executable without trusting PATH."""
+    if name not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
+        raise WorkspaceError(f"validation_executable_not_approved:{name}")
+
+    relative = _validation_executable_relative_path(name)
+    for raw_root in _trusted_validation_runtime_roots(repo):
+        root = raw_root.resolve(strict=False)
+        candidate = raw_root / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise WorkspaceError(
+                f"validation_executable_untrusted_runtime_root:{resolved}"
+            ) from exc
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise WorkspaceError(f"validation_executable_not_executable:{resolved}")
+        try:
+            root_info = root.stat()
+        except OSError as exc:
+            raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
+        if os.name != "nt" and root_info.st_uid != os.getuid():
+            raise WorkspaceError(f"validation_executable_runtime_root_untrusted_owner:{root}")
+        if stat.S_IMODE(root_info.st_mode) & 0o002:
+            raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
+        return _trusted_validation_executable_from_resolved(name, root, resolved)
+    raise WorkspaceError(f"validation_executable_unavailable:{name}")
+
+
+def _trusted_validation_executable_from_resolved(
+    name: str, root: Path, resolved: Path
+) -> TrustedValidationExecutable:
+    try:
+        info = resolved.stat()
+    except OSError as exc:
+        raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
+    if os.name != "nt" and info.st_uid != os.getuid():
+        raise WorkspaceError(f"validation_executable_untrusted_owner:{resolved}")
+    if stat.S_IMODE(info.st_mode) & 0o002:
+        raise WorkspaceError(f"validation_executable_world_writable:{resolved}")
+    return TrustedValidationExecutable(path=resolved, root=root)
+
+
+def resolve_trusted_validation_executable(name: str, repo: Path | None = None) -> Path:
+    return _resolve_trusted_validation_executable(name, repo).path
+
+
+def _normalize_trusted_validation_executable_argv(
+    argv: list[str], repo: Path | None = None
+) -> list[str]:
+    normalized, _roots = _normalize_trusted_validation_executable_argv_with_roots(
+        argv, repo
+    )
+    return normalized
+
+
+def _normalize_trusted_validation_executable_argv_with_roots(
+    argv: list[str], repo: Path | None = None
+) -> tuple[list[str], tuple[Path, ...]]:
+    if not argv:
+        return [], ()
+    head = argv[0]
+    if "/" in head or "\\" in head or Path(head).is_absolute():
+        return list(argv), ()
+    if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
+        return list(argv), ()
+    executable = _resolve_trusted_validation_executable(head, repo)
+    return [str(executable.path), *argv[1:]], (executable.root,)
+
+
 def _node_install_root(executable: str) -> Path | None:
     path = Path(executable).resolve()
     for parent in path.parents:
@@ -1771,6 +1892,7 @@ def sandbox_argv(
     validation_exec_scratch: Path | None = None,
     package_import_root: Path | None = None,
     validation_cwd: str | None = None,
+    validation_executable_roots: tuple[Path, ...] = (),
 ) -> list[str]:
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
@@ -1823,6 +1945,21 @@ def sandbox_argv(
         for value in adapter_argv
     ]
     validation_binds: list[str] = []
+    for index, root in enumerate(validation_executable_roots):
+        resolved_root = root.resolve(strict=False)
+        alias = f"{SANDBOX_VALIDATION_EXECUTABLE_ROOT}/{index}"
+        if index == 0:
+            validation_binds.extend(("--dir", SANDBOX_VALIDATION_EXECUTABLE_ROOT))
+        validation_binds.extend(("--ro-bind", str(resolved_root), alias))
+        rewritten = [
+            (
+                f"{alias}/{value_path.relative_to(resolved_root).as_posix()}"
+                if _path_is_relative_to(value_path, resolved_root)
+                else value
+            )
+            for value in rewritten
+            for value_path in (Path(value).resolve(strict=False),)
+        ]
     if validation_readonly_dirs:
         validation_binds.extend(("--dir", "/validation-pythonpath"))
         for index, path in enumerate(validation_readonly_dirs):
@@ -2249,6 +2386,22 @@ def _is_pytest_validation_command(argv: list[str]) -> bool:
     return len(argv) >= 3 and head.startswith("python") and argv[1] == "-m" and argv[2] == "pytest"
 
 
+def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
+    """Make the console-script spelling independent of the sanitized PATH.
+
+    The validation sandbox intentionally excludes the user's ``~/.local/bin``.
+    A declared ``pytest ...`` command can therefore import the trusted pytest
+    package we bind into PYTHONPATH but still fail before import while PATH
+    searches for a non-existent ``/bin/pytest``.  Execute the same package
+    through the already-running trusted coordinator interpreter instead.
+    Explicit ``python* -m pytest`` commands remain byte-for-byte unchanged.
+    """
+
+    if argv and Path(argv[0]).name == "pytest":
+        return [sys.executable, "-m", "pytest", *argv[1:]]
+    return list(argv)
+
+
 def resolve_trusted_pytest_runtime_root() -> Path:
     """Resolve and validate the one canonical, read-only pytest package root
     used to repair ``pytest``/``python3 -m pytest`` validation commands under
@@ -2349,6 +2502,12 @@ def run_validations(
                 # byte-equivalent to before.
                 pytest_root = resolve_trusted_pytest_runtime_root()
                 effective_components = (str(pytest_root),) + pythonpath_components
+                tokens = _normalize_pytest_validation_argv(tokens)
+            tokens, validation_executable_roots = (
+                _normalize_trusted_validation_executable_argv_with_roots(
+                    tokens, workspace.repo
+                )
+            )
             wrapped = sandbox_argv(
                 workspace,
                 "validation",
@@ -2359,6 +2518,7 @@ def run_validations(
                 ),
                 validation_exec_scratch=scratch_dir,
                 validation_cwd=cd_relative,
+                validation_executable_roots=validation_executable_roots,
             )
             env = sanitized_env(
                 "validation", home=validation_home, isolated_task_queue_db=True

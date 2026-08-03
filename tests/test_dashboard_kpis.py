@@ -1,4 +1,5 @@
 from aiworkhub.dashboard_kpis import build_kpi_snapshot
+from aiworkhub.dashboard import _compact_ai_infra
 
 
 def _run(
@@ -11,6 +12,9 @@ def _run(
     stages=None,
     raw_context_bytes=0,
     bundle_bytes=0,
+    prompt_bytes=0,
+    prompt_budget_bytes=0,
+    prompt_mode="initial",
 ):
     return {
         "task_id": task_id,
@@ -27,6 +31,12 @@ def _run(
             "estimate": {
                 "raw_context_bytes": raw_context_bytes,
                 "bundle_bytes": bundle_bytes,
+            },
+            "prompt_budget": {
+                "mode": prompt_mode,
+                "total_bytes": prompt_bytes,
+                "max_bytes": prompt_budget_bytes,
+                "delta_rework": prompt_mode == "rework_delta",
             },
         },
     }
@@ -196,11 +206,14 @@ def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_cla
             calls=3, live_calls=3,
             stages={"orientation": 1, "implementation": 1, "validation": 1},
             raw_context_bytes=10_000, bundle_bytes=2_500,
+            prompt_bytes=40_000, prompt_budget_bytes=160_000,
         ),
         _run(
             "B", "validation_failed", "2026-08-01T13:00:00Z",
             calls=1, live_calls=1, stages={"orientation": 1},
             raw_context_bytes=2_000, bundle_bytes=3_000,
+            prompt_bytes=20_000, prompt_budget_bytes=112_000,
+            prompt_mode="rework_delta",
         ),
     ])
 
@@ -212,4 +225,43 @@ def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_cla
     assert result["economics"]["delivered_bundle_bytes"] == 5_500
     assert result["economics"]["estimated_context_bytes_avoided"] == 7_500
     assert result["economics"]["context_compression_rate"] == 62.5
+    assert result["economics"]["prompt_measured_tasks"] == 2
+    assert result["economics"]["initial_prompt_tasks"] == 1
+    assert result["economics"]["rework_prompt_tasks"] == 1
+    assert result["economics"]["average_prompt_bytes"] == 30_000.0
+    assert result["economics"]["prompt_budget_utilization_rate"] == 22.1
+    assert result["headline"]["average_prompt_bytes"] == 30_000.0
     assert result["economics"]["token_savings_available"] is False
+
+
+def test_process_event_prompt_budget_survives_bounded_dashboard_projection():
+    compact = _compact_ai_infra({
+        "prompt_budget": {
+            "schema_id": "aiworkhub.worker_prompt_budget.v1",
+            "mode": "rework_delta",
+            "total_bytes": 24_000,
+            "max_bytes": 112_000,
+            "remaining_bytes": 88_000,
+            "utilization_percent": 21.43,
+            "delta_rework": True,
+            "sections": {
+                "task_contract_bytes": 4_000,
+                "project_context_bytes": 12_000,
+            },
+        },
+    })
+
+    assert compact["prompt_budget"] == {
+        "schema_id": "aiworkhub.worker_prompt_budget.v1",
+        "mode": "rework_delta",
+        "total_bytes": 24_000,
+        "max_bytes": 112_000,
+        "remaining_bytes": 88_000,
+        "utilization_percent": 21.43,
+        "delta_rework": True,
+        "byte_labels_are_token_truth": False,
+        "sections": {
+            "task_contract_bytes": 4_000,
+            "project_context_bytes": 12_000,
+        },
+    }

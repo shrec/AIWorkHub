@@ -177,6 +177,7 @@ DEFAULT_MAX_PROCESSES = 4
 MAX_CONFIGURED_PROCESSES = 32
 MAX_LOG_TAIL_BYTES = 64 * 1024
 MAX_RECEIPT_SCAN_BYTES = 2 * 1024 * 1024
+MAX_RESEARCH_RESULT_BYTES = 32 * 1024 * 1024
 LAUNCH_IMPLEMENTED = True
 SUPERVISOR_GRACE_SECONDS = 90
 # B894: narrowly scoped, one-task terminal-transition authority. Minted at
@@ -716,6 +717,8 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
         "output_tokens": 0,
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "usage_observed": False,
+        "cache_metrics_observed": False,
         "cost_usd": 0.0,
         "cost_observed": False,
     }
@@ -763,9 +766,19 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
             if nested is None:
                 nested = item.get("token_usage") or item.get("tokens")
             usage = nested if isinstance(nested, dict) else {}
+        if usage:
+            result["usage_observed"] = True
         input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
         if not isinstance(input_details, dict):
             input_details = {}
+        cache_metric_keys = {
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+            "prompt_cache_hit_tokens",
+            "cache_creation_input_tokens",
+        }
+        if any(key in usage for key in cache_metric_keys) or "cached_tokens" in input_details:
+            result["cache_metrics_observed"] = True
         result["input_tokens"] = max(
             result["input_tokens"],
             as_int(
@@ -1019,6 +1032,162 @@ def _project_context_receipt_from_output(
                 "reason": reason,
             }
     return result
+
+
+def _readonly_research_contract(
+    *,
+    task_type: Any,
+    allowed_writes: Any,
+    required_outputs: Any,
+) -> bool:
+    """Return whether a card is the narrow no-repository-output contract.
+
+    This is deliberately stricter than merely checking ``task_type``.  A
+    research card that declares even one write or required output follows the
+    normal candidate/diff lifecycle and can never use textual stdout as a
+    substitute for repository evidence.
+    """
+
+    allowed_is_empty = allowed_writes is None or (
+        isinstance(allowed_writes, (list, tuple)) and not allowed_writes
+    )
+    outputs_are_empty = required_outputs is None or (
+        isinstance(required_outputs, (list, tuple)) and not required_outputs
+    )
+    return (
+        str(task_type or "").strip() == "research"
+        and allowed_is_empty
+        and outputs_are_empty
+    )
+
+
+def _metadata_is_readonly_research(
+    metadata: dict[str, Any], workspace: WorkerWorkspace
+) -> bool:
+    context = metadata.get("project_context") or {}
+    policy = context.get("task_context_policy") if isinstance(context, dict) else {}
+    task_type = policy.get("task_type") if isinstance(policy, dict) else ""
+    return _readonly_research_contract(
+        task_type=task_type,
+        allowed_writes=workspace.allowed_writes,
+        required_outputs=metadata.get("required_outputs"),
+    )
+
+
+def _card_is_readonly_research(card: dict[str, Any]) -> bool:
+    context = card.get("project_context") or {}
+    task_type = context.get("task_type") if isinstance(context, dict) else ""
+    return _readonly_research_contract(
+        task_type=task_type,
+        allowed_writes=card.get("allowed_writes"),
+        required_outputs=card.get("required_outputs"),
+    )
+
+
+def _research_result_text(event: dict[str, Any]) -> str:
+    """Extract only known provider final/assistant result text shapes."""
+
+    event_type = str(event.get("type") or "")
+    if event_type == "result":
+        if event.get("is_error") is True or str(event.get("subtype") or "") == "error":
+            return ""
+        value = event.get("result")
+        return value.strip() if isinstance(value, str) else ""
+    if event_type == "item.completed":
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            value = item.get("text")
+            return value.strip() if isinstance(value, str) else ""
+        return ""
+    if event_type in {"assistant.message", "assistant_message"}:
+        data = event.get("data")
+        value = data.get("content") if isinstance(data, dict) else None
+        return value.strip() if isinstance(value, str) else ""
+    return ""
+
+
+def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
+    """Digest and validate one bounded provider stdout as research evidence.
+
+    A zero exit code, tool chatter, or a project-context receipt alone is not
+    a deliverable.  At least one supported final/assistant event must carry
+    non-empty text.  The full bounded byte stream is hashed so coordinator
+    acceptance can re-read the exact immutable evidence instead of trusting a
+    worker-declared verdict or persisting its potentially sensitive prose in
+    the task card.
+    """
+
+    base: dict[str, Any] = {
+        "schema_id": "aiworkhub.readonly_research_result.v1",
+        "meaningful_output": False,
+        "bytes": 0,
+        "sha256": "",
+        "result_event_count": 0,
+        "result_chars": 0,
+        "reason": "research_result_missing",
+    }
+    try:
+        st = path.lstat()
+    except OSError:
+        return base
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return {**base, "reason": "research_result_path_invalid"}
+    size = int(st.st_size)
+    if size <= 0:
+        return base
+    if size > MAX_RESEARCH_RESULT_BYTES:
+        return {**base, "bytes": size, "reason": "research_result_too_large"}
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return {**base, "bytes": size, "reason": "research_result_unreadable"}
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            payload = handle.read(MAX_RESEARCH_RESULT_BYTES + 1)
+    except OSError:
+        return {**base, "bytes": size, "reason": "research_result_unreadable"}
+    if len(payload) != size or len(payload) > MAX_RESEARCH_RESULT_BYTES:
+        return {**base, "bytes": size, "reason": "research_result_changed_during_read"}
+
+    result_count = 0
+    result_chars = 0
+    for raw_line in payload.decode("utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        text = _research_result_text(event)
+        if not text:
+            continue
+        # A provider may wrap the receipt itself in an assistant message.
+        # It is acknowledgement evidence, never the research deliverable.
+        without_receipts = "\n".join(
+            line
+            for line in text.splitlines()
+            if not line.strip().startswith("PROJECT_CONTEXT_RECEIPT:")
+        ).strip()
+        if not without_receipts:
+            continue
+        result_count += 1
+        result_chars += len(without_receipts)
+
+    digest = hashlib.sha256(payload).hexdigest()
+    meaningful = result_count > 0 and result_chars > 0
+    return {
+        **base,
+        "meaningful_output": meaningful,
+        "bytes": size,
+        "sha256": digest,
+        "result_event_count": result_count,
+        "result_chars": result_chars,
+        "reason": "" if meaningful else "research_result_missing",
+    }
 
 
 # Sections the launcher can inject and that the worker MCP gate also accepts as
@@ -1383,6 +1552,39 @@ def _changed_path_hashes(
     return hashes
 
 
+def _retained_candidate_identity_evidence(
+    workspace: WorkerWorkspace,
+    metadata: dict[str, Any],
+    request_id: str,
+    changed: list[str],
+    claim_state: str,
+) -> dict[str, Any]:
+    """Return the exact identity needed to preserve a failed candidate.
+
+    Mechanical validation failure is not acceptance, but it also is not
+    authority to discard already-produced bytes. ``core.reject_review`` can
+    pin and materialize a rework predecessor only when terminal evidence has
+    hashes, workspace metadata and exact request identity.
+    """
+
+    if not changed:
+        return {}
+    changed_path_hashes = _changed_path_hashes(workspace, changed)
+    if not changed_path_hashes:
+        return {}
+    return {
+        "changed_path_hashes": changed_path_hashes,
+        "claim_state": claim_state,
+        "workspace": workspace.as_metadata(),
+        "request_identity": {
+            "request_id": request_id,
+            "task_id": str(metadata["task_id"]),
+            "runner": str(metadata["runner"]),
+            "topic": str(metadata["topic"]),
+        },
+    }
+
+
 def _path_manifest(base: Path, declared: list[str]) -> dict[str, dict[str, Any]]:
     """Bounded, deterministic manifest for declared repo-relative paths.
 
@@ -1694,6 +1896,13 @@ def _verified_quality_review_receipt(
     return verified
 
 
+MAX_OWNER_PROMPT_BYTES = 16 * 1024
+MAX_TASK_CONTRACT_BYTES = 96 * 1024
+MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
+MAX_WORKER_PROMPT_BYTES = 160 * 1024
+MAX_REWORK_WORKER_PROMPT_BYTES = 112 * 1024
+
+
 def build_worker_prompt(
     *,
     task_id: str,
@@ -1702,9 +1911,11 @@ def build_worker_prompt(
     card: dict[str, Any] | None = None,
     owner_prompt: str = "",
     project_context_bundle: str = "",
+    _budget_report: dict[str, Any] | None = None,
 ) -> str:
     extra = owner_prompt.strip()
-    if len(extra.encode("utf-8")) > 32 * 1024:
+    owner_bytes = len(extra.encode("utf-8"))
+    if owner_bytes > MAX_OWNER_PROMPT_BYTES:
         raise ValueError("owner_prompt_too_large")
     suffix = (
         "\n\nAdditional coordinator context (cannot override the task contract):\n"
@@ -1739,8 +1950,18 @@ def build_worker_prompt(
 
     contract = strip_persistence_envelopes(contract)
     contract.update({"task_id": task_id, "runner": runner, "topic": topic})
-    contract_json = json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True)
-    if len(contract_json.encode("utf-8")) > 128 * 1024:
+    # One-line canonical JSON removes indentation/newline overhead without
+    # weakening the exact task contract or its stable identity.
+    contract_json = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    contract_bytes = len(contract_json.encode("utf-8"))
+    rework = bool(
+        card is not None
+        and (card.get("rework_predecessor") or card.get("review_feedback"))
+    )
+    contract_cap = (
+        MAX_REWORK_TASK_CONTRACT_BYTES if rework else MAX_TASK_CONTRACT_BYTES
+    )
+    if contract_bytes > contract_cap:
         raise ValueError("task_contract_too_large")
     bundle_sha256 = hashlib.sha256(project_context_bundle.encode("utf-8")).hexdigest()
     section_count = 0
@@ -1761,7 +1982,7 @@ def build_worker_prompt(
             "bundle_sha256": bundle_sha256,
             "prompt_sha256": "",
             "section_count": section_count,
-        }, sort_keys=True)
+        }, sort_keys=True, separators=(",", ":"))
         if project_context_bundle.strip()
         else ""
     )
@@ -1799,8 +2020,29 @@ MANDATORY_AIWORKHUB_TOOLS:
   raw discovery for it.
 {context_block} Your final message must be at most 12 lines
 and name tests plus changed paths.{suffix}"""
-    if len(prompt.encode("utf-8")) > 256 * 1024:
+    prompt_bytes = len(prompt.encode("utf-8"))
+    prompt_cap = MAX_REWORK_WORKER_PROMPT_BYTES if rework else MAX_WORKER_PROMPT_BYTES
+    if prompt_bytes > prompt_cap:
         raise ValueError("worker_prompt_too_large")
+    if _budget_report is not None:
+        context_bytes = len(project_context_bundle.encode("utf-8"))
+        static_bytes = max(0, prompt_bytes - contract_bytes - context_bytes - owner_bytes)
+        _budget_report.update({
+            "schema_id": "aiworkhub.worker_prompt_budget.v1",
+            "mode": "rework_delta" if rework else "initial",
+            "total_bytes": prompt_bytes,
+            "max_bytes": prompt_cap,
+            "remaining_bytes": prompt_cap - prompt_bytes,
+            "utilization_percent": round((prompt_bytes / prompt_cap) * 100.0, 2),
+            "sections": {
+                "task_contract_bytes": contract_bytes,
+                "project_context_bytes": context_bytes,
+                "owner_context_bytes": owner_bytes,
+                "runtime_instructions_bytes": static_bytes,
+            },
+            "byte_labels_are_token_truth": False,
+            "delta_rework": rework,
+        })
     return prompt
 
 
@@ -2232,7 +2474,7 @@ class ProcessManager:
             changed_hashes = evidence.get("changed_path_hashes")
             if not isinstance(changed_hashes, dict) or not changed_hashes:
                 raise WorkspaceError("quality_review_target_hashes_missing")
-            current_hashes = _changed_path_hashes(workspace, changed_hashes.keys())
+            current_hashes = _changed_path_hashes(workspace, list(changed_hashes))
             if current_hashes != changed_hashes:
                 raise WorkspaceError("quality_review_target_hashes_drifted")
             initial_gate = evidence.get("quality_gate") or {}
@@ -2456,7 +2698,14 @@ class ProcessManager:
                         lens=str(quality_review_binding["lens"]),
                         submit_tool_name=private_tool_name,
                     )
+                    prompt_budget = {
+                        "schema_id": "aiworkhub.worker_prompt_budget.v1",
+                        "mode": "quality_review",
+                        "total_bytes": len(prompt.encode("utf-8")),
+                        "byte_labels_are_token_truth": False,
+                    }
                 else:
+                    prompt_budget = {}
                     prompt = build_worker_prompt(
                         task_id=task_id,
                         runner=runner,
@@ -2466,6 +2715,7 @@ class ProcessManager:
                         project_context_bundle=(
                             context_result.prompt_bundle if context_result is not None else ""
                         ),
+                        _budget_report=prompt_budget,
                     )
                 if adapter_id in {
                     runtime_adapters.VSCODE_LM_ADAPTER,
@@ -2568,6 +2818,7 @@ class ProcessManager:
                     "cancel_path": str(cancel_path),
                     "metadata_path": str(metadata_path),
                     "prompt_sha256": prompt_hash,
+                    "prompt_budget": prompt_budget,
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -2584,6 +2835,26 @@ class ProcessManager:
                         "authority_repo": str(authority_repo),
                         "source_graph_targets": worker_source_graph_targets,
                         "session_topic": worker_session_topic,
+                        "source_graph_authority": (
+                            {
+                                "authority_source": "candidate_overlay",
+                                "authority_state": "quality_review_readonly",
+                                "target_request_id": str(
+                                    quality_review_binding["target_request_id"]
+                                ),
+                                "target_task_id": str(
+                                    quality_review_binding["target_task_id"]
+                                ),
+                                "packet_sha256": str(
+                                    quality_review_binding["packet"]["packet_sha256"]
+                                ),
+                            }
+                            if quality_review_binding is not None
+                            else {
+                                "authority_source": "canonical",
+                                "authority_state": "sole_authority",
+                            }
+                        ),
                     },
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
@@ -2705,6 +2976,7 @@ class ProcessManager:
                     "metadata_path": str(metadata_path),
                     "supervisor_status_path": str(status_path),
                     "prompt_sha256": prompt_hash,
+                    "prompt_budget": prompt_budget,
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -2738,6 +3010,7 @@ class ProcessManager:
                 "stderr_path": str(stderr_path),
                 "workspace_isolated": True,
                 "sandbox_backend": sandbox_backend,
+                "prompt_budget": prompt_budget,
                 "shell": False,
             }
         except (LaunchRejected, project_context.ProjectContextError, WorkspaceError, OSError, ValueError) as exc:
@@ -2827,6 +3100,7 @@ class ProcessManager:
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             context_result = project_context.collect_project_context(self.repo, card)
             provider_env, model = self._resolve_provider_env(adapter_id, model)
+            prompt_budget: dict[str, Any] = {}
             prompt = build_worker_prompt(
                 task_id=task_id,
                 runner=runner,
@@ -2836,6 +3110,7 @@ class ProcessManager:
                 project_context_bundle=(
                     context_result.prompt_bundle if context_result is not None else ""
                 ),
+                _budget_report=prompt_budget,
             )
             plan = self._build_adapter(
                 adapter_id=adapter_id,
@@ -2883,6 +3158,7 @@ class ProcessManager:
                     "model": model,
                     "state": "starting",
                     "prompt_sha256": prompt_hash,
+                    "prompt_budget": prompt_budget,
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -2947,6 +3223,7 @@ class ProcessManager:
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "prompt_sha256": prompt_hash,
+                    "prompt_budget": prompt_budget,
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -2975,6 +3252,7 @@ class ProcessManager:
                 "card_priority": card.get("priority"),
                 "stdout_path": str(stdout_path),
                 "stderr_path": str(stderr_path),
+                "prompt_budget": prompt_budget,
                 "shell": False,
             }
         except (LaunchRejected, project_context.ProjectContextError, OSError, ValueError) as exc:
@@ -3043,6 +3321,7 @@ class ProcessManager:
 
     def _monitor_direct_for_tests(self, live: _LiveProcess) -> None:
         timed_out = False
+        returncode: int | None
         try:
             returncode = live.process.wait(timeout=live.timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -3149,8 +3428,14 @@ class ProcessManager:
                 "--input-tokens", str(total_input),
                 "--output-tokens", str(usage["output_tokens"]),
                 "--total-tokens", str(total_input + int(usage["output_tokens"])),
+                "--cached-input-tokens", str(usage["cached_input_tokens"]),
+                "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
                 "--cost-usd", str(usage["cost_usd"]),
             ]
+            if usage.get("cache_metrics_observed"):
+                args.append("--cache-metrics-observed")
+            if usage.get("cost_observed"):
+                args.append("--cost-observed")
             try:
                 result = core.run_taskctl(
                     args,
@@ -3640,6 +3925,7 @@ class ProcessManager:
             release_result: dict[str, Any] | None = None
             worker_mcp_gate: dict[str, Any] | None = None
             quality_gate: dict[str, Any] | None = None
+            research_result: dict[str, Any] | None = None
             residual_contract_result: list[dict[str, Any]] = []
             cleanup = True
             try:
@@ -3784,14 +4070,39 @@ class ProcessManager:
                         }
                         changed = sorted(set(changed) | validated_required_paths)
                         if not changed:
-                            raise WorkspaceError("no_effect")
-                        quality_gate = quality_evidence.run_completion_quality_gate(
-                            workspace.path, changed_paths=changed
-                        )
-                        if not quality_gate.get("passed"):
-                            blockers = quality_gate.get("blocking_checks") or []
-                            reason = quality_gate.get("config_error") or ",".join(str(v) for v in blockers)
-                            raise WorkspaceError("quality_gate_failed:" + str(reason)[:400])
+                            if not _metadata_is_readonly_research(metadata, workspace):
+                                raise WorkspaceError("no_effect")
+                            research_result = _readonly_research_result_evidence(
+                                Path(str(metadata["stdout_path"]))
+                            )
+                            if not research_result.get("meaningful_output"):
+                                raise WorkspaceError(
+                                    str(
+                                        research_result.get("reason")
+                                        or "research_result_missing"
+                                    )
+                                )
+                            quality_gate = {
+                                "schema_id": "aiworkhub.completion_quality_gate.v1",
+                                "applicable": False,
+                                "passed": None,
+                                "reason": "research_no_repository_change",
+                                "changed_paths": [],
+                                "checks": [],
+                                "blocking_checks": [],
+                            }
+                        else:
+                            quality_gate = quality_evidence.run_completion_quality_gate(
+                                workspace.path, changed_paths=changed
+                            )
+                            if not quality_gate.get("passed"):
+                                blockers = quality_gate.get("blocking_checks") or []
+                                reason = quality_gate.get("config_error") or ",".join(
+                                    str(v) for v in blockers
+                                )
+                                raise WorkspaceError(
+                                    "quality_gate_failed:" + str(reason)[:400]
+                                )
                         # Phase 1 review-first reconcile: a successful worker
                         # exit no longer promotes into the canonical repo nor
                         # marks review via core.mark_review directly. The
@@ -3816,6 +4127,7 @@ class ProcessManager:
                                 "validation": validations,
                                 "worker_mcp_gate": worker_mcp_gate,
                                 "quality_gate": quality_gate,
+                                "research_result": research_result,
                                 "claim_state": claim_state,
                                 "immutable_inputs": metadata.get("immutable_inputs") or [],
                                 "immutable_input_manifest": (
@@ -3846,7 +4158,8 @@ class ProcessManager:
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
                     terminal_state = "scope_rejected"
                 elif error.startswith((
-                    "validation", "required_output", "quality_gate", "residual_contract"
+                    "validation", "required_output", "quality_gate", "residual_contract",
+                    "research_result",
                 )):
                     terminal_state = "validation_failed"
                 elif error.startswith(("parent_changed", "promotion_scope")):
@@ -3876,6 +4189,20 @@ class ProcessManager:
                 ownership_lost = error.startswith("claim_ownership_lost")
                 cleanup = False
                 if not ownership_lost and not promoted:
+                    retained_candidate: dict[str, Any] = {}
+                    if terminal_state == "validation_failed":
+                        try:
+                            retained_candidate = _retained_candidate_identity_evidence(
+                                workspace,
+                                metadata,
+                                request_id,
+                                changed,
+                                claim_state,
+                            )
+                        except WorkspaceError:
+                            # Keep the truthful failure even when these bytes
+                            # cannot be safely bound for residual rework.
+                            retained_candidate = {}
                     release_result = self._review_terminal_exact(
                         metadata,
                         terminal_state,
@@ -3889,6 +4216,7 @@ class ProcessManager:
                             "worker_mcp_gate": worker_mcp_gate,
                             "quality_gate": quality_gate,
                             "residual_contract": residual_contract_result,
+                            **retained_candidate,
                         },
                     )
                     if not release_result.get("ok"):
@@ -3982,10 +4310,12 @@ class ProcessManager:
                 "usage_error": usage_error,
                 "project_context": metadata.get("project_context"),
                 "project_context_delivery": metadata.get("project_context_delivery"),
+                "prompt_budget": metadata.get("prompt_budget"),
                 "project_context_acknowledgement": context_ack,
                 "provider_tool_denials": provider_tool_denials,
                 "worker_mcp_gate": worker_mcp_gate,
                 "quality_gate": quality_gate,
+                "research_result": research_result,
                 "residual_contract": residual_contract_result,
             })
             if cleanup:
@@ -4424,7 +4754,8 @@ class ProcessManager:
         total_log_limit = max(0, min(int(max_log_bytes), MAX_LOG_TAIL_BYTES))
         stdout_limit = (total_log_limit + 1) // 2
         stderr_limit = total_log_limit // 2
-        card = status.get("task_card") if isinstance(status.get("task_card"), dict) else {}
+        raw_card = status.get("task_card")
+        card: dict[str, Any] = raw_card if isinstance(raw_card, dict) else {}
         card_fields = (
             "task_id", "status", "worker_status", "runner", "topic", "priority",
             "claimed_by", "claim_epoch", "launch_request_id", "terminal_substatus",
@@ -4840,11 +5171,21 @@ class ProcessManager:
                     "task_id": task_id,
                 }
 
+            readonly_research = _card_is_readonly_research(card)
             stored_hashes = evidence.get("changed_path_hashes")
-            if not isinstance(stored_hashes, dict) or not stored_hashes:
+            if not isinstance(stored_hashes, dict) or (
+                not stored_hashes and not readonly_research
+            ):
                 return {
                     "ok": False,
                     "error": "evidence_changed_hashes_missing",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
+            if readonly_research and stored_hashes:
+                return {
+                    "ok": False,
+                    "error": "research_changed_hashes_forbidden",
                     "request_id": request_id,
                     "task_id": task_id,
                 }
@@ -4890,6 +5231,138 @@ class ProcessManager:
                     "task_id": task_id,
                 }
 
+            if readonly_research:
+                try:
+                    if enforce_scope(workspace):
+                        raise WorkspaceError("research_workspace_mutated")
+                    if evidence.get("changed_paths") not in ([], None):
+                        raise WorkspaceError("research_changed_paths_forbidden")
+                    required_output_records = validate_required_outputs(
+                        workspace,
+                        card.get("required_outputs") or [],
+                        allow_empty=(),
+                        allow_unchanged=(),
+                    )
+                    stored_result = evidence.get("research_result")
+                    if not isinstance(stored_result, dict):
+                        raise WorkspaceError("research_result_evidence_missing")
+                    stdout_raw = latest.get("stdout_path")
+                    if not stdout_raw:
+                        raise WorkspaceError("research_result_path_missing")
+                    stdout_path = Path(str(stdout_raw))
+                    try:
+                        safe_parent = stdout_path.parent.resolve()
+                        expected_parent = self.process_dir.resolve()
+                    except OSError as exc:
+                        raise WorkspaceError("research_result_path_invalid") from exc
+                    if (
+                        safe_parent != expected_parent
+                        or stdout_path.name != f"{request_id}.stdout.log"
+                    ):
+                        raise WorkspaceError("research_result_path_identity_mismatch")
+                    current_result = _readonly_research_result_evidence(stdout_path)
+                    if not current_result.get("meaningful_output"):
+                        raise WorkspaceError(
+                            str(
+                                current_result.get("reason")
+                                or "research_result_missing"
+                            )
+                        )
+                    identity_keys = (
+                        "schema_id",
+                        "meaningful_output",
+                        "bytes",
+                        "sha256",
+                        "result_event_count",
+                        "result_chars",
+                    )
+                    if any(
+                        current_result.get(key) != stored_result.get(key)
+                        for key in identity_keys
+                    ):
+                        raise WorkspaceError("research_result_evidence_mismatch")
+                    worker_mcp_gate = evidence.get("worker_mcp_gate")
+                    if isinstance(worker_mcp_gate, dict) and worker_mcp_gate.get("gated"):
+                        raise WorkspaceError("research_worker_mcp_gate_invalid")
+                    validations = run_validations(
+                        workspace, card.get("validation") or []
+                    )
+                except WorkspaceError as exc:
+                    return {
+                        "ok": False,
+                        "error": f"revalidation_failed:{exc}",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
+
+                quality_gate = {
+                    "schema_id": "aiworkhub.completion_quality_gate.v1",
+                    "applicable": False,
+                    "passed": None,
+                    "reason": "research_no_repository_change",
+                    "changed_paths": [],
+                    "checks": [],
+                    "blocking_checks": [],
+                }
+                accept_result = task_engine.accept_review(
+                    self.repo,
+                    task_id,
+                    runner=runner,
+                    topic=topic,
+                    request_id=request_id,
+                    evidence={
+                        "promoted_paths": [],
+                        "validation": validations,
+                        "required_outputs": required_output_records,
+                        "quality_gate": quality_gate,
+                        "research_result": current_result,
+                    },
+                )
+                if not accept_result.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "research_finalize_failed:"
+                            + str(
+                                accept_result.get("stderr")
+                                or accept_result.get("stdout")
+                                or ""
+                            )
+                        )[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "promoted_paths": [],
+                    }
+                cleanup_error = ""
+                try:
+                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                except WorkspaceError as exc:
+                    cleanup_error = str(exc)[:500]
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": latest.get("adapter_id"),
+                    "state": "accepted",
+                    "accepted": True,
+                    "promoted_paths": [],
+                    "workspace_retained": bool(cleanup_error),
+                    "cleanup_error": cleanup_error,
+                    "research_result": current_result,
+                    "reviewer_finalization": [],
+                    "finished_at": _utcnow(),
+                })
+                return {
+                    "ok": True,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": [],
+                    "cleanup_error": cleanup_error,
+                    "research_result": current_result,
+                    "reviewer_finalization": [],
+                }
+
             try:
                 changed = enforce_scope(workspace)
                 required_output_records = validate_required_outputs(
@@ -4932,7 +5405,13 @@ class ProcessManager:
                         "destructive_diff_requires_manager_confirmation:"
                         + ",".join(destructive_blockers)[:300]
                     )
-                effective_risk_signals = list(risk_signals or [])
+                effective_risk_signals = quality_evidence.derive_risk_signals(
+                    card,
+                    changed,
+                    destructive_checks=destructive_checks,
+                )
+                effective_risk_signals.extend(risk_signals or [])
+                effective_risk_signals = sorted(dict.fromkeys(effective_risk_signals))
                 risk_profile = quality_evidence.resolve_risk_profile(
                     requested_risk_tier,
                     signals=effective_risk_signals,
@@ -5209,14 +5688,14 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
         handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if handle:
             kernel32.CloseHandle(handle)
             return True
-        return ctypes.get_last_error() == 5  # access denied still proves liveness
+        return getattr(ctypes, "get_last_error")() == 5  # access denied proves liveness
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
@@ -5232,7 +5711,7 @@ def _pid_start_ticks(pid: int) -> int | None:
         class _FileTime(ctypes.Structure):
             _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
         handle = kernel32.OpenProcess(0x1000, False, pid)

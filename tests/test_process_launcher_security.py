@@ -585,6 +585,9 @@ def test_cached_token_accounting_matches_provider_semantics(
     args = captured[0]
     assert args[args.index("--input-tokens") + 1] == str(expected_input)
     assert args[args.index("--total-tokens") + 1] == str(expected_input + 45)
+    assert args[args.index("--cached-input-tokens") + 1] == "80"
+    assert args[args.index("--cache-creation-input-tokens") + 1] == "25"
+    assert "--cache-metrics-observed" in args
 
 
 # ── B561: gitignored required-output promotion in full finalize flow ──────

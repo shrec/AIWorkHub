@@ -81,6 +81,35 @@ def test_risk_signals_can_raise_but_never_lower_requested_tier() -> None:
     assert released["effective_tier"] == "critical"
 
 
+def test_risk_signals_are_derived_from_exact_card_and_changed_paths() -> None:
+    signals = qe.derive_risk_signals(
+        {
+            "task_type": "code",
+            "validation": ["pytest -q"],
+        },
+        ["src/aiworkhub/runtime_adapters.py", "tests/test_runtime_adapters.py"],
+    )
+
+    assert "code_change" in signals
+    assert "combined_change" in signals
+    assert "public_api" in signals
+    profile = qe.resolve_risk_profile("low", signals=signals)
+    assert profile["effective_tier"] == "medium"
+    assert profile["required_reviewer_lenses"] == [qe.LENS_CORRECTNESS]
+
+
+def test_missing_validation_and_destructive_diff_raise_automatic_floor() -> None:
+    signals = qe.derive_risk_signals(
+        {"task_type": "code", "validation": []},
+        ["src/aiworkhub/core.py"],
+        destructive_checks=[_check("destructive", status=qe.STATUS_FAILED)],
+    )
+
+    assert "missing_validation" in signals
+    assert "destructive_change" in signals
+    assert qe.resolve_risk_profile("low", signals=signals)["effective_tier"] == "high"
+
+
 def test_unknown_risk_input_fails_closed() -> None:
     with pytest.raises(qe.MalformedConfigError):
         qe.resolve_risk_profile("tiny")

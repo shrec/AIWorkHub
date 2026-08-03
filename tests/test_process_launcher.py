@@ -339,6 +339,43 @@ def test_worker_prompt_strips_nested_card_json_and_bounds_contract():
         )
 
 
+def test_worker_prompt_reports_adaptive_initial_and_rework_budgets():
+    initial_budget = {}
+    initial = process_launcher.build_worker_prompt(
+        task_id="TASK_INITIAL",
+        runner="codex_worker_b1",
+        topic="task_mcp",
+        card={"objective": "bounded implementation"},
+        project_context_bundle="PROJECT_CONTEXT_BUNDLE:\n{}",
+        _budget_report=initial_budget,
+    )
+    assert initial_budget["mode"] == "initial"
+    assert initial_budget["total_bytes"] == len(initial.encode("utf-8"))
+    assert initial_budget["max_bytes"] == process_launcher.MAX_WORKER_PROMPT_BYTES
+    assert initial_budget["sections"]["project_context_bytes"] > 0
+    assert initial_budget["byte_labels_are_token_truth"] is False
+
+    rework_budget = {}
+    rework = process_launcher.build_worker_prompt(
+        task_id="TASK_REWORK",
+        runner="codex_worker_b1",
+        topic="task_mcp",
+        card={
+            "objective": "repair residual",
+            "review_feedback": {
+                "schema_id": "aiworkhub.rework_feedback_delta.v1",
+                "instruction": "repair row 7 only",
+                "residual_identities": [{"path": "out.json", "pointer": "/rows/7"}],
+            },
+        },
+        _budget_report=rework_budget,
+    )
+    assert "repair row 7 only" in rework
+    assert rework_budget["mode"] == "rework_delta"
+    assert rework_budget["delta_rework"] is True
+    assert rework_budget["max_bytes"] == process_launcher.MAX_REWORK_WORKER_PROMPT_BYTES
+
+
 def test_external_readonly_sources_are_bounded_and_collapsed(monkeypatch, tmp_path):
     root = tmp_path / "external"
     release = root / "release"
@@ -753,6 +790,8 @@ def test_usage_parser_reads_claude_result_json(tmp_path):
         "output_tokens": 45,
         "cached_input_tokens": 80,
         "cache_creation_input_tokens": 0,
+        "usage_observed": True,
+        "cache_metrics_observed": True,
         "cost_usd": 0.125,
         "cost_observed": True,
     }

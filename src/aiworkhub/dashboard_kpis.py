@@ -134,6 +134,11 @@ def build_kpi_snapshot(
         "raw_context_bytes": 0,
         "delivered_bundle_bytes": 0,
         "estimated_context_bytes_avoided": 0,
+        "prompt_measured_tasks": 0,
+        "initial_prompt_tasks": 0,
+        "rework_prompt_tasks": 0,
+        "total_prompt_bytes": 0,
+        "total_prompt_budget_bytes": 0,
     }
     for row in runs:
         state = str(row.get("state") or "unknown")
@@ -214,6 +219,19 @@ def build_kpi_snapshot(
                 economics["estimated_context_bytes_avoided"] += max(
                     0, raw_bytes - bundle_bytes
                 )
+        prompt_budget = infra.get("prompt_budget") if isinstance(infra, Mapping) else None
+        if isinstance(prompt_budget, Mapping):
+            prompt_bytes = _count(prompt_budget.get("total_bytes"))
+            if prompt_bytes > 0:
+                economics["prompt_measured_tasks"] += 1
+                economics["total_prompt_bytes"] += prompt_bytes
+                economics["total_prompt_budget_bytes"] += _count(
+                    prompt_budget.get("max_bytes")
+                )
+                if str(prompt_budget.get("mode") or "") == "rework_delta":
+                    economics["rework_prompt_tasks"] += 1
+                else:
+                    economics["initial_prompt_tasks"] += 1
 
         day = _date_bucket(row)
         if day is None:
@@ -350,6 +368,19 @@ def build_kpi_snapshot(
         "measurement_label": "declared_raw_context_paths_vs_delivered_project_context_bundle_bytes",
         "token_savings_available": False,
         "token_savings_reason": "no_tokenizer_bound_counterfactual_baseline",
+        "average_prompt_bytes": (
+            round(economics["total_prompt_bytes"] / economics["prompt_measured_tasks"], 1)
+            if economics["prompt_measured_tasks"] else None
+        ),
+        "prompt_budget_utilization_rate": (
+            round(
+                100.0
+                * economics["total_prompt_bytes"]
+                / economics["total_prompt_budget_bytes"],
+                1,
+            )
+            if economics["total_prompt_budget_bytes"] else None
+        ),
     })
 
     return {
@@ -401,6 +432,8 @@ def build_kpi_snapshot(
             "source_graph_index_revisions": len(revision_rows),
             "context_compression_rate": context_compression_rate,
             "estimated_context_bytes_avoided": economics["estimated_context_bytes_avoided"],
+            "average_prompt_bytes": economics["average_prompt_bytes"],
+            "prompt_budget_utilization_rate": economics["prompt_budget_utilization_rate"],
             "callback_delivery_rate": _rate(delivered, callback_terminal),
             "callback_backlog": _count(callback_health.get("backlog_count")),
             "callback_retries": _count(callback_health.get("retry_count")),

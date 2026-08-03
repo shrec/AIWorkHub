@@ -476,6 +476,7 @@ def build_runtime_command(
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_write_intent",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_write_intent",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_write_intent",
+            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_quality_review_submit",
             "--no-session-persistence",
             "--disallowedTools",
             *CLAUDE_RAW_DISCOVERY_DENIES,

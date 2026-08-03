@@ -357,23 +357,80 @@ def _canonical_json_output(
     encoded = canonical.encode("utf-8")
     if len(encoded) <= max_bytes:
         return canonical, False
+    priority_keys = (
+        "ranked_symbols",
+        "related_tests",
+        "risks",
+        "todos",
+        "recommended_next_steps",
+    )
+    identity_keys = (
+        "schema_id", "ok", "tool", "mode", "query", "target", "hit_count", "budget",
+    )
+
+    def preview_value(value: Any, depth: int = 0) -> Any:
+        if depth >= 3:
+            if isinstance(value, list):
+                return {"truncated": True, "original_items": len(value)}
+            if isinstance(value, dict):
+                return {"truncated": True, "original_keys": len(value)}
+        if isinstance(value, str):
+            return value if len(value) <= 768 else value[:768] + "…"
+        if isinstance(value, list):
+            return [preview_value(item, depth + 1) for item in value[:3]]
+        if isinstance(value, dict):
+            return {
+                str(key): preview_value(value[key], depth + 1)
+                for key in sorted(value, key=str)[:10]
+            }
+        return value
+
     wrapper = {
         "schema_id": "aiworkhub.task_mcp.bounded_json_preview.v1",
         "truncated": True,
         "original_bytes": len(encoded),
         "original_sha256": hashlib.sha256(encoded).hexdigest(),
         "original_hit_count": _json_hit_count(payload),
-        "preview": "",
+        "preview_semantics": "structure_aware_priority_preserving",
+        "preview": {},
     }
-    overhead = len(
-        json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
-    wrapper["preview"] = encoded[: max(0, max_bytes - overhead - 8)].decode(
-        "utf-8", errors="ignore"
-    )
+    preview: dict[str, Any] = wrapper["preview"]
+    ordered_keys = [key for key in (*identity_keys, *priority_keys) if key in payload]
+    ordered_keys.extend(key for key in sorted(payload) if key not in ordered_keys)
+    omitted = 0
+    for key in ordered_keys:
+        candidate_value = preview_value(payload[key])
+        preview[key] = candidate_value
+        candidate = json.dumps(
+            wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            continue
+        preview.pop(key, None)
+        omitted += 1
+        if key in priority_keys:
+            value = payload[key]
+            preview[key] = {
+                "truncated": True,
+                "original_items": len(value) if isinstance(value, (list, dict)) else 1,
+            }
+            candidate = json.dumps(
+                wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if len(candidate.encode("utf-8")) > max_bytes:
+                preview.pop(key, None)
+    wrapper["omitted_key_count"] = omitted
+    wrapper["priority_keys_present"] = [key for key in priority_keys if key in preview]
     bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    while len(bounded.encode("utf-8")) > max_bytes and wrapper["preview"]:
-        wrapper["preview"] = wrapper["preview"][:-64]
+    while len(bounded.encode("utf-8")) > max_bytes:
+        removable = next(
+            (key for key in reversed(list(preview)) if key not in priority_keys),
+            None,
+        )
+        if removable is None:
+            break
+        preview.pop(removable, None)
+        wrapper["omitted_key_count"] += 1
         bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return bounded, True
 

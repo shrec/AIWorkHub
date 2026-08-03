@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import stat
@@ -96,6 +97,10 @@ def test_reject_to_pending_requeues_for_rework(coord):
     assert res["ok"] is True, res
     row = _row(coord, "T_PEND")
     assert row["status"] == "pending" and row["worker_status"] == "unclaimed"
+    feedback = json.loads(row["card_json"])["review_feedback"]
+    assert feedback["schema_id"] == "aiworkhub.rework_feedback_delta.v1"
+    assert feedback["instruction"] == "rework this"
+    assert feedback["reason_identity"]["truncated"] is False
 
 
 def test_reject_to_pending_never_repersists_decoded_card_json_envelope(coord):
@@ -111,7 +116,23 @@ def test_reject_to_pending_never_repersists_decoded_card_json_envelope(coord):
     assert res["ok"] is True, res
     persisted = json.loads(_row(coord, "T_PEND_BOUNDED")["card_json"])
     assert "card_json" not in persisted
-    assert len(json.dumps(persisted)) < 2_000
+    assert len(json.dumps(persisted)) < 3_000
+
+
+def test_reject_to_pending_bounds_large_unicode_feedback(coord):
+    _insert(coord, "T_PEND_UNICODE")
+    reason = "ქართული მიზეზი " * 1000
+
+    res = core.reject_review("T_PEND_UNICODE", reason, to="pending")
+
+    assert res["ok"] is True, res
+    feedback = json.loads(_row(coord, "T_PEND_UNICODE")["card_json"])[
+        "review_feedback"
+    ]
+    assert len(feedback["instruction"].encode("utf-8")) <= 4 * 1024
+    assert feedback["reason_identity"]["bytes"] == len(reason.encode("utf-8"))
+    assert feedback["reason_identity"]["truncated"] is True
+    assert len(feedback["reason_identity"]["sha256"]) == 64
 
 
 def test_reject_transition_does_not_wait_for_workspace_gc(coord, monkeypatch):
@@ -184,6 +205,20 @@ def test_reject_to_pending_pins_exact_review_workspace(coord):
     assert card["rework_predecessor"]["residual_identities"] == [
         {"path": "out/result.txt", "pointer": "/rows/3"}
     ]
+    assert card["review_feedback"] == {
+        "schema_id": "aiworkhub.rework_feedback_delta.v1",
+        "instruction": "repair residual only",
+        "reason_identity": {
+            "bytes": len("repair residual only".encode("utf-8")),
+            "sha256": hashlib.sha256(b"repair residual only").hexdigest(),
+            "truncated": False,
+        },
+        "predecessor_request_id": request_id,
+        "predecessor_changed_paths": ["out/result.txt"],
+        "residual_identities": [
+            {"path": "out/result.txt", "pointer": "/rows/3"}
+        ],
+    }
     assert "terminal_review" not in card
 
 

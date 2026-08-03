@@ -83,7 +83,9 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,23 +328,84 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
         raise WorkerToolError(f"tool_malformed_json:{name}:{exc.msg}") from exc
     if not isinstance(payload, dict):
         raise WorkerToolError(f"tool_malformed_json:{name}:object_required")
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     encoded = canonical.encode("utf-8")
     if len(encoded) <= max_bytes:
         return canonical, False
+    priority_keys = (
+        "ranked_symbols",
+        "related_tests",
+        "risks",
+        "todos",
+        "recommended_next_steps",
+    )
+    identity_keys = (
+        "schema_id", "ok", "tool", "mode", "query", "target", "hit_count", "budget",
+    )
+
+    def preview_value(value: Any, depth: int = 0) -> Any:
+        if depth >= 3:
+            if isinstance(value, list):
+                return {"truncated": True, "original_items": len(value)}
+            if isinstance(value, dict):
+                return {"truncated": True, "original_keys": len(value)}
+        if isinstance(value, str):
+            return value if len(value) <= 768 else value[:768] + "…"
+        if isinstance(value, list):
+            return [preview_value(item, depth + 1) for item in value[:3]]
+        if isinstance(value, dict):
+            return {
+                str(key): preview_value(value[key], depth + 1)
+                for key in sorted(value, key=str)[:10]
+            }
+        return value
+
     wrapper = {
         "schema_id": "aiworkhub.task_mcp.bounded_json_preview.v1",
         "truncated": True,
         "original_bytes": len(encoded),
+        "original_sha256": hashlib.sha256(encoded).hexdigest(),
         "original_hit_count": _json_hit_count(payload),
-        "preview": "",
+        "preview_semantics": "structure_aware_priority_preserving",
+        "preview": {},
     }
-    overhead = len(json.dumps(wrapper, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-    wrapper["preview"] = encoded[: max(0, max_bytes - overhead - 8)].decode("utf-8", errors="ignore")
-    bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True)
-    while len(bounded.encode("utf-8")) > max_bytes and wrapper["preview"]:
-        wrapper["preview"] = wrapper["preview"][:-64]
-        bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True)
+    preview: dict[str, Any] = wrapper["preview"]
+    ordered_keys = [key for key in (*identity_keys, *priority_keys) if key in payload]
+    ordered_keys.extend(key for key in sorted(payload) if key not in ordered_keys)
+    omitted = 0
+    for key in ordered_keys:
+        preview[key] = preview_value(payload[key])
+        candidate = json.dumps(
+            wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            continue
+        preview.pop(key, None)
+        omitted += 1
+        if key in priority_keys:
+            value = payload[key]
+            preview[key] = {
+                "truncated": True,
+                "original_items": len(value) if isinstance(value, (list, dict)) else 1,
+            }
+            candidate = json.dumps(
+                wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if len(candidate.encode("utf-8")) > max_bytes:
+                preview.pop(key, None)
+    wrapper["omitted_key_count"] = omitted
+    wrapper["priority_keys_present"] = [key for key in priority_keys if key in preview]
+    bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    while len(bounded.encode("utf-8")) > max_bytes:
+        removable = next(
+            (key for key in reversed(list(preview)) if key not in priority_keys),
+            None,
+        )
+        if removable is None:
+            break
+        preview.pop(removable, None)
+        wrapper["omitted_key_count"] += 1
+        bounded = json.dumps(wrapper, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return bounded, True
 
 
@@ -357,9 +420,105 @@ class AuthorityBinding:
     db_path: Path
     authority_source: str  # "legacy" | "canonical"
     authority_state: str   # raw storage.json authority.state, e.g. "shadow"
+    authority_repo: Path | None = None
+    target_request_id: str = ""
+    target_task_id: str = ""
+    packet_sha256: str = ""
 
 
 _STORAGE_REGISTRY_CACHE: dict[str, dict[str, Any]] = {}
+_SOURCE_GRAPH_DB_OVERRIDE_LOCK = threading.RLock()
+
+
+@contextmanager
+def _with_source_graph_db(source_graph_module: Any, db_path: Path):
+    """Temporarily bind Source Graph resolution to one already-verified DB.
+
+    The worker MCP server is one process per request, but FastMCP may dispatch
+    concurrent calls.  The module-level resolver is therefore changed only
+    while holding a re-entrant lock and is restored in ``finally``.  This is
+    required for a quality reviewer: its repository is the immutable combined
+    candidate worktree while its ephemeral index lives in the private runtime
+    directory, not in that read-only worktree.
+    """
+
+    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
+        original = source_graph_module.resolve_db_path
+        source_graph_module.resolve_db_path = lambda _repo_root: db_path
+        try:
+            yield
+        finally:
+            source_graph_module.resolve_db_path = original
+
+
+def _candidate_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
+    """Build/return the exact packet-bound reviewer candidate index.
+
+    Ordinary workers have no quality-review packet and return ``None``.  A
+    reviewer fails closed unless the packet digest, target identity and every
+    changed-path byte match the immutable combined worktree it was given.
+    Session Manager, AI Memory and KB deliberately remain canonical.
+    """
+
+    path = ctx.quality_review_packet_path
+    if path is None:
+        return None
+    from . import quality_reviewer, source_graph as _source_graph_mod
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise WorkerToolError("quality_review_packet_invalid")
+        if path.stat().st_size > MAX_QUALITY_REVIEW_PACKET_BYTES:
+            raise WorkerToolError("quality_review_packet_too_large")
+        packet = json.loads(path.read_text(encoding="utf-8"))
+    except WorkerToolError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkerToolError("quality_review_packet_unreadable") from exc
+    if not isinstance(packet, dict) or packet.get("schema_id") != quality_reviewer.PACKET_SCHEMA_ID:
+        raise WorkerToolError("quality_review_packet_schema_mismatch")
+    packet_sha256 = str(packet.get("packet_sha256") or "")
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    if quality_reviewer._canonical_digest(body) != packet_sha256:
+        raise WorkerToolError("quality_review_packet_digest_invalid")
+    target = packet.get("target") or {}
+    target_request_id = str(target.get("request_id") or "")
+    target_task_id = str(target.get("task_id") or "")
+    if not target_request_id or not target_task_id:
+        raise WorkerToolError("quality_review_packet_target_invalid")
+    rows = (packet.get("candidate") or {}).get("changed_paths") or []
+    if not isinstance(rows, list) or not rows:
+        raise WorkerToolError("quality_review_candidate_paths_missing")
+    repo = ctx.repo.resolve()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise WorkerToolError("quality_review_candidate_path_invalid")
+        relative = str(row.get("path") or "")
+        expected = str(row.get("sha256") or "")
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise WorkerToolError("quality_review_candidate_path_invalid")
+        candidate = (repo / relative).resolve()
+        if not candidate.is_relative_to(repo) or candidate.is_symlink() or not candidate.is_file():
+            raise WorkerToolError("quality_review_candidate_path_missing")
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+            raise WorkerToolError("quality_review_candidate_hash_mismatch")
+
+    runtime_dir = path.parent.resolve()
+    db_path = runtime_dir / f"candidate_source_graph_{packet_sha256[:16]}.sqlite"
+    if not db_path.is_file() or db_path.stat().st_size <= 0:
+        with _with_source_graph_db(_source_graph_mod, db_path):
+            _source_graph_mod.build_index(repo, db_path=db_path, incremental=False)
+    if not db_path.is_file() or db_path.stat().st_size <= 0:
+        raise WorkerToolError("quality_review_candidate_source_graph_empty")
+    return AuthorityBinding(
+        db_path=db_path,
+        authority_source="candidate_overlay",
+        authority_state="quality_review_readonly",
+        authority_repo=repo,
+        target_request_id=target_request_id,
+        target_task_id=target_task_id,
+        packet_sha256=packet_sha256,
+    )
 
 
 def _load_storage_registry(authority_repo: Path) -> dict[str, Any]:
@@ -433,6 +592,10 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
     falls back to ``AITools/source_graph.db``.
     """
 
+    candidate = _candidate_source_graph_binding(ctx)
+    if candidate is not None:
+        return candidate
+
     from . import storage_registry as _storage_registry_mod
     try:
         registry = _storage_registry_mod.load_storage_registry(ctx.authority_repo)
@@ -441,7 +604,12 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
         raise WorkerToolError(f"authority_registry_unresolved:source_graph.source_graph:{exc}") from exc
     if not db_path.is_file() or db_path.stat().st_size <= 0:
         raise WorkerToolError("authority_db_absent_or_empty:source_graph.source_graph:canonical")
-    return AuthorityBinding(db_path=db_path, authority_source="canonical", authority_state="sole_authority")
+    return AuthorityBinding(
+        db_path=db_path,
+        authority_source="canonical",
+        authority_state="sole_authority",
+        authority_repo=ctx.authority_repo,
+    )
 
 
 def _source_graph_index_identity(db_path: Path, *, default_revision: str) -> dict[str, str]:
@@ -595,6 +763,7 @@ def _append_audit(
     violation: str = "",
     authority_source: str = "",
     authority_state: str = "",
+    authority_repo: Path | None = None,
     payload: Mapping[str, Any] | None = None,
 ) -> None:
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
@@ -618,7 +787,7 @@ def _append_audit(
         "violation": violation[:160],
         "authority_source": authority_source[:32],
         "authority_state": authority_state[:64],
-        "authority_repo": str(ctx.authority_repo),
+        "authority_repo": str(authority_repo or ctx.authority_repo),
     }
     if payload is not None:
         encoded_payload = json.dumps(
@@ -832,6 +1001,9 @@ def verify_audit_ledger(
         authoritative_source_graph = (
             authority_source == "canonical"
             and authority_state in {"canonical_active", "sole_authority"}
+        ) or (
+            authority_source == "candidate_overlay"
+            and authority_state == "quality_review_readonly"
         )
         # A fresh call is real tool-use telemetry even when its bounded query
         # returns zero rows.  Keep it distinct from the non-empty "live" count
@@ -1121,12 +1293,14 @@ def source_graph_query(
         return _violation(ctx, tool, str(exc)[:160])
 
     from . import source_graph as _source_graph_mod
+    query_repo = binding.authority_repo or ctx.authority_repo
     index_identity = _source_graph_index_identity(
         binding.db_path, default_revision=_source_graph_mod.BUILD_REVISION,
     )
     cache_key = (
-        "source_graph", ctx.task_id, ctx.request_id, str(ctx.authority_repo),
+        "source_graph", ctx.task_id, ctx.request_id, str(query_repo),
         mode, bounded_query, scope, budget, bundle_type,
+        binding.packet_sha256,
         index_identity["build_revision"], index_identity["finished_at"],
     )
     cached = _CACHE.get(cache_key)
@@ -1135,6 +1309,7 @@ def source_graph_query(
             ctx, tool=tool, ok=True, cache_hit=True,
             hit_count=cached["hit_count"], bytes_returned=cached["bytes"],
             authority_source=cached["authority_source"], authority_state=cached["authority_state"],
+            authority_repo=query_repo,
             payload={
                 "mode": mode,
                 "workflow_stage": workflow_stage,
@@ -1147,40 +1322,37 @@ def source_graph_query(
         return {**cached["result"], "cache_hit": True}
 
     try:
-        if mode == "bundle":
-            payload = _source_graph_mod.bundle(ctx.authority_repo, bundle_type, bounded_query, budget)
-        elif mode == "slice":
-            payload = _source_graph_mod.slice_(ctx.authority_repo, bounded_query, budget)
-        elif mode == "context":
-            payload = _source_graph_mod.context_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "file":
-            payload = _source_graph_mod.file_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "function":
-            payload = _source_graph_mod.function_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "class":
-            payload = _source_graph_mod.class_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "body":
-            payload = _source_graph_mod.body_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "bodygrep":
-            # Apply exact file/directory scope before scanning.  Filtering a
-            # globally truncated alphabetical scan afterwards can otherwise
-            # produce a false zero for an indexed target that lies beyond the
-            # byte/file cap (notably README/docs in large repositories).
-            payload = _source_graph_mod.bodygrep_query(
-                ctx.authority_repo, bounded_query, budget, target=scope,
-            )
-        elif mode == "impact":
-            payload = _source_graph_mod.impact(ctx.authority_repo, bounded_query, budget)
-        elif mode == "trace":
-            payload = _source_graph_mod.trace(ctx.authority_repo, bounded_query, budget)
-        elif mode == "deps":
-            payload = _source_graph_mod.deps_query(ctx.authority_repo, bounded_query, budget)
-        elif mode == "focus":
-            payload = _source_graph_mod.focus(ctx.authority_repo, bounded_query, budget)
-        else:
-            payload = _source_graph_mod.analytics_query(
-                ctx.authority_repo, mode, bounded_query, budget,
-            )
+        with _with_source_graph_db(_source_graph_mod, binding.db_path):
+            if mode == "bundle":
+                payload = _source_graph_mod.bundle(query_repo, bundle_type, bounded_query, budget)
+            elif mode == "slice":
+                payload = _source_graph_mod.slice_(query_repo, bounded_query, budget)
+            elif mode == "context":
+                payload = _source_graph_mod.context_query(query_repo, bounded_query, budget)
+            elif mode == "file":
+                payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
+            elif mode == "function":
+                payload = _source_graph_mod.function_query(query_repo, bounded_query, budget)
+            elif mode == "class":
+                payload = _source_graph_mod.class_query(query_repo, bounded_query, budget)
+            elif mode == "body":
+                payload = _source_graph_mod.body_query(query_repo, bounded_query, budget)
+            elif mode == "bodygrep":
+                payload = _source_graph_mod.bodygrep_query(
+                    query_repo, bounded_query, budget, target=scope,
+                )
+            elif mode == "impact":
+                payload = _source_graph_mod.impact(query_repo, bounded_query, budget)
+            elif mode == "trace":
+                payload = _source_graph_mod.trace(query_repo, bounded_query, budget)
+            elif mode == "deps":
+                payload = _source_graph_mod.deps_query(query_repo, bounded_query, budget)
+            elif mode == "focus":
+                payload = _source_graph_mod.focus(query_repo, bounded_query, budget)
+            else:
+                payload = _source_graph_mod.analytics_query(
+                    query_repo, mode, bounded_query, budget,
+                )
     except _source_graph_mod.SourceGraphError as exc:
         return _violation(ctx, tool, str(exc)[:160])
     if (
@@ -1222,7 +1394,10 @@ def source_graph_query(
         "cache_hit": False,
         "authority_source": binding.authority_source,
         "authority_state": binding.authority_state,
-        "authority_repo": str(ctx.authority_repo),
+        "authority_repo": str(query_repo),
+        "target_request_id": binding.target_request_id,
+        "target_task_id": binding.target_task_id,
+        "packet_sha256": binding.packet_sha256,
         "index_revision": index_identity["build_revision"],
         "index_finished_at": index_identity["finished_at"],
         "evidence_counts": evidence_counts,
@@ -1235,6 +1410,7 @@ def source_graph_query(
     _append_audit(
         ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=binding.authority_source, authority_state=binding.authority_state,
+        authority_repo=query_repo,
         payload={
             "mode": mode,
             "workflow_stage": workflow_stage,
@@ -1242,6 +1418,9 @@ def source_graph_query(
             "index_revision": index_identity["build_revision"],
             "index_finished_at": index_identity["finished_at"],
             "evidence_counts": evidence_counts,
+            "target_request_id": binding.target_request_id,
+            "target_task_id": binding.target_task_id,
+            "packet_sha256": binding.packet_sha256,
         },
     )
     return result

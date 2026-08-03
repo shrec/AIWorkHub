@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.46] - 2026-08-03
+
+### Fixed
+
+- Normalized declared `pytest` validation commands to the trusted running
+  Python interpreter before entering the secure sandbox. Packaged workers no
+  longer fail by trying to execute the absent `/bin/pytest` console script.
+- Resolved approved bare `ruff` validations from the selected repository or
+  active trusted virtual environment, with owner/mode/symlink checks and an
+  explicit read-only sandbox bind instead of trusting `PATH`.
+- Preserved high-value semantic fields in bounded Source Graph/context JSON
+  previews instead of returning an arbitrary alphabetic prefix.
+- Made automatic review risk signals monotonic and derived from the task card
+  and candidate diff, while requiring explicit validation for mutating code
+  tasks and exposing Claude's quality-review submission tool.
+- Corrected token/cache accounting across retries and surfaced truthful
+  unknown-cost evidence instead of reporting unpriced work as free.
+- Preserved hash-pinned predecessor identity after failed validation and made
+  strict read-only research tasks reach review through bounded, hash-verified
+  provider evidence without weakening the empty-diff rule for code tasks.
+- Indexed the exact isolated candidate tree for independent quality reviewers,
+  so Source Graph review queries inspect proposed code rather than stale HEAD.
+- Recognized Claude `message_delta` and terminal stream events in the dashboard
+  instead of rendering valid provider JSON as an unsupported event shape.
+
+### Added
+
+- Added dashboard KPI evidence for context delivery, tool use, validation and
+  provider/runtime outcomes, backed by focused regression coverage.
+- Added bounded initial/rework prompt envelopes with per-section byte evidence
+  and compact residual feedback, keeping token claims separate from byte data.
+
 ## [0.8.45] - 2026-08-03
 
 ### Added
