@@ -614,7 +614,9 @@ def test_failure_outcome_preserves_already_finalized_task(
     result = manager._finalize_isolated_request(request_id)
 
     assert result["state"] == "timed_out"
-    assert result["error"] == ""
+    assert result["error"] == (
+        "worker_timed_out:timeout_seconds=unknown:exit_code=124"
+    )
     assert result["release_transition_ok"] is True
     assert result["canonical_lifecycle"] == "archived"
     assert result["terminal_review_disposition"] == (

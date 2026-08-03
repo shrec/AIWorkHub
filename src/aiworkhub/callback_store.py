@@ -44,6 +44,7 @@ CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = frozenset({
     "validation_failed",
     "scope_rejected",
     "timed_out",
+    "token_budget_exceeded",
     "cancelled",
 })
 
@@ -383,6 +384,13 @@ def _task_still_in_matching_terminal_state(
         return False
     if transition == "blocked":
         return current_status in ("review", "blocked")
+    if current_status == "blocked":
+        return transition in {
+            "launch_failed",
+            "timed_out",
+            "token_budget_exceeded",
+            "cancelled",
+        }
     return current_status == "review"
 
 
@@ -412,6 +420,7 @@ _CALLBACK_TRANSITION_MAP: dict[str, str] = {
     "required_output_unchanged": "validation_failed",
     "scope_rejected": "scope_rejected",
     "timed_out": "timed_out",
+    "token_budget_exceeded": "token_budget_exceeded",
     "cancelled": "cancelled",
     "canceled": "cancelled",
 }
@@ -825,7 +834,7 @@ def seed_missing_review_callbacks(
     provider: str,
     origin_thread_id: str | None = None,
 ) -> int:
-    """Backfill durable callback rows for review tasks after route recovery.
+    """Backfill durable callbacks for current review/terminal-failure tasks.
 
     Normal terminal transitions enqueue callbacks immediately.  A reload,
     stale runtime, or earlier route bug can leave a task already in the
@@ -843,9 +852,10 @@ def seed_missing_review_callbacks(
       that already has any callback row for the same provider/claim episode.
       An explicit verified route remains route-scoped so reload retargeting can
       seed the new origin exactly once.
-    - A verified route may recover one matching dead-letter row once when the
-      task is still in the same Review episode.  ``recovery_count`` prevents an
-      endlessly failing transport from being resurrected on every health poll.
+    - A verified route may recover one matching dead-letter row or one row
+      incorrectly superseded by an older eligibility bug, but only while the
+      task is still in that exact terminal episode. ``recovery_count`` prevents
+      an endlessly failing transport from being resurrected on every poll.
     """
     _ensure_tasks_origin_thread_column(conn)
     _ensure_callback_outbox_table(conn)
@@ -855,9 +865,9 @@ def seed_missing_review_callbacks(
         return 0
     rows = conn.execute(
         """
-        SELECT task_id, card_json, origin_thread_id
+        SELECT task_id, status, card_json, origin_thread_id
           FROM tasks
-         WHERE status='review'
+         WHERE status IN ('review', 'blocked')
            AND (archived_at IS NULL OR archived_at='')
          ORDER BY updated_at ASC, task_id ASC
         """
@@ -875,12 +885,18 @@ def seed_missing_review_callbacks(
         if row_provider != provider:
             continue
         episode_id = str(card.get("claim_epoch") or 0)
-        raw_terminal = str(card.get("terminal_substatus") or "").strip() or "review_ready"
+        current_status = str(row["status"] or "").strip()
+        raw_terminal = str(card.get("terminal_substatus") or "").strip()
         # Reconciliation starts from an already-canonical review row. Preserve
         # known compact terminal states, but recover an unfamiliar persisted
         # substatus as review_ready so a future/legacy spelling cannot strand
         # the review. Direct enqueue_callback callers remain fail-closed.
-        transition = resolve_callback_transition(raw_terminal)
+        if current_status == "blocked":
+            transition = normalize_callback_transition(raw_terminal)
+            if transition not in CALLBACK_ELIGIBLE_TRANSITIONS:
+                continue
+        else:
+            transition = resolve_callback_transition(raw_terminal or "review_ready")
         callback_origin = route_origin or str(row["origin_thread_id"] or card.get("origin_thread_id") or "").strip()
         if not callback_origin:
             continue
@@ -899,7 +915,7 @@ def seed_missing_review_callbacks(
         if existing is not None:
             if (
                 route_origin
-                and str(existing["state"] or "") == "dead_letter"
+                and str(existing["state"] or "") in {"dead_letter", "superseded"}
                 and int(existing["recovery_count"] or 0) == 0
                 and _task_still_in_matching_terminal_state(
                     conn, task_id, transition, episode_id
@@ -907,27 +923,37 @@ def seed_missing_review_callbacks(
             ):
                 batch_id = str(existing["batch_id"] or "")
                 now = utc_now()
+                prior_state = str(existing["state"] or "")
                 if batch_id:
                     conn.execute(
                         "UPDATE callback_batches SET state='superseded', updated_at=? "
-                        "WHERE batch_id=? AND state='dead_letter'",
+                        "WHERE batch_id=? AND state IN ('dead_letter','superseded')",
                         (now, batch_id),
                     )
                 conn.execute(
                     "UPDATE callback_outbox SET state='pending', batch_id='', "
                     "lease_id='', lease_expires_at='', attempts=0, "
-                    "last_error='verified_route_dead_letter_recovery', "
+                    "last_error=?, "
                     "recovery_count=recovery_count+1, updated_at=? "
-                    "WHERE outbox_id=? AND state='dead_letter' AND recovery_count=0",
-                    (now, existing["outbox_id"]),
+                    "WHERE outbox_id=? AND state=? AND recovery_count=0",
+                    (
+                        f"verified_route_{prior_state}_recovery",
+                        now,
+                        existing["outbox_id"],
+                        prior_state,
+                    ),
                 )
                 conn.commit()
                 append_event(
                     conn,
                     task_id,
-                    "callback_dead_letter_recovered_on_verified_route",
+                    "callback_terminal_recovered_on_verified_route",
                     "",
-                    {"transition": transition, "episode_id": episode_id},
+                    {
+                        "transition": transition,
+                        "episode_id": episode_id,
+                        "prior_state": prior_state,
+                    },
                 )
                 seeded += 1
             continue

@@ -3907,15 +3907,18 @@ class ProcessManager:
         one current request; only older, different request ids are collected.
         """
         canonical_status = _canonical_task_status(card)
-        if canonical_status == "pending":
-            predecessor = card.get("rework_predecessor")
-            pinned_request_id = (
-                str(predecessor.get("request_id") or "").strip()
-                if isinstance(predecessor, dict)
-                else ""
-            )
-            if pinned_request_id == request_id:
-                return False, "pinned_rework_predecessor"
+        predecessor = card.get("rework_predecessor")
+        pinned_request_id = (
+            str(predecessor.get("request_id") or "").strip()
+            if isinstance(predecessor, dict)
+            else ""
+        )
+        # A failed successor moves the task from pending/processing to
+        # blocked, but the predecessor remains the only hash-pinned reviewed
+        # candidate that a manager can recover or retry.  Its retention is an
+        # identity invariant, not a pending-status convenience.
+        if pinned_request_id == request_id:
+            return False, "pinned_rework_predecessor"
         if canonical_status in GC_DISPOSED_CANONICAL_STATUSES:
             return True, f"disposed_task_status:{canonical_status}"
         if canonical_status != "review":
@@ -4115,14 +4118,30 @@ class ProcessManager:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
             if supervisor_state == "timed_out":
                 terminal_state = "timed_out"
+                error = error or (
+                    "worker_timed_out:timeout_seconds="
+                    + str(metadata.get("timeout_seconds") or "unknown")
+                    + f":exit_code={exit_code}"
+                )
             elif supervisor_state == "token_budget_exceeded":
                 terminal_state = "token_budget_exceeded"
+                budget = supervisor_status.get("token_budget") or {}
+                error = error or (
+                    "token_budget_exceeded:cap_tokens="
+                    + str(budget.get("cap_tokens") or "unknown")
+                    + ":accepted_total_tokens="
+                    + str(budget.get("accepted_total_tokens") or "unknown")
+                )
             elif supervisor_state == "cancelled":
                 terminal_state = "cancelled"
+                error = error or "worker_cancelled"
             elif supervisor_state == "exited" and exit_code == 0:
                 terminal_state = "exited"
             elif supervisor_state in {"exited", "spawn_failed", "supervisor_error"}:
                 terminal_state = "worker_failed"
+                error = error or (
+                    f"worker_failed:supervisor_state={supervisor_state}:exit_code={exit_code}"
+                )
             else:
                 # A missing, malformed, or stale running status is never proof
                 # that the worker ran successfully. Cancellation intent is the

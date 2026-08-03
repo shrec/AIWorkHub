@@ -302,3 +302,62 @@ def test_seed_missing_review_callbacks_can_retarget_verified_reloaded_route(tmp_
         }
     finally:
         conn.close()
+
+
+def test_verified_route_recovers_superseded_blocked_terminal_callback(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db_path = repo / "task_queue.sqlite"
+    conn = callback_store.open_db(db_path)
+    try:
+        callback_store.init_db(conn)
+        origin = str(uuid.uuid4())
+        task_id = "CALLBACK_BLOCKED_TIMEOUT_RECOVERY_B962"
+        now = callback_store.utc_now()
+        card = {
+            "task_id": task_id,
+            "coordinator_provider": "codex",
+            "origin_thread_id": origin,
+            "claim_epoch": 2,
+            "terminal_substatus": "timed_out",
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id,runner,topic,status,worker_status,card_json,"
+            "created_at,updated_at,origin_thread_id,archived_at) "
+            "VALUES(?,?,?,'blocked','timed_out',?,?,?,?, '')",
+            (
+                task_id,
+                "worker",
+                "task_mcp",
+                json.dumps(card),
+                now,
+                now,
+                origin,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO callback_outbox(task_id,provider,origin_thread_id,transition,"
+            "episode_id,state,created_at,updated_at) VALUES(?,?,?,?,?,'superseded',?,?)",
+            (task_id, "codex", origin, "timed_out", "2", now, now),
+        )
+        conn.commit()
+
+        assert callback_store.seed_missing_review_callbacks(
+            conn, provider="codex", origin_thread_id=origin
+        ) == 1
+        row = conn.execute(
+            "SELECT transition,state,recovery_count,last_error FROM callback_outbox "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert dict(row) == {
+            "transition": "timed_out",
+            "state": "pending",
+            "recovery_count": 1,
+            "last_error": "verified_route_superseded_recovery",
+        }
+        assert callback_store.seed_missing_review_callbacks(
+            conn, provider="codex", origin_thread_id=origin
+        ) == 0
+    finally:
+        conn.close()

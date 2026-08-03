@@ -56,6 +56,8 @@ def _seed_processing_task(
             "task_id": task_id,
             "callback_required": True,
             "coordinator_provider": "claude",
+            "claim_epoch": 1,
+            "launch_request_id": f"request-{task_id.lower()}",
         })
         conn.execute(
             "INSERT INTO tasks("
@@ -186,10 +188,57 @@ def test_mark_terminal_review_hardcoded_review_ready_regression_guard(tmp_path):
     assert _read_outbox_transition(repo, task_id) == "validation_failed"
 
 
+@pytest.mark.parametrize(
+    ("substatus", "expected_transition"),
+    [
+        ("timed_out", "timed_out"),
+        ("token_budget_exceeded", "token_budget_exceeded"),
+        ("worker_failed", "launch_failed"),
+        ("cancelled", "cancelled"),
+        ("liveness_lost", "blocked"),
+    ],
+)
+def test_blocked_terminal_failure_remains_callback_eligible(
+    tmp_path, substatus, expected_transition,
+):
+    repo = _init_repo(tmp_path)
+    task_id = f"TASK_B921_BLOCKED_{substatus.upper()}"
+    runner = "claude_worker_b921"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id=f"thread-b921-blocked-{substatus}",
+        runner=runner,
+    )
+    request_id = f"request-{task_id.lower()}"
+
+    result = task_engine.mark_terminal_failure(
+        repo,
+        task_id,
+        runner,
+        substatus,
+        evidence={"error": f"observed:{substatus}"},
+        request_id=request_id,
+    )
+
+    assert result["ok"] is True
+    assert result["callback_enqueued"] is True
+    card = task_store.get_task(repo, task_id)
+    assert card["status"] == "blocked"
+    assert card["terminal_substatus"] == substatus
+    assert _read_outbox_transition(repo, task_id) == expected_transition
+    assert _claim_and_render_prompt(repo) == (
+        f"Task MCP: {task_id} → {expected_transition}"
+    )
+
+
 def test_normalize_callback_transition_public_wrapper_matches_private_map():
     assert callback_store.normalize_callback_transition("validation_failed") == "validation_failed"
     assert callback_store.normalize_callback_transition("review") == "review_ready"
     assert callback_store.normalize_callback_transition("process_lost") == "blocked"
+    assert callback_store.normalize_callback_transition("token_budget_exceeded") == (
+        "token_budget_exceeded"
+    )
     assert callback_store.normalize_callback_transition("blocked_on_dependency") == "blocked"
     assert callback_store.normalize_callback_transition("") is None
     assert callback_store.normalize_callback_transition(None) is None
