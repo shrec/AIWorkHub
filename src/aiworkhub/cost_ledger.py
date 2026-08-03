@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from aiworkhub import core, launch_queue_persist
+from aiworkhub import core, launch_queue_persist, task_store
 
 
 USAGE_LINE_RE = re.compile(
@@ -73,6 +74,30 @@ def _launch_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in task_store.list_usage_events(repo_root, limit=10_000):
+        created_at = str(entry.get("created_at") or "")
+        total_tokens = int(entry.get("total_tokens") or 0)
+        cost_usd = float(entry.get("cost_usd") or 0.0)
+        rows.append({
+            "source": "canonical_usage_event",
+            "task_id": str(entry.get("task_id") or ""),
+            "runner": str(entry.get("runner") or ""),
+            "topic": str(entry.get("topic") or ""),
+            "model": str(entry.get("model") or ""),
+            "provider": str(entry.get("provider") or ""),
+            "records": int(entry.get("records") or 1),
+            "input_tokens": int(entry.get("input_tokens") or 0),
+            "output_tokens": int(entry.get("output_tokens") or 0),
+            "total_tokens": total_tokens,
+            "cost_usd": cost_usd,
+            "cost_known": not (total_tokens > 0 and cost_usd == 0.0),
+            "day": created_at[:10] if len(created_at) >= 10 else "",
+        })
+    return rows
+
+
 def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = defaultdict(lambda: {
         "records": 0,
@@ -101,15 +126,31 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
 
 def build_cost_ledger(
     *,
+    repo_root: Path | str | None = None,
     runner: str | None = None,
     topic: str | None = None,
     status: str | None = None,
     include_tasks: bool = False,
 ) -> dict[str, Any]:
-    usage = core.usage_report(runner=runner, topic=topic, status=status)
-    usage_rows = _parse_usage_stdout(usage.get("stdout", ""))
-    launch_summary = launch_queue_persist.read_persisted_log(max_entries=10_000)
-    launch_rows = _launch_rows(launch_summary)
+    if repo_root is not None:
+        usage_rows = _canonical_usage_rows(repo_root)
+        if runner:
+            usage_rows = [row for row in usage_rows if row.get("runner") == runner]
+        if topic:
+            usage_rows = [row for row in usage_rows if row.get("topic") == topic]
+        if status:
+            usage_rows = [row for row in usage_rows if row.get("status") == status]
+        # The persisted launch queue is process-global and carries no complete
+        # repository identity.  Never mix it into an explicitly repo-bound
+        # catalog; canonical usage events are the sole authority here.
+        usage = {"ok": True}
+        launch_summary = {"ok": True}
+        launch_rows: list[dict[str, Any]] = []
+    else:
+        usage = core.usage_report(runner=runner, topic=topic, status=status)
+        usage_rows = _parse_usage_stdout(usage.get("stdout", ""))
+        launch_summary = launch_queue_persist.read_persisted_log(max_entries=10_000)
+        launch_rows = _launch_rows(launch_summary)
 
     seen: set[tuple[str, str, str]] = set()
     union_rows: list[dict[str, Any]] = []

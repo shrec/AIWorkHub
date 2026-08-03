@@ -308,6 +308,53 @@ def test_identical_bundle_reaches_all_adapter_prompts_and_metadata_is_redacted(
     assert "SECRET" not in json.dumps(result.metadata)
 
 
+def test_worker_prompt_bounds_contract_and_excludes_recursive_persistence_envelopes() -> None:
+    recursive_artifact = {
+        "card_json": json.dumps(
+            {
+                "card_json": "MEGABYTE_REWORK_ARTIFACT" * 20_000,
+                "provider_input_tokens": 9_999_999,
+                "review_packet": "REPEATED_REVIEW_PACKET",
+            },
+            sort_keys=True,
+        ),
+        "persistence": {"card_json": "REPEATED_PERSISTENCE_ENVELOPE" * 10_000},
+    }
+    prompt = process_launcher.build_worker_prompt(
+        task_id="TASK_BOUNDED_CARD",
+        runner="codex_worker_b434",
+        topic="task_mcp",
+        card={
+            "review_feedback": {
+                "instruction": "repair only row 7",
+                "card_json": json.dumps(recursive_artifact, sort_keys=True),
+            },
+            "persistence": recursive_artifact,
+            "quality_review": recursive_artifact,
+        },
+    )
+    contract_json = prompt.split("TASK_CONTRACT_JSON:\n", 1)[1].split(
+        "\n\nRead every read_first path", 1
+    )[0]
+    contract = json.loads(contract_json)
+
+    assert contract["review_feedback"] == {"instruction": "repair only row 7"}
+    assert "card_json" not in prompt
+    assert "MEGABYTE_REWORK_ARTIFACT" not in prompt
+    assert "REPEATED_REVIEW_PACKET" not in prompt
+    assert "provider_input_tokens" not in prompt
+    assert len(contract_json.encode("utf-8")) < 1024
+    assert len(prompt.encode("utf-8")) < 16_000
+
+    with pytest.raises(ValueError, match="task_contract_too_large"):
+        process_launcher.build_worker_prompt(
+            task_id="TASK_OVERSIZED_CARD",
+            runner="codex_worker_b434",
+            topic="task_mcp",
+            card={"review_feedback": {"instruction": "x" * (129 * 1024)}},
+        )
+
+
 def test_workspace_creation_does_not_copy_live_context_databases(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     repo = _context_repo(tmp_path)
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)

@@ -29,6 +29,20 @@ class ProtocolError(Exception):
         self.message = message
 
 
+class TransportClosed(SystemExit):
+    """The MCP client closed stdout, so the server must stop cleanly."""
+
+
+def _stderr_event(event: str, **fields: Any) -> None:
+    record = {"component": "aiworkhub.worker_mcp_stdio", "event": event}
+    record.update({key: value for key, value in fields.items() if value is not None})
+    try:
+        sys.stderr.write(json.dumps(record, ensure_ascii=False, default=str)[:4000] + "\n")
+        sys.stderr.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _json_type(annotation: Any) -> str:
     if annotation is inspect.Signature.empty:
         return "string"
@@ -148,7 +162,7 @@ def _dispatch(server_name: str, tools: dict[str, Any], method: Any, params: Any)
     if method == "initialize":
         return {
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "resources": {}},
             "serverInfo": {"name": server_name, "version": __version__},
         }
     if method == "notifications/initialized":
@@ -170,6 +184,10 @@ def _dispatch(server_name: str, tools: dict[str, Any], method: Any, params: Any)
         }
     if method == "tools/call":
         return _tool_result(tools, params)
+    if method == "resources/list":
+        return {"resources": []}
+    if method == "resources/templates/list":
+        return {"resourceTemplates": []}
     raise ProtocolError(-32601, f"method_not_found:{method}")
 
 
@@ -181,8 +199,16 @@ def _write(message: dict[str, Any]) -> None:
             "id": message.get("id"),
             "error": {"code": -32603, "message": "response_too_large"},
         })
-    sys.stdout.write(payload + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(payload + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        _stderr_event(
+            "transport_closed",
+            request_id=message.get("id"),
+            error_type=type(exc).__name__,
+        )
+        raise TransportClosed(0) from exc
 
 
 def _run(server_name: str, tools: dict[str, Any]) -> None:
@@ -216,6 +242,12 @@ def _run(server_name: str, tools: dict[str, Any]) -> None:
         except ProtocolError as exc:
             _write({"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": exc.message}})
         except Exception as exc:
+            _stderr_event(
+                "request_failed",
+                request_id=request_id,
+                method=request.get("method"),
+                error_type=type(exc).__name__,
+            )
             _write({
                 "jsonrpc": "2.0",
                 "id": request_id,

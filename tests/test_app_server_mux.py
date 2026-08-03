@@ -242,6 +242,53 @@ def test_non_app_server_invocation_never_touches_sideband_dir():
         assert not sideband_dir.exists()
 
 
+def test_windows_passthrough_keeps_tracked_parent_until_child_exit(monkeypatch):
+    events = []
+
+    class _Child:
+        _handle = 91
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            return 23
+
+    monkeypatch.setattr(app_server_mux.subprocess, "Popen", lambda *args, **kwargs: _Child())
+    monkeypatch.setattr(
+        app_server_mux,
+        "_bind_child_lifetime_to_this_process",
+        lambda child: events.append(("bind", child._handle)) or 77,
+    )
+    monkeypatch.setattr(
+        app_server_mux,
+        "_close_windows_handle",
+        lambda handle: events.append(("close", handle)),
+    )
+
+    assert app_server_mux._hold_passthrough_child("codex.exe", ["app-server"]) == 23
+    assert events == [("bind", 91), ("wait", None), ("close", 77)]
+
+
+def test_mux_shutdown_releases_its_exact_windows_job_handle(monkeypatch, tmp_path):
+    mux = AppServerMux(
+        ["app-server"],
+        repo_id=_MUX_TEST_REPO_ID,
+        sideband_dir=tmp_path,
+        real_executable="unused",
+    )
+
+    class _ExitedChild:
+        def poll(self):
+            return 0
+
+    released = []
+    mux._child = _ExitedChild()
+    mux._child_job_handle = 81
+    monkeypatch.setattr(app_server_mux, "_close_windows_handle", released.append)
+    mux.shutdown()
+    assert released == [81]
+    assert mux._child_job_handle is None
+
+
 # ---------------------------------------------------------------------------
 # In-process mux harness: OS pipes stand in for the extension's stdio
 # ---------------------------------------------------------------------------

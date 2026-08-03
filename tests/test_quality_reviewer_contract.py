@@ -35,6 +35,28 @@ def _packet() -> dict[str, object]:
     )
 
 
+def test_read_only_research_reviewer_allows_no_repository_outputs() -> None:
+    process_launcher._validate_required_outputs_contract(
+        {
+            "topic": "quality_review",
+            "allowed_writes": [],
+            "required_outputs": [],
+            "project_context": {"task_type": "research"},
+        }
+    )
+
+
+def test_empty_outputs_still_fail_closed_for_code_tasks() -> None:
+    with pytest.raises(process_launcher.LaunchRejected, match="required_outputs_invalid"):
+        process_launcher._validate_required_outputs_contract(
+            {
+                "allowed_writes": [],
+                "required_outputs": [],
+                "project_context": {"task_type": "code"},
+            }
+        )
+
+
 def _receipt(packet: dict[str, object]) -> dict[str, object]:
     return {
         "schema_id": qr.RECEIPT_SCHEMA_ID,

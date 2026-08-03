@@ -51,9 +51,92 @@ const { __testInternals } = extensionModule;
 const {
   repairCodexConfigTomlText,
   ensureCodexManagerGatesTomlText,
+  ensureCodexStableMcpRegistrationTomlText,
   migrateCodexConfigTomlText,
   splitCodexPythonPathValue,
 } = __testInternals;
+
+{
+  const original = [
+    "[mcp_servers.AIWorkHub]",
+    'command = "py"',
+    'args = ["-3", "-m", "aiworkhub.server"]',
+    "",
+    "[mcp_servers.AIWorkHub.env]",
+    'PYTHONPATH = "C:\\\\Users\\\\dev\\\\.vscode\\\\extensions\\\\IvaneChkheidze.aiworkhub-0.8.40\\\\runtime"',
+    'AIWORKHUB_REPO = "C:\\\\repo"',
+    'AIWORKHUB_ALLOW_WRITES = "1"',
+    "",
+    "[mcp_servers.Unrelated]",
+    'command = "node"',
+    'args = ["server.js"]',
+    "",
+  ].join("\r\n");
+  const launcher = "C:\\Users\\dev\\AppData\\Roaming\\AIWorkHub\\bin\\aiworkhub-mcp-server.py";
+  const migrated = ensureCodexStableMcpRegistrationTomlText(
+    original,
+    launcher,
+    { command: "py", argsPrefix: ["-3"] },
+  );
+  assert.strictEqual(migrated.changed, true);
+  assert.ok(migrated.text.includes(JSON.stringify(launcher)));
+  assert.ok(!migrated.text.includes("PYTHONPATH"));
+  assert.ok(!migrated.text.includes("AIWORKHUB_REPO ="));
+  assert.ok(migrated.text.includes('AIWORKHUB_ALLOW_WRITES = "1"'));
+  assert.ok(migrated.text.includes('AIWORKHUB_ALLOW_LAUNCH = "1"'));
+  assert.ok(migrated.text.includes('[mcp_servers.Unrelated]\r\ncommand = "node"'));
+  const second = ensureCodexStableMcpRegistrationTomlText(
+    migrated.text,
+    launcher,
+    { command: "py", argsPrefix: ["-3"] },
+  );
+  assert.strictEqual(second.changed, false);
+  assert.strictEqual(second.text, migrated.text);
+}
+
+{
+  const created = ensureCodexStableMcpRegistrationTomlText(
+    "",
+    "/stable/aiworkhub-mcp-server.py",
+    { command: "python3", argsPrefix: [] },
+  );
+  assert.strictEqual(created.changed, true);
+  assert.ok(created.text.includes("[mcp_servers.aiworkhub]"));
+  assert.ok(created.text.includes('args = ["/stable/aiworkhub-mcp-server.py"]'));
+  assert.ok(!created.text.includes("PYTHONPATH"));
+}
+
+// A historical developer registration may point at an arbitrary source
+// checkout rather than a packaged extension runtime.  Marketplace activation
+// owns and repairs this exact block too, while preserving per-tool approvals.
+{
+  const original = [
+    "[mcp_servers.aiworkhub]",
+    'command = "py"',
+    'args = ["-3", "-m", "aiworkhub.server"]',
+    "",
+    "[mcp_servers.aiworkhub.env]",
+    "PYTHONPATH = 'D:\\Dev\\AIWorkHub\\src'",
+    'AIWORKHUB_ALLOW_WRITES = "1"',
+    'AIWORKHUB_ALLOW_LAUNCH = "1"',
+    "",
+    "[mcp_servers.aiworkhub.tools.aiworkhub_repo_current]",
+    'approval_mode = "approve"',
+    "",
+  ].join("\r\n");
+  const launcher = "C:\\Users\\shrek\\AppData\\Roaming\\Code\\User\\globalStorage\\IvaneChkheidze.aiworkhub\\bin\\aiworkhub-mcp-server.py";
+  const migrated = ensureCodexStableMcpRegistrationTomlText(
+    original,
+    launcher,
+    { command: "py", argsPrefix: ["-3"] },
+  );
+  assert.strictEqual(migrated.changed, true);
+  assert.ok(!migrated.text.includes("D:\\Dev\\AIWorkHub\\src"));
+  assert.ok(!migrated.text.includes("PYTHONPATH"));
+  assert.ok(migrated.text.includes(JSON.stringify(launcher)));
+  assert.ok(migrated.text.includes("[mcp_servers.aiworkhub.tools.aiworkhub_repo_current]"));
+  assert.ok(migrated.text.includes('approval_mode = "approve"'));
+}
 
 {
   const original = [

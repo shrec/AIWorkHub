@@ -54,7 +54,7 @@ def _ensure_deepseek_credentials_stub() -> None:
 
 _ensure_deepseek_credentials_stub()
 
-from aiworkhub import dashboard, task_store  # noqa: E402
+from aiworkhub import core, dashboard, task_store  # noqa: E402
 
 
 NOW = "2026-07-21T00:00:00+00:00"
@@ -72,6 +72,25 @@ def _canonical_db(root: Path) -> Path:
     readiness = task_store.storage_readiness(root)
     assert readiness.ready, readiness.reason
     return Path(readiness.canonical_db)
+
+
+def test_default_repo_root_tracks_manager_process_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dashboard reads must follow the same live repo authority as MCP tools."""
+    original = _init_canonical_repo(tmp_path, "original")
+    switched = _init_canonical_repo(tmp_path, "switched")
+    monkeypatch.setenv("AIWORKHUB_REPO", str(original))
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.setattr(core, "_PROCESS_REPO_ROOT_OVERRIDE", switched)
+
+    assert core.repo_root() == switched.resolve()
+    assert dashboard._default_repo_root() == switched.resolve()
+    provider = dashboard.DashboardProvider()
+    assert provider.repo_root.resolve() == switched.resolve()
+    assert provider.get_storage_readiness().repo_id == task_store.storage_readiness(
+        switched
+    ).repo_id
 
 
 def _insert_canonical_task(
@@ -671,6 +690,50 @@ def test_agent_processes_expose_derived_liveness_never_the_raw_status_path(tmp_p
     assert "last_activity_at" in row
     assert "supervisor_status_path" not in row
     assert "metadata_path" not in row
+
+
+def test_terminal_review_ready_process_is_not_mislabeled_lost(tmp_path, monkeypatch):
+    process_log = tmp_path / "process_events.jsonl"
+    status_path = tmp_path / "req-terminal.supervisor.json"
+    status_path.write_text(
+        json.dumps({
+            "state": "exited",
+            "heartbeat_at_epoch": time.time() - 30.0,
+            "child_pid": 99999999,
+        }),
+        encoding="utf-8",
+    )
+    status_path.chmod(0o600)
+    events = [
+        {
+            "request_id": "req-terminal",
+            "task_id": "TASK_TERMINAL_REVIEW_V1",
+            "state": "running",
+            "supervisor_status_path": str(status_path),
+            "pid": 99999999,
+            "timestamp": "2026-07-10T10:00:00+00:00",
+        },
+        {
+            "request_id": "req-terminal",
+            "task_id": "TASK_TERMINAL_REVIEW_V1",
+            "state": "review_ready",
+            "exit_code": 0,
+            "finished_at": "2026-07-10T10:05:00+00:00",
+            "timestamp": "2026-07-10T10:05:00+00:00",
+        },
+    ]
+    process_log.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(dashboard.process_launcher.PROCESS_LOG_ENV, str(process_log))
+
+    row = dashboard.read_process_runs()["processes"][0]
+    assert row["state"] == "review_ready"
+    assert row["exit_code"] == 0
+    assert "liveness_state" not in row
+    assert "process_alive" not in row
+    assert "observed_state" not in row
 
 
 def test_task_rows_receive_last_activity_and_liveness_from_process_report(monkeypatch):

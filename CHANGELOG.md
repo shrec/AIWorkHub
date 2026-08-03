@@ -6,6 +6,35 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.41] - 2026-08-03
+
+### Added
+
+- Added durable create reconciliation: identical retries of a committed task
+  now return `created:false` with the existing canonical receipt, while a
+  same-id/different-payload request remains a field-described conflict.
+- Added empty MCP resource discovery surfaces for fallback runtimes, removing
+  `resources/list` and `resources/templates/list` compatibility warnings.
+
+### Fixed
+
+- Replaced versioned/source-checkout Codex MCP registrations with a
+  host-stable launcher. Marketplace activation atomically migrates legacy
+  `PYTHONPATH` entries once, preserves tool approvals, and future upgrades
+  advance only the immutable runtime pointer instead of closing live stdio.
+- Serialized task create/claim/launch/review/finalize mutations inside each MCP
+  server and added an immediate SQLite transaction boundary, preventing
+  concurrent shared-transport writes from racing.
+- Made fallback stdio shutdown BrokenPipe-safe with bounded structured stderr
+  diagnostics, and restored Windows child lifetime ownership through Job
+  Objects for both muxed and passthrough Codex processes.
+- Repaired AI Memory FTS migration, repository-authoritative dashboard and
+  preflight truth, terminal liveness, targeted Markdown/body Source Graph
+  search, DeepSeek/GLM adapter fallback, and repo-bound usage/cost provenance.
+- Allowed read-only research reviewers without output files, isolated pytest
+  cache writes in worker sandboxes, and returned actionable residual-identity
+  schema guidance during review rejection.
+
 ## [0.8.40] - 2026-08-02
 
 ### Fixed

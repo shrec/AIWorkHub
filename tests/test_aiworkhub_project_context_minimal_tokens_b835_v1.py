@@ -359,6 +359,47 @@ def test_representative_fixture_meets_bootstrap_byte_gate(tmp_path: Path) -> Non
     assert after_bytes <= BYTE_CAP_GATE
     assert after_bytes <= CARD_REFERENCE_BASELINE_BYTES * 0.5
     assert after_bytes <= MEASURED_PRE_CHANGE_BASELINE_BYTES * 0.5
+    assert result.metadata["bundle_bytes"] == after_bytes
+    assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
+    assert result.metadata["estimated_raw_context_vs_bundle_bytes"]["label"] == (
+        "deterministic_byte_estimate_not_token_or_cost_truth"
+    )
+    assert result.metadata["optimization"]["byte_labels_are_token_truth"] is False
+
+
+def test_tool_caps_are_enforced_before_bundle_cap_independent_of_token_accounting(
+    tmp_path: Path,
+) -> None:
+    large_source = {
+        "rows": [
+            {"path": f"src/aiworkhub/module_{i}.py", "snippet": "source graph evidence " * 80}
+            for i in range(120)
+        ]
+    }
+    repo = _repo(tmp_path, source_payload=large_source, session_payload=SESSION_PAYLOAD)
+
+    with _install_source_graph_stub(large_source), _install_worker_tools_stub(
+        session_hit=True,
+        memory_hit=True,
+        kb_hit=True,
+    ):
+        result = project_context.collect_project_context(repo, _card())
+
+    assert result is not None
+    payload = json.loads(_bundle_body(result.prompt_bundle))
+    by_name = {section["name"]: section for section in payload["sections"]}
+    metadata_by_name = {section["name"]: section for section in result.metadata["sections"]}
+    assert len(result.prompt_bundle.encode("utf-8")) == result.metadata["bundle_bytes"]
+    assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
+    for name, cap in project_context.TOOL_CAPS.items():
+        if name in by_name:
+            assert len(by_name[name]["content"].encode("utf-8")) <= cap["bytes"]
+            assert metadata_by_name[name]["bytes"] <= cap["bytes"]
+
+    source_preview = json.loads(by_name["source_graph"]["content"])
+    assert source_preview["schema_id"] == "aiworkhub.task_mcp.bounded_json_preview.v1"
+    assert source_preview["truncated"] is True
+    assert source_preview["original_bytes"] > project_context.TOOL_CAPS["source_graph"]["bytes"]
 
 
 def test_real_measurement_evidence_written(tmp_path: Path) -> None:
@@ -439,8 +480,9 @@ def test_real_measurement_evidence_written(tmp_path: Path) -> None:
             "b829_eval_artifacts_untouched": True,
         },
     }
-    EVAL_JSON.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    evidence_path = tmp_path / EVAL_JSON.name
+    evidence_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     assert report["verdict"] == "PASS"
     assert report["token_economy"]["meets_byte_cap_gate"] is True
     assert report["token_economy"]["meets_50pct_reduction_gate"] is True
-    assert EVAL_JSON.stat().st_size > 0
+    assert evidence_path.stat().st_size > 0

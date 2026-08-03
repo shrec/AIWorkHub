@@ -187,6 +187,24 @@ def test_reject_to_pending_pins_exact_review_workspace(coord):
     assert "terminal_review" not in card
 
 
+def test_invalid_residual_identity_returns_actionable_schema(coord):
+    _insert(coord, "T_BAD_RESIDUAL")
+    result = core.reject_review(
+        "T_BAD_RESIDUAL",
+        "repair residual",
+        to="pending",
+        residual_identities=[{"path": "out/result.txt", "pointer": "rows/3"}],
+    )
+
+    assert result["ok"] is False
+    assert result["invalid_index"] == 0
+    schema = result["residual_identities_schema"]
+    assert schema["items"]["required"] == ["path", "pointer"]
+    assert schema["example"] == [
+        {"path": "data/residual.json", "pointer": "/rows/7"}
+    ]
+
+
 def test_reject_to_blocked_parks_as_blocked(coord):
     _insert(
         coord,

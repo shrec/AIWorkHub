@@ -153,3 +153,110 @@ def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path
     assert decision["selected_worker_id"] == "b"
     by_id = {item["worker_id"]: item for item in decision["candidates"]}
     assert by_id["b"]["score_components"]["manager_adjusted_success_rate"] > by_id["a"]["score_components"]["manager_adjusted_success_rate"]
+
+
+def test_deepseek_uses_launchable_copilot_fallback_without_identity_drift(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={
+            "providers": [
+                {"adapter_id": "deepseek_vscode_lm", "launchable": False, "status": "not_visible"},
+                {"adapter_id": "deepseek_copilot_cli", "launchable": True, "status": "ready", "access_observed": True},
+            ]
+        },
+    )
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro")
+    assert worker["available"] is True
+    assert worker["adapter_id"] == "deepseek_vscode_lm"
+    assert worker["effective_adapter_id"] == "deepseek_copilot_cli"
+    assert worker["adapter_fallback_used"] is True
+    assert worker["provider"] == "deepseek"
+    assert worker["model"] == "deepseek-v4-pro"
+
+
+def test_glm_uses_launchable_copilot_fallback(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={
+            "providers": [
+                {"adapter_id": "glm_vscode_lm", "launchable": False, "status": "not_visible"},
+                {"adapter_id": "glm_copilot_cli", "launchable": True, "status": "ready", "access_observed": True},
+            ]
+        },
+    )
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "glm-5.2")
+    assert worker["available"] is True
+    assert worker["effective_adapter_id"] == "glm_copilot_cli"
+    assert worker["adapter_fallback_used"] is True
+
+
+def test_successful_attributed_outcome_establishes_access_observation(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[{"task_id": "T1", "status": "finished", "terminal_substatus": "review_ready"}],
+        process_rows=[{
+            "request_id": "r1", "task_id": "T1", "adapter_id": "codex_cli",
+            "model": "gpt-5.5", "total_tokens": 500,
+        }],
+        preflight={"providers": [{"adapter_id": "codex_cli", "launchable": True, "status": "ready"}]},
+    )
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5")
+    assert worker["outcomes"]["sample_count"] == 1
+    assert worker["availability_observed"] is True
+
+
+def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[{"task_id": "T1", "status": "finished", "terminal_substatus": "review_ready"}],
+        process_rows=[{
+            "request_id": "r1", "task_id": "T1", "runner": "codex_runner",
+            "adapter_id": "codex_cli", "model": "gpt-5.5",
+        }],
+        usage_rows=[{
+            "task_id": "T1", "runner": "codex_runner", "model": "gpt-5.5",
+            "total_tokens": 1702755, "cost_usd": 0.0, "cost_known": False,
+        }],
+        preflight={"providers": [{"adapter_id": "codex_cli", "launchable": True, "status": "ready"}]},
+    )
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5")
+    assert worker["outcomes"]["total_tokens"] == 1702755
+    assert worker["outcomes"]["cost_usd"] is None
+    assert worker["outcomes"]["tokens_with_unknown_cost"] == 1702755
+
+
+def test_missing_process_identity_is_recovered_only_from_canonical_terminal_evidence(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[{
+            "task_id": "T1",
+            "runner": "deepseek_runner",
+            "status": "finished",
+            "terminal_substatus": "review_ready",
+            "terminal_review": {"evidence": {
+                "model": "deepseek-v4-pro",
+                "adapter_id": "deepseek_copilot_cli",
+            }},
+        }],
+        process_rows=[{"request_id": "r1", "task_id": "T1"}],
+        preflight={"providers": [{
+            "adapter_id": "deepseek_copilot_cli", "launchable": True, "status": "ready"
+        }]},
+    )
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "deepseek-v4-pro")
+    assert worker["outcomes"]["sample_count"] == 1
+    assert snapshot["summary"]["process_identity_recovered_rows"] == 1
+    assert snapshot["summary"]["unattributed_process_rows"] == 0

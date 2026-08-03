@@ -1144,7 +1144,21 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
                 "allow_unchanged_required_outputs_requires_required_outputs"
             )
         return
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list):
+        raise LaunchRejected("required_outputs_invalid")
+    if not raw:
+        # A research task can be intentionally read-only: quality reviewers
+        # submit their packet-bound receipt through MCP and must not mutate the
+        # candidate repository.  Treat an empty output list as valid only for
+        # that narrow contract; code/data tasks and any task with write scope
+        # continue to fail closed.
+        project_context = card.get("project_context") or {}
+        if (
+            isinstance(project_context, dict)
+            and project_context.get("task_type") == "research"
+            and not (card.get("allowed_writes") or [])
+        ):
+            return
         raise LaunchRejected("required_outputs_invalid")
     allowed = card.get("allowed_writes") or []
     if not isinstance(allowed, list):

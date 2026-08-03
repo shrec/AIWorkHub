@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.40";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.41";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -366,6 +366,23 @@ function atomicWriteJson(file, payload) {
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.${nonce}.tmp`);
   try {
     fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {
+      // Best-effort cleanup; preserve the original filesystem failure.
+    }
+    throw err;
+  }
+}
+
+function atomicWriteText(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const nonce = crypto.randomBytes(6).toString("hex");
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.${nonce}.tmp`);
+  try {
+    fs.writeFileSync(tmp, String(text), "utf8");
     fs.renameSync(tmp, file);
   } catch (err) {
     try {
@@ -3684,6 +3701,157 @@ function ensureCodexMcpRegistrationTomlText(text, runtimeDir, python) {
   return { text: `${input}${prefix}${block}`, changed: true };
 }
 
+/** Point every AIWorkHub-owned Codex MCP entry at one host-stable launcher.
+ *
+ * The launcher resolves the current immutable runtime generation at process
+ * start.  Extension upgrades therefore update only current.json; they no
+ * longer rewrite ~/.codex/config.toml while an existing Codex chat owns an
+ * MCP transport.  That removes the Windows config-reload race which could
+ * close stdio after a task mutation but before its receipt reached the chat.
+ */
+function ensureCodexStableMcpRegistrationTomlText(text, launcherPath, python) {
+  const input = String(text || "");
+  const launcherArgs = [
+    ...(Array.isArray(python.argsPrefix) ? python.argsPrefix : []),
+    launcherPath,
+  ];
+  const commandLine = `command = ${tomlQuoted(python.command)}`;
+  const argsLine = `args = [${launcherArgs.map(tomlQuoted).join(", ")}]`;
+  const lines = input.split("\n");
+  const output = [];
+  const topSections = new Set();
+  const envSections = new Set();
+  let currentSection = "";
+  let changed = false;
+
+  for (const line of lines) {
+    const sectionMatch = line.match(TOML_SECTION_RE);
+    if (sectionMatch) currentSection = sectionMatch[1];
+    const segments = currentSection.trim().split(".");
+    const owned = segments.length >= 2
+      && segments[0].toLowerCase() === "mcp_servers"
+      && OWNED_MCP_SERVER_NAMES.has(segments[1].toLowerCase());
+    const topLevel = owned && segments.length === 2;
+    const envLevel = owned && segments.length === 3 && segments[2].toLowerCase() === "env";
+    if (topLevel) topSections.add(segments[1]);
+    if (envLevel) envSections.add(segments[1].toLowerCase());
+    const suffix = line.endsWith("\r") ? "\r" : "";
+    if (topLevel && /^\s*command\s*=/.test(line)) {
+      const replacement = `${commandLine}${suffix}`;
+      output.push(replacement);
+      if (replacement !== line) changed = true;
+      continue;
+    }
+    if (topLevel && /^\s*args\s*=/.test(line)) {
+      const replacement = `${argsLine}${suffix}`;
+      output.push(replacement);
+      if (replacement !== line) changed = true;
+      continue;
+    }
+    if (
+      envLevel
+      && /^\s*(?:PYTHONPATH|AIWORKHUB_REPO(?:_ROOT|_ID)?)\s*=/.test(line)
+    ) {
+      changed = true;
+      continue;
+    }
+    output.push(line);
+  }
+
+  if (topSections.size === 0) {
+    const prefix = input && !input.endsWith("\n") ? "\n\n" : input ? "\n" : "";
+    output.length = 0;
+    output.push(`${input}${prefix}[mcp_servers.aiworkhub]`);
+    output.push(commandLine);
+    output.push(argsLine);
+    output.push("");
+    output.push("[mcp_servers.aiworkhub.env]");
+    output.push('AIWORKHUB_ALLOW_WRITES = "1"');
+    output.push('AIWORKHUB_ALLOW_LAUNCH = "1"');
+    output.push("");
+    changed = true;
+  } else {
+    for (const serverName of topSections) {
+      if (envSections.has(serverName.toLowerCase())) continue;
+      output.push("");
+      output.push(`[mcp_servers.${serverName}.env]`);
+      output.push('AIWORKHUB_ALLOW_WRITES = "1"');
+      output.push('AIWORKHUB_ALLOW_LAUNCH = "1"');
+      changed = true;
+    }
+  }
+  const withGates = ensureCodexManagerGatesTomlText(output.join("\n"));
+  return { text: withGates.text, changed: changed || withGates.changed };
+}
+
+function materializeStableMcpLauncher(context) {
+  const storageRoot = context.globalStorageUri && context.globalStorageUri.fsPath
+    ? context.globalStorageUri.fsPath
+    : path.join(
+      os.tmpdir(),
+      "aiworkhub-extension-fallback",
+      crypto.createHash("sha256").update(String(context.extensionUri.fsPath)).digest("hex").slice(0, 16),
+    );
+  const binDir = path.join(storageRoot, "bin");
+  const launcher = path.join(binDir, "aiworkhub-mcp-server.py");
+  const script = `#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
+runtime = Path(current["runtime_dir"])
+server = runtime / "aiworkhub" / "server.py"
+if not server.is_file():
+    raise SystemExit("AIWorkHub stable MCP runtime is missing")
+sys.path.insert(0, str(runtime))
+from aiworkhub.server import main
+raise SystemExit(main())
+`;
+  fs.mkdirSync(binDir, { recursive: true });
+  let existing = "";
+  try {
+    existing = fs.readFileSync(launcher, "utf8");
+  } catch (_err) {
+    existing = "";
+  }
+  if (existing !== script) {
+    fs.writeFileSync(launcher, script, { encoding: "utf8", mode: 0o755 });
+  }
+  if (process.platform !== "win32") fs.chmodSync(launcher, 0o755);
+  return launcher;
+}
+
+function ensureCodexStableMcpRegistered(context) {
+  const configPath = resolveCodexConfigTomlPath(process.env);
+  let original = "";
+  try {
+    original = fs.readFileSync(configPath, "utf8");
+  } catch (err) {
+    if (err && err.code !== "ENOENT") {
+      outputChannel.appendLine(`[codex] failed to read config.toml: ${sanitizeErrorMessage(err)}`);
+      return false;
+    }
+  }
+  const launcher = materializeStableMcpLauncher(context);
+  const python = findPythonCommand(os.homedir(), { preflight: false });
+  const result = ensureCodexStableMcpRegistrationTomlText(original, launcher, python);
+  if (!result.changed || result.text === original) return false;
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    // Exactly one write per activation migration. Subsequent versions update
+    // only the launcher's current.json pointer and leave this live transport
+    // configuration byte-identical.
+    atomicWriteText(configPath, result.text);
+    outputChannel.appendLine("[codex] migrated AIWorkHub MCP to the host-stable runtime launcher");
+    return true;
+  } catch (err) {
+    outputChannel.appendLine(`[codex] failed to install stable AIWorkHub MCP launcher: ${sanitizeErrorMessage(err)}`);
+    return false;
+  }
+}
+
 function ensureCodexMcpRegistered(context, _repoRoot) {
   const configPath = resolveCodexConfigTomlPath(process.env);
   let original = "";
@@ -6543,10 +6711,7 @@ async function activate(context) {
     : "packaged runtime fallback";
   outputChannel.appendLine(`[runtime] using ${runtimeLabel}`);
   debugTrace("activation.config_repair.begin");
-  ensureCodexConfigTomlRepaired(context);
-  migrateCodexConfigTomlRuntimePath(context);
-  ensureCodexMcpRegistered(context, activeRepoIdentity && activeRepoIdentity.root);
-  ensureCodexManagerGatesRepaired();
+  ensureCodexStableMcpRegistered(context);
   ensureWorkspaceMcpConfigsRepaired(context);
   debugTrace("activation.config_repair.end");
 
@@ -6672,6 +6837,9 @@ module.exports = {
     ensureWorkspaceMcpConfigsRepaired,
     ensureCodexMcpRegistrationTomlText,
     ensureCodexMcpRegistered,
+    ensureCodexStableMcpRegistrationTomlText,
+    materializeStableMcpLauncher,
+    ensureCodexStableMcpRegistered,
     splitCodexPythonPathValue,
     ensureCodexConfigTomlRepaired,
     CODEX_OWNED_RUNTIME_SEGMENT_RE,

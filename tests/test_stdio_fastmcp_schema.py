@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from aiworkhub.stdio_fastmcp import _schema_for
+from aiworkhub.stdio_fastmcp import _dispatch, _schema_for
 
 
 def test_literal_and_optional_literal_are_exposed_as_enums() -> None:
@@ -21,3 +21,12 @@ def test_literal_and_optional_literal_are_exposed_as_enums() -> None:
         "type": "string",
         "enum": ["audit", "explore"],
     }
+
+
+def test_resource_discovery_is_empty_but_protocol_compatible() -> None:
+    assert _dispatch("worker", {}, "resources/list", {}) == {"resources": []}
+    assert _dispatch("worker", {}, "resources/templates/list", {}) == {
+        "resourceTemplates": []
+    }
+    initialized = _dispatch("worker", {}, "initialize", {})
+    assert initialized["capabilities"]["resources"] == {}

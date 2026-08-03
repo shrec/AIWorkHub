@@ -3007,6 +3007,85 @@ def create_task(
             "kb": {"query": semantic_query, "limit": 5},
         },
     }
+
+    # Only caller-controlled task semantics participate in idempotency.  The
+    # manager route fields are runtime provenance and may legitimately change
+    # after a transport restart, while the requested operation is still the
+    # same create.  A same-id/different-payload retry remains a hard conflict.
+    requested_payload = {
+        "title": title,
+        "runner": runner,
+        "topic": topic,
+        "objective": objective,
+        "acceptance": acceptance2,
+        "allowed_writes": writes2,
+        "forbidden": forbidden2,
+        "required_outputs": outputs2,
+        "validation": validation2,
+        "priority": priority,
+        "task_type": task_type,
+        "depends_on": depends_on2,
+        "read_first": read_first2,
+        "immutable_inputs": immutable_inputs2,
+    }
+
+    def reconcile_existing(existing_json: Any) -> dict[str, Any]:
+        try:
+            existing_card = json.loads(existing_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            existing_card = {}
+        if not isinstance(existing_card, dict):
+            existing_card = {}
+        existing_context = existing_card.get("project_context")
+        if not isinstance(existing_context, dict):
+            existing_context = {}
+        existing_payload = {
+            "title": str(existing_card.get("title") or ""),
+            "runner": str(existing_card.get("runner") or ""),
+            "topic": str(existing_card.get("topic") or ""),
+            "objective": str(existing_card.get("objective") or ""),
+            "acceptance": existing_card.get("acceptance") or [],
+            "allowed_writes": existing_card.get("allowed_writes") or [],
+            "forbidden": existing_card.get("forbidden") or [],
+            "required_outputs": existing_card.get("required_outputs") or [],
+            "validation": existing_card.get("validation") or [],
+            "priority": str(existing_card.get("priority") or "normal"),
+            "task_type": str(existing_context.get("task_type") or "code"),
+            "depends_on": existing_card.get("depends_on") or [],
+            "read_first": existing_card.get("read_first") or [],
+            "immutable_inputs": existing_card.get("immutable_inputs") or [],
+        }
+        if existing_payload == requested_payload:
+            result = _canonical_result(
+                ok=True,
+                stdout=json.dumps(existing_card, ensure_ascii=False),
+                command=["add-card", task_id],
+            )
+            result.update({
+                "task_id": task_id,
+                "created": False,
+                "reconciled": True,
+                "receipt_state": "existing_identical",
+            })
+            return result
+        differing_fields = sorted(
+            key for key, value in requested_payload.items()
+            if existing_payload.get(key) != value
+        )
+        result = _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"task_already_exists:{task_id}",
+            command=["add-card", task_id],
+        )
+        result.update({
+            "task_id": task_id,
+            "created": False,
+            "reconciled": False,
+            "conflict_fields": differing_fields,
+        })
+        return result
+
     command = ["add-card", task_id]
     try:
         conn = _canonical_connect()
@@ -3014,10 +3093,13 @@ def create_task(
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     try:
         callback_store.init_db(conn)
-        if conn.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone() is not None:
-            return _canonical_result(
-                ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
-            )
+        conn.execute("BEGIN IMMEDIATE")
+        existing_row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if existing_row is not None:
+            conn.rollback()
+            return reconcile_existing(existing_row["card_json"])
         if depends_on2:
             existing_cards: dict[str, dict[str, Any]] = {}
             for row in conn.execute("SELECT task_id, card_json FROM tasks"):
@@ -3055,16 +3137,28 @@ def create_task(
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
+        existing_row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if existing_row is not None:
+            return reconcile_existing(existing_row["card_json"])
         return _canonical_result(
-            ok=False, returncode=1, stderr=f"task_already_exists:{task_id}", command=command
+            ok=False, returncode=1, stderr="task_create_integrity_error", command=command
         )
     finally:
         conn.close()
-    return _canonical_result(
+    result = _canonical_result(
         ok=True,
         stdout=json.dumps(card, ensure_ascii=False),
         command=command,
     )
+    result.update({
+        "task_id": task_id,
+        "created": True,
+        "reconciled": False,
+        "receipt_state": "created",
+    })
+    return result
 
 
 def mark_review(task_id: str, runner: str | None = None, topic: str | None = None) -> dict[str, Any]:
@@ -3296,15 +3390,37 @@ def reject_review(
     if disposition not in ("pending", "blocked", "archived", "superseded"):
         return _lifecycle_error(f"invalid reject-review disposition: {disposition}")
     normalized_residuals: list[dict[str, str]] = []
+
+    def residual_error(code: str, *, index: int | None = None) -> dict[str, Any]:
+        result = _lifecycle_error(code, 2)
+        result["residual_identities_schema"] = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {
+                "type": "object",
+                "required": ["path", "pointer"],
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string", "description": "repo-relative file path"},
+                    "pointer": {"type": "string", "description": "JSON pointer beginning with /"},
+                },
+            },
+            "example": [{"path": "data/residual.json", "pointer": "/rows/7"}],
+        }
+        if index is not None:
+            result["invalid_index"] = index
+        return result
+
     if residual_identities is not None:
         if disposition != "pending" or not isinstance(residual_identities, list):
-            return _lifecycle_error("residual_identities_require_pending_rework", 2)
+            return residual_error("residual_identities_require_pending_rework")
         if not residual_identities or len(residual_identities) > 256:
-            return _lifecycle_error("invalid_residual_identities", 2)
+            return residual_error("invalid_residual_identities")
         seen_residuals: set[tuple[str, str]] = set()
-        for row in residual_identities:
+        for index, row in enumerate(residual_identities):
             if not isinstance(row, dict):
-                return _lifecycle_error("invalid_residual_identities", 2)
+                return residual_error("invalid_residual_identities", index=index)
             path = _task_contract_path(row.get("path"))
             pointer = str(row.get("pointer") or "").strip()
             if (
@@ -3313,7 +3429,7 @@ def reject_review(
                 or len(pointer) > 1000
                 or "\x00" in pointer
             ):
-                return _lifecycle_error("invalid_residual_identities", 2)
+                return residual_error("invalid_residual_identities", index=index)
             key = (path, pointer)
             if key in seen_residuals:
                 continue
@@ -3396,7 +3512,7 @@ def reject_review(
                 "pinned_at": now,
             }
         elif normalized_residuals:
-            return _lifecycle_error("residual_contract_requires_review_predecessor", 2)
+            return residual_error("residual_contract_requires_review_predecessor")
     prior_episode = task_store.begin_claim_episode(card)
     if disposition == "blocked":
         card.update(status="blocked", worker_status="blocked")

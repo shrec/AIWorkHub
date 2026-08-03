@@ -28,6 +28,16 @@ MAX_CATALOG_BYTES = 256 * 1024
 MAX_WORKERS = 64
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
+# Keep the declared worker/provider/model identity stable while allowing an
+# equivalent launch transport when the preferred VS Code LM surface is not
+# visible in the current host.  The effective adapter remains explicit in the
+# catalog response; this is routing evidence, not fabricated credential/quota
+# evidence.
+_WORKER_ADAPTER_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "deepseek_vscode_lm": ("deepseek_copilot_cli",),
+    "glm_vscode_lm": ("glm_copilot_cli",),
+}
+
 
 DEFAULT_WORKERS: tuple[dict[str, Any], ...] = (
     {"worker_id": "claude-haiku", "adapter_id": "claude_cli", "model": "haiku", "provider": "anthropic", "supports": ["mechanical", "code", "review"], "tools": ["filesystem", "source-graph"], "max_context_tokens": 200_000, "max_risk": "medium", "quality_ceiling": 0.85},
@@ -243,18 +253,61 @@ def _canonical_cards(root: Path) -> list[dict[str, Any]]:
     return task_store.list_task_cards(root, limit=5000)
 
 
+def _resolve_effective_adapter(
+    worker: Mapping[str, Any],
+    ready_by_adapter: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, Mapping[str, Any]]:
+    declared = str(worker.get("adapter_id") or "")
+    candidate = ready_by_adapter.get(declared, {})
+    if candidate.get("launchable"):
+        return declared, candidate
+    for fallback in _WORKER_ADAPTER_FALLBACKS.get(declared, ()):
+        candidate = ready_by_adapter.get(fallback, {})
+        if candidate.get("launchable"):
+            return fallback, candidate
+    return declared, ready_by_adapter.get(declared, {})
+
+
 def build_catalog(
     repo_root: Path | str,
     *,
     cards: Iterable[Mapping[str, Any]] | None = None,
     process_rows: Iterable[Mapping[str, Any]] | None = None,
+    usage_rows: Iterable[Mapping[str, Any]] | None = None,
     preflight: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     catalog = load_catalog(root)
     task_cards = [dict(item) for item in (cards if cards is not None else _canonical_cards(root))]
     processes = [dict(item) for item in (process_rows or [])]
+    usage = [dict(item) for item in (usage_rows or [])]
     card_by_task = {str(item.get("task_id") or ""): item for item in task_cards}
+    identity_recovered = 0
+    for process in processes:
+        task_id = str(process.get("task_id") or "")
+        card = card_by_task.get(task_id) or {}
+        terminal = card.get("terminal_review") if isinstance(card, Mapping) else {}
+        evidence = terminal.get("evidence") if isinstance(terminal, Mapping) else {}
+        recovered_fields: list[str] = []
+        if not str(process.get("model") or "") and isinstance(evidence, Mapping):
+            model = str(evidence.get("model") or "")
+            if model:
+                process["model"] = model
+                recovered_fields.append("model")
+        if not str(process.get("adapter_id") or "") and isinstance(evidence, Mapping):
+            adapter = str(evidence.get("adapter_id") or "")
+            if adapter:
+                process["adapter_id"] = adapter
+                recovered_fields.append("adapter_id")
+        if not str(process.get("runner") or ""):
+            runner = str(card.get("runner") or "") if isinstance(card, Mapping) else ""
+            if runner:
+                process["runner"] = runner
+                recovered_fields.append("runner")
+        if recovered_fields:
+            process["identity_evidence_source"] = "canonical_terminal_review"
+            process["identity_recovered_fields"] = recovered_fields
+            identity_recovered += 1
     readiness = preflight or repo_policy.build_preflight(root)
     ready_by_adapter = {
         str(item.get("adapter_id") or ""): item
@@ -264,15 +317,33 @@ def build_catalog(
     rows: list[dict[str, Any]] = []
     attributed_process_ids: set[int] = set()
     for worker in catalog["workers"]:
+        effective_adapter, adapter_ready = _resolve_effective_adapter(
+            worker, ready_by_adapter
+        )
+        adapter_ids_to_match = {worker["adapter_id"], effective_adapter}
         matched: list[dict[str, Any]] = []
         for index, process in enumerate(processes):
-            if str(process.get("adapter_id") or "") != worker["adapter_id"]:
+            if str(process.get("adapter_id") or "") not in adapter_ids_to_match:
                 continue
             if str(process.get("model") or "") != worker["model"]:
                 continue
             matched.append(process)
             attributed_process_ids.add(index)
         task_ids = {str(item.get("task_id") or "") for item in matched if item.get("task_id")}
+        runners = {str(item.get("runner") or "") for item in matched if item.get("runner")}
+        matched_usage = [
+            item for item in usage
+            if str(item.get("task_id") or "") in task_ids
+            and (
+                not str(item.get("model") or "")
+                or str(item.get("model") or "") == worker["model"]
+            )
+            and (
+                not runners
+                or not str(item.get("runner") or "")
+                or str(item.get("runner") or "") in runners
+            )
+        ]
         matched_cards = [card_by_task[task_id] for task_id in task_ids if task_id in card_by_task]
         sample_count = len(matched_cards)
         accepted = sum(1 for item in matched_cards if str(item.get("status") or "") == "finished")
@@ -292,8 +363,15 @@ def build_catalog(
         ]
         attempts = len(matched)
         retries = max(0, attempts - sample_count)
-        tokens = sum(int(item.get("total_tokens") or 0) for item in matched)
-        cost = sum(float(item.get("cost_usd") or 0.0) for item in matched)
+        usage_source = matched_usage or matched
+        tokens = sum(int(item.get("total_tokens") or 0) for item in usage_source)
+        known_cost_rows = [item for item in usage_source if item.get("cost_known") is not False]
+        cost = sum(float(item.get("cost_usd") or 0.0) for item in known_cost_rows)
+        unknown_cost_tokens = sum(
+            int(item.get("total_tokens") or 0)
+            for item in usage_source
+            if item.get("cost_known") is False
+        )
         accepted_rate = accepted / sample_count if sample_count else None
         review_rate = review_ready / sample_count if sample_count else None
         failure_rate = failed / sample_count if sample_count else None
@@ -307,12 +385,13 @@ def build_catalog(
             if effective is not None else None
         )
         effective_score = max(0.0, min(100.0, (observed_score if observed_score is not None else 50.0) + worker["manager_score_adjustment"]))
-        adapter_ready = ready_by_adapter.get(worker["adapter_id"], {})
         access_observed = bool(adapter_ready.get("access_observed"))
         rows.append({
             **worker,
+            "effective_adapter_id": effective_adapter,
+            "adapter_fallback_used": effective_adapter != worker["adapter_id"],
             "available": bool(worker["enabled"] and adapter_ready.get("launchable")),
-            "availability_observed": access_observed,
+            "availability_observed": access_observed or bool(sample_count > 0),
             "readiness_status": str(adapter_ready.get("status") or "unobserved"),
             "quota_observed": False,
             "quota_state": "unavailable_from_provider_api",
@@ -328,6 +407,7 @@ def build_catalog(
                 "p95_latency_seconds": _percentile(latencies, 0.95),
                 "total_tokens": tokens,
                 "cost_usd": round(cost, 6) if cost else None,
+                "tokens_with_unknown_cost": unknown_cost_tokens,
                 "cost_usd_per_1k_tokens": round(cost * 1000.0 / tokens, 6) if cost and tokens else None,
                 "evidence_source": "observed" if sample_count else "conservative_prior",
             },
@@ -353,6 +433,7 @@ def build_catalog(
             "unattributed_process_rows": len(unattributed),
             "unattributed_missing_model_rows": missing_model,
             "unattributed_unknown_adapter_or_model_rows": len(unattributed) - missing_model,
+            "process_identity_recovered_rows": identity_recovered,
         },
         "truth_contract": {
             "provider_quota_fabricated": False,

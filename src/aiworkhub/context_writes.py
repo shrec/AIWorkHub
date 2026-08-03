@@ -81,14 +81,20 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
 
 
 def _normalize_memory_schema(con: sqlite3.Connection) -> None:
-    """Remove the legacy UNIQUE(key) constraint without losing memories.
+    """Repair known legacy ``memories`` schema shapes without losing rows.
 
     Supersede/archive semantics retain historical rows with the same logical
     key.  Early databases declared ``key UNIQUE``; after an archived row was
     imported, ``remember`` therefore raised an opaque IntegrityError.  Rebuild
     only when an exact unique-key index is observed, preserve ids, and rebuild
-    the contentless FTS mirror deterministically.
+    the contentless FTS mirror deterministically.  Legacy databases that have
+    ``memories`` but no ``memories_fts`` are backfilled in place.  Both paths
+    are idempotent.
     """
+    if con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
+    ).fetchone() is None:
+        return
     unique_key_index = False
     for row in con.execute("PRAGMA index_list(memories)"):
         # seq, name, unique, origin, partial
@@ -102,15 +108,25 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
         if columns == ["key"]:
             unique_key_index = True
             break
-    if not unique_key_index:
+    if unique_key_index:
+        con.executescript(
+            "DROP TABLE IF EXISTS memories_fts;"
+            "ALTER TABLE memories RENAME TO memories_legacy_unique;"
+            "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
+            "INSERT INTO memories(id,key,value,tags,scope) "
+            "SELECT id,key,value,tags,scope FROM memories_legacy_unique;"
+            "DROP TABLE memories_legacy_unique;"
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
+            "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+            "SELECT id,key,value,tags,scope FROM memories;"
+        )
+        con.commit()
+        return
+    if con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+    ).fetchone() is not None:
         return
     con.executescript(
-        "DROP TABLE IF EXISTS memories_fts;"
-        "ALTER TABLE memories RENAME TO memories_legacy_unique;"
-        "CREATE TABLE memories(id INTEGER PRIMARY KEY,key TEXT,value TEXT,tags TEXT,scope TEXT);"
-        "INSERT INTO memories(id,key,value,tags,scope) "
-        "SELECT id,key,value,tags,scope FROM memories_legacy_unique;"
-        "DROP TABLE memories_legacy_unique;"
         "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
         "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
         "SELECT id,key,value,tags,scope FROM memories;"

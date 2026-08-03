@@ -190,6 +190,25 @@ def test_markdown_is_indexed_as_truthful_repository_document_evidence(tmp_path):
     assert literal["matches"]
 
 
+def test_bodygrep_target_is_scanned_before_global_byte_cap(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "000-large.md", "x" * (1024 * 1024 + 128))
+    _write(repo / "README.md", "# AIWorkHub\n\nExact bounded target survives.\n")
+    sg.build_index(repo, incremental=False)
+
+    literal = sg.bodygrep_query(
+        repo,
+        "Exact bounded target survives",
+        budget=4,
+        target="README.md",
+    )
+
+    assert literal["target"] == "README.md"
+    assert literal["files_scanned"] == 1
+    assert literal["candidate_files"] == ["README.md"]
+    assert literal["matches"][0]["file_path"] == "README.md"
+
+
 def test_cpp_cuda_semantic_lexical_extraction_records_symbols_bodies_and_calls(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     target = repo / "native" / "engine.cu"

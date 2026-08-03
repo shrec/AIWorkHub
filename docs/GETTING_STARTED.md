@@ -25,8 +25,8 @@ The extension kind is `workspace`: under Remote-SSH it installs and runs on
 the remote host, not locally, so no port forwarding or local Python install
 is needed on the client machine. On plain Linux/WSL/Windows the same VSIX
 runs unmodified -- there is no host-specific path anywhere in the extension
-or the Python runtime; every path is resolved relative to the opened
-workspace folder.
+or the Python runtime. Packaged assets resolve from extension/global storage,
+while repository authority always resolves from the active workspace.
 
 ### Headless (any MCP-capable client)
 
@@ -97,7 +97,29 @@ A code task's worker context bundle reports honest hit counts, bytes, and
 hashes for each of these sections rather than claiming injected context was
 consumed.
 
-## 5. Task workers and Live Output
+## 5. Run the first task
+
+Open a fresh model chat after initialization so the client performs MCP tool
+discovery against the installed runtime. A normal manager loop is:
+
+1. Read repository/preflight state and query Source Graph for the requested
+   work boundary.
+2. Create one task card with a stable `task_id`, exact objective, acceptance
+   criteria, allowed writes, forbidden paths, required outputs, validation and
+   optional dependencies.
+3. Choose a ready adapter/model from Workforce and launch that exact card.
+4. Monitor bounded Live Output or continue other work until the durable
+   callback reports a terminal outcome.
+5. Review the task's diff, tests, logs, artifacts and authenticated tool-use
+   receipts. Accept only verified evidence; otherwise reject with a precise
+   residual disposition.
+
+Identical `task_create` retries are safe after an interrupted connection: the
+server returns the existing canonical receipt with `created=false`. Reusing a
+task id with different content remains an explicit conflict and never
+overwrites the first card.
+
+## 6. Task workers and Live Output
 
 `aiworkhub_task_auto_pickup` claims the next pending task for an exact
 runner/topic; `aiworkhub_agent_launch_task` starts the configured local
@@ -107,14 +129,14 @@ The dashboard's task detail view for a selected, currently-running task
 shows **Live Output**: a bounded, incremental read of that one task's
 stdout/stderr, never a repository-wide log stream.
 
-## 6. Codex callback routing / Claude callback capability
+## 7. Codex callback routing / Claude callback capability
 
 When a claimed task reaches a terminal state (`review_ready`, `blocked`,
 `launch_failed`, `validation_failed`, `scope_rejected`, `timed_out`,
 `cancelled`), the callback bridge wakes the exact originating Codex thread
 automatically -- see the README's
-[Callback Bridge](../README.md#callback-bridge-task-mcp---originating-codex-thread)
-section for the full transport/lease/batching contract.
+[Callback delivery](CALLBACKS.md) guide for the full
+transport/lease/batching contract.
 
 Claude callback delivery reuses the same durable outbox: it uses a
 `claude --resume` CLI transport (`ClaudeCliResumeClient`) gated on an
@@ -124,7 +146,25 @@ Claude Code CLI session and currently supports the `panel`/`cli_resume`
 adapter modes only -- it does not (yet) speak the VS Code-owned App Server
 sideband transport that the Codex path uses for `transport="sideband"`.
 
-## 7. Running the tests
+## 8. Operations and troubleshooting
+
+The dashboard's **Operations** dialog contains KPIs, Tool Use, Storage,
+workforce and reliability evidence. Use the bounded last-log row and Logs
+viewer before reading host logs directly.
+
+- **Connecting:** run **AIWorkHub: Restart MCP Connection** once. It replaces
+  only AIWorkHub's selected repository child.
+- **Chat has no tools:** create a new chat after install/upgrade so MCP
+  discovery runs against the current server.
+- **Windows has an old `PYTHONPATH`:** current releases migrate AIWorkHub-owned
+  Codex config from source/version paths to the packaged host-stable launcher
+  automatically. Tool approval subsections are preserved.
+- **Model unavailable:** inspect Preflight, authenticate that provider and
+  grant VS Code's one-time model consent if requested.
+- **Source Graph empty:** verify the repository was initialized, enable the
+  relevant language family in Settings and refresh the index.
+
+## 9. Running the tests
 
 ```bash
 python -m pytest tests/ -v

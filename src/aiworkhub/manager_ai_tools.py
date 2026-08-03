@@ -16,6 +16,7 @@ from . import core
 from . import context_writes
 from . import context_importer
 from . import context_graph
+from . import cost_ledger
 from . import feature_settings
 from . import storage_registry
 from . import workforce_catalog
@@ -243,6 +244,9 @@ def workforce_catalog_read() -> dict[str, Any]:
         return workforce_catalog.build_catalog(
             ctx.authority_repo,
             process_rows=_workforce_process_rows(ctx.authority_repo),
+            usage_rows=cost_ledger.build_cost_ledger(
+                repo_root=ctx.authority_repo, include_tasks=True
+            ).get("tasks") or [],
         )
 
     return _invoke(
@@ -272,6 +276,9 @@ def workforce_rank(
         snapshot = workforce_catalog.build_catalog(
             ctx.authority_repo,
             process_rows=_workforce_process_rows(ctx.authority_repo),
+            usage_rows=cost_ledger.build_cost_ledger(
+                repo_root=ctx.authority_repo, include_tasks=True
+            ).get("tasks") or [],
         )
         return workforce_catalog.rank_task(ctx.authority_repo, task, catalog=snapshot)
 

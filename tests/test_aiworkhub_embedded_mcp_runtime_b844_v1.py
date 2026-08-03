@@ -23,7 +23,7 @@ virtualenv, so it cannot silently succeed by falling back to an ambient
 
 from __future__ import annotations
 
-import json
+import io
 import json
 import os
 import select
@@ -264,12 +264,42 @@ def test_stdlib_fallback_initialize_and_tools_call_shape(fallback_server_module)
     tools = server_module.mcp._tools
     init = server_module._stdio_dispatch("AIWorkHub MCP", tools, "initialize", {})
     assert init["protocolVersion"] == "2024-11-05"
+    assert init["capabilities"]["resources"] == {}
+    assert server_module._stdio_dispatch(
+        "AIWorkHub MCP", tools, "resources/list", {}
+    ) == {"resources": []}
+    assert server_module._stdio_dispatch(
+        "AIWorkHub MCP", tools, "resources/templates/list", {}
+    ) == {"resourceTemplates": []}
     result = server_module._stdio_dispatch(
         "AIWorkHub MCP", tools, "tools/call",
         {"name": "aiworkhub_dashboard_health", "arguments": {}},
     )
     assert result.get("isError") is not True
     assert result["structuredContent"]["server_tool"] == "aiworkhub_dashboard_health"
+
+
+def test_stdlib_fallback_broken_stdout_exits_cleanly_with_stderr_event(
+    fallback_server_module, monkeypatch
+):
+    server_module = fallback_server_module
+
+    class ClosedPipe:
+        def write(self, _text):
+            raise BrokenPipeError("client closed")
+
+        def flush(self):
+            raise AssertionError("flush must not run after failed write")
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(server_module.sys, "stderr", stderr)
+    with pytest.raises(server_module._StdioTransportClosed):
+        server_module._stdio_write_message(
+            ClosedPipe(), {"jsonrpc": "2.0", "id": 7, "result": {}}
+        )
+    event = json.loads(stderr.getvalue())
+    assert event["event"] == "transport_closed"
+    assert event["request_id"] == 7
 
 
 # ---------------------------------------------------------------------------

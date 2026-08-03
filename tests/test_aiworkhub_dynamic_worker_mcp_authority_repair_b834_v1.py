@@ -352,6 +352,39 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
     assert payload["scope"] == "target"
 
 
+def test_bodygrep_passes_target_into_bounded_engine_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    calls: list[tuple[str, str | None]] = []
+
+    def bodygrep(repo_root, query, budget=64, *, target=None):  # noqa: ANN001
+        calls.append((query, target))
+        return {
+            "mode": "bodygrep",
+            "matches": [{"file_path": "docs/README.md", "signature": query}],
+            "candidate_files": ["docs/README.md"],
+        }
+
+    monkeypatch.setattr(source_graph_mod, "bodygrep_query", bodygrep)
+    ctx = _ctx(
+        repo=authority, authority_repo=authority, home=tmp_path / "home",
+        targets=("docs/README.md",),
+    )
+
+    result = w.source_graph_query(
+        ctx,
+        mode="bodygrep",
+        query="exact documentation text",
+        target="docs/README.md",
+    )
+
+    assert result["ok"] is True
+    assert calls == [("exact documentation text", "docs/README.md")]
+    assert json.loads(result["content"])["candidate_files"] == ["docs/README.md"]
+
+
 def test_target_scope_is_applied_before_large_payload_truncation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

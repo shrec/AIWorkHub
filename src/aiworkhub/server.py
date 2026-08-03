@@ -6,6 +6,7 @@ import sys
 import threading
 import types
 import typing
+from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
@@ -44,6 +45,20 @@ except ModuleNotFoundError:
             super().__init__(message)
             self.code = code
             self.message = message
+
+    class _StdioTransportClosed(SystemExit):
+        """The client closed stdout; no further JSON-RPC response is possible."""
+
+    def _stdio_log(event: str, **fields: Any) -> None:
+        """Write one bounded structured diagnostic without touching stdout."""
+
+        record = {"component": "aiworkhub.mcp_stdio", "event": event}
+        record.update({key: value for key, value in fields.items() if value is not None})
+        try:
+            sys.stderr.write(json.dumps(record, ensure_ascii=False, default=str)[:4000] + "\n")
+            sys.stderr.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     def _stdio_json_type(annotation: Any) -> str:
         if annotation is inspect.Signature.empty:
@@ -155,7 +170,7 @@ except ModuleNotFoundError:
         if method == "initialize":
             return {
                 "protocolVersion": _FALLBACK_PROTOCOL_VERSION,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": name, "version": __version__},
             }
         if method == "notifications/initialized":
@@ -166,6 +181,10 @@ except ModuleNotFoundError:
             return _stdio_tools_list(tools)
         if method == "tools/call":
             return _stdio_tools_call(tools, params)
+        if method == "resources/list":
+            return {"resources": []}
+        if method == "resources/templates/list":
+            return {"resourceTemplates": []}
         raise _StdioProtocolError(-32601, f"method_not_found:{method}")
 
     def _stdio_write_message(stream: Any, message: dict[str, Any]) -> None:
@@ -177,8 +196,16 @@ except ModuleNotFoundError:
                 "error": {"code": -32603, "message": "response_too_large"},
             }
             payload = json.dumps(message, ensure_ascii=False)
-        stream.write(payload + "\n")
-        stream.flush()
+        try:
+            stream.write(payload + "\n")
+            stream.flush()
+        except (BrokenPipeError, OSError) as exc:
+            _stdio_log(
+                "transport_closed",
+                request_id=message.get("id"),
+                error_type=type(exc).__name__,
+            )
+            raise _StdioTransportClosed(0) from exc
 
     def _run_stdio_fallback_server(name: str, tools: dict[str, Any]) -> None:
         # Read from the binary buffer with an explicit limit.  Calling the
@@ -235,6 +262,12 @@ except ModuleNotFoundError:
                     })
                 continue
             except Exception as exc:  # defensive: never let one bad request kill the loop
+                _stdio_log(
+                    "request_failed",
+                    request_id=msg_id,
+                    method=method,
+                    error_type=type(exc).__name__,
+                )
                 if has_id:
                     _stdio_write_message(stdout, {
                         "jsonrpc": "2.0", "id": msg_id,
@@ -294,6 +327,27 @@ from . import shared_router
 
 
 mcp = FastMCP("AIWorkHub MCP")
+
+
+_TASK_LIFECYCLE_WRITE_LOCK = threading.RLock()
+
+
+def _serialize_task_lifecycle_write(function: Any) -> Any:
+    """Serialize state-changing task operations within one MCP server.
+
+    FastMCP may dispatch synchronous tools concurrently.  Keeping the complete
+    task lifecycle mutation and its result construction under one re-entrant
+    lock prevents overlapping create/claim/review/finalize calls from racing
+    on a shared stdio session.  SQLite transactions remain the cross-process
+    authority; this lock is the per-server ordering boundary.
+    """
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _TASK_LIFECYCLE_WRITE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
 
 RiskSignal = Literal[
     "public_api",
@@ -650,6 +704,7 @@ def aiworkhub_repo_switch(repo_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_create(
     task_id: str,
     title: str,
@@ -749,6 +804,7 @@ def aiworkhub_task_pending_for_runner(runner: str, topic: str | None = None) -> 
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_auto_pickup(runner: str, topic: str | None = None) -> dict[str, Any]:
     """Write-gated: claim and start the next task for a runner.
 
@@ -798,6 +854,7 @@ def aiworkhub_task_auto_pickup_dryrun(runner: str, topic: str | None = None) -> 
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
     """Write-gated: mark a worker task as ready for Codex review."""
 
@@ -805,6 +862,7 @@ def aiworkhub_task_mark_review(task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_mark_done(task_id: str) -> dict[str, Any]:
     """Write-gated: finalize a reviewed task as done."""
 
@@ -812,6 +870,7 @@ def aiworkhub_task_mark_done(task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) -> dict[str, Any]:
     """MANAGER WRITE: bounded startup reconciliation for dependency-ready children."""
 
@@ -823,6 +882,7 @@ def aiworkhub_task_dependency_autolaunch_reconcile(capacity: int | None = None) 
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_reject_review(
     task_id: str,
     reason: str,
@@ -844,6 +904,7 @@ def aiworkhub_task_reject_review(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_archive(
     task_id: str,
     reason: str = "",
@@ -857,6 +918,7 @@ def aiworkhub_task_archive(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_task_supersede(
     task_id: str,
     reason: str = "",
@@ -871,6 +933,7 @@ def aiworkhub_task_supersede(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_manager_task_archive(
     task_id: str,
     reason: str = "",
@@ -889,6 +952,7 @@ def aiworkhub_manager_task_archive(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_manager_task_supersede(
     task_id: str,
     reason: str = "",
@@ -1351,6 +1415,7 @@ def aiworkhub_completion_inbox(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_agent_launch_task(
     task_id: str,
     runner: str,
@@ -1381,6 +1446,7 @@ def aiworkhub_agent_launch_task(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_quality_reviewer_launch(
     target_request_id: str,
     target_task_id: str,
@@ -1423,6 +1489,7 @@ def aiworkhub_agent_collect_result(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_agent_cancel_task(
     request_id: str,
     reason: str = "owner_cancelled",
@@ -1433,6 +1500,7 @@ def aiworkhub_agent_cancel_task(
 
 
 @mcp.tool()
+@_serialize_task_lifecycle_write
 def aiworkhub_agent_accept_review(
     request_id: str,
     task_id: str,

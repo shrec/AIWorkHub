@@ -1058,6 +1058,40 @@ def get_task_events(root: str | Path, task_id: str, *, limit: int = 100) -> list
     return [dict(row) for row in rows]
 
 
+def list_usage_events(root: str | Path, *, limit: int = 10_000) -> list[dict[str, Any]]:
+    """Return bounded, structured canonical usage events for one repository.
+
+    Unlike the legacy pipe-text report this preserves request-time model and
+    provider identity so workforce telemetry can attribute tokens without
+    guessing from runner names.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, runner, payload_json, created_at FROM task_events "
+            "WHERE event='usage_record' ORDER BY event_id DESC LIMIT ?",
+            (max(1, min(int(limit), 50_000)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        result.append({
+            **payload,
+            "task_id": str(row["task_id"] or ""),
+            "runner": str(payload.get("runner") or row["runner"] or ""),
+            "created_at": str(row["created_at"] or ""),
+        })
+    return result
+
+
 def manager_decision_counts(root: str | Path) -> dict[str, Any]:
     """Return exact review decisions plus bounded review-to-decision latency."""
 

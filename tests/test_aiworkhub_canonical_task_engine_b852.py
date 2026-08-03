@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -514,6 +515,21 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
     assert stored["worker_status"] == "unclaimed"
     assert stored["origin_thread_id"] == session_id
 
+    reconciled = core.create_task(
+        task_id="TASK_MANAGER_CREATE",
+        title="Manager-created task",
+        runner="claude_worker",
+        topic="coding",
+        objective="Prove canonical MCP task creation.",
+        acceptance=["created once"],
+        allowed_writes=["src/example.py"],
+        forbidden=["secrets/**"],
+    )
+    assert reconciled["ok"] is True, reconciled
+    assert reconciled["created"] is False
+    assert reconciled["reconciled"] is True
+    assert reconciled["receipt_state"] == "existing_identical"
+
     duplicate = core.create_task(
         task_id="TASK_MANAGER_CREATE",
         title="Must not overwrite",
@@ -525,6 +541,56 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
     )
     assert duplicate["ok"] is False
     assert "task_already_exists" in duplicate["stderr"]
+    assert "title" in duplicate["conflict_fields"]
+
+
+def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monkeypatch):
+    session_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {"provider": "claude", "session_id": session_id, "window_id": "claude_vscode_123"},
+    )
+
+    def create_once():
+        return core.create_task(
+            task_id="TASK_LOST_ACK_RETRY",
+            title="Idempotent transport recovery",
+            runner="claude_worker",
+            topic="coding",
+            objective="Commit once and reconcile every identical retry.",
+            acceptance=["one canonical row", "durable receipt"],
+            allowed_writes=["src/example.py"],
+            validation=["python -m pytest -q"],
+        )
+
+    # Model three overlapping MCP writes.  Exactly one creates the row; the
+    # other callers receive successful reconciliation receipts.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: create_once(), range(3)))
+    assert all(result["ok"] is True for result in results), results
+    assert sum(result["created"] is True for result in results) == 1
+    assert sum(result["reconciled"] is True for result in results) == 2
+
+    # Drop/ignore the first acknowledgement and retry the same request, as a
+    # client must after Transport closed.  The retry is a success receipt and
+    # the database still contains one task and one created event.
+    retry = create_once()
+    assert retry["ok"] is True
+    assert retry["created"] is False
+    assert retry["receipt_state"] == "existing_identical"
+
+    readiness = task_store.storage_readiness(writable_repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE task_id='TASK_LOST_ACK_RETRY'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id='TASK_LOST_ACK_RETRY' AND event='created'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo, monkeypatch):

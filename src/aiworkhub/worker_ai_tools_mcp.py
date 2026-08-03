@@ -1162,7 +1162,13 @@ def source_graph_query(
         elif mode == "body":
             payload = _source_graph_mod.body_query(ctx.authority_repo, bounded_query, budget)
         elif mode == "bodygrep":
-            payload = _source_graph_mod.bodygrep_query(ctx.authority_repo, bounded_query, budget)
+            # Apply exact file/directory scope before scanning.  Filtering a
+            # globally truncated alphabetical scan afterwards can otherwise
+            # produce a false zero for an indexed target that lies beyond the
+            # byte/file cap (notably README/docs in large repositories).
+            payload = _source_graph_mod.bodygrep_query(
+                ctx.authority_repo, bounded_query, budget, target=scope,
+            )
         elif mode == "impact":
             payload = _source_graph_mod.impact(ctx.authority_repo, bounded_query, budget)
         elif mode == "trace":

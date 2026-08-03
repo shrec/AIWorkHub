@@ -134,6 +134,23 @@ Initialization is explicit and idempotent. It creates `.aiworkhub/`, starts the
 first Source Graph index and keeps the index fresh. The packaged extension runs
 on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
+### First task workflow
+
+1. Confirm **Preflight** is ready for at least one model adapter. Optional
+   unavailable adapters do not block the repository.
+2. Ask the manager chat for a bounded task. The canonical card records the
+   objective, acceptance criteria, dependencies, write scope and validation.
+3. Launch the exact card. The worker uses repository-local Source Graph and
+   durable context inside an isolated task workspace.
+4. Follow **Live Output** or wait for the durable terminal callback.
+5. In **Review**, inspect the diff, tests, logs, artifacts and tool receipts.
+   Accept to promote the verified change, or reject with exact residual work.
+
+The dashboard's **Operations** dialog explains real tool use, Source Graph
+modes, model outcomes, latency, token/cost evidence, callback delivery and
+storage retention. See the [complete user guide](docs/GETTING_STARTED.md) for
+multi-repository, Remote-SSH and troubleshooting flows.
+
 **Current public channels:** VS Code Marketplace and signed-by-checksum GitHub
 Release artifacts (VSIX, wheel and source distribution). Marketplace review
 can briefly lag a new GitHub tag; the release page and attached `SHA256SUMS`

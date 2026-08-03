@@ -833,7 +833,13 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
     return [dict(row) for row in rows]
 
 
-def bodygrep_query(repo_root: Path, term: str, budget: int = 64) -> dict[str, Any]:
+def bodygrep_query(
+    repo_root: Path,
+    term: str,
+    budget: int = 64,
+    *,
+    target: str | None = None,
+) -> dict[str, Any]:
     """Search literal/body text only inside canonical indexed source files.
 
     The graph stores symbols and edges, not whole file bodies.  This bounded
@@ -853,14 +859,45 @@ def bodygrep_query(repo_root: Path, term: str, budget: int = 64) -> dict[str, An
     byte_cap = max(512, budget * 512)
     scan_file_cap = max(64, min(4000, budget * 32))
     scan_byte_cap = max(1_048_576, min(32 * 1_048_576, budget * 262_144))
+    normalized_target = ""
+    if target is not None:
+        normalized_target = str(target).strip().replace("\\", "/").strip("/")
+        target_parts = Path(normalized_target).parts
+        if (
+            not normalized_target
+            or "\x00" in normalized_target
+            or Path(str(target)).is_absolute()
+            or ".." in target_parts
+        ):
+            raise SourceGraphError("bodygrep_target_invalid")
+
     conn = connect(resolve_db_path(repo_root), read_only=True)
     try:
+        if normalized_target:
+            exact = conn.execute(
+                "SELECT 1 FROM files WHERE file_path=? LIMIT 1",
+                (normalized_target,),
+            ).fetchone()
+            if exact:
+                query = "SELECT file_path FROM files WHERE file_path=? ORDER BY file_path LIMIT ?"
+                params: tuple[Any, ...] = (normalized_target, scan_file_cap + 1)
+            else:
+                escaped = (
+                    normalized_target.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                query = (
+                    "SELECT file_path FROM files WHERE file_path LIKE ? ESCAPE '\\' "
+                    "ORDER BY file_path LIMIT ?"
+                )
+                params = (f"{escaped}/%", scan_file_cap + 1)
+        else:
+            query = "SELECT file_path FROM files ORDER BY file_path LIMIT ?"
+            params = (scan_file_cap + 1,)
         paths = [
             str(row["file_path"])
-            for row in conn.execute(
-                "SELECT file_path FROM files ORDER BY file_path LIMIT ?",
-                (scan_file_cap + 1,),
-            )
+            for row in conn.execute(query, params)
         ]
     finally:
         conn.close()
@@ -918,6 +955,7 @@ def bodygrep_query(repo_root: Path, term: str, budget: int = 64) -> dict[str, An
         "scan_file_cap": scan_file_cap,
         "scan_byte_cap": scan_byte_cap,
         "scan_truncated": scan_truncated,
+        "target": normalized_target or None,
         "truncated": bool(output_truncated or scan_truncated),
     }
     return _fit_payload_bytes(payload, byte_cap)

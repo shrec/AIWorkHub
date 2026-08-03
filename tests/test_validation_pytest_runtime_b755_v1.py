@@ -327,6 +327,35 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
+    def test_pytest_validation_disables_repo_local_cache_writes(self) -> None:
+        fake_root = self.tmp_path / "trusted_site_packages_no_cache"
+        fake_root.mkdir()
+        os.chmod(fake_root, 0o755)
+        _write_fake_pytest_package(
+            fake_root,
+            body=(
+                "import os\n"
+                "print('PYTEST_ADDOPTS=' + os.environ.get('PYTEST_ADDOPTS', ''))\n"
+            ),
+        )
+        repo, workspace = _manual_workspace(self.tmp_path, "b755-no-cache-write")
+        try:
+            with mock.patch.object(
+                worker_workspace.site,
+                "getusersitepackages",
+                return_value=str(fake_root),
+            ):
+                results = worker_workspace.run_validations(
+                    workspace, ["python3 -m pytest --version"]
+                )
+            self.assertEqual(results[0]["returncode"], 0)
+            self.assertIn(
+                "PYTEST_ADDOPTS=-p no:cacheprovider",
+                results[0]["stdout_tail"],
+            )
+        finally:
+            worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
 
 if __name__ == "__main__":
     unittest.main()

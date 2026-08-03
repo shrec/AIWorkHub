@@ -27,7 +27,6 @@ from aiworkhub import (
     deepseek_credentials,
     process_launcher,
     repo_policy,
-    repository_state,
     storage_observability,
     task_plan,
     task_store,
@@ -1092,13 +1091,17 @@ def read_process_runs(
     )[:safe_limit]
     active_observed = 0
     for row in rows:
+        # Liveness describes an active process lease.  A clean terminal row
+        # (for example ``review_ready``) is expected to have no live PID or
+        # heartbeat owner; deriving liveness for it mislabeled successful
+        # completion as ``lost`` in the dashboard/workforce telemetry.
+        if row.get("state") not in process_launcher.ACTIVE_PROCESS_STATES:
+            continue
         status_path_raw = status_paths.get(str(row.get("request_id") or ""))
         if status_path_raw:
             liveness_fields = _process_liveness_fields(row, status_path_raw)
             if liveness_fields:
                 row.update(liveness_fields)
-        if row.get("state") not in process_launcher.ACTIVE_PROCESS_STATES:
-            continue
         try:
             pid = int(row.get("pid") or 0)
             alive = bool(pid and process_launcher._pid_matches(pid, row.get("pid_start_ticks")))
@@ -1142,9 +1145,16 @@ def exact_status_counts(repo_root: Path | str | None = None) -> dict[str, int]:
 
 def _default_repo_root() -> Path:
     """Resolve the active repository root the same way the MCP child was
-    spawned with (``AIWORKHUB_REPO_ROOT``/cwd ancestor), never a fixed path
-    relative to this package's own install location."""
-    return repository_state.resolve_repository_root(require_manifest=False)
+    spawned or switched, never a fixed path relative to this package's own
+    install location.
+
+    ``core.repo_root`` is the process-wide repository authority.  In a
+    repo-neutral manager child it also honors the atomic in-process switch
+    override.  Resolving independently from cwd here made dashboard snapshots
+    keep reading the repository from which the process originally started
+    after the manager had switched to another repository.
+    """
+    return core.repo_root()
 
 
 class DashboardProvider:
@@ -1292,6 +1302,9 @@ class DashboardProvider:
             self.repo_root,
             cards=task_store.list_task_cards(self.repo_root, limit=5000),
             process_rows=process_report.get("processes") or [],
+            usage_rows=cost_ledger.build_cost_ledger(
+                repo_root=self.repo_root, include_tasks=True
+            ).get("tasks") or [],
         )
 
     def get_callback_bridge_health(self) -> dict[str, Any]:

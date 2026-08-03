@@ -90,6 +90,7 @@ missing, stale, or ambiguous ownership is a durable park
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import hmac
 import json
@@ -108,6 +109,9 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
+
+if os.name == "nt":  # pragma: no cover - imported only on Windows hosts
+    import ctypes.wintypes as wintypes
 
 try:
     from .platform_io import chmod_fd
@@ -288,6 +292,116 @@ def resolve_real_executable() -> str:
     except OSError:
         pass
     return DEFAULT_REAL_EXECUTABLE
+
+
+def _close_windows_handle(handle: int | None) -> None:
+    """Close one exact Windows kernel handle owned by this process."""
+
+    if os.name != "nt" or not handle:
+        return
+    with contextlib.suppress(OSError):  # pragma: no cover - Windows kernel call
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _bind_child_lifetime_to_this_process(child: subprocess.Popen[Any]) -> int | None:
+    """Best-effort Windows Job Object with KILL_ON_JOB_CLOSE.
+
+    VS Code tracks the mux parent, not the real Codex child.  Binding that
+    child to a job owned by the mux prevents reload/crash paths from leaving
+    an orphan with detached stdio.  Failure is deliberately non-fatal: the
+    transparent proxy remains usable on restricted Windows hosts.
+    """
+
+    if os.name != "nt":
+        return None
+
+    class _IO_COUNTERS(ctypes.Structure):  # pragma: no cover - Windows only
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BASIC_LIMIT(ctypes.Structure):  # pragma: no cover - Windows only
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _EXTENDED_LIMIT(ctypes.Structure):  # pragma: no cover - Windows only
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC_LIMIT),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.windll.kernel32  # pragma: no cover - Windows only
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    job_value = int(job) if isinstance(job, int) else int(job.value)
+    info = _EXTENDED_LIMIT()
+    info.BasicLimitInformation.LimitFlags = 0x00002000
+    if not kernel32.SetInformationJobObject(
+        job,
+        9,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        _close_windows_handle(job_value)
+        return None
+    process_handle = getattr(child, "_handle", None)
+    if not process_handle or not kernel32.AssignProcessToJobObject(
+        job,
+        wintypes.HANDLE(int(process_handle)),
+    ):
+        _close_windows_handle(job_value)
+        return None
+    return job_value
+
+
+def _hold_passthrough_child(real_executable: str, argv: list[str]) -> int:
+    """Keep the Windows PID tracked by VS Code alive until Codex exits."""
+
+    child = subprocess.Popen([real_executable, *argv], shell=False)
+    job_handle = _bind_child_lifetime_to_this_process(child)
+    try:
+        return int(child.wait())
+    except KeyboardInterrupt:
+        with contextlib.suppress(OSError):
+            child.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            child.wait(timeout=5)
+        return 130
+    finally:
+        _close_windows_handle(job_handle)
 
 
 def is_app_server_invocation(argv: list[str]) -> bool:
@@ -1019,6 +1133,7 @@ class AppServerMux:
         self._sideband_dir = Path(sideband_dir) if sideband_dir else default_sideband_dir()
 
         self._child: subprocess.Popen[bytes] | None = None
+        self._child_job_handle: int | None = None
         self._child_write_lock = threading.Lock()
 
         self._pending_by_id: dict[str, _PendingSidebandCall] = {}
@@ -1122,6 +1237,7 @@ class AppServerMux:
             stderr=None,  # inherited -- transparent stderr proxy, no active pumping needed
             bufsize=0,
         )
+        self._child_job_handle = _bind_child_lifetime_to_this_process(self._child)
         self._start_thread(self._pump_extension_to_child)
         self._start_thread(self._pump_child_to_extension)
         if self._repo_id:
@@ -1247,6 +1363,8 @@ class AppServerMux:
                     self._child.kill()
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     self._child.wait(timeout=2)
+        _close_windows_handle(self._child_job_handle)
+        self._child_job_handle = None
 
     def _fail_all_pending(self, reason: str) -> None:
         with self._pending_lock:
@@ -1664,7 +1782,7 @@ def _passthrough_real_executable(real_executable: str, raw_argv: list[str]) -> i
     the argv vector and returns the real process status there.
     """
     if os.name == "nt":
-        return int(subprocess.call([real_executable, *raw_argv], shell=False))
+        return _hold_passthrough_child(real_executable, raw_argv)
     os.execvp(real_executable, [real_executable, *raw_argv])
     return 0  # unreachable on POSIX success
 
