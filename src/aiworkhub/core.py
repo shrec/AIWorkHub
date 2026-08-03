@@ -3845,7 +3845,15 @@ def release_launch(
 
 
 def _active_cards_for_collision_guard() -> list[dict[str, Any]]:
-    """Active (pending/processing/review/blocked) cards with ``card_json``
+    """Non-terminal cards that can still own or acquire write authority.
+
+    Blocked cards have no live worker and no promotable candidate workspace,
+    so retaining their historical ``allowed_writes`` as an active lock makes a
+    dependency repair impossible.  Pending, processing, and review cards stay
+    conservative here; only an explicit supersede/requeue/review transition
+    releases those scopes.
+
+    Cards are returned with ``card_json``
     merged in, sourced purely from a SQL scan of the canonical ``tasks``
     table -- no taskctl/taskdb subprocess."""
     conn = _canonical_connect(readonly=True)
@@ -3859,7 +3867,7 @@ def _active_cards_for_collision_guard() -> list[dict[str, Any]]:
     for row in rows:
         item = dict(row)
         bucket = task_store.canonical_status(item)
-        if bucket not in {"pending", "processing", "review", "blocked"}:
+        if bucket not in {"pending", "processing", "review"}:
             continue
         try:
             card_json = json.loads(item.get("card_json") or "{}")

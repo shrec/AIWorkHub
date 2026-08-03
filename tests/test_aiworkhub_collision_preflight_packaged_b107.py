@@ -55,7 +55,7 @@ def test_helpers_resolve_without_scripts_and_use_production_semantics() -> None:
     # canonical_status is the SAME production function the live collision guard
     # uses -- so the preflight can never drift from production.
     assert canonical is task_store.canonical_status
-    assert set(active) == {"pending", "processing", "review", "blocked"}
+    assert set(active) == {"pending", "processing", "review"}
     assert callable(load)
 
 
@@ -103,6 +103,7 @@ def test_preflight_no_collision_when_only_terminal_cards(tmp_path, monkeypatch) 
             [
                 json.dumps({"task_id": "T1", "runner": "r", "status": "finished"}),
                 json.dumps({"task_id": "T1", "runner": "r", "status": "archived", "archived_at": "2026-01-01"}),
+                json.dumps({"task_id": "T2", "runner": "r", "status": "blocked"}),
             ]
         ),
         encoding="utf-8",

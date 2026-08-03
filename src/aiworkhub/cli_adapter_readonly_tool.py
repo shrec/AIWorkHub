@@ -127,7 +127,7 @@ def collision_cards_path(repo: Any = None) -> Path:
 
 # The active lifecycle buckets that count as a live claim -- the EXACT set the
 # production collision guard uses (see core._active_cards_for_collision_guard).
-_ACTIVE_STATUSES = frozenset({"pending", "processing", "review", "blocked"})
+_ACTIVE_STATUSES = frozenset({"pending", "processing", "review"})
 
 
 def _load_cards(cards_path: Path) -> list[dict[str, Any]]:
@@ -182,9 +182,10 @@ def collision_preflight(
 
     Reads the task-card JSONL with a plain file read -- no lock is acquired,
     no claim is written, and no queue/audit state is mutated. ``would_collide``
-    is true when an ACTIVE (pending/processing/review/blocked) card already
+    is true when an ACTIVE (pending/processing/review) card already
     claims this exact ``task_id``, or when the same ``runner`` already holds a
-    different active task.
+    different active task. A blocked card has no live worker or promotable
+    candidate and therefore cannot retain a write/runner lock indefinitely.
     """
     cards_path = collision_cards_path(repo)
     exists = cards_path.exists()

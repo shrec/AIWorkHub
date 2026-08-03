@@ -115,6 +115,30 @@ def test_launcher_preflight_accepts_only_unattached_owned_claim(tmp_path, monkey
         raise AssertionError("an attached launch must not pass preflight twice")
 
 
+def test_blocked_predecessor_does_not_retain_collision_scope(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(repo, "BLOCKED_PREDECESSOR", status="blocked", worker_status="blocked")
+    _insert(repo, "READY_REPLACEMENT")
+
+    blocked = task_store.get_task(repo, "BLOCKED_PREDECESSOR") or {}
+    ready = task_store.get_task(repo, "READY_REPLACEMENT") or {}
+    for card in (blocked, ready):
+        card["allowed_writes"] = ["src/aiworkhub/token_budget.py"]
+        conn = sqlite3.connect(task_store.storage_readiness(repo).canonical_db)
+        try:
+            conn.execute(
+                "UPDATE tasks SET card_json=? WHERE task_id=?",
+                (json.dumps(card, ensure_ascii=False, sort_keys=True), card["task_id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    active = core._active_cards_for_collision_guard()
+    assert {card["task_id"] for card in active} == {"READY_REPLACEMENT"}
+    assert core.collision_guard(print_json=True)["ok"] is True
+
+
 def test_launch_failure_is_blocked_not_review_and_is_request_scoped(tmp_path, monkeypatch):
     repo = _repo(tmp_path, monkeypatch)
     _insert(
