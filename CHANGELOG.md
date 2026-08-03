@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.48] - 2026-08-03
+
+### Added
+
+- Added a provider-neutral token-budget kernel with authoritative-live,
+  posthoc-only and unavailable-telemetry states, immutable report identities,
+  cumulative/delta deduplication and truthful cap-crossing evidence.
+
+### Fixed
+
+- Preserved secure Windows execution truth: editor-visible models route through
+  the bounded VS Code LM broker, requested aliases resolve to the exact model
+  observed by the editor, and unconstrained native CLI routes fail closed
+  instead of claiming sandbox readiness.
+- Rewrote declared `python -m ruff` validation commands to the trusted
+  repository-runtime Ruff executable, closing false `validation_failed`
+  results in isolated workers.
+- Classified structured provider 401/403 authentication failures as blocked
+  launch failures rather than empty review candidates, without persisting
+  provider error bodies or secrets.
+- Stopped terminal process rows from being mislabeled `liveness=lost` and
+  excluded blocked cards from active write-collision ownership.
+
 ## [0.8.47] - 2026-08-03
 
 ### Fixed
