@@ -312,6 +312,35 @@ def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_pat
     assert "operational_blocker" not in retried_card
 
 
+def test_preclaim_launch_blocker_gate_denial_reports_exact_operation(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(repo, "TASK_BLOCKER_GATE")
+    monkeypatch.setattr(
+        task_engine.core,
+        "_canonical_write_gate",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "returncode": 126,
+            "command": ["claim-start"],
+            "stdout": "",
+            "stderr": "write_gate_closed",
+        },
+    )
+
+    result = task_engine.record_launch_blocker(
+        repo,
+        "TASK_BLOCKER_GATE",
+        RUNNER,
+        TOPIC,
+        adapter_id="vscode_lm",
+        reason="model consent required",
+    )
+
+    assert result["ok"] is False
+    assert result["command"] == ["launch-blocked", "TASK_BLOCKER_GATE", "--runner", RUNNER]
+    assert result["stderr"] == "write_gate_closed"
+
+
 def test_readonly_scope_is_valid_but_required_output_without_scope_is_not(tmp_path):
     process_launcher._validate_scope(tmp_path, {"allowed_writes": [], "required_outputs": []})
     try:

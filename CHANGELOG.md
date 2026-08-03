@@ -6,6 +6,13 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- Reported `record_launch_blocker` write-gate denials with the exact
+  `launch-blocked` command instead of the underlying claim authority name.
+- Made the cross-plugin snapshot regression fail clearly when either function
+  marker is missing or reordered, rather than slicing from an invalid index.
+
 ## [0.8.49] - 2026-08-03
 
 ### Added

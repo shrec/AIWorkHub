@@ -236,7 +236,10 @@ def record_launch_blocker(
         "claim-start", runner=runner, topic=topic, task_id=task_id
     )
     if blocked is not None:
-        return blocked
+        # The gate checks the same narrow claim-start authority, but callers
+        # are performing a distinct launch-blocker write. Preserve the exact
+        # denial while reporting the operation they actually requested.
+        return {**blocked, "command": command}
     now = datetime.now(timezone.utc).isoformat()
     try:
         _readiness, db_path = task_store._require_ready(repo)
