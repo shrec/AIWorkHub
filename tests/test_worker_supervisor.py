@@ -117,6 +117,50 @@ def test_supervisor_timeout_kills_child_and_persists_timeout(tmp_path: Path) -> 
     assert status["exit_code"] != 0
 
 
+def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) -> None:
+    script = (
+        "import json,time; "
+        "print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}), flush=True); "
+        "time.sleep(30)"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(
+        adapter_id="vscode_lm",
+        token_budget={"cap_tokens": 10},
+        heartbeat_interval_seconds=0.05,
+    )
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 122, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "token_budget_exceeded"
+    assert status["token_budget"]["cap_tokens"] == 10
+    assert status["token_budget"]["enforceable_live_tokens"] == 13
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
+
+
+def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Path) -> None:
+    script = "import json; print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}))"
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(
+        adapter_id="vscode_lm",
+        token_budget={"cap_tokens": 10},
+        heartbeat_interval_seconds=30,
+    )
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "exited"
+    assert status["token_budget"]["accepted_total_tokens"] == 13
+    assert status["token_budget"]["enforceable_live_tokens"] == 0
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is False
+
+
 def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Path) -> None:
     spec_path, spec = _spec(
         tmp_path,

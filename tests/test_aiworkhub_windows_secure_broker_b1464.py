@@ -62,6 +62,52 @@ def test_windows_sandbox_selection_fails_closed_without_appcontainer(
         worker_workspace.select_sandbox_backend()
 
 
+@pytest.mark.parametrize(
+    "adapter_id",
+    ["vscode_lm", "glm_vscode_lm", "deepseek_vscode_lm"],
+)
+def test_editor_model_launch_selects_in_process_boundary_before_host_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_id: str,
+) -> None:
+    monkeypatch.setattr(
+        process_launcher,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError("windows_appcontainer_sandbox_unavailable")
+        ),
+    )
+
+    assert (
+        process_launcher._sandbox_backend_for_adapter(adapter_id)
+        == worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND
+    )
+
+
+def test_editor_response_applier_is_only_unsandboxed_for_editor_adapters(tmp_path: Path) -> None:
+    workspace = SimpleNamespace(
+        path=tmp_path / "worktree",
+        home=tmp_path / "home",
+        repo=tmp_path / "repo",
+        allowed_writes=("out/result.json",),
+    )
+    argv = [sys.executable, "-m", "aiworkhub.vscode_lm_worker"]
+
+    assert worker_workspace.sandbox_argv(
+        workspace,
+        "glm_vscode_lm",
+        argv,
+        backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+    ) == argv
+    with pytest.raises(worker_workspace.WorkspaceError, match="adapter_forbidden"):
+        worker_workspace.sandbox_argv(
+            workspace,
+            "claude_cli",
+            argv,
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+        )
+
+
 def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

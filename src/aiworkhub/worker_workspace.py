@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -60,6 +61,10 @@ def bubblewrap_home_env_value() -> str:
 WORKTREE_ROOT_ENV = "AIWORKHUB_WORKTREE_ROOT"
 BWRAP_ENV = "AIWORKHUB_BWRAP"
 SANDBOX_BACKEND_ENV = "AIWORKHUB_SANDBOX_BACKEND"
+VSCODE_LM_IN_PROCESS_BACKEND = "vscode_lm_in_process"
+_VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
+    {"vscode_lm", "glm_vscode_lm", "deepseek_vscode_lm"}
+)
 SANDBOX_WORKSPACE = "/workspace"
 # B834: the coordinator-owned host repository (``workspace.repo``) bound
 # read-only for worker MCP authority lookups (Source Graph / Session Manager
@@ -189,6 +194,14 @@ _SECCOMP_DENIED_SYSCALLS = (
 
 class WorkspaceError(RuntimeError):
     """A fail-closed workspace, sandbox, scope, or promotion error."""
+
+
+class ValidationRunError(WorkspaceError):
+    """A bounded validation batch failed with structured rows retained."""
+
+    def __init__(self, message: str, results: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.results = [dict(row) for row in results]
 
 
 @dataclass(frozen=True, slots=True)
@@ -904,7 +917,7 @@ def provision_worker_mcp_runtime(
     other's repository-layout assumptions.
     """
 
-    if backend not in ("landlock", "bubblewrap"):
+    if backend not in ("landlock", "bubblewrap", VSCODE_LM_IN_PROCESS_BACKEND):
         raise WorkspaceError(f"unsupported_sandbox_backend:{backend}")
     if not workspace.repo.is_dir():
         raise WorkspaceError(f"authority_repo_not_directory:{workspace.repo}")
@@ -1910,6 +1923,17 @@ def sandbox_argv(
     if not adapter_argv:
         raise WorkspaceError("adapter_argv_empty")
     selected = backend or select_sandbox_backend()
+    if selected == VSCODE_LM_IN_PROCESS_BACKEND:
+        # The model runs inside VS Code's LM host, never in this subprocess.
+        # This narrowly-scoped worker only consumes the owner-only response
+        # spool and applies a complete response after path/scope validation.
+        # AppContainer is therefore a native-CLI requirement, not a gate for
+        # these three editor-hosted adapters.
+        if adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+            raise WorkspaceError(
+                f"vscode_lm_in_process_adapter_forbidden:{adapter_id}"
+            )
+        return list(adapter_argv)
     # B892: resolve the validated ``cd`` prefix target once, against the real
     # workspace filesystem, before either backend's argv is built -- so
     # Landlock and bubblewrap bind/chdir into the exact same
@@ -2562,6 +2586,7 @@ def run_validations(
                     "variable": "TMPDIR",
                     "value": tmpdir_override,
                 }
+            started = time.monotonic()
             try:
                 result = subprocess.run(
                     wrapped,
@@ -2575,26 +2600,72 @@ def run_validations(
                     shell=False,
                 )
             except subprocess.TimeoutExpired as exc:
-                raise WorkspaceError(
-                    f"validation_timeout:{command}:timeout_seconds={bounded_timeout}"
-                ) from exc
+                stdout = (
+                    exc.stdout.decode("utf-8", errors="replace")
+                    if isinstance(exc.stdout, bytes)
+                    else str(exc.stdout or "")
+                )
+                stderr = (
+                    exc.stderr.decode("utf-8", errors="replace")
+                    if isinstance(exc.stderr, bytes)
+                    else str(exc.stderr or "")
+                )
+                results.append(
+                    {
+                        "command": command,
+                        "argv": tokens,
+                        "cwd": cd_relative,
+                        "env_override": env_override_evidence,
+                        "returncode": None,
+                        "timed_out": True,
+                        "duration_seconds": round(time.monotonic() - started, 6),
+                        "stdout_head": stdout[:4_096],
+                        "stdout_tail": stdout[-4_096:],
+                        "stdout_truncated": len(stdout) > 8_192,
+                        "stderr_head": stderr[:4_096],
+                        "stderr_tail": stderr[-4_096:],
+                        "stderr_truncated": len(stderr) > 8_192,
+                    }
+                )
+                continue
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
             record = {
                 "command": command,
                 "argv": tokens,
                 "cwd": cd_relative,
                 "env_override": env_override_evidence,
                 "returncode": result.returncode,
-                "stdout_tail": result.stdout[-8_192:],
-                "stderr_tail": result.stderr[-8_192:],
+                "duration_seconds": round(time.monotonic() - started, 6),
+                "stdout_head": stdout[:4_096],
+                "stdout_tail": stdout[-4_096:],
+                "stdout_truncated": len(stdout) > 8_192,
+                "stderr_head": stderr[:4_096],
+                "stderr_tail": stderr[-4_096:],
+                "stderr_truncated": len(stderr) > 8_192,
             }
             results.append(record)
-            if result.returncode != 0:
-                stdout_detail = result.stdout[-1_000:].replace("\n", "\\n")
-                stderr_detail = result.stderr[-1_000:].replace("\n", "\\n")
-                raise WorkspaceError(
-                    f"validation_failed:{command}:rc={result.returncode}:"
+        failed = [
+            row
+            for row in results
+            if row.get("timed_out") or row.get("returncode") != 0
+        ]
+        if failed:
+            first = failed[0]
+            if first.get("timed_out"):
+                reason = (
+                    f"validation_timeout:{first.get('command')}:"
+                    f"timeout_seconds={bounded_timeout}"
+                )
+            else:
+                stdout_detail = str(first.get("stdout_tail") or "")[-1_000:].replace("\n", "\\n")
+                stderr_detail = str(first.get("stderr_tail") or "")[-1_000:].replace("\n", "\\n")
+                reason = (
+                    f"validation_failed:{first.get('command')}:"
+                    f"rc={first.get('returncode')}:"
                     f"stdout={stdout_detail}:stderr={stderr_detail}"
                 )
+            raise ValidationRunError(reason, results)
         return results
     finally:
         cleanup_validation_exec_scratch(scratch_dir)

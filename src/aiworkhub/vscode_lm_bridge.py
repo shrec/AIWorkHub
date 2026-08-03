@@ -206,6 +206,25 @@ def bridge_readiness(
         if matching_hosts
         else None
     )
+    selected_model = resolved_by_host.get(id(selected), "") if selected is not None else ""
+    selected_access_state = "unknown"
+    if selected is not None:
+        metadata = selected.get("model_metadata")
+        if isinstance(metadata, list):
+            for entry in metadata[:128]:
+                if not isinstance(entry, dict):
+                    continue
+                identities = {
+                    str(entry.get(key) or "").strip()
+                    for key in ("canonical", "id", "family", "name")
+                }
+                if model is None or selected_model in identities:
+                    selected_access_state = str(entry.get("access_state") or "unknown")[:64]
+                    if selected_access_state.startswith("granted") or model is not None:
+                        break
+        if model is None and selected_access_state == "unknown" and selected.get("permission_granted") is True:
+            selected_access_state = "granted_observed"
+    access_observed = selected_access_state.startswith("granted")
     observed_models = sorted(
         {
             str(name)
@@ -229,9 +248,12 @@ def bridge_readiness(
         "kind": "vscode_language_model_api",
         "repo_id": repo_id,
         "model": model,
-        "resolved_model": resolved_by_host.get(id(selected), "") if selected is not None else "",
+        "resolved_model": selected_model,
         "launchable": selected is not None,
         "blocker_reason": blocker_reason,
+        "access_state": selected_access_state,
+        "access_observed": access_observed,
+        "consent_required": selected is not None and not access_observed,
         "window_id": str((selected or {}).get("window_id") or ""),
         "host_count": len(matching_hosts),
         "live_host_count": len(live_hosts),

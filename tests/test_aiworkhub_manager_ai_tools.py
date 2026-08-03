@@ -493,6 +493,9 @@ def test_manager_bootstrap_describes_current_repo_manager_callback_ownership(tmp
 
     assert "current verified Codex manager" in contract["callback"]["codex"]
     assert "audit provenance" in contract["callback"]["codex"]
+    assert "optional explicit claim" in contract["operating_contract"]["task_state_machine"]["claim"]
+    assert "always required" in contract["operating_contract"]["task_state_machine"]["launch"]
+    assert not any("auto_pickup or" in step for step in contract["workflow"])
 
 
 def test_task_create_persists_required_project_context(tmp_path, monkeypatch):

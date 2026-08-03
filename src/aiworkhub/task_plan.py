@@ -231,6 +231,8 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         if blockers[tid]:
             continue
+        if isinstance(c.get("operational_blocker"), dict):
+            continue
         my_writes = set(c.get("allowed_writes") or [])
         overlap = {p for p in my_writes if _paths_conflict_any(p, claimed_paths)}
         if overlap:
@@ -296,6 +298,13 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         tid: "processing_without_launch_request"
         for tid in orphaned_processing_task_ids
     }
+    for tid, card in by_id.items():
+        blocker = card.get("operational_blocker")
+        if lifecycle[tid] != "pending" or not isinstance(blocker, dict):
+            continue
+        reason = str(blocker.get("reason") or blocker.get("kind") or "launch_blocked")
+        operational_blockers[tid] = reason[:500]
+    operational_blocked_task_ids = sorted(operational_blockers)
     dependency_blocked_ids = sorted(tid for tid, value in blockers.items() if value)
     lifecycle_blocked_ids = sorted(
         tid for tid, value in lifecycle.items() if value == "blocked"
@@ -303,7 +312,7 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     blocked_task_ids = sorted(
         set(dependency_blocked_ids)
         | set(lifecycle_blocked_ids)
-        | set(orphaned_processing_task_ids)
+        | set(operational_blocked_task_ids)
     )
 
     return {
@@ -326,6 +335,8 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "lifecycle_blocked_count": len(lifecycle_blocked_ids),
         "lifecycle_blocked_task_ids": lifecycle_blocked_ids,
         "operational_blockers": operational_blockers,
+        "operational_blocked_task_ids": operational_blocked_task_ids,
+        "operational_blocked_count": len(operational_blocked_task_ids),
         "orphaned_processing": orphaned_processing_task_ids,
         "orphaned_processing_count": len(orphaned_processing_task_ids),
         "edge_count": sum(len(value) for value in dependencies.values()),

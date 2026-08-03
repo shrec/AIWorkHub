@@ -295,6 +295,29 @@ async function malformedCatalogChecks() {
   }
 }
 
+async function permissionPersistenceChecks() {
+  const remembered = new Map();
+  let prompts = 0;
+  fakeVscode.lm = { accessInformation: { canSendRequest: () => false } };
+  fakeVscode.window = {
+    showInformationMessage: async () => {
+      prompts += 1;
+      return "Allow VS Code models";
+    },
+  };
+  const host = new internals.VscodeLmBridgeHost({
+    globalState: {
+      get: (key, fallback) => remembered.has(key) ? remembered.get(key) : fallback,
+      update: async (key, value) => { remembered.set(key, value); },
+    },
+  });
+
+  assert.strictEqual(await host.ensurePermission(exact), true);
+  assert.strictEqual(host.modelAccessState(exact), "granted_remembered");
+  assert.strictEqual(await host.ensurePermission(exact), true);
+  assert.strictEqual(prompts, 1, "explicit approval must survive provider failure/retry");
+}
+
 async function nativeProtocolChecks() {
   const finalResponse = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -416,7 +439,14 @@ try {
   fs.rmSync(temp, { recursive: true, force: true });
 }
 
-Promise.all([textProtocolChecks(), nativeProtocolChecks(), malformedCatalogChecks()]).then(() => {
+async function main() {
+  await textProtocolChecks();
+  await nativeProtocolChecks();
+  await malformedCatalogChecks();
+  await permissionPersistenceChecks();
+}
+
+main().then(() => {
   console.log("GLM VS Code LM bridge: ok");
 }).catch((err) => {
   console.error(err);

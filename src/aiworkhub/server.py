@@ -750,6 +750,7 @@ def aiworkhub_task_create(
     depends_on: list[str] | None = None,
     read_first: list[str] | None = None,
     immutable_inputs: list[str] | None = None,
+    max_live_tokens: int | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -759,6 +760,10 @@ def aiworkhub_task_create(
     ``depends_on`` (optional) names other task_ids in this repo that must
     finish before this card is Plan-DAG ready; omit it for the pre-DAG
     behavior.
+    ``max_live_tokens`` (optional) is a bounded provider-reported token cap.
+    It is enforced only when the selected provider exposes structured usage
+    while running; terminal-only usage remains posthoc evidence, never a
+    false live-enforcement claim.
     """
 
     return core.create_task(
@@ -777,6 +782,7 @@ def aiworkhub_task_create(
         depends_on=depends_on,
         read_first=read_first,
         immutable_inputs=immutable_inputs,
+        max_live_tokens=max_live_tokens,
     )
 
 

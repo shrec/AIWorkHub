@@ -77,13 +77,53 @@ def test_ready_vscode_lm_route_does_not_require_subprocess_sandbox(monkeypatch, 
     monkeypatch.setattr(
         repo_policy.vscode_lm_bridge,
         "bridge_readiness",
-        lambda *args, **kwargs: {"launchable": True, "blocker_reason": ""},
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": True,
+            "consent_required": False,
+        },
     )
     report = repo_policy.build_preflight(root, adapter_id=runtime_adapters.VSCODE_LM_ADAPTER)
     by_adapter = {item["adapter_id"]: item for item in report["providers"]}
     assert "selected_adapter_not_launchable" not in report["errors"]
     assert by_adapter[runtime_adapters.VSCODE_LM_ADAPTER]["launchable"] is True
     assert by_adapter[runtime_adapters.VSCODE_LM_ADAPTER]["sandbox_backend"] == "vscode_lm_in_process"
+
+
+def test_visible_vscode_lm_route_reports_consent_required_without_global_blocker(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(worker_workspace.WorkspaceError("unavailable")),
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(adapter_id, "/bin/code", True, ""),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": False,
+            "consent_required": True,
+            "access_state": "not_granted",
+        },
+    )
+
+    report = repo_policy.build_preflight(root, adapter_id=runtime_adapters.VSCODE_LM_ADAPTER)
+    selected = report["selected_adapter"]
+
+    assert report["ok"] is True
+    assert selected["launchable"] is True
+    assert selected["access_observed"] is False
+    assert selected["status"] == "consent_required"
+    assert selected["access_state"] == "not_granted"
 
 
 def test_source_graph_requires_success_identity_not_only_ready_label(monkeypatch, tmp_path):
@@ -96,3 +136,17 @@ def test_source_graph_requires_success_identity_not_only_ready_label(monkeypatch
     report = repo_policy.build_preflight(root)
     assert "source_graph_not_ready" in report["errors"]
     assert report["source_graph"]["ready_for_code"] is False
+
+
+def test_source_graph_fresh_standby_generation_is_ready_for_code(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    graph = _ready_graph()
+    graph["status"] = source_graph_daemon.STATUS_STANDBY
+    graph["readable_generation"] = True
+    _common(monkeypatch, graph=graph)
+    monkeypatch.setattr(repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap")
+
+    report = repo_policy.build_preflight(root)
+
+    assert "source_graph_not_ready" not in report["errors"]
+    assert report["source_graph"]["ready_for_code"] is True

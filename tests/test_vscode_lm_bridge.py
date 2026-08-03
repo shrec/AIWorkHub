@@ -25,7 +25,13 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _host(bridge_root: Path, repo_id: str, *, models: list[str]) -> Path:
+def _host(
+    bridge_root: Path,
+    repo_id: str,
+    *,
+    models: list[str],
+    access_state: str = "unknown",
+) -> Path:
     path = bridge_root / "hosts" / repo_id / "window_test.json"
     vscode_lm_bridge._atomic_json(  # noqa: SLF001 - contract-level test
         path,
@@ -34,6 +40,11 @@ def _host(bridge_root: Path, repo_id: str, *, models: list[str]) -> Path:
             "repo_id": repo_id,
             "window_id": "window_test",
             "models": models,
+            "model_metadata": [
+                {"canonical": model, "id": model, "family": model, "access_state": access_state}
+                for model in models
+            ],
+            "permission_granted": access_state.startswith("granted"),
         },
     )
     return path
@@ -53,6 +64,8 @@ def test_readiness_is_repo_scoped_and_credential_free(tmp_path: Path, monkeypatc
     host = _host(root, repo_id, models=["glm-5.2"])
     ready = vscode_lm_bridge.bridge_readiness(repo)
     assert ready["launchable"] is True
+    assert ready["access_observed"] is False
+    assert ready["consent_required"] is True
     assert ready["window_id"] == "window_test"
     deepseek_absent = vscode_lm_bridge.bridge_readiness(
         repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
@@ -64,15 +77,32 @@ def test_readiness_is_repo_scoped_and_credential_free(tmp_path: Path, monkeypatc
         repo, model="deepseek-v4-pro", adapter_id="deepseek_vscode_lm"
     )
     assert deepseek_ready["launchable"] is True
+    assert deepseek_ready["access_state"] == "unknown"
     assert deepseek_ready["credential_required"] is False
     shared = vscode_lm_bridge.bridge_readiness(
         repo, model=None, adapter_id="vscode_lm"
     )
     assert shared["launchable"] is True
+    assert shared["access_observed"] is False
     assert shared["live_host_count"] == 1
     assert shared["observed_models"] == ["deepseek-v4-pro", "glm-5.2"]
     if os.name != "nt":
         assert host.stat().st_mode & 0o077 == 0
+
+
+def test_readiness_reports_durable_model_consent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"], access_state="granted_remembered")
+
+    ready = vscode_lm_bridge.bridge_readiness(repo)
+
+    assert ready["launchable"] is True
+    assert ready["access_observed"] is True
+    assert ready["consent_required"] is False
+    assert ready["access_state"] == "granted_remembered"
 
 
 def test_readiness_distinguishes_stale_host_from_missing_model(

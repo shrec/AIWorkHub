@@ -160,6 +160,8 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
         "bridge_readiness",
         lambda *args, **kwargs: {
             "launchable": True,
+            "access_observed": True,
+            "access_state": "granted",
             "blocker_reason": "",
             "window_id": "window_test",
             "live_host_count": 1,

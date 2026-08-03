@@ -313,9 +313,27 @@ def _provider_status(
     except (OSError, RuntimeError, ValueError):
         readiness = None
     if isinstance(readiness, Mapping):
-        result["access_observed"] = True
+        if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+            # Editor visibility/host presence is not consent or a completed
+            # provider turn; the bridge must report its explicit observation.
+            result["access_observed"] = bool(readiness.get("access_observed"))
+        else:
+            # Native credential/auth helpers have already validated their
+            # exact local credential/subscription boundary before declaring
+            # launchable. They do not use the editor consent state machine.
+            result["access_observed"] = bool(
+                readiness.get("access_observed")
+                or readiness.get("authenticated")
+                or readiness.get("credential_present")
+                or readiness.get("launchable")
+            )
         result["launchable"] = bool(resolution.ok and readiness.get("launchable"))
-        result["status"] = "ready" if result["launchable"] else "access_unavailable"
+        if result["launchable"] and result["access_observed"]:
+            result["status"] = "ready"
+        elif result["launchable"] and readiness.get("consent_required"):
+            result["status"] = "consent_required"
+        else:
+            result["status"] = "access_unavailable"
         result["reason"] = str(readiness.get("blocker_reason") or readiness.get("reason") or "")[:200]
         # Preserve only bounded, secret-free broker observability.  The UI can
         # then report real editor model capacity instead of presenting
@@ -326,6 +344,8 @@ def _provider_status(
             "live_host_count",
             "stale_host_count",
             "freshest_age_seconds",
+            "access_state",
+            "consent_required",
         ):
             value = readiness.get(key)
             if value is not None:
@@ -381,10 +401,15 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         errors.append("required_validation_missing")
     source_health = source_graph_daemon.daemon_health(root)
     source_graph_ready_for_code = (
-        bool(source_health.get("running"))
-        and source_health.get("status") == source_graph_daemon.STATUS_READY
+        bool(source_health.get("ok"))
+        and bool(source_health.get("running"))
+        and source_health.get("status") in {
+            source_graph_daemon.STATUS_READY,
+            source_graph_daemon.STATUS_STANDBY,
+        }
         and bool(source_health.get("last_success_at"))
         and bool(source_health.get("build_revision"))
+        and int(source_health.get("files_seen") or 0) > 0
     )
     if policy["tools"]["source_graph_required_for_code"] and not source_graph_ready_for_code:
         errors.append("source_graph_not_ready")
@@ -455,6 +480,7 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                 for key in (
                     "ok", "status", "running", "registered", "last_success_at",
                     "stale_reason", "build_revision", "files_seen",
+                    "readable_generation",
                 )
             },
             "ready_for_code": source_graph_ready_for_code,

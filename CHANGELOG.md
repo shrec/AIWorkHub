@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.49] - 2026-08-03
+
+### Added
+
+- Wired the provider-neutral token-budget kernel into the detached worker
+  supervisor. Tasks may set an explicit `max_live_tokens`; structured usage
+  observed while the provider is running is enforced immediately, while
+  terminal-only telemetry is truthfully retained as posthoc-only evidence.
+
+### Fixed
+
+- Routed VS Code LM adapters through their editor-host execution boundary on
+  every platform, while retaining AppContainer/OS sandbox enforcement for
+  native CLI adapters.
+- Persisted explicit per-model editor consent before the provider turn and
+  isolated broker/snapshot failures from the manager MCP recovery circuit.
+- Hydrated Source Graph daemon/preflight truth from the canonical readable
+  generation and added exact file provenance to context entities and edges.
+- Recorded pre-claim launch failures as retryable operational blockers without
+  fabricating processing/review states, and clarified that auto-pickup is
+  optional while launch is the required worker-start operation.
+- Moved timeout, cancellation and worker-crash outcomes out of the actionable
+  review queue while preserving callbacks, worktree evidence and original
+  validation/output denominators.
+- Retained structured evidence for every failed validation command, including
+  return code, duration, bounded stream heads/tails and truncation markers.
+- Reported native authenticated/credential-backed routes independently from
+  editor consent telemetry, preventing healthy CLI adapters from appearing
+  access-unavailable.
+- Drained provider pipes as available chunks instead of waiting for a 64 KiB
+  read or EOF, restoring genuinely live output and usage telemetry.
+
 ## [0.8.48] - 2026-08-03
 
 ### Added

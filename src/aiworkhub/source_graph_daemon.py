@@ -534,6 +534,50 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "registered": False,
         }
     out = daemon.health()
+    # A second extension/MCP process may own the writer lease while this
+    # daemon is a healthy standby reader.  Local in-memory fields then have no
+    # successful report even though the canonical SQLite generation is fresh
+    # and fully queryable.  Hydrate only immutable build identity from that
+    # read-only authority; never claim readiness from the standby label alone.
+    if out.get("status") == STATUS_STANDBY and (
+        not out.get("last_success_at") or not out.get("build_revision")
+    ):
+        try:
+            db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
+            if db_path.exists():
+                conn = source_graph.connect(db_path, read_only=True)
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM meta WHERE key='last_build'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                payload = json.loads(row["value"]) if row is not None else {}
+                finished_at = str(payload.get("finished_at") or "")
+                build_revision = str(payload.get("build_revision") or "")
+                files_seen = int(payload.get("files_seen") or 0)
+                if finished_at and build_revision and files_seen > 0:
+                    out["last_success_at"] = finished_at
+                    out["build_revision"] = build_revision
+                    out["files_seen"] = files_seen
+                    out["readable_generation"] = True
+                    try:
+                        anchor = datetime.fromisoformat(finished_at)
+                        age = max(0.0, (datetime.now(timezone.utc) - anchor).total_seconds())
+                    except ValueError:
+                        age = None
+                    out["index_age_seconds"] = age
+                    stale_after = out.get("stale_after_seconds")
+                    if age is not None and stale_after is not None and age > float(stale_after):
+                        out["ok"] = False
+                        out["status"] = STATUS_STALE
+                        out["stale_reason"] = "last_success_exceeded_threshold"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, source_graph.SourceGraphError):
+            out["readable_generation"] = False
+    else:
+        out["readable_generation"] = bool(
+            out.get("last_success_at") and out.get("build_revision") and int(out.get("files_seen") or 0) > 0
+        )
     out["registered"] = True
     return out
 

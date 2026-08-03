@@ -159,6 +159,10 @@ def claim_start_exact(
             except (TypeError, ValueError):
                 claim_epoch = 1
             prior_episode = task_store.begin_claim_episode(stored_card)
+            # A prior pre-claim launch failure is operational history, not a
+            # permanent task lifecycle state.  This exact successful claim is
+            # the authority that clears it.
+            stored_card.pop("operational_blocker", None)
             stored_card.update(
                 claim_epoch=claim_epoch,
                 launch_request_id=request_id,
@@ -210,6 +214,90 @@ def claim_start_exact(
     card = task_store.get_task(repo, task_id)
     stdout = json.dumps(card, ensure_ascii=False, default=str) if card else ""
     return {"ok": True, "returncode": 0, "command": command, "stdout": stdout, "stderr": ""}
+
+
+def record_launch_blocker(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    topic: str,
+    *,
+    adapter_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record a pre-claim launch blocker without fabricating a claim.
+
+    The card remains pending/unclaimed and can be retried explicitly after the
+    environment is repaired, but Plan-DAG/auto-pickup can now see the exact
+    operational blocker instead of looping or reporting an empty blocker map.
+    """
+    command = ["launch-blocked", task_id, "--runner", runner]
+    blocked = core._canonical_write_gate(
+        "claim-start", runner=runner, topic=topic, task_id=task_id
+    )
+    if blocked is not None:
+        return blocked
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        conn = task_store._connect(db_path)
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    try:
+        row = conn.execute(
+            "SELECT runner, topic, status, worker_status, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": f"task_not_found:{task_id}"}
+        if row["runner"] != runner or _effective_topic(row) != topic:
+            conn.rollback()
+            return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": "identity_mismatch"}
+        if str(row["status"] or "").lower() != "pending" or str(row["worker_status"] or "").lower() != "unclaimed":
+            conn.rollback()
+            return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": "task_not_pending_unclaimed"}
+        raw_card = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card)
+        except (TypeError, json.JSONDecodeError):
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        card["operational_blocker"] = {
+            "kind": "launch_blocked",
+            "adapter_id": str(adapter_id)[:128],
+            "reason": str(reason)[:500],
+            "observed_at": now,
+        }
+        cur = conn.execute(
+            "UPDATE tasks SET card_json=?, updated_at=? "
+            "WHERE task_id=? AND status='pending' AND worker_status='unclaimed' AND card_json=?",
+            (json.dumps(card, ensure_ascii=False, sort_keys=True), now, task_id, raw_card),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": "launch_blocker_conflict"}
+        conn.execute(
+            "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) VALUES (?,?,?,?,?)",
+            (
+                task_id,
+                "launch_blocked",
+                runner,
+                json.dumps(card["operational_blocker"], ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "returncode": 0,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": "pending"}, ensure_ascii=False),
+        "stderr": "",
+    }
 
 
 def show_task(repo: Path, task_id: str) -> dict[str, Any]:
@@ -338,6 +426,72 @@ def mark_launch_failed(
                     task_id,
                     origin_thread_id,
                     callback_store.resolve_callback_transition("launch_failed"),
+                    provider=provider,
+                    episode_id=str(card.get("claim_epoch") or 0),
+                    request_id=request_id,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except task_store.TaskStoreError:
+            callback_enqueued = False
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+        "callback_enqueued": callback_enqueued,
+    }
+
+
+def mark_terminal_failure(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    substatus: str,
+    *,
+    evidence: dict[str, Any] | None = None,
+    request_id: str = "",
+) -> dict[str, Any]:
+    """Truthfully block one launched worker failure and notify the manager."""
+    command = ["terminal-failure", task_id, "--runner", runner, "--substatus", substatus]
+    try:
+        ok, state = task_store.mark_terminal_failure(
+            repo,
+            task_id,
+            runner=runner,
+            substatus=substatus,
+            evidence=evidence or {},
+            request_id=request_id,
+        )
+    except task_store.TaskStoreError as exc:
+        return {
+            "ok": False,
+            "returncode": 1,
+            "command": command,
+            "stdout": "",
+            "stderr": str(exc),
+            "callback_enqueued": False,
+        }
+    callback_enqueued = False
+    if ok:
+        card = task_store.get_task(repo, task_id) or {}
+        try:
+            _readiness, db_path = task_store._require_ready(repo)
+            conn = task_store._connect(db_path)
+            try:
+                callback_store.init_db(conn)
+                origin_thread_id = (
+                    callback_store.read_origin_thread(conn, task_id)
+                    or str(card.get("origin_thread_id") or "").strip()
+                )
+                provider = str(card.get("coordinator_provider") or "").strip().lower()
+                callback_enqueued = callback_store.enqueue_callback(
+                    conn,
+                    task_id,
+                    origin_thread_id,
+                    callback_store.resolve_callback_transition(substatus),
                     provider=provider,
                     episode_id=str(card.get("claim_epoch") or 0),
                     request_id=request_id,

@@ -71,6 +71,7 @@ except ImportError:  # optional host-only credential helper in some worktrees
     glm_credentials = None  # type: ignore[assignment]
 from .worker_workspace import (
     WorkerWorkspace,
+    ValidationRunError,
     WorkspaceError,
     cleanup_workspace,
     build_residual_contract_manifest,
@@ -86,6 +87,7 @@ from .worker_workspace import (
     sanitized_env as _base_sanitized_env,
     unlink_if_regular,
     validate_residual_contract,
+    VSCODE_LM_IN_PROCESS_BACKEND,
     write_json_0600,
 )
 from . import worker_workspace as _worker_workspace
@@ -197,6 +199,7 @@ TERMINAL_PROCESS_STATES = {
     "exited",
     "exited_without_review",
     "timed_out",
+    "token_budget_exceeded",
     "cancelled",
     "launch_failed",
     "worker_failed",
@@ -252,6 +255,27 @@ def _vscode_lm_worker_env(
 # Backwards-compatible private alias retained for installed integrations and
 # tests that predate the generic VS Code Auth Model Broker.
 _glm_vscode_worker_env = _vscode_lm_worker_env
+
+_VSCODE_LM_IN_PROCESS_ADAPTERS = frozenset(
+    {
+        runtime_adapters.VSCODE_LM_ADAPTER,
+        runtime_adapters.GLM_VSCODE_LM_ADAPTER,
+        runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
+    }
+)
+
+
+def _sandbox_backend_for_adapter(adapter_id: str) -> str:
+    """Resolve the execution boundary for this exact adapter.
+
+    Native CLI adapters still require the host OS sandbox. VS Code LM routes
+    execute the provider/model inside the editor host and launch only the
+    bounded response-applier subprocess, whose complete output is validated
+    before its first workspace write.
+    """
+    if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+        return VSCODE_LM_IN_PROCESS_BACKEND
+    return select_sandbox_backend()
 
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
@@ -460,6 +484,33 @@ def _safe_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
             return fh.read(max_bytes).decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _declared_failure_denominators(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Preserve gates a worker never reached without inventing results."""
+    validations: list[dict[str, Any]] = []
+    for raw in list(metadata.get("validation") or []):
+        command: Any = list(raw) if isinstance(raw, (list, tuple)) else str(raw)
+        validations.append(
+            {
+                "command": command,
+                "returncode": None,
+                "not_run": True,
+                "reason": "worker_terminal_before_validation",
+            }
+        )
+    required_outputs = [
+        {
+            "pattern": str(raw),
+            "path": str(raw),
+            "bytes": None,
+            "sha256": "",
+            "missing": True,
+            "reason": "worker_terminal_before_output_validation",
+        }
+        for raw in list(metadata.get("required_outputs") or [])
+    ]
+    return {"validation": validations, "required_outputs": required_outputs}
 
 
 # --- B855: bounded, single-task Live Output read ----------------------------
@@ -2689,7 +2740,7 @@ class ProcessManager:
             # A missing/invalid credential raises here, leaving the task
             # pending/unclaimed -- never claim on a missing credential.
             provider_env, model = self._resolve_provider_env(adapter_id, model)
-            sandbox_backend = select_sandbox_backend()
+            sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
             with self._lock, self._registry_lock():
                 if self._active_count() >= _configured_limit():
                     raise LaunchRejected("concurrency_limit_reached")
@@ -2801,11 +2852,7 @@ class ProcessManager:
                         ),
                         _budget_report=prompt_budget,
                     )
-                if adapter_id in {
-                    runtime_adapters.VSCODE_LM_ADAPTER,
-                    runtime_adapters.GLM_VSCODE_LM_ADAPTER,
-                    runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
-                }:
+                if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
                     bridge_request = vscode_lm_bridge.create_request(
                         repo=self.repo,
                         request_id=request_id,
@@ -2896,6 +2943,11 @@ class ProcessManager:
                     "adapter_id": adapter_id,
                     "model": model,
                     "timeout_seconds": timeout_seconds,
+                    "token_budget": (
+                        dict(card.get("token_budget"))
+                        if isinstance(card.get("token_budget"), dict)
+                        else None
+                    ),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "supervisor_status_path": str(status_path),
@@ -2993,6 +3045,8 @@ class ProcessManager:
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "max_output_bytes": 16 * 1024 * 1024,
+                    "adapter_id": adapter_id,
+                    "token_budget": metadata.get("token_budget"),
                 })
 
                 supervisor = Path(__file__).with_name("worker_supervisor.py")
@@ -3010,7 +3064,11 @@ class ProcessManager:
                     cwd="/",
                     env=sanitized_env(
                         adapter_id,
-                        home=workspace.home if sandbox_backend == "landlock" else None,
+                        home=(
+                            workspace.home
+                            if sandbox_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+                            else None
+                        ),
                         isolated_task_queue_db=True,
                         provider_env=provider_env,
                     ),
@@ -3115,6 +3173,19 @@ class ProcessManager:
                 if not blocked_result.get("ok"):
                     reason += ":launch_failure_transition_failed:" + str(
                         blocked_result.get("stderr") or ""
+                    )[:200]
+            else:
+                blocker_result = task_engine.record_launch_blocker(
+                    self.repo,
+                    task_id,
+                    runner,
+                    topic,
+                    adapter_id=adapter_id,
+                    reason=reason,
+                )
+                if not blocker_result.get("ok"):
+                    reason += ":launch_blocker_record_failed:" + str(
+                        blocker_result.get("stderr") or ""
                     )[:200]
             if workspace is not None:
                 try:
@@ -3683,6 +3754,43 @@ class ProcessManager:
             evidence=payload,
         )
 
+    def _terminal_failure_exact(
+        self,
+        metadata: dict[str, Any],
+        substatus: str,
+        *,
+        request_id: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Record a no-candidate failure without resurrecting disposed work."""
+        task_id = str(metadata["task_id"])
+        runner = str(metadata["runner"])
+        try:
+            card = _parse_card(self._show_task(task_id), task_id)
+            archived_at = str(card.get("archived_at") or "").strip()
+            lifecycle = core._lifecycle_state(card)
+            if archived_at or lifecycle == "archived":
+                operation = str(card.get("archive_operation") or "archived").strip().lower()
+                disposition = "superseded" if operation == "superseded" else "archived"
+                return {
+                    "ok": True,
+                    "idempotent_noop": True,
+                    "canonical_lifecycle": "archived",
+                    "terminal_review_disposition": (
+                        f"terminal_skipped_already_finalized:{disposition}"
+                    ),
+                }
+        except Exception:
+            pass
+        return task_engine.mark_terminal_failure(
+            self.repo,
+            task_id,
+            runner,
+            substatus,
+            evidence=evidence,
+            request_id=request_id,
+        )
+
     @staticmethod
     def _read_supervisor_status(path: Path) -> dict[str, Any]:
         return read_supervisor_status(path)
@@ -3974,6 +4082,8 @@ class ProcessManager:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
             if supervisor_state == "timed_out":
                 terminal_state = "timed_out"
+            elif supervisor_state == "token_budget_exceeded":
+                terminal_state = "token_budget_exceeded"
             elif supervisor_state == "cancelled":
                 terminal_state = "cancelled"
             elif supervisor_state == "exited" and exit_code == 0:
@@ -4017,12 +4127,10 @@ class ProcessManager:
             cleanup = True
             try:
                 if terminal_state != "exited":
-                    # Coordinator review-first: timed_out/cancelled/
-                    # worker_failed are terminal outcomes that move to
-                    # review, never a silent
-                    # pending. Retain the isolated worktree/candidate and
-                    # logs until Codex's accept/reject decision instead of
-                    # deleting the only evidence of what the worker did.
+                    # A worker that timed out, crashed, or was cancelled did
+                    # not produce actionable review work. Preserve its exact
+                    # evidence/worktree, but close it in the blocked terminal
+                    # bucket so the review queue remains truthful.
                     cleanup = terminal_state == "launch_failed"
                     # A non-exited terminal outcome never promotes/writes and
                     # so never needs the one-task authority grant -- remove
@@ -4039,21 +4147,27 @@ class ProcessManager:
                             request_id=request_id,
                         )
                     else:
-                        release_result = self._review_terminal_exact(
+                        failure_evidence = {
+                            "request_id": request_id,
+                            "adapter_id": metadata.get("adapter_id"),
+                            "model": metadata.get("model"),
+                            "error": error[:500],
+                            "supervisor_state": supervisor_state,
+                            "exit_code": exit_code,
+                            "liveness_lost": liveness_lost,
+                            "token_budget": supervisor_status.get("token_budget"),
+                            **_declared_failure_denominators(metadata),
+                        }
+                        release_result = self._terminal_failure_exact(
                             metadata,
                             terminal_state,
+                            evidence=failure_evidence,
                             request_id=request_id,
-                            error=error,
-                            evidence={
-                                "supervisor_state": supervisor_state,
-                                "exit_code": exit_code,
-                                "liveness_lost": liveness_lost,
-                            },
                         )
                     if not release_result.get("ok"):
                         terminal_state = "release_pending"
                         error = error or (
-                            "terminal_review_transition_failed:"
+                            "terminal_failure_transition_failed:"
                             + str(
                                 release_result.get("stderr")
                                 or release_result.get("stdout")
@@ -4250,6 +4364,8 @@ class ProcessManager:
             except _QualityReviewFinalized:
                 pass
             except WorkspaceError as exc:
+                if isinstance(exc, ValidationRunError):
+                    validations = [dict(row) for row in exc.results]
                 error = str(exc)
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
                     terminal_state = "scope_rejected"
@@ -4407,6 +4523,7 @@ class ProcessManager:
                 "project_context": metadata.get("project_context"),
                 "project_context_delivery": metadata.get("project_context_delivery"),
                 "prompt_budget": metadata.get("prompt_budget"),
+                "token_budget": supervisor_status.get("token_budget"),
                 "project_context_acknowledgement": context_ack,
                 "provider_tool_denials": provider_tool_denials,
                 "worker_mcp_gate": worker_mcp_gate,
