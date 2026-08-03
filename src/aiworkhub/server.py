@@ -188,16 +188,18 @@ except ModuleNotFoundError:
         raise _StdioProtocolError(-32601, f"method_not_found:{method}")
 
     def _stdio_write_message(stream: Any, message: dict[str, Any]) -> None:
-        payload = json.dumps(message, ensure_ascii=False, default=str)
-        if len(payload.encode("utf-8")) > _FALLBACK_MAX_RESPONSE_BYTES:
+        payload = json.dumps(
+            message, ensure_ascii=False, default=str,
+        ).encode("utf-8")
+        if len(payload) > _FALLBACK_MAX_RESPONSE_BYTES:
             message = {
                 "jsonrpc": "2.0",
                 "id": message.get("id"),
                 "error": {"code": -32603, "message": "response_too_large"},
             }
-            payload = json.dumps(message, ensure_ascii=False)
+            payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
         try:
-            stream.write(payload + "\n")
+            stream.write(payload + b"\n")
             stream.flush()
         except (BrokenPipeError, OSError) as exc:
             _stdio_log(
@@ -214,7 +216,11 @@ except ModuleNotFoundError:
         # line.  The one-byte look-ahead detects overflow; the remainder is
         # drained in bounded chunks so the next request keeps its framing.
         stdin = sys.stdin.buffer
-        stdout = sys.stdout
+        # MCP stdio is a byte protocol.  Writing Unicode JSON through the
+        # platform text wrapper makes transport correctness depend on the
+        # host locale (for example Windows cp1251 cannot encode Georgian).
+        # Always emit explicit UTF-8 bytes and bypass locale transcoding.
+        stdout = sys.stdout.buffer
         while True:
             line = stdin.readline(_FALLBACK_MAX_LINE_BYTES + 1)
             if line == b"":

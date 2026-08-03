@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.42] - 2026-08-03
+
+### Fixed
+
+- Made manager and worker fallback MCP responses explicit binary UTF-8 rather
+  than locale-encoded text. Georgian and other Unicode task content can no
+  longer raise `UnicodeEncodeError` on Windows `cp1251` stdout after a task
+  mutation has committed, so `task_create` and the following `task_show` stay
+  on the same live transport.
+- Added a deterministic locale-hostile JSON-RPC regression covering Georgian
+  `task_create -> task_show`, plus the equivalent worker stdio response path.
+
 ## [0.8.41] - 2026-08-03
 
 ### Added

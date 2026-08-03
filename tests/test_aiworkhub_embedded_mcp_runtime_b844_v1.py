@@ -302,6 +302,98 @@ def test_stdlib_fallback_broken_stdout_exits_cleanly_with_stderr_event(
     assert event["request_id"] == 7
 
 
+def test_stdlib_fallback_task_create_then_show_uses_binary_utf8_for_georgian(
+    fallback_server_module, monkeypatch
+):
+    """Regression: Windows text stdout may be cp1251, not UTF-8.
+
+    Exercise the real fallback JSON-RPC dispatcher and the canonical public
+    task-create/task-show tool wrappers.  The fake text wrapper deliberately
+    rejects every text write, exactly as a Windows locale wrapper rejects
+    Georgian.  A valid server must exclusively use its binary buffer and keep
+    both responses on the same live transport.
+    """
+
+    server_module = fallback_server_module
+    task_id = "CODEX_UNICODE_STDIO_REGRESSION_V1"
+    title = "ქართული სათაური"
+    objective = "ქართული ამოცანის შექმნა და იმავე ტრანსპორტზე წაკითხვა"
+    card: dict[str, object] = {}
+
+    def fake_create_task(**kwargs):
+        card.update(kwargs)
+        return {"ok": True, "created": True, "task_id": kwargs["task_id"], **kwargs}
+
+    def fake_show_task(requested_task_id):
+        assert requested_task_id == task_id
+        return {"ok": True, "task_id": requested_task_id, "card": dict(card)}
+
+    monkeypatch.setattr(server_module.core, "create_task", fake_create_task)
+    monkeypatch.setattr(server_module.core, "show_task", fake_show_task)
+
+    requests = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "aiworkhub_task_create",
+                "arguments": {
+                    "task_id": task_id,
+                    "title": title,
+                    "runner": "codex_unicode_test",
+                    "topic": "task_mcp",
+                    "objective": objective,
+                    "acceptance": ["ქართული პასუხი უცვლელია"],
+                    "allowed_writes": [],
+                },
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "aiworkhub_task_show",
+                "arguments": {"task_id": task_id},
+            },
+        },
+    ]
+    stdin_bytes = io.BytesIO(
+        b"".join(
+            json.dumps(request, ensure_ascii=True).encode("ascii") + b"\n"
+            for request in requests
+        )
+    )
+    stdout_bytes = io.BytesIO()
+
+    class LocaleBoundTextStream:
+        def __init__(self, buffer):
+            self.buffer = buffer
+
+        def write(self, _text):
+            raise UnicodeEncodeError("charmap", "ქართული", 0, 1, "unsupported")
+
+        def flush(self):
+            raise AssertionError("text flush must not be used")
+
+    monkeypatch.setattr(server_module.sys, "stdin", LocaleBoundTextStream(stdin_bytes))
+    monkeypatch.setattr(server_module.sys, "stdout", LocaleBoundTextStream(stdout_bytes))
+
+    server_module._run_stdio_fallback_server(
+        "AIWorkHub MCP", server_module.mcp._tools,
+    )
+
+    responses = [
+        json.loads(line.decode("utf-8"))
+        for line in stdout_bytes.getvalue().splitlines()
+    ]
+    assert [response["id"] for response in responses] == [1, 2]
+    assert responses[0]["result"]["structuredContent"]["title"] == title
+    shown = responses[1]["result"]["structuredContent"]
+    assert shown["card"]["objective"] == objective
+
+
 # ---------------------------------------------------------------------------
 # 3. Isolated end-to-end smoke: the actual extracted VSIX runtime, -S (no
 #    site-packages), a fresh repository with no checkout and no venv.

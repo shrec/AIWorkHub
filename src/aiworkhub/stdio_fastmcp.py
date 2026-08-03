@@ -192,16 +192,20 @@ def _dispatch(server_name: str, tools: dict[str, Any], method: Any, params: Any)
 
 
 def _write(message: dict[str, Any]) -> None:
-    payload = json.dumps(message, ensure_ascii=False, default=str)
-    if len(payload.encode("utf-8")) > MAX_RESPONSE_BYTES:
+    payload = json.dumps(
+        message, ensure_ascii=False, default=str,
+    ).encode("utf-8")
+    if len(payload) > MAX_RESPONSE_BYTES:
         payload = json.dumps({
             "jsonrpc": "2.0",
             "id": message.get("id"),
             "error": {"code": -32603, "message": "response_too_large"},
-        })
+        }).encode("utf-8")
     try:
-        sys.stdout.write(payload + "\n")
-        sys.stdout.flush()
+        # JSON-RPC stdio is UTF-8 bytes, independent of the Windows console
+        # code page or PYTHONIOENCODING inherited by the worker process.
+        sys.stdout.buffer.write(payload + b"\n")
+        sys.stdout.buffer.flush()
     except (BrokenPipeError, OSError) as exc:
         _stderr_event(
             "transport_closed",
