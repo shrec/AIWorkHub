@@ -34,7 +34,8 @@ except ImportError:  # pragma: no cover - standalone compatibility
 REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"
 HOST_SCHEMA_ID = "aiworkhub.vscode_lm.host.v1"
 RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.response.v1"
-EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.edit_response.v1"
+EDIT_RESPONSE_SCHEMA_ID_V1 = "aiworkhub.vscode_lm.edit_response.v1"
+EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.edit_response.v2"
 BRIDGE_ROOT_ENV = "AIWORKHUB_VSCODE_LM_BRIDGE_ROOT"
 DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
@@ -331,7 +332,17 @@ def create_request(
         "response_contract": {
             "schema_id": EDIT_RESPONSE_SCHEMA_ID,
             "format": "json_only",
-            "files": [{"path": "repo-relative allowed_writes path", "content": "complete UTF-8 file"}],
+            "edits": [
+                {
+                    "path": "repo-relative allowed_writes path",
+                    "current_sha256": "lowercase sha256 of current workspace bytes",
+                    "replacements": [
+                        {"old": "exact nonempty current text", "new": "replacement text", "expected_count": 1}
+                    ],
+                }
+            ],
+            "creates": [{"path": "repo-relative allowed_writes path", "content": "complete UTF-8 file"}],
+            "legacy_v1_files": [{"path": "repo-relative allowed_writes path", "content": "complete UTF-8 file"}],
         },
     }
     context_receipt = ""

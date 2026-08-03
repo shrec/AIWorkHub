@@ -71,6 +71,38 @@ assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiwork
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", "research/*.json"), true);
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=body with query equal to the exact indexed symbol name"));
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "v2",
+    edits: [{
+      path: "src/app.py",
+      current_sha256: "a".repeat(64),
+      replacements: [{ old: "before", new: "after", expected_count: 1 }],
+    }],
+    creates: [],
+  }, ["src/*.py"]),
+  "",
+);
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1,
+    summary: "v1",
+    files: [{ path: "src/app.py", content: "complete\n" }],
+  }, ["src/*.py"]),
+  "",
+);
+assert.match(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "bad",
+    edits: [{ path: "src/app.py", current_sha256: "A".repeat(64), replacements: [] }],
+    creates: [],
+  }, ["src/*.py"]),
+  /final_hash_invalid/,
+);
 
 async function textProtocolChecks() {
   const toolRequest = JSON.stringify({
@@ -81,7 +113,8 @@ async function textProtocolChecks() {
   const finalResponse = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "bounded",
-    files: [{ path: "out/result.json", content: "{}\n" }],
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
   });
   const queued = [toolRequest, finalResponse];
   const options = [];
@@ -139,7 +172,8 @@ async function textProtocolChecks() {
   const laterFinal = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "actual final",
-    files: [{ path: "out/result.json", content: '{"ok":true}\n' }],
+    edits: [],
+    creates: [{ path: "out/result.json", content: '{"ok":true}\n' }],
   });
   assert.deepStrictEqual(
     internals.parseVscodeLmJsonEnvelope(`${finalResponse}\nreasoning\n${laterFinal}`, { preferFinal: true }),
@@ -215,7 +249,8 @@ async function textProtocolChecks() {
   const wrongPath = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "placeholder",
-    files: [{ path: "repo/relative", content: "bad" }],
+    edits: [],
+    creates: [{ path: "repo/relative", content: "bad" }],
   });
   const correctedQueued = [wrongPath, finalResponse];
   const correctingModel = {
@@ -378,7 +413,8 @@ async function nativeProtocolChecks() {
   const finalResponse = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "bounded native",
-    files: [{ path: "out/result.json", content: "{}\n" }],
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
   });
   const turns = [
     [{ callId: "call-1", name: "aiworkhub_manager_source_graph_query", input: { mode: "focus", query: "model" } }],

@@ -171,7 +171,8 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
             {
                 "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
                 "summary": "implemented",
-                "files": [{"path": "out/result.txt", "content": "ok\n"}],
+                "creates": [{"path": "out/result.txt", "content": "ok\n"}],
+                "edits": [],
             }
         ),
         "error": "",
@@ -218,7 +219,7 @@ def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path
             "error": "",
             "text": json.dumps(
                 {
-                    "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+                    "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID_V1,
                     "summary": "bad mixed response",
                     "files": [
                         {"path": "out/good.txt", "content": "must not land"},

@@ -199,7 +199,8 @@ const DISPATCHER_WATCHDOG_INTERVAL_MS = 15 * 1000;
 const VSCODE_LM_REQUEST_SCHEMA = "aiworkhub.vscode_lm.request.v1";
 const VSCODE_LM_HOST_SCHEMA = "aiworkhub.vscode_lm.host.v1";
 const VSCODE_LM_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.response.v1";
-const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v1";
+const VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1 = "aiworkhub.vscode_lm.edit_response.v1";
+const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v2";
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
@@ -2552,11 +2553,14 @@ function glmAgentProtocolPrompt(prompt, allowedWrites) {
     : "output.json";
   return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
     `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
+    `- Source Graph file lookup: mode=file with query and target both equal to one declared repo-relative path returns source_hash for that file.\n` +
+    `- Source Graph body lookup: mode=body with query equal to the exact indexed symbol name and target equal to that file path returns bounded source.\n` +
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
-    `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}.\n` +
-    `- files must contain complete UTF-8 content and paths must match allowed_writes.\n` +
+    `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}; legacy ${VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1} is accepted only for small complete-file writes.\n` +
+    `- v2 edits must name an allowed path, current_sha256 as exact lowercase SHA-256 of current workspace bytes, and bounded exact replacements with nonempty old, nonempty new, and expected_count.\n` +
+    `- v2 creates must name an allowed path and complete UTF-8 content; creates fail when the target already exists.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
-    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","files":[{"path":${JSON.stringify(examplePath)},"content":"complete content"}]}`;
+    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<lowercase sha256>","replacements":[{"old":"exact current text","new":"replacement text","expected_count":1}]}],"creates":[]}`;
 }
 
 function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
@@ -2577,15 +2581,47 @@ function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
 }
 
 function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
-  if (!envelope || typeof envelope.summary !== "string" || !Array.isArray(envelope.files)) {
+  if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
   }
-  for (const file of envelope.files) {
-    if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
-      return "final_file_invalid";
+  if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
+    if (!Array.isArray(envelope.files)) return "final_files_invalid";
+    for (const file of envelope.files) {
+      if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
+        return "final_file_invalid";
+      }
+      if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(file.path, pattern))) {
+        return `final_path_not_allowed:${file.path}`;
+      }
     }
-    if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(file.path, pattern))) {
-      return `final_path_not_allowed:${file.path}`;
+    return "";
+  }
+  if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) return "final_schema_invalid";
+  if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
+    return "final_v2_shape_invalid";
+  }
+  for (const edit of envelope.edits) {
+    if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) {
+      return "final_edit_invalid";
+    }
+    if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
+    if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) {
+      return `final_path_not_allowed:${edit.path}`;
+    }
+    for (const replacement of edit.replacements) {
+      if (!replacement || typeof replacement.old !== "string" || !replacement.old ||
+          typeof replacement.new !== "string" || !replacement.new ||
+          !Number.isSafeInteger(replacement.expected_count) || replacement.expected_count < 1) {
+        return `final_replacement_invalid:${edit.path}`;
+      }
+    }
+  }
+  for (const create of envelope.creates) {
+    if (!create || typeof create.path !== "string" || typeof create.content !== "string") {
+      return "final_create_invalid";
+    }
+    if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) {
+      return `final_path_not_allowed:${create.path}`;
     }
   }
   return "";
@@ -2632,7 +2668,7 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
   const source = String(text || "").trim();
   const normalize = (candidate) => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
-    if ([VSCODE_LM_TOOL_REQUEST_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA].includes(candidate.schema_id)) {
+    if ([VSCODE_LM_TOOL_REQUEST_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1].includes(candidate.schema_id)) {
       return candidate;
     }
     // GLM custom endpoints commonly serialize a function request using an
@@ -2655,8 +2691,11 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
     // Likewise tolerate an omitted final schema only when the complete edit
     // response shape is unmistakable; downstream validation still enforces
     // allowed paths and complete UTF-8 file contents.
-    if (typeof candidate.summary === "string" && Array.isArray(candidate.files)) {
+    if (typeof candidate.summary === "string" && Array.isArray(candidate.edits) && Array.isArray(candidate.creates)) {
       return { ...candidate, schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA };
+    }
+    if (typeof candidate.summary === "string" && Array.isArray(candidate.files)) {
+      return { ...candidate, schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1 };
     }
     return null;
   };
@@ -2716,7 +2755,9 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
     }
     if (uniqueCandidates.length === 1) return uniqueCandidates[0];
     if (preferFinal) {
-      const finals = uniqueCandidates.filter((candidate) => candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA);
+      const finals = uniqueCandidates.filter((candidate) =>
+        candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1
+      );
       // Text-only GLM endpoints may narrate or restate the prompt's example
       // envelope before emitting the real final object. The last complete
       // final envelope is the provider's answer; downstream validation still
@@ -2832,7 +2873,7 @@ async function runVscodeLmTextProtocol(
       ));
       continue;
     }
-    if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
+    if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
       if (finalError) {
@@ -2971,7 +3012,7 @@ async function runVscodeLmAgent(
         ));
         continue;
       }
-      if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) {
+      if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA && envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "non_final_envelope" });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
@@ -7018,6 +7059,7 @@ module.exports = {
       VSCODE_LM_REQUEST_SCHEMA,
       VSCODE_LM_HOST_SCHEMA,
       VSCODE_LM_RESPONSE_SCHEMA,
+      VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1,
       VSCODE_LM_EDIT_RESPONSE_SCHEMA,
       VSCODE_LM_TOOL_REQUEST_SCHEMA,
       VSCODE_LM_TOOL_RESULT_SCHEMA,
