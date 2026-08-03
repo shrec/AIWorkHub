@@ -6,6 +6,8 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.50] - 2026-08-03
+
 ### Added
 
 - Wired provider-reported input, output, cache and cost observations into the
@@ -16,6 +18,15 @@ noted by package/extension version and release tag.
   canonical completion verdict.
 
 ### Fixed
+
+- Delivered `timed_out`, `worker_failed`, cancellation and token-budget
+  terminal callbacks while their canonical task remains in the blocked
+  lifecycle bucket, instead of incorrectly superseding the durable wake-up.
+- Recovered one matching callback that an older eligibility check incorrectly
+  superseded when the verified manager route reloads.
+- Preserved the hash-pinned predecessor candidate after a rework successor
+  fails or times out, and retained explicit terminal failure reasons instead
+  of empty error evidence.
 
 - Preserved launch-time project-context evidence when a later terminal event
   adds provider usage, instead of replacing the whole per-request telemetry
