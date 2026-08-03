@@ -106,10 +106,12 @@ assert.ok(
   "editor-worker tools need a distinct bounded budget from dashboard reads",
 );
 const extensionSource = require("fs").readFileSync(extensionPath, "utf8");
-const snapshotBody = extensionSource.slice(
-  extensionSource.indexOf("async function pushSnapshotOnce"),
-  extensionSource.indexOf("async function pushSnapshotNoRetry"),
-);
+const snapshotStart = extensionSource.indexOf("async function pushSnapshotOnce");
+const snapshotEnd = extensionSource.indexOf("async function pushSnapshotNoRetry");
+assert.ok(snapshotStart >= 0, "pushSnapshotOnce marker is missing or renamed");
+assert.ok(snapshotEnd >= 0, "pushSnapshotNoRetry marker is missing or renamed");
+assert.ok(snapshotStart < snapshotEnd, "snapshot function markers are in the wrong order");
+const snapshotBody = extensionSource.slice(snapshotStart, snapshotEnd);
 assert.ok(snapshotBody.includes("snapshotRecovery"));
 assert.ok(!snapshotBody.includes("client.recovery.category = \"snapshot\""));
 assert.ok(!snapshotBody.includes("client.recovery.open = true"));
