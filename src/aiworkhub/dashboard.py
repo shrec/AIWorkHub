@@ -126,6 +126,7 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     gate = event.get("worker_mcp_gate")
     prompt_budget = event.get("prompt_budget")
     provider_denials = event.get("provider_tool_denials")
+    usage = event.get("usage")
     if (
         not isinstance(context, Mapping)
         and not isinstance(delivery, Mapping)
@@ -133,6 +134,7 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         and not isinstance(gate, Mapping)
         and not isinstance(prompt_budget, Mapping)
         and not isinstance(provider_denials, Mapping)
+        and not isinstance(usage, Mapping)
     ):
         return {}
 
@@ -335,8 +337,40 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
                 for value in (provider_denials.get("raw_discovery_labels") or [])[:16]
             ],
         } if isinstance(provider_denials, Mapping) else {},
+        "usage": {
+            "input_tokens": _bounded_int(usage.get("input_tokens")),
+            "output_tokens": _bounded_int(usage.get("output_tokens")),
+            "cached_input_tokens": _bounded_int(usage.get("cached_input_tokens")),
+            "cache_creation_input_tokens": _bounded_int(
+                usage.get("cache_creation_input_tokens")
+            ),
+            "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
+            "cost_usd": max(0.0, float(usage.get("cost_usd") or 0.0)),
+            "cost_observed": bool(usage.get("cost_observed")),
+        } if isinstance(usage, Mapping) else {},
         "tool_use": tool_use,
     }
+
+
+def _merge_ai_infra(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge bounded process evidence without erasing prior event sections.
+
+    A terminal usage event usually carries usage/acknowledgement but not the
+    launch event's project-context sections.  Replacing the whole compact
+    mapping made the latest row lose exactly the context evidence needed for
+    truthful economics.  Empty current sections therefore never erase an
+    earlier non-empty section from the same request.
+    """
+
+    merged = dict(previous or {})
+    for key, value in (current or {}).items():
+        if isinstance(value, Mapping) and not value:
+            continue
+        merged[key] = value
+    return merged
 
 
 def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]:
@@ -1096,7 +1130,10 @@ def read_process_runs(
                 compact[key] = value
         ai_infra = _compact_ai_infra(event)
         if ai_infra:
-            compact["ai_infra_context"] = ai_infra
+            compact["ai_infra_context"] = _merge_ai_infra(
+                (latest.get(request_id) or {}).get("ai_infra_context"),
+                ai_infra,
+            )
         latest[request_id] = {**latest.get(request_id, {}), **compact, "request_id": request_id}
         raw_status_path = event.get("supervisor_status_path")
         if isinstance(raw_status_path, str) and raw_status_path:

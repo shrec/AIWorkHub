@@ -1060,6 +1060,8 @@ function renderKpis(snapshot) {
     ["SG long gaps", formatCount(headline.source_graph_long_call_gap_count), `${kpiPercent(headline.source_graph_long_call_gap_rate)} at or above the informational threshold`, numberValue(headline.source_graph_long_call_gap_count) ? "bad" : "good"],
     ["SG evidence rows", formatCount(numberValue(headline.source_graph_entity_rows) + numberValue(headline.source_graph_edge_rows) + numberValue(headline.source_graph_file_rows)), `${formatCount(headline.source_graph_entity_rows)} entities · ${formatCount(headline.source_graph_edge_rows)} edges · ${formatCount(headline.source_graph_file_rows)} files`, "accent"],
     ["Context compression", kpiPercent(headline.context_compression_rate), `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`, "accent"],
+    ["Provider cache hit", kpiPercent(headline.provider_cache_hit_rate), `${formatCount(headline.provider_measured_tasks)} provider-measured tasks`, "accent"],
+    ["Cost / review-ready", headline.cost_per_review_ready_usd == null ? "—" : `$${Number(headline.cost_per_review_ready_usd).toFixed(4)}`, "provider-reported cost only", "neutral"],
     ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
     ["Observed cost", `$${Number(headline.cost_usd || 0).toFixed(2)}`, `${formatCount(headline.total_tokens)} recorded tokens`, "neutral"],
   ];

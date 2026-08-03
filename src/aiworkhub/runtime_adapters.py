@@ -481,6 +481,8 @@ def build_runtime_command(
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
+            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_get",
+            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_related",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_search",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_get",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_kb_related",

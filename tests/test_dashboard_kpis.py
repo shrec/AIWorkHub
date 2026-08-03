@@ -1,5 +1,5 @@
 from aiworkhub.dashboard_kpis import build_kpi_snapshot
-from aiworkhub.dashboard import _compact_ai_infra
+from aiworkhub.dashboard import _compact_ai_infra, _merge_ai_infra
 
 
 def _run(
@@ -15,6 +15,7 @@ def _run(
     prompt_bytes=0,
     prompt_budget_bytes=0,
     prompt_mode="initial",
+    usage=None,
 ):
     return {
         "task_id": task_id,
@@ -38,6 +39,7 @@ def _run(
                 "max_bytes": prompt_budget_bytes,
                 "delta_rework": prompt_mode == "rework_delta",
             },
+            "usage": usage or {},
         },
     }
 
@@ -234,6 +236,34 @@ def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_cla
     assert result["economics"]["token_savings_available"] is False
 
 
+def test_kpis_wire_provider_usage_into_context_economics() -> None:
+    result = _build([
+        _run(
+            "A",
+            "review_ready",
+            "2026-08-01T12:00:00Z",
+            adapter="claude_cli",
+            raw_context_bytes=10_000,
+            bundle_bytes=2_500,
+            usage={
+                "input_tokens": 8_000,
+                "output_tokens": 400,
+                "cached_input_tokens": 3_000,
+                "cache_creation_input_tokens": 500,
+                "cost_usd": 0.12,
+                "cost_observed": True,
+            },
+        )
+    ])
+
+    provider = result["economics"]["provider_measurement"]
+    assert provider["summary"]["total_tasks"] == 1
+    assert provider["summary"]["overall_cache_hit_rate"] == 0.4375
+    assert provider["summary"]["cost_per_review_ready_usd"] == 0.12
+    assert result["headline"]["provider_cache_hit_rate"] == 43.8
+    assert result["headline"]["cost_per_review_ready_usd"] == 0.12
+
+
 def test_process_event_prompt_budget_survives_bounded_dashboard_projection():
     compact = _compact_ai_infra({
         "prompt_budget": {
@@ -265,3 +295,37 @@ def test_process_event_prompt_budget_survives_bounded_dashboard_projection():
             "project_context_bytes": 12_000,
         },
     }
+
+
+def test_terminal_usage_merge_preserves_launch_context_evidence() -> None:
+    launch = _compact_ai_infra({
+        "project_context": {
+            "sections": [{
+                "name": "source_graph",
+                "requested": True,
+                "executed": True,
+                "bytes": 2400,
+            }],
+            "estimated_raw_context_vs_bundle_bytes": {
+                "raw_context_bytes": 10_000,
+                "bundle_bytes": 2_500,
+            },
+        },
+    })
+    terminal = _compact_ai_infra({
+        "usage": {
+            "input_tokens": 8_000,
+            "output_tokens": 400,
+            "cached_input_tokens": 3_000,
+            "cost_usd": 0.12,
+            "cost_observed": True,
+        },
+        "project_context_acknowledgement": {"acknowledged": True},
+    })
+
+    merged = _merge_ai_infra(launch, terminal)
+
+    assert merged["source_graph"]["bytes"] == 2400
+    assert merged["estimate"]["raw_context_bytes"] == 10_000
+    assert merged["usage"]["input_tokens"] == 8_000
+    assert merged["usage"]["cost_usd"] == 0.12

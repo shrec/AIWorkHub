@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -98,3 +99,45 @@ def test_worker_prompt_explains_runtime_enforcement() -> None:
     assert "provider-blocked" in prompt
     assert "HMAC-authenticated MCP audit ledger" in prompt
     assert "new coordinator-authorized fallback card" in prompt
+
+
+def test_context_gate_honors_repo_policy_toggle(monkeypatch, tmp_path) -> None:
+    policy = json.loads(json.dumps(process_launcher.repo_policy.DEFAULT_POLICY))
+    policy["tools"]["session_memory_kb_required_for_nontrivial"] = False
+    path = tmp_path / ".aiworkhub" / "config" / "policy.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    metadata = _metadata()
+    metadata["worker_mcp"]["authority_repo"] = str(tmp_path)
+    monkeypatch.setattr(
+        process_launcher.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "live_source_graph_calls": 1,
+            "successful_call_count_by_tool": {"source_graph": 1},
+        },
+    )
+
+    result = process_launcher._worker_mcp_live_call_gate(metadata, "request-1")
+
+    assert result["satisfied"] is True
+    assert result["required_tools"] == ["source_graph"]
+    assert result["tools_policy"] == {
+        "source_graph_required_for_code": True,
+        "session_memory_kb_required_for_nontrivial": False,
+    }
+
+
+def test_context_gate_fails_closed_on_malformed_repo_policy(tmp_path) -> None:
+    path = tmp_path / ".aiworkhub" / "config" / "policy.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{broken", encoding="utf-8")
+    metadata = _metadata()
+    metadata["worker_mcp"]["authority_repo"] = str(tmp_path)
+
+    result = process_launcher._worker_mcp_live_call_gate(metadata, "request-1")
+
+    assert result["gated"] is True
+    assert result["satisfied"] is False
+    assert result["reason"].startswith("repo_policy_invalid:")

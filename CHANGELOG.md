@@ -6,8 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Added
+
+- Wired provider-reported input, output, cache and cost observations into the
+  bounded Context Economics KPI surface, including provider cache-hit and
+  cost-per-review-ready measurements without fabricating token savings.
+- Allowed declared quality commands to normalize bounded SARIF, JUnit XML,
+  coverage JSON, benchmark JSON and AI-finding report artifacts into the
+  canonical completion verdict.
+
 ### Fixed
 
+- Preserved launch-time project-context evidence when a later terminal event
+  adds provider usage, instead of replacing the whole per-request telemetry
+  record.
+- Exposed AI Memory exact-get and related-record tools to Claude workers, in
+  parity with the registered worker MCP surface.
+- Enforced the repository's `session_memory_kb_required_for_nontrivial` policy
+  switch in the completion gate and failed closed on malformed policy state.
+- Labeled absent provider usage explicitly as `telemetry_unavailable` in
+  token-budget supervisor evidence.
 - Reported `record_launch_blocker` write-gate denials with the exact
   `launch-blocked` command instead of the underlying claim authority name.
 - Made the cross-plugin snapshot regression fail clearly when either function

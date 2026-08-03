@@ -125,6 +125,34 @@ without repository or model side effects. Its current baseline is 26 cases
 blocking schema error rather than silently truncated. Cross-platform CI runs
 the same matrix so a platform-specific false green or false red blocks release.
 
+## Normalized command reports
+
+A repository-declared exact command may attach one bounded report artifact.
+The command still owns execution truth; the report adapter adds mechanical
+evidence to the same completion verdict and cannot override a failed command.
+Supported formats are `sarif`, `junit_xml`, `coverage_json`,
+`benchmark_json`, and `ai_reviewer_findings`.
+
+```json
+{
+  "id": "python-coverage",
+  "kind": "coverage",
+  "command": ["{python}", "-m", "pytest", "--cov", "--cov-report=json"],
+  "report": {
+    "format": "coverage_json",
+    "path": "coverage.json",
+    "min_percent": 80
+  }
+}
+```
+
+Report paths are exact repository-relative paths: parent traversal, absolute
+paths, globs, symlinks, missing files, malformed content and artifacts over
+8 MiB never silently pass. A configured missing report is `not_available`; a
+malformed or below-threshold report is blocking. Coverage percentages are
+imported evidence, not a claim of changed-line coverage or test adequacy by
+themselves.
+
 ## What we adopt from kimi-atlas
 
 The useful transferable mechanisms are its falsifiable named lenses, pure

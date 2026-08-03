@@ -41,6 +41,8 @@ test("KPI v3 renders Source Graph workflow, generations, call gaps and byte econ
   assert.match(appSource, /Source Graph modes/);
   assert.match(appSource, /Tool-use cohorts/);
   assert.match(appSource, /Context compression/);
+  assert.match(appSource, /Provider cache hit/);
+  assert.match(appSource, /Cost \/ review-ready/);
   assert.match(appSource, /Source Graph latency p50/);
   assert.match(appSource, /SG call gap p95/);
   assert.match(appSource, /SG long gaps/);

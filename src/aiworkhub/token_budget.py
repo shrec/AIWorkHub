@@ -328,6 +328,15 @@ def supervisor_evidence(
 ) -> dict[str, Any]:
     events = [decision.evidence for decision in decisions]
     encoded = json.dumps(events, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    authorities = [
+        str(event.get("telemetry_authority") or "") for event in events
+    ]
+    if TelemetryAuthority.ENFORCED_LIVE.value in authorities:
+        telemetry_authority = TelemetryAuthority.ENFORCED_LIVE.value
+    elif TelemetryAuthority.POSTHOC_ONLY.value in authorities:
+        telemetry_authority = TelemetryAuthority.POSTHOC_ONLY.value
+    else:
+        telemetry_authority = TelemetryAuthority.TELEMETRY_UNAVAILABLE.value
     return {
         "schema_id": EVIDENCE_SCHEMA_ID,
         "subject": subject,
@@ -336,6 +345,12 @@ def supervisor_evidence(
         "accepted_total_tokens": state.accepted_total_tokens,
         "enforceable_live_tokens": state.enforceable_live_tokens,
         "report_count": len(state.reports),
+        "telemetry_authority": telemetry_authority,
+        "telemetry_observed": bool(events),
+        "telemetry_reason": "" if events else "no_provider_usage_report_observed",
+        "cap_enforceable": any(
+            bool(event.get("cap_enforceable")) for event in events
+        ),
         "event_sha256": hashlib.sha256(encoded).hexdigest(),
         "events": events,
     }

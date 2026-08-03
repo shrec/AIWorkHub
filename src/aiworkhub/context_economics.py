@@ -71,7 +71,11 @@ def measure_context_delivery(
     output_tokens: int | None = _opt_int(usage_data.get("output_tokens"))
     cost_usd: float | None = _opt_float(usage_data.get("cost_usd"))
 
-    cache_read: int = int(usage_data.get("cache_read_input_tokens") or 0)
+    cache_read: int = int(
+        usage_data.get("cache_read_input_tokens")
+        or usage_data.get("cached_input_tokens")
+        or 0
+    )
     cache_create: int = int(usage_data.get("cache_creation_input_tokens") or 0)
     openai_cached: int = int(usage_data.get("cached_input_tokens") or 0)
 

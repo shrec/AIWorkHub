@@ -191,6 +191,16 @@ MAX_SUMMARY_CHARS = 2000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 MAX_CHECK_PATH_PATTERNS = 64
 MAX_CHECK_PATH_PATTERN_BYTES = 256
+MAX_NORMALIZED_REPORT_BYTES = 8 * 1024 * 1024
+DECLARED_REPORT_FORMATS = frozenset(
+    {
+        "sarif",
+        "junit_xml",
+        "coverage_json",
+        "benchmark_json",
+        "ai_reviewer_findings",
+    }
+)
 DESTRUCTIVE_SOURCE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".bash"})
 DESTRUCTIVE_MIN_BASELINE_LINES = 200
 DESTRUCTIVE_MIN_REMOVED_LINES = 100
@@ -705,6 +715,49 @@ def _validate_declared_check(entry: Any) -> None:
         raise MalformedConfigError(
             f"declared check {check_id!r} has invalid 'minimum_risk': {minimum_risk!r}"
         )
+    report = entry.get("report")
+    if report is not None:
+        if not isinstance(report, Mapping):
+            raise MalformedConfigError(
+                f"declared check {check_id!r} 'report' must be an object"
+            )
+        report_format = report.get("format")
+        if report_format not in DECLARED_REPORT_FORMATS:
+            raise MalformedConfigError(
+                f"declared check {check_id!r} has invalid report format: {report_format!r}"
+            )
+        report_path = report.get("path")
+        if not isinstance(report_path, str) or not report_path.strip():
+            raise MalformedConfigError(
+                f"declared check {check_id!r} report path must be non-empty"
+            )
+        normalized_report_path = report_path.strip().replace("\\", "/")
+        if (
+            len(normalized_report_path.encode("utf-8")) > MAX_CHECK_PATH_PATTERN_BYTES
+            or normalized_report_path.startswith("/")
+            or "\x00" in normalized_report_path
+            or ".." in normalized_report_path.split("/")
+            or any(char in normalized_report_path for char in "*?[]")
+        ):
+            raise MalformedConfigError(
+                f"declared check {check_id!r} has unsafe report path"
+            )
+        min_percent = report.get("min_percent")
+        if min_percent is not None:
+            if report_format != "coverage_json" or isinstance(min_percent, bool):
+                raise MalformedConfigError(
+                    f"declared check {check_id!r} min_percent requires coverage_json"
+                )
+            try:
+                numeric_minimum = float(min_percent)
+            except (TypeError, ValueError) as exc:
+                raise MalformedConfigError(
+                    f"declared check {check_id!r} min_percent must be numeric"
+                ) from exc
+            if not 0.0 <= numeric_minimum <= 100.0:
+                raise MalformedConfigError(
+                    f"declared check {check_id!r} min_percent out of range"
+                )
 
 
 def _declared_check_applicability(
@@ -857,7 +910,123 @@ def run_declared_checks(
                 error="" if status != STATUS_NOT_AVAILABLE else stderr,
             )
         )
+        if isinstance(entry.get("report"), Mapping):
+            results.append(
+                _adapt_declared_report(root, entry, affected_paths=affected)
+            )
     return results
+
+
+def _adapt_declared_report(
+    repo_root: Path,
+    entry: Mapping[str, Any],
+    *,
+    affected_paths: tuple[str, ...],
+) -> EvidenceCheck:
+    """Normalize one bounded report produced by a declared exact command."""
+
+    check_id = f"{entry['id']}:report"
+    declared_kind = str(entry["kind"])
+    report = entry["report"]
+    assert isinstance(report, Mapping)
+    relative = str(report["path"]).strip().replace("\\", "/")
+    report_format = str(report["format"])
+    raw_candidate = repo_root / relative
+    candidate = raw_candidate.resolve(strict=False)
+    if candidate != repo_root and repo_root not in candidate.parents:
+        return EvidenceCheck(
+            check_id=check_id,
+            kind=declared_kind,
+            status=STATUS_FAILED,
+            affected_paths=affected_paths,
+            summary="normalized report path escapes repository",
+            provenance=f"adapter:{report_format}:{relative}",
+            error="report_path_escape",
+        )
+    try:
+        if raw_candidate.is_symlink():
+            return EvidenceCheck(
+                check_id=check_id,
+                kind=declared_kind,
+                status=STATUS_FAILED,
+                affected_paths=affected_paths,
+                summary=f"normalized report must not be a symlink: {relative}",
+                provenance=f"adapter:{report_format}:{relative}",
+                error="report_symlink_forbidden",
+            )
+        if not candidate.is_file():
+            raise FileNotFoundError(relative)
+        size = candidate.stat().st_size
+        if size > MAX_NORMALIZED_REPORT_BYTES:
+            return EvidenceCheck(
+                check_id=check_id,
+                kind=declared_kind,
+                status=STATUS_FAILED,
+                affected_paths=affected_paths,
+                summary=(
+                    f"normalized report too large: {size}>"
+                    f"{MAX_NORMALIZED_REPORT_BYTES}"
+                ),
+                provenance=f"adapter:{report_format}:{relative}",
+                error="report_too_large",
+            )
+        text = candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return EvidenceCheck(
+            check_id=check_id,
+            kind=declared_kind,
+            status=STATUS_NOT_AVAILABLE,
+            affected_paths=affected_paths,
+            summary=f"normalized report unavailable: {relative}",
+            provenance=f"adapter:{report_format}:{relative}",
+            error=type(exc).__name__,
+        )
+
+    try:
+        if report_format == "junit_xml":
+            adapted = adapt_junit_xml(check_id, text)
+        else:
+            document = json.loads(text)
+            if report_format == "sarif":
+                adapted = adapt_sarif(check_id, document)
+            elif report_format == "coverage_json":
+                adapted = adapt_coverage_summary(
+                    check_id,
+                    document,
+                    min_percent=float(report.get("min_percent") or 0.0),
+                )
+            elif report_format == "benchmark_json":
+                adapted = adapt_benchmark_json(check_id, document)
+            else:
+                findings = (
+                    document.get("findings")
+                    if isinstance(document, Mapping)
+                    else document
+                )
+                if not isinstance(findings, list):
+                    raise ValueError("AI reviewer report must contain a findings array")
+                adapted = adapt_ai_reviewer_findings(check_id, findings)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return EvidenceCheck(
+            check_id=check_id,
+            kind=declared_kind,
+            status=STATUS_FAILED,
+            affected_paths=affected_paths,
+            summary=f"malformed {report_format} report: {exc}",
+            provenance=f"adapter:{report_format}:{relative}",
+            error=str(exc),
+        )
+    return EvidenceCheck(
+        check_id=adapted.check_id,
+        kind=adapted.kind,
+        status=adapted.status,
+        command=tuple(str(part) for part in entry["command"]),
+        duration_seconds=adapted.duration_seconds,
+        affected_paths=adapted.affected_paths or affected_paths,
+        summary=adapted.summary,
+        provenance=f"{adapted.provenance}:{relative}",
+        error=adapted.error,
+    )
 
 
 def run_builtin_static_checks(

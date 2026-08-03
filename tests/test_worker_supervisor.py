@@ -64,6 +64,9 @@ def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> 
     status = _read_status(Path(spec["status_path"]))
     assert status["state"] == "exited"
     assert status["exit_code"] == 0
+    assert status["token_budget"]["telemetry_authority"] == "telemetry_unavailable"
+    assert status["token_budget"]["telemetry_observed"] is False
+    assert status["token_budget"]["telemetry_reason"] == "no_provider_usage_report_observed"
     assert Path(spec["stdout_path"]).read_text(encoding="utf-8").strip() == "worker-ok"
     for key in ("status_path", "stdout_path", "stderr_path"):
         assert os.name == "nt" or stat.S_IMODE(Path(spec[key]).stat().st_mode) == 0o600

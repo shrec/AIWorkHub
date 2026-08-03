@@ -179,6 +179,18 @@ class TestClaudeDisjointCache(unittest.TestCase):
             result["ratios"]["cache_hit_rate_of_input"], 3500 / 8000
         )
 
+    def test_claude_launcher_cached_field_is_accepted_as_cache_read(self):
+        result = measure_context_delivery(
+            usage={
+                "input_tokens": 8000,
+                "cached_input_tokens": 3000,
+                "cache_creation_input_tokens": 500,
+            },
+            adapter_id="claude_cli",
+            task_id="T06-launcher",
+        )
+        self.assertEqual(result["populations"]["cached_input_tokens"], 3500)
+
     def test_claude_no_cache_null(self):
         result = measure_context_delivery(
             usage={"input_tokens": 1000},

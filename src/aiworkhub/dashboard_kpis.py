@@ -11,6 +11,8 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Mapping
 
+from . import context_economics
+
 
 TERMINAL_STATES = frozenset(
     {
@@ -140,6 +142,7 @@ def build_kpi_snapshot(
         "total_prompt_bytes": 0,
         "total_prompt_budget_bytes": 0,
     }
+    context_measurements: list[dict[str, Any]] = []
     for row in runs:
         state = str(row.get("state") or "unknown")
         adapter = str(row.get("adapter_id") or "unknown")[:120]
@@ -232,6 +235,52 @@ def build_kpi_snapshot(
                     economics["rework_prompt_tasks"] += 1
                 else:
                     economics["initial_prompt_tasks"] += 1
+
+        if isinstance(infra, Mapping):
+            usage = infra.get("usage")
+            estimate = infra.get("estimate")
+            delivery = infra.get("delivery")
+            sections = [
+                dict(section)
+                for name in ("source_graph", "session_current_state", "ai_memory", "kb")
+                if isinstance((section := infra.get(name)), Mapping) and section
+            ]
+            bundle_bytes = (
+                _count(delivery.get("bundle_bytes"))
+                if isinstance(delivery, Mapping)
+                else 0
+            ) or (
+                _count(estimate.get("bundle_bytes"))
+                if isinstance(estimate, Mapping)
+                else 0
+            )
+            has_usage = isinstance(usage, Mapping) and bool(
+                usage.get("input_tokens")
+                or usage.get("output_tokens")
+                or usage.get("cached_input_tokens")
+                or usage.get("cache_creation_input_tokens")
+                or usage.get("cost_observed")
+            )
+            if sections or bundle_bytes or has_usage:
+                context_measurements.append(
+                    context_economics.measure_context_delivery(
+                        project_context_metadata={
+                            "sections": sections,
+                            "bundle_bytes": bundle_bytes or None,
+                        },
+                        naive_discover_bytes=(
+                            _count(estimate.get("raw_context_bytes")) or None
+                            if isinstance(estimate, Mapping)
+                            else None
+                        ),
+                        usage=dict(usage) if isinstance(usage, Mapping) else None,
+                        adapter_id=adapter,
+                        outcome=state,
+                        task_id=str(row.get("task_id") or ""),
+                        runner=str(row.get("runner") or ""),
+                        topic=topic,
+                    )
+                )
 
         day = _date_bucket(row)
         if day is None:
@@ -382,6 +431,9 @@ def build_kpi_snapshot(
             if economics["total_prompt_budget_bytes"] else None
         ),
     })
+    provider_economics = context_economics.dashboard_record(context_measurements)
+    provider_summary = provider_economics["summary"]
+    economics["provider_measurement"] = provider_economics
 
     return {
         "schema_id": "aiworkhub.kpi.dashboard.v3",
@@ -434,6 +486,15 @@ def build_kpi_snapshot(
             "estimated_context_bytes_avoided": economics["estimated_context_bytes_avoided"],
             "average_prompt_bytes": economics["average_prompt_bytes"],
             "prompt_budget_utilization_rate": economics["prompt_budget_utilization_rate"],
+            "provider_measured_tasks": provider_summary["total_tasks"],
+            "provider_cache_hit_rate": (
+                round(100.0 * provider_summary["overall_cache_hit_rate"], 1)
+                if provider_summary["overall_cache_hit_rate"] is not None
+                else None
+            ),
+            "cost_per_review_ready_usd": provider_summary[
+                "cost_per_review_ready_usd"
+            ],
             "callback_delivery_rate": _rate(delivered, callback_terminal),
             "callback_backlog": _count(callback_health.get("backlog_count")),
             "callback_retries": _count(callback_health.get("retry_count")),

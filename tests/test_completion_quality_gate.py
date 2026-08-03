@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from aiworkhub import quality_evidence
 
@@ -68,6 +69,120 @@ def test_completion_quality_gate_accepts_codeql_like_static_analysis_kind(tmp_pa
     declared = next(row for row in packet["checks"] if row["check_id"] == "bounded-sast")
     assert declared["kind"] == "static_analysis"
     assert declared["status"] == "passed"
+
+
+def test_completion_quality_gate_normalizes_declared_coverage_report(tmp_path) -> None:
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "checks": [{
+            "id": "python-coverage",
+            "kind": "coverage",
+            "command": ["{python}", "-c", "raise SystemExit(0)"],
+            "report": {
+                "format": "coverage_json",
+                "path": "coverage.json",
+                "min_percent": 80,
+            },
+        }]
+    }), encoding="utf-8")
+    (tmp_path / "coverage.json").write_text(
+        json.dumps({"total": {"lines": {"pct": 85.5}}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "good.py").write_text("value = 1\n", encoding="utf-8")
+
+    packet = quality_evidence.run_completion_quality_gate(
+        tmp_path, changed_paths=["good.py"]
+    )
+
+    assert packet["passed"] is True
+    report = next(
+        row for row in packet["checks"]
+        if row["check_id"] == "python-coverage:report"
+    )
+    assert report["kind"] == "coverage"
+    assert report["status"] == "passed"
+    assert report["provenance"] == "adapter:coverage_summary:coverage.json"
+
+
+def test_completion_quality_gate_blocks_below_threshold_declared_report(tmp_path) -> None:
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "checks": [{
+            "id": "python-coverage",
+            "kind": "coverage",
+            "command": ["{python}", "-c", "raise SystemExit(0)"],
+            "report": {
+                "format": "coverage_json",
+                "path": "coverage.json",
+                "min_percent": 80,
+            },
+        }]
+    }), encoding="utf-8")
+    (tmp_path / "coverage.json").write_text(
+        json.dumps({"total": {"lines": {"pct": 42.0}}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "good.py").write_text("value = 1\n", encoding="utf-8")
+
+    packet = quality_evidence.run_completion_quality_gate(
+        tmp_path, changed_paths=["good.py"]
+    )
+
+    assert packet["passed"] is False
+    assert packet["blocking_checks"] == ["python-coverage:report"]
+
+
+def test_declared_report_path_rejects_globs_and_parent_escape(tmp_path) -> None:
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    for unsafe in ("../coverage.json", "reports/*.json"):
+        config.write_text(json.dumps({
+            "checks": [{
+                "id": "unsafe-report",
+                "kind": "coverage",
+                "command": ["{python}", "-c", "raise SystemExit(0)"],
+                "report": {"format": "coverage_json", "path": unsafe},
+            }]
+        }), encoding="utf-8")
+        try:
+            quality_evidence.load_repo_config(tmp_path)
+        except quality_evidence.MalformedConfigError as exc:
+            assert "unsafe report path" in str(exc)
+        else:
+            raise AssertionError(f"unsafe report path was accepted: {unsafe}")
+
+
+def test_declared_report_symlink_fails_closed(tmp_path) -> None:
+    if os.name == "nt":
+        return
+    config = tmp_path / ".aiworkhub" / "quality.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "checks": [{
+            "id": "linked-coverage",
+            "kind": "coverage",
+            "command": ["{python}", "-c", "raise SystemExit(0)"],
+            "report": {"format": "coverage_json", "path": "coverage.json"},
+        }]
+    }), encoding="utf-8")
+    target = tmp_path / "actual-coverage.json"
+    target.write_text(
+        json.dumps({"total": {"lines": {"pct": 100}}}), encoding="utf-8"
+    )
+    (tmp_path / "coverage.json").symlink_to(target)
+    (tmp_path / "good.py").write_text("value = 1\n", encoding="utf-8")
+
+    packet = quality_evidence.run_completion_quality_gate(
+        tmp_path, changed_paths=["good.py"]
+    )
+
+    assert packet["passed"] is False
+    assert packet["blocking_checks"] == ["linked-coverage:report"]
+    report = next(row for row in packet["checks"] if row["check_id"].endswith(":report"))
+    assert report["error"] == "report_symlink_forbidden"
 
 
 def test_declared_check_skips_unrelated_exact_delta(tmp_path) -> None:

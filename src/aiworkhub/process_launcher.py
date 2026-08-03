@@ -1812,8 +1812,9 @@ def _provision_worker_mcp_runtime_for_authority(
 def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
     """Bounded, redacted B833 completion-gate summary.
 
-    Gated only for ``task_context_policy.task_type == "code"`` (a
-    ``project_context`` contract must be present to reach that value at all).
+    Gated for ``task_context_policy.task_type == "code"`` according to the
+    repository's two explicit tool-policy switches.  A ``project_context``
+    contract must be present to reach that value at all.
     Data-classification and research tasks -- and any task without a
     ``project_context`` contract -- are exempt and never blocked here; they
     keep whatever policy already applied to them (e.g. the immutable input
@@ -1834,15 +1835,34 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         ((metadata.get("project_context") or {}).get("task_context_policy") or {}).get("task_type") or ""
     )
     worker_mcp_meta = metadata.get("worker_mcp") or {}
-    gated = task_type == "code"
     sections = (metadata.get("project_context") or {}).get("sections") or []
-    required_tools = ["source_graph"]
-    for section in sections:
-        if not isinstance(section, dict) or not section.get("requested", True):
-            continue
-        name = str(section.get("name") or "")
-        if name in {"session_current_state", "ai_memory", "kb"} and name not in required_tools:
-            required_tools.append(name)
+    tools_policy = dict(repo_policy.DEFAULT_POLICY["tools"])
+    policy_error = ""
+    authority_repo = worker_mcp_meta.get("authority_repo")
+    if isinstance(authority_repo, str) and authority_repo.strip():
+        try:
+            tools_policy = dict(
+                repo_policy.load_policy(Path(authority_repo))["tools"]
+            )
+        except repo_policy.RepoPolicyError as exc:
+            policy_error = f"repo_policy_invalid:{exc}"
+    required_tools: list[str] = []
+    if task_type == "code" and tools_policy.get("source_graph_required_for_code"):
+        required_tools.append("source_graph")
+    if (
+        task_type == "code"
+        and tools_policy.get("session_memory_kb_required_for_nontrivial")
+    ):
+        for section in sections:
+            if not isinstance(section, dict) or not section.get("requested", True):
+                continue
+            name = str(section.get("name") or "")
+            if (
+                name in {"session_current_state", "ai_memory", "kb"}
+                and name not in required_tools
+            ):
+                required_tools.append(name)
+    gated = task_type == "code" and bool(required_tools)
     result: dict[str, Any] = {
         "gated": gated,
         "task_type": task_type,
@@ -1855,7 +1875,20 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         "policy_warning": False,
         "policy_warning_count": 0,
         "warnings": [],
+        "tools_policy": {
+            "source_graph_required_for_code": bool(
+                tools_policy.get("source_graph_required_for_code")
+            ),
+            "session_memory_kb_required_for_nontrivial": bool(
+                tools_policy.get("session_memory_kb_required_for_nontrivial")
+            ),
+        },
     }
+    if policy_error:
+        result["gated"] = True
+        result["satisfied"] = False
+        result["reason"] = policy_error
+        return result
     if not gated:
         return result
     ledger_path = worker_mcp_meta.get("audit_ledger_path")
