@@ -97,10 +97,60 @@ A code task's worker context bundle reports honest hit counts, bytes, and
 hashes for each of these sections rather than claiming injected context was
 consumed.
 
-## 5. Run the first task
+## 5. Attach and verify a manager chat
 
-Open a fresh model chat after initialization so the client performs MCP tool
-discovery against the installed runtime. A normal manager loop is:
+Open a **new** model chat after repository initialization or an AIWorkHub
+upgrade. MCP tools are discovered when the chat runtime starts; an already
+open chat can legitimately retain an older tool schema and server version.
+
+Paste this first:
+
+```text
+Use AIWorkHub as the manager for the currently bound repository.
+First call aiworkhub_manager_bootstrap, then verify repository identity,
+manager route, callback health, Source Graph readiness and model preflight.
+Recover relevant Session Manager state and make one bounded AI Memory query.
+Do not edit files, create tasks or launch workers yet. Report what is ready,
+what is degraded, and which repository you are authorized to manage.
+```
+
+The manager must report:
+
+- the exact repository path and repository ID shown by the dashboard;
+- `role=manager` and a verified manager route;
+- callback health for that repository;
+- Source Graph freshness/coverage, including any unsupported or disabled
+  language family;
+- visible editor models and ready execution routes as separate populations;
+- any real blocker, without treating optional route absence as a global block.
+
+Stop if the chat has no AIWorkHub tools, is bound to another repository, or
+reports `worker_or_unverified_client`. Use **AIWorkHub: Restart MCP
+Connection**, reselect the repository if necessary, then open a new chat. A
+manager must never repair this by directly editing `.aiworkhub` SQLite files,
+fabricating a route/thread ID, or copying a task into another repository.
+
+The MCP initialize response carries the mandatory Manager Contract even before
+the bootstrap tool is called. `aiworkhub_manager_bootstrap` returns the same
+contract as structured data so the model can reason over its startup order,
+task state machine, parallelism, callback ownership and recovery rules.
+
+## 6. Run the first task
+
+Tell the verified manager what outcome you want; you do not need to translate
+it into tool calls. This prompt gives the manager an explicit operating mode:
+
+```text
+Plan this outcome with AIWorkHub: <describe the change and constraints>.
+Inspect the repository with Source Graph, create bounded dependency-aware
+task cards with exact acceptance criteria, allowed writes and validation,
+then launch every independent non-colliding ready task in parallel on the
+best available models. Keep dependent or overlapping work pending. When a
+callback arrives, independently review evidence and accept or reject it.
+Give me a short progress report after each accepted wave.
+```
+
+A normal manager loop is:
 
 1. Read repository/preflight state and query Source Graph for the requested
    work boundary.
@@ -114,12 +164,46 @@ discovery against the installed runtime. A normal manager loop is:
    receipts. Accept only verified evidence; otherwise reject with a precise
    residual disposition.
 
+The canonical state machine is deliberately strict:
+
+| Transition | Contract |
+| --- | --- |
+| create | Creates or idempotently reconciles one `pending` card. It does not run a model. |
+| claim | Selects one dependency-ready card whose write scope does not collide with active work. |
+| launch | Starts the exact claimed worker. Only a successful runtime launch may establish `processing`. |
+| worker finish | Submits evidence and stops at `review_ready`, or records another truthful terminal substatus such as validation/launch/scope failure. |
+| callback | Notifies the repository's current verified manager for every review/terminal category. It does not approve the task. |
+| manager finish | Independently verifies and accepts, or rejects with bounded residual work. |
+
+Parallel work is encouraged when cards have satisfied dependencies and
+non-overlapping `allowed_writes`. The manager must use the plan/collision and
+preflight receipts rather than guessing availability. A pending card never
+starts itself, and a worker never accepts its own review.
+
 Identical `task_create` retries are safe after an interrupted connection: the
 server returns the existing canonical receipt with `created=false`. Reusing a
 task id with different content remains an explicit conflict and never
-overwrites the first card.
+overwrites the first card. After `Transport closed`, query the same task ID
+before retrying; a commit may have succeeded even when its response was lost.
 
-## 6. Task workers and Live Output
+## 7. Review, accept and continue
+
+When callbacks arrive, use:
+
+```text
+Inspect the completion inbox. For every review-ready task, verify its scoped
+diff, declared validation, logs, artifacts and authenticated tool-use receipt.
+Accept only evidence that satisfies the card; otherwise reject with an exact
+residual. Recompute the dependency DAG and launch the next independent ready
+wave. Report accepted, residual, blocked and still-running counts.
+```
+
+The originating thread is immutable audit provenance, but callbacks route to
+the repository's **current verified manager**. This permits an owner to move
+management between chats without sending another repository's results to the
+wrong manager.
+
+## 8. Task workers and Live Output
 
 `aiworkhub_task_auto_pickup` claims the next pending task for an exact
 runner/topic; `aiworkhub_agent_launch_task` starts the configured local
@@ -129,7 +213,7 @@ The dashboard's task detail view for a selected, currently-running task
 shows **Live Output**: a bounded, incremental read of that one task's
 stdout/stderr, never a repository-wide log stream.
 
-## 7. Codex callback routing / Claude callback capability
+## 9. Codex callback routing / Claude callback capability
 
 When a claimed task reaches a terminal state (`review_ready`, `blocked`,
 `launch_failed`, `validation_failed`, `scope_rejected`, `timed_out`,
@@ -146,7 +230,7 @@ Claude Code CLI session and currently supports the `panel`/`cli_resume`
 adapter modes only -- it does not (yet) speak the VS Code-owned App Server
 sideband transport that the Codex path uses for `transport="sideband"`.
 
-## 8. Operations and troubleshooting
+## 10. Operations and troubleshooting
 
 The dashboard's **Operations** dialog contains KPIs, Tool Use, Storage,
 workforce and reliability evidence. Use the bounded last-log row and Logs
@@ -164,7 +248,7 @@ viewer before reading host logs directly.
 - **Source Graph empty:** verify the repository was initialized, enable the
   relevant language family in Settings and refresh the index.
 
-## 9. Running the tests
+## 11. Running the tests
 
 ```bash
 python -m pytest tests/ -v

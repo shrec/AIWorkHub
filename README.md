@@ -140,6 +140,60 @@ Initialization is explicit and idempotent. It creates `.aiworkhub/`, starts the
 first Source Graph index and keeps the index fresh. The packaged extension runs
 on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
+### Start a manager chat
+
+Open a new Codex, Claude or other MCP-capable chat **after** initializing (or
+upgrading) AIWorkHub. The new chat performs tool discovery and receives the
+MCP Manager Contract banner. Start with this copy/paste prompt:
+
+```text
+Use AIWorkHub as the manager for the currently bound repository.
+First call aiworkhub_manager_bootstrap, then verify repository identity,
+manager route, callback health, Source Graph readiness and model preflight.
+Recover relevant Session Manager state and make one bounded AI Memory query.
+Do not edit files, create tasks or launch workers yet. Report what is ready,
+what is degraded, and which repository you are authorized to manage.
+```
+
+The response should identify the same repository shown in the dashboard and
+report `role=manager` with a verified route. If it reports an unverified role,
+the wrong repository, no tools, or a stale runtime version, stop and use
+**AIWorkHub: Restart MCP Connection** or open a fresh chat. Do not ask the
+model to bypass the route or write directly to `.aiworkhub` databases.
+
+Now describe the outcome in ordinary language. A useful second prompt is:
+
+```text
+Plan this outcome with AIWorkHub: <describe the change and constraints>.
+Inspect the repository with Source Graph, create bounded dependency-aware
+task cards with exact acceptance criteria, allowed writes and validation,
+then launch every independent non-colliding ready task in parallel on the
+best available models. Keep dependent or overlapping work pending. When a
+callback arrives, independently review evidence and accept or reject it.
+Give me a short progress report after each accepted wave.
+```
+
+You do not need to name a model. Preflight and Workforce expose the models
+already authorized in the editor, and the manager chooses a route from live
+readiness and observed outcomes. Name a model only when you intentionally want
+to override automatic routing.
+
+### Understand the task lifecycle
+
+| State/action | Meaning | Owner |
+| --- | --- | --- |
+| `task_create → pending` | A durable card exists; no model is running yet | Manager |
+| claim + launch → `processing` | The exact dependency-ready card was claimed and its worker process started | AIWorkHub runtime |
+| `review_ready` | Worker stopped and submitted diff/tests/logs/artifacts/tool receipts | Worker |
+| callback | Wakes the repository's current verified manager; it is not approval | AIWorkHub callback bridge |
+| accept or reject | Promote verified work, or preserve evidence and issue exact residual work | Manager |
+
+Never move a card to `processing` merely because it is pending, and never
+infer completion from chat prose. The canonical task receipt is state truth.
+All review and terminal categories are callback-eligible. If a connection
+drops after a write, reconcile the same task ID; identical retries are
+idempotent, while inventing a replacement ID creates duplicate work.
+
 ### First task workflow
 
 1. Confirm **Preflight** is ready and lists at least one editor model or
@@ -152,6 +206,10 @@ on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 4. Follow **Live Output** or wait for the durable terminal callback.
 5. In **Review**, inspect the diff, tests, logs, artifacts and tool receipts.
    Accept to promote the verified change, or reject with exact residual work.
+
+For ongoing work, ask the manager: `Inspect the completion inbox, finalize all
+review-ready tasks from verified evidence, rebase the task DAG, and launch the
+next dependency-safe parallel wave.` Workers never finalize their own work.
 
 The dashboard's **Operations** dialog explains real tool use, Source Graph
 modes, model outcomes, latency, token/cost evidence, callback delivery and

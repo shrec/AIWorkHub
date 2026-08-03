@@ -2558,6 +2558,19 @@ def _live_card(task_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | No
     return card, None
 
 
+MCP_MANAGER_CONTRACT_BANNER = (
+    "AIWORKHUB MANAGER CONTRACT (MANDATORY): call "
+    "aiworkhub_manager_bootstrap first and trust only repository-bound MCP "
+    "receipts. Creating a task leaves it pending; only an exact claim plus "
+    "launch may make it processing. Launch independent tasks in parallel only "
+    "after dependency, write-scope, preflight and collision checks. Workers "
+    "stop at review_ready; every review/terminal transition emits a callback, "
+    "but only the current verified manager may inspect evidence and accept or "
+    "reject it. Never invent task/status/callback IDs, infer state from prose, "
+    "or recreate a task after a lost acknowledgement—reconcile the same ID."
+)
+
+
 def manager_bootstrap() -> dict[str, Any]:
     """Compact, model-readable manager contract for a newly attached chat."""
     identity = _claude_manager_identity() or _codex_manager_identity()
@@ -2569,6 +2582,46 @@ def manager_bootstrap() -> dict[str, Any]:
         "provider": provider,
         "repo": str(repo_root()),
         "manager_route": identity or {},
+        "operating_contract": {
+            "schema_id": "aiworkhub.manager_operating_contract.v1",
+            "mandatory": True,
+            "banner": MCP_MANAGER_CONTRACT_BANNER,
+            "authority": [
+                "Use only receipts whose repo and repo_id match the active repository.",
+                "Proceed as manager only when role=manager and manager_route is verified.",
+                "Repository tools and canonical stores are the state authority; chat prose and dashboard impressions are not.",
+            ],
+            "start_sequence": [
+                "aiworkhub_manager_bootstrap",
+                "aiworkhub_repository_current and aiworkhub_task_health",
+                "aiworkhub_manager_session_current_state, one task-specific AI Memory query, and KB only when relevant",
+                "aiworkhub_manager_source_graph_query for code discovery",
+                "aiworkhub_task_plan_snapshot before creating or launching a dependency wave",
+            ],
+            "task_state_machine": {
+                "create": "aiworkhub_task_create creates/reconciles one canonical pending card; it does not run the model",
+                "claim": "aiworkhub_task_auto_pickup claims one dependency-ready non-colliding card",
+                "launch": "aiworkhub_agent_launch_task starts the exact claimed card; only then may runtime truth become processing",
+                "worker_finish": "the worker submits evidence and stops at review_ready or another truthful terminal substatus",
+                "manager_finish": "the current verified manager independently verifies evidence, then accepts or rejects review",
+            },
+            "parallelism": [
+                "Parallel launch is encouraged for independent ready cards.",
+                "Never parallelize unmet dependencies or overlapping allowed_writes.",
+                "Use preflight/workforce evidence and the plan/collision receipts; do not assume a model or route is available.",
+            ],
+            "callbacks_and_review": [
+                "Every transition into review or another terminal state is callback-eligible; task category does not suppress delivery.",
+                "A callback is a wake-up notification, not acceptance or proof of quality.",
+                "Inspect the completion inbox, diff, tests, logs, artifacts and tool-use receipts before finalization.",
+                "The repository's current verified manager receives the callback; originating thread identity remains audit provenance.",
+            ],
+            "recovery": [
+                "After Transport closed, query the same task_id before retrying.",
+                "Retry an identical create payload with the same task_id; never create a replacement ID to guess around a lost response.",
+                "On repository switch or runtime reload, call bootstrap/current-state again before acting.",
+            ],
+        },
         "workflow": [
             "aiworkhub_manager_source_graph_query / session_current_state / ai_memory_search / kb_*",
             "aiworkhub_task_create",

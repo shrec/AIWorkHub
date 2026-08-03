@@ -265,6 +265,16 @@ def test_stdlib_fallback_initialize_and_tools_call_shape(fallback_server_module)
     init = server_module._stdio_dispatch("AIWorkHub MCP", tools, "initialize", {})
     assert init["protocolVersion"] == "2024-11-05"
     assert init["capabilities"]["resources"] == {}
+    with_banner = server_module._stdio_dispatch(
+        "AIWorkHub MCP",
+        tools,
+        "initialize",
+        {},
+        server_module.core.MCP_MANAGER_CONTRACT_BANNER,
+    )
+    assert "AIWORKHUB MANAGER CONTRACT" in with_banner["instructions"]
+    assert "Creating a task leaves it pending" in with_banner["instructions"]
+    assert server_module.mcp.instructions == server_module.core.MCP_MANAGER_CONTRACT_BANNER
     assert server_module._stdio_dispatch(
         "AIWorkHub MCP", tools, "resources/list", {}
     ) == {"resources": []}

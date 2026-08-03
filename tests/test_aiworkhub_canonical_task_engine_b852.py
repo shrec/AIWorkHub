@@ -607,6 +607,14 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
     result = core.manager_bootstrap()
     assert result["role"] == "manager"
+    contract = result["operating_contract"]
+    assert contract["schema_id"] == "aiworkhub.manager_operating_contract.v1"
+    assert contract["mandatory"] is True
+    assert "Creating a task leaves it pending" in contract["banner"]
+    assert "only then may runtime truth become processing" in contract["task_state_machine"]["launch"]
+    assert "Parallel launch is encouraged" in contract["parallelism"][0]
+    assert "task category does not suppress delivery" in contract["callbacks_and_review"][0]
+    assert "same task_id" in contract["recovery"][1]
     assert result["workflow"][0].startswith("aiworkhub_manager_source_graph_query")
     assert "aiworkhub_task_create" in result["workflow"]
     assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]

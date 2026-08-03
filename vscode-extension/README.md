@@ -71,6 +71,22 @@ background.
 AIWorkHub is designed for a manager chat that delegates bounded work instead
 of letting several models edit one checkout without coordination.
 
+Start a new chat after initialization or upgrade and paste:
+
+```text
+Use AIWorkHub as manager for the currently bound repository. Call
+aiworkhub_manager_bootstrap first; verify repository identity, manager route,
+callback, Source Graph and preflight. Do not edit or launch yet. Report what is
+ready and what is degraded.
+```
+
+Then describe the desired outcome normally. Ask the manager to create bounded
+cards and launch only independent, dependency-ready, non-colliding cards in
+parallel. The MCP server also presents this lifecycle as a mandatory contract:
+creating a task leaves it `pending`; exact claim plus launch establishes
+`processing`; workers stop at `review_ready`; callbacks wake the current
+verified manager; and only that manager accepts or rejects verified evidence.
+
 1. Check the dashboard header. Repository, MCP, Source Graph and callback
    state should be ready; **Preflight** explains any unavailable optional
    model adapters.
@@ -90,6 +106,10 @@ of letting several models edit one checkout without coordination.
 
 Dependency cards remain pending until their prerequisites finish. Collision
 checks prevent two active workers from owning overlapping write paths.
+
+See the [complete first-run and manager manual](https://github.com/shrec/AIWorkHub/blob/main/docs/GETTING_STARTED.md)
+for copy/paste planning/review prompts, Remote-SSH behavior and recovery after
+an interrupted write acknowledgement.
 
 ## Models and authentication
 

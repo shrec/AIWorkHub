@@ -166,13 +166,22 @@ except ModuleNotFoundError:
         text = json.dumps(result, ensure_ascii=False, default=str)
         return {"content": [{"type": "text", "text": text}], "structuredContent": structured}
 
-    def _stdio_dispatch(name: str, tools: dict[str, Any], method: Any, params: Any) -> Any:
+    def _stdio_dispatch(
+        name: str,
+        tools: dict[str, Any],
+        method: Any,
+        params: Any,
+        instructions: str = "",
+    ) -> Any:
         if method == "initialize":
-            return {
+            result = {
                 "protocolVersion": _FALLBACK_PROTOCOL_VERSION,
                 "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": name, "version": __version__},
             }
+            if instructions:
+                result["instructions"] = instructions
+            return result
         if method == "notifications/initialized":
             return None
         if method == "ping":
@@ -209,7 +218,11 @@ except ModuleNotFoundError:
             )
             raise _StdioTransportClosed(0) from exc
 
-    def _run_stdio_fallback_server(name: str, tools: dict[str, Any]) -> None:
+    def _run_stdio_fallback_server(
+        name: str,
+        tools: dict[str, Any],
+        instructions: str = "",
+    ) -> None:
         # Read from the binary buffer with an explicit limit.  Calling the
         # text wrapper's unbounded readline() and checking the length only
         # afterwards would already have allocated an arbitrarily large client
@@ -259,7 +272,7 @@ except ModuleNotFoundError:
             method = message.get("method")
             params = message.get("params") if message.get("params") is not None else {}
             try:
-                result = _stdio_dispatch(name, tools, method, params)
+                result = _stdio_dispatch(name, tools, method, params, instructions)
             except _StdioProtocolError as exc:
                 if has_id:
                     _stdio_write_message(stdout, {
@@ -286,8 +299,9 @@ except ModuleNotFoundError:
     class FastMCP:  # type: ignore[no-redef]
         """Bounded stdlib MCP stdio server, used when the `mcp` package is absent."""
 
-        def __init__(self, name: str):
+        def __init__(self, name: str, instructions: str | None = None):
             self.name = name
+            self.instructions = str(instructions or "")
             self._tools: dict[str, Any] = {}
 
         def tool(self, *args: Any, **kwargs: Any):
@@ -303,7 +317,7 @@ except ModuleNotFoundError:
             return list(self._tools.keys())
 
         def run(self) -> None:
-            _run_stdio_fallback_server(self.name, self._tools)
+            _run_stdio_fallback_server(self.name, self._tools, self.instructions)
 
 from . import __version__
 from . import agent_tool_instruction_mcp
@@ -332,7 +346,16 @@ from . import repo_policy
 from . import shared_router
 
 
-mcp = FastMCP("AIWorkHub MCP")
+try:
+    mcp = FastMCP(
+        "AIWorkHub MCP",
+        instructions=core.MCP_MANAGER_CONTRACT_BANNER,
+    )
+except TypeError:
+    # Older MCP SDKs and deliberately minimal embedders may expose a
+    # name-only constructor.  Keep startup fail-open; the identical mandatory
+    # contract remains available through aiworkhub_manager_bootstrap.
+    mcp = FastMCP("AIWorkHub MCP")
 
 
 _TASK_LIFECYCLE_WRITE_LOCK = threading.RLock()
@@ -369,7 +392,7 @@ RiskSignal = Literal[
 
 @mcp.tool()
 def aiworkhub_manager_bootstrap() -> dict[str, Any]:
-    """READ-ONLY: explain this repository's manager workflow and callback lanes."""
+    """CALL FIRST: mandatory repository manager contract and callback workflow."""
 
     return core.manager_bootstrap()
 

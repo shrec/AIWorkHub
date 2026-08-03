@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.45] - 2026-08-03
+
+### Added
+
+- Added a mandatory MCP server-level Manager Contract banner, visible during
+  protocol initialization in both FastMCP and the packaged stdlib fallback.
+  It defines repository authority, startup order, truthful task transitions,
+  safe parallel launch, callback/review ownership and lost-ack recovery.
+- Expanded the public first-run documentation with copy/paste manager prompts,
+  the exact pending/processing/review lifecycle and evidence-first acceptance.
+
 ## [0.8.44] - 2026-08-03
 
 ### Fixed
