@@ -530,6 +530,51 @@ def test_failure_outcome_reaches_blocked_without_ambient_writes_or_any_grant(tmp
     assert card["worker_status"] == "timed_out"
 
 
+def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeypatch):
+    card = _card()
+    manager = _build_manager(tmp_path, card)
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
+    failure_calls = []
+
+    def fake_mark_terminal_failure(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
+        failure_calls.append((task_id, runner, substatus, request_id, evidence))
+        card.update({"status": "blocked", "worker_status": substatus})
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_terminal_failure", fake_mark_terminal_failure
+    )
+    request_id = "req-token-cap"
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=2_147_483_049,
+        supervisor_ticks=999_999_948,
+        supervisor_status={
+            "state": "token_budget_exceeded",
+            "exit_code": 122,
+            "error": "token_budget_exceeded:provider_reported_live_usage",
+            "token_budget": {
+                "schema_id": "aiworkhub.token_budget.supervisor_evidence.v1",
+                "cap_tokens": 10,
+                "enforceable_live_tokens": 13,
+            },
+        },
+    )
+
+    result = manager._finalize_isolated_request(request_id)
+
+    assert result["state"] == "token_budget_exceeded"
+    assert failure_calls[0][2] == "token_budget_exceeded"
+    assert failure_calls[0][4]["token_budget"]["enforceable_live_tokens"] == 13
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "token_budget_exceeded"
+
+
 @pytest.mark.parametrize("operation", ["archived", "superseded"])
 def test_failure_outcome_preserves_already_finalized_task(
     tmp_path, monkeypatch, operation,

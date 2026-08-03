@@ -8,6 +8,13 @@ noted by package/extension version and release tag.
 
 ## [0.8.49] - 2026-08-03
 
+### Added
+
+- Wired the provider-neutral token-budget kernel into the detached worker
+  supervisor. Tasks may set an explicit `max_live_tokens`; structured usage
+  observed while the provider is running is enforced immediately, while
+  terminal-only telemetry is truthfully retained as posthoc-only evidence.
+
 ### Fixed
 
 - Routed VS Code LM adapters through their editor-host execution boundary on
@@ -28,6 +35,8 @@ noted by package/extension version and release tag.
 - Reported native authenticated/credential-backed routes independently from
   editor consent telemetry, preventing healthy CLI adapters from appearing
   access-unavailable.
+- Drained provider pipes as available chunks instead of waiting for a 64 KiB
+  read or EOF, restoring genuinely live output and usage telemetry.
 
 ## [0.8.48] - 2026-08-03
 

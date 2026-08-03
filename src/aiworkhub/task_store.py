@@ -1119,7 +1119,13 @@ def mark_terminal_failure(
     emit a truthful terminal substatus, and end in the canonical ``blocked``
     bucket instead of fabricating ``status=review``.
     """
-    allowed = {"timed_out", "worker_failed", "cancelled", "liveness_lost"}
+    allowed = {
+        "timed_out",
+        "token_budget_exceeded",
+        "worker_failed",
+        "cancelled",
+        "liveness_lost",
+    }
     substatus = str(substatus or "").strip()
     if substatus not in allowed:
         return False, f"unsupported_terminal_failure:{substatus}"

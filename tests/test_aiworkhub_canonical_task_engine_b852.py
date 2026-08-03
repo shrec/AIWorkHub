@@ -507,11 +507,17 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         allowed_writes=["src/example.py"],
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
+        max_live_tokens=250_000,
     )
     assert created["ok"] is True, created
     card = json.loads(created["stdout"])
     assert card["coordinator_provider"] == "claude"
     assert card["origin_thread_id"] == session_id
+    assert card["token_budget"] == {
+        "schema_id": "aiworkhub.task_token_budget.v1",
+        "cap_tokens": 250_000,
+        "enforcement": "live_when_provider_reports_usage",
+    }
     stored = _row(writable_repo, "TASK_MANAGER_CREATE")
     assert stored["worker_status"] == "unclaimed"
     assert stored["origin_thread_id"] == session_id
@@ -526,6 +532,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         allowed_writes=["src/example.py"],
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
+        max_live_tokens=250_000,
     )
     assert reconciled["ok"] is True, reconciled
     assert reconciled["created"] is False

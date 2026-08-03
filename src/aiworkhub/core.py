@@ -2624,6 +2624,7 @@ def manager_bootstrap() -> dict[str, Any]:
             ],
             "task_state_machine": {
                 "create": "aiworkhub_task_create creates/reconciles one canonical pending card; it does not run the model",
+                "token_budget": "max_live_tokens is optional and explicit; AIWorkHub enforces it only from structured usage observed while the provider is running and labels terminal-only usage posthoc_only",
                 "claim": "aiworkhub_task_auto_pickup is an optional explicit claim step for one dependency-ready non-colliding card",
                 "launch": "aiworkhub_agent_launch_task is always required; it atomically claims a pending card or attaches the exact prior claim, then starts the worker; only then may runtime truth become processing",
                 "worker_finish": "the worker submits evidence and stops at review_ready or another truthful terminal substatus",
@@ -2920,6 +2921,7 @@ def create_task(
     depends_on: list[str] | None = None,
     read_first: list[str] | None = None,
     immutable_inputs: list[str] | None = None,
+    max_live_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -2968,6 +2970,15 @@ def create_task(
         result["allowed_task_types"] = list(allowed_task_types)
         result["received_task_type"] = task_type[:80]
         return result
+    if (
+        max_live_tokens is not None
+        and (
+            isinstance(max_live_tokens, bool)
+            or not isinstance(max_live_tokens, int)
+            or not 1 <= max_live_tokens <= 100_000_000
+        )
+    ):
+        return _lifecycle_error("max_live_tokens_out_of_range", 2)
 
     def bounded_strings(value: list[str] | None, name: str, *, required: bool = False) -> list[str]:
         if not isinstance(value, list) or (required and not value) or len(value) > 128:
@@ -3072,6 +3083,15 @@ def create_task(
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
         "depends_on": depends_on2,
+        "token_budget": (
+            {
+                "schema_id": "aiworkhub.task_token_budget.v1",
+                "cap_tokens": max_live_tokens,
+                "enforcement": "live_when_provider_reports_usage",
+            }
+            if max_live_tokens is not None
+            else None
+        ),
         "project_context": {
             "required": True,
             "task_type": task_type,
@@ -3107,6 +3127,7 @@ def create_task(
         "depends_on": depends_on2,
         "read_first": read_first2,
         "immutable_inputs": immutable_inputs2,
+        "max_live_tokens": max_live_tokens,
     }
 
     def reconcile_existing(existing_json: Any) -> dict[str, Any]:
@@ -3134,6 +3155,11 @@ def create_task(
             "depends_on": existing_card.get("depends_on") or [],
             "read_first": existing_card.get("read_first") or [],
             "immutable_inputs": existing_card.get("immutable_inputs") or [],
+            "max_live_tokens": (
+                (existing_card.get("token_budget") or {}).get("cap_tokens")
+                if isinstance(existing_card.get("token_budget"), dict)
+                else None
+            ),
         }
         if existing_payload == requested_payload:
             result = _canonical_result(

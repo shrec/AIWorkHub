@@ -199,6 +199,7 @@ TERMINAL_PROCESS_STATES = {
     "exited",
     "exited_without_review",
     "timed_out",
+    "token_budget_exceeded",
     "cancelled",
     "launch_failed",
     "worker_failed",
@@ -2942,6 +2943,11 @@ class ProcessManager:
                     "adapter_id": adapter_id,
                     "model": model,
                     "timeout_seconds": timeout_seconds,
+                    "token_budget": (
+                        dict(card.get("token_budget"))
+                        if isinstance(card.get("token_budget"), dict)
+                        else None
+                    ),
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "supervisor_status_path": str(status_path),
@@ -3039,6 +3045,8 @@ class ProcessManager:
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "max_output_bytes": 16 * 1024 * 1024,
+                    "adapter_id": adapter_id,
+                    "token_budget": metadata.get("token_budget"),
                 })
 
                 supervisor = Path(__file__).with_name("worker_supervisor.py")
@@ -4074,6 +4082,8 @@ class ProcessManager:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
             if supervisor_state == "timed_out":
                 terminal_state = "timed_out"
+            elif supervisor_state == "token_budget_exceeded":
+                terminal_state = "token_budget_exceeded"
             elif supervisor_state == "cancelled":
                 terminal_state = "cancelled"
             elif supervisor_state == "exited" and exit_code == 0:
@@ -4145,6 +4155,7 @@ class ProcessManager:
                             "supervisor_state": supervisor_state,
                             "exit_code": exit_code,
                             "liveness_lost": liveness_lost,
+                            "token_budget": supervisor_status.get("token_budget"),
                             **_declared_failure_denominators(metadata),
                         }
                         release_result = self._terminal_failure_exact(
@@ -4512,6 +4523,7 @@ class ProcessManager:
                 "project_context": metadata.get("project_context"),
                 "project_context_delivery": metadata.get("project_context_delivery"),
                 "prompt_budget": metadata.get("prompt_budget"),
+                "token_budget": supervisor_status.get("token_budget"),
                 "project_context_acknowledgement": context_ack,
                 "provider_tool_denials": provider_tool_denials,
                 "worker_mcp_gate": worker_mcp_gate,

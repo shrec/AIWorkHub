@@ -18,8 +18,26 @@ from typing import Any, BinaryIO
 
 try:
     from .platform_io import atomic_replace, chmod_fd
+    from .token_budget import (
+        SampleKind,
+        TelemetryAuthority,
+        TokenBudgetDecision,
+        TokenBudgetState,
+        TokenSample,
+        consume_sample,
+        supervisor_evidence,
+    )
 except ImportError:  # direct-script entrypoint
     from platform_io import atomic_replace
+    from token_budget import (  # type: ignore[no-redef]
+        SampleKind,
+        TelemetryAuthority,
+        TokenBudgetDecision,
+        TokenBudgetState,
+        TokenSample,
+        consume_sample,
+        supervisor_evidence,
+    )
 
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
@@ -39,6 +57,7 @@ DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MIN_MAX_OUTPUT_BYTES = 1024
 _TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+MAX_USAGE_SCAN_BYTES = 32 * 1024 * 1024
 
 
 class _IoCounters(ctypes.Structure):
@@ -252,6 +271,139 @@ def _file_size(path: Path) -> int:
         return 0
 
 
+def _usage_total_from_output(path: Path, adapter_id: str) -> int | None:
+    """Return provider-reported cumulative tokens from bounded JSON output.
+
+    Only structured ``usage`` objects are authority. Free text and token-like
+    prose are ignored. The maximum observed field values are used because
+    supported provider streams report cumulative snapshots; summing repeated
+    snapshots would double count. Claude cache fields are disjoint from its
+    input count, while OpenAI-shaped adapters report cache hits as an input
+    subset.
+    """
+    try:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.stat().st_size > MAX_USAGE_SCAN_BYTES
+        ):
+            return None
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    candidates: list[Any] = []
+    try:
+        candidates.append(json.loads(raw))
+    except json.JSONDecodeError:
+        for line in raw.splitlines()[:8192]:
+            try:
+                candidates.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    maxima = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    observed = False
+
+    def as_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def consume_usage(usage: dict[str, Any]) -> None:
+        nonlocal observed
+        keys = {
+            "input_tokens",
+            "prompt_tokens",
+            "output_tokens",
+            "completion_tokens",
+            "cache_read_input_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+        }
+        if not any(key in usage for key in keys):
+            return
+        observed = True
+        details = usage.get("input_tokens_details") or usage.get(
+            "prompt_tokens_details"
+        )
+        if not isinstance(details, dict):
+            details = {}
+        maxima["input_tokens"] = max(
+            maxima["input_tokens"],
+            as_int(
+                usage.get("input_tokens")
+                or usage.get("prompt_tokens")
+                or usage.get("input")
+            ),
+        )
+        maxima["output_tokens"] = max(
+            maxima["output_tokens"],
+            as_int(
+                usage.get("output_tokens")
+                or usage.get("completion_tokens")
+                or usage.get("output")
+            ),
+        )
+        maxima["cached_input_tokens"] = max(
+            maxima["cached_input_tokens"],
+            as_int(
+                usage.get("cache_read_input_tokens")
+                or usage.get("cached_input_tokens")
+                or usage.get("prompt_cache_hit_tokens")
+                or details.get("cached_tokens")
+            ),
+        )
+        maxima["cache_creation_input_tokens"] = max(
+            maxima["cache_creation_input_tokens"],
+            as_int(usage.get("cache_creation_input_tokens")),
+        )
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            usage = value.get("usage")
+            if isinstance(usage, dict):
+                consume_usage(usage)
+            for key, nested in list(value.items())[:256]:
+                if key != "usage":
+                    walk(nested, depth + 1)
+        elif isinstance(value, list):
+            for nested in value[:256]:
+                walk(nested, depth + 1)
+
+    for candidate in candidates[:8192]:
+        walk(candidate)
+    if not observed:
+        return None
+    total = maxima["input_tokens"] + maxima["output_tokens"]
+    if adapter_id == "claude_cli":
+        total += (
+            maxima["cached_input_tokens"]
+            + maxima["cache_creation_input_tokens"]
+        )
+    return total
+
+
+def _token_budget_config(spec: dict[str, Any]) -> tuple[int | None, str]:
+    raw = spec.get("token_budget")
+    if raw in (None, {}):
+        return None, str(spec.get("adapter_id") or "")
+    if not isinstance(raw, dict):
+        raise ValueError("invalid_token_budget")
+    cap = raw.get("cap_tokens")
+    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 100_000_000:
+        raise ValueError("token_budget_cap_out_of_range")
+    return cap, str(spec.get("adapter_id") or "")
+
+
 class _BoundedTailWriter:
     """Continuously drain a pipe while bounding its on-disk tail file."""
 
@@ -281,7 +433,18 @@ class _BoundedTailWriter:
         try:
             with _open_0600(self.path) as handle:
                 while True:
-                    chunk = stream.read(64 * 1024)
+                    # ``BufferedReader.read(n)`` may wait for all ``n`` bytes
+                    # or EOF. Provider streams are normally line-sized, so
+                    # that behavior hid live output (and structured usage)
+                    # until the worker exited. ``read1`` returns the bytes
+                    # currently available while retaining the same bounded
+                    # capture and no-shell guarantees.
+                    read1 = getattr(stream, "read1", None)
+                    chunk = (
+                        read1(64 * 1024)
+                        if callable(read1)
+                        else stream.read(64 * 1024)
+                    )
                     if not chunk:
                         break
                     handle.write(chunk)
@@ -315,6 +478,10 @@ def supervise(spec: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
     max_output_bytes = max(MIN_MAX_OUTPUT_BYTES, max_output_bytes)
+    token_cap, adapter_id = _token_budget_config(spec)
+    token_state = TokenBudgetState(cap_tokens=token_cap)
+    token_decisions: list[TokenBudgetDecision] = []
+    last_observed_tokens: int | None = None
     try:
         heartbeat_interval = float(spec.get("heartbeat_interval_seconds") or DEFAULT_HEARTBEAT_INTERVAL_SECONDS)
     except (TypeError, ValueError):
@@ -437,6 +604,25 @@ def supervise(spec: dict[str, Any]) -> int:
                     last_output_change_epoch = time.time()
                     last_stdout_bytes = stdout_bytes
                     last_stderr_bytes = stderr_bytes
+                observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
+                if observed_tokens is not None and observed_tokens != last_observed_tokens:
+                    decision = consume_sample(
+                        token_state,
+                        TokenSample(
+                            report_id=f"live:{heartbeat_seq}:{observed_tokens}",
+                            authority=TelemetryAuthority.ENFORCED_LIVE,
+                            kind=SampleKind.CUMULATIVE,
+                            total_tokens=observed_tokens,
+                            source=f"{adapter_id or 'provider'}:stdout",
+                        ),
+                    )
+                    token_state = decision.state
+                    token_decisions.append(decision)
+                    last_observed_tokens = observed_tokens
+                    if decision.cap_enforceable:
+                        final_state = "token_budget_exceeded"
+                        returncode = _terminate_child(child)
+                        break
                 heartbeat_seq += 1
                 _write_json_0600(status_path, {
                     "state": "running",
@@ -452,6 +638,11 @@ def supervise(spec: dict[str, Any]) -> int:
                     "stdout_bytes": last_stdout_bytes,
                     "stderr_bytes": last_stderr_bytes,
                     "last_output_change_epoch": last_output_change_epoch,
+                    "token_budget": supervisor_evidence(
+                        token_state,
+                        token_decisions,
+                        subject="worker-request",
+                    ),
                 })
                 next_heartbeat_monotonic = now_monotonic + heartbeat_interval
             time.sleep(POLL_SECONDS)
@@ -468,6 +659,23 @@ def supervise(spec: dict[str, Any]) -> int:
             or final_stderr_bytes != last_stderr_bytes
         ):
             last_output_change_epoch = time.time()
+        final_observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
+        if (
+            final_observed_tokens is not None
+            and final_observed_tokens != last_observed_tokens
+        ):
+            final_decision = consume_sample(
+                token_state,
+                TokenSample(
+                    report_id=f"posthoc:{heartbeat_seq}:{final_observed_tokens}",
+                    authority=TelemetryAuthority.POSTHOC_ONLY,
+                    kind=SampleKind.CUMULATIVE,
+                    total_tokens=final_observed_tokens,
+                    source=f"{adapter_id or 'provider'}:stdout",
+                ),
+            )
+            token_state = final_decision.state
+            token_decisions.append(final_decision)
         _write_json_0600(status_path, {
             "state": final_state,
             "supervisor_pid": supervisor_pid,
@@ -486,6 +694,16 @@ def supervise(spec: dict[str, Any]) -> int:
             "stderr_dropped_bytes": stderr_capture.dropped_bytes,
             "capture_errors": capture_errors,
             "last_output_change_epoch": last_output_change_epoch,
+            "token_budget": supervisor_evidence(
+                token_state,
+                token_decisions,
+                subject="worker-request",
+            ),
+            "error": (
+                "token_budget_exceeded:provider_reported_live_usage"
+                if final_state == "token_budget_exceeded"
+                else ""
+            ),
         })
     except Exception as exc:
         if child is not None and child.poll() is None:
@@ -511,6 +729,8 @@ def supervise(spec: dict[str, Any]) -> int:
         return 125
     if final_state == "timed_out":
         return 124
+    if final_state == "token_budget_exceeded":
+        return 122
     return int(returncode)
 
 
