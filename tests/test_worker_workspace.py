@@ -410,6 +410,9 @@ def test_sanitized_env_is_allowlisted_and_json_files_are_0600(
     monkeypatch.setenv("AIWORKHUB_REPO", "/sensitive/parent")
     monkeypatch.setenv("AIWORKHUB_ALLOW_LAUNCH", "1")
     home = tmp_path / "home"
+    if os.name != "nt":
+        home.mkdir(mode=0o700)
+        (home / "tmp").mkdir(mode=0o700)
     env = worker_workspace.sanitized_env("claude_cli", home=home)
     assert env["HOME"] == str(home)
     assert env["ANTHROPIC_API_KEY"] == "allowed-adapter-secret"
@@ -424,6 +427,82 @@ def test_sanitized_env_is_allowlisted_and_json_files_are_0600(
     worker_workspace.write_json_0600(target, {"ok": True})
     assert os.name == "nt" or stat.S_IMODE(target.stat().st_mode) == 0o600
     assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows keeps provisioning behavior")
+def test_sanitized_env_verifies_preprovisioned_home_without_chmod(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    tmp = home / "tmp"
+    home.mkdir(mode=0o700)
+    tmp.mkdir(mode=0o700)
+
+    def _deny_chmod(_path: object, _mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(worker_workspace.os, "chmod", _deny_chmod)
+
+    env = worker_workspace.sanitized_env(
+        "validation", home=home, verify_preprovisioned_home=True
+    )
+
+    assert env["HOME"] == str(home.resolve())
+    assert env["TMPDIR"] == str(tmp.resolve())
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    assert stat.S_IMODE(tmp.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows keeps provisioning behavior")
+@pytest.mark.parametrize(
+    "shape,match",
+    [
+        ("missing_home", "sanitized_home_missing"),
+        ("home_file", "sanitized_home_not_directory"),
+        ("home_symlink", "sanitized_home_symlink_forbidden"),
+        ("home_group_readable", "sanitized_home_not_private"),
+        ("missing_tmp", "sanitized_tmp_missing"),
+        ("tmp_file", "sanitized_tmp_not_directory"),
+        ("tmp_symlink", "sanitized_tmp_symlink_forbidden"),
+        ("tmp_group_readable", "sanitized_tmp_not_private"),
+    ],
+)
+def test_sanitized_env_rejects_unsafe_posix_home_shapes(
+    tmp_path: Path,
+    shape: str,
+    match: str,
+) -> None:
+    home = tmp_path / "home"
+    tmp = home / "tmp"
+    if shape == "missing_home":
+        pass
+    elif shape == "home_file":
+        home.write_text("not a directory", encoding="utf-8")
+    elif shape == "home_symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        home.symlink_to(target, target_is_directory=True)
+    else:
+        home.mkdir(mode=0o700)
+        if shape == "home_group_readable":
+            os.chmod(home, 0o750)
+        elif shape == "missing_tmp":
+            pass
+        elif shape == "tmp_file":
+            tmp.write_text("not a directory", encoding="utf-8")
+        elif shape == "tmp_symlink":
+            target = tmp_path / "target_tmp"
+            target.mkdir(mode=0o700)
+            tmp.symlink_to(target, target_is_directory=True)
+        else:
+            tmp.mkdir(mode=0o700)
+            os.chmod(tmp, 0o750)
+
+    with pytest.raises(worker_workspace.WorkspaceError, match=match):
+        worker_workspace.sanitized_env(
+            "validation", home=home, verify_preprovisioned_home=True
+        )
 
 
 def test_bubblewrap_home_string_is_single_sourced_for_env_and_bind_mount(

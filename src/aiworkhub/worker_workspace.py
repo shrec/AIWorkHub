@@ -732,6 +732,9 @@ def validate_residual_contract(
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(home, 0o700)
+    temp_home = home / "tmp"
+    temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(temp_home, 0o700)
     source_home = Path.home()
     if adapter_id == "claude_cli":
         source = source_home / ".claude" / ".credentials.json"
@@ -1489,21 +1492,55 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
     return promoted
 
 
+def _verify_owner_private_directory(path: Path, label: str) -> Path:
+    if path.is_absolute():
+        cursor = Path(path.anchor)
+        parts = path.parts[1:]
+    else:
+        cursor = Path()
+        parts = path.parts
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise WorkspaceError(f"{label}_symlink_forbidden:{path}")
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise WorkspaceError(f"{label}_missing:{path}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise WorkspaceError(f"{label}_not_directory:{path}")
+    if info.st_uid != os.getuid():
+        raise WorkspaceError(f"{label}_untrusted_owner:{path}")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise WorkspaceError(f"{label}_not_private:{path}")
+    return path.resolve(strict=True)
+
+
 def sanitized_env(
     adapter_id: str,
     *,
     home: Path | None = None,
     isolated_task_queue_db: bool = False,
     provider_env: Mapping[str, str] | None = None,
+    verify_preprovisioned_home: bool = False,
 ) -> dict[str, str]:
-    selected_home = (home or Path(bubblewrap_home_env_value())).resolve()
     if home is not None:
-        selected_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(selected_home, 0o700)
-        temp_home = selected_home / "tmp"
-        temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(temp_home, 0o700)
+        if os.name == "nt" or not verify_preprovisioned_home:
+            selected_home = Path(home).resolve()
+            selected_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(selected_home, 0o700)
+            temp_home = selected_home / "tmp"
+            temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(temp_home, 0o700)
+        else:
+            selected_home = _verify_owner_private_directory(
+                Path(home), "sanitized_home"
+            )
+            temp_home = _verify_owner_private_directory(
+                Path(home) / "tmp", "sanitized_tmp"
+            )
     else:
+        selected_home = Path(bubblewrap_home_env_value()).resolve()
         # Bubblewrap provides a private /tmp. Do not chmod or create anything
         # in the caller's real HOME while constructing the child environment.
         temp_home = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
@@ -2558,7 +2595,10 @@ def run_validations(
                 validation_executable_roots=validation_executable_roots,
             )
             env = sanitized_env(
-                "validation", home=validation_home, isolated_task_queue_db=True
+                "validation",
+                home=validation_home,
+                isolated_task_queue_db=True,
+                verify_preprovisioned_home=backend == "landlock",
             )
             env["TMPDIR"] = scratch_env_value
             env["TMP"] = scratch_env_value

@@ -141,7 +141,8 @@ def _fixture_workspace(tmp_path: Path) -> worker_workspace.WorkerWorkspace:
     (path / "out").mkdir(parents=True)
     (path / "out" / "result.txt").write_text("v1", encoding="utf-8")
     home = tmp_path / "home"
-    home.mkdir(parents=True)
+    home.mkdir(parents=True, mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
     return worker_workspace.WorkerWorkspace(
         request_id="b892-argv",
         repo=tmp_path,
@@ -302,7 +303,8 @@ def _manual_workspace(
     path = base / "worktree"
     home = base / "home"
     path.mkdir(parents=True)
-    home.mkdir(parents=True)
+    home.mkdir(parents=True, mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
     workspace = worker_workspace.WorkerWorkspace(
         request_id=request_id,
         repo=repo,
