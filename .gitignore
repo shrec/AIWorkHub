@@ -5,11 +5,17 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 dist/
 build/
 tmp/
 logs/
 .env
+.vscode/
 node_modules/
 *.vsix
 *.sqlite
@@ -17,3 +23,18 @@ node_modules/
 *.db
 .aiworkhub/*
 !.aiworkhub/quality.json
+
+# Local coordinator handoffs, dated audits, and review scratch reports.
+/AUTONOMOUS_SESSION_SUMMARY.md
+/NEXT_SESSION_HANDOFF.md
+/CODE_REVIEW_*.md
+/PROJECT_EVALUATION_*.md
+/AUDIT_TOKEN_ECONOMY_AND_AGENT_QUALITY_*.md
+/docs/AUDIT_2026-08-03.md
+/docs/LIVE_BUG_BACKLOG_2026-08-03.md
+
+# Legacy local release/task evidence; canonical tracked eval fixtures remain visible.
+/eval/aiworkhub_local_release_*.json
+/eval/aiworkhub_p0_context_lifecycle_gap_*.json
+/eval/aiworkhub_self_hosted_roadmap_rebase_audit_*.json
+/eval/aiworkhub_verified_codex_dispatch_expected_rework_*.json
