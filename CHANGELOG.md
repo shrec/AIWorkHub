@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.47] - 2026-08-03
+
+### Fixed
+
+- Removed a Python 3.14-only procfs race from the abrupt-supervisor-loss
+  regression: a worker disappearing between the existence probe and
+  `/proc/<pid>/stat` read is now correctly treated as successful termination.
+
 ## [0.8.46] - 2026-08-03
 
 ### Fixed
