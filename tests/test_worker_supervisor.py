@@ -144,6 +144,44 @@ def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) ->
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
 
 
+def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
+    tmp_path: Path,
+) -> None:
+    event = {
+        "type": "stream_event",
+        "event": {
+            "type": "message_delta",
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 40,
+                "cache_creation_input_tokens": 10,
+            },
+        },
+    }
+    script = (
+        "import json,time; "
+        f"event={event!r}; "
+        "print(json.dumps(event), flush=True); time.sleep(.2); "
+        "print(json.dumps(event), flush=True); time.sleep(30)"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(
+        adapter_id="claude_cli",
+        token_budget={"cap_tokens": 100},
+        heartbeat_interval_seconds=0.05,
+    )
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 122, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "token_budget_exceeded"
+    assert status["token_budget"]["enforceable_live_tokens"] == 112
+    assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
+
+
 def test_supervisor_enforces_output_bytes_without_claiming_token_truth(
     tmp_path: Path,
 ) -> None:

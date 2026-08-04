@@ -129,6 +129,35 @@ def test_research_result_requires_supported_non_receipt_output(tmp_path: Path) -
     assert evidence["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
+def test_no_write_no_output_contract_is_readonly_for_code_inspection(
+    tmp_path: Path,
+) -> None:
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=REQUEST_ID,
+        repo=tmp_path,
+        path=tmp_path / "worktree",
+        home=tmp_path / "home",
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    assert process_launcher._metadata_is_readonly_research(
+        {
+            "project_context": {"task_context_policy": {"task_type": "code"}},
+            "required_outputs": [],
+        },
+        workspace,
+    )
+    assert process_launcher._card_is_readonly_research(
+        {
+            "project_context": {"task_type": "code"},
+            "allowed_writes": [],
+            "required_outputs": [],
+        }
+    )
+
+
 def test_successful_readonly_research_reaches_review_ready(
     monkeypatch, tmp_path: Path
 ) -> None:

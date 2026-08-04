@@ -75,6 +75,18 @@ def test_python_module_ruff_resolves_to_trusted_console_executable(
     assert roots == (runtime_root.resolve(strict=False),)
 
 
+def test_bare_python_validation_uses_portable_python3_alias() -> None:
+    argv, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            ["python", "-m", "compileall", "-q", "src"]
+        )
+    )
+
+    expected = "python" if os.name == "nt" else "python3"
+    assert argv == [expected, "-m", "compileall", "-q", "src"]
+    assert roots == ()
+
+
 def test_unrelated_home_aiworkhub_runtime_is_not_selected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
