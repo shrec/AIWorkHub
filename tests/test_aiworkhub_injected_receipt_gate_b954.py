@@ -45,7 +45,15 @@ def _write_receipt(tmp_path: Path, bundle_sha: str, *, section_count: int = 2, a
     return stdout
 
 
-def _metadata(tmp_path: Path, *, bundle_sha: str, sections: list[dict], stdout: Path, runtime: bool = True) -> dict:
+def _metadata(
+    tmp_path: Path,
+    *,
+    bundle_sha: str,
+    sections: list[dict],
+    stdout: Path,
+    runtime: bool = True,
+    task_type: str = "code",
+) -> dict:
     return {
         "task_id": "TASK_B954", "runner": "codex", "topic": "representation",
         "stdout_path": str(stdout),
@@ -54,7 +62,7 @@ def _metadata(tmp_path: Path, *, bundle_sha: str, sections: list[dict], stdout: 
             if runtime else {}
         ),
         "project_context": {
-            "task_context_policy": {"task_type": "code"},
+            "task_context_policy": {"task_type": task_type},
             "bundle_sha256": bundle_sha,
             "sections": sections,
         },
@@ -116,6 +124,30 @@ def test_injected_ai_memory_zero_hit_is_valid(tmp_path, monkeypatch):
     assert gate["satisfied"] is False
     assert gate["missing_tools"] == ["source_graph_live_call"]
     assert gate["satisfaction_by_tool"]["ai_memory"] == "injected_receipt"
+
+
+def test_research_task_reports_acknowledged_injected_context_without_becoming_gated(
+    tmp_path,
+):
+    bundle = _sha()
+    stdout = _write_receipt(tmp_path, bundle, section_count=1)
+    sections = _sections(("source_graph", True, 3, ""))
+
+    gate = pl._worker_mcp_live_call_gate(
+        _metadata(
+            tmp_path,
+            bundle_sha=bundle,
+            sections=sections,
+            stdout=stdout,
+            runtime=False,
+            task_type="research",
+        ),
+        "req",
+    )
+
+    assert gate["gated"] is False
+    assert gate["satisfied"] is True
+    assert gate["injected_context_acknowledged"] is True
 
 
 # --- FAIL: not injected / degraded, no live call ---------------------------

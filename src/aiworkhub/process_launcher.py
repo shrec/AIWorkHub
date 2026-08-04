@@ -1938,6 +1938,12 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
             ),
         },
     }
+    # Receipt acknowledgement is evidence truth, not merely a code-task gate
+    # implementation detail.  Keep it observable for exempt research and
+    # data-classification tasks as well, while preserving their non-gated
+    # completion semantics.
+    injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
+    result["injected_context_acknowledged"] = injected_acknowledged
     if policy_error:
         result["gated"] = True
         result["satisfied"] = False
@@ -1967,8 +1973,6 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # use.  In particular, Source Graph must have a fresh authenticated worker
     # call during execution; an initial hash-receipted bundle alone can never
     # satisfy a code task's discovery gate.
-    injected_acknowledged, injected_tools = _injected_context_satisfaction(metadata)
-    result["injected_context_acknowledged"] = injected_acknowledged
     satisfaction_by_tool: dict[str, str] = {}
     missing: list[str] = []
     stale: list[str] = []
