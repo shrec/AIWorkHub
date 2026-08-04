@@ -24,7 +24,7 @@ and CI checks its denominators with
 
 | Surface | Population | Measured result | Evidence grade | What it means |
 | --- | ---: | --- | --- | --- |
-| Release quality | Python + extension qualification | 1,943 Python tests passed, 27 skipped; 29 extension test files passed; wheel, sdist and VSIX checks passed | Verified snapshot | The release artifact has broad automated regression coverage; this does not prove worker task quality |
+| Release quality | Python + extension qualification | 1,944 Python tests passed, 27 skipped; 29 extension test files passed; wheel, sdist and VSIX checks passed | Verified snapshot | The release artifact has broad automated regression coverage; this does not prove worker task quality |
 | Runtime readiness | One canonical preflight snapshot | 6/7 execution routes launchable; 9/9 configured workers available; 7 had observed outcomes | Verified snapshot | Several model families can be routed from one repository control plane; one redundant route remained unavailable |
 | Source Graph enforcement | 7 current gated tasks | 7/7 satisfied and 7/7 used live graph evidence; 13 calls, 0 failures, 846 hits | Verified snapshot | The current enforced cohort used live structural context instead of satisfying the gate with stale/injected-only evidence |
 | Source Graph latency | 13 current calls | p50 15.024 ms; p95 39.014 ms | Verified snapshot | Graph lookup overhead was small in this repository/runtime snapshot |
