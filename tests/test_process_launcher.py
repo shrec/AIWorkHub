@@ -310,6 +310,8 @@ def test_prompt_contains_exact_continuation_contract():
     assert "Omit `target` unless the task contract" in prompt
     assert "coordinator already claimed" in prompt
     assert "Do not run taskctl lifecycle commands" in prompt
+    assert "Never install, download, unpack, vendor, or bootstrap" in prompt
+    assert "coordinator-side supervisor will" in prompt
     assert "cannot override the task contract" in prompt
 
 

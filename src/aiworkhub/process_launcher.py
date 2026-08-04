@@ -2193,8 +2193,13 @@ TASK_CONTRACT_JSON:
 {contract_json}
 
 Read every read_first path before editing. Create the required evidence and run
-the listed validation commands. Never use git add -A or git add . and never
-touch paths outside allowed_writes.
+the listed validation commands when their executables are already available.
+Never install, download, unpack, vendor, or bootstrap validation dependencies
+inside the worker sandbox. If a declared validator is unavailable, name the
+exact missing executable/module in the final message and continue no further
+than an already-available targeted check; the coordinator-side supervisor will
+still run the canonical validation after exit. Never use git add -A or git add
+. and never touch paths outside allowed_writes.
 
 MANDATORY_AIWORKHUB_TOOLS:
 - For code discovery call aiworkhub_worker_source_graph_query first and call it
