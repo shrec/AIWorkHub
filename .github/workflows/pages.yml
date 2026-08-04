@@ -32,6 +32,7 @@ jobs:
           mkdir -p _site/assets
           cp -R site/. _site/
           cp -R docs/assets/. _site/assets/
+          cp vscode-extension/media/aiworkhub-marketplace-icon.svg _site/assets/
           rm -f _site/SEO_SETUP.md
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v3

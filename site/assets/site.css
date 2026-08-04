@@ -29,7 +29,7 @@ body {
 
 a { color: var(--cyan); }
 a:hover { color: var(--teal); }
-img { max-width: 100%; }
+img { max-width: 100%; height: auto; }
 
 .container {
   width: min(1120px, calc(100% - 2rem));
@@ -63,16 +63,7 @@ img { max-width: 100%; }
   letter-spacing: -.02em;
 }
 
-.brand-mark {
-  width: 2rem;
-  height: 2rem;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgb(49 230 194 / 50%);
-  border-radius: .7rem;
-  background: linear-gradient(145deg, rgb(49 230 194 / 18%), rgb(22 135 232 / 20%));
-  color: var(--teal);
-}
+.brand-logo { width: 2.35rem; height: 2.35rem; object-fit: contain; }
 
 .nav-links { display: flex; align-items: center; gap: 1.15rem; }
 .nav-links a { color: var(--muted); text-decoration: none; font-size: .94rem; }
@@ -129,7 +120,7 @@ h3 { margin: 0 0 .65rem; font-size: 1.18rem; }
   box-shadow: var(--shadow);
 }
 .hero-panel { padding: 1.2rem; }
-.hero-panel img { display: block; border-radius: .65rem; }
+.hero-panel img { display: block; width: 100%; height: auto; border-radius: .65rem; }
 .panel-label { margin: 0 0 .8rem; color: var(--muted); font-size: .82rem; }
 
 .section { padding: 4.5rem 0; }

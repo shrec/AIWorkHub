@@ -50,7 +50,7 @@ def test_readme_and_migration_manifest_are_release_facing() -> None:
     readme = _read("README.md")
     manifest = json.loads(_read("eval/aiworkhub_canonical_rebrand_b837_v1.json"))
     assert readme.startswith("# AIWorkHub")
-    assert "local-first control plane for multi-model software development" in readme
+    assert "open-source control plane for multi-model AI coding agents" in readme
     assert "docs/assets/aiworkhub-hero.svg" in readme
     assert (ROOT / "docs" / "assets" / "aiworkhub-hero.svg").is_file()
     assert (ROOT / "docs" / "BRAND.md").is_file()

@@ -118,7 +118,12 @@ def check(root: Path = ROOT) -> list[str]:
             if raw.endswith("/"):
                 source_target = source_target / "index.html"
             copied_asset = root / "docs" / deployed_path
-            if not source_target.exists() and not copied_asset.exists():
+            extension_asset = root / "vscode-extension" / "media" / Path(deployed_path).name
+            if (
+                not source_target.exists()
+                and not copied_asset.exists()
+                and not extension_asset.exists()
+            ):
                 errors.append(f"{relative}: broken deployed site link {raw!r}")
         canonical_urls.add(canonical)
 
