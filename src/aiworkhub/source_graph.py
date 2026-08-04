@@ -979,8 +979,30 @@ def body_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
     }, max(512, budget * 512))
 
 
+def _bounded_file_preview(
+    repo_root: Path, file_path: str, *, max_bytes: int,
+) -> dict[str, Any]:
+    """Read one exact repository file without exposing an unbounded body."""
+
+    try:
+        root = repo_root.resolve()
+        target = (root / file_path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            return {}
+        with target.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+    except OSError:
+        return {}
+    preview = data[:max_bytes]
+    return {
+        "source_preview": preview.decode("utf-8", errors="replace"),
+        "source_preview_bytes": len(preview),
+        "source_preview_truncated": len(data) > max_bytes,
+    }
+
+
 def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, Any]:
-    """Return exact canonical context for one indexed repository path."""
+    """Return exact metadata and a bounded preview for one indexed path."""
 
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     conn = connect(resolve_db_path(repo_root), read_only=True)
@@ -993,6 +1015,10 @@ def file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, A
         edge_limit = max(1, min(16, budget // 2))
         payload["entities"] = payload["entities"][:entity_limit]
         payload["edges"] = payload["edges"][:edge_limit]
+        payload.update(_bounded_file_preview(
+            repo_root, file_path,
+            max_bytes=min(4096, max(1024, budget * 128)),
+        ))
         file_match = {
             **dict(payload.get("file") or {}),
             "kind": "file",

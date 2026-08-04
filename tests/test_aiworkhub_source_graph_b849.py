@@ -377,6 +377,23 @@ def test_multi_term_find_and_indexed_body_modes_are_non_empty(tmp_path):
     assert sg.deps_query(repo, "collect_graph_metrics", budget=16)["mode"] == "deps"
 
 
+def test_file_mode_returns_bounded_source_preview_for_constant_only_file(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "_version.py",
+        '"""Canonical version."""\n\n__version__ = "0.8.55"\n',
+    )
+    sg.build_index(repo, incremental=False)
+
+    result = sg.file_query(repo, "pkg/_version.py", budget=8)
+
+    assert result["candidate_files"] == ["pkg/_version.py"]
+    context = result["contexts"][0]
+    assert '__version__ = "0.8.55"' in context["source_preview"]
+    assert context["source_preview_bytes"] <= 1024
+    assert context["source_preview_truncated"] is False
+
+
 # ---------------------------------------------------------------------------
 # B881: truthful bounded JS/TS semantic lexical evidence
 # ---------------------------------------------------------------------------
