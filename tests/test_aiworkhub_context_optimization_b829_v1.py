@@ -91,10 +91,10 @@ def test_project_context_caps_zero_hit_suppression_and_fail_closed(monkeypatch, 
     result = collect_project_context(repo, _base_card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("\n", 1)[1])
-    sections = {section["name"]: section for section in payload["sections"]}
-    assert sections["source_graph"]["content"]
-    assert "ai_memory" not in sections
-    assert "kb" not in sections
+    evidence = payload["evidence"]
+    assert evidence["source_graph"]
+    assert "ai_memory" not in evidence
+    assert "kb" not in evidence
     assert result.metadata["optimization"]["zero_hit_suppression_count"] == 2
     assert result.metadata["optimization"]["per_tool_hard_caps"] == TOOL_CAPS
     assert result.metadata["optimization"]["byte_labels_are_token_truth"] is False

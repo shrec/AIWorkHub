@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -487,6 +488,31 @@ def _safe_tail(path: Path, max_bytes: int = MAX_LOG_TAIL_BYTES) -> str:
             return fh.read(max_bytes).decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _bounded_launch_diagnostic(
+    exc: BaseException,
+    *,
+    phase: str,
+    repo: Path,
+) -> dict[str, str]:
+    """Return bounded coordinator traceback evidence for a pre-supervisor bug."""
+
+    rendered = "".join(
+        traceback.TracebackException.from_exception(exc, limit=12).format()
+    )
+    for raw, replacement in (
+        (str(repo), "<repo>"),
+        (str(Path.home()), "<home>"),
+    ):
+        if raw:
+            rendered = rendered.replace(raw, replacement)
+    return {
+        "phase": str(phase or "unknown")[:120],
+        "exception_type": type(exc).__name__[:120],
+        "message": str(exc)[:500],
+        "traceback": rendered[-4000:],
+    }
 
 
 def _declared_failure_denominators(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -2062,9 +2088,21 @@ def _worker_mcp_bundle_payload(
     if context_result is None or not context_result.prompt_bundle.strip():
         return {}
     try:
-        return json.loads(context_result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+        return json.loads(
+            context_result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1]
+        )
     except (IndexError, TypeError, json.JSONDecodeError):
         return {}
+
+
+def _worker_context_section_count(payload: dict[str, Any]) -> int:
+    """Count delivered evidence across project-context bundle versions."""
+
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        return len(evidence)
+    sections = payload.get("sections")
+    return len(sections) if isinstance(sections, list) else 0
 
 
 def _worker_mcp_source_graph_targets(
@@ -2570,7 +2608,7 @@ def build_worker_prompt(
     if project_context_bundle.strip():
         try:
             payload = json.loads(project_context_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-            section_count = len(payload.get("sections") or [])
+            section_count = _worker_context_section_count(payload)
         except (IndexError, TypeError, json.JSONDecodeError):
             section_count = 0
     context_block = (
@@ -3283,6 +3321,7 @@ class ProcessManager:
         residual_contract_manifest: list[dict[str, Any]] = []
         claimed = False
         provider_env: dict[str, str] | None = None
+        launch_phase = "preflight"
         try:
             _validate_adapter_identity(runner, adapter_id)
             # Materialize completed dependencies' promoted (accepted-but-not-yet-
@@ -3300,6 +3339,7 @@ class ProcessManager:
             # pending/unclaimed -- never claim on a missing credential.
             provider_env, model = self._resolve_provider_env(adapter_id, model)
             sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
+            launch_phase = "workspace_and_runtime_provision"
             with self._lock, self._registry_lock():
                 if self._active_count() >= _configured_limit():
                     raise LaunchRejected("concurrency_limit_reached")
@@ -3377,6 +3417,7 @@ class ProcessManager:
                     session_topic=worker_session_topic,
                     quality_review_packet_path=review_packet_path,
                 )
+                launch_phase = "prompt_and_adapter_plan"
                 if quality_review_binding is not None:
                     private_tool_name = (
                         "aiworkhub_manager_quality_review_submit"
@@ -3484,6 +3525,7 @@ class ProcessManager:
                     self.repo, declared_immutable_inputs
                 )
 
+                launch_phase = "canonical_claim"
                 claim = task_engine.claim_start_exact(
                     self.repo, task_id, runner, topic, request_id=request_id
                 )
@@ -3589,8 +3631,10 @@ class ProcessManager:
                         else None
                     ),
                 }
+                launch_phase = "request_metadata"
                 write_json_0600(metadata_path, metadata)
                 authority_path = self._terminal_authority_grant_path(request_id)
+                launch_phase = "terminal_authority"
                 _write_terminal_authority_grant(
                     authority_path,
                     self._terminal_authority_key(),
@@ -3600,6 +3644,7 @@ class ProcessManager:
                     topic=topic,
                     request_id=request_id,
                 )
+                launch_phase = "supervisor_spec"
                 write_json_0600(spec_path, {
                     "argv": worker_argv,
                     "cwd": "/",
@@ -3623,6 +3668,7 @@ class ProcessManager:
                 # shared string as HOME so the two line up by construction,
                 # not by two independently-coincidental Path.home() calls
                 # (B314_F004).
+                launch_phase = "supervisor_spawn"
                 process = self._popen(
                     [sys.executable, str(supervisor), "--spec", str(spec_path)],
                     cwd="/",
@@ -3643,6 +3689,7 @@ class ProcessManager:
                     start_new_session=True,
                 )
                 started_at = _utcnow()
+                launch_phase = "supervisor_pid_identity"
                 start_ticks = _pid_start_ticks(process.pid)
                 if start_ticks is None:
                     _terminate_process_group(process.pid, grace_seconds=5.0)
@@ -3719,8 +3766,31 @@ class ProcessManager:
                 "prompt_budget": prompt_budget,
                 "shell": False,
             }
-        except (LaunchRejected, project_context.ProjectContextError, WorkspaceError, OSError, ValueError) as exc:
-            reason = str(exc)
+        except Exception as exc:  # noqa: BLE001 - return durable launch diagnostics
+            expected = isinstance(
+                exc,
+                (
+                    LaunchRejected,
+                    project_context.ProjectContextError,
+                    WorkspaceError,
+                    OSError,
+                    ValueError,
+                ),
+            )
+            diagnostic = (
+                None
+                if expected
+                else _bounded_launch_diagnostic(
+                    exc,
+                    phase=launch_phase,
+                    repo=self.repo,
+                )
+            )
+            reason = (
+                str(exc)
+                if expected
+                else f"unexpected_launch_error:{type(exc).__name__}:{exc}"
+            )
             # A pre-claim failure leaves a pending card pending.  Fabricating a
             # claim merely to manufacture a terminal review was the source of
             # false review-ready launch failures.  A card already claimed by
@@ -3770,6 +3840,7 @@ class ProcessManager:
                 reason,
                 request_id=request_id,
                 state="launch_failed" if claimed else "blocked",
+                diagnostic=diagnostic,
             )
 
     def _assert_no_duplicate_task(self, task_id: str) -> None:
@@ -3981,6 +4052,7 @@ class ProcessManager:
         *,
         request_id: str | None = None,
         state: str = "blocked",
+        diagnostic: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         event = self._append_event({
             "request_id": request_id or uuid.uuid4().hex,
@@ -3990,6 +4062,7 @@ class ProcessManager:
             "adapter_id": adapter_id,
             "state": state,
             "blocked_reason": reason[:500],
+            **({"diagnostic": diagnostic} if diagnostic else {}),
         })
         return {
             "ok": False,
@@ -3999,6 +4072,7 @@ class ProcessManager:
             "task_id": task_id,
             "state": state,
             "blocked_reason": reason[:500],
+            **({"diagnostic": diagnostic} if diagnostic else {}),
             "shell": False,
         }
 

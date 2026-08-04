@@ -10,6 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT = ROOT / "benchmarks" / "system-benefit-snapshot-v1.json"
+DEFAULT_SEMANTIC_EDIT_PILOT = ROOT / "benchmarks" / "semantic-edit-pilot-v1.json"
 
 
 def _rate(numerator: float, denominator: float, digits: int = 1) -> float:
@@ -22,7 +23,10 @@ def _close(actual: Any, expected: float, tolerance: float = 0.05) -> bool:
     return abs(float(actual) - expected) <= tolerance
 
 
-def check(path: Path = DEFAULT_SNAPSHOT) -> list[str]:
+def check(
+    path: Path = DEFAULT_SNAPSHOT,
+    semantic_edit_path: Path = DEFAULT_SEMANTIC_EDIT_PILOT,
+) -> list[str]:
     try:
         doc: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -86,6 +90,45 @@ def check(path: Path = DEFAULT_SNAPSHOT) -> list[str]:
     ratio = round(file_bytes / replacement, 2) if replacement else 0.0
     if not _close(edits.get("structural_file_to_replacement_ratio"), ratio, 0.01):
         errors.append("semantic_edit_structural_ratio_mismatch")
+
+    paired = doc.get("semantic_edit_paired_pilot") or {}
+    try:
+        paired_doc: dict[str, Any] = json.loads(
+            semantic_edit_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"semantic_edit_paired_artifact_unreadable:{exc}")
+        paired_doc = {}
+    paired_aggregate = paired_doc.get("aggregate") or {}
+    paired_reductions = paired_aggregate.get("observed_reduction_percent") or {}
+    paired_design = paired_doc.get("design") or {}
+    paired_claim = paired_doc.get("claim_status") or {}
+    paired_expected = {
+        "schema_id": paired_doc.get("schema_id"),
+        "pair_count": paired_design.get("pair_count"),
+        "model": paired_design.get("model"),
+        "adapter_id": paired_design.get("adapter_id"),
+        "total_token_reduction_percent": paired_reductions.get("total_tokens"),
+        "output_token_reduction_percent": paired_reductions.get("output_tokens"),
+        "elapsed_reduction_percent": paired_reductions.get("duration_seconds"),
+        "uncached_input_change_percent": paired_aggregate.get(
+            "uncached_input_change_percent"
+        ),
+        "manager_acceptance_observed": paired_design.get(
+            "manager_acceptance_observed"
+        ),
+        "public_claim_eligible": paired_claim.get("public_claim_eligible"),
+    }
+    for key, expected_value in paired_expected.items():
+        actual_value = paired.get(key)
+        if isinstance(expected_value, float):
+            if not _close(actual_value, expected_value, 0.001):
+                errors.append(f"semantic_edit_paired_snapshot_mismatch:{key}")
+        elif actual_value != expected_value:
+            errors.append(f"semantic_edit_paired_snapshot_mismatch:{key}")
+    expected_artifact = semantic_edit_path.relative_to(ROOT).as_posix()
+    if paired.get("artifact") != expected_artifact:
+        errors.append("semantic_edit_paired_artifact_path_mismatch")
 
     callbacks = doc.get("callback_reliability") or {}
     resolved = int(callbacks.get("delivered") or 0) + int(

@@ -57,6 +57,15 @@ def measure_context_delivery(
     if bundle_bytes_val is not None:
         delivered_prompt_bytes = int(bundle_bytes_val)
 
+    encoding = (metadata.get("optimization") or {}).get("prompt_encoding") or {}
+    legacy_prompt_bytes: int | None = None
+    legacy_value = encoding.get("legacy_v1_bundle_bytes")
+    if isinstance(legacy_value, (int, float)) and legacy_value > 0:
+        legacy_prompt_bytes = int(legacy_value)
+    prompt_encoding_delta_bytes: int | None = None
+    if legacy_prompt_bytes is not None and delivered_prompt_bytes is not None:
+        prompt_encoding_delta_bytes = delivered_prompt_bytes - legacy_prompt_bytes
+
     serialized_envelope_bytes: int | None = None
     if (selected_source_bytes is not None
             and delivered_prompt_bytes is not None):
@@ -132,6 +141,13 @@ def measure_context_delivery(
             serialized_envelope_bytes / delivered_prompt_bytes, 4
         )
 
+    prompt_encoding_reduction: float | None = None
+    if legacy_prompt_bytes is not None and delivered_prompt_bytes is not None:
+        prompt_encoding_reduction = round(
+            1.0 - delivered_prompt_bytes / legacy_prompt_bytes,
+            4,
+        )
+
     cache_hit_rate: float | None = None
     if (cache_metric_valid is True
             and cache_eligible_input_tokens is not None
@@ -154,6 +170,8 @@ def measure_context_delivery(
             "selected_source_bytes": selected_source_bytes,
             "serialized_envelope_bytes": serialized_envelope_bytes,
             "delivered_prompt_bytes": delivered_prompt_bytes,
+            "legacy_v1_prompt_bytes": legacy_prompt_bytes,
+            "prompt_encoding_delta_bytes": prompt_encoding_delta_bytes,
             "cached_input_tokens": cached_total,
             "cache_creation_input_tokens": (
                 cache_create if is_claude and cache_observed else None
@@ -177,6 +195,7 @@ def measure_context_delivery(
         "ratios": {
             "compression_ratio_vs_naive_discover": compression_ratio,
             "envelope_overhead_ratio": overhead_ratio,
+            "prompt_encoding_reduction": prompt_encoding_reduction,
             "cache_hit_rate_of_input": cache_hit_rate,
         },
         "notes": {
@@ -521,6 +540,10 @@ def _agg_zero() -> dict[str, Any]:
         "total_delivered_bytes": 0,
         "total_selected_bytes": 0,
         "total_envelope_bytes": 0,
+        "encoding_observed_tasks": 0,
+        "total_legacy_v1_prompt_bytes": 0,
+        "total_nested_v2_prompt_bytes": 0,
+        "total_prompt_encoding_delta_bytes": 0,
     }
 
 
@@ -549,6 +572,17 @@ def _agg_merge(
         val = pops.get(src_key)
         if isinstance(val, (int, float)):
             bucket[dst_key] += int(val)
+    legacy_prompt = pops.get("legacy_v1_prompt_bytes")
+    delivered_prompt = pops.get("delivered_prompt_bytes")
+    if isinstance(legacy_prompt, (int, float)) and isinstance(
+        delivered_prompt, (int, float)
+    ):
+        bucket["encoding_observed_tasks"] += 1
+        bucket["total_legacy_v1_prompt_bytes"] += int(legacy_prompt)
+        bucket["total_nested_v2_prompt_bytes"] += int(delivered_prompt)
+        bucket["total_prompt_encoding_delta_bytes"] += int(
+            delivered_prompt - legacy_prompt
+        )
     if cache_valid is True:
         for src_key, dst_key in [
             ("cached_input_tokens", "total_cached_tokens"),

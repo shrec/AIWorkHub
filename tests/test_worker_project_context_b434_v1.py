@@ -176,27 +176,20 @@ def test_project_context_collects_source_modes_bounded_session_and_optional_kb(
         seen[mode] = result.prompt_bundle
         assert "PROJECT_CONTEXT_BUNDLE" in result.prompt_bundle
         payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-        assert payload["source_graph"]["mode"] == mode
-        source_section = next(
-            section for section in payload["sections"]
-            if section["name"] == "source_graph"
-        )
-        assert json.loads(source_section["content"])["mode"] == (
+        assert payload["schema_id"] == project_context.SCHEMA_ID
+        source_evidence = payload["evidence"]["source_graph"]
+        assert source_evidence["mode"] == (
             mode if mode != "bundle" else "explore"
         )
-        session_section = next(
-            section for section in payload["sections"]
-            if section["name"] == "session_current_state"
-        )
-        assert json.loads(session_section["content"])["state"] == "current"
+        assert payload["evidence"]["session_current_state"]["state"] == "current"
         assert "--no-refresh" not in result.prompt_bundle
         assert result.metadata["section_count"] == 3
         assert "missing B434 context" not in json.dumps(result.metadata)
         assert "source_graph.db" not in result.prompt_bundle
 
-    assert '"mode": "focus"' in seen["focus"]
-    assert '"mode": "slice"' in seen["slice"]
-    assert '"mode": "bundle"' in seen["bundle"]
+    assert '"mode":"focus"' in seen["focus"]
+    assert '"mode":"slice"' in seen["slice"]
+    assert '"mode":"explore"' in seen["bundle"]
 
 
 def test_project_context_validates_types_and_rejects_shellish_or_overbudget_values(
@@ -235,12 +228,16 @@ def test_large_valid_json_is_canonicalized_into_bounded_valid_preview(
     result = project_context.collect_project_context(repo, _project_context_card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-    source = next(s for s in payload["sections"] if s["name"] == "source_graph")
-    bounded = json.loads(source["content"])
+    bounded = payload["evidence"]["source_graph"]["data"]
     assert bounded["truncated"] is True
     assert bounded["original_bytes"] > project_context.MAX_TOOL_OUTPUT_BYTES
     assert bounded["original_hit_count"] > 0
-    assert source["hit_count"] == bounded["original_hit_count"]
+    source_metadata = next(
+        section
+        for section in result.metadata["sections"]
+        if section["name"] == "source_graph"
+    )
+    assert source_metadata["hit_count"] == bounded["original_hit_count"]
     assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
 
 

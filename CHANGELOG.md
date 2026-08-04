@@ -6,6 +6,35 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.82] - 2026-08-04
+
+### Changed
+
+- Project Context Bundle v2 embeds canonical JSON evidence as nested objects
+  instead of escaped JSON strings, removes card-duplicated mode/section
+  wrapper fields, and uses compact outer serialization. The exact same
+  representative evidence fixture shrank from 849 to 600 bytes (29.329%);
+  this is deterministic structural byte evidence, not a token-savings claim.
+- Context-economics telemetry now records the per-task legacy-v1 versus
+  nested-v2 byte counterfactual while preserving token and cost fields as
+  unknown unless the provider reports them.
+- The system-benefit checker now cross-validates the public semantic-edit
+  pilot deltas against its separate pair-level machine-readable ledger.
+
+### Fixed
+
+- Windows worker launch no longer recurses before supervisor spawn when an
+  existing terminal-authority key has ACL-backed Windows permissions that do
+  not round-trip as POSIX `0600`; create races are now bounded and invalid
+  keys fail closed with structured launch-phase diagnostics.
+- Completion Inbox adapter launchability now consumes the same route-aware
+  preflight authority as the Preflight card, removing contradictory native
+  CLI readiness on Windows.
+- Worker context receipts count delivered evidence correctly for both legacy
+  v1 section lists and v2 evidence maps.
+- Benchmark documentation now uses an evidence-snapshot label and clarifies
+  the provider-trace/read-operation denominators.
+
 ## [0.8.81] - 2026-08-04
 
 ### Added

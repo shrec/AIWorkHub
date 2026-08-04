@@ -93,7 +93,10 @@ def test_project_context_uses_nested_repo_authority_and_rebased_targets(tmp_path
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
     assert payload["repo_identity"]["repo_id"] == ""
     assert payload["repo_identity"]["scope_root"] == "tools/geoai-task-mcp"
-    assert set(payload["source_graph"]) == {"mode"}
+    assert "source_graph" not in payload
+    assert payload["evidence"]["source_graph"]["matches"][0]["file_path"] == (
+        "src/aiworkhub/project_context.py"
+    )
     assert result.worker_source_graph_targets[0] == "src/aiworkhub/project_context.py"
 
 

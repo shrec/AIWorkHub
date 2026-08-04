@@ -1648,9 +1648,35 @@ def aiworkhub_completion_inbox(
     # sees whether a deepseek_copilot_cli launch is possible BEFORE claiming a
     # task. Exposed here (not as a new tool) to preserve the frozen v1 tool
     # contract; it never exposes the DeepSeek key contents or any hash of them.
-    result["adapter_readiness"] = deepseek_credentials.adapter_readiness(
-        repo=core.repo_root()
-    )
+    repo_root = core.repo_root()
+    readiness = deepseek_credentials.adapter_readiness(repo=repo_root)
+    # ``adapter_readiness`` preserves credential/endpoint compatibility fields,
+    # but executable presence alone is not route launchability (notably for
+    # native CLI adapters on Windows without AppContainer). Overlay the exact
+    # canonical preflight verdict so this inbox cannot contradict Preflight.
+    preflight = repo_policy.build_preflight(repo_root)
+    route_truth = {
+        str(item.get("adapter_id") or ""): item
+        for item in preflight.get("providers", [])
+        if isinstance(item, Mapping)
+    }
+    for adapter in readiness.get("adapters", []):
+        if not isinstance(adapter, dict):
+            continue
+        route = route_truth.get(str(adapter.get("adapter_id") or ""))
+        if route is None:
+            continue
+        adapter["launchable"] = bool(route.get("launchable"))
+        adapter["status"] = str(route.get("status") or "unavailable")
+        adapter["sandbox_backend"] = str(route.get("sandbox_backend") or "")
+        adapter["blocker_reason"] = (
+            ""
+            if route.get("launchable")
+            else str(route.get("reason") or adapter.get("blocker_reason") or "not_launchable")
+        )[:300]
+        adapter["launchability_authority"] = repo_policy.PREFLIGHT_SCHEMA_ID
+    readiness["preflight_schema_id"] = preflight.get("schema_id")
+    result["adapter_readiness"] = readiness
     return result
 
 

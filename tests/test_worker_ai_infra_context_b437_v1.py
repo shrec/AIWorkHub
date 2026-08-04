@@ -192,9 +192,8 @@ def test_exact_source_graph_targets_policy_and_metadata_are_bounded(
     result = project_context.collect_project_context(repo, _card())
     assert result is not None
     payload = json.loads(result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-    source = next(section for section in payload["sections"] if section["name"] == "source_graph")
-    assert source["target"] == "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"
-    assert source["hit_count"] > 0
+    source = payload["evidence"]["source_graph"]
+    assert source["sections"][0]["items"][0]["file"] == "process_launcher.py"
     assert captured["contract"]["source_graph"]["targets_origin"] == "declared"
     assert captured["contract"]["source_graph"]["targets"][0] == "tools/geoai-task-mcp/src/aiworkhub/process_launcher.py"
     assert result.metadata["sections"][0]["requested"] is True

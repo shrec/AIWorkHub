@@ -1,0 +1,34 @@
+{
+  "schema_id": "aiworkhub.context_envelope_encoding_benchmark.v1",
+  "recorded_at": "2026-08-04T21:18:00Z",
+  "source_version": "0.8.82",
+  "design": {
+    "fixture_id": "project_context_minimal_tokens_b835_representative",
+    "comparison": "same_evidence_legacy_v1_vs_nested_v2_serialization",
+    "deterministic": true,
+    "provider_tokens_observed": false,
+    "manager_acceptance_observed": false
+  },
+  "measurement": {
+    "selected_evidence_bytes": 426,
+    "legacy_v1_bundle_bytes": 849,
+    "nested_v2_bundle_bytes": 600,
+    "nested_v2_envelope_bytes": 174,
+    "delta_bytes": -249,
+    "reduction_percent": 29.329
+  },
+  "claim_status": {
+    "public_claim_eligible": true,
+    "allowed_interpretation": "deterministic_structural_bundle_byte_reduction_for_this_fixture",
+    "token_savings_available": false,
+    "cost_savings_available": false,
+    "latency_savings_available": false,
+    "quality_improvement_available": false,
+    "forbidden_interpretations": [
+      "system_wide_token_savings",
+      "provider_cost_savings",
+      "source_graph_multiplier",
+      "quality_improvement"
+    ]
+  }
+}
