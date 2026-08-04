@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.57] - 2026-08-04
+
+### Fixed
+
+- Retained every completed provider attempt in the canonical usage ledger even
+  when VS Code LM exposes no token or price counters, while reporting missing
+  measurements as `unknown` instead of fabricated zero-token or zero-cost
+  values.
+- Added observed-versus-unknown usage counters to usage reports, cost-ledger
+  aggregates, and compact dashboard process telemetry without changing the
+  existing measured-token accounting path.
+
 ## [0.8.56] - 2026-08-04
 
 ### Fixed
