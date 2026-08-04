@@ -40,6 +40,7 @@ from . import context_writes
 from .platform_io import chmod_fd, lock_fd, unlock_fd
 from . import quality_evidence
 from . import process_event_ledger
+from . import provider_usage
 from . import repo_policy
 from . import read_efficiency
 from . import task_engine
@@ -790,126 +791,35 @@ def _touch_0600(path: Path) -> None:
         os.close(fd)
 
 
-def _usage_from_output(path: Path) -> dict[str, Any]:
-    """Extract bounded Claude/Codex JSON usage without trusting free text."""
-    result = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "usage_observed": False,
-        "cache_metrics_observed": False,
-        # Unknown cost is not a measured zero.  Keep it nullable in process
-        # evidence; the canonical numeric ledger receives 0 only alongside
-        # cost_observed=false because its storage contract is numeric.
-        "cost_usd": None,
-        "cost_observed": False,
-    }
-    if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
-        return result
+def _usage_from_output(
+    path: Path,
+    *,
+    include_samples: bool = False,
+) -> dict[str, Any]:
+    """Extract bounded structured usage without trusting provider prose."""
 
-    def as_int(value: Any) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    def as_float(value: Any) -> float:
-        try:
-            return max(0.0, float(value or 0.0))
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    candidates: list[dict[str, Any]] = []
-    try:
-        value = json.loads(raw)
-        if isinstance(value, dict):
-            candidates.append(value)
-    except json.JSONDecodeError:
-        for line in raw.splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                candidates.append(value)
-    for item in candidates:
-        usage = item.get("usage")
-        if not isinstance(usage, dict):
-            # Copilot JSONL and DeepSeek's OpenAI-compatible objects nest usage
-            # under a variety of containers (response/result/data/stats/message).
-            # Search them without inventing any numeric field.
-            nested: Any = None
-            for container_key in ("response", "result", "data", "stats", "message"):
-                container = item.get(container_key)
-                if isinstance(container, dict) and isinstance(container.get("usage"), dict):
-                    nested = container["usage"]
-                    break
-            if nested is None:
-                nested = item.get("token_usage") or item.get("tokens")
-            usage = nested if isinstance(nested, dict) else {}
-        if usage:
-            result["usage_observed"] = True
-        input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details")
-        if not isinstance(input_details, dict):
-            input_details = {}
-        cache_metric_keys = {
-            "cache_read_input_tokens",
+    usage = provider_usage.read_provider_usage(
+        path,
+        include_samples=include_samples,
+    )
+    if include_samples:
+        return usage
+    # Preserve the compact historical helper contract for callers that need
+    # only aggregate accounting. Durable process events explicitly request
+    # samples and model evidence through ``include_samples=True``.
+    return {
+        key: usage[key]
+        for key in (
+            "input_tokens",
+            "output_tokens",
             "cached_input_tokens",
-            "prompt_cache_hit_tokens",
             "cache_creation_input_tokens",
-        }
-        if any(key in usage for key in cache_metric_keys) or "cached_tokens" in input_details:
-            result["cache_metrics_observed"] = True
-        result["input_tokens"] = max(
-            result["input_tokens"],
-            as_int(
-                usage.get("input_tokens")
-                or usage.get("prompt_tokens")
-                or usage.get("input")
-            ),
+            "usage_observed",
+            "cache_metrics_observed",
+            "cost_usd",
+            "cost_observed",
         )
-        result["output_tokens"] = max(
-            result["output_tokens"],
-            as_int(
-                usage.get("output_tokens")
-                or usage.get("completion_tokens")
-                or usage.get("output")
-            ),
-        )
-        result["cached_input_tokens"] = max(
-            result["cached_input_tokens"],
-            as_int(
-                usage.get("cache_read_input_tokens")
-                or usage.get("cached_input_tokens")
-                # DeepSeek's OpenAI-compatible cache-hit field. For an
-                # OpenAI-shaped provider prompt_tokens already INCLUDES cached
-                # input, so this is reported for observability only and is not
-                # re-added to the ledger input (see _ledger_input_tokens).
-                or usage.get("prompt_cache_hit_tokens")
-                or input_details.get("cached_tokens")
-            ),
-        )
-        result["cache_creation_input_tokens"] = max(
-            result["cache_creation_input_tokens"],
-            as_int(usage.get("cache_creation_input_tokens")),
-        )
-        raw_cost = None
-        for source in (item, usage):
-            for key in ("total_cost_usd", "cost_usd"):
-                if key in source and source.get(key) is not None:
-                    raw_cost = source.get(key)
-                    break
-            if raw_cost is not None:
-                break
-        if raw_cost is not None:
-            result["cost_observed"] = True
-            result["cost_usd"] = max(
-                float(result["cost_usd"] or 0.0),
-                as_float(raw_cost),
-            )
-    return result
+    }
 
 
 def _provider_tool_denials_from_output(path: Path) -> dict[str, Any]:
@@ -1505,10 +1415,14 @@ def _readonly_research_contract(
 ) -> bool:
     """Return whether a card is the narrow no-repository-output contract.
 
-    This is deliberately stricter than merely checking ``task_type``.  A
-    research card that declares even one write or required output follows the
-    normal candidate/diff lifecycle and can never use textual stdout as a
-    substitute for repository evidence.
+    Task type does not create write authority.  Any card with both lists
+    explicitly empty is read-only by construction and may use its
+    authenticated provider result as evidence.  A card that declares even one
+    write or required output follows the normal candidate/diff lifecycle and
+    can never use textual stdout as a substitute for repository evidence.
+
+    ``task_type`` remains in the signature for compatibility with existing
+    call sites and receipts; it is intentionally not an admission gate.
     """
 
     allowed_is_empty = allowed_writes is None or (
@@ -1517,11 +1431,7 @@ def _readonly_research_contract(
     outputs_are_empty = required_outputs is None or (
         isinstance(required_outputs, (list, tuple)) and not required_outputs
     )
-    return (
-        str(task_type or "").strip() == "research"
-        and allowed_is_empty
-        and outputs_are_empty
-    )
+    return allowed_is_empty and outputs_are_empty
 
 
 def _metadata_is_readonly_research(
@@ -1891,17 +1801,12 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
     if not isinstance(raw, list):
         raise LaunchRejected("required_outputs_invalid")
     if not raw:
-        # A research task can be intentionally read-only: quality reviewers
-        # submit their packet-bound receipt through MCP and must not mutate the
-        # candidate repository.  Treat an empty output list as valid only for
-        # that narrow contract; code/data tasks and any task with write scope
-        # continue to fail closed.
-        project_context = card.get("project_context") or {}
-        if (
-            isinstance(project_context, dict)
-            and project_context.get("task_type") == "research"
-            and not (card.get("allowed_writes") or [])
-        ):
+        # Any explicitly no-write/no-output card is read-only by construction.
+        # Its evidence is the authenticated worker transcript/MCP receipt, so
+        # audit and code-inspection tasks must not need a dummy repository
+        # marker merely because their task_type is not ``research``.  A write
+        # scope paired with no required output still fails closed.
+        if not (card.get("allowed_writes") or []):
             return
         raise LaunchRejected("required_outputs_invalid")
     allowed = card.get("allowed_writes") or []
@@ -2626,15 +2531,17 @@ def build_worker_prompt(
         if project_context_bundle.strip()
         else ""
     )
-    prompt = f"""You are the sole worker for one exact AIWorkHub task in an isolated worktree.
+    # Keep every invariant instruction before the first task-specific byte.
+    # Provider prefix caches can then reuse this complete policy block across
+    # unrelated tasks; the task contract, context receipt, and owner text stay
+    # after the stable boundary. This is a structural optimization only --
+    # cache savings remain unclaimed until provider telemetry observes them.
+    stable_prefix = """You are the sole worker for one exact AIWorkHub task in an isolated worktree.
 
 The coordinator already claimed the task. Do not run taskctl lifecycle commands,
-do not commit, and do not modify .git. Work only on the contract below. The
+do not commit, and do not modify .git. Work only on the task contract. The
 coordinator will independently enforce allowed_writes, rerun validation, promote
 accepted files, and request review after your process exits successfully.
-
-TASK_CONTRACT_JSON:
-{contract_json}
 
 Read every read_first path before editing. Create the required evidence and run
 the listed validation commands when their executables are already available.
@@ -2673,8 +2580,16 @@ MANDATORY_AIWORKHUB_TOOLS:
 - If Source Graph reports an exact target unsupported/unindexed, stop and
   report that target. Only a new coordinator-authorized fallback card may use
   raw discovery for it.
-{context_block} Your final message must be at most 12 lines
-and name tests plus changed paths.{suffix}"""
+
+Your final message must be at most 12 lines and name tests plus changed paths."""
+    prompt = (
+        stable_prefix
+        + "\n\nTASK_CONTRACT_JSON:\n"
+        + contract_json
+        + "\nEND_TASK_CONTRACT_JSON"
+        + context_block
+        + suffix
+    )
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_cap = MAX_REWORK_WORKER_PROMPT_BYTES if rework else MAX_WORKER_PROMPT_BYTES
     if prompt_bytes > prompt_cap:
@@ -2695,6 +2610,9 @@ and name tests plus changed paths.{suffix}"""
                 "owner_context_bytes": owner_bytes,
                 "runtime_instructions_bytes": static_bytes,
             },
+            "stable_prefix_bytes": len(stable_prefix.encode("utf-8")),
+            "stable_prefix_precedes_task_contract": True,
+            "provider_cache_savings_observed": False,
             "byte_labels_are_token_truth": False,
             "delta_rework": rework,
         })
@@ -4183,7 +4101,8 @@ class ProcessManager:
         stdout_path: Path,
         topic: str | None = None,
     ) -> tuple[dict[str, Any], bool, str]:
-        usage = _usage_from_output(stdout_path)
+        usage = _usage_from_output(stdout_path, include_samples=True)
+        usage["requested_model"] = model
         usage_recorded = False
         usage_error = ""
         total_input = _ledger_input_tokens(usage, adapter_id)
@@ -6436,8 +6355,15 @@ class ProcessManager:
                     ):
                         raise WorkspaceError("research_result_evidence_mismatch")
                     worker_mcp_gate = evidence.get("worker_mcp_gate")
-                    if isinstance(worker_mcp_gate, dict) and worker_mcp_gate.get("gated"):
-                        raise WorkspaceError("research_worker_mcp_gate_invalid")
+                    if (
+                        isinstance(worker_mcp_gate, dict)
+                        and worker_mcp_gate.get("gated")
+                        and not worker_mcp_gate.get("satisfied", True)
+                    ):
+                        raise WorkspaceError(
+                            "validation_required_aiworkhub_mcp_call_missing:"
+                            + str(worker_mcp_gate.get("reason") or "")
+                        )
                     validations = run_validations(
                         workspace, card.get("validation") or []
                     )

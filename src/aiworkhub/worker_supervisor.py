@@ -18,6 +18,7 @@ from typing import Any, BinaryIO
 
 try:
     from .platform_io import atomic_replace, chmod_fd
+    from .provider_usage import live_total_tokens, read_provider_usage
     from .token_budget import (
         SampleKind,
         TelemetryAuthority,
@@ -29,6 +30,7 @@ try:
     )
 except ImportError:  # direct-script entrypoint
     from platform_io import atomic_replace
+    from provider_usage import live_total_tokens, read_provider_usage
     from token_budget import (  # type: ignore[no-redef]
         SampleKind,
         TelemetryAuthority,
@@ -283,115 +285,12 @@ def _usage_total_from_output(path: Path, adapter_id: str) -> int | None:
     input count, while OpenAI-shaped adapters report cache hits as an input
     subset.
     """
-    try:
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or path.stat().st_size > MAX_USAGE_SCAN_BYTES
-        ):
-            return None
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    candidates: list[Any] = []
-    try:
-        candidates.append(json.loads(raw))
-    except json.JSONDecodeError:
-        for line in raw.splitlines()[:8192]:
-            try:
-                candidates.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
-    maxima = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-    }
-    observed = False
-
-    def as_int(value: Any) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    def consume_usage(usage: dict[str, Any]) -> None:
-        nonlocal observed
-        keys = {
-            "input_tokens",
-            "prompt_tokens",
-            "output_tokens",
-            "completion_tokens",
-            "cache_read_input_tokens",
-            "cached_input_tokens",
-            "cache_creation_input_tokens",
-        }
-        if not any(key in usage for key in keys):
-            return
-        observed = True
-        details = usage.get("input_tokens_details") or usage.get(
-            "prompt_tokens_details"
-        )
-        if not isinstance(details, dict):
-            details = {}
-        maxima["input_tokens"] = max(
-            maxima["input_tokens"],
-            as_int(
-                usage.get("input_tokens")
-                or usage.get("prompt_tokens")
-                or usage.get("input")
-            ),
-        )
-        maxima["output_tokens"] = max(
-            maxima["output_tokens"],
-            as_int(
-                usage.get("output_tokens")
-                or usage.get("completion_tokens")
-                or usage.get("output")
-            ),
-        )
-        maxima["cached_input_tokens"] = max(
-            maxima["cached_input_tokens"],
-            as_int(
-                usage.get("cache_read_input_tokens")
-                or usage.get("cached_input_tokens")
-                or usage.get("prompt_cache_hit_tokens")
-                or details.get("cached_tokens")
-            ),
-        )
-        maxima["cache_creation_input_tokens"] = max(
-            maxima["cache_creation_input_tokens"],
-            as_int(usage.get("cache_creation_input_tokens")),
-        )
-
-    def walk(value: Any, depth: int = 0) -> None:
-        if depth > 8:
-            return
-        if isinstance(value, dict):
-            usage = value.get("usage")
-            if isinstance(usage, dict):
-                consume_usage(usage)
-            for key, nested in list(value.items())[:256]:
-                if key != "usage":
-                    walk(nested, depth + 1)
-        elif isinstance(value, list):
-            for nested in value[:256]:
-                walk(nested, depth + 1)
-
-    for candidate in candidates[:8192]:
-        walk(candidate)
-    if not observed:
-        return None
-    total = maxima["input_tokens"] + maxima["output_tokens"]
-    if adapter_id == "claude_cli":
-        total += (
-            maxima["cached_input_tokens"]
-            + maxima["cache_creation_input_tokens"]
-        )
-    return total
+    summary = read_provider_usage(
+        path,
+        max_bytes=MAX_USAGE_SCAN_BYTES,
+        include_samples=False,
+    )
+    return live_total_tokens(summary, adapter_id)
 
 
 def _token_budget_config(spec: dict[str, Any]) -> tuple[int | None, str]:

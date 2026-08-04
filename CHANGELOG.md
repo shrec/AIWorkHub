@@ -6,6 +6,53 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.85] - 2026-08-04
+
+### Fixed
+
+- Successful no-write/no-output code inspections now use the authenticated
+  read-only result lifecycle instead of failing terminal reconciliation with
+  `no_effect`.
+- Read-only code tasks preserve and revalidate a satisfied worker MCP gate at
+  manager acceptance; an unsatisfied required Source Graph/tool receipt still
+  fails closed.
+
+## [0.8.84] - 2026-08-04
+
+### Fixed
+
+- Live Claude token ceilings now sum completed per-turn `message_delta`
+  usage until the terminal request aggregate arrives. Multi-turn workers can
+  no longer evade a request-wide cap merely because every individual turn is
+  below it.
+- POSIX validation normalizes the portable bare `python` spelling to
+  `python3`, avoiding false `rc=126` failures on hosts without `/bin/python`.
+- Explicit no-write/no-output cards can launch regardless of task type, so
+  evidence-only audits no longer require dummy repository artifacts.
+
+## [0.8.83] - 2026-08-04
+
+### Changed
+
+- Provider-reported usage now passes through one bounded recursive normalizer
+  shared by live token-budget enforcement and durable process accounting.
+  Nested Claude, Codex and OpenAI-compatible usage/cache fields are interpreted
+  consistently, while missing telemetry remains unknown rather than a false
+  zero.
+- Durable process evidence retains the requested model, an observed provider
+  model identity when emitted, and up to 64 ordered provider usage snapshots;
+  snapshots are explicitly labeled as provider-reported rather than assumed
+  deltas.
+- Worker prompts place 3,014 bytes of invariant runtime/tool policy before the
+  first task-specific byte, making that prefix cacheable across tasks. No cache
+  or token savings are claimed until fresh provider telemetry measures them.
+
+### Fixed
+
+- Live token caps and terminal cost accounting no longer use divergent usage
+  parsers, preventing nested stream events from being enforceable live but
+  absent from the canonical ledger (or vice versa).
+
 ## [0.8.82] - 2026-08-04
 
 ### Changed

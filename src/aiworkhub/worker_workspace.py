@@ -1969,6 +1969,14 @@ def _normalize_trusted_validation_executable_argv_with_roots(
     if not argv:
         return [], ()
     head = argv[0]
+    # AIWorkHub itself requires Python 3, while many POSIX hosts deliberately
+    # expose only ``python3`` in the credential-free validation PATH.  Treat
+    # the common ``python`` spelling as the portable Python-3 alias instead
+    # of letting execvpe fail against a non-existent /bin/python.  Explicit
+    # python3/path spellings remain untouched.
+    if os.name != "nt" and head == "python":
+        argv = ["python3", *argv[1:]]
+        head = argv[0]
     if (
         len(argv) >= 3
         and Path(head).name.startswith("python")

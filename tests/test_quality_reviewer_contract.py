@@ -46,11 +46,21 @@ def test_read_only_research_reviewer_allows_no_repository_outputs() -> None:
     )
 
 
-def test_empty_outputs_still_fail_closed_for_code_tasks() -> None:
+def test_no_write_code_inspection_allows_no_repository_outputs() -> None:
+    process_launcher._validate_required_outputs_contract(
+        {
+            "allowed_writes": [],
+            "required_outputs": [],
+            "project_context": {"task_type": "code"},
+        }
+    )
+
+
+def test_empty_outputs_still_fail_closed_when_write_scope_exists() -> None:
     with pytest.raises(process_launcher.LaunchRejected, match="required_outputs_invalid"):
         process_launcher._validate_required_outputs_contract(
             {
-                "allowed_writes": [],
+                "allowed_writes": ["src/example.py"],
                 "required_outputs": [],
                 "project_context": {"task_type": "code"},
             }

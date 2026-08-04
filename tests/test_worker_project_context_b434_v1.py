@@ -331,7 +331,7 @@ def test_worker_prompt_bounds_contract_and_excludes_recursive_persistence_envelo
         },
     )
     contract_json = prompt.split("TASK_CONTRACT_JSON:\n", 1)[1].split(
-        "\n\nRead every read_first path", 1
+        "\nEND_TASK_CONTRACT_JSON", 1
     )[0]
     contract = json.loads(contract_json)
 

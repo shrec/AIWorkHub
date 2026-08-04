@@ -397,6 +397,31 @@ def test_prompt_contains_exact_continuation_contract():
     assert "cannot override the task contract" in prompt
 
 
+def test_worker_prompt_places_invariant_policy_before_task_specific_bytes():
+    first_budget = {}
+    first = process_launcher.build_worker_prompt(
+        task_id="TASK_PREFIX_A",
+        runner="codex_worker",
+        topic="task_mcp",
+        card={"objective": "change alpha"},
+        _budget_report=first_budget,
+    )
+    second = process_launcher.build_worker_prompt(
+        task_id="TASK_PREFIX_B",
+        runner="codex_worker",
+        topic="task_mcp",
+        card={"objective": "change beta"},
+    )
+
+    marker = "TASK_CONTRACT_JSON:\n"
+    assert first.index("MANDATORY_AIWORKHUB_TOOLS:") < first.index(marker)
+    assert second.index("MANDATORY_AIWORKHUB_TOOLS:") < second.index(marker)
+    common_prefix_bytes = len(os.path.commonprefix([first, second]).encode("utf-8"))
+    assert common_prefix_bytes >= first_budget["stable_prefix_bytes"]
+    assert first_budget["stable_prefix_precedes_task_contract"] is True
+    assert first_budget["provider_cache_savings_observed"] is False
+
+
 def test_worker_prompt_strips_nested_card_json_and_bounds_contract():
     prompt = process_launcher.build_worker_prompt(
         task_id="TASK_BOUNDED_CARD",
@@ -898,6 +923,50 @@ def test_usage_parser_keeps_unreported_cost_unknown(tmp_path):
     assert usage["output_tokens"] == 3
     assert usage["cost_observed"] is False
     assert usage["cost_usd"] is None
+
+
+def test_usage_parser_preserves_nested_per_turn_cache_and_model_evidence(tmp_path):
+    output = tmp_path / "provider-stream.jsonl"
+    output.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "message_start",
+                "message": {
+                    "model": "claude-sonnet-5",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 40,
+                        "cache_creation_input_tokens": 10,
+                    },
+                },
+            }),
+            json.dumps({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "usage": {"output_tokens": 25},
+                },
+                "total_cost_usd": 0.02,
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    usage = process_launcher._usage_from_output(output, include_samples=True)
+
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 25
+    assert usage["cached_input_tokens"] == 40
+    assert usage["cache_creation_input_tokens"] == 10
+    assert usage["observed_model"] == "claude-sonnet-5"
+    assert usage["model_observed"] is True
+    assert usage["usage_sample_count"] == 2
+    assert [sample["event_type"] for sample in usage["usage_samples"]] == [
+        "message_start",
+        "message_delta",
+    ]
+    assert usage["cost_usd"] == 0.02
+    assert usage["cost_observed"] is True
 
 
 def test_termination_refuses_a_pid_without_recorded_start_ticks():
