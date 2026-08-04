@@ -135,6 +135,8 @@
     "elapsed_reduction_percent": 21.537,
     "uncached_input_change_percent": 20.275,
     "manager_acceptance_observed": false,
+    "natural_uncapped": false,
+    "token_budget_pair_parity": false,
     "public_claim_eligible": false
   },
   "callback_reliability": {

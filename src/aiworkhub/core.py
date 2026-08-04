@@ -2605,7 +2605,10 @@ MCP_MANAGER_CONTRACT_BANNER = (
     "stop at review_ready; every review/terminal transition emits a callback, "
     "but only the current verified manager may inspect evidence and accept or "
     "reject it. Never invent task/status/callback IDs, infer state from prose, "
-    "or recreate a task after a lost acknowledgement—reconcile the same ID."
+    "or recreate a task after a lost acknowledgement—reconcile the same ID. "
+    "Tasks are uncapped by default; never infer or auto-assign a token cap "
+    "unless the owner supplies an exact budget or repository policy "
+    "pre-registers one."
 )
 
 
@@ -2638,7 +2641,17 @@ def manager_bootstrap() -> dict[str, Any]:
             ],
             "task_state_machine": {
                 "create": "aiworkhub_task_create creates/reconciles one canonical pending card; it does not run the model",
-                "token_budget": "max_live_tokens is optional and explicit; AIWorkHub enforces it only from structured usage observed while the provider is running and labels terminal-only usage posthoc_only",
+                "token_budget": (
+                    "Tasks are uncapped by default. Never infer, estimate, or "
+                    "auto-assign max_live_tokens from task complexity, model, "
+                    "historical usage, or cost. Set it only when the owner "
+                    "explicitly supplies an exact cap or a repository policy "
+                    "pre-registers one; optimize reads, context, edits, retries, "
+                    "and validation instead of truncating useful work. When an "
+                    "authorized cap exists, AIWorkHub enforces it only from "
+                    "structured live provider usage and labels terminal-only "
+                    "usage posthoc_only."
+                ),
                 "claim": "aiworkhub_task_auto_pickup is an optional explicit claim step for one dependency-ready non-colliding card",
                 "launch": "aiworkhub_agent_launch_task is always required; it atomically claims a pending card or attaches the exact prior claim, then starts the worker; only then may runtime truth become processing",
                 "worker_finish": "the worker submits evidence and stops at review_ready or another truthful terminal substatus",

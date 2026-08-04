@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.86] - 2026-08-04
+
+### Changed
+
+- Manager and task-creation contracts now state that tasks are uncapped by
+  default and prohibit inferred or automatically assigned token ceilings.
+  Explicit owner- or repository-policy budgets remain available, while normal
+  efficiency work targets focused context, bounded reads, minimal edits,
+  retries, and validation rather than truncating useful work.
+
+### Fixed
+
+- The semantic-edit pilot ledger now exposes its historical explicit token
+  caps and the `20k` versus `200k` first-pair mismatch. The benchmark checker
+  rejects hidden cap-policy drift and prevents capped evidence from being
+  presented as a natural uncapped result.
+
 ## [0.8.85] - 2026-08-04
 
 ### Fixed

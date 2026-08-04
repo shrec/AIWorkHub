@@ -786,13 +786,50 @@ def test_manager_bootstrap_advertises_create_and_callback_contract(writable_repo
     assert contract["schema_id"] == "aiworkhub.manager_operating_contract.v1"
     assert contract["mandatory"] is True
     assert "Creating a task leaves it pending" in contract["banner"]
+    assert "Tasks are uncapped by default" in contract["banner"]
+    assert "never infer or auto-assign a token cap" in contract["banner"]
     assert "only then may runtime truth become processing" in contract["task_state_machine"]["launch"]
+    token_budget = contract["task_state_machine"]["token_budget"]
+    assert "uncapped by default" in token_budget
+    assert "Never infer, estimate, or auto-assign" in token_budget
+    assert "owner explicitly supplies an exact cap" in token_budget
+    assert "optimize reads, context, edits, retries" in token_budget
     assert "Parallel launch is encouraged" in contract["parallelism"][0]
     assert "task category does not suppress delivery" in contract["callbacks_and_review"][0]
     assert "same task_id" in contract["recovery"][1]
     assert result["workflow"][0].startswith("aiworkhub_manager_source_graph_query")
     assert "aiworkhub_task_create" in result["workflow"]
     assert "aiworkhub_claude_callback_wait" in result["callback"]["claude"]
+
+
+def test_manager_create_task_is_uncapped_by_default(writable_repo, monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "thread_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "codex_vscode_123",
+        },
+    )
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+
+    created = core.create_task(
+        task_id="TASK_DEFAULT_UNCAPPED",
+        title="Default uncapped task",
+        runner="codex_worker",
+        topic="token_economy",
+        objective="Prove task complexity never creates an inferred token cap.",
+        acceptance=["canonical card remains uncapped"],
+        allowed_writes=[],
+        required_outputs=[],
+        task_type="research",
+    )
+
+    assert created["ok"] is True, created
+    card = json.loads(created["stdout"])
+    assert card["token_budget"] is None
 
 
 def test_usage_report_empty_no_events(repo):

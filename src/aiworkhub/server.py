@@ -763,10 +763,15 @@ def aiworkhub_task_create(
     ``depends_on`` (optional) names other task_ids in this repo that must
     finish before this card is Plan-DAG ready; omit it for the pre-DAG
     behavior.
-    ``max_live_tokens`` (optional) is a bounded provider-reported token cap.
-    It is enforced only when the selected provider exposes structured usage
-    while running; terminal-only usage remains posthoc evidence, never a
-    false live-enforcement claim.
+    Tasks are uncapped by default. Never infer, estimate, or auto-assign
+    ``max_live_tokens`` from task complexity, model, historical usage, or
+    cost. Supply it only when the owner explicitly requests an exact cap or a
+    repository policy pre-registers one. Process efficiency must come from
+    focused context, bounded reads, minimal edits, fewer retries, and useful
+    validation rather than from truncating work. An authorized cap is enforced
+    only when the selected provider exposes structured usage while running;
+    terminal-only usage remains posthoc evidence, never a false live-
+    enforcement claim.
     ``required_outputs`` contains only repo-relative file paths or glob
     patterns covered by ``allowed_writes``. Human-readable outcome
     descriptions belong in ``acceptance``; mixing prose into

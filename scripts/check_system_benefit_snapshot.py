@@ -103,6 +103,40 @@ def check(
     paired_reductions = paired_aggregate.get("observed_reduction_percent") or {}
     paired_design = paired_doc.get("design") or {}
     paired_claim = paired_doc.get("claim_status") or {}
+    pair_caps: list[tuple[Any, Any]] = []
+    for pair in paired_doc.get("pairs") or []:
+        if not isinstance(pair, dict):
+            continue
+        focused = pair.get("focused") or {}
+        baseline = pair.get("baseline") or {}
+        pair_caps.append(
+            (
+                focused.get("task_card_max_live_tokens"),
+                baseline.get("task_card_max_live_tokens"),
+            )
+        )
+    natural_uncapped = bool(pair_caps) and all(
+        focused_cap is None and baseline_cap is None
+        for focused_cap, baseline_cap in pair_caps
+    )
+    token_budget_pair_parity = bool(pair_caps) and all(
+        focused_cap == baseline_cap for focused_cap, baseline_cap in pair_caps
+    )
+    if paired_design.get("natural_uncapped") != natural_uncapped:
+        errors.append("semantic_edit_natural_uncapped_mismatch")
+    if paired_design.get("token_budget_pair_parity") != token_budget_pair_parity:
+        errors.append("semantic_edit_token_budget_pair_parity_mismatch")
+    reason_codes = set(paired_claim.get("reason_codes") or [])
+    if not natural_uncapped:
+        for reason in ("explicit_token_caps_present", "not_natural_uncapped_workload"):
+            if reason not in reason_codes:
+                errors.append(f"semantic_edit_missing_reason:{reason}")
+    if not token_budget_pair_parity and "pair_token_budget_mismatch" not in reason_codes:
+        errors.append("semantic_edit_missing_reason:pair_token_budget_mismatch")
+    if (not natural_uncapped or not token_budget_pair_parity) and paired_claim.get(
+        "public_claim_eligible"
+    ) is not False:
+        errors.append("semantic_edit_unsafe_budget_claim")
     paired_expected = {
         "schema_id": paired_doc.get("schema_id"),
         "pair_count": paired_design.get("pair_count"),
@@ -117,6 +151,8 @@ def check(
         "manager_acceptance_observed": paired_design.get(
             "manager_acceptance_observed"
         ),
+        "natural_uncapped": natural_uncapped,
+        "token_budget_pair_parity": token_budget_pair_parity,
         "public_claim_eligible": paired_claim.get("public_claim_eligible"),
     }
     for key, expected_value in paired_expected.items():
@@ -126,7 +162,10 @@ def check(
                 errors.append(f"semantic_edit_paired_snapshot_mismatch:{key}")
         elif actual_value != expected_value:
             errors.append(f"semantic_edit_paired_snapshot_mismatch:{key}")
-    expected_artifact = semantic_edit_path.relative_to(ROOT).as_posix()
+    try:
+        expected_artifact = semantic_edit_path.relative_to(ROOT).as_posix()
+    except ValueError:
+        expected_artifact = semantic_edit_path.as_posix()
     if paired.get("artifact") != expected_artifact:
         errors.append("semantic_edit_paired_artifact_path_mismatch")
 

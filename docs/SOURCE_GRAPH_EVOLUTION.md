@@ -14,7 +14,10 @@ That ratio measures retrieval compression, not an agent task.
 Every optimization is evaluated with paired runs:
 
 - the same frozen repository revision and task specification;
-- the same provider, model, live-token ceiling, timeout and validation;
+- the same provider, model, timeout, validation and token-budget policy;
+- normal benchmarks are uncapped; a ceiling is allowed only when the owner or
+  the frozen benchmark protocol explicitly pre-registers the same exact cap
+  for both arms, and capped evidence is reported separately from natural use;
 - a fresh isolated worktree and provider session for each arm;
 - `raw` arm: bounded file discovery/read tools, Source Graph unavailable;
 - `graph` arm: Source Graph available under the normal worker policy;

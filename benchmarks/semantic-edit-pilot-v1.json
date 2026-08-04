@@ -12,7 +12,10 @@
     "randomized": false,
     "order_balanced": false,
     "manager_acceptance_observed": false,
-    "cost_observed": false
+    "cost_observed": false,
+    "natural_uncapped": false,
+    "token_budget_policy": "legacy_explicit_caps_mixed",
+    "token_budget_pair_parity": false
   },
   "pairs": [
     {
@@ -26,7 +29,8 @@
         "output_tokens": 1113,
         "total_tokens": 130302,
         "duration_seconds": 33.476743,
-        "semantic_edit_receipt_observed": false
+        "semantic_edit_receipt_observed": false,
+        "task_card_max_live_tokens": 20000
       },
       "baseline": {
         "task_id": "CODEX_GPT55_AIWORKHUB_SEMANTIC_EDIT_AB_B_20260804_V1",
@@ -37,7 +41,8 @@
         "output_tokens": 1312,
         "total_tokens": 178356,
         "duration_seconds": 48.323995,
-        "semantic_edit_receipt_observed": false
+        "semantic_edit_receipt_observed": false,
+        "task_card_max_live_tokens": 200000
       }
     },
     {
@@ -52,6 +57,7 @@
         "total_tokens": 126082,
         "duration_seconds": 39.640331,
         "semantic_edit_receipt_observed": true,
+        "task_card_max_live_tokens": 200000,
         "semantic_edit_bytes": {
           "file_bytes": 15092,
           "old_region_bytes": 218,
@@ -69,6 +75,7 @@
         "total_tokens": 175516,
         "duration_seconds": 44.862172,
         "semantic_edit_receipt_observed": false,
+        "task_card_max_live_tokens": 200000,
         "read_evidence": {
           "total_reads": 3,
           "total_read_bytes": 15537,
@@ -112,9 +119,12 @@
       "manager_acceptance_not_observed_in_ledger",
       "one_focused_run_predates_authenticated_semantic_edit_receipt",
       "single_model_single_task_family",
-      "cost_not_observed"
+      "cost_not_observed",
+      "explicit_token_caps_present",
+      "pair_token_budget_mismatch",
+      "not_natural_uncapped_workload"
     ],
-    "allowed_interpretation": "preliminary_observed_pilot_only",
+    "allowed_interpretation": "historical_capped_pilot_observation_only",
     "forbidden_interpretations": [
       "universal_token_savings_multiplier",
       "causal_quality_improvement",
