@@ -771,7 +771,10 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
         "cache_creation_input_tokens": 0,
         "usage_observed": False,
         "cache_metrics_observed": False,
-        "cost_usd": 0.0,
+        # Unknown cost is not a measured zero.  Keep it nullable in process
+        # evidence; the canonical numeric ledger receives 0 only alongside
+        # cost_observed=false because its storage contract is numeric.
+        "cost_usd": None,
         "cost_observed": False,
     }
     if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
@@ -874,7 +877,10 @@ def _usage_from_output(path: Path) -> dict[str, Any]:
                 break
         if raw_cost is not None:
             result["cost_observed"] = True
-            result["cost_usd"] = max(result["cost_usd"], as_float(raw_cost))
+            result["cost_usd"] = max(
+                float(result["cost_usd"] or 0.0),
+                as_float(raw_cost),
+            )
     return result
 
 
@@ -1926,6 +1932,9 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         "reason": "",
         "satisfaction_by_tool": {},
         "injected_context_acknowledged": False,
+        "observation_only": not gated,
+        "telemetry_observed": False,
+        "telemetry_reason": "",
         "policy_warning": False,
         "policy_warning_count": 0,
         "warnings": [],
@@ -1949,13 +1958,13 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
         result["satisfied"] = False
         result["reason"] = policy_error
         return result
-    if not gated:
-        return result
     ledger_path = worker_mcp_meta.get("audit_ledger_path")
     key_path = worker_mcp_meta.get("audit_hmac_key_path")
     if not ledger_path or not key_path:
-        result["satisfied"] = False
-        result["reason"] = "worker_mcp_runtime_not_provisioned"
+        result["telemetry_reason"] = "worker_mcp_runtime_not_provisioned"
+        if gated:
+            result["satisfied"] = False
+            result["reason"] = "worker_mcp_runtime_not_provisioned"
         return result
     verification = worker_ai_tools_mcp.verify_audit_ledger(
         Path(str(ledger_path)),
@@ -1968,6 +1977,10 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     # Bounded/redacted by construction: verify_audit_ledger never returns raw
     # paths, prompts, or database contents -- only counts and a short reason.
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
+    result["telemetry_observed"] = bool(verification.get("ok"))
+    result["telemetry_reason"] = str(verification.get("reason") or "")
+    if not gated:
+        return result
     successful = verification.get("successful_call_count_by_tool") or {}
     # Injected context accelerates startup but does not prove continuous tool
     # use.  In particular, Source Graph must have a fresh authenticated worker
@@ -3674,7 +3687,11 @@ class ProcessManager:
                 "--total-tokens", str(total_input + int(usage["output_tokens"])),
                 "--cached-input-tokens", str(usage["cached_input_tokens"]),
                 "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
-                "--cost-usd", str(usage["cost_usd"]),
+                "--cost-usd", str(
+                    float(usage["cost_usd"] or 0.0)
+                    if usage.get("cost_observed")
+                    else 0.0
+                ),
             ]
             if usage.get("cache_metrics_observed"):
                 args.append("--cache-metrics-observed")

@@ -128,7 +128,13 @@ def test_injected_ai_memory_zero_hit_is_valid(tmp_path, monkeypatch):
 
 def test_research_task_reports_acknowledged_injected_context_without_becoming_gated(
     tmp_path,
+    monkeypatch,
 ):
+    _patch_verify(
+        monkeypatch,
+        live_source_graph=1,
+        successful={"source_graph": 1},
+    )
     bundle = _sha()
     stdout = _write_receipt(tmp_path, bundle, section_count=1)
     sections = _sections(("source_graph", True, 3, ""))
@@ -139,7 +145,6 @@ def test_research_task_reports_acknowledged_injected_context_without_becoming_ga
             bundle_sha=bundle,
             sections=sections,
             stdout=stdout,
-            runtime=False,
             task_type="research",
         ),
         "req",
@@ -148,6 +153,9 @@ def test_research_task_reports_acknowledged_injected_context_without_becoming_ga
     assert gate["gated"] is False
     assert gate["satisfied"] is True
     assert gate["injected_context_acknowledged"] is True
+    assert gate["observation_only"] is True
+    assert gate["telemetry_observed"] is True
+    assert gate["verification"]["live_source_graph_calls"] == 1
 
 
 # --- FAIL: not injected / degraded, no live call ---------------------------

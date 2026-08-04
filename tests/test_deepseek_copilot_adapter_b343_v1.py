@@ -656,7 +656,8 @@ def test_usage_parser_invents_nothing_when_no_usage(tmp_path):
     usage = process_launcher._usage_from_output(output)
     assert usage["input_tokens"] == 0
     assert usage["output_tokens"] == 0
-    assert usage["cost_usd"] == 0.0
+    assert usage["cost_usd"] is None
+    assert usage["cost_observed"] is False
 
 
 # ---------------------------------------------------------------------------

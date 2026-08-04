@@ -799,6 +799,25 @@ def test_usage_parser_reads_claude_result_json(tmp_path):
     }
 
 
+def test_usage_parser_keeps_unreported_cost_unknown(tmp_path):
+    output = tmp_path / "usage-without-cost.json"
+    output.write_text(
+        json.dumps({
+            "type": "result",
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+        }),
+        encoding="utf-8",
+    )
+
+    usage = process_launcher._usage_from_output(output)
+
+    assert usage["usage_observed"] is True
+    assert usage["input_tokens"] == 12
+    assert usage["output_tokens"] == 3
+    assert usage["cost_observed"] is False
+    assert usage["cost_usd"] is None
+
+
 def test_termination_refuses_a_pid_without_recorded_start_ticks():
     """A bare pid is not an identity, so it must never authorise a kill.
 
