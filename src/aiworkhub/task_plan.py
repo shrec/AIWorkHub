@@ -306,6 +306,17 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         reason = str(blocker.get("reason") or blocker.get("kind") or "launch_blocked")
         operational_blockers[tid] = reason[:500]
     operational_blocked_task_ids = sorted(operational_blockers)
+    # A pending pre-claim operational blocker is intentionally excluded from
+    # automatic ``ready`` selection so a broken adapter cannot create a retry
+    # loop. It is nevertheless eligible for an explicit exact launch, whose
+    # claim path clears the historical blocker and re-runs current preflight.
+    # Surface that recovery path separately instead of presenting the task as
+    # an opaque permanent blocker.
+    explicit_retry_task_ids = sorted(
+        tid
+        for tid in operational_blocked_task_ids
+        if lifecycle.get(tid) == "pending"
+    )
     dependency_blocked_ids = sorted(tid for tid, value in blockers.items() if value)
     lifecycle_blocked_ids = sorted(
         tid for tid, value in lifecycle.items() if value == "blocked"
@@ -338,6 +349,8 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "operational_blockers": operational_blockers,
         "operational_blocked_task_ids": operational_blocked_task_ids,
         "operational_blocked_count": len(operational_blocked_task_ids),
+        "explicit_retry_task_ids": explicit_retry_task_ids,
+        "explicit_retry_count": len(explicit_retry_task_ids),
         "orphaned_processing": orphaned_processing_task_ids,
         "orphaned_processing_count": len(orphaned_processing_task_ids),
         "edge_count": sum(len(value) for value in dependencies.values()),

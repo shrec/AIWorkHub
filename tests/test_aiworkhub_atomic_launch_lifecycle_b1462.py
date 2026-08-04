@@ -279,6 +279,8 @@ def test_plan_surfaces_pending_preclaim_launch_blocker():
     }
     assert snapshot["operational_blocked_count"] == 1
     assert snapshot["blocked_task_ids"] == ["TASK_PRECLAIM_BLOCKED"]
+    assert snapshot["explicit_retry_task_ids"] == ["TASK_PRECLAIM_BLOCKED"]
+    assert snapshot["explicit_retry_count"] == 1
 
 
 def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_path, monkeypatch):

@@ -76,8 +76,12 @@ _DETAIL_TRIM_FIELDS: tuple[str, ...] = (
     "ai_infra_context",
 )
 
-# Bound on the Live Output tool's serialized response.
-MAX_LIVE_OUTPUT_BYTES = 64 * 1024
+# Bound on each incremental Live Output raw-text read. The cursor advances by
+# exactly the delivered raw bytes, so a caller can fetch the next chunk
+# without loss. Keep this materially below the general log-tail bound: JSONL
+# provider streams can represent each token fragment as a full event object,
+# and HTML escaping can expand the serialized response beyond the raw size.
+MAX_LIVE_OUTPUT_BYTES = 8 * 1024
 MAX_MEMORY_ROWS = 200
 MAX_MEMORY_VALUE_CHARS = 4000
 MAX_SESSION_ROWS = 200

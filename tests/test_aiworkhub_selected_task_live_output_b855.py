@@ -208,6 +208,21 @@ def test_mcp_tool_functional(repo, monkeypatch) -> None:
     assert result["authority_flags"]["readonly"] is True
 
 
+def test_mcp_tool_uses_small_incremental_chunk(repo, monkeypatch) -> None:
+    payload = "x" * (dashboard_mcp_app.MAX_LIVE_OUTPUT_BYTES + 100)
+    _seed_task(repo, "TASK_B855_MCP_BOUND", stdout_text=payload)
+    monkeypatch.setattr(dashboard_mcp_app.dashboard, "_default_repo_root", lambda: repo)
+
+    result = dashboard_mcp_app.task_live_output_view(
+        "TASK_B855_MCP_BOUND", cursor=0
+    )
+
+    assert result["ok"] is True
+    assert len(result["output"]) <= dashboard_mcp_app.MAX_LIVE_OUTPUT_BYTES
+    assert result["next_cursor"] == dashboard_mcp_app.MAX_LIVE_OUTPUT_BYTES
+    assert result["truncated"] is True
+
+
 def test_webview_normalizer_handles_nested_provider_json_without_visible_raw_dump() -> None:
     """Regression guard for Claude/Codex/DeepSeek/GLM stringified envelopes.
 
