@@ -5,23 +5,27 @@
 </div>
 
 <p align="center">
-  <strong>The local-first control plane for multi-model software development.</strong><br>
+  <strong>The open-source control plane for multi-model AI coding agents.</strong><br>
   Plan work, delegate it to coding models, preserve project context and accept
   changes only when the evidence passes.
 </p>
 
 <p align="center">
   <a href="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shrec/AIWorkHub/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://shrec.github.io/AIWorkHub/"><img alt="Website" src="https://img.shields.io/badge/website-AIWorkHub-1687e8.svg"></a>
   <a href="https://github.com/shrec/AIWorkHub/releases"><img alt="Release" src="https://img.shields.io/github/v/release/shrec/AIWorkHub?include_prereleases&sort=semver"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2dd4bf.svg"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-38bdf8.svg">
   <img alt="VS Code 1.93+" src="https://img.shields.io/badge/VS%20Code-1.93%2B-0ea5e9.svg">
 </p>
 
-AIWorkHub turns each Git repository into an isolated AI engineering workspace.
-It connects the models already available in VS Code to a repository-scoped task
-queue, Source Graph, Session Manager, AI Memory, knowledge base and review
-inbox. No AIWorkHub cloud account or HTTP service is required.
+AIWorkHub is an open-source, local-first multi-model AI coding agent
+orchestrator for VS Code and MCP. It coordinates Codex, Claude, Copilot,
+DeepSeek and GLM workers through dependency-aware task graphs, durable project
+memory, source-code intelligence and evidence-based review. Each Git repository
+remains an isolated AI engineering workspace; no AIWorkHub cloud account or
+HTTP service is required. Visit the [AIWorkHub product site](https://shrec.github.io/AIWorkHub/)
+or follow the [getting-started guide](docs/GETTING_STARTED.md).
 
 ## Supported models
 

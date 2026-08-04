@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AIWorkHub — Open-Source Multi-Model AI Coding Agent Orchestrator</title>
+  <meta name="description" content="AIWorkHub is an open-source, local-first multi-model AI coding agent orchestrator for VS Code and MCP, with task graphs, durable context, source intelligence and evidence-based review.">
+  <link rel="canonical" href="https://shrec.github.io/AIWorkHub/">
+  <meta name="robots" content="index,follow,max-image-preview:large">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="AIWorkHub">
+  <meta property="og:title" content="AIWorkHub — Multi-Model AI Coding Agent Orchestration">
+  <meta property="og:description" content="Coordinate Codex, Claude, Copilot, DeepSeek and GLM workers from a repository-native VS Code control plane.">
+  <meta property="og:url" content="https://shrec.github.io/AIWorkHub/">
+  <meta property="og:image" content="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AIWorkHub — Multi-Model AI Coding Agent Orchestrator">
+  <meta name="twitter:description" content="Local-first task orchestration, source intelligence, durable context and evidence-based review for coding agents.">
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/screenshots/aiworkhub-self-hosted-dashboard.png">
+  <!-- Add Google and Bing site-verification meta tags here after ownership setup. -->
+  <link rel="stylesheet" href="/AIWorkHub/assets/site.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "name": "AIWorkHub",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Windows, macOS, Linux",
+        "description": "Open-source, local-first multi-model AI coding agent orchestrator for VS Code and MCP.",
+        "url": "https://shrec.github.io/AIWorkHub/",
+        "downloadUrl": "https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub",
+        "softwareRequirements": "Visual Studio Code 1.93 or later",
+        "license": "https://github.com/shrec/AIWorkHub/blob/main/LICENSE",
+        "isAccessibleForFree": true
+      },
+      {
+        "@type": "SoftwareSourceCode",
+        "name": "AIWorkHub",
+        "codeRepository": "https://github.com/shrec/AIWorkHub",
+        "programmingLanguage": ["Python", "JavaScript", "Go"],
+        "runtimePlatform": "Visual Studio Code and Model Context Protocol",
+        "license": "https://github.com/shrec/AIWorkHub/blob/main/LICENSE",
+        "url": "https://shrec.github.io/AIWorkHub/"
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <header class="site-header"><div class="container nav">
+    <a class="brand" href="/AIWorkHub/"><span class="brand-mark">A</span>AIWorkHub</a>
+    <nav class="nav-links" aria-label="Primary navigation">
+      <a href="/AIWorkHub/docs/">Docs</a><a href="/AIWorkHub/source-graph/">Source Graph</a><a href="https://github.com/shrec/AIWorkHub">GitHub</a>
+      <a class="button" href="https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub">Install</a>
+    </nav>
+  </div></header>
+
+  <main>
+    <section class="hero"><div class="container hero-grid">
+      <div>
+        <span class="eyebrow">Open source · Local first · Repository native</span>
+        <h1>One control plane for your coding models.</h1>
+        <p class="hero-copy">AIWorkHub is an open-source multi-model AI coding agent orchestrator for VS Code and MCP. Coordinate Codex, Claude, Copilot, DeepSeek and GLM workers through dependency-aware tasks, durable project context, source-code intelligence and evidence-based review.</p>
+        <div class="actions">
+          <a class="button primary" href="https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub">Install from VS Code Marketplace</a>
+          <a class="button" href="/AIWorkHub/docs/">Read the documentation</a>
+        </div>
+      </div>
+      <div class="hero-panel">
+        <p class="panel-label">AIWorkHub managing its own repository</p>
+        <img src="/AIWorkHub/assets/screenshots/aiworkhub-self-hosted-dashboard.png" alt="AIWorkHub dashboard showing repository tasks, source graph, context stores, preflight and callback health" width="1262" height="968">
+      </div>
+    </div></section>
+
+    <section class="section"><div class="container">
+      <div class="section-heading"><span class="eyebrow">The engineering loop</span><h2>Delegate work without giving up authority.</h2><p>Every repository owns its task state, indexes, memories, callbacks and audit trail. Models work in bounded scopes; the manager accepts changes only after evidence is checked.</p></div>
+      <div class="flow"><div>Plan a dependency-aware task</div><div>Choose an available model route</div><div>Work in an isolated scope</div><div>Collect diff, tests and receipts</div><div>Accept, reject or rework</div></div>
+    </div></section>
+
+    <section class="section"><div class="container callout">
+      <span class="eyebrow">Built from a real engineering bottleneck</span>
+      <h2>Your coding agents can write code. Who keeps the work coherent?</h2>
+      <p>AIWorkHub began while managing long-running, multi-model development: decisions disappeared after context compaction, repositories were scanned repeatedly, parallel changes collided, session knowledge was lost and a model's “done” still required manual proof.</p>
+      <p><strong>I did not build AIWorkHub to demonstrate multi-agent orchestration.</strong> I built it because I needed several coding models to work on real repositories without losing decisions, colliding with each other or asking me to trust unverified completion claims.</p>
+      <p>Task DAGs, Source Graph, Manager Context Graph, durable memory, callbacks, isolated workers and evidence receipts are direct answers to those failures—not a collection of unrelated agent-demo features.</p>
+    </div></section>
+
+    <section class="section"><div class="container">
+      <div class="section-heading"><span class="eyebrow">Product surfaces</span><h2>Built for real multi-agent coding workflows.</h2></div>
+      <div class="grid-3">
+        <article class="card"><span class="number">01</span><h3><a href="/AIWorkHub/ai-coding-agent-orchestration/">Agent orchestration</a></h3><p>Repository-bound tasks, dependency planning, model routing, bounded execution and callback delivery.</p></article>
+        <article class="card"><span class="number">02</span><h3><a href="/AIWorkHub/source-graph/">Source Graph</a></h3><p>Structural code context through focused, sliced, impact, trace and bundle queries instead of repeated broad scans.</p></article>
+        <article class="card"><span class="number">03</span><h3><a href="/AIWorkHub/coding-agent-context-memory/">Durable context</a></h3><p>Separate Session Manager, AI Memory, knowledge base and manager-only Context Graph authorities.</p></article>
+        <article class="card"><span class="number">04</span><h3><a href="/AIWorkHub/evidence-based-code-review/">Evidence-based review</a></h3><p>Review diffs, tests, logs, artifacts, tool-use receipts and approval history—not model self-reports.</p></article>
+        <article class="card"><span class="number">05</span><h3><a href="/AIWorkHub/multi-agent-coding/">Multi-agent planning</a></h3><p>Parallelize independent cards while dependency and write-scope collision checks preserve task truth.</p></article>
+        <article class="card"><span class="number">06</span><h3><a href="/AIWorkHub/vscode-extension/">VS Code and Remote SSH</a></h3><p>Use the editor models and authenticated CLIs you already have across Windows, macOS, Linux and Remote SSH.</p></article>
+      </div>
+    </div></section>
+
+    <section class="section"><div class="container callout">
+      <span class="eyebrow">Context accounting</span><h2>Measure context evidence, not marketing claims.</h2>
+      <p>AIWorkHub distinguishes requested and delivered bytes, acknowledged tool receipts, truncation and degraded reasons. Its telemetry is designed to support honest ablation benchmarks instead of inventing unverifiable token-savings figures.</p>
+      <div class="actions"><a class="button primary" href="https://github.com/shrec/AIWorkHub">Explore the source</a><a class="button" href="/AIWorkHub/docs/">Start with the guide</a></div>
+    </div></section>
+  </main>
+
+  <footer class="site-footer"><div class="container footer-grid"><span>AIWorkHub · MIT licensed</span><span><a href="https://github.com/shrec/AIWorkHub">GitHub</a> · <a href="https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub">Marketplace</a> · <a href="/AIWorkHub/docs/">Documentation</a></span></div></footer>
+</body>
+</html>

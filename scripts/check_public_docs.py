@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -25,8 +26,26 @@ PUBLIC_DOCS = tuple(
         "docs/PRODUCT_ROADMAP.md",
     )
 )
+SITE_BASE = "https://shrec.github.io/AIWorkHub/"
+PUBLIC_SITE_PAGES = {
+    "site/index.html": SITE_BASE,
+    "site/ai-coding-agent-orchestration/index.html": (
+        SITE_BASE + "ai-coding-agent-orchestration/"
+    ),
+    "site/multi-agent-coding/index.html": SITE_BASE + "multi-agent-coding/",
+    "site/coding-agent-context-memory/index.html": (
+        SITE_BASE + "coding-agent-context-memory/"
+    ),
+    "site/source-graph/index.html": SITE_BASE + "source-graph/",
+    "site/evidence-based-code-review/index.html": (
+        SITE_BASE + "evidence-based-code-review/"
+    ),
+    "site/vscode-extension/index.html": SITE_BASE + "vscode-extension/",
+    "site/docs/index.html": SITE_BASE + "docs/",
+}
 LINK_RE = re.compile(r"!?\[[^]]*\]\(([^)]+)\)")
 HTML_IMAGE_RE = re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)
+SITE_LINK_RE = re.compile(r"(?:href|src)=[\"'](/AIWorkHub/[^\"'#?]*)[\"']", re.IGNORECASE)
 FORBIDDEN_README = {
     r"\bB\d{3,}\b": "internal task/bug identifier",
     r"(?:^|[\s`(])AITools/": "legacy host-only AITools path",
@@ -72,6 +91,70 @@ def check(root: Path = ROOT) -> list[str]:
         for pattern, label in FORBIDDEN_README.items():
             if re.search(pattern, text):
                 errors.append(f"README.md: contains {label}")
+
+    canonical_urls: set[str] = set()
+    for relative, canonical in PUBLIC_SITE_PAGES.items():
+        page = root / relative
+        if not page.is_file():
+            errors.append(f"missing public site page: {relative}")
+            continue
+        text = page.read_text(encoding="utf-8")
+        required_fragments = {
+            "HTML title": "<title>",
+            "meta description": '<meta name="description"',
+            "canonical URL": f'<link rel="canonical" href="{canonical}">',
+            "Open Graph title": '<meta property="og:title"',
+            "Open Graph URL": f'<meta property="og:url" content="{canonical}">',
+            "Open Graph image": '<meta property="og:image"',
+            "Twitter card": '<meta name="twitter:card"',
+            "index directive": '<meta name="robots" content="index,follow',
+        }
+        for label, fragment in required_fragments.items():
+            if fragment not in text:
+                errors.append(f"{relative}: missing {label}")
+        for raw in SITE_LINK_RE.findall(text):
+            deployed_path = raw.removeprefix("/AIWorkHub/")
+            source_target = root / "site" / deployed_path
+            if raw.endswith("/"):
+                source_target = source_target / "index.html"
+            copied_asset = root / "docs" / deployed_path
+            if not source_target.exists() and not copied_asset.exists():
+                errors.append(f"{relative}: broken deployed site link {raw!r}")
+        canonical_urls.add(canonical)
+
+    home = root / "site/index.html"
+    if home.is_file():
+        text = home.read_text(encoding="utf-8")
+        for schema_type in ('"SoftwareApplication"', '"SoftwareSourceCode"'):
+            if schema_type not in text:
+                errors.append(f"site/index.html: missing JSON-LD {schema_type}")
+
+    sitemap = root / "site/sitemap.xml"
+    if not sitemap.is_file():
+        errors.append("missing public site sitemap: site/sitemap.xml")
+    else:
+        try:
+            tree = ET.parse(sitemap)
+            namespace = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            sitemap_urls = {
+                str(node.text or "").strip()
+                for node in tree.findall("sm:url/sm:loc", namespace)
+            }
+            if sitemap_urls != canonical_urls:
+                missing = sorted(canonical_urls - sitemap_urls)
+                extra = sorted(sitemap_urls - canonical_urls)
+                errors.append(
+                    "site/sitemap.xml: canonical URL mismatch "
+                    f"missing={missing} extra={extra}"
+                )
+        except (ET.ParseError, OSError) as exc:
+            errors.append(f"site/sitemap.xml: invalid XML: {exc}")
+
+    robots = root / "site/robots.txt"
+    if not robots.is_file():
+        errors.append("missing public site robots.txt")
+    elif f"Sitemap: {SITE_BASE}sitemap.xml" not in robots.read_text(encoding="utf-8"):
+        errors.append("site/robots.txt: missing canonical sitemap URL")
     return errors
 
 
