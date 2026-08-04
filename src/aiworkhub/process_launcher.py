@@ -200,6 +200,7 @@ TERMINAL_PROCESS_STATES = {
     "exited_without_review",
     "timed_out",
     "token_budget_exceeded",
+    "output_budget_exceeded",
     "cancelled",
     "launch_failed",
     "worker_failed",
@@ -4191,6 +4192,15 @@ class ProcessManager:
                     + ":accepted_total_tokens="
                     + str(budget.get("accepted_total_tokens") or "unknown")
                 )
+            elif supervisor_state == "output_budget_exceeded":
+                terminal_state = "output_budget_exceeded"
+                budget = supervisor_status.get("output_budget") or {}
+                error = error or (
+                    "output_budget_exceeded:cap_bytes="
+                    + str(budget.get("cap_bytes") or "unknown")
+                    + ":observed_bytes="
+                    + str(budget.get("observed_bytes") or "unknown")
+                )
             elif supervisor_state == "cancelled":
                 terminal_state = "cancelled"
                 error = error or "worker_cancelled"
@@ -4281,6 +4291,7 @@ class ProcessManager:
                             "exit_code": exit_code,
                             "liveness_lost": liveness_lost,
                             "token_budget": supervisor_status.get("token_budget"),
+                            "output_budget": supervisor_status.get("output_budget"),
                             **_declared_failure_denominators(metadata),
                         }
                         release_result = self._terminal_failure_exact(

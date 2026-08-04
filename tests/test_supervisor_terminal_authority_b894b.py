@@ -575,6 +575,55 @@ def test_live_token_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeyp
     assert card["worker_status"] == "token_budget_exceeded"
 
 
+def test_output_byte_cap_outcome_reaches_truthful_blocked_state(tmp_path, monkeypatch):
+    card = _card()
+    manager = _build_manager(tmp_path, card)
+    monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: False)
+    failure_calls = []
+
+    def fake_mark_terminal_failure(
+        repo, task_id, runner, substatus, *, evidence=None, request_id=""
+    ):
+        failure_calls.append((task_id, runner, substatus, request_id, evidence))
+        card.update({"status": "blocked", "worker_status": substatus})
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_terminal_failure", fake_mark_terminal_failure
+    )
+    request_id = "req-output-byte-cap"
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=2_147_483_048,
+        supervisor_ticks=999_999_947,
+        supervisor_status={
+            "state": "output_budget_exceeded",
+            "exit_code": 121,
+            "error": "output_budget_exceeded:captured_output_bytes",
+            "output_budget": {
+                "cap_bytes": 2048,
+                "observed_bytes": 4096,
+                "byte_labels_are_token_truth": False,
+            },
+        },
+    )
+
+    result = manager._finalize_isolated_request(request_id)
+
+    assert result["state"] == "output_budget_exceeded"
+    assert result["error"] == (
+        "output_budget_exceeded:captured_output_bytes"
+    )
+    assert failure_calls[0][2] == "output_budget_exceeded"
+    assert failure_calls[0][4]["output_budget"]["observed_bytes"] == 4096
+    assert failure_calls[0][4]["output_budget"]["byte_labels_are_token_truth"] is False
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "output_budget_exceeded"
+
+
 @pytest.mark.parametrize("operation", ["archived", "superseded"])
 def test_failure_outcome_preserves_already_finalized_task(
     tmp_path, monkeypatch, operation,

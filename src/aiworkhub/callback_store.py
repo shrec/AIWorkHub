@@ -45,6 +45,7 @@ CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = frozenset({
     "scope_rejected",
     "timed_out",
     "token_budget_exceeded",
+    "output_budget_exceeded",
     "cancelled",
 })
 
@@ -389,6 +390,7 @@ def _task_still_in_matching_terminal_state(
             "launch_failed",
             "timed_out",
             "token_budget_exceeded",
+            "output_budget_exceeded",
             "cancelled",
         }
     return current_status == "review"
@@ -421,6 +423,7 @@ _CALLBACK_TRANSITION_MAP: dict[str, str] = {
     "scope_rejected": "scope_rejected",
     "timed_out": "timed_out",
     "token_budget_exceeded": "token_budget_exceeded",
+    "output_budget_exceeded": "output_budget_exceeded",
     "cancelled": "cancelled",
     "canceled": "cancelled",
 }

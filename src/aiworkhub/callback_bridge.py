@@ -82,6 +82,7 @@ CALLBACK_ELIGIBLE_STATES: frozenset[str] = frozenset({
     "scope_rejected",
     "timed_out",
     "token_budget_exceeded",
+    "output_budget_exceeded",
     "cancelled",
 })
 

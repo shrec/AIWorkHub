@@ -3745,6 +3745,7 @@ _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
     {
         "cancelled",
         "timed_out",
+        "output_budget_exceeded",
         "launch_failed",
         "worker_failed",
         "process_lost",

@@ -144,6 +144,31 @@ def test_supervisor_enforces_provider_reported_live_token_cap(tmp_path: Path) ->
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
 
 
+def test_supervisor_enforces_output_bytes_without_claiming_token_truth(
+    tmp_path: Path,
+) -> None:
+    script = (
+        "import sys,time; "
+        "sys.stdout.write('x' * 4096); sys.stdout.flush(); time.sleep(30)"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(
+        max_total_output_bytes=2048,
+        heartbeat_interval_seconds=0.05,
+    )
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 121, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["state"] == "output_budget_exceeded"
+    assert status["output_budget"]["cap_bytes"] == 2048
+    assert status["output_budget"]["observed_bytes"] >= 4096
+    assert status["output_budget"]["byte_labels_are_token_truth"] is False
+    assert status["token_budget"]["telemetry_observed"] is False
+
+
 def test_terminal_only_usage_is_posthoc_and_never_claimed_enforced(tmp_path: Path) -> None:
     script = "import json; print(json.dumps({'usage': {'input_tokens': 9, 'output_tokens': 4}}))"
     spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])

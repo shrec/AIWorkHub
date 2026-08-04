@@ -54,7 +54,9 @@ _PR_SET_PDEATHSIG = 1
 # model turn, dashboard read, or MCP request.
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15.0
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_TOTAL_OUTPUT_BYTES = 8 * 1024 * 1024
 MIN_MAX_OUTPUT_BYTES = 1024
+MAX_TOTAL_OUTPUT_BYTES = 1024 * 1024 * 1024
 _TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 MAX_USAGE_SCAN_BYTES = 32 * 1024 * 1024
@@ -412,6 +414,7 @@ class _BoundedTailWriter:
         self.max_bytes = max(MIN_MAX_OUTPUT_BYTES, int(max_bytes))
         self.keep_bytes = max(512, self.max_bytes // 2)
         self.dropped_bytes = 0
+        self.received_bytes = 0
         self.error = ""
 
     def _compact(self, handle: BinaryIO) -> None:
@@ -447,6 +450,7 @@ class _BoundedTailWriter:
                     )
                     if not chunk:
                         break
+                    self.received_bytes += len(chunk)
                     handle.write(chunk)
                     self._compact(handle)
         except Exception as exc:  # drain to EOF even when persistence fails
@@ -478,6 +482,16 @@ def supervise(spec: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES
     max_output_bytes = max(MIN_MAX_OUTPUT_BYTES, max_output_bytes)
+    try:
+        max_total_output_bytes = int(
+            spec.get("max_total_output_bytes") or DEFAULT_MAX_TOTAL_OUTPUT_BYTES
+        )
+    except (TypeError, ValueError):
+        max_total_output_bytes = DEFAULT_MAX_TOTAL_OUTPUT_BYTES
+    max_total_output_bytes = max(
+        MIN_MAX_OUTPUT_BYTES,
+        min(max_total_output_bytes, MAX_TOTAL_OUTPUT_BYTES),
+    )
     token_cap, adapter_id = _token_budget_config(spec)
     token_state = TokenBudgetState(cap_tokens=token_cap)
     token_decisions: list[TokenBudgetDecision] = []
@@ -592,6 +606,13 @@ def supervise(spec: dict[str, Any]) -> int:
                 final_state = "timed_out"
                 returncode = _terminate_child(child)
                 break
+            observed_output_bytes = (
+                stdout_capture.received_bytes + stderr_capture.received_bytes
+            )
+            if observed_output_bytes > max_total_output_bytes:
+                final_state = "output_budget_exceeded"
+                returncode = _terminate_child(child)
+                break
             now_monotonic = time.monotonic()
             if now_monotonic >= next_heartbeat_monotonic:
                 # Heartbeat is a supervisor-owned liveness signal only --
@@ -643,6 +664,14 @@ def supervise(spec: dict[str, Any]) -> int:
                         token_decisions,
                         subject="worker-request",
                     ),
+                    "output_budget": {
+                        "cap_bytes": max_total_output_bytes,
+                        "observed_bytes": (
+                            stdout_capture.received_bytes
+                            + stderr_capture.received_bytes
+                        ),
+                        "byte_labels_are_token_truth": False,
+                    },
                 })
                 next_heartbeat_monotonic = now_monotonic + heartbeat_interval
             time.sleep(POLL_SECONDS)
@@ -654,6 +683,14 @@ def supervise(spec: dict[str, Any]) -> int:
         ]
         final_stdout_bytes = _file_size(stdout_path)
         final_stderr_bytes = _file_size(stderr_path)
+        final_output_received_bytes = (
+            stdout_capture.received_bytes + stderr_capture.received_bytes
+        )
+        if (
+            final_state == "exited"
+            and final_output_received_bytes > max_total_output_bytes
+        ):
+            final_state = "output_budget_exceeded"
         if (
             final_stdout_bytes != last_stdout_bytes
             or final_stderr_bytes != last_stderr_bytes
@@ -699,9 +736,18 @@ def supervise(spec: dict[str, Any]) -> int:
                 token_decisions,
                 subject="worker-request",
             ),
+            "output_budget": {
+                "cap_bytes": max_total_output_bytes,
+                "observed_bytes": final_output_received_bytes,
+                "stdout_received_bytes": stdout_capture.received_bytes,
+                "stderr_received_bytes": stderr_capture.received_bytes,
+                "byte_labels_are_token_truth": False,
+            },
             "error": (
                 "token_budget_exceeded:provider_reported_live_usage"
                 if final_state == "token_budget_exceeded"
+                else "output_budget_exceeded:captured_output_bytes"
+                if final_state == "output_budget_exceeded"
                 else ""
             ),
         })
@@ -731,6 +777,8 @@ def supervise(spec: dict[str, Any]) -> int:
         return 124
     if final_state == "token_budget_exceeded":
         return 122
+    if final_state == "output_budget_exceeded":
+        return 121
     return int(returncode)
 
 

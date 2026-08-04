@@ -193,6 +193,7 @@ def test_mark_terminal_review_hardcoded_review_ready_regression_guard(tmp_path):
     [
         ("timed_out", "timed_out"),
         ("token_budget_exceeded", "token_budget_exceeded"),
+        ("output_budget_exceeded", "output_budget_exceeded"),
         ("worker_failed", "launch_failed"),
         ("cancelled", "cancelled"),
         ("liveness_lost", "blocked"),
@@ -238,6 +239,9 @@ def test_normalize_callback_transition_public_wrapper_matches_private_map():
     assert callback_store.normalize_callback_transition("process_lost") == "blocked"
     assert callback_store.normalize_callback_transition("token_budget_exceeded") == (
         "token_budget_exceeded"
+    )
+    assert callback_store.normalize_callback_transition("output_budget_exceeded") == (
+        "output_budget_exceeded"
     )
     assert callback_store.normalize_callback_transition("blocked_on_dependency") == "blocked"
     assert callback_store.normalize_callback_transition("") is None

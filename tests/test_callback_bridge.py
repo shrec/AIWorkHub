@@ -365,7 +365,8 @@ def test_production_command_contains_app_server_and_no_rejected_flags():
 def test_callback_eligible_states():
     expected = {
         "review_ready", "blocked", "launch_failed", "validation_failed",
-        "scope_rejected", "timed_out", "token_budget_exceeded", "cancelled",
+        "scope_rejected", "timed_out", "token_budget_exceeded",
+        "output_budget_exceeded", "cancelled",
     }
     assert expected == CALLBACK_ELIGIBLE_STATES
     for ineligible in ("pending", "processing", "done", "review"):

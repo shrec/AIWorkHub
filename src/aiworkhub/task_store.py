@@ -1122,6 +1122,7 @@ def mark_terminal_failure(
     allowed = {
         "timed_out",
         "token_budget_exceeded",
+        "output_budget_exceeded",
         "worker_failed",
         "cancelled",
         "liveness_lost",
