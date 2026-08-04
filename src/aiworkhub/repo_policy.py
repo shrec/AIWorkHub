@@ -428,6 +428,13 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         errors.append("selected_adapter_unsupported")
     elif selected is not None and not selected["launchable"]:
         errors.append("selected_adapter_not_launchable")
+    launchable_routes = [item for item in providers if item.get("launchable")]
+    selected_route_backend = str((selected or {}).get("sandbox_backend") or "")
+    route_enforceable = bool(
+        selected_route_backend and (selected or {}).get("launchable")
+    ) if selected is not None else bool(
+        any(item.get("sandbox_backend") for item in launchable_routes)
+    )
     try:
         callback_health = task_store.callback_bridge_health(root) if readiness.ready else {}
     except (OSError, RuntimeError, ValueError, task_store.TaskStoreError):
@@ -486,9 +493,28 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "ready_for_code": source_graph_ready_for_code,
         },
         "sandbox": {
-            "backend": sandbox_backend,
-            "enforceable": bool(sandbox_backend),
-            "reason": sandbox_error,
+            # Primary fields describe the selected route (or the set of
+            # launchable routes when no adapter is selected), not only native
+            # CLI sandbox availability. This prevents a ready VS Code LM
+            # in-process route from being displayed beside a contradictory
+            # global ``sandbox unenforceable`` warning.
+            "backend": (
+                selected_route_backend
+                if selected is not None
+                else (sandbox_backend or ("route_specific" if route_enforceable else ""))
+            ),
+            "enforceable": route_enforceable,
+            "reason": (
+                str((selected or {}).get("reason") or "")[:200]
+                if selected is not None and not route_enforceable
+                else ("" if route_enforceable else sandbox_error)
+            ),
+            "selected_adapter": str((selected or {}).get("adapter_id") or ""),
+            "selected_backend": selected_route_backend,
+            "native_cli_backend": sandbox_backend,
+            "native_cli_enforceable": bool(sandbox_backend),
+            "native_cli_reason": sandbox_error,
+            "route_aware": True,
         },
         "callback": {
             key: callback_health.get(key)
@@ -505,6 +531,11 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         },
         "workspace_hygiene": hygiene_status,
         "providers": providers,
+        "provider_summary": {
+            "route_count": len(providers),
+            "launchable_route_count": len(launchable_routes),
+            "unavailable_route_count": len(providers) - len(launchable_routes),
+        },
         "selected_adapter": selected,
     }
 

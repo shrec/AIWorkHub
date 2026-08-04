@@ -72,3 +72,27 @@ def test_small_json_remains_complete(renderer) -> None:
 
     assert truncated is False
     assert json.loads(bounded) == {"a": 1, "b": 2}
+
+
+@pytest.mark.parametrize("mode", ["focus", "slice"])
+def test_source_graph_orientation_modes_use_smallest_output_cap(mode) -> None:
+    assert worker_ai_tools_mcp._source_graph_output_cap(mode) == 8 * 1024
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "context", "impact", "trace", "deps", "coverage", "testmap",
+        "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    ],
+)
+def test_source_graph_analysis_modes_use_intermediate_output_cap(mode) -> None:
+    assert worker_ai_tools_mcp._source_graph_output_cap(mode) == 12 * 1024
+
+
+@pytest.mark.parametrize("mode", ["file", "body", "bundle", "hotspots", "stats"])
+def test_source_graph_rich_modes_retain_global_output_cap(mode) -> None:
+    assert (
+        worker_ai_tools_mcp._source_graph_output_cap(mode)
+        == worker_ai_tools_mcp.MAX_TOOL_OUTPUT_BYTES
+    )

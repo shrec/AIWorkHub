@@ -247,10 +247,21 @@ def test_source_graph_telemetry_separates_live_from_injected_and_stale() -> None
 
 def test_source_graph_telemetry_ignores_ungated_tasks() -> None:
     result = dashboard._source_graph_telemetry(
-        {"processes": [_row("DATA", "deepseek_copilot_cli", {"gated": False})]}
+        {"processes": [
+            _row("GATED", "deepseek_copilot_cli", {
+                "gated": True,
+                "source_graph_fresh_calls": 0,
+            }),
+            _row("UNGATED", "deepseek_copilot_cli", {
+                "gated": False,
+                "source_graph_fresh_calls": 5,
+            }),
+        ]}
     )
-    assert result["observed_tasks"] == 1
-    assert result["gated_tasks"] == 0
+    assert result["observed_tasks"] == 2
+    assert result["gated_tasks"] == 1
+    assert result["source_graph_fresh_tasks"] == 0
+    assert result["fresh_rate"] == 0.0
     assert result["live_rate"] == 0.0
     assert result["source_graph_call_gaps"]["alert_state"] == "not_available"
 

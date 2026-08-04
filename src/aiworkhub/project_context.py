@@ -880,7 +880,14 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
                 else authority_repo.relative_to(repo).as_posix()
             ),
         },
+        # Historical key retained for readers of older process events. This
+        # population is tool-section payload before optional zero-hit/dedup
+        # suppression; it is not raw repository-file or counterfactual read
+        # volume.
         "estimated_raw_context_bytes": sum(section["bytes"] for section in raw_sections),
+        "pre_optimization_section_bytes": sum(
+            section["bytes"] for section in raw_sections
+        ),
         "optimized_context_bytes": sum(section["bytes"] for section in sections),
         "optimization": {
             "schema_id": "aiworkhub.task_mcp.project_context_optimization.v1",
@@ -903,11 +910,32 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             "empty_ceremonial_calls_injected": False,
         },
         "estimated_raw_context_vs_bundle_bytes": {
-            "label": "deterministic_byte_estimate_not_token_or_cost_truth",
+            "label": (
+                "pre_optimization_tool_sections_vs_optimized_sections_and_"
+                "bundle_bytes_not_token_or_cost_truth"
+            ),
+            "population_definition": (
+                "tool_section_payload_before_optional_suppression_not_raw_"
+                "repository_files_or_counterfactual_reads"
+            ),
+            "pre_optimization_section_bytes": sum(
+                section["bytes"] for section in raw_sections
+            ),
+            "optimized_section_bytes": sum(section["bytes"] for section in sections),
             "raw_context_bytes": sum(section["bytes"] for section in raw_sections),
             "optimized_context_bytes": sum(section["bytes"] for section in sections),
             "bundle_bytes": len(bundle.encode("utf-8")),
+            "optimization_delta_bytes": (
+                sum(section["bytes"] for section in raw_sections)
+                - sum(section["bytes"] for section in sections)
+            ),
+            "envelope_delta_bytes": (
+                len(bundle.encode("utf-8"))
+                - sum(section["bytes"] for section in sections)
+            ),
             "delta_bytes": sum(section["bytes"] for section in raw_sections) - len(bundle.encode("utf-8")),
+            "raw_file_counterfactual_available": False,
+            "token_savings_available": False,
         },
         "section_count": len(sections),
         "sections": [

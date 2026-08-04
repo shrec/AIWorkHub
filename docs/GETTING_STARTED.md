@@ -236,6 +236,12 @@ The dashboard's **Operations** dialog contains KPIs, Tool Use, Storage,
 workforce and reliability evidence. Use the bounded last-log row and Logs
 viewer before reading host logs directly.
 
+The KPI tab also shows focused semantic-edit evidence when a worker used the
+hash-bound replacement protocol. `Replacement / file bytes` and `whole-file
+bytes not re-emitted` are deterministic byte-shape measurements. They do not
+claim provider-token, monetary, latency or quality savings; those require a
+controlled paired baseline with provider usage and validation outcomes.
+
 - **Connecting:** run **AIWorkHub: Restart MCP Connection** once. It replaces
   only AIWorkHub's selected repository child.
 - **Chat has no tools:** create a new chat after install/upgrade so MCP

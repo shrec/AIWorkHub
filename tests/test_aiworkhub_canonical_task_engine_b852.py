@@ -554,6 +554,77 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
     assert "title" in duplicate["conflict_fields"]
 
 
+def test_manager_create_exposes_required_output_exceptions_and_reconciles(
+    writable_repo, monkeypatch
+):
+    session_id = "5be44029-03da-4683-aae3-c68ecb07b1a4"
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": session_id,
+            "window_id": "claude_vscode_123",
+        },
+    )
+    kwargs = {
+        "task_id": "TASK_REQUIRED_OUTPUT_EXCEPTIONS",
+        "title": "Preserve valid evidence and update readiness",
+        "runner": "claude_worker",
+        "topic": "coding",
+        "objective": "Keep the accepted artifact and update only readiness.",
+        "acceptance": ["Existing evidence remains valid.", "READY is updated."],
+        "allowed_writes": ["out/evidence.json", "out/READY.md", "out/*.jsonl"],
+        "required_outputs": ["out/evidence.json", "out/READY.md", "out/*.jsonl"],
+        "allow_unchanged_required_outputs": ["out/evidence.json"],
+        "allow_empty_required_outputs": ["out/empty.jsonl"],
+        "validation": ["python -m pytest -q"],
+    }
+
+    created = core.create_task(**kwargs)
+
+    assert created["ok"] is True, created
+    card = json.loads(created["stdout"])
+    assert card["allow_unchanged_required_outputs"] == ["out/evidence.json"]
+    assert card["allow_empty_required_outputs"] == ["out/empty.jsonl"]
+
+    reconciled = core.create_task(**kwargs)
+    assert reconciled["ok"] is True
+    assert reconciled["created"] is False
+    assert reconciled["receipt_state"] == "existing_identical"
+
+
+def test_manager_create_rejects_undeclared_unchanged_output_exception(
+    writable_repo, monkeypatch
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+
+    result = core.create_task(
+        task_id="TASK_BAD_UNCHANGED_EXCEPTION",
+        title="Reject undeclared exception",
+        runner="claude_worker",
+        topic="coding",
+        objective="Fail before launching a provider.",
+        acceptance=["Rejected."],
+        allowed_writes=["out/evidence.json", "out/READY.md"],
+        required_outputs=["out/READY.md"],
+        allow_unchanged_required_outputs=["out/evidence.json"],
+        validation=["python -m pytest -q"],
+    )
+
+    assert result["ok"] is False
+    assert "not_in_required_outputs:out/evidence.json" in result["stderr"]
+    assert task_store.get_task(writable_repo, "TASK_BAD_UNCHANGED_EXCEPTION") is None
+
+
 def test_manager_create_rejects_mutating_code_task_without_validation(
     writable_repo, monkeypatch
 ):

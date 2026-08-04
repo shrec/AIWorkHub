@@ -1,0 +1,125 @@
+{
+  "schema_id": "aiworkhub.semantic_edit.paired_benchmark.v1",
+  "recorded_at": "2026-08-04T20:00:00Z",
+  "repository_revision": "42d494daf1596e30ff60f4fbb7a9b15f58209ee0",
+  "source_version": "0.8.79",
+  "authority": "canonical_task_process_ledger",
+  "design": {
+    "pair_count": 2,
+    "model": "gpt-5.5",
+    "adapter_id": "codex_cli",
+    "task_type": "small_existing_file_docstring_edit",
+    "randomized": false,
+    "order_balanced": false,
+    "manager_acceptance_observed": false,
+    "cost_observed": false
+  },
+  "pairs": [
+    {
+      "pair_id": "semantic-edit-pilot-1",
+      "focused": {
+        "task_id": "CODEX_GPT55_AIWORKHUB_SEMANTIC_EDIT_AB_A_20260804_V1",
+        "request_id": "a74b01f979f1412fb5e7bd7305a91bd9",
+        "terminal_worker_state": "review_ready",
+        "input_tokens": 129189,
+        "cached_input_tokens": 111232,
+        "output_tokens": 1113,
+        "total_tokens": 130302,
+        "duration_seconds": 33.476743,
+        "semantic_edit_receipt_observed": false
+      },
+      "baseline": {
+        "task_id": "CODEX_GPT55_AIWORKHUB_SEMANTIC_EDIT_AB_B_20260804_V1",
+        "request_id": "625a80b4c589435a9f95826fde5f3a99",
+        "terminal_worker_state": "review_ready",
+        "input_tokens": 177044,
+        "cached_input_tokens": 153600,
+        "output_tokens": 1312,
+        "total_tokens": 178356,
+        "duration_seconds": 48.323995,
+        "semantic_edit_receipt_observed": false
+      }
+    },
+    {
+      "pair_id": "semantic-edit-pilot-2",
+      "focused": {
+        "task_id": "CODEX_GPT55_AIWORKHUB_V0879_SEMANTIC_TELEMETRY_CANARY_20260804_V1",
+        "request_id": "c47e3d7dbfc34b02ab7267a393a2cfbb",
+        "terminal_worker_state": "review_ready",
+        "input_tokens": 125005,
+        "cached_input_tokens": 92800,
+        "output_tokens": 1077,
+        "total_tokens": 126082,
+        "duration_seconds": 39.640331,
+        "semantic_edit_receipt_observed": true,
+        "semantic_edit_bytes": {
+          "file_bytes": 15092,
+          "old_region_bytes": 218,
+          "replacement_bytes": 300,
+          "model_reemitted_old_bytes": 0
+        }
+      },
+      "baseline": {
+        "task_id": "CODEX_GPT55_AIWORKHUB_V0879_READ_BASELINE_CANARY_20260804_V1",
+        "request_id": "4ad10c2f725640dda32cb82b11874675",
+        "terminal_worker_state": "review_ready",
+        "input_tokens": 173910,
+        "cached_input_tokens": 155648,
+        "output_tokens": 1606,
+        "total_tokens": 175516,
+        "duration_seconds": 44.862172,
+        "semantic_edit_receipt_observed": false,
+        "read_evidence": {
+          "total_reads": 3,
+          "total_read_bytes": 15537,
+          "bounded_reads": 3,
+          "unbounded_reads": 0
+        }
+      }
+    }
+  ],
+  "aggregate": {
+    "focused": {
+      "input_tokens": 254194,
+      "cached_input_tokens": 204032,
+      "uncached_input_tokens": 50162,
+      "output_tokens": 2190,
+      "total_tokens": 256384,
+      "duration_seconds": 73.117074
+    },
+    "baseline": {
+      "input_tokens": 350954,
+      "cached_input_tokens": 309248,
+      "uncached_input_tokens": 41706,
+      "output_tokens": 2918,
+      "total_tokens": 353872,
+      "duration_seconds": 93.186167
+    },
+    "observed_reduction_percent": {
+      "input_tokens": 27.571,
+      "output_tokens": 24.949,
+      "total_tokens": 27.549,
+      "duration_seconds": 21.537
+    },
+    "uncached_input_change_percent": 20.275
+  },
+  "claim_status": {
+    "public_claim_eligible": false,
+    "reason_codes": [
+      "sample_size_two_pairs",
+      "not_randomized_or_order_balanced",
+      "cache_mix_differs_between_variants",
+      "manager_acceptance_not_observed_in_ledger",
+      "one_focused_run_predates_authenticated_semantic_edit_receipt",
+      "single_model_single_task_family",
+      "cost_not_observed"
+    ],
+    "allowed_interpretation": "preliminary_observed_pilot_only",
+    "forbidden_interpretations": [
+      "universal_token_savings_multiplier",
+      "causal_quality_improvement",
+      "cost_savings_claim",
+      "cross_model_generalization"
+    ]
+  }
+}

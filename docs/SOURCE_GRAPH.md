@@ -80,6 +80,31 @@ sample denominator. A gap may include legitimate testing or reasoning time, so
 it is never treated as proof of model inactivity. These are observed local
 facts; they do not claim token savings or causation.
 
+## Focused semantic edits
+
+`body` responses already carry an exact repository-relative file and
+`line_start`/`line_end` for the selected symbol. Workers can bind that small
+range through `aiworkhub_worker_semantic_edit_prepare`, receive only the old
+fragment plus its hashes, and submit only the replacement through
+`aiworkhub_worker_semantic_edit_apply`. The local applier then:
+
+1. rechecks the isolated-worktree file and fragment hashes;
+2. rejects stale, overlapping, out-of-scope or symlinked targets;
+3. applies the replacement atomically; and
+4. leaves formatter, static-check and test execution to the task's declared
+   validation contract.
+
+VS Code LM workers use the equivalent `semantic_edit_response.v3` envelope:
+full-file hash, inclusive line range and `new` text only. The old exact-text
+replacement protocol remains readable for compatibility, while complete-file
+rewrites are not the default for existing files.
+
+Semantic-edit receipts expose observed bytes (`file_bytes`,
+`old_region_bytes`, `replacement_bytes`, and fragment bytes returned). They do
+not claim provider token savings. Controlled A/B runs must compare provider
+input/output tokens, acceptance, retries and validation outcomes before any
+economy multiplier is published.
+
 ## Repository isolation
 
 The database, generations and settings belong to the selected repository's

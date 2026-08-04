@@ -48,6 +48,8 @@ def test_worker_mcp_starts_without_optional_mcp_package(tmp_path: Path) -> None:
     tools = {item["name"]: item for item in responses[1]["result"]["tools"]}
     assert set(tools) == {
         "aiworkhub_worker_source_graph_query",
+        "aiworkhub_worker_semantic_edit_prepare",
+        "aiworkhub_worker_semantic_edit_apply",
             "aiworkhub_worker_session_current_state",
             "aiworkhub_worker_ai_memory_search",
             "aiworkhub_worker_ai_memory_get",

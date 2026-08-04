@@ -56,7 +56,13 @@ from aiworkhub import worker_workspace as ws  # noqa: E402
 
 REQUEST_TIMEOUT = timedelta(seconds=30)
 BWRAP = Path("/usr/bin/bwrap")
-_PACKAGE_FILES = ("__init__.py", "_version.py", "repository_state.py", "worker_ai_tools_mcp.py")
+_PACKAGE_FILES = (
+    "__init__.py",
+    "_version.py",
+    "repository_state.py",
+    "semantic_edit.py",
+    "worker_ai_tools_mcp.py",
+)
 
 
 def _write_tool(path: Path, body: str) -> None:

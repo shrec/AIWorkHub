@@ -724,6 +724,7 @@ def test_structured_provider_auth_failure_blocks_without_review_candidate(
     card = _card()
     manager = _build_manager(tmp_path, card)
     blocked_calls = []
+    runtime_auth_failures = []
 
     def fake_launch_failed(repo, task_id, runner, *, reason, request_id=""):
         blocked_calls.append((task_id, runner, reason, request_id))
@@ -737,6 +738,11 @@ def test_structured_provider_auth_failure_blocks_without_review_candidate(
         lambda *a, **k: pytest.fail("provider auth failure must not enter review"),
     )
     monkeypatch.setattr(process_launcher, "cleanup_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "record_runtime_auth_failure",
+        lambda **kwargs: runtime_auth_failures.append(kwargs),
+    )
     request_id = "req-provider-auth"
     _seed_request(
         manager,
@@ -781,6 +787,7 @@ def test_structured_provider_auth_failure_blocks_without_review_candidate(
             request_id,
         )
     ]
+    assert runtime_auth_failures == [{"http_status": 401}]
     assert card["status"] == "blocked"
     assert manager.status(request_id)["liveness"] == {}
 

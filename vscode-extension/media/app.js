@@ -1025,6 +1025,7 @@ function renderKpis(snapshot) {
     "aiworkhub.kpi.dashboard.v1",
     "aiworkhub.kpi.dashboard.v2",
     "aiworkhub.kpi.dashboard.v3",
+    "aiworkhub.kpi.dashboard.v4",
   ].includes(kpis.schema_id)) {
     elements.kpiDashboard.replaceChildren(
       createElement("div", "panel-list-empty", "No KPI evidence in this snapshot"),
@@ -1034,6 +1035,40 @@ function renderKpis(snapshot) {
 
   const headline = kpis.headline && typeof kpis.headline === "object" ? kpis.headline : {};
   const windowInfo = kpis.window && typeof kpis.window === "object" ? kpis.window : {};
+  const readEfficiency = snapshot && snapshot.read_efficiency_telemetry
+    && typeof snapshot.read_efficiency_telemetry === "object"
+    ? snapshot.read_efficiency_telemetry
+    : null;
+  const readObservedTasks = readEfficiency ? numberValue(readEfficiency.observed_tasks) : 0;
+  const readEvidenceTasks = readEfficiency ? numberValue(readEfficiency.evidence_observed_tasks) : 0;
+  const readEvidenceRate = readObservedTasks
+    ? (readEvidenceTasks / readObservedTasks) * 100
+    : null;
+  const contextDirection = String(headline.context_delivery_direction || "unmeasured");
+  const contextDeltaCard = contextDirection === "expanded"
+    ? [
+      "Delivery overhead",
+      kpiPercent(headline.context_expansion_rate),
+      `${formatCount(headline.estimated_context_bytes_added)} estimated bytes added`,
+      "bad",
+    ]
+    : contextDirection === "compressed"
+      ? [
+        "Delivery reduction",
+        kpiPercent(headline.context_compression_rate),
+        `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`,
+        "accent",
+      ]
+      : contextDirection === "unchanged"
+        ? ["Context delivery", "0.0%", "declared bytes unchanged", "neutral"]
+        : ["Context delivery", "—", "no comparable byte evidence", "neutral"];
+  const recognizedReads = readEfficiency ? numberValue(readEfficiency.total_reads) : 0;
+  const semanticEdit = kpis.semantic_edit && typeof kpis.semantic_edit === "object"
+    ? kpis.semantic_edit
+    : null;
+  const semanticObservedRuns = semanticEdit
+    ? numberValue(semanticEdit.evidence_observed_runs)
+    : 0;
   const fragment = document.createDocumentFragment();
   const header = createElement("div", "kpi-heading");
   const headingText = createElement("div");
@@ -1059,7 +1094,30 @@ function renderKpis(snapshot) {
     ["SG call gap p95", headline.source_graph_call_gap_p95_seconds == null ? "—" : formatDuration(numberValue(headline.source_graph_call_gap_p95_seconds) * 1000), "time between authenticated Source Graph calls", "accent"],
     ["SG long gaps", formatCount(headline.source_graph_long_call_gap_count), `${kpiPercent(headline.source_graph_long_call_gap_rate)} at or above the informational threshold`, numberValue(headline.source_graph_long_call_gap_count) ? "bad" : "good"],
     ["SG evidence rows", formatCount(numberValue(headline.source_graph_entity_rows) + numberValue(headline.source_graph_edge_rows) + numberValue(headline.source_graph_file_rows)), `${formatCount(headline.source_graph_entity_rows)} entities · ${formatCount(headline.source_graph_edge_rows)} edges · ${formatCount(headline.source_graph_file_rows)} files`, "accent"],
-    ["Context compression", kpiPercent(headline.context_compression_rate), `${formatCount(headline.estimated_context_bytes_avoided)} estimated bytes avoided`, "accent"],
+    ["Read trace coverage", kpiPercent(readEvidenceRate), `${formatCount(readEvidenceTasks)}/${formatCount(readObservedTasks)} current tasks · ${formatCount(readEfficiency ? readEfficiency.legacy_evidence_tasks : 0)} legacy excluded`, "accent"],
+    ["Bounded file reads", recognizedReads ? kpiPercent(readEfficiency.bounded_read_rate) : "—", `${formatCount(readEfficiency ? readEfficiency.bounded_reads : 0)}/${formatCount(recognizedReads)} recognized reads`, "accent"],
+    ["Exact rereads", readEfficiency ? formatCount(readEfficiency.exact_rereads) : "—", `${formatBytes(readEfficiency ? readEfficiency.exact_reread_bytes : 0)} observed redundant bytes`, numberValue(readEfficiency && readEfficiency.exact_rereads) ? "bad" : "good"],
+    [
+      "Focused edits",
+      semanticObservedRuns ? formatCount(semanticObservedRuns) : "—",
+      semanticObservedRuns
+        ? `${formatCount(semanticEdit.range_count)} ranges · ${formatCount(semanticEdit.file_count)} files`
+        : "no authenticated semantic-edit receipts",
+      semanticObservedRuns ? "good" : "neutral",
+    ],
+    [
+      "Replacement / file bytes",
+      semanticEdit && semanticEdit.replacement_to_file_byte_rate != null
+        ? kpiPercent(semanticEdit.replacement_to_file_byte_rate)
+        : "—",
+      semanticObservedRuns
+        ? `${formatBytes(semanticEdit.replacement_bytes)} replacements vs ${formatBytes(semanticEdit.file_bytes)} source files`
+        : "structural byte evidence only",
+      "accent",
+    ],
+    contextDeltaCard,
+    ["Optional suppression", headline.optimization_reduction_rate == null ? "—" : kpiPercent(headline.optimization_reduction_rate), `${formatCount(headline.optimization_bytes_removed)} section bytes removed`, "accent"],
+    ["Envelope overhead", headline.envelope_overhead_rate == null ? "—" : kpiPercent(headline.envelope_overhead_rate), `${formatCount(headline.envelope_bytes_added)} serialization bytes added`, numberValue(headline.envelope_bytes_added) ? "neutral" : "good"],
     ["Provider cache hit", kpiPercent(headline.provider_cache_hit_rate), `${formatCount(headline.provider_measured_tasks)} provider-measured tasks`, "accent"],
     ["Cost / review-ready", headline.cost_per_review_ready_usd == null ? "—" : `$${Number(headline.cost_per_review_ready_usd).toFixed(4)}`, "provider-reported cost only", "neutral"],
     ["Callback delivery", kpiPercent(headline.callback_delivery_rate), `${formatCount(headline.callback_backlog)} backlog · ${formatCount(headline.callback_dead_letters)} dead`, numberValue(headline.callback_dead_letters) ? "bad" : "good"],
@@ -1222,13 +1280,88 @@ function renderKpis(snapshot) {
     ));
   }
   chartGrid.appendChild(contextPanel);
+
+  const readPanel = createElement("section", "kpi-chart-panel");
+  readPanel.appendChild(createElement("h3", "kpi-chart-title", "Worker read efficiency"));
+  if (readEfficiency && readEvidenceTasks) {
+    const readMaximum = Math.max(1, recognizedReads);
+    for (const [label, value, tone] of [
+      ["Bounded reads", readEfficiency.bounded_reads, "good"],
+      ["Unbounded reads", readEfficiency.unbounded_reads, "bad"],
+      ["Exact rereads", readEfficiency.exact_rereads, "bad"],
+      ["Overlapping rereads", readEfficiency.overlap_rereads, "bad"],
+    ]) {
+      readPanel.appendChild(kpiBarRow(label, value, readMaximum, tone));
+    }
+    readPanel.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      `${formatBytes(readEfficiency.total_read_bytes)} observed across ${formatCount(readEfficiency.read_bytes_observed)} byte-bearing reads; ${formatCount(readEfficiency.legacy_evidence_tasks)} incompatible legacy task(s) excluded. Provider event/byte evidence only; no token or savings claim.`,
+    ));
+  } else {
+    readPanel.appendChild(createElement("div", "panel-list-empty", "No provider read-event evidence yet"));
+  }
+  chartGrid.appendChild(readPanel);
+
+  const readAdapterPanel = createElement("section", "kpi-chart-panel");
+  readAdapterPanel.appendChild(createElement("h3", "kpi-chart-title", "Read evidence by adapter"));
+  const readAdapters = readEfficiency && readEfficiency.by_adapter
+    && typeof readEfficiency.by_adapter === "object"
+    ? Object.entries(readEfficiency.by_adapter)
+      .map(([name, value]) => ({ name, ...(value && typeof value === "object" ? value : {}) }))
+      .filter((item) => numberValue(item.tasks) > 0)
+      .sort((left, right) => numberValue(right.tasks) - numberValue(left.tasks) || left.name.localeCompare(right.name))
+    : [];
+  if (readAdapters.length) {
+    for (const item of readAdapters.slice(0, 8)) {
+      const tasks = numberValue(item.tasks);
+      const observed = numberValue(item.evidence_observed_tasks);
+      readAdapterPanel.appendChild(kpiBarRow(
+        item.name || "unknown",
+        observed,
+        tasks,
+        observed ? "accent" : "neutral",
+        `${observed}/${tasks} tasks · ${formatCount(item.total_reads)} reads`,
+      ));
+    }
+  } else {
+    readAdapterPanel.appendChild(createElement("div", "panel-list-empty", "No adapter read evidence yet"));
+  }
+  chartGrid.appendChild(readAdapterPanel);
+
+  const semanticPanel = createElement("section", "kpi-chart-panel");
+  semanticPanel.appendChild(createElement("h3", "kpi-chart-title", "Focused semantic edits"));
+  if (semanticEdit && semanticObservedRuns) {
+    const semanticMaximum = Math.max(
+      1,
+      numberValue(semanticEdit.file_bytes),
+      numberValue(semanticEdit.old_region_bytes),
+      numberValue(semanticEdit.replacement_bytes),
+    );
+    for (const [label, value, tone] of [
+      ["Existing file bytes", semanticEdit.file_bytes, "neutral"],
+      ["Selected old-region bytes", semanticEdit.old_region_bytes, "accent"],
+      ["Model replacement bytes", semanticEdit.replacement_bytes, "good"],
+      ["Old bytes re-emitted by model", semanticEdit.model_reemitted_old_bytes, "bad"],
+    ]) {
+      semanticPanel.appendChild(kpiBarRow(label, value, semanticMaximum, tone, formatBytes(value)));
+    }
+    semanticPanel.appendChild(createElement(
+      "div",
+      "telemetry-note",
+      `${formatCount(semanticObservedRuns)} authenticated run(s); structural ratio ${semanticEdit.structural_byte_ratio == null ? "—" : `${Number(semanticEdit.structural_byte_ratio).toFixed(2)}×`} and ${formatBytes(semanticEdit.structural_bytes_not_reemitted)} whole-file bytes not re-emitted. This is byte-shape evidence, not a token, cost, speed, or quality-savings claim. Paired baselines are required for those claims.`,
+    ));
+  } else {
+    semanticPanel.appendChild(createElement("div", "panel-list-empty", "No authenticated semantic-edit evidence yet"));
+  }
+  chartGrid.appendChild(semanticPanel);
   fragment.appendChild(chartGrid);
 
   const quality = kpis.data_quality && typeof kpis.data_quality === "object" ? kpis.data_quality : {};
   fragment.appendChild(createElement(
     "div",
     `kpi-disclosure${quality.process_window_truncated || numberValue(quality.invalid_timestamp_rows) ? " warning" : ""}`,
-    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} calls lack mode attribution; ${formatCount(quality.source_graph_stage_unattributed_calls)} lack workflow-stage attribution; Source Graph latency p50 ${headline.source_graph_latency_p50_ms == null ? "—" : `${Number(headline.source_graph_latency_p50_ms).toFixed(1)} ms`} / p95 ${headline.source_graph_latency_p95_ms == null ? "—" : `${Number(headline.source_graph_latency_p95_ms).toFixed(1)} ms`}; authenticated call-gap sample ${formatCount(quality.source_graph_call_gap_samples)} with an informational ${formatDuration(numberValue(quality.source_graph_long_call_gap_threshold_seconds) * 1000)} threshold. A long gap is an observed interval, not proof that the model was inactive. Byte compression uses declared raw paths versus delivered bundle bytes; no token-savings or causal quality claim is inferred.`,
+    `Measurement: worker outcomes and explicit manager decisions are separate. Sample ${formatCount(quality.sample_size)}; ${formatCount(quality.source_graph_unattributed_calls)} calls lack mode attribution; ${formatCount(quality.source_graph_stage_unattributed_calls)} lack workflow-stage attribution; Source Graph latency p50 ${headline.source_graph_latency_p50_ms == null ? "—" : `${Number(headline.source_graph_latency_p50_ms).toFixed(1)} ms`} / p95 ${headline.source_graph_latency_p95_ms == null ? "—" : `${Number(headline.source_graph_latency_p95_ms).toFixed(1)} ms`}; authenticated call-gap sample ${formatCount(quality.source_graph_call_gap_samples)} with an informational ${formatDuration(numberValue(quality.source_graph_long_call_gap_threshold_seconds) * 1000)} threshold. A long gap is an observed interval, not proof that the model was inactive. Context delivery reports the signed net delta between pre-optimization tool-section payload and delivered bundle bytes. It is not raw repository-file, counterfactual read, or token-savings evidence. Read efficiency uses provider event and observed-byte evidence only; semantic-edit ratios use authenticated structural bytes only. No token-savings or causal quality claim is inferred.`,
   ));
   elements.kpiDashboard.replaceChildren(fragment);
 }

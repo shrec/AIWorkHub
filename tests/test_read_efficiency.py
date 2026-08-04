@@ -1,9 +1,13 @@
+import json
+
 import pytest
 
 try:
     from aiworkhub.read_efficiency import analyze_read_efficiency
+    from aiworkhub import process_launcher
 except ImportError:
     from src.aiworkhub.read_efficiency import analyze_read_efficiency
+    from src.aiworkhub import process_launcher
 
 
 def read(path='a.py', sha='h', offset=0, limit=10, timestamp=None, **extra):
@@ -236,3 +240,199 @@ def test_recommendations_are_pattern_based_and_do_not_claim_savings():
 def test_correlation_window_must_be_nonnegative():
     with pytest.raises(ValueError):
         analyze_read_efficiency([], correlation_window=-1)
+
+
+def test_observed_read_bytes_are_partitioned_without_inventing_missing_values():
+    events = [
+        read(path='a.py', sha='h1', offset=0, limit=10, bytes_returned=100),
+        read(path='a.py', sha='h1', offset=0, limit=10, bytes_returned=100),
+        read(path='a.py', sha=None, offset=None, limit=None, bytes_returned=250),
+        read(path='b.py', sha='h2', offset=0, limit=10),
+    ]
+
+    report = analyze_read_efficiency(events)
+
+    assert report.read_bytes_observed == 3
+    assert report.total_read_bytes == 450
+    assert report.bounded_read_bytes == 200
+    assert report.unbounded_read_bytes == 250
+    assert report.exact_reread_bytes == 100
+    assert report.overlap_reread_bytes == 0
+    assert report.unknown_repetition_bytes == 250
+
+
+def test_codex_jsonl_read_efficiency_uses_only_strict_command_shapes(tmp_path):
+    output = tmp_path / 'codex.jsonl'
+    records = [
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'mcp_tool_call',
+                'name': 'aiworkhub_worker_source_graph_query',
+                'arguments': {'mode': 'slice', 'query': 'parser'},
+            },
+        },
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'command_execution',
+                'command': "/usr/bin/bash -lc \"sed -n '1,20p' src/a.py\"",
+                'aggregated_output': 'a\n' * 20,
+            },
+        },
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'command_execution',
+                'command': "/usr/bin/bash -lc \"sed -n '1,20p' src/a.py\"",
+                'aggregated_output': 'a\n' * 20,
+            },
+        },
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'command_execution',
+                'command': "/usr/bin/bash -lc 'cat src/b.py'",
+                'aggregated_output': 'whole file\n',
+            },
+        },
+        {
+            'type': 'item.completed',
+            'item': {
+                'type': 'command_execution',
+                'command': "/usr/bin/bash -lc 'sed -n 1,20p src/a.py | head'",
+                'aggregated_output': 'ambiguous\n',
+            },
+        },
+    ]
+    output.write_text(
+        '\n'.join(json.dumps(record) for record in records) + '\n',
+        encoding='utf-8',
+    )
+
+    report = process_launcher._provider_read_efficiency_from_output(output)
+
+    assert report['evidence_observed'] is True
+    assert report['provider_records_scanned'] == 5
+    assert report['recognized_read_events'] == 3
+    assert report['recognized_source_graph_events'] == 1
+    assert report['total_reads'] == 3
+    assert report['bounded_reads'] == 2
+    assert report['unbounded_reads'] == 1
+    assert report['exact_rereads'] == 1
+    assert report['derived_temporal_associations'] == 3
+    assert report['read_bytes_observed'] == 3
+    assert report['total_read_bytes'] == 91
+    serialized = json.dumps(report, sort_keys=True)
+    assert 'src/a.py' not in serialized
+    assert 'whole file' not in serialized
+
+
+def test_codex_started_and_completed_command_is_counted_once(tmp_path):
+    output = tmp_path / 'codex.jsonl'
+    item = {
+        'id': 'item_7',
+        'type': 'command_execution',
+        'command': "/usr/bin/bash -lc \"sed -n '1,40p' src/a.py\"",
+    }
+    records = [
+        {
+            'type': 'item.started',
+            'item': {**item, 'aggregated_output': '', 'status': 'in_progress'},
+        },
+        {
+            'type': 'item.completed',
+            'item': {**item, 'aggregated_output': 'one\ntwo\n', 'status': 'completed'},
+        },
+    ]
+    output.write_text(
+        '\n'.join(json.dumps(record) for record in records) + '\n',
+        encoding='utf-8',
+    )
+
+    report = process_launcher._provider_read_efficiency_from_output(output)
+
+    assert report['provider_records_scanned'] == 2
+    assert report['recognized_read_events'] == 1
+    assert report['total_reads'] == 1
+    assert report['unknown_repetitions'] == 0
+    assert report['bounded_reads'] == 1
+    assert report['read_bytes_observed'] == 1
+    assert report['total_read_bytes'] == len('one\ntwo\n'.encode('utf-8'))
+
+
+def test_codex_wc_then_same_path_sed_is_one_observed_read(tmp_path):
+    output = tmp_path / 'codex.jsonl'
+    file_text = 'one\ntwo\nthree\n'
+    record = {
+        'type': 'item.completed',
+        'item': {
+            'type': 'command_execution',
+            'command': (
+                '/usr/bin/bash -lc "wc -l src/a.py && '
+                "sed -n '1,40p' src/a.py\""
+            ),
+            'aggregated_output': f'3 src/a.py\n{file_text}',
+        },
+    }
+    output.write_text(json.dumps(record) + '\n', encoding='utf-8')
+
+    report = process_launcher._provider_read_efficiency_from_output(output)
+
+    assert report['recognized_read_events'] == 1
+    assert report['total_reads'] == 1
+    assert report['bounded_reads'] == 1
+    assert report['total_read_bytes'] == len(file_text.encode('utf-8'))
+
+
+def test_claude_read_tool_results_supply_hashes_and_observed_bytes(tmp_path):
+    output = tmp_path / 'claude.jsonl'
+    records = []
+    for tool_id in ('read-1', 'read-2'):
+        records.extend([
+            {
+                'type': 'assistant',
+                'message': {
+                    'content': [{
+                        'type': 'tool_use',
+                        'id': tool_id,
+                        'name': 'Read',
+                        'input': {'file_path': 'src/c.py', 'offset': 0, 'limit': 10},
+                    }],
+                },
+            },
+            {
+                'type': 'user',
+                'message': {
+                    'content': [{
+                        'type': 'tool_result',
+                        'tool_use_id': tool_id,
+                        'content': 'same content',
+                    }],
+                },
+            },
+        ])
+    output.write_text(
+        '\n'.join(json.dumps(record) for record in records) + '\n',
+        encoding='utf-8',
+    )
+
+    report = process_launcher._provider_read_efficiency_from_output(output)
+
+    assert report['recognized_read_events'] == 2
+    assert report['read_bytes_observed'] == 2
+    assert report['total_read_bytes'] == 24
+    assert report['exact_rereads'] == 1
+    assert report['exact_reread_bytes'] == 12
+
+
+def test_provider_output_without_read_evidence_is_not_false_zero(tmp_path):
+    output = tmp_path / 'result.jsonl'
+    output.write_text('{"type":"result","result":"done"}\n', encoding='utf-8')
+
+    report = process_launcher._provider_read_efficiency_from_output(output)
+
+    assert report['evidence_observed'] is False
+    assert report['provider_records_scanned'] == 1
+    assert report['recognized_read_events'] == 0
+    assert report['total_reads'] == 0

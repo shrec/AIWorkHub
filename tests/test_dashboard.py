@@ -534,6 +534,143 @@ def test_snapshot_isolates_provider_failures_without_hiding_healthy_groups():
     }
 
 
+def test_read_efficiency_telemetry_separates_observed_from_unobserved_tasks():
+    process_report = {
+        "processes": [
+            {
+                "task_id": "TASK_A",
+                "adapter_id": "codex_cli",
+                "ai_infra_context": {
+                    "read_efficiency": {
+                        "schema_id": "aiworkhub.provider_read_efficiency.v2",
+                        "evidence_observed": True,
+                        "provider_records_scanned": 12,
+                        "recognized_read_events": 4,
+                        "recognized_source_graph_events": 1,
+                        "total_reads": 4,
+                        "bounded_reads": 3,
+                        "unbounded_reads": 1,
+                        "exact_rereads": 1,
+                        "read_bytes_observed": 3,
+                        "total_read_bytes": 900,
+                        "bounded_read_bytes": 600,
+                        "unbounded_read_bytes": 300,
+                    },
+                },
+            },
+            {
+                "task_id": "TASK_B",
+                "adapter_id": "vscode_lm",
+                "ai_infra_context": {
+                    "read_efficiency": {"evidence_observed": False},
+                },
+            },
+        ],
+    }
+
+    report = dashboard._read_efficiency_telemetry(process_report)
+
+    assert report["observed_tasks"] == 2
+    assert report["evidence_observed_tasks"] == 1
+    assert report["evidence_unobserved_tasks"] == 1
+    assert report["total_reads"] == 4
+    assert report["bounded_read_rate"] == 75.0
+    assert report["exact_reread_rate"] == 25.0
+    assert report["read_byte_coverage_rate"] == 75.0
+    assert report["total_read_bytes"] == 900
+    assert report["by_adapter"]["vscode_lm"]["evidence_observed_tasks"] == 0
+
+
+def test_read_efficiency_telemetry_excludes_legacy_codex_double_count_rows():
+    process_report = {
+        "processes": [
+            {
+                "task_id": "LEGACY",
+                "adapter_id": "codex_cli",
+                "ai_infra_context": {
+                    "read_efficiency": {
+                        "schema_id": "aiworkhub.provider_read_efficiency.v1",
+                        "evidence_observed": True,
+                        "total_reads": 2,
+                        "unknown_repetitions": 1,
+                    },
+                },
+            },
+            {
+                "task_id": "CURRENT",
+                "adapter_id": "codex_cli",
+                "ai_infra_context": {
+                    "read_efficiency": {
+                        "schema_id": "aiworkhub.provider_read_efficiency.v2",
+                        "evidence_observed": True,
+                        "total_reads": 1,
+                        "bounded_reads": 1,
+                    },
+                },
+            },
+        ],
+    }
+
+    report = dashboard._read_efficiency_telemetry(process_report)
+
+    assert report["schema_id"] == "aiworkhub.read_efficiency.telemetry.v2"
+    assert report["evidence_observed_tasks"] == 1
+    assert report["legacy_evidence_tasks"] == 1
+    assert report["total_reads"] == 1
+    assert report["unknown_repetitions"] == 0
+    assert report["by_adapter"]["codex_cli"]["legacy_evidence_tasks"] == 1
+
+
+def test_compact_ai_infra_keeps_only_path_free_read_aggregates():
+    compact = dashboard._compact_ai_infra({
+        "read_efficiency": {
+            "schema_id": "aiworkhub.provider_read_efficiency.v2",
+            "evidence_observed": True,
+            "provider_records_scanned": 4,
+            "recognized_read_events": 2,
+            "total_reads": 2,
+            "bounded_reads": 1,
+            "total_read_bytes": 123,
+            "events": [{"path": "/secret/repository/file.py"}],
+            "recommendations": ["raw provider detail"],
+            "measurement_label": "observed",
+        },
+    })
+
+    assert compact["read_efficiency"]["total_reads"] == 2
+    assert compact["read_efficiency"]["schema_id"] == "aiworkhub.provider_read_efficiency.v2"
+    assert compact["read_efficiency"]["total_read_bytes"] == 123
+    serialized = json.dumps(compact, sort_keys=True)
+    assert "/secret/repository/file.py" not in serialized
+    assert "raw provider detail" not in serialized
+
+
+def test_compact_ai_infra_keeps_only_path_free_semantic_edit_aggregates():
+    compact = dashboard._compact_ai_infra({
+        "semantic_edit": {
+            "schema_id": "aiworkhub.semantic_edit_runtime_evidence.v1",
+            "observed": True,
+            "file_count": 1,
+            "range_count": 2,
+            "file_bytes": 8_453,
+            "old_region_bytes": 112,
+            "replacement_bytes": 91,
+            "model_reemitted_old_bytes": 0,
+            "path": "/secret/repository/file.py",
+            "replacement": "secret source text",
+            "token_savings_claimed": True,
+        },
+    })
+
+    evidence = compact["semantic_edit"]
+    assert evidence["file_bytes"] == 8_453
+    assert evidence["range_count"] == 2
+    assert evidence["token_savings_claimed"] is False
+    serialized = json.dumps(compact, sort_keys=True)
+    assert "/secret/repository/file.py" not in serialized
+    assert "secret source text" not in serialized
+
+
 def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path):
     calls = []
     root = _init_canonical_repo(tmp_path)
@@ -554,20 +691,27 @@ def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path
         calls.append(("task_store.get_task", repo_root, task_id))
         return {"task_id": task_id}
 
-    def fake_list_task_cards(repo_root, limit=500):
-        calls.append(("task_store.list_task_cards", repo_root, limit))
-        return []
+    def fake_cost_ledger(*, repo_root, include_tasks):
+        calls.append(("cost_ledger.build_cost_ledger", repo_root, include_tasks))
+        return {
+            "schema_id": "aiworkhub.cost_ledger.v1",
+            "aggregates": {
+                "by_runner": {
+                    "runner_a": {"total_tokens": 123, "cost_usd": 0.5},
+                },
+            },
+            "source_status": {"launch_log_ok": True},
+        }
 
     def forbidden_legacy_provider(*_args, **_kwargs):
         raise AssertionError("canonical dashboard must not call a legacy provider")
 
     monkeypatch.setattr(dashboard.task_store, "list_tasks", fake_list_tasks)
     monkeypatch.setattr(dashboard.task_store, "get_task", fake_get_task)
-    monkeypatch.setattr(dashboard.task_store, "list_task_cards", fake_list_task_cards)
     monkeypatch.setattr(
         dashboard.completion_inbox, "build_completion_inbox", forbidden_legacy_provider
     )
-    monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", forbidden_legacy_provider)
+    monkeypatch.setattr(dashboard.cost_ledger, "build_cost_ledger", fake_cost_ledger)
     monkeypatch.setattr(dashboard.core, "collision_guard", forbidden_legacy_provider)
 
     provider = dashboard.DashboardProvider(
@@ -576,12 +720,19 @@ def test_production_provider_uses_only_existing_read_paths(monkeypatch, tmp_path
     assert provider.list_tasks("pending")[0]["task_id"] == "TASK_PENDING_B12_V1"
     assert provider.get_task("TASK_PENDING_B12_V1") == {"task_id": "TASK_PENDING_B12_V1"}
     assert provider.get_completion_inbox()["review_queue"][0]["task_id"] == "TASK_REVIEW_B12_V1"
-    assert provider.get_cost_ledger()["aggregates"]["by_runner"] == {}
+    ledger = provider.get_cost_ledger()
+    assert ledger["aggregates"]["by_runner"]["runner_a"]["total_tokens"] == 123
+    assert ledger["schema_id"] == "aiworkhub.dashboard.canonical_cost_ledger.v1"
     assert provider.get_collision_report()["collision_free"] is True
 
     assert ("task_store.list_tasks", root, "pending", 25) in calls
     assert ("task_store.get_task", root, "TASK_PENDING_B12_V1") in calls
-    assert all(call[0].startswith("task_store.") for call in calls)
+    assert ("cost_ledger.build_cost_ledger", root, False) in calls
+    assert all(
+        call[0].startswith("task_store.")
+        or call[0] == "cost_ledger.build_cost_ledger"
+        for call in calls
+    )
 
 
 def test_process_run_reader_uses_latest_allowlisted_events_without_manager_side_effects(

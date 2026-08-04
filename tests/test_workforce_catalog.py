@@ -198,7 +198,7 @@ def test_glm_uses_launchable_copilot_fallback(tmp_path: Path) -> None:
     assert worker["adapter_fallback_used"] is True
 
 
-def test_claude_uses_visible_editor_model_when_remote_cli_is_unavailable(
+def test_first_party_claude_never_falls_back_to_editor_authorization(
     tmp_path: Path,
 ) -> None:
     root = _root(tmp_path)
@@ -221,13 +221,15 @@ def test_claude_uses_visible_editor_model_when_remote_cli_is_unavailable(
     )
     sonnet = next(row for row in snapshot["workers"] if row["worker_id"] == "claude-sonnet-5")
     haiku = next(row for row in snapshot["workers"] if row["worker_id"] == "claude-haiku")
-    assert sonnet["available"] is True
-    assert sonnet["effective_adapter_id"] == "vscode_lm"
-    assert sonnet["adapter_fallback_used"] is True
+    assert sonnet["available"] is False
+    assert sonnet["effective_adapter_id"] == "claude_cli"
+    assert sonnet["adapter_fallback_used"] is False
     assert haiku["available"] is False
 
 
-def test_rank_task_returns_effective_editor_adapter(tmp_path: Path) -> None:
+def test_rank_task_does_not_substitute_editor_auth_for_first_party_claude(
+    tmp_path: Path,
+) -> None:
     root = _root(tmp_path)
     snapshot = workforce_catalog.build_catalog(
         root,
@@ -255,8 +257,8 @@ def test_rank_task_returns_effective_editor_adapter(tmp_path: Path) -> None:
         tool_needs=["source-graph"],
     )
     decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
-    assert decision["selected_worker_id"] == "claude-sonnet-5"
-    assert decision["selected_adapter_id"] == "vscode_lm"
+    assert decision["selected_worker_id"] is None
+    assert decision["selected_adapter_id"] is None
 
 
 def test_successful_attributed_outcome_establishes_access_observation(tmp_path: Path) -> None:

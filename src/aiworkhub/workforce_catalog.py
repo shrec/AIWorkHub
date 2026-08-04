@@ -34,7 +34,11 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 # catalog response; this is routing evidence, not fabricated credential/quota
 # evidence.
 _WORKER_ADAPTER_FALLBACKS: dict[str, tuple[str, ...]] = {
-    "claude_cli": ("vscode_lm",),
+    # First-party Claude subscription workers never fall back to the editor
+    # broker.  A VS Code/Copilot Claude model is a distinct authorization and
+    # billing surface, and a Claude Code-contributed LM may be visible while
+    # yielding no background response parts.  Copilot-owned Claude workers
+    # must be declared explicitly with their own ``copilot_*`` identity.
     "codex_cli": ("vscode_lm",),
     "deepseek_vscode_lm": ("vscode_lm", "deepseek_copilot_cli"),
     "glm_vscode_lm": ("vscode_lm", "glm_copilot_cli"),

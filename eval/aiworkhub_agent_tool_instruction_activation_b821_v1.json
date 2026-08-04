@@ -3,23 +3,23 @@
   "task_id": "DEEPSEEK_AIWORKHUB_AGENT_TOOL_INSTRUCTION_ACTIVATION_B821_V1",
   "runner": "deepseek_aiworkhub_agent_tool_instruction_activation_b821_v1",
   "topic": "task_mcp",
-  "canonical_sha256": "22bb849c281324a0aa02fb80a9af94c273c2a78b33829aaabb080a7d3967f33c",
-  "canonical_bytes": 3613,
+  "canonical_sha256": "a8e227d183b0987ac11a756f0a76209b112db954e45a8d96f481f0187c1fd6ee",
+  "canonical_bytes": 3749,
   "projections": {
     "AGENTS.md": {
-      "bytes": 3711,
-      "sha256": "14c8bb8339386452de947a5ea923f0ade964f4a7ce6504efb629ec5d61514909",
-      "canonical_sha256": "22bb849c281324a0aa02fb80a9af94c273c2a78b33829aaabb080a7d3967f33c"
+      "bytes": 3847,
+      "sha256": "071928218dc992c1fe8442a0c3c03078810cfd6e4e0a800895db3579a0034ae3",
+      "canonical_sha256": "a8e227d183b0987ac11a756f0a76209b112db954e45a8d96f481f0187c1fd6ee"
     },
     "CLAUDE.md": {
-      "bytes": 3711,
-      "sha256": "0db2811f128538e70200b24bca867ce5f1bb9f26b843edeb7991926749a0efc4",
-      "canonical_sha256": "22bb849c281324a0aa02fb80a9af94c273c2a78b33829aaabb080a7d3967f33c"
+      "bytes": 3847,
+      "sha256": "205036e0147d4dd2f7df2db93e7f8664d8e62ed58f77cf4ab176bd1a5c7e28a1",
+      "canonical_sha256": "a8e227d183b0987ac11a756f0a76209b112db954e45a8d96f481f0187c1fd6ee"
     },
     ".github/copilot-instructions.md": {
-      "bytes": 3733,
-      "sha256": "737442ea4b6023e4851c97f40d6f43c88b86cfede375e96e2de7a2befe9cb2a8",
-      "canonical_sha256": "22bb849c281324a0aa02fb80a9af94c273c2a78b33829aaabb080a7d3967f33c"
+      "bytes": 3869,
+      "sha256": "211c12b1a8d071e486d41d1e6901ef691cdac4d31cbd60d0861643dfa72a1a79",
+      "canonical_sha256": "a8e227d183b0987ac11a756f0a76209b112db954e45a8d96f481f0187c1fd6ee"
     }
   },
   "mcp_tool_names": [

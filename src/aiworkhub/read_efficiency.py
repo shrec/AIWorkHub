@@ -107,6 +107,13 @@ class ReadEfficiencyReport:
     unbounded_reads: int
     explicit_source_graph_associations: int
     derived_temporal_associations: int
+    read_bytes_observed: int
+    total_read_bytes: int
+    bounded_read_bytes: int
+    unbounded_read_bytes: int
+    exact_reread_bytes: int
+    overlap_reread_bytes: int
+    unknown_repetition_bytes: int
     recommendations: List[str] = field(default_factory=list)
     events: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -131,6 +138,13 @@ class ReadEfficiencyReport:
             'unbounded_reads': self.unbounded_reads,
             'explicit_source_graph_associations': self.explicit_source_graph_associations,
             'derived_temporal_associations': self.derived_temporal_associations,
+            'read_bytes_observed': self.read_bytes_observed,
+            'total_read_bytes': self.total_read_bytes,
+            'bounded_read_bytes': self.bounded_read_bytes,
+            'unbounded_read_bytes': self.unbounded_read_bytes,
+            'exact_reread_bytes': self.exact_reread_bytes,
+            'overlap_reread_bytes': self.overlap_reread_bytes,
+            'unknown_repetition_bytes': self.unknown_repetition_bytes,
             'totals': self.totals,
             'recommendations': list(self.recommendations),
             'events': [dict(record) for record in self.events],
@@ -189,6 +203,13 @@ def analyze_read_efficiency(
         'unbounded_reads': 0,
         'explicit_source_graph_associations': 0,
         'derived_temporal_associations': 0,
+        'read_bytes_observed': 0,
+        'total_read_bytes': 0,
+        'bounded_read_bytes': 0,
+        'unbounded_read_bytes': 0,
+        'exact_reread_bytes': 0,
+        'overlap_reread_bytes': 0,
+        'unknown_repetition_bytes': 0,
     }
 
     for original_index, event in enumerate(event_list):
@@ -236,6 +257,11 @@ def analyze_read_efficiency(
             if hash_text:
                 content_hash = hash_text
 
+        raw_bytes = event.get('bytes_returned')
+        bytes_returned: Optional[int] = None
+        if _is_number(raw_bytes) and raw_bytes >= 0:
+            bytes_returned = int(raw_bytes)
+
         repetition = 'none'
         if path in seen_paths:
             known_hashes = hashes_by_path.setdefault(path, set())
@@ -269,12 +295,25 @@ def analyze_read_efficiency(
             counts['bounded_reads'] += 1
         else:
             counts['unbounded_reads'] += 1
+        if bytes_returned is not None:
+            counts['read_bytes_observed'] += 1
+            counts['total_read_bytes'] += bytes_returned
+            if bounded:
+                counts['bounded_read_bytes'] += bytes_returned
+            else:
+                counts['unbounded_read_bytes'] += bytes_returned
         if repetition == 'exact':
             counts['exact_rereads'] += 1
+            if bytes_returned is not None:
+                counts['exact_reread_bytes'] += bytes_returned
         elif repetition == 'overlap':
             counts['overlap_rereads'] += 1
+            if bytes_returned is not None:
+                counts['overlap_reread_bytes'] += bytes_returned
         elif repetition == 'unknown':
             counts['unknown_repetitions'] += 1
+            if bytes_returned is not None:
+                counts['unknown_repetition_bytes'] += bytes_returned
 
         source_graph_mode: Any = None
         source_graph_timestamp: Any = None
@@ -318,6 +357,7 @@ def analyze_read_efficiency(
                 'event_type': _event_type(event) or 'read',
                 'path': path,
                 'content_sha256': content_hash,
+                'bytes_returned': bytes_returned,
                 'offset': offset,
                 'limit': limit,
                 'bounded': bounded,
@@ -348,6 +388,13 @@ def analyze_read_efficiency(
         unbounded_reads=counts['unbounded_reads'],
         explicit_source_graph_associations=counts['explicit_source_graph_associations'],
         derived_temporal_associations=counts['derived_temporal_associations'],
+        read_bytes_observed=counts['read_bytes_observed'],
+        total_read_bytes=counts['total_read_bytes'],
+        bounded_read_bytes=counts['bounded_read_bytes'],
+        unbounded_read_bytes=counts['unbounded_read_bytes'],
+        exact_reread_bytes=counts['exact_reread_bytes'],
+        overlap_reread_bytes=counts['overlap_reread_bytes'],
+        unknown_repetition_bytes=counts['unknown_repetition_bytes'],
         recommendations=_build_recommendations(counts),
         events=report_events,
     )

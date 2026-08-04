@@ -372,6 +372,43 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert len(verification["source_graph_index_sequence"]) == 2
 
 
+def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    large_payload = {
+        "mode": "focus",
+        "query": "large orientation payload",
+        "matches": [
+            {"path": f"src/module_{index}.py", "body": "x" * 1200}
+            for index in range(24)
+        ],
+        "ranked_symbols": [
+            {"name": f"symbol_{index}", "score": 100 - index}
+            for index in range(12)
+        ],
+    }
+    monkeypatch.setattr(
+        source_graph_mod,
+        "focus",
+        lambda repo_root, query, budget=64: large_payload,
+    )
+    ctx = _ctx(repo, home=tmp_path / "home")
+
+    result = w.source_graph_query(ctx, mode="focus", query="large", budget=32)
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert result["output_cap_bytes"] == 8 * 1024
+    assert result["bytes"] <= result["output_cap_bytes"]
+    assert result["hit_count"] == w._json_hit_count(large_payload)
+    assert result["evidence_counts"] == w._source_graph_evidence_counts(large_payload)
+    bounded = json.loads(result["content"])
+    assert bounded["original_hit_count"] == result["hit_count"]
+    assert "ranked_symbols" in bounded["priority_keys_present"]
+
+
 def test_source_graph_cache_is_invalidated_by_index_generation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

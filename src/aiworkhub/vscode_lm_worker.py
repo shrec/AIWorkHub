@@ -12,7 +12,13 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .vscode_lm_bridge import EDIT_RESPONSE_SCHEMA_ID, EDIT_RESPONSE_SCHEMA_ID_V1, RESPONSE_SCHEMA_ID
+from . import semantic_edit
+from .vscode_lm_bridge import (
+    EDIT_RESPONSE_SCHEMA_ID,
+    EDIT_RESPONSE_SCHEMA_ID_V1,
+    EDIT_RESPONSE_SCHEMA_ID_V2,
+    RESPONSE_SCHEMA_ID,
+)
 
 
 MAX_V2_PATHS = 128
@@ -270,6 +276,87 @@ def _v2_planned_outputs(
     return planned
 
 
+def _v3_planned_outputs(
+    workspace: Path,
+    edit: dict[str, Any],
+    allowed: list[str],
+    create_paths: set[str] | None = None,
+) -> tuple[list[tuple[str, str]], list[dict[str, Any]]]:
+    """Plan hash-bound line-range edits without requiring old/full-file output."""
+
+    edits = edit.get("edits", [])
+    creates = edit.get("creates", [])
+    _validate_v2_counts(edits, creates)
+    planned: list[tuple[str, str]] = []
+    metrics: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in edits:
+        if not isinstance(item, dict):
+            raise RuntimeError("vscode_lm_semantic_edit_invalid")
+        relative = _validate_allowed_path(item.get("path"), allowed)
+        if relative in seen:
+            raise RuntimeError(f"vscode_lm_edit_response_duplicate_path:{relative}")
+        seen.add(relative)
+        expected_hash = _require_sha256(item.get("current_sha256"), relative)
+        ranges = item.get("ranges")
+        if not isinstance(ranges, list):
+            raise RuntimeError(f"vscode_lm_semantic_edit_ranges_invalid:{relative}")
+        target = _target_path(workspace, relative)
+        if target.is_symlink() or not target.is_file():
+            raise RuntimeError(f"vscode_lm_edit_response_edit_target_invalid:{relative}")
+        current_bytes = target.read_bytes()
+        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
+            raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
+        try:
+            current_text = current_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_current_utf8_invalid:{relative}"
+            ) from exc
+        try:
+            next_text, edit_metrics = semantic_edit.apply_line_ranges(current_text, ranges)
+        except semantic_edit.SemanticEditError as exc:
+            raise RuntimeError(f"vscode_lm_semantic_edit_rejected:{relative}:{exc}") from exc
+        planned.append((relative, next_text))
+        metrics.append({
+            "path": relative,
+            "file_bytes": len(current_bytes),
+            **edit_metrics,
+        })
+
+    # File creation necessarily needs complete content; it is not counted as
+    # a full-file rewrite of an existing source file.
+    for item in creates:
+        if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+            raise RuntimeError("vscode_lm_edit_response_create_invalid")
+        relative = _validate_allowed_path(item.get("path"), allowed)
+        if relative in seen:
+            raise RuntimeError(f"vscode_lm_edit_response_duplicate_path:{relative}")
+        seen.add(relative)
+        target = _target_path(workspace, relative)
+        precreated_placeholder = (
+            relative in (create_paths or set())
+            and target.is_file()
+            and not target.is_symlink()
+            and target.stat().st_size == 0
+        )
+        if (target.exists() or target.is_symlink()) and not precreated_placeholder:
+            raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
+        content = item["content"]
+        if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
+            raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        planned.append((relative, content))
+        metrics.append({
+            "path": relative,
+            "create": True,
+            "replacement_bytes": len(content.encode("utf-8")),
+            "whole_file_output_required": True,
+            "token_savings_claimed": False,
+        })
+    return planned, metrics
+
+
 def run(spec_path: Path) -> dict[str, Any]:
     spec = _load_json(spec_path)
     if spec.get("schema_id") != "aiworkhub.vscode_lm.worker_spec.v1":
@@ -307,18 +394,27 @@ def run(spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("vscode_lm_edit_response_invalid_json") from exc
     if not isinstance(edit, dict) or edit.get("schema_id") not in {
         EDIT_RESPONSE_SCHEMA_ID,
+        EDIT_RESPONSE_SCHEMA_ID_V2,
         EDIT_RESPONSE_SCHEMA_ID_V1,
     }:
         raise RuntimeError("vscode_lm_edit_response_schema_mismatch")
     allowed = [str(value) for value in spec.get("allowed_writes") or []]
     try:
+        semantic_metrics: list[dict[str, Any]] = []
         if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
             planned = _v1_planned_outputs(edit, allowed)
-        else:
+        elif edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V2:
             create_paths = {
                 str(value) for value in spec.get("create_paths") or [] if str(value)
             }
             planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
+        else:
+            create_paths = {
+                str(value) for value in spec.get("create_paths") or [] if str(value)
+            }
+            planned, semantic_metrics = _v3_planned_outputs(
+                workspace, edit, allowed, create_paths
+            )
     except RuntimeError as exc:
         response_bytes = raw_text.encode("utf-8")
         raise RuntimeError(
@@ -338,6 +434,8 @@ def run(spec_path: Path) -> dict[str, Any]:
         "result": str(edit.get("summary") or "GLM VS Code worker completed"),
         "model": response.get("model"),
         "changed_paths": sorted(set(written)),
+        "edit_protocol": str(edit.get("schema_id") or ""),
+        "semantic_edit_metrics": semantic_metrics,
         "project_context_receipt": str(spec.get("project_context_receipt") or ""),
     }
 

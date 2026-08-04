@@ -58,11 +58,84 @@ def _v2(
     creates: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
-        "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+        "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID_V2,
         "summary": "patch",
         "edits": edits or [],
         "creates": creates or [],
     }
+
+
+def _v3(
+    *,
+    edits: list[dict[str, object]] | None = None,
+    creates: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+        "summary": "semantic patch",
+        "edits": edits or [],
+        "creates": creates or [],
+    }
+
+
+def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Path) -> None:
+    current = "header\ndef old():\n    return 1\nfooter\n"
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[{
+            "path": "src/app.py",
+            "current_sha256": hashlib.sha256(current.encode()).hexdigest(),
+            "ranges": [{"start_line": 2, "end_line": 3, "new": "def new():\n    return 2"}],
+        }]),
+    )
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    target.write_text(current, encoding="utf-8")
+
+    result = vscode_lm_worker.run(spec)
+
+    assert target.read_text(encoding="utf-8") == "header\ndef new():\n    return 2\nfooter\n"
+    assert result["edit_protocol"] == vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID
+    metric = result["semantic_edit_metrics"][0]
+    assert metric["model_reemitted_old_bytes"] == 0
+    assert metric["whole_file_output_required"] is False
+    assert metric["token_savings_claimed"] is False
+
+
+def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> None:
+    current = "one\ntwo\nthree\n"
+    overlap, workspace = _request(
+        tmp_path / "overlap",
+        _v3(edits=[{
+            "path": "src/app.py",
+            "current_sha256": hashlib.sha256(current.encode()).hexdigest(),
+            "ranges": [
+                {"start_line": 1, "end_line": 2, "new": "x"},
+                {"start_line": 2, "end_line": 3, "new": "y"},
+            ],
+        }]),
+    )
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    target.write_text(current, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ranges_overlap"):
+        vscode_lm_worker.run(overlap)
+    assert target.read_text(encoding="utf-8") == current
+
+    stale, stale_workspace = _request(
+        tmp_path / "stale",
+        _v3(edits=[{
+            "path": "src/app.py",
+            "current_sha256": "0" * 64,
+            "ranges": [{"start_line": 1, "end_line": 1, "new": "x"}],
+        }]),
+    )
+    stale_target = stale_workspace / "src" / "app.py"
+    stale_target.parent.mkdir()
+    stale_target.write_text(current, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="stale_hash"):
+        vscode_lm_worker.run(stale)
+    assert stale_target.read_text(encoding="utf-8") == current
 
 
 def _edit(path: str, content: str, *, expected_count: int = 1) -> dict[str, object]:

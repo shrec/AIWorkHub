@@ -51,6 +51,9 @@ FILE_EVIDENCE_EXTRACTOR_ID = "aiworkhub.source_graph_ast.file_evidence.v1"
 PHP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.php_lexical.v1"
 CPP_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.cpp_lexical.v1"
 POLYGLOT_LEXICAL_EXTRACTOR_ID = "aiworkhub.source_graph_ast.polyglot_lexical.v1"
+TREE_SITTER_JS_TS_EXTRACTOR_ID = (
+    "aiworkhub.source_graph.tree_sitter.javascript_typescript.v1"
+)
 
 EXTRACTED = "EXTRACTED"
 INFERRED = "INFERRED"
@@ -154,6 +157,49 @@ def extract_file(repo_root: Path, file_path: Path, *, build_revision: str) -> Fi
         return _extract_cpp_lexical(rel, text, source_hash, build_revision)
 
     if language in POLYGLOT_LEXICAL_LANGUAGES:
+        if language in {"javascript", "typescript"}:
+            from . import source_graph_semantic
+
+            semantic = source_graph_semantic.extract_javascript_typescript(
+                file_path=rel, raw=raw, language=language,
+            )
+            if semantic is not None:
+                return FileExtraction(
+                    file_path=rel,
+                    language=language,
+                    status="ok",
+                    source_hash=source_hash,
+                    entities=tuple(Entity(
+                        kind=str(row["kind"]),
+                        name=str(row["name"]),
+                        qualname=str(row["qualname"]),
+                        file_path=rel,
+                        line_start=int(row["line_start"]),
+                        line_end=int(row["line_end"]),
+                        signature=str(row["signature"]),
+                        evidence_label=EXTRACTED,
+                        extractor=source_graph_semantic.EXTRACTOR_ID,
+                        confidence=float(row["confidence"]),
+                        source_hash=source_hash,
+                        build_revision=build_revision,
+                    ) for row in semantic.entities),
+                    edges=tuple(Edge(
+                        kind=str(row["kind"]),
+                        src_qualname=str(row["src_qualname"]),
+                        dst_name=str(row["dst_name"]),
+                        dst_qualname=(
+                            str(row["dst_qualname"])
+                            if row.get("dst_qualname") is not None else None
+                        ),
+                        file_path=rel,
+                        line=int(row["line"]),
+                        evidence_label=str(row["evidence_label"]),
+                        extractor=source_graph_semantic.EXTRACTOR_ID,
+                        confidence=float(row["confidence"]),
+                        source_hash=source_hash,
+                        build_revision=build_revision,
+                    ) for row in semantic.edges),
+                )
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:

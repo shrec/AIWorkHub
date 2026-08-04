@@ -6,6 +6,292 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.81] - 2026-08-04
+
+### Added
+
+- Added a machine-checked paired semantic-edit pilot ledger with exact task and
+  request identities, provider token/time observations, contrary uncached-
+  input evidence and an enforced `public_claim_eligible=false` status while
+  the sample remains small, non-randomized and cache-confounded.
+- Added a public benchmark page and documentation that distinguish structural
+  byte ratios from token, cost, latency and accepted-quality measurements.
+- Added a Product Hunt launch pack plus three canonical 1270x760 gallery
+  compositions using the existing AIWorkHub brand assets.
+- Added benchmark-evidence recomputation to the static CI quality job.
+- Added a machine-checked full-system benefit snapshot covering Source Graph
+  enforcement/latency, tool-use cohorts, read behavior, signed context
+  expansion, semantic-edit shape, callback durability, task outcomes and
+  incomplete cost coverage. The public comparison page now separates
+  AIWorkHub's integrated control-plane differentiation from the documented
+  strengths of Graphify, Serena, Aider and Cline.
+
+## [0.8.80] - 2026-08-04
+
+### Added
+
+- Operations KPI analytics now retain authenticated, path-free semantic-edit
+  receipts and visualize focused-edit runs, edited ranges, source-file bytes,
+  selected old-region bytes, replacement bytes and model-reemitted old bytes.
+- Added an explicit structural replacement/file byte ratio and bytes-not-
+  reemitted counter. These measurements are labeled as byte-shape evidence and
+  never presented as token, cost, speed or quality savings without a paired
+  provider baseline.
+
+## [0.8.79] - 2026-08-04
+
+### Fixed
+
+- Terminal semantic-edit telemetry now consumes authenticated CLI
+  `semantic_edit_apply` receipts as well as VS Code LM response metrics, while
+  exporting only bounded byte counts and never replacement text, paths, hashes
+  or idempotency keys.
+- Read-efficiency telemetry now recognizes the exact side-effect-free
+  `wc -l <path> && sed -n <range> <same-path>` shape emitted by Codex and
+  excludes the line-count prefix from measured file bytes. Other compound
+  shell commands remain deliberately unclassified.
+
+## [0.8.78] - 2026-08-04
+
+### Fixed
+
+- Normalized the text-only VS Code LM semantic-edit prepare request so the
+  final-envelope `path` alias cannot turn a valid repository-relative target
+  into `semantic_edit_path_invalid`. The worker prompt now shows the exact
+  `file_path` tool input shape, while all existing scope and hash checks remain
+  fail-closed.
+
+## [0.8.77] - 2026-08-04
+
+### Added
+
+- Added a replacement-only semantic edit protocol for existing files. Source
+  Graph-selected line ranges are bound to full-file and fragment hashes;
+  workers return only new code and a deterministic local Python applier enforces
+  scope, freshness, overlap, symlink and atomic-write guards.
+- Added byte-level semantic-edit receipts to terminal evidence. They distinguish
+  full file size, selected old region and model replacement output while
+  explicitly making no token-savings claim; provider-token A/B measurement
+  remains the authority for economy claims.
+
+### Changed
+
+- VS Code LM workers now request `semantic_edit_response.v3` by default while
+  retaining v1/v2 parsing as compatibility fallbacks. Existing files no longer
+  require old-code echo or complete-file regeneration in the normal path.
+
+## [0.8.76] - 2026-08-04
+
+### Fixed
+
+- Corrected Context economics population names: the existing baseline is
+  pre-optimization tool-section payload, not raw repository files or a
+  counterfactual model read. Dashboard provider economics no longer feeds
+  that population into the naive-discovery compression ratio.
+- Split context delivery into optional-section suppression, serialization
+  envelope overhead and signed net delivery delta. Source-selection and token
+  savings remain explicitly unavailable until a controlled raw-file A/B
+  counterfactual exists.
+
+## [0.8.75] - 2026-08-04
+
+### Fixed
+
+- Replaced one-sided Context compression accounting with a signed net byte
+  delta. Mixed samples now subtract bundle expansion from gross compression,
+  and Operations renders expansion explicitly instead of reporting false
+  bytes avoided. The metric remains a deterministic declared-byte comparison,
+  never a token-savings claim.
+
+## [0.8.74] - 2026-08-04
+
+### Fixed
+
+- Versioned the corrected provider read-efficiency measurement and exclude
+  incompatible legacy summaries from current KPI totals while reporting their
+  count explicitly; historical false rows can no longer pollute the corrected
+  dashboard.
+
+## [0.8.73] - 2026-08-04
+
+### Fixed
+
+- Deduplicated Codex `item.started`/`item.completed` command pairs so a single
+  bounded file read is no longer counted twice or misclassified as an unknown
+  repetition. The regression is covered by a real provider-event-shaped test.
+- Stopped instructing workers to repeat fresh, non-degraded Session Manager,
+  AI Memory and KB queries already authenticated in their injected context.
+  Live re-query remains available for absent/degraded sections or new facts,
+  removing ceremonial tool cycles without weakening the Source Graph code gate.
+
+### Added
+
+- Added truthful read-efficiency visuals to Operations KPIs: provider trace
+  coverage, bounded/unbounded reads, exact/overlapping rereads, observed bytes
+  and per-adapter evidence coverage. The UI explicitly labels these as
+  provider event/byte measurements, never inferred token or savings claims.
+
+## [0.8.72] - 2026-08-04
+
+### Added
+
+- Connected the previously standalone read-efficiency analyzer to canonical
+  worker finalization. High-confidence Claude/Codex read events now produce a
+  path-free process summary with bounded/unbounded reads, exact/overlapping
+  rereads, observed response bytes and Source Graph correlation. Missing
+  provider evidence remains explicitly unobserved rather than a false zero.
+- Added repository/dashboard aggregation by adapter and worker instructions
+  that prefer Source Graph body/file previews plus bounded, non-repeated exact
+  reads. Measurements explicitly make no token or cost-savings claim.
+
+## [0.8.71] - 2026-08-04
+
+### Fixed
+
+- Made Source Graph's advertised low-token workflow truthful: `focus` and
+  `slice` responses now use an 8 KiB content ceiling, analysis modes use a
+  12 KiB ceiling and content-rich modes retain 16 KiB. Truncation remains
+  structure-aware, exposes its applied cap and preserves full pre-truncation
+  hit/evidence counts for telemetry and reproducible benchmarks.
+
+## [0.8.70] - 2026-08-04
+
+### Fixed
+
+- Exposed the existing fail-closed required-output exception contracts through
+  canonical MCP task creation. Managers can now explicitly declare valid
+  unchanged or deliberately empty required files; both lists are validated,
+  persisted and included in idempotent create reconciliation instead of
+  forcing clean-root successor tasks.
+
+## [0.8.69] - 2026-08-04
+
+### Fixed
+
+- Bounded the manager-facing cost ledger to provider, model and day summaries
+  by default. Per-runner/per-topic maps and raw task rows remain independently
+  available through explicit `full=true` and `include_tasks=true` requests.
+
+## [0.8.68] - 2026-08-04
+
+### Fixed
+
+- Made the manager-facing Plan-DAG snapshot actionable and bounded by default.
+  Ready work, live blockers, collisions, orphaned processing and DAG validity
+  remain visible, while repeated finished-card lifecycle and dependency maps
+  move behind explicit `full=true` inspection.
+
+## [0.8.67] - 2026-08-04
+
+### Fixed
+
+- Made the manager-facing dashboard snapshot bounded by default while the
+  native Webview explicitly requests the unchanged full shape. Model calls no
+  longer pull task rows, process evidence, ledgers, workforce history and KPI
+  analytics when only health, queue counts, warnings and route truth are
+  needed.
+
+## [0.8.66] - 2026-08-04
+
+### Fixed
+
+- Replaced Completion Inbox's embedded full process-event payloads with
+  bounded operational summaries. Manager polling keeps lifecycle, error and
+  measured-usage facts while omitting repeated project-context bundles,
+  receipts, validation arrays and other evidence available through exact
+  process inspection.
+
+## [0.8.65] - 2026-08-04
+
+### Fixed
+
+- Unified the completion-inbox compatibility readiness view with canonical
+  Claude live-auth evidence. A provider-observed 401/403 can no longer appear
+  blocked in Environment Preflight but launchable in Completion Inbox.
+
+## [0.8.64] - 2026-08-04
+
+### Fixed
+
+- Preserved the bounded Claude live-authentication circuit across MCP and
+  extension reloads using owner-only, non-secret metadata. A recent
+  authoritative 401/403 now continues to block stale `auth status` readiness
+  without storing the executable path, OAuth token, or provider credentials.
+
+## [0.8.63] - 2026-08-04
+
+### Fixed
+
+- Excluded the first-party `claude-code` extension's internal model entries
+  from the background VS Code LM worker broker after repeated text-first and
+  stream-first live canaries proved they return no public response parts.
+  Copilot-hosted Claude remains a separate explicit editor route; first-party
+  Claude subscription workers remain bound to `claude_cli`.
+
+## [0.8.62] - 2026-08-04
+
+### Fixed
+
+- Read VS Code language-model responses from the authoritative typed
+  `response.stream` before the derived text-only view. This preserves
+  provider text/tool parts that `response.text` may filter and consume, while
+  retaining a bounded compatibility fallback for legacy responses that omit
+  the typed stream.
+
+## [0.8.61] - 2026-08-04
+
+### Fixed
+
+- Added bounded, content-free VS Code LM response-part diagnostics so an
+  actually empty contributed provider stream is no longer confused with an
+  unsupported JSON event shape.
+- Trip a short Claude authentication circuit breaker after an authoritative
+  live 401/403, preventing stale `claude auth status` cache entries from
+  advertising the expired subscription route as ready and repeatedly burning
+  failed task launches.
+- Kept first-party Claude subscription workers on `claude_cli`; they no longer
+  fall back silently to the separate VS Code/Copilot authorization and billing
+  surface when the subscription CLI is unavailable.
+
+## [0.8.60] - 2026-08-04
+
+### Fixed
+
+- Made the VS Code LM text bridge fall back to `response.stream` when a
+  contributed provider exposes an iterable `response.text` channel but emits
+  no content through it, preventing false empty-response finalization loops.
+- Rejected VS Code/Codium launchers at the Claude subscription preflight
+  boundary so a stale executable override can never run `code auth status`
+  and repeatedly open empty `auth`/`status` editor buffers.
+
+## [0.8.59] - 2026-08-04
+
+### Added
+
+- Added an optional `source-graph-semantic` backend for parser-backed
+  JavaScript/TypeScript declarations, imports, inheritance and calls while
+  retaining the dependency-free lexical fallback and truthful capability
+  receipts.
+- Added cross-platform lock, topic-grammar and large-tree semantic regression
+  coverage, including the semantic extra on Linux, Windows and macOS CI.
+
+### Fixed
+
+- Split long worker finalization and canonical review promotion away from the
+  short global launch registry lock, preventing unrelated Windows launches
+  from timing out behind completed-worker reconciliation or review work.
+- Unified task-create and launch topic identity grammar so valid dotted,
+  dashed and colon-delimited topics remain launchable.
+- Made preflight sandbox telemetry route-aware, separating native CLI sandbox
+  capability from safe in-process VS Code LM routes.
+- Corrected cost-ledger duplicate aggregation, provider cache accounting and
+  Source Graph freshness denominators without presenting unknown usage as
+  zero cost or zero tokens.
+- Improved Source Graph query normalization, exact phrase/identifier handling
+  and cross-file JavaScript/TypeScript import resolution; large native parse
+  trees now derive line numbers from stable byte offsets instead of unstable
+  parser point accessors.
+
 ## [0.8.58] - 2026-08-04
 
 ### Fixed

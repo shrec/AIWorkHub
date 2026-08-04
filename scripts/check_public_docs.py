@@ -20,6 +20,8 @@ PUBLIC_DOCS = tuple(
         "SUPPORT.md",
         "vscode-extension/README.md",
         "docs/ARCHITECTURE.md",
+    "docs/BENCHMARKS.md",
+    "benchmarks/system-benefit-snapshot-v1.json",
         "docs/CALLBACKS.md",
         "docs/GETTING_STARTED.md",
         "docs/PUBLISHING.md",
@@ -42,6 +44,7 @@ PUBLIC_SITE_PAGES = {
     ),
     "site/vscode-extension/index.html": SITE_BASE + "vscode-extension/",
     "site/docs/index.html": SITE_BASE + "docs/",
+    "site/benchmarks/index.html": SITE_BASE + "benchmarks/",
 }
 LINK_RE = re.compile(r"!?\[[^]]*\]\(([^)]+)\)")
 HTML_IMAGE_RE = re.compile(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)

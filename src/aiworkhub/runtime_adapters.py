@@ -479,6 +479,8 @@ def build_runtime_command(
             "Edit",
             "Bash",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_source_graph_query",
+            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_prepare",
+            "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_semantic_edit_apply",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_session_current_state",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_search",
             "mcp__aiworkhub_worker_ai_tools__aiworkhub_worker_ai_memory_get",

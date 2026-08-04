@@ -126,6 +126,8 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     gate = event.get("worker_mcp_gate")
     prompt_budget = event.get("prompt_budget")
     provider_denials = event.get("provider_tool_denials")
+    read_efficiency = event.get("read_efficiency")
+    semantic_edit = event.get("semantic_edit")
     usage = event.get("usage")
     if (
         not isinstance(context, Mapping)
@@ -134,6 +136,8 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         and not isinstance(gate, Mapping)
         and not isinstance(prompt_budget, Mapping)
         and not isinstance(provider_denials, Mapping)
+        and not isinstance(read_efficiency, Mapping)
+        and not isinstance(semantic_edit, Mapping)
         and not isinstance(usage, Mapping)
     ):
         return {}
@@ -159,11 +163,44 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(context, Mapping):
         raw_estimate = context.get("estimated_raw_context_vs_bundle_bytes")
         if isinstance(raw_estimate, Mapping):
+            pre_optimization_bytes = raw_estimate.get(
+                "pre_optimization_section_bytes"
+            )
+            if pre_optimization_bytes is None:
+                pre_optimization_bytes = raw_estimate.get("raw_context_bytes")
+            optimized_section_bytes = raw_estimate.get("optimized_section_bytes")
+            if optimized_section_bytes is None:
+                optimized_section_bytes = raw_estimate.get("optimized_context_bytes")
+            optimized_section_bytes_observed = optimized_section_bytes is not None
             estimate = {
                 "label": str(raw_estimate.get("label") or "")[:80],
-                "raw_context_bytes": int(raw_estimate.get("raw_context_bytes") or 0),
+                "population_definition": str(
+                    raw_estimate.get("population_definition") or (
+                        "tool_section_payload_before_optional_suppression_not_"
+                        "raw_repository_files_or_counterfactual_reads"
+                    )
+                )[:180],
+                "pre_optimization_section_bytes": int(
+                    pre_optimization_bytes or 0
+                ),
+                "optimized_section_bytes": int(optimized_section_bytes or 0),
+                "optimized_section_bytes_observed": (
+                    optimized_section_bytes_observed
+                ),
+                # Compatibility alias for historical dashboard consumers.
+                "raw_context_bytes": int(pre_optimization_bytes or 0),
                 "bundle_bytes": int(raw_estimate.get("bundle_bytes") or 0),
+                "optimization_delta_bytes": int(
+                    raw_estimate.get("optimization_delta_bytes") or 0
+                ),
+                "envelope_delta_bytes": int(
+                    raw_estimate.get("envelope_delta_bytes") or 0
+                ),
                 "delta_bytes": int(raw_estimate.get("delta_bytes") or 0),
+                "raw_file_counterfactual_available": bool(
+                    raw_estimate.get("raw_file_counterfactual_available")
+                ),
+                "token_savings_available": False,
             }
 
     tool_use: dict[str, Any] = {}
@@ -337,6 +374,49 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
                 for value in (provider_denials.get("raw_discovery_labels") or [])[:16]
             ],
         } if isinstance(provider_denials, Mapping) else {},
+        "read_efficiency": {
+            "schema_id": str(read_efficiency.get("schema_id") or "")[:96],
+            "evidence_observed": bool(read_efficiency.get("evidence_observed")),
+            "provider_records_scanned": _bounded_int(
+                read_efficiency.get("provider_records_scanned")
+            ),
+            "recognized_read_events": _bounded_int(
+                read_efficiency.get("recognized_read_events")
+            ),
+            "recognized_source_graph_events": _bounded_int(
+                read_efficiency.get("recognized_source_graph_events")
+            ),
+            **{
+                key: _bounded_int(read_efficiency.get(key))
+                for key in (
+                    "total_reads", "known_repetitions", "unknown_repetitions",
+                    "exact_rereads", "overlap_rereads", "bounded_reads",
+                    "unbounded_reads", "explicit_source_graph_associations",
+                    "derived_temporal_associations", "read_bytes_observed",
+                    "total_read_bytes", "bounded_read_bytes",
+                    "unbounded_read_bytes", "exact_reread_bytes",
+                    "overlap_reread_bytes", "unknown_repetition_bytes",
+                )
+            },
+            "measurement_label": str(
+                read_efficiency.get("measurement_label") or ""
+            )[:120],
+        } if isinstance(read_efficiency, Mapping) else {},
+        "semantic_edit": {
+            "schema_id": str(semantic_edit.get("schema_id") or "")[:96],
+            "observed": bool(semantic_edit.get("observed")),
+            **{
+                key: _bounded_int(semantic_edit.get(key))
+                for key in (
+                    "file_count", "range_count", "file_bytes",
+                    "old_region_bytes", "replacement_bytes",
+                    "model_reemitted_old_bytes",
+                )
+            },
+            # This receipt is structural byte evidence only. It cannot prove
+            # provider-token or monetary savings without a paired baseline.
+            "token_savings_claimed": False,
+        } if isinstance(semantic_edit, Mapping) else {},
         "usage": {
             "input_tokens": _bounded_int(usage.get("input_tokens")),
             "output_tokens": _bounded_int(usage.get("output_tokens")),
@@ -396,6 +476,7 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "gated_tasks": 0,
         "satisfied_tasks": 0,
         "source_graph_any_tasks": 0,
+        "source_graph_fresh_tasks": 0,
         "source_graph_live_tasks": 0,
         "source_graph_injected_only_tasks": 0,
         "source_graph_stale_or_cached_tasks": 0,
@@ -525,6 +606,8 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         satisfaction = str(tool_use.get("source_graph_satisfaction") or "")
         totals["source_graph_calls"] += calls
         totals["source_graph_fresh_calls"] += fresh_calls
+        if fresh_calls > 0:
+            totals["source_graph_fresh_tasks"] += 1
         totals["source_graph_live_calls"] += live_calls
         totals["source_graph_hit_count"] += hit_count
         totals["source_graph_zero_hit_calls"] += zero_hits
@@ -780,15 +863,92 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         )
     if denominator:
         totals["live_rate"] = round(100.0 * totals["source_graph_live_tasks"] / denominator, 1)
-        fresh_tasks = sum(
-            1
-            for row in latest_by_task.values()
-            if isinstance((row.get("ai_infra_context") or {}).get("tool_use"), Mapping)
-            and int((row.get("ai_infra_context") or {})["tool_use"].get("source_graph_fresh_calls") or 0) > 0
+        totals["fresh_rate"] = round(
+            100.0 * totals["source_graph_fresh_tasks"] / denominator, 1
         )
-        totals["fresh_rate"] = round(100.0 * fresh_tasks / denominator, 1)
         totals["any_rate"] = round(100.0 * totals["source_graph_any_tasks"] / denominator, 1)
         totals["gate_satisfaction_rate"] = round(100.0 * totals["satisfied_tasks"] / denominator, 1)
+    return totals
+
+
+def _read_efficiency_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate path-free provider read evidence by latest task run."""
+
+    latest_by_task: dict[str, Mapping[str, Any]] = {}
+    for row in process_report.get("processes") or []:
+        if not isinstance(row, Mapping):
+            continue
+        task_id = str(row.get("task_id") or "").strip()
+        if task_id and task_id not in latest_by_task:
+            latest_by_task[task_id] = row
+
+    count_fields = (
+        "provider_records_scanned", "recognized_read_events",
+        "recognized_source_graph_events", "total_reads", "known_repetitions",
+        "unknown_repetitions", "exact_rereads", "overlap_rereads",
+        "bounded_reads", "unbounded_reads", "explicit_source_graph_associations",
+        "derived_temporal_associations", "read_bytes_observed",
+        "total_read_bytes", "bounded_read_bytes", "unbounded_read_bytes",
+        "exact_reread_bytes", "overlap_reread_bytes",
+        "unknown_repetition_bytes",
+    )
+    totals: dict[str, Any] = {
+        "schema_id": "aiworkhub.read_efficiency.telemetry.v2",
+        "observed_tasks": len(latest_by_task),
+        "evidence_observed_tasks": 0,
+        "evidence_unobserved_tasks": 0,
+        "legacy_evidence_tasks": 0,
+        **{field: 0 for field in count_fields},
+        "bounded_read_rate": None,
+        "exact_reread_rate": None,
+        "read_byte_coverage_rate": None,
+        "measurement_label": (
+            "observed_provider_events_and_bytes_only_no_token_or_cost_claim"
+        ),
+        "by_adapter": {},
+    }
+
+    for row in latest_by_task.values():
+        infra = row.get("ai_infra_context")
+        evidence = infra.get("read_efficiency") if isinstance(infra, Mapping) else None
+        adapter = str(row.get("adapter_id") or "unknown")[:120]
+        bucket = totals["by_adapter"].setdefault(
+            adapter,
+            {
+                "tasks": 0,
+                "evidence_observed_tasks": 0,
+                "legacy_evidence_tasks": 0,
+                **{field: 0 for field in count_fields},
+            },
+        )
+        bucket["tasks"] += 1
+        if not isinstance(evidence, Mapping) or not evidence.get("evidence_observed"):
+            totals["evidence_unobserved_tasks"] += 1
+            continue
+        if str(evidence.get("schema_id") or "") != "aiworkhub.provider_read_efficiency.v2":
+            # v1 Codex summaries counted both item.started and item.completed
+            # for one command. Preserve their existence as legacy evidence,
+            # but never mix their suspect counts into current KPIs.
+            totals["legacy_evidence_tasks"] += 1
+            bucket["legacy_evidence_tasks"] += 1
+            continue
+        totals["evidence_observed_tasks"] += 1
+        bucket["evidence_observed_tasks"] += 1
+        for field in count_fields:
+            value = max(0, _bounded_int(evidence.get(field)))
+            totals[field] += value
+            bucket[field] += value
+
+    if totals["total_reads"]:
+        totals["bounded_read_rate"] = round(
+            100.0 * totals["bounded_reads"] / totals["total_reads"], 1
+        )
+        totals["exact_reread_rate"] = round(
+            100.0 * totals["exact_rereads"] / totals["total_reads"], 1
+        )
+        totals["read_byte_coverage_rate"] = round(
+            100.0 * totals["read_bytes_observed"] / totals["total_reads"], 1
+        )
     return totals
 
 
@@ -1266,34 +1426,15 @@ class DashboardProvider:
         }
 
     def get_cost_ledger(self) -> dict[str, Any]:
-        by_runner: dict[str, dict[str, Any]] = {}
-        for card in task_store.list_task_cards(self.repo_root, limit=5000):
-            summary = card.get("usage_summary") or {}
-            if isinstance(summary, str):
-                try:
-                    summary = json.loads(summary)
-                except json.JSONDecodeError:
-                    summary = {}
-            source = summary.get("by_runner") if isinstance(summary, Mapping) else {}
-            if not isinstance(source, Mapping):
-                continue
-            for runner, raw_bucket in source.items():
-                if not isinstance(raw_bucket, Mapping):
-                    continue
-                bucket = by_runner.setdefault(
-                    str(runner),
-                    {"records": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
-                )
-                for key in ("records", "input_tokens", "output_tokens", "total_tokens"):
-                    bucket[key] += int(raw_bucket.get(key) or 0)
-                bucket["cost_usd"] += float(raw_bucket.get("cost_usd") or 0.0)
-        for bucket in by_runner.values():
-            bucket["cost_usd"] = round(float(bucket["cost_usd"]), 6)
-        return {
-            "schema_id": "aiworkhub.dashboard.canonical_cost_ledger.v1",
-            "aggregates": {"by_runner": by_runner},
-            "source_status": {"canonical_task_store": "ready"},
-        }
+        # Reuse the canonical union ledger exposed through Task MCP. Task
+        # cards alone omit retry/terminal usage and can produce a false-zero
+        # dashboard while measured launch records exist.
+        result = dict(cost_ledger.build_cost_ledger(
+            repo_root=self.repo_root,
+            include_tasks=False,
+        ))
+        result["schema_id"] = "aiworkhub.dashboard.canonical_cost_ledger.v1"
+        return result
 
     def get_collision_report(self) -> dict[str, Any]:
         active: list[dict[str, Any]] = []
@@ -1552,6 +1693,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "agent_processes": {},
             "adapter_readiness": {},
             "source_graph_telemetry": _source_graph_telemetry({}),
+            "read_efficiency_telemetry": _read_efficiency_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
             "kpi_analytics": dashboard_kpis.build_kpi_snapshot(
                 process_report={},
@@ -1807,6 +1949,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         row_counts[status] = {"returned": 0, "exact": exact, "truncated": exact > 0}
 
     source_graph_telemetry = _source_graph_telemetry(process_report)
+    read_efficiency_telemetry = _read_efficiency_telemetry(process_report)
     project_context_telemetry = _project_context_telemetry(process_report)
     cost_totals = _cost_totals(ledger)
     kpi_analytics = dashboard_kpis.build_kpi_snapshot(
@@ -1856,6 +1999,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "environment_preflight": dict(environment_preflight),
         "workforce_catalog": dict(workforce),
         "source_graph_telemetry": source_graph_telemetry,
+        "read_efficiency_telemetry": read_efficiency_telemetry,
         "project_context_telemetry": project_context_telemetry,
         "kpi_analytics": kpi_analytics,
         "callback_bridge_health": dict(callback_bridge_health),

@@ -91,6 +91,33 @@ degraded reasons remain distinguishable. See the
 [Source Graph economics](docs/PRODUCT_ROADMAP.md#p1--source-graph-economics-and-enforcement-080)
 contract.
 
+For existing-file changes, the worker can stay on a focused path end to end.
+Source Graph `body` returns one bounded symbol with exact line evidence; the
+model emits only replacement code; AIWorkHub's local Python applier verifies
+the complete-file preimage, the prepared fragment, write scope and range before
+changing the isolated worktree. Full-file output remains available only as a
+legacy fallback or for genuinely new files. Receipts report file, fragment and
+replacement bytes, but do not turn those byte counts into an invented token
+savings multiplier.
+
+## Measured benefits and limits
+
+The checked-in benchmark ledgers are recomputed in CI. They include favorable,
+negative and still-unmeasured results.
+
+| Evidence | Current observation | Status |
+| --- | --- | --- |
+| Focused-edit paired pilot | 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time; uncached input was 20.3% higher | Pilot, `n=2`; not a product multiplier |
+| Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified byte shape; not token savings |
+| Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
+| Tool-use cohorts | Review-ready rate was 7.2% with missing graph use, 26.7% with live single-stage use and 33.3% with continuous use | Observational association; not causality |
+| Context packaging | 156-task payload expanded 20.0% after envelope overhead | Verified negative result and optimization target |
+| Callback durability | 271 events, zero dead letters and zero backlog | Verified runtime snapshot |
+
+See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators,
+competitor capability comparison, raw ledgers and the promotion gate required
+before publishing any universal savings claim.
+
 ## How it works
 
 ```mermaid
@@ -263,7 +290,7 @@ never inherit the manager launch capability.
 | Area | Current capability |
 | --- | --- |
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
-| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
+| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing, replacement-only semantic edits and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
 | Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
@@ -273,7 +300,10 @@ The KPI view separates explicit manager decisions from worker terminal
 outcomes and plots only bounded repository evidence. Its larger aggregate-only
 history shows Source Graph modes, workflow stages, latency, inter-call gaps,
 returned structural evidence, index generations, tool-use cohorts and
-deterministic raw-path-versus-delivered-bundle byte economics. Every rate
+deterministic raw-path-versus-delivered-bundle byte economics. Focused semantic
+edits additionally report authenticated source-file, selected-region and
+replacement byte totals, including how many whole-file bytes the model did not
+re-emit. This is structural evidence, not a token multiplier. Every rate
 carries its sample window or denominator; token savings and causal quality
 gains are deliberately not inferred. Inter-call gaps at or above the bounded
 15-minute informational threshold are surfaced, but never mislabeled as proof

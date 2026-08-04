@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1270" height="760" viewBox="0 0 1270 760">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#071018"/><stop offset="1" stop-color="#102b3c"/></linearGradient><clipPath id="screen"><rect x="392" y="48" width="824" height="664" rx="18"/></clipPath><filter id="shadow"><feDropShadow dx="0" dy="18" stdDeviation="20" flood-opacity=".45"/></filter></defs>
+  <rect width="1270" height="760" fill="url(#bg)"/>
+  <image href="vscode-extension/media/aiworkhub-marketplace-icon.png" x="60" y="58" width="70" height="70"/>
+  <text x="150" y="103" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="32" font-weight="800">AIWorkHub</text>
+  <text x="60" y="216" fill="#31e6c2" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="800" letter-spacing="2">ONE RETAINED VS CODE TAB</text>
+  <text x="60" y="281" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="42" font-weight="850">See the</text>
+  <text x="60" y="330" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="42" font-weight="850">engineering</text>
+  <text x="60" y="379" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="42" font-weight="850">loop.</text>
+  <g font-family="Inter,Segoe UI,sans-serif" font-size="20" fill="#9eb3b8">
+    <text x="60" y="446">• dependency-aware tasks</text><text x="60" y="485">• model readiness and routing</text><text x="60" y="524">• Source Graph tool use</text><text x="60" y="563">• durable context and callbacks</text><text x="60" y="602">• evidence-first review</text><text x="60" y="641">• token, cost and reliability KPIs</text>
+  </g>
+  <rect x="384" y="40" width="840" height="680" rx="24" fill="#02070b" stroke="#29485b" filter="url(#shadow)"/>
+</svg>

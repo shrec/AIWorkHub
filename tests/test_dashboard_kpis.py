@@ -11,12 +11,19 @@ def _run(
     live_calls=0,
     stages=None,
     raw_context_bytes=0,
+    optimized_context_bytes=None,
     bundle_bytes=0,
     prompt_bytes=0,
     prompt_budget_bytes=0,
     prompt_mode="initial",
     usage=None,
 ):
+    estimate = {
+        "raw_context_bytes": raw_context_bytes,
+        "bundle_bytes": bundle_bytes,
+    }
+    if optimized_context_bytes is not None:
+        estimate["optimized_section_bytes"] = optimized_context_bytes
     return {
         "task_id": task_id,
         "state": state,
@@ -29,10 +36,7 @@ def _run(
                 "source_graph_stage_counts": stages or {},
                 "policy_violations": 0,
             },
-            "estimate": {
-                "raw_context_bytes": raw_context_bytes,
-                "bundle_bytes": bundle_bytes,
-            },
+            "estimate": estimate,
             "prompt_budget": {
                 "mode": prompt_mode,
                 "total_bytes": prompt_bytes,
@@ -145,7 +149,7 @@ def test_kpis_prefer_exact_canonical_manager_decisions_over_process_states():
 def test_kpis_calculate_callback_tool_and_context_denominators():
     result = _build([_run("A", "review_ready", "2026-08-01T12:00:00Z")])
 
-    assert result["schema_id"] == "aiworkhub.kpi.dashboard.v3"
+    assert result["schema_id"] == "aiworkhub.kpi.dashboard.v4"
     assert result["headline"]["callback_delivery_rate"] == 90.0
     assert result["headline"]["source_graph_useful_call_rate"] == 80.0
     assert result["headline"]["source_graph_mode_attribution_rate"] == 80.0
@@ -201,6 +205,43 @@ def test_kpis_handle_empty_and_invalid_inputs_without_false_percentages():
     assert result["data_quality"]["invalid_timestamp_rows"] == 1
 
 
+def test_kpis_aggregate_semantic_edit_bytes_without_claiming_token_savings():
+    focused = _run("A", "review_ready", "2026-08-04T18:00:00Z")
+    focused["ai_infra_context"]["semantic_edit"] = {
+        "schema_id": "aiworkhub.semantic_edit_runtime_evidence.v1",
+        "observed": True,
+        "file_count": 1,
+        "range_count": 2,
+        "file_bytes": 10_000,
+        "old_region_bytes": 400,
+        "replacement_bytes": 250,
+        "model_reemitted_old_bytes": 0,
+    }
+    legacy = _run("B", "review_ready", "2026-08-04T18:01:00Z")
+    legacy["ai_infra_context"]["semantic_edit"] = {
+        "schema_id": "aiworkhub.semantic_edit_runtime_evidence.v0",
+        "observed": True,
+        "file_bytes": 999_999,
+        "replacement_bytes": 1,
+    }
+
+    result = _build([focused, legacy])
+    semantic = result["semantic_edit"]
+
+    assert semantic["bounded_runs"] == 2
+    assert semantic["evidence_observed_runs"] == 1
+    assert semantic["evidence_unobserved_runs"] == 1
+    assert semantic["file_bytes"] == 10_000
+    assert semantic["old_region_bytes"] == 400
+    assert semantic["replacement_bytes"] == 250
+    assert semantic["replacement_to_file_byte_rate"] == 2.5
+    assert semantic["structural_bytes_not_reemitted"] == 9_750
+    assert semantic["structural_byte_ratio"] == 40.0
+    assert semantic["token_savings_available"] is False
+    assert semantic["cost_savings_available"] is False
+    assert result["headline"]["semantic_edit_observed_runs"] == 1
+
+
 def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_claims():
     result = _build([
         _run(
@@ -223,10 +264,25 @@ def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_cla
     assert cohorts["continuous_use"]["review_ready_rate"] == 100.0
     assert cohorts["live_single_stage"]["review_ready_rate"] == 0.0
     assert result["economics"]["measured_tasks"] == 2
+    assert result["economics"]["pre_optimization_section_bytes"] == 12_000
     assert result["economics"]["raw_context_bytes"] == 12_000
     assert result["economics"]["delivered_bundle_bytes"] == 5_500
-    assert result["economics"]["estimated_context_bytes_avoided"] == 7_500
-    assert result["economics"]["context_compression_rate"] == 62.5
+    assert result["economics"]["net_context_bytes_delta"] == 6_500
+    assert result["economics"]["estimated_context_bytes_avoided"] == 6_500
+    assert result["economics"]["estimated_context_bytes_added"] == 0
+    assert result["economics"]["gross_context_bytes_avoided"] == 7_500
+    assert result["economics"]["gross_context_bytes_added"] == 1_000
+    assert result["economics"]["compressed_tasks"] == 1
+    assert result["economics"]["expanded_tasks"] == 1
+    assert result["economics"]["context_delivery_direction"] == "compressed"
+    assert result["economics"]["context_delta_rate"] == 54.2
+    assert result["economics"]["context_compression_rate"] == 54.2
+    assert result["economics"]["context_expansion_rate"] is None
+    assert result["economics"]["raw_file_counterfactual_available"] is False
+    assert result["economics"]["source_selection_savings_available"] is False
+    assert result["economics"]["source_selection_savings_reason"] == (
+        "no_raw_file_counterfactual_baseline"
+    )
     assert result["economics"]["prompt_measured_tasks"] == 2
     assert result["economics"]["initial_prompt_tasks"] == 1
     assert result["economics"]["rework_prompt_tasks"] == 1
@@ -234,6 +290,57 @@ def test_kpis_report_truthful_stage_cohorts_and_byte_economics_without_token_cla
     assert result["economics"]["prompt_budget_utilization_rate"] == 22.1
     assert result["headline"]["average_prompt_bytes"] == 30_000.0
     assert result["economics"]["token_savings_available"] is False
+
+
+def test_kpis_report_context_expansion_instead_of_false_compression() -> None:
+    result = _build([
+        _run(
+            "A",
+            "review_ready",
+            "2026-08-04T17:51:09Z",
+            raw_context_bytes=4_285,
+            bundle_bytes=5_136,
+        ),
+    ])
+
+    economics = result["economics"]
+    headline = result["headline"]
+    assert economics["context_delivery_direction"] == "expanded"
+    assert economics["net_context_bytes_delta"] == -851
+    assert economics["estimated_context_bytes_avoided"] == 0
+    assert economics["estimated_context_bytes_added"] == 851
+    assert economics["gross_context_bytes_added"] == 851
+    assert economics["expanded_tasks"] == 1
+    assert economics["context_delta_rate"] == -19.9
+    assert economics["context_compression_rate"] is None
+    assert economics["context_expansion_rate"] == 19.9
+    assert headline["context_delivery_direction"] == "expanded"
+    assert headline["estimated_context_bytes_added"] == 851
+
+
+def test_kpis_separate_optional_suppression_from_envelope_overhead() -> None:
+    result = _build([
+        _run(
+            "A",
+            "review_ready",
+            "2026-08-04T17:51:09Z",
+            raw_context_bytes=2_000,
+            optimized_context_bytes=1_200,
+            bundle_bytes=1_500,
+        ),
+    ])
+
+    economics = result["economics"]
+    headline = result["headline"]
+    assert economics["optimization_measured_tasks"] == 1
+    assert economics["optimization_bytes_removed"] == 800
+    assert economics["optimization_reduction_rate"] == 40.0
+    assert economics["envelope_measured_tasks"] == 1
+    assert economics["envelope_bytes_added"] == 300
+    assert economics["envelope_overhead_rate"] == 25.0
+    assert economics["net_context_bytes_delta"] == 500
+    assert headline["optimization_bytes_removed"] == 800
+    assert headline["envelope_bytes_added"] == 300
 
 
 def test_kpis_wire_provider_usage_into_context_economics() -> None:
@@ -258,9 +365,9 @@ def test_kpis_wire_provider_usage_into_context_economics() -> None:
 
     provider = result["economics"]["provider_measurement"]
     assert provider["summary"]["total_tasks"] == 1
-    assert provider["summary"]["overall_cache_hit_rate"] == 0.4375
+    assert provider["summary"]["overall_cache_hit_rate"] == 0.2609
     assert provider["summary"]["cost_per_review_ready_usd"] == 0.12
-    assert result["headline"]["provider_cache_hit_rate"] == 43.8
+    assert result["headline"]["provider_cache_hit_rate"] == 26.1
     assert result["headline"]["cost_per_review_ready_usd"] == 0.12
 
 
@@ -326,6 +433,24 @@ def test_terminal_usage_merge_preserves_launch_context_evidence() -> None:
     merged = _merge_ai_infra(launch, terminal)
 
     assert merged["source_graph"]["bytes"] == 2400
+    assert merged["estimate"]["pre_optimization_section_bytes"] == 10_000
     assert merged["estimate"]["raw_context_bytes"] == 10_000
+    assert merged["estimate"]["optimized_section_bytes_observed"] is False
     assert merged["usage"]["input_tokens"] == 8_000
     assert merged["usage"]["cost_usd"] == 0.12
+
+
+def test_compact_context_marks_optimized_section_measurement_observed() -> None:
+    compact = _compact_ai_infra({
+        "project_context": {
+            "estimated_raw_context_vs_bundle_bytes": {
+                "raw_context_bytes": 2_000,
+                "optimized_context_bytes": 1_200,
+                "bundle_bytes": 1_500,
+            },
+        },
+    })
+
+    assert compact["estimate"]["pre_optimization_section_bytes"] == 2_000
+    assert compact["estimate"]["optimized_section_bytes"] == 1_200
+    assert compact["estimate"]["optimized_section_bytes_observed"] is True

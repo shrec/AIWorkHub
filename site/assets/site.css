@@ -139,6 +139,32 @@ h3 { margin: 0 0 .65rem; font-size: 1.18rem; }
 .callout { padding: clamp(1.5rem, 4vw, 2.5rem); }
 .callout p { max-width: 70ch; color: var(--muted); }
 
+.pilot-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .8rem;
+  margin: 1.5rem 0;
+}
+.pilot-metrics div {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: .8rem;
+  background: rgb(7 19 29 / 72%);
+}
+.pilot-metrics strong { display: block; color: var(--teal); font-size: 1.55rem; }
+.pilot-metrics span { display: block; color: var(--muted); font-size: .82rem; }
+.measurement-warning { font-size: .9rem; }
+
+.evidence-table { width: 100%; border-collapse: collapse; margin: 1.3rem 0; }
+.evidence-table th, .evidence-table td {
+  padding: .75rem;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+}
+.evidence-table th:first-child, .evidence-table td:first-child { text-align: left; }
+.evidence-table th { color: var(--muted); font-size: .8rem; }
+.evidence-table .contrary { color: #ffb4a8; }
+
 .article-hero { padding: 4.5rem 0 2.5rem; }
 .article-hero h1 { max-width: 18ch; font-size: clamp(2.5rem, 6vw, 4.3rem); }
 .article-lead { max-width: 68ch; font-size: 1.18rem; }
@@ -161,9 +187,11 @@ code { padding: .12rem .35rem; border: 1px solid var(--line); border-radius: .35
   .grid-3, .flow { grid-template-columns: 1fr 1fr; }
   .side-nav { position: static; }
   .nav-links a:not(.button) { display: none; }
+  .pilot-metrics { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 560px) {
   .grid-2, .grid-3, .flow { grid-template-columns: 1fr; }
   h1 { max-width: none; }
+  .pilot-metrics { grid-template-columns: 1fr; }
 }

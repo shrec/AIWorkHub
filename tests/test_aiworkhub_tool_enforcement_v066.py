@@ -99,6 +99,9 @@ def test_worker_prompt_explains_runtime_enforcement() -> None:
     assert "provider-blocked" in prompt
     assert "HMAC-authenticated MCP audit ledger" in prompt
     assert "new coordinator-authorized fallback card" in prompt
+    assert "trusted injected bundle are already canonical queries" in prompt
+    assert "Never repeat an unchanged zero-hit query as ceremony" in prompt
+    assert "Call aiworkhub_worker_session_current_state for continuity" not in prompt
 
 
 def test_context_gate_honors_repo_policy_toggle(monkeypatch, tmp_path) -> None:

@@ -36,7 +36,8 @@ REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"
 HOST_SCHEMA_ID = "aiworkhub.vscode_lm.host.v1"
 RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.response.v1"
 EDIT_RESPONSE_SCHEMA_ID_V1 = "aiworkhub.vscode_lm.edit_response.v1"
-EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.edit_response.v2"
+EDIT_RESPONSE_SCHEMA_ID_V2 = "aiworkhub.vscode_lm.edit_response.v2"
+EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.semantic_edit_response.v3"
 BRIDGE_ROOT_ENV = "AIWORKHUB_VSCODE_LM_BRIDGE_ROOT"
 DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
@@ -363,12 +364,22 @@ def create_request(
                 {
                     "path": "repo-relative allowed_writes path",
                     "current_sha256": "lowercase sha256 of current workspace bytes",
-                    "replacements": [
-                        {"old": "exact nonempty current text", "new": "replacement text", "expected_count": 1}
+                    "ranges": [
+                        {
+                            "start_line": 1,
+                            "end_line": 1,
+                            "new": "replacement text only; never the complete file",
+                            "preserve_trailing_newline": True,
+                        }
                     ],
                 }
             ],
             "creates": [{"path": "repo-relative allowed_writes path", "content": "complete UTF-8 file"}],
+            "legacy_v2_edits": [{
+                "path": "repo-relative allowed_writes path",
+                "current_sha256": "lowercase sha256",
+                "replacements": [{"old": "exact current text", "new": "replacement text", "expected_count": 1}],
+            }],
             "legacy_v1_files": [{"path": "repo-relative allowed_writes path", "content": "complete UTF-8 file"}],
         },
     }

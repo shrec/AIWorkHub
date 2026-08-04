@@ -195,7 +195,11 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     assert by_adapter["claude_cli"]["access_observed"] is True
     assert by_adapter["claude_cli"]["sandbox_backend"] == "bubblewrap"
     assert by_adapter["vscode_lm"]["sandbox_backend"] == "vscode_lm_in_process"
-    assert report["sandbox"] == {"backend": "bubblewrap", "enforceable": True, "reason": ""}
+    assert report["sandbox"]["backend"] == "bubblewrap"
+    assert report["sandbox"]["enforceable"] is True
+    assert report["sandbox"]["reason"] == ""
+    assert report["sandbox"]["native_cli_backend"] == "bubblewrap"
+    assert report["sandbox"]["route_aware"] is True
     assert report["source_graph"]["ready_for_code"] is True
     assert report["callback"]["backlog_count"] == 0
     serialized = json.dumps(report, sort_keys=True)

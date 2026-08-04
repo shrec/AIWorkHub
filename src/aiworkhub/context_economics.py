@@ -79,16 +79,41 @@ def measure_context_delivery(
     cache_create: int = int(usage_data.get("cache_creation_input_tokens") or 0)
     openai_cached: int = int(usage_data.get("cached_input_tokens") or 0)
 
+    explicit_cache_observed = usage_data.get("cache_metrics_observed")
+    if isinstance(explicit_cache_observed, bool):
+        cache_observed = explicit_cache_observed
+    else:
+        cache_observed = any(
+            key in usage_data
+            for key in (
+                "cache_read_input_tokens",
+                "cached_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        )
+
     # Claude reports cache fields as DISJOINT (add to input_tokens).
     # OpenAI reports cached_input_tokens as a SUBSET of input_tokens.
     is_claude = (adapter_id == "claude_cli")
-    if is_claude:
-        cached_total: int | None = (
-            _opt_int(cache_read + cache_create)
-            if (cache_read or cache_create) else None
+    cached_total: int | None = None
+    cache_eligible_input_tokens: int | None = None
+    cache_metric_valid: bool | None = None
+    cache_invalid_reason = ""
+    if cache_observed and input_tokens is not None:
+        # Cache creation is a write, never a hit. Claude's input/cache fields
+        # are disjoint, whereas OpenAI's cached tokens are a subset of input.
+        cached_total = cache_read if is_claude else openai_cached
+        cache_eligible_input_tokens = (
+            input_tokens + cache_read + cache_create
+            if is_claude else input_tokens
         )
-    else:
-        cached_total = _opt_int(openai_cached)
+        cache_metric_valid = (
+            cached_total >= 0
+            and cache_eligible_input_tokens > 0
+            and cached_total <= cache_eligible_input_tokens
+        )
+        if not cache_metric_valid:
+            cache_invalid_reason = "cached_tokens_exceed_eligible_input"
 
     # -- Ratios (only when both operands measurable) ------------------------
     compression_ratio: float | None = None
@@ -108,9 +133,12 @@ def measure_context_delivery(
         )
 
     cache_hit_rate: float | None = None
-    if (input_tokens is not None and input_tokens > 0
-            and cached_total is not None and cached_total > 0):
-        cache_hit_rate = round(cached_total / input_tokens, 4)
+    if (cache_metric_valid is True
+            and cache_eligible_input_tokens is not None
+            and cached_total is not None):
+        cache_hit_rate = round(
+            cached_total / cache_eligible_input_tokens, 4
+        )
 
     return {
         "schema_id": SCHEMA_ID,
@@ -128,8 +156,10 @@ def measure_context_delivery(
             "delivered_prompt_bytes": delivered_prompt_bytes,
             "cached_input_tokens": cached_total,
             "cache_creation_input_tokens": (
-                _opt_int(cache_create) if is_claude else None
+                cache_create if is_claude and cache_observed else None
             ),
+            "cache_eligible_input_tokens": cache_eligible_input_tokens,
+            "cache_metric_valid": cache_metric_valid,
             "model_input_tokens": input_tokens,
             "model_output_tokens": output_tokens,
             "cost_usd": cost_usd,
@@ -139,6 +169,10 @@ def measure_context_delivery(
                 "claude_disjoint" if is_claude else "openai_subset"
             ),
             "cache_subset_of_input_tokens": not is_claude,
+            "cache_creation_counts_as_hit": False,
+            "measurement_observed": cache_observed,
+            "measurement_valid": cache_metric_valid,
+            "invalid_reason": cache_invalid_reason,
         },
         "ratios": {
             "compression_ratio_vs_naive_discover": compression_ratio,
@@ -193,6 +227,9 @@ def aggregate_context_economics(
     total_in = 0
     total_out = 0
     total_cached = 0
+    total_cache_eligible = 0
+    cache_observed_tasks = 0
+    cache_invalid_tasks = 0
 
     for m in measurements:
         pops: dict[str, Any] = m.get("populations") or {}
@@ -206,6 +243,8 @@ def aggregate_context_economics(
         inp = pops.get("model_input_tokens")
         out_tok = pops.get("model_output_tokens")
         cached = pops.get("cached_input_tokens")
+        cache_eligible = pops.get("cache_eligible_input_tokens")
+        cache_valid = pops.get("cache_metric_valid")
 
         total_tasks += 1
         if isinstance(cost, (int, float)):
@@ -214,8 +253,14 @@ def aggregate_context_economics(
             total_in += int(inp)
         if isinstance(out_tok, (int, float)):
             total_out += int(out_tok)
-        if isinstance(cached, (int, float)):
+        if cache_valid is True:
+            cache_observed_tasks += 1
+        elif cache_valid is False:
+            cache_invalid_tasks += 1
+        if cache_valid is True and isinstance(cached, (int, float)):
             total_cached += int(cached)
+        if cache_valid is True and isinstance(cache_eligible, (int, float)):
+            total_cache_eligible += int(cache_eligible)
 
         if outcome in ("accepted", "done", "SHIP"):
             accepted_tasks += 1
@@ -245,6 +290,9 @@ def aggregate_context_economics(
             "total_input_tokens": total_in,
             "total_output_tokens": total_out,
             "total_cached_tokens": total_cached,
+            "total_cache_eligible_input_tokens": total_cache_eligible,
+            "cache_observed_tasks": cache_observed_tasks,
+            "cache_invalid_tasks": cache_invalid_tasks,
         },
         "derived": {
             "cost_per_accepted_task_usd": (
@@ -256,8 +304,8 @@ def aggregate_context_economics(
                 if review_ready_tasks > 0 else None
             ),
             "overall_cache_hit_rate": (
-                round(total_cached / total_in, 4)
-                if total_in > 0 else None
+                round(total_cached / total_cache_eligible, 4)
+                if total_cache_eligible > 0 else None
             ),
         },
         "by_repo": _dict_sorted(by_repo),
@@ -467,6 +515,9 @@ def _agg_zero() -> dict[str, Any]:
         "total_input_tokens": 0,
         "total_output_tokens": 0,
         "total_cached_tokens": 0,
+        "total_cache_eligible_input_tokens": 0,
+        "cache_observed_tasks": 0,
+        "cache_invalid_tasks": 0,
         "total_delivered_bytes": 0,
         "total_selected_bytes": 0,
         "total_envelope_bytes": 0,
@@ -483,10 +534,14 @@ def _agg_merge(
         bucket["total_cost_usd"] = round(
             bucket["total_cost_usd"] + float(cost), 6
         )
+    cache_valid = pops.get("cache_metric_valid")
+    if cache_valid is True:
+        bucket["cache_observed_tasks"] += 1
+    elif cache_valid is False:
+        bucket["cache_invalid_tasks"] += 1
     for src_key, dst_key in [
         ("model_input_tokens", "total_input_tokens"),
         ("model_output_tokens", "total_output_tokens"),
-        ("cached_input_tokens", "total_cached_tokens"),
         ("delivered_prompt_bytes", "total_delivered_bytes"),
         ("selected_source_bytes", "total_selected_bytes"),
         ("serialized_envelope_bytes", "total_envelope_bytes"),
@@ -494,6 +549,14 @@ def _agg_merge(
         val = pops.get(src_key)
         if isinstance(val, (int, float)):
             bucket[dst_key] += int(val)
+    if cache_valid is True:
+        for src_key, dst_key in [
+            ("cached_input_tokens", "total_cached_tokens"),
+            ("cache_eligible_input_tokens", "total_cache_eligible_input_tokens"),
+        ]:
+            val = pops.get(src_key)
+            if isinstance(val, (int, float)):
+                bucket[dst_key] += int(val)
 
 
 def _dict_sorted(d: dict[str, Any]) -> dict[str, Any]:
