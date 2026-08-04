@@ -502,6 +502,45 @@ def test_exact_declared_jsonl_falls_back_to_bounded_workspace_file(
     assert "ქართული" in row["preview"]
 
 
+def test_file_mode_prefers_exact_target_over_semantic_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    calls: list[str] = []
+
+    def _file_query(repo_root: Path, file_path: str, budget: int = 64) -> dict[str, object]:
+        calls.append(file_path)
+        found = file_path == "src/pkg/_version.py"
+        return {
+            "mode": "file",
+            "query": file_path,
+            "matches": [{"file_path": file_path, "kind": "file"}] if found else [],
+            "contexts": [{"found": True, "file": {"path": file_path}}] if found else [],
+            "candidate_files": [file_path] if found else [],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(source_graph_mod, "file_query", _file_query)
+    ctx = _ctx(
+        repo=authority, authority_repo=authority, home=tmp_path / "home",
+        targets=("src/pkg/_version.py",),
+    )
+
+    result = w.source_graph_query(
+        ctx,
+        mode="file",
+        query="canonical package version",
+        target="src/pkg/_version.py",
+    )
+
+    assert result["ok"] is True
+    assert calls == ["src/pkg/_version.py"]
+    payload = json.loads(result["content"])
+    assert payload["candidate_files"] == ["src/pkg/_version.py"]
+    assert payload["scope"] == "target"
+
+
 def test_declared_input_fallback_rejects_symlink(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

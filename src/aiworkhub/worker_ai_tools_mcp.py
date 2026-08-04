@@ -1252,8 +1252,9 @@ def source_graph_query(
     coordinator had declared any targets at all). ``target``, when given,
     must be one of the coordinator-declared allowlist entries and constrains
     the RETURNED scope: matching file-path-bearing entries in the response
-    are kept, everything else is dropped. Omitting ``target`` returns the
-    unscoped query result.
+    are kept, everything else is dropped. In ``file`` mode an indexed exact
+    target is also the requested file authority; directory targets fall back
+    to the query path. Omitting ``target`` returns the unscoped query result.
     """
 
     tool = "source_graph"
@@ -1335,7 +1336,18 @@ def source_graph_query(
             elif mode == "context":
                 payload = _source_graph_mod.context_query(query_repo, bounded_query, budget)
             elif mode == "file":
-                payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
+                # ``file`` is the one mode whose target can itself be the
+                # exact authority being requested.  Prefer that scoped path
+                # when it is indexed, while retaining the semantic-query
+                # path as a fallback for directory-scoped calls.
+                file_query_path = scope or bounded_query
+                payload = _source_graph_mod.file_query(query_repo, file_query_path, budget)
+                if (
+                    scope is not None
+                    and file_query_path != bounded_query
+                    and _json_hit_count(payload) == 0
+                ):
+                    payload = _source_graph_mod.file_query(query_repo, bounded_query, budget)
             elif mode == "function":
                 payload = _source_graph_mod.function_query(query_repo, bounded_query, budget)
             elif mode == "class":
@@ -1363,7 +1375,6 @@ def source_graph_query(
     if (
         mode == "file"
         and scope is not None
-        and bounded_query == scope
         and _json_hit_count(payload) == 0
     ):
         exact_payload = _declared_input_file_payload(ctx, scope)
