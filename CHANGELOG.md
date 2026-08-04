@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.55] - 2026-08-04
+
+### Fixed
+
+- Reported injected project-context acknowledgement from the actual receipt
+  check even for evidence-only tasks that do not require the worker MCP gate.
+- Preserved observational Source Graph/tool-use telemetry for ungated research
+  tasks and kept unobserved provider cost explicitly unknown instead of
+  presenting a fabricated zero-dollar measurement.
+- Made Source Graph `file` mode honor an indexed exact target even when the
+  query is a semantic description, while retaining query-path fallback for
+  directory-scoped requests.
+
 ## [0.8.54] - 2026-08-04
 
 ### Added
