@@ -750,6 +750,65 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
     assert FAKE_KEY not in json.dumps(result)
 
 
+def test_completion_inbox_uses_preflight_as_launchability_authority(
+    monkeypatch, tmp_path,
+):
+    from aiworkhub import server
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    monkeypatch.setattr(
+        server.completion_inbox,
+        "build_completion_inbox",
+        lambda **_kwargs: {"review_queue": [], "stale_processing": []},
+    )
+    monkeypatch.setattr(
+        server.process_launcher,
+        "default_manager",
+        lambda: SimpleNamespace(
+            list_processes=lambda limit: {"ok": True, "processes": []}
+        ),
+    )
+    monkeypatch.setattr(server.core, "repo_root", lambda: repo_dir)
+    monkeypatch.setattr(
+        server.deepseek_credentials,
+        "adapter_readiness",
+        lambda repo=None: {
+            "ok": True,
+            "readonly": True,
+            "adapters": [{
+                "adapter_id": "codex_cli",
+                "installed": True,
+                "credential_present": True,
+                "launchable": True,
+                "blocker_reason": "",
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        server.repo_policy,
+        "build_preflight",
+        lambda repo: {
+            "schema_id": server.repo_policy.PREFLIGHT_SCHEMA_ID,
+            "providers": [{
+                "adapter_id": "codex_cli",
+                "launchable": False,
+                "status": "sandbox_unavailable",
+                "reason": "windows_appcontainer_sandbox_unavailable",
+                "sandbox_backend": "",
+            }],
+        },
+    )
+
+    result = server.aiworkhub_completion_inbox()
+    codex = result["adapter_readiness"]["adapters"][0]
+
+    assert codex["launchable"] is False
+    assert codex["status"] == "sandbox_unavailable"
+    assert codex["blocker_reason"] == "windows_appcontainer_sandbox_unavailable"
+    assert codex["launchability_authority"] == server.repo_policy.PREFLIGHT_SCHEMA_ID
+
+
 def test_dashboard_snapshot_tolerates_provider_without_readiness_method():
     from aiworkhub import dashboard
 

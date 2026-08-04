@@ -25,49 +25,83 @@ def signing_material(
     ).encode("utf-8")
 
 
-def load_or_create_key(key_path: Path) -> bytes:
-    """Load or atomically mint one owner-only process-directory HMAC key."""
+def _trusted_key_file(st: os.stat_result, *, platform_name: str) -> bool:
+    """Return whether an opened key file satisfies the host trust model.
 
+    Windows does not represent profile ACLs through POSIX permission bits:
+    ``os.chmod(..., 0o600)`` commonly reads back as ``0o666`` or ``0o444``.
+    Requiring an exact ``0o600`` there rejected AIWorkHub's own existing key,
+    then the create-once race path recursively retried forever.  POSIX keeps
+    the original owner + exact-mode requirement.
+    """
+
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if platform_name == "nt":
+        return True
+    return st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o600
+
+
+def _read_existing_key(key_path: Path, *, platform_name: str) -> bytes | None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(key_path, flags)
     except OSError:
-        fd = None
-    if fd is not None:
-        try:
-            st = os.fstat(fd)
-            # os.getuid() is POSIX-only; on Windows the per-user profile
-            # directory is ACL-protected instead of mode-bit protected, so
-            # owner equivalence is enforced only where mode bits are meaningful.
-            if (
-                stat.S_ISREG(st.st_mode)
-                and (os.name == "nt" or st.st_uid == os.getuid())
-                and stat.S_IMODE(st.st_mode) == 0o600
-            ):
-                with os.fdopen(fd, "rb") as handle:
-                    data = handle.read()
-                if len(data) == 32:
-                    return data
-            else:
-                os.close(fd)
-        except OSError:
-            pass
+        return None
+    try:
+        st = os.fstat(fd)
+        if not _trusted_key_file(st, platform_name=platform_name):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(33)
+        return data if len(data) == 32 else None
+    finally:
+        os.close(fd)
+
+
+def load_or_create_key(
+    key_path: Path,
+    *,
+    _platform_name: str | None = None,
+) -> bytes:
+    """Load or atomically mint one owner-only process-directory HMAC key.
+
+    Create races are reconciled with a small bounded loop.  A pre-existing
+    untrusted or malformed key fails closed instead of recursively calling
+    this function until Python's recursion limit terminates worker launch.
+    ``_platform_name`` exists only for deterministic cross-platform tests.
+    """
+
+    platform_name = _platform_name or os.name
     key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(key_path.parent, 0o700)
-    key = os.urandom(32)
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        new_fd = os.open(key_path, flags, 0o600)
-    except FileExistsError:
-        return load_or_create_key(key_path)
-    chmod_fd(new_fd, 0o600)
-    with os.fdopen(new_fd, "wb") as handle:
-        handle.write(key)
-    return key
+    for _attempt in range(3):
+        existing = _read_existing_key(key_path, platform_name=platform_name)
+        if existing is not None:
+            return existing
+        if key_path.exists():
+            existing = _read_existing_key(key_path, platform_name=platform_name)
+            if existing is not None:
+                return existing
+            raise RuntimeError("terminal_authority_key_invalid")
+
+        key = os.urandom(32)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            new_fd = os.open(key_path, flags, 0o600)
+        except FileExistsError:
+            # Another process won the create race. Re-open and validate the
+            # exact file on the next bounded iteration; never recurse.
+            continue
+        chmod_fd(new_fd, 0o600)
+        with os.fdopen(new_fd, "wb") as handle:
+            handle.write(key)
+        return key
+    raise RuntimeError("terminal_authority_key_race_unresolved")
 
 
 def write_grant(

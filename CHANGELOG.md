@@ -23,6 +23,13 @@ noted by package/extension version and release tag.
 
 ### Fixed
 
+- Windows worker launch no longer recurses before supervisor spawn when an
+  existing terminal-authority key has ACL-backed Windows permissions that do
+  not round-trip as POSIX `0600`; create races are now bounded and invalid
+  keys fail closed with structured launch-phase diagnostics.
+- Completion Inbox adapter launchability now consumes the same route-aware
+  preflight authority as the Preflight card, removing contradictory native
+  CLI readiness on Windows.
 - Worker context receipts count delivered evidence correctly for both legacy
   v1 section lists and v2 evidence maps.
 - Benchmark documentation now uses an evidence-snapshot label and clarifies
