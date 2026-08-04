@@ -126,8 +126,15 @@ def test_v2_rejects_ambiguous_or_noninteger_replacement_count(
     target.parent.mkdir()
     target.write_text(current, encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="replacement_(count|invalid)"):
+    with pytest.raises(RuntimeError, match="replacement_(count|invalid)") as raised:
         vscode_lm_worker.run(spec)
+    error = str(raised.value)
+    assert "response_sha256=" in error
+    assert "response_bytes=" in error
+    if expected_count is not True:
+        assert "index=0:actual=2:expected=1" in error
+        assert "old_sha256=" in error
+        assert "old_bytes=6" in error
     assert target.read_text(encoding="utf-8") == current
 
 

@@ -203,7 +203,7 @@ def _v2_planned_outputs(
                 f"vscode_lm_edit_response_current_utf8_invalid:{relative}"
             ) from exc
         next_text = current_text
-        for replacement in replacements:
+        for replacement_index, replacement in enumerate(replacements):
             if not isinstance(replacement, dict):
                 raise RuntimeError(
                     f"vscode_lm_edit_response_replacement_invalid:{relative}"
@@ -232,9 +232,13 @@ def _v2_planned_outputs(
                 )
             actual_count = next_text.count(old)
             if actual_count != expected_count:
+                old_bytes = old.encode("utf-8")
                 raise RuntimeError(
                     f"vscode_lm_edit_response_replacement_count:{relative}:"
-                    f"{actual_count}!={expected_count}"
+                    f"index={replacement_index}:actual={actual_count}:"
+                    f"expected={expected_count}:old_sha256="
+                    f"{hashlib.sha256(old_bytes).hexdigest()}:"
+                    f"old_bytes={len(old_bytes)}"
                 )
             next_text = next_text.replace(old, new)
             if len(next_text.encode("utf-8")) > MAX_V2_FILE_BYTES:
@@ -307,13 +311,20 @@ def run(spec_path: Path) -> dict[str, Any]:
     }:
         raise RuntimeError("vscode_lm_edit_response_schema_mismatch")
     allowed = [str(value) for value in spec.get("allowed_writes") or []]
-    if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
-        planned = _v1_planned_outputs(edit, allowed)
-    else:
-        create_paths = {
-            str(value) for value in spec.get("create_paths") or [] if str(value)
-        }
-        planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
+    try:
+        if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
+            planned = _v1_planned_outputs(edit, allowed)
+        else:
+            create_paths = {
+                str(value) for value in spec.get("create_paths") or [] if str(value)
+            }
+            planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
+    except RuntimeError as exc:
+        response_bytes = raw_text.encode("utf-8")
+        raise RuntimeError(
+            f"{exc}:response_sha256={hashlib.sha256(response_bytes).hexdigest()}:"
+            f"response_bytes={len(response_bytes)}"
+        ) from exc
     # Scope-validate the complete response before the first mutation.  This
     # prevents a mixed valid/invalid model response from partially applying.
     written: list[str] = []
