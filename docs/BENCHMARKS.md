@@ -14,7 +14,18 @@ never substituted for another.
 | **Pilot A/B** | Matched variants exist, but the sample or controls are insufficient for a general product claim |
 | **Unmeasured** | The required counterfactual does not exist; AIWorkHub reports no multiplier |
 
-## Complete benefit snapshot for 0.8.81
+## Current 0.8.82 optimization evidence
+
+| Surface | Population | Measured result | Evidence grade | What it means |
+| --- | ---: | --- | --- | --- |
+| Context Bundle v2 encoding | One deterministic same-evidence representative fixture | 849 legacy-v1 bytes to 600 nested-v2 bytes; −249 bytes, **29.329% structural reduction** | Verified structural fixture | Nested JSON avoids string escaping and duplicate wrappers. Provider tokens, cost, latency and accepted quality remain unmeasured until live paired tasks run |
+
+The machine-readable fixture is
+[`benchmarks/context-envelope-encoding-v2.json`](../benchmarks/context-envelope-encoding-v2.json),
+and CI recomputes its arithmetic and claim boundaries with
+[`scripts/check_context_envelope_benchmark.py`](../scripts/check_context_envelope_benchmark.py).
+
+## System benefit evidence snapshot for 0.8.81
 
 Captured from AIWorkHub managing its own repository on 2026-08-04. The
 machine-readable snapshot is
@@ -32,7 +43,7 @@ and CI checks its denominators with
 | Tool-use association | 170 runs across three comparable telemetry cohorts | `missing` 7.2% review-ready; `live_single_stage` 26.7%; `continuous_use` 33.3% | Observed association | Live/continuous Source Graph use coincided with higher review-ready rates, but task difficulty, model and era are confounders; this is not causality |
 | Focused semantic edits | 3 authenticated edit receipts | 31,998 file bytes vs 531 replacement bytes; 1.66% replacement/file; 60.26× structural ratio; 0 old bytes re-emitted | Verified structural snapshot | Models returned small replacement bodies rather than full existing files; the 60.26× figure is a byte-shape ratio, not token savings |
 | Semantic-edit provider A/B | 2 paired Codex GPT-5.5 tasks | 27.5% fewer total tokens, 24.9% fewer output tokens, 21.5% less elapsed time; uncached input **20.3% higher** | Pilot A/B | Promising end-to-end evidence, but too small, cache-confounded and not manager-acceptance matched |
-| Provider read behavior | 5 tasks with usable provider traces | 4/4 recognized reads bounded; 0 exact/overlap rereads; 15,820 bytes observed | Pilot telemetry | The measured Codex sample avoided whole-file/unbounded reads; other adapters were not observable, so no fleet-wide claim is allowed |
+| Provider read behavior | 5 tasks exposed usable provider evidence | 4 recognized read operations, all 4 bounded; 0 exact/overlap rereads; 15,820 bytes observed | Pilot telemetry | The measured Codex sample avoided whole-file/unbounded reads; other adapters were not observable, so no fleet-wide claim is allowed |
 | Context delivery | 156 tasks | Optional suppression removed 8,424 bytes (0.6%), but the signed envelope added 308,843 bytes; delivered context expanded by **300,419 bytes (20.0%)** | Verified negative result | Current context packaging is a measured optimization target, not a savings success; no raw-file or token counterfactual exists |
 | Callback reliability | 271 events | 176 delivered, 95 superseded, 0 dead letters, backlog 0; 100% resolved without dead letter | Verified snapshot | Terminal notifications were durably delivered or intentionally superseded; this is not a latency SLA |
 | Quality selectivity | 216 manager decisions | 25 accepted, 191 rejected; 11.6% acceptance | Verified snapshot | The manager gate is selective and catches non-acceptable work; it does not by itself show that AIWorkHub caused better code |

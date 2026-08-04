@@ -987,3 +987,13 @@ def test_collect_returns_bounded_projection_without_recursive_card(tmp_path, mon
     assert len(result["latest_event"]["changed_paths"]) == 64
     assert result["truncated_fields"] == ["task_card", "latest_event"]
     assert len(json.dumps(result)) < 12_000
+
+
+def test_worker_context_section_count_supports_v1_and_v2_bundles():
+    assert process_launcher._worker_context_section_count(
+        {"sections": [{"name": "source_graph"}, {"name": "session"}]}
+    ) == 2
+    assert process_launcher._worker_context_section_count(
+        {"evidence": {"source_graph": {}, "session_current_state": {}}}
+    ) == 2
+    assert process_launcher._worker_context_section_count({}) == 0

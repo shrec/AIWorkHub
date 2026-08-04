@@ -124,6 +124,19 @@
     "structural_file_to_replacement_ratio": 60.26,
     "token_savings_available": false
   },
+  "semantic_edit_paired_pilot": {
+    "artifact": "benchmarks/semantic-edit-pilot-v1.json",
+    "schema_id": "aiworkhub.semantic_edit.paired_benchmark.v1",
+    "pair_count": 2,
+    "model": "gpt-5.5",
+    "adapter_id": "codex_cli",
+    "total_token_reduction_percent": 27.549,
+    "output_token_reduction_percent": 24.949,
+    "elapsed_reduction_percent": 21.537,
+    "uncached_input_change_percent": 20.275,
+    "manager_acceptance_observed": false,
+    "public_claim_eligible": false
+  },
   "callback_reliability": {
     "events_total": 271,
     "delivered": 176,

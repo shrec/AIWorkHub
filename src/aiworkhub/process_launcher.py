@@ -2062,9 +2062,21 @@ def _worker_mcp_bundle_payload(
     if context_result is None or not context_result.prompt_bundle.strip():
         return {}
     try:
-        return json.loads(context_result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
+        return json.loads(
+            context_result.prompt_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1]
+        )
     except (IndexError, TypeError, json.JSONDecodeError):
         return {}
+
+
+def _worker_context_section_count(payload: dict[str, Any]) -> int:
+    """Count delivered evidence across project-context bundle versions."""
+
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict):
+        return len(evidence)
+    sections = payload.get("sections")
+    return len(sections) if isinstance(sections, list) else 0
 
 
 def _worker_mcp_source_graph_targets(
@@ -2570,7 +2582,7 @@ def build_worker_prompt(
     if project_context_bundle.strip():
         try:
             payload = json.loads(project_context_bundle.split("PROJECT_CONTEXT_BUNDLE:\n", 1)[1])
-            section_count = len(payload.get("sections") or [])
+            section_count = _worker_context_section_count(payload)
         except (IndexError, TypeError, json.JSONDecodeError):
             section_count = 0
     context_block = (

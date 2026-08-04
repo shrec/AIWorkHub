@@ -116,6 +116,36 @@ class TestAbsentBaseline(unittest.TestCase):
         self.assertIsNone(pops["cost_usd"])
 
 
+class TestPromptEncodingCounterfactual(unittest.TestCase):
+    """Exact same-evidence v1/v2 byte accounting stays separate from tokens."""
+
+    def test_nested_encoding_delta_is_measured(self):
+        sections = [_section("source_graph", SRC)]
+        result = measure_context_delivery(
+            project_context_metadata={
+                "sections": sections,
+                "bundle_bytes": 800,
+                "optimization": {
+                    "prompt_encoding": {
+                        "legacy_v1_bundle_bytes": 1000,
+                        "nested_v2_bundle_bytes": 800,
+                    }
+                },
+            },
+            task_id="T03-encoding",
+        )
+        pops = result["populations"]
+        self.assertEqual(pops["legacy_v1_prompt_bytes"], 1000)
+        self.assertEqual(pops["prompt_encoding_delta_bytes"], -200)
+        self.assertEqual(result["ratios"]["prompt_encoding_reduction"], 0.2)
+
+        bucket = aggregate_context_economics([result])["by_repo"]["unknown"]
+        self.assertEqual(bucket["encoding_observed_tasks"], 1)
+        self.assertEqual(bucket["total_legacy_v1_prompt_bytes"], 1000)
+        self.assertEqual(bucket["total_nested_v2_prompt_bytes"], 800)
+        self.assertEqual(bucket["total_prompt_encoding_delta_bytes"], -200)
+
+
 class TestOpenAICacheSubset(unittest.TestCase):
     """3. Cached-token subset semantics (OpenAI shape)."""
 

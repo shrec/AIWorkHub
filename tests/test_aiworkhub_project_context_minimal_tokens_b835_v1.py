@@ -228,10 +228,10 @@ def test_unicode_evidence_preserved_unescaped(tmp_path: Path) -> None:
 def test_zero_hit_optional_sections_omitted_from_prompt_but_kept_in_metadata(tmp_path: Path) -> None:
     result = _collect(tmp_path)
     payload = json.loads(_bundle_body(result.prompt_bundle))
-    names = {section["name"] for section in payload["sections"]}
+    names = set(payload["evidence"])
     assert names == {"source_graph", "session_current_state"}
     for suppressed_name in ("ai_memory", "kb"):
-        assert not any(section["name"] == suppressed_name for section in payload["sections"])
+        assert suppressed_name not in payload["evidence"]
 
     meta_by_name = {section["name"]: section for section in result.metadata["sections"]}
     assert meta_by_name["ai_memory"]["hit_count"] == 0
@@ -245,16 +245,12 @@ def test_zero_hit_optional_sections_omitted_from_prompt_but_kept_in_metadata(tmp
 def test_json_evidence_embedded_without_pretty_indentation_padding(tmp_path: Path) -> None:
     result = _collect(tmp_path)
     payload = json.loads(_bundle_body(result.prompt_bundle))
-    source = next(s for s in payload["sections"] if s["name"] == "source_graph")
-    parsed = json.loads(source["content"])
-    assert parsed["target"] == "project_context.py"
-    session = next(s for s in payload["sections"] if s["name"] == "session_current_state")
-    assert json.loads(session["content"])["state"] == "current"
-    # The inner canonical tool payload uses fully compact separators, so no
-    # "key": value space padding (double-whitespace overhead) survives once
-    # nested as a nested-JSON-as-string value.
-    assert '": ' not in source["content"]
-    assert '", "' not in source["content"]
+    source = payload["evidence"]["source_graph"]
+    assert source["target"] == "project_context.py"
+    assert payload["evidence"]["session_current_state"]["state"] == "current"
+    body = _bundle_body(result.prompt_bundle)
+    assert '": ' not in body
+    assert '", "' not in body
 
 
 def test_required_evidence_and_caps_and_hashes_kept_out_of_prompt(tmp_path: Path) -> None:
@@ -278,11 +274,11 @@ def test_card_duplicated_fields_not_repeated_in_prompt(tmp_path: Path) -> None:
     # envelope must not re-inject a duplicate top-level copy of them (the
     # tool evidence itself may legitimately still mention the topic/target
     # text as part of its own answer).
-    assert set(payload["source_graph"].keys()) == {"mode"}
+    assert "source_graph" not in payload
     assert "session" not in payload
-    assert "query" not in payload["source_graph"]
-    assert "budget" not in payload["source_graph"]
-    assert "targets" not in payload["source_graph"]
+    assert "query" not in payload
+    assert "budget" not in payload
+    assert "targets" not in payload
     assert "required" not in payload
 
 
@@ -361,6 +357,14 @@ def test_representative_fixture_meets_bootstrap_byte_gate(tmp_path: Path) -> Non
     assert after_bytes <= MEASURED_PRE_CHANGE_BASELINE_BYTES * 0.5
     assert result.metadata["bundle_bytes"] == after_bytes
     assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
+    encoding = result.metadata["optimization"]["prompt_encoding"]
+    assert encoding["schema_id"] == project_context.ENCODING_SCHEMA_ID
+    assert encoding["nested_v2_bundle_bytes"] == after_bytes
+    assert encoding["nested_v2_bundle_bytes"] < encoding["legacy_v1_bundle_bytes"]
+    assert encoding["delta_bytes"] < 0
+    assert encoding["reduction_percent"] > 20.0
+    assert encoding["json_string_reencoding_avoided"] is True
+    assert encoding["token_savings_available"] is False
     assert result.metadata["estimated_raw_context_vs_bundle_bytes"]["label"] == (
         "pre_optimization_tool_sections_vs_optimized_sections_and_"
         "bundle_bytes_not_token_or_cost_truth"
@@ -397,16 +401,25 @@ def test_tool_caps_are_enforced_before_bundle_cap_independent_of_token_accountin
 
     assert result is not None
     payload = json.loads(_bundle_body(result.prompt_bundle))
-    by_name = {section["name"]: section for section in payload["sections"]}
+    by_name = payload["evidence"]
     metadata_by_name = {section["name"]: section for section in result.metadata["sections"]}
     assert len(result.prompt_bundle.encode("utf-8")) == result.metadata["bundle_bytes"]
     assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
     for name, cap in project_context.TOOL_CAPS.items():
         if name in by_name:
-            assert len(by_name[name]["content"].encode("utf-8")) <= cap["bytes"]
+            content = by_name[name]
+            if isinstance(content, dict) and "data" in content:
+                content = content["data"]
+            encoded = json.dumps(
+                content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            assert len(encoded) <= cap["bytes"]
             assert metadata_by_name[name]["bytes"] <= cap["bytes"]
 
-    source_preview = json.loads(by_name["source_graph"]["content"])
+    source_preview = by_name["source_graph"]["data"]
     assert source_preview["schema_id"] == "aiworkhub.task_mcp.bounded_json_preview.v1"
     assert source_preview["truncated"] is True
     assert source_preview["original_bytes"] > project_context.TOOL_CAPS["source_graph"]["bytes"]
@@ -463,16 +476,9 @@ def test_real_measurement_evidence_written(tmp_path: Path) -> None:
             "omitted_zero_hit_optional_count": omitted_zero_hit_count,
             "json_double_encoding_avoided": True,
             "json_double_encoding_note": (
-                "Tool JSON is canonicalized once with compact separators and "
-                "embedded as a single already-minimal JSON-text string; no "
-                "second json.dumps pass or indent-driven padding is applied "
-                "to it. Full nested-object (non-string) embedding for "
-                "source_graph/session content was evaluated but rejected: it "
-                "breaks the pinned regression fixtures in "
-                "test_worker_project_context_b434_v1.py and "
-                "test_worker_ai_infra_context_b437_v1.py, which call "
-                "json.loads(section['content']) and require content to stay "
-                "a parseable JSON string."
+                "Canonical JSON tool evidence is embedded as a nested object "
+                "under the v2 evidence map, eliminating quote/backslash "
+                "re-encoding. Plain-text evidence remains a string."
             ),
             "approximate_token_estimate_after": round(after_bytes / 4),
             "approximate_token_estimate_before_card_reference": round(

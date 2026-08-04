@@ -18,7 +18,9 @@ from . import repository_state
 from . import worker_ai_tools_mcp as _worker_tools
 
 
-SCHEMA_ID = "aiworkhub.task_mcp.project_context_bundle.v1"
+LEGACY_SCHEMA_ID = "aiworkhub.task_mcp.project_context_bundle.v1"
+SCHEMA_ID = "aiworkhub.task_mcp.project_context_bundle.v2"
+ENCODING_SCHEMA_ID = "aiworkhub.task_mcp.project_context_encoding.v2"
 RECEIPT_SCHEMA_ID = "aiworkhub.task_mcp.worker_context_receipt.v1"
 MAX_QUERY_BYTES = 512
 MAX_TOPIC_BYTES = 128
@@ -659,6 +661,38 @@ def _canonical_tool_result(result: dict[str, Any], tool: str) -> tuple[str, bool
     return str(result["content"]), bool(result.get("truncated")), int(result.get("hit_count") or 0)
 
 
+def _prompt_evidence_value(section: dict[str, Any]) -> Any:
+    """Return model-visible evidence without nested JSON string escaping.
+
+    Canonical tool JSON is embedded as an object/list. Plain-text tool output
+    stays a string. Exceptional delivery facts wrap the evidence only when
+    they are actually present, keeping the common path compact while
+    preserving truncation/degradation truth.
+    """
+
+    content = str(section.get("content") or "")
+    value: Any = content
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        value = parsed
+
+    annotations: dict[str, Any] = {}
+    if section.get("truncated"):
+        annotations["truncated"] = True
+    if section.get("degraded_reason"):
+        annotations["degraded_reason"] = section["degraded_reason"]
+    if not section.get("requested", True):
+        annotations["requested"] = False
+    if not section.get("executed", True):
+        annotations["executed"] = False
+    if annotations:
+        return {"data": value, **annotations}
+    return value
+
+
 def _degrade_or_raise(required: bool, reason: str) -> tuple[str, bool, str]:
     if required:
         raise ProjectContextError(reason)
@@ -797,6 +831,11 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
     # which is not otherwise echoed into the contract), and non-empty
     # evidence. Query/budget/targets/session-topic/caps/hashes are already in
     # the card or metadata, so they are not repeated here.
+    scope_root = (
+        "."
+        if authority_repo == repo
+        else authority_repo.relative_to(repo).as_posix()
+    )
     prompt_payload: dict[str, Any] = {"schema_id": SCHEMA_ID}
     if contract["task_type"] != "code" or contract.get("input_shard"):
         policy: dict[str, Any] = {
@@ -809,45 +848,61 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
         if contract.get("input_shard"):
             policy["immutable_input_shard"] = contract["input_shard"]
         prompt_payload["task_context_policy"] = policy
-    prompt_payload["source_graph"] = {
-        "mode": contract["source_graph"]["mode"],
-    }
     prompt_payload["repo_identity"] = {
         "repo_id": repo_id,
-        "scope_root": (
-            "."
-            if authority_repo == repo
-            else authority_repo.relative_to(repo).as_posix()
-        ),
+        "scope_root": scope_root,
     }
 
-    prompt_sections: list[dict[str, Any]] = []
+    prompt_evidence: dict[str, Any] = {}
+    legacy_prompt_sections: list[dict[str, Any]] = []
     for section in sections:
         if section.get("content_suppressed") or not str(section.get("content") or "").strip():
             # Zero-hit optional tools and empty/degraded evidence carry no
             # bootstrap value; their facts still live in metadata below.
             continue
-        entry: dict[str, Any] = {
+        legacy_entry: dict[str, Any] = {
             "name": section["name"],
             "hit_count": section["hit_count"],
             "content": section["content"],
         }
         if section["name"] == "source_graph" and section.get("target"):
-            entry["target"] = section["target"]
+            legacy_entry["target"] = section["target"]
         if section.get("truncated"):
-            entry["truncated"] = True
+            legacy_entry["truncated"] = True
         if section.get("degraded_reason"):
-            entry["degraded_reason"] = section["degraded_reason"]
+            legacy_entry["degraded_reason"] = section["degraded_reason"]
         if not section.get("requested", True):
-            entry["requested"] = False
+            legacy_entry["requested"] = False
         if not section.get("executed", True):
-            entry["executed"] = False
-        prompt_sections.append(entry)
-    prompt_payload["sections"] = prompt_sections
+            legacy_entry["executed"] = False
+        legacy_prompt_sections.append(legacy_entry)
+        prompt_evidence[str(section["name"])] = _prompt_evidence_value(section)
+    prompt_payload["evidence"] = prompt_evidence
+
+    legacy_prompt_payload: dict[str, Any] = {
+        "schema_id": LEGACY_SCHEMA_ID,
+        "source_graph": {"mode": contract["source_graph"]["mode"]},
+        "repo_identity": {"repo_id": repo_id, "scope_root": scope_root},
+        "sections": legacy_prompt_sections,
+    }
+    if "task_context_policy" in prompt_payload:
+        legacy_prompt_payload["task_context_policy"] = prompt_payload[
+            "task_context_policy"
+        ]
+    legacy_bundle = "PROJECT_CONTEXT_BUNDLE:\n" + json.dumps(
+        legacy_prompt_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
     bundle = (
         "PROJECT_CONTEXT_BUNDLE:\n"
-        + json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True)
+        + json.dumps(
+            prompt_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     )
     encoded = bundle.encode("utf-8")
     if len(encoded) > MAX_BUNDLE_BYTES:
@@ -908,6 +963,26 @@ def collect_project_context(repo: Path, card: dict[str, Any]) -> ProjectContextR
             "byte_labels_are_token_truth": False,
             "adaptive_optional_tools": True,
             "empty_ceremonial_calls_injected": False,
+            "prompt_encoding": {
+                "schema_id": ENCODING_SCHEMA_ID,
+                "legacy_v1_bundle_bytes": len(legacy_bundle.encode("utf-8")),
+                "nested_v2_bundle_bytes": len(bundle.encode("utf-8")),
+                "delta_bytes": (
+                    len(bundle.encode("utf-8"))
+                    - len(legacy_bundle.encode("utf-8"))
+                ),
+                "reduction_percent": round(
+                    100.0
+                    * (
+                        1.0
+                        - len(bundle.encode("utf-8"))
+                        / len(legacy_bundle.encode("utf-8"))
+                    ),
+                    3,
+                ),
+                "json_string_reencoding_avoided": True,
+                "token_savings_available": False,
+            },
         },
         "estimated_raw_context_vs_bundle_bytes": {
             "label": (
