@@ -3660,54 +3660,55 @@ class ProcessManager:
         usage_error = ""
         total_input = _ledger_input_tokens(usage, adapter_id)
         usage["recorded_input_tokens"] = total_input
-        if total_input or usage["output_tokens"] or usage["cost_usd"]:
-            note = f"task_mcp_request:{request_id}"
-            try:
-                card = _parse_card(self._show_task(task_id), task_id)
-                topic = topic or str(card.get("topic") or "")
-                records = card.get("usage_records") or []
-                if isinstance(records, list) and any(
-                    isinstance(record, dict)
-                    and record.get("source") == "task_mcp_launcher"
-                    and record.get("note") == note
-                    for record in records
-                ):
-                    return usage, True, ""
-            except Exception:
-                pass
-            args = [
-                "usage", task_id,
-                "--runner", runner,
-                "--model", model,
-                "--provider", adapter_id.removesuffix("_cli"),
-                "--source", "task_mcp_launcher",
-                "--note", note,
-                "--input-tokens", str(total_input),
-                "--output-tokens", str(usage["output_tokens"]),
-                "--total-tokens", str(total_input + int(usage["output_tokens"])),
-                "--cached-input-tokens", str(usage["cached_input_tokens"]),
-                "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
-                "--cost-usd", str(
-                    float(usage["cost_usd"] or 0.0)
-                    if usage.get("cost_observed")
-                    else 0.0
-                ),
-            ]
-            if usage.get("cache_metrics_observed"):
-                args.append("--cache-metrics-observed")
-            if usage.get("cost_observed"):
-                args.append("--cost-observed")
-            try:
-                result = core.run_taskctl(
-                    args,
-                    allow_write=True,
-                    runner=runner,
-                    topic=topic,
-                )
-                usage_recorded = result.returncode == 0
-                usage_error = result.stderr[:300] if not usage_recorded else ""
-            except Exception as exc:
-                usage_error = str(exc)[:300]
+        note = f"task_mcp_request:{request_id}"
+        try:
+            card = _parse_card(self._show_task(task_id), task_id)
+            topic = topic or str(card.get("topic") or "")
+            records = card.get("usage_records") or []
+            if isinstance(records, list) and any(
+                isinstance(record, dict)
+                and record.get("source") == "task_mcp_launcher"
+                and record.get("note") == note
+                for record in records
+            ):
+                return usage, True, ""
+        except Exception:
+            pass
+        args = [
+            "usage", task_id,
+            "--runner", runner,
+            "--model", model,
+            "--provider", adapter_id.removesuffix("_cli"),
+            "--source", "task_mcp_launcher",
+            "--note", note,
+            "--input-tokens", str(total_input),
+            "--output-tokens", str(usage["output_tokens"]),
+            "--total-tokens", str(total_input + int(usage["output_tokens"])),
+            "--cached-input-tokens", str(usage["cached_input_tokens"]),
+            "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
+            "--cost-usd", str(
+                float(usage["cost_usd"] or 0.0)
+                if usage.get("cost_observed")
+                else 0.0
+            ),
+        ]
+        if usage.get("usage_observed"):
+            args.append("--usage-observed")
+        if usage.get("cache_metrics_observed"):
+            args.append("--cache-metrics-observed")
+        if usage.get("cost_observed"):
+            args.append("--cost-observed")
+        try:
+            result = core.run_taskctl(
+                args,
+                allow_write=True,
+                runner=runner,
+                topic=topic,
+            )
+            usage_recorded = result.returncode == 0
+            usage_error = result.stderr[:300] if not usage_recorded else ""
+        except Exception as exc:
+            usage_error = str(exc)[:300]
         return usage, usage_recorded, usage_error
 
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:

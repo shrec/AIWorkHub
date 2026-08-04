@@ -1858,6 +1858,7 @@ def run_taskctl(
                 total_tokens=_int_value("--total-tokens", 0),
                 cached_input_tokens=_int_value("--cached-input-tokens", 0),
                 cache_creation_input_tokens=_int_value("--cache-creation-input-tokens", 0),
+                usage_observed=True if "--usage-observed" in args else None,
                 cache_metrics_observed="--cache-metrics-observed" in args,
                 cost_usd=float(_value("--cost-usd", "0") or 0),
                 cost_observed="--cost-observed" in args,
@@ -4275,6 +4276,7 @@ def record_usage(
     total_tokens: int = 0,
     cached_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
+    usage_observed: bool | None = None,
     cache_metrics_observed: bool = False,
     cost_usd: float = 0.0,
     cost_observed: bool = False,
@@ -4299,6 +4301,19 @@ def record_usage(
         return error
     assert card is not None
     live_topic = str(card.get("topic") or topic or "")
+    measured_usage = (
+        bool(usage_observed)
+        if usage_observed is not None
+        else bool(
+            input_tokens
+            or output_tokens
+            or total_tokens
+            or cached_input_tokens
+            or cache_creation_input_tokens
+            or cache_metrics_observed
+            or cost_observed
+        )
+    )
     payload = {
         "runner": runner,
         "topic": live_topic,
@@ -4314,6 +4329,7 @@ def record_usage(
         "total_tokens": int(total_tokens or (int(input_tokens or 0) + int(output_tokens or 0))),
         "cached_input_tokens": int(cached_input_tokens or 0),
         "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),
+        "usage_observed": measured_usage,
         "cache_metrics_observed": bool(cache_metrics_observed),
         "cost_usd": float(cost_usd or 0.0),
         "cost_observed": bool(cost_observed),
@@ -4337,13 +4353,10 @@ def record_usage(
 def usage_report(runner: str | None = None, topic: str | None = None, status: str | None = None) -> dict[str, Any]:
     """Read-only aggregate over ``task_events`` rows with ``event='usage_record'``.
 
-    Stdout keeps ``AITools/taskctl.py::cmd_usage_report``'s exact per-task pipe
-    line format (``cost_ledger.py::USAGE_LINE_RE`` regex-parses it) so existing
-    callers keep working unchanged. The canonical ``tasks`` schema carries no
-    token/cost columns, and no write path in this module's current scope
-    appends usage-record events yet, so with zero recorded events this prints
-    the same ``"No usage records."`` taskctl prints for an empty report --
-    never a fabricated total, never taskctl/taskdb.
+    Observed rows retain the historical pipe format. Missing provider usage or
+    price telemetry is rendered as ``unknown`` rather than a fabricated zero;
+    every launcher attempt therefore remains visible without pretending that
+    VS Code LM exposed token or cost figures it did not report.
     """
     command = ["usage-report"]
     if runner:
@@ -4369,6 +4382,19 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
         except json.JSONDecodeError:
             payload = {}
         rec = {**payload, "task_id": row["task_id"], "runner": row["runner"], "created_at": row["created_at"]}
+        if "usage_observed" not in rec:
+            rec["usage_observed"] = bool(
+                rec.get("input_tokens")
+                or rec.get("output_tokens")
+                or rec.get("total_tokens")
+                or rec.get("cache_metrics_observed")
+                or rec.get("cost_observed")
+            )
+        if "cost_observed" not in rec:
+            # Historical events predate the explicit observation bit. A
+            # positive persisted amount is evidence that a provider reported
+            # cost; a missing/zero amount remains unknown, never free.
+            rec["cost_observed"] = float(rec.get("cost_usd") or 0.0) > 0.0
         if runner and rec.get("runner") != runner:
             continue
         if topic and rec.get("topic") != topic:
@@ -4382,14 +4408,30 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
 
     lines = ["=== Task Usage Report ==="]
     for rec in records:
+        usage_is_observed = bool(rec.get("usage_observed"))
+        cost_is_observed = bool(rec.get("cost_observed"))
+        tokens = str(int(rec.get("total_tokens") or 0)) if usage_is_observed else "unknown"
+        input_tokens = str(int(rec.get("input_tokens") or 0)) if usage_is_observed else "unknown"
+        output_tokens = str(int(rec.get("output_tokens") or 0)) if usage_is_observed else "unknown"
+        cost = f"${float(rec.get('cost_usd') or 0.0):.4f}" if cost_is_observed else "unknown"
         lines.append(
             f"{rec.get('task_id')} | runner={rec.get('runner', '?')} | topic={rec.get('topic', '?')} | "
-            f"records={int(rec.get('records') or 1)} | tokens={int(rec.get('total_tokens') or 0)} | "
-            f"in={int(rec.get('input_tokens') or 0)} out={int(rec.get('output_tokens') or 0)} | "
-            f"cost=${float(rec.get('cost_usd') or 0.0):.4f}"
+            f"records={int(rec.get('records') or 1)} | tokens={tokens} | "
+            f"in={input_tokens} out={output_tokens} | cost={cost} | "
+            f"usage_observed={str(usage_is_observed).lower()} "
+            f"cost_observed={str(cost_is_observed).lower()}"
         )
     stdout = "\n".join(lines)
-    return _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    result.update({
+        "schema_id": "aiworkhub.usage_report.v2",
+        "record_count": len(records),
+        "usage_observed_records": sum(bool(rec.get("usage_observed")) for rec in records),
+        "usage_unknown_records": sum(not bool(rec.get("usage_observed")) for rec in records),
+        "cost_observed_records": sum(bool(rec.get("cost_observed")) for rec in records),
+        "cost_unknown_records": sum(not bool(rec.get("cost_observed")) for rec in records),
+    })
+    return result
 
 
 def export_jsonl(runner: str | None = None, topic: str | None = None) -> dict[str, Any]:

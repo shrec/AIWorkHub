@@ -665,6 +665,52 @@ def test_cached_token_accounting_matches_provider_semantics(
     assert "--cache-metrics-observed" in args
 
 
+def test_unobserved_provider_usage_still_records_one_truthful_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "vscode-lm.json"
+    output.write_text('{"type":"result","content":"ok"}\n', encoding="utf-8")
+    card = _card()
+    captured: list[list[str]] = []
+
+    def run_taskctl(args: list[str], **_kwargs):
+        captured.append(args)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(process_launcher.core, "run_taskctl", run_taskctl)
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(card),
+        collision_guard=_collision,
+        adapter_builder=_plan([]),
+        isolation_enabled=False,
+    )
+
+    usage, recorded, error = manager._record_usage(
+        "request-unobserved",
+        card["task_id"],
+        card["runner"],
+        "vscode_lm",
+        "glm-5.2",
+        output,
+    )
+
+    assert recorded is True
+    assert error == ""
+    assert usage["usage_observed"] is False
+    assert usage["cost_observed"] is False
+    assert usage["cost_usd"] is None
+    assert len(captured) == 1
+    args = captured[0]
+    assert "--usage-observed" not in args
+    assert "--cost-observed" not in args
+    assert args[args.index("--total-tokens") + 1] == "0"
+    assert args[args.index("--note") + 1] == "task_mcp_request:request-unobserved"
+
+
 # ── B561: gitignored required-output promotion in full finalize flow ──────
 
 

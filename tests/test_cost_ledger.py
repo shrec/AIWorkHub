@@ -115,3 +115,35 @@ def test_cache_ratio_is_unknown_when_provider_did_not_report_cache_metrics() -> 
 
     assert aggregate["cache_hit_ratio"] is None
     assert aggregate["cache_observed_records"] == 0
+
+
+def test_repo_bound_unobserved_attempt_is_counted_but_not_measured(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "list_usage_events",
+        lambda _root, limit=10_000: [{
+            "task_id": "T-UNKNOWN",
+            "runner": "glm_worker",
+            "topic": "code",
+            "model": "glm-5.2",
+            "provider": "vscode_lm",
+            "usage_observed": False,
+            "cost_observed": False,
+            "source": "task_mcp_launcher",
+            "note": "task_mcp_request:req-unknown",
+            "created_at": "2026-08-04T01:02:03+00:00",
+        }],
+    )
+
+    result = cost_ledger.build_cost_ledger(repo_root=tmp_path, include_tasks=True)
+
+    assert result["counts"]["usage_rows"] == 1
+    [row] = result["tasks"]
+    assert row["attempt_id"] == "req-unknown"
+    assert row["usage_observed"] is False
+    assert row["cost_known"] is False
+    aggregate = result["aggregates"]["by_provider"]["vscode_lm"]
+    assert aggregate["records"] == 1
+    assert aggregate["usage_observed_records"] == 0
+    assert aggregate["usage_unknown_records"] == 1
+    assert aggregate["total_tokens"] == 0

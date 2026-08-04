@@ -87,6 +87,13 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
         total_tokens = int(entry.get("total_tokens") or 0)
         cost_usd = float(entry.get("cost_usd") or 0.0)
         cost_observed = entry.get("cost_observed")
+        usage_observed = entry.get("usage_observed")
+        if usage_observed is None:
+            usage_observed = bool(
+                total_tokens
+                or entry.get("cache_metrics_observed")
+                or cost_observed
+            )
         note = str(entry.get("note") or "")
         rows.append({
             "source": "canonical_usage_event",
@@ -102,6 +109,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "cached_input_tokens": int(entry.get("cached_input_tokens") or 0),
             "cache_creation_input_tokens": int(entry.get("cache_creation_input_tokens") or 0),
             "cache_metrics_observed": bool(entry.get("cache_metrics_observed")),
+            "usage_observed": bool(usage_observed),
             "cost_usd": cost_usd,
             "cost_observed": bool(cost_observed),
             "cost_known": (
@@ -125,6 +133,8 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "usage_observed_records": 0,
+        "usage_unknown_records": 0,
         "cache_observed_records": 0,
         "cache_eligible_input_tokens": 0,
         "cost_usd": 0.0,
@@ -142,6 +152,10 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         out[bucket]["cache_creation_input_tokens"] += int(
             row.get("cache_creation_input_tokens") or 0
         )
+        if row.get("usage_observed"):
+            out[bucket]["usage_observed_records"] += int(row.get("records") or 0)
+        else:
+            out[bucket]["usage_unknown_records"] += int(row.get("records") or 0)
         if row.get("cache_metrics_observed"):
             out[bucket]["cache_observed_records"] += int(row.get("records") or 0)
             out[bucket]["cache_eligible_input_tokens"] += int(row.get("input_tokens") or 0)

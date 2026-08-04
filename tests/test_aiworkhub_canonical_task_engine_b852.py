@@ -798,6 +798,53 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
     assert event["cost_observed"] is True
 
 
+def test_run_taskctl_usage_preserves_unobserved_attempt_without_fake_zero(writable_repo):
+    _insert_task(
+        writable_repo,
+        "TASK_USAGE_UNKNOWN",
+        "glm_worker",
+        "coding",
+        worker_status="claimed",
+        status="processing",
+        claimed_by="glm_worker",
+    )
+
+    usage = core.run_taskctl(
+        [
+            "usage",
+            "TASK_USAGE_UNKNOWN",
+            "--runner",
+            "glm_worker",
+            "--topic",
+            "coding",
+            "--model",
+            "glm-5.2",
+            "--provider",
+            "vscode_lm",
+            "--source",
+            "task_mcp_launcher",
+            "--note",
+            "task_mcp_request:req-unknown",
+        ],
+        allow_write=True,
+        runner="glm_worker",
+        topic="coding",
+    )
+    assert usage.returncode == 0, usage.stderr
+
+    report = core.usage_report(runner="glm_worker")
+    assert report["record_count"] == 1
+    assert report["usage_observed_records"] == 0
+    assert report["usage_unknown_records"] == 1
+    assert report["cost_observed_records"] == 0
+    assert "tokens=unknown" in report["stdout"]
+    assert "cost=unknown" in report["stdout"]
+    assert "$0.0000" not in report["stdout"]
+    [event] = task_store.list_usage_events(writable_repo)
+    assert event["usage_observed"] is False
+    assert event["cost_observed"] is False
+
+
 # ---------------------------------------------------------------------------
 # Isolation across repos with identical task_ids
 # ---------------------------------------------------------------------------

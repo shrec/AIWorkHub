@@ -344,6 +344,7 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "cache_creation_input_tokens": _bounded_int(
                 usage.get("cache_creation_input_tokens")
             ),
+            "usage_observed": bool(usage.get("usage_observed")),
             "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
             "cost_usd": max(0.0, float(usage.get("cost_usd") or 0.0)),
             "cost_observed": bool(usage.get("cost_observed")),
