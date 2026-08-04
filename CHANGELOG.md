@@ -19,6 +19,12 @@ noted by package/extension version and release tag.
 - Added a Product Hunt launch pack plus three canonical 1270x760 gallery
   compositions using the existing AIWorkHub brand assets.
 - Added benchmark-evidence recomputation to the static CI quality job.
+- Added a machine-checked full-system benefit snapshot covering Source Graph
+  enforcement/latency, tool-use cohorts, read behavior, signed context
+  expansion, semantic-edit shape, callback durability, task outcomes and
+  incomplete cost coverage. The public comparison page now separates
+  AIWorkHub's integrated control-plane differentiation from the documented
+  strengths of Graphify, Serena, Aider and Cline.
 
 ## [0.8.80] - 2026-08-04
 

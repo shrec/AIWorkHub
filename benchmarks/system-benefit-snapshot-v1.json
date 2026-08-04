@@ -1,0 +1,154 @@
+{
+  "schema_id": "aiworkhub.system_benefit_snapshot.v1",
+  "captured_at": "2026-08-04T20:36:46.732420+00:00",
+  "release": "0.8.81",
+  "population": {
+    "repository": "AIWorkHub self-hosted development",
+    "process_window": "latest 1000 process rows, 175 bounded runs observed",
+    "runtime_snapshot": "canonical dashboard snapshot",
+    "causal_design": false
+  },
+  "release_validation": {
+    "python_passed": 1943,
+    "python_skipped": 27,
+    "extension_test_files_passed": 29,
+    "wheel_smoke_passed": true,
+    "sdist_check_passed": true,
+    "vsix_package_passed": true
+  },
+  "runtime_readiness": {
+    "routes_total": 7,
+    "routes_launchable": 6,
+    "workers_configured": 9,
+    "workers_available": 9,
+    "workers_with_observed_outcomes": 7,
+    "source_files_indexed": 815
+  },
+  "task_outcomes": {
+    "observed_runs": 175,
+    "terminal_runs": 154,
+    "review_ready_runs": 23,
+    "review_ready_rate_percent": 14.9,
+    "validation_failed_runs": 59,
+    "validation_failed_rate_percent": 38.3,
+    "other_non_green_runs": 72,
+    "manager_decisions": 216,
+    "manager_accepted": 25,
+    "manager_rejected": 191,
+    "manager_acceptance_rate_percent": 11.6,
+    "population_note": "Manager decisions and process outcomes are distinct ledgers and must not be merged into one denominator."
+  },
+  "source_graph_recent_cohort": {
+    "observed_tasks": 38,
+    "gated_tasks": 7,
+    "gate_satisfied_tasks": 7,
+    "live_tasks": 7,
+    "calls": 13,
+    "failed_calls": 0,
+    "zero_hit_calls": 2,
+    "returned_hits": 846,
+    "returned_bytes": 34272,
+    "distinct_modes": 4,
+    "mode_attribution_rate_percent": 100.0,
+    "stage_attribution_rate_percent": 69.2,
+    "latency_p50_ms": 15.024,
+    "latency_p95_ms": 39.014,
+    "gate_satisfaction_rate_percent": 100.0,
+    "live_rate_percent": 100.0
+  },
+  "source_graph_broader_window": {
+    "live_rate_percent": 92.2,
+    "gate_satisfaction_rate_percent": 93.8,
+    "useful_call_rate_percent": 97.3,
+    "mode_attribution_rate_percent": 23.0,
+    "stage_attribution_rate_percent": 14.2,
+    "note": "The broader historical window includes legacy rows predating current attribution."
+  },
+  "tool_use_cohorts": [
+    {
+      "name": "missing",
+      "runs": 104,
+      "terminal_runs": 97,
+      "review_ready_runs": 7,
+      "review_ready_rate_percent": 7.2
+    },
+    {
+      "name": "live_single_stage",
+      "runs": 57,
+      "terminal_runs": 45,
+      "review_ready_runs": 12,
+      "review_ready_rate_percent": 26.7
+    },
+    {
+      "name": "continuous_use",
+      "runs": 9,
+      "terminal_runs": 9,
+      "review_ready_runs": 3,
+      "review_ready_rate_percent": 33.3
+    }
+  ],
+  "read_efficiency_recent_cohort": {
+    "observed_tasks": 38,
+    "provider_evidence_tasks": 5,
+    "recognized_reads": 4,
+    "bounded_reads": 4,
+    "unbounded_reads": 0,
+    "exact_rereads": 0,
+    "overlap_rereads": 0,
+    "read_bytes": 15820,
+    "bounded_read_rate_percent": 100.0,
+    "evidence_scope": "Codex provider traces only; other adapters were unobserved."
+  },
+  "context_delivery": {
+    "measured_tasks": 156,
+    "pre_optimization_tool_section_bytes": 1502863,
+    "optimized_section_bytes": 1494439,
+    "optimization_bytes_removed": 8424,
+    "optimization_reduction_rate_percent": 0.6,
+    "envelope_bytes_added": 308843,
+    "delivered_bundle_bytes": 1803282,
+    "net_bytes_added": 300419,
+    "context_expansion_rate_percent": 20.0,
+    "raw_file_counterfactual_available": false,
+    "token_savings_available": false
+  },
+  "semantic_edit_structural": {
+    "bounded_runs_scanned": 175,
+    "authenticated_evidence_runs": 3,
+    "file_count": 3,
+    "file_bytes": 31998,
+    "selected_old_region_bytes": 270,
+    "replacement_bytes": 531,
+    "model_reemitted_old_bytes": 0,
+    "replacement_to_file_byte_rate_percent": 1.66,
+    "structural_file_to_replacement_ratio": 60.26,
+    "token_savings_available": false
+  },
+  "callback_reliability": {
+    "events_total": 271,
+    "delivered": 176,
+    "superseded": 95,
+    "dead_letter": 0,
+    "backlog": 0,
+    "resolved_without_dead_letter_rate_percent": 100.0
+  },
+  "provider_usage": {
+    "records": 110,
+    "total_tokens": 196349159,
+    "input_tokens": 194993825,
+    "output_tokens": 1355334,
+    "known_cost_records": 21,
+    "unknown_cost_records": 89,
+    "tokens_with_unknown_cost": 121142679,
+    "observed_cost_usd": 63.822892,
+    "cost_complete": false
+  },
+  "claim_status": {
+    "system_wide_token_savings": "unmeasured",
+    "source_graph_end_to_end_token_multiplier": "unmeasured",
+    "system_wide_cost_savings": "unmeasured",
+    "tool_use_quality_causality": "observational_only",
+    "semantic_edit_paired_result": "pilot_only",
+    "reason": "No randomized end-to-end ablation across matched tasks, adapters, cache states and manager-accepted quality outcomes exists yet."
+  }
+}

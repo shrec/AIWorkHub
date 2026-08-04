@@ -36,7 +36,9 @@ jobs:
       - name: Public documentation contract
         run: python scripts/check_public_docs.py
       - name: Recompute checked-in benchmark evidence
-        run: python scripts/check_semantic_edit_benchmark.py
+        run: |
+          python scripts/check_semantic_edit_benchmark.py
+          python scripts/check_system_benefit_snapshot.py
 
   cross-platform:
     name: Fresh install (${{ matrix.name }})

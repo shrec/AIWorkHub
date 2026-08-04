@@ -100,24 +100,23 @@ legacy fallback or for genuinely new files. Receipts report file, fragment and
 replacement bytes, but do not turn those byte counts into an invented token
 savings multiplier.
 
-## Measured semantic-edit pilot
+## Measured benefits and limits
 
-Two exact paired Codex GPT-5.5 observations compared the focused semantic-edit
-path with the full-file baseline on the same task family. The checked-in ledger
-is recomputed in CI.
+The checked-in benchmark ledgers are recomputed in CI. They include favorable,
+negative and still-unmeasured results.
 
-| Observed metric | Focused edit | Full-file baseline | Difference |
-| --- | ---: | ---: | ---: |
-| Total tokens | 256,384 | 353,872 | 27.5% fewer |
-| Output tokens | 2,190 | 2,918 | 24.9% fewer |
-| Elapsed time | 73.1 s | 93.2 s | 21.5% less |
-| Uncached input tokens | 50,162 | 41,706 | 20.3% more |
+| Evidence | Current observation | Status |
+| --- | --- | --- |
+| Focused-edit paired pilot | 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time; uncached input was 20.3% higher | Pilot, `n=2`; not a product multiplier |
+| Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified byte shape; not token savings |
+| Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
+| Tool-use cohorts | Review-ready rate was 7.2% with missing graph use, 26.7% with live single-stage use and 33.3% with continuous use | Observational association; not causality |
+| Context packaging | 156-task payload expanded 20.0% after envelope overhead | Verified negative result and optimization target |
+| Callback durability | 271 events, zero dead letters and zero backlog | Verified runtime snapshot |
 
-This is an honest pilot result, **not a general product claim**: `n=2`, one
-model/task family, non-randomized order, cache-confounded runs and no canonical
-manager-acceptance measurement. See [Benchmarks](docs/BENCHMARKS.md) for exact
-request identities, raw evidence, limitations and the promotion gate required
-before publishing a savings multiplier.
+See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators,
+competitor capability comparison, raw ledgers and the promotion gate required
+before publishing any universal savings claim.
 
 ## How it works
 
