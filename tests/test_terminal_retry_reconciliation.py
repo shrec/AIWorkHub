@@ -107,6 +107,7 @@ def _row(repo: Path, task_id: str) -> sqlite3.Row:
         "output_budget_exceeded",
         "launch_failed",
         "worker_failed",
+        "finalize_failed",
         "process_lost",
         "liveness_lost",
     ],

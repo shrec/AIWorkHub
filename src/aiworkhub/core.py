@@ -3021,6 +3021,35 @@ def create_task(
     # surface unchanged.
     from . import worker_workspace
 
+    for output_index, output_pattern in enumerate(outputs2):
+        try:
+            normalized_output = worker_workspace._relative_repo_path(output_pattern)
+            output_allowed = worker_workspace._matches(normalized_output, writes2)
+        except worker_workspace.WorkspaceError as exc:
+            result = _lifecycle_error(
+                f"invalid_required_output_path:{exc}",
+                2,
+            )
+            result.update({
+                "required_output_index": output_index,
+                "required_output": output_pattern[:240],
+            })
+            return result
+        if not output_allowed:
+            result = _lifecycle_error(
+                f"required_output_not_allowed:{normalized_output}",
+                2,
+            )
+            result.update({
+                "required_output_index": output_index,
+                "required_output": output_pattern[:240],
+                "contract_hint": (
+                    "required_outputs accepts repo-relative file paths or glob patterns only; "
+                    "put prose requirements in acceptance"
+                ),
+            })
+            return result
+
     for validation_index, validation_command in enumerate(validation2):
         try:
             worker_workspace.validation_argv(validation_command)
@@ -3749,6 +3778,7 @@ _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
         "output_budget_exceeded",
         "launch_failed",
         "worker_failed",
+        "finalize_failed",
         "process_lost",
         "liveness_lost",
     }

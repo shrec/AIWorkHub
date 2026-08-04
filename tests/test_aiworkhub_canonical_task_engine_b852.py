@@ -616,6 +616,38 @@ def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
     assert task_store.get_task(writable_repo, "TASK_INVALID_VALIDATION_SYNTAX") is None
 
 
+def test_manager_create_rejects_required_output_prose_before_provider_launch(
+    writable_repo, monkeypatch
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+
+    result = core.create_task(
+        task_id="TASK_REQUIRED_OUTPUT_PROSE",
+        title="Reject prose output contract",
+        runner="claude_worker",
+        topic="coding",
+        objective="Do not spend a provider run on a malformed card.",
+        acceptance=["Write a useful report."],
+        allowed_writes=["reports/result.md"],
+        required_outputs=["A concise report explaining the result"],
+        validation=["python -m pytest -q"],
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"].startswith("required_output_not_allowed:")
+    assert result["required_output_index"] == 0
+    assert "put prose requirements in acceptance" in result["contract_hint"]
+    assert task_store.get_task(writable_repo, "TASK_REQUIRED_OUTPUT_PROSE") is None
+
+
 def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monkeypatch):
     session_id = "019f5097-6dbe-7172-870a-945afc5f3bfa"
     monkeypatch.setattr(

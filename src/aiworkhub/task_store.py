@@ -1124,6 +1124,7 @@ def mark_terminal_failure(
         "token_budget_exceeded",
         "output_budget_exceeded",
         "worker_failed",
+        "finalize_failed",
         "cancelled",
         "liveness_lost",
     }

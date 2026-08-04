@@ -115,6 +115,88 @@ def test_dual_gate_is_closed_by_default(monkeypatch, tmp_path):
     assert manager.list_processes()["active_in_memory"] == 0
 
 
+def test_launch_contract_rejects_legacy_required_output_prose():
+    card = _card()
+    card["required_outputs"] = ["A concise report explaining the result"]
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="required_output_not_allowed",
+    ):
+        process_launcher._validate_required_outputs_contract(card)
+
+
+def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_path):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    attempts = []
+
+    def flaky_finalize(request_id, supervisor_returncode=None):
+        attempts.append((request_id, supervisor_returncode))
+        if len(attempts) < 3:
+            raise OSError("transient windows finalizer race")
+        return {"request_id": request_id, "state": "review_ready"}
+
+    monkeypatch.setattr(manager, "_finalize_isolated_request", flaky_finalize)
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda _seconds: None)
+
+    event = manager._finalize_after_process_exit("a" * 32, 0)
+
+    assert event == {"request_id": "a" * 32, "state": "review_ready"}
+    assert len(attempts) == 3
+
+
+def test_finalize_after_process_exit_emits_terminal_callback_fallback(
+    monkeypatch, tmp_path
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "b" * 32
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "vscode_lm",
+        "state": "running",
+    })
+    monkeypatch.setattr(
+        manager,
+        "_finalize_isolated_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(process_launcher.time, "sleep", lambda _seconds: None)
+    transition_calls = []
+
+    def terminal_failure(repo, task_id, runner, substatus, **kwargs):
+        transition_calls.append((repo, task_id, runner, substatus, kwargs))
+        return {"ok": True, "callback_enqueued": True, "stderr": ""}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_failure",
+        terminal_failure,
+    )
+
+    event = manager._finalize_after_process_exit(request_id, 0)
+
+    assert event["state"] == "finalize_failed"
+    assert event["release_transition_ok"] is True
+    assert event["callback_enqueued"] is True
+    assert "finalizer_retries_exhausted" in event["error"]
+    assert transition_calls[0][1:4] == (
+        "TASK_B1",
+        "claude_worker_b1",
+        "finalize_failed",
+    )
+
+
 @pytest.mark.parametrize(
     ("runner", "topic", "reason"),
     [

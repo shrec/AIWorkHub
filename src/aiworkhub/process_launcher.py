@@ -1505,6 +1505,13 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
     for item in raw:
         if not isinstance(item, str) or not item.strip() or "\x00" in item:
             raise LaunchRejected("required_outputs_invalid")
+        try:
+            normalized = _worker_workspace._relative_repo_path(item)
+            output_allowed = _worker_workspace._matches(normalized, allowed)
+        except WorkspaceError as exc:
+            raise LaunchRejected(f"required_output_path_invalid:{exc}") from exc
+        if not output_allowed:
+            raise LaunchRejected(f"required_output_not_allowed:{normalized}")
     _validate_allow_empty_required_outputs(card, raw, allowed)
     _validate_allow_unchanged_required_outputs(card, raw, allowed)
 
@@ -3568,7 +3575,7 @@ class ProcessManager:
                     "metadata_path": str(live.metadata_path or ""),
                     "supervisor_status_path": str(live.supervisor_status_path or ""),
                 })
-            self._finalize_isolated_request(live.request_id, live.process.poll())
+            self._finalize_after_process_exit(live.request_id, live.process.poll())
             with self._lock:
                 self._live.pop(live.request_id, None)
                 self._cancelled.discard(live.request_id)
@@ -3919,10 +3926,87 @@ class ProcessManager:
         try:
             while _pid_matches(pid, start_ticks):
                 time.sleep(0.2)
-            self._finalize_isolated_request(request_id)
+            self._finalize_after_process_exit(request_id)
         finally:
             with self._lock:
                 self._watching.discard(request_id)
+
+    def _finalize_after_process_exit(
+        self,
+        request_id: str,
+        supervisor_returncode: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Reconcile a dead supervisor without silently stranding its task.
+
+        Finalization crosses filesystem, process-ledger, task-store and
+        callback boundaries.  A transient Windows file/SQLite race must not
+        kill the daemon monitor thread and leave the canonical card forever
+        in ``processing``.  Retry the exact idempotent reconciliation a small
+        bounded number of times.  If the implementation itself keeps
+        failing, convert the still-processing card into a truthful
+        ``finalize_failed`` terminal outcome and enqueue its manager callback.
+        The isolated workspace remains retained for diagnosis.
+        """
+        errors: list[str] = []
+        for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                event = self._finalize_isolated_request(
+                    request_id,
+                    supervisor_returncode,
+                )
+                if event is not None:
+                    return event
+                errors.append(f"attempt={attempt}:no_terminal_event")
+            except Exception as exc:  # noqa: BLE001 - monitor must remain durable
+                errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
+
+        events = self._request_events(request_id)
+        identity = self._event_identity(events)
+        task_id = str(identity.get("task_id") or "")
+        runner = str(identity.get("runner") or "")
+        error = "finalizer_retries_exhausted:" + "|".join(errors)
+        release_result: dict[str, Any] = {
+            "ok": False,
+            "stderr": "request_identity_missing",
+            "callback_enqueued": False,
+        }
+        if task_id and runner:
+            release_result = task_engine.mark_terminal_failure(
+                self.repo,
+                task_id,
+                runner,
+                "finalize_failed",
+                evidence={
+                    "request_id": request_id,
+                    "error": error[:500],
+                    "supervisor_returncode": supervisor_returncode,
+                    "finalize_attempts": len(errors),
+                },
+                request_id=request_id,
+            )
+        terminal_state = "finalize_failed" if release_result.get("ok") else "reconcile_pending"
+        if release_result.get("ok"):
+            unlink_if_regular(self._terminal_authority_grant_path(request_id))
+        return self._append_event({
+            **identity,
+            "request_id": request_id,
+            "state": terminal_state,
+            "worker_terminal_state": "finalize_failed",
+            "exit_code": supervisor_returncode,
+            "finished_at": _utcnow(),
+            "workspace_retained": True,
+            "release_transition_ok": bool(release_result.get("ok")),
+            "callback_enqueued": bool(release_result.get("callback_enqueued")),
+            "error": (
+                error
+                if release_result.get("ok")
+                else error + ":terminal_transition_failed:" + str(
+                    release_result.get("stderr") or release_result.get("stdout") or ""
+                )
+            )[:500],
+        })
 
     def _reconcile_persisted_requests(self) -> dict[str, int]:
         watched = 0
@@ -3954,7 +4038,7 @@ class ProcessManager:
                 thread.start()
                 watched += 1
             else:
-                if self._finalize_isolated_request(request_id) is not None:
+                if self._finalize_after_process_exit(request_id) is not None:
                     finalized += 1
         return {"watched": watched, "finalized": finalized}
 

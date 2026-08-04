@@ -764,6 +764,10 @@ def aiworkhub_task_create(
     It is enforced only when the selected provider exposes structured usage
     while running; terminal-only usage remains posthoc evidence, never a
     false live-enforcement claim.
+    ``required_outputs`` contains only repo-relative file paths or glob
+    patterns covered by ``allowed_writes``. Human-readable outcome
+    descriptions belong in ``acceptance``; mixing prose into
+    ``required_outputs`` is rejected before a provider run is launched.
     """
 
     return core.create_task(
