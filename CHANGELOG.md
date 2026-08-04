@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.54] - 2026-08-04
+
+### Added
+
+- Added an exact operational-terminal retry flow that preserves task identity,
+  prior evidence and claim history while requiring the manager to name the
+  matching request and terminal substatus.
+- Added a deterministic worker read-efficiency analyzer for measuring bounded
+  versus unbounded reads, repeated file reads and estimated input waste without
+  inventing token savings.
+- Added hash-pinned VS Code LM source edits with bounded mismatch diagnostics so
+  stale replacements fail closed without retaining raw model output.
+
+### Fixed
+
+- Stopped runaway workers after 8 MiB of combined stdout/stderr, retained exact
+  byte evidence without labelling it token truth, and propagated the distinct
+  `output_budget_exceeded` state through task storage, callbacks and retry.
+- Bounded live dashboard output to cursor-based 8 KiB chunks and exposed
+  explicitly retryable operational blockers in Plan-DAG telemetry.
+- Prevented isolated workers from spending time installing or unpacking missing
+  validation dependencies; canonical validation remains a supervisor concern.
+- Accepted authenticated evidence-only reviews with no write scope, retained
+  code-task residual rework contracts, and preserved terminal callback truth.
+
 ## [0.8.53] - 2026-08-03
 
 ### Fixed
