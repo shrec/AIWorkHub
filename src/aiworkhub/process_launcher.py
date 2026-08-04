@@ -1135,6 +1135,15 @@ def _card_is_readonly_research(card: dict[str, Any]) -> bool:
     )
 
 
+def _card_is_readonly_quality_review(card: dict[str, Any]) -> bool:
+    """Return whether a card is the bound no-write reviewer contract."""
+
+    return (
+        str(card.get("topic") or "") == "quality_review"
+        and _card_is_readonly_research(card)
+    )
+
+
 def _research_result_text(event: dict[str, Any]) -> str:
     """Extract only known provider final/assistant result text shapes."""
 
@@ -5507,10 +5516,16 @@ class ProcessManager:
                     "task_id": task_id,
                 }
 
-            readonly_research = _card_is_readonly_research(card)
+            readonly_quality_review = _card_is_readonly_quality_review(card)
+            readonly_research = (
+                _card_is_readonly_research(card) and not readonly_quality_review
+            )
+            readonly_no_change = readonly_research or readonly_quality_review
             stored_hashes = evidence.get("changed_path_hashes")
+            if stored_hashes is None and readonly_no_change:
+                stored_hashes = {}
             if not isinstance(stored_hashes, dict) or (
-                not stored_hashes and not readonly_research
+                not stored_hashes and not readonly_no_change
             ):
                 return {
                     "ok": False,
@@ -5518,10 +5533,14 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                 }
-            if readonly_research and stored_hashes:
+            if readonly_no_change and stored_hashes:
                 return {
                     "ok": False,
-                    "error": "research_changed_hashes_forbidden",
+                    "error": (
+                        "quality_review_changed_hashes_forbidden"
+                        if readonly_quality_review
+                        else "research_changed_hashes_forbidden"
+                    ),
                     "request_id": request_id,
                     "task_id": task_id,
                 }
@@ -5565,6 +5584,140 @@ class ProcessManager:
                     "error": "write_gate_closed",
                     "request_id": request_id,
                     "task_id": task_id,
+                }
+
+            if readonly_quality_review:
+                try:
+                    if enforce_scope(workspace):
+                        raise WorkspaceError("quality_review_workspace_mutated")
+                    if evidence.get("changed_paths") not in ([], None):
+                        raise WorkspaceError("quality_review_changed_paths_forbidden")
+                    required_output_records = validate_required_outputs(
+                        workspace,
+                        card.get("required_outputs") or [],
+                        allow_empty=(),
+                        allow_unchanged=(),
+                    )
+                    metadata_path = self._metadata_from_events(events)
+                    if metadata_path is None:
+                        raise WorkspaceError("quality_review_metadata_missing")
+                    if (
+                        metadata_path.parent.resolve() != self.process_dir.resolve()
+                        or metadata_path.is_symlink()
+                        or not metadata_path.is_file()
+                        or metadata_path.stat().st_size > 2 * 1024 * 1024
+                    ):
+                        raise WorkspaceError("quality_review_metadata_invalid")
+                    try:
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise WorkspaceError("quality_review_metadata_unreadable") from exc
+                    if (
+                        str(metadata.get("request_id") or "") != request_id
+                        or str(metadata.get("task_id") or "") != task_id
+                        or str(metadata.get("runner") or "") != runner
+                        or str(metadata.get("topic") or "") != topic
+                    ):
+                        raise WorkspaceError("quality_review_metadata_identity_mismatch")
+                    try:
+                        metadata_workspace = WorkerWorkspace.from_metadata(
+                            dict(metadata["workspace"])
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise WorkspaceError("quality_review_workspace_invalid") from exc
+                    if metadata_workspace.as_metadata() != workspace.as_metadata():
+                        raise WorkspaceError("quality_review_workspace_identity_mismatch")
+                    verified_receipt = _verified_quality_review_receipt(
+                        metadata, workspace, request_id
+                    )
+                    stored_receipt = evidence.get("quality_review_receipt")
+                    if not isinstance(stored_receipt, dict):
+                        raise WorkspaceError("quality_review_receipt_missing")
+                    if verified_receipt != stored_receipt:
+                        raise WorkspaceError("quality_review_receipt_mismatch")
+                    report = verified_receipt.get("report") or {}
+                    if (
+                        report.get("read_only") is not True
+                        or report.get("can_mutate_repo") is not False
+                    ):
+                        raise WorkspaceError("quality_review_receipt_not_readonly")
+                    validations = run_validations(
+                        workspace, card.get("validation") or []
+                    )
+                except WorkspaceError as exc:
+                    return {
+                        "ok": False,
+                        "error": f"revalidation_failed:{exc}",
+                        "request_id": request_id,
+                        "task_id": task_id,
+                    }
+
+                quality_gate = {
+                    "schema_id": "aiworkhub.completion_quality_gate.v1",
+                    "applicable": False,
+                    "passed": None,
+                    "reason": "quality_review_no_repository_change",
+                    "changed_paths": [],
+                    "checks": [],
+                    "blocking_checks": [],
+                }
+                accept_result = task_engine.accept_review(
+                    self.repo,
+                    task_id,
+                    runner=runner,
+                    topic=topic,
+                    request_id=request_id,
+                    evidence={
+                        "promoted_paths": [],
+                        "validation": validations,
+                        "required_outputs": required_output_records,
+                        "quality_gate": quality_gate,
+                        "quality_review_receipt": verified_receipt,
+                    },
+                )
+                if not accept_result.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "quality_review_finalize_failed:"
+                            + str(
+                                accept_result.get("stderr")
+                                or accept_result.get("stdout")
+                                or ""
+                            )
+                        )[:500],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "promoted_paths": [],
+                    }
+                cleanup_error = ""
+                try:
+                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                except WorkspaceError as exc:
+                    cleanup_error = str(exc)[:500]
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": latest.get("adapter_id"),
+                    "state": "accepted",
+                    "accepted": True,
+                    "promoted_paths": [],
+                    "workspace_retained": bool(cleanup_error),
+                    "cleanup_error": cleanup_error,
+                    "quality_review_receipt": verified_receipt,
+                    "reviewer_finalization": [],
+                    "finished_at": _utcnow(),
+                })
+                return {
+                    "ok": True,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "promoted_paths": [],
+                    "cleanup_error": cleanup_error,
+                    "quality_review_receipt": verified_receipt,
+                    "reviewer_finalization": [],
                 }
 
             if readonly_research:

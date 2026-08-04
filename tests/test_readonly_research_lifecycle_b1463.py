@@ -293,3 +293,142 @@ def test_accept_revalidates_exact_readonly_research_stdout(
     mismatch = manager.accept_review(REQUEST_ID, TASK_ID)
     assert mismatch["ok"] is False
     assert mismatch["error"] == "revalidation_failed:research_result_evidence_mismatch"
+
+
+def test_accepts_authenticated_readonly_quality_review_without_changed_hashes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    root = tmp_path / "worktrees"
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(root))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workspace_path = root / REQUEST_ID / "worktree"
+    home = root / REQUEST_ID / "home"
+    _init_git(workspace_path)
+    home.mkdir(parents=True)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=REQUEST_ID,
+        repo=repo,
+        path=workspace_path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    card = _research_card(workspace)
+    card["topic"] = "quality_review"
+    evidence = card["terminal_review"]["evidence"]
+    evidence.pop("changed_path_hashes")
+    evidence["request_identity"]["topic"] = "quality_review"
+    evidence["quality_review"] = {
+        "target_request_id": "b" * 32,
+        "target_task_id": "TARGET_TASK",
+    }
+    receipt = {
+        "schema_id": "aiworkhub.quality_reviewer_receipt.v1",
+        "reviewer": {"request_id": REQUEST_ID, "task_id": TASK_ID},
+        "report": {
+            "lens": "correctness",
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings": [],
+        },
+    }
+    evidence["quality_review_receipt"] = receipt
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{REQUEST_ID}.request.json"
+    worker_workspace.write_json_0600(
+        metadata_path,
+        {
+            "request_id": REQUEST_ID,
+            "task_id": TASK_ID,
+            "runner": RUNNER,
+            "topic": "quality_review",
+            "adapter_id": "codex_cli",
+            "quality_review": evidence["quality_review"],
+            "workspace": workspace.as_metadata(),
+        },
+    )
+    manager = _manager(repo, process_dir, card)
+    manager._append_event(
+        {
+            "request_id": REQUEST_ID,
+            "task_id": TASK_ID,
+            "runner": RUNNER,
+            "topic": "quality_review",
+            "adapter_id": "codex_cli",
+            "state": "review_ready",
+            "metadata_path": str(metadata_path),
+        }
+    )
+    accepted: list[dict] = []
+    monkeypatch.setattr(
+        process_launcher,
+        "_verified_quality_review_receipt",
+        lambda _metadata, _workspace, _request_id: receipt,
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "accept_review",
+        lambda *_args, **kwargs: accepted.append(kwargs) or {"ok": True},
+    )
+    monkeypatch.setattr(process_launcher, "cleanup_workspace", lambda *_a, **_k: None)
+
+    result = manager.accept_review(REQUEST_ID, TASK_ID)
+
+    assert result["ok"] is True
+    assert result["promoted_paths"] == []
+    assert result["quality_review_receipt"] == receipt
+    final_evidence = accepted[0]["evidence"]
+    assert final_evidence["promoted_paths"] == []
+    assert final_evidence["quality_gate"]["reason"] == (
+        "quality_review_no_repository_change"
+    )
+
+
+def test_readonly_quality_review_requires_canonical_receipt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
+    root = tmp_path / "worktrees"
+    monkeypatch.setenv("AIWORKHUB_WORKTREE_ROOT", str(root))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workspace_path = root / REQUEST_ID / "worktree"
+    home = root / REQUEST_ID / "home"
+    _init_git(workspace_path)
+    home.mkdir(parents=True)
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=REQUEST_ID,
+        repo=repo,
+        path=workspace_path,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    card = _research_card(workspace)
+    card["topic"] = "quality_review"
+    card["terminal_review"]["evidence"]["request_identity"]["topic"] = (
+        "quality_review"
+    )
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    manager = _manager(repo, process_dir, card)
+    manager._append_event(
+        {
+            "request_id": REQUEST_ID,
+            "task_id": TASK_ID,
+            "runner": RUNNER,
+            "topic": "quality_review",
+            "adapter_id": "codex_cli",
+            "state": "review_ready",
+        }
+    )
+
+    result = manager.accept_review(REQUEST_ID, TASK_ID)
+
+    assert result["ok"] is False
+    assert result["error"] == "revalidation_failed:quality_review_metadata_missing"
