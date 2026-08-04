@@ -6,6 +6,14 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.56] - 2026-08-04
+
+### Fixed
+
+- Added a repository-confined, byte-bounded source preview to exact Source
+  Graph `file` results, allowing constant-only and file-level authorities to
+  be read without repeated zero-hit symbol-body queries or unbounded reads.
+
 ## [0.8.55] - 2026-08-04
 
 ### Fixed
