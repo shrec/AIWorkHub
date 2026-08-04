@@ -193,6 +193,62 @@ def test_residual_contract_allows_only_declared_json_pointer_changes(
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
+def test_residual_contract_supports_whole_file_code_rework(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "code-predecessor",
+        {"allowed_writes": ["src/repair.py"]},
+        "validation",
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "src" / "repair.py"
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text("VALUE = 'bad'\n", encoding="utf-8")
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        card = {
+            "allowed_writes": ["src/repair.py"],
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "code-predecessor",
+                "workspace": predecessor.as_metadata(),
+                "changed_path_hashes": {"src/repair.py": candidate_hash},
+                "residual_identities": [
+                    {
+                        "path": "src/repair.py",
+                        "pointer": "/CORRECTNESS-REPAIR-001",
+                    },
+                ],
+            },
+        }
+        successor = worker_workspace.create_workspace(
+            repo, "code-successor", card, "validation"
+        )
+        manifest = worker_workspace.build_residual_contract_manifest(successor, card)
+        assert manifest[0]["scope"] == "whole_file"
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="residual_contract_file_unchanged",
+        ):
+            worker_workspace.validate_residual_contract(successor, manifest)
+
+        output = successor.path / "src" / "repair.py"
+        output.write_text("VALUE = 'fixed'\n", encoding="utf-8")
+        result = worker_workspace.validate_residual_contract(successor, manifest)[0]
+        assert result["pass"] is True
+        assert result["scope"] == "whole_file"
+        assert result["observed_file_hash"] != result["predecessor_file_hash"]
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
 def test_claude_workspace_preseeds_exact_project_trust_without_parent_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

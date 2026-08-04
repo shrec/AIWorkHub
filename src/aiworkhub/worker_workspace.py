@@ -674,6 +674,19 @@ def _masked_json_hash(path: Path, pointers: list[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _bounded_residual_file_hash(path: Path) -> str:
+    """Hash one non-JSON residual artifact without claiming pointer precision."""
+
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError(f"residual_artifact_missing:{path.name}")
+    if path.stat().st_size > 32 * 1024 * 1024:
+        raise WorkspaceError(f"residual_artifact_too_large:{path.name}")
+    value = _hash_path(path)
+    if not isinstance(value, str) or not value.startswith("file:"):
+        raise WorkspaceError(f"residual_artifact_invalid:{path.name}")
+    return value
+
+
 def build_residual_contract_manifest(
     workspace: WorkerWorkspace, card: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -698,13 +711,21 @@ def build_residual_contract_manifest(
     manifest: list[dict[str, Any]] = []
     for relative, pointers in sorted(grouped.items()):
         unique = sorted(set(pointers))
-        manifest.append({
-            "path": relative,
-            "pointers": unique,
-            "non_residual_sha256": _masked_json_hash(
-                workspace.path / relative, unique
-            ),
-        })
+        path = workspace.path / relative
+        if path.suffix.lower() == ".json":
+            manifest.append({
+                "path": relative,
+                "pointers": unique,
+                "scope": "json_pointer",
+                "non_residual_sha256": _masked_json_hash(path, unique),
+            })
+        else:
+            manifest.append({
+                "path": relative,
+                "pointers": unique,
+                "scope": "whole_file",
+                "predecessor_file_hash": _bounded_residual_file_hash(path),
+            })
     return manifest
 
 
@@ -716,6 +737,29 @@ def validate_residual_contract(
     for row in manifest:
         relative = _relative_repo_path(str(row.get("path") or ""))
         pointers = [str(value) for value in row.get("pointers") or []]
+        scope = str(row.get("scope") or "json_pointer")
+        if scope == "whole_file":
+            expected_file_hash = str(row.get("predecessor_file_hash") or "")
+            if not re.fullmatch(r"file:[0-7]{3,4}:[0-9a-f]{64}", expected_file_hash):
+                raise WorkspaceError(
+                    f"residual_contract_file_hash_invalid:{relative}"
+                )
+            observed_file_hash = _bounded_residual_file_hash(
+                workspace.path / relative
+            )
+            if observed_file_hash == expected_file_hash:
+                raise WorkspaceError(f"residual_contract_file_unchanged:{relative}")
+            results.append({
+                "path": relative,
+                "pointers": pointers,
+                "scope": scope,
+                "predecessor_file_hash": expected_file_hash,
+                "observed_file_hash": observed_file_hash,
+                "pass": True,
+            })
+            continue
+        if scope != "json_pointer":
+            raise WorkspaceError(f"residual_contract_scope_invalid:{relative}")
         expected = str(row.get("non_residual_sha256") or "")
         observed = _masked_json_hash(workspace.path / relative, pointers)
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or observed != expected:
@@ -723,6 +767,7 @@ def validate_residual_contract(
         results.append({
             "path": relative,
             "pointers": pointers,
+            "scope": scope,
             "non_residual_sha256": expected,
             "pass": True,
         })
