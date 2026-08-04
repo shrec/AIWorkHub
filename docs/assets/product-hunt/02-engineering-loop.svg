@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1270" height="760" viewBox="0 0 1270 760">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#071018"/><stop offset="1" stop-color="#102433"/></linearGradient><filter id="shadow"><feDropShadow dx="0" dy="14" stdDeviation="18" flood-opacity=".3"/></filter></defs>
+  <rect width="1270" height="760" fill="url(#bg)"/>
+  <image href="vscode-extension/media/aiworkhub-marketplace-icon.png" x="76" y="60" width="64" height="64"/>
+  <text x="158" y="104" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="31" font-weight="800">AIWorkHub</text>
+  <text x="76" y="202" fill="#e8f6f5" font-family="Inter,Segoe UI,sans-serif" font-size="52" font-weight="850">Delegate work without giving up authority.</text>
+  <text x="76" y="249" fill="#9eb3b8" font-family="Inter,Segoe UI,sans-serif" font-size="23">Workers propose. Evidence proves. The current manager decides.</text>
+  <g filter="url(#shadow)" font-family="Inter,Segoe UI,sans-serif">
+    <g transform="translate(64 344)"><rect width="205" height="182" rx="22" fill="#122332" stroke="#29485b"/><text x="28" y="47" fill="#31e6c2" font-size="18" font-weight="800">01 · PLAN</text><text x="28" y="89" fill="#e8f6f5" font-size="22" font-weight="800">Task DAG</text><text x="28" y="126" fill="#9eb3b8" font-size="17">Dependencies</text><text x="28" y="151" fill="#9eb3b8" font-size="17">and write scopes</text></g>
+    <path d="M277 435h38" stroke="#31e6c2" stroke-width="4"/><path d="m307 425 12 10-12 10" fill="none" stroke="#31e6c2" stroke-width="4"/>
+    <g transform="translate(327 344)"><rect width="205" height="182" rx="22" fill="#122332" stroke="#29485b"/><text x="28" y="47" fill="#31e6c2" font-size="18" font-weight="800">02 · ROUTE</text><text x="28" y="89" fill="#e8f6f5" font-size="21" font-weight="800">Best ready model</text><text x="28" y="126" fill="#9eb3b8" font-size="17">Observed adapters</text><text x="28" y="151" fill="#9eb3b8" font-size="17">and preflight truth</text></g>
+    <path d="M540 435h38" stroke="#31e6c2" stroke-width="4"/><path d="m570 425 12 10-12 10" fill="none" stroke="#31e6c2" stroke-width="4"/>
+    <g transform="translate(590 344)"><rect width="205" height="182" rx="22" fill="#122332" stroke="#29485b"/><text x="28" y="47" fill="#31e6c2" font-size="18" font-weight="800">03 · EXECUTE</text><text x="28" y="89" fill="#e8f6f5" font-size="22" font-weight="800">Isolated worker</text><text x="28" y="126" fill="#9eb3b8" font-size="17">Focused source</text><text x="28" y="151" fill="#9eb3b8" font-size="17">and durable context</text></g>
+    <path d="M803 435h38" stroke="#31e6c2" stroke-width="4"/><path d="m833 425 12 10-12 10" fill="none" stroke="#31e6c2" stroke-width="4"/>
+    <g transform="translate(853 344)"><rect width="205" height="182" rx="22" fill="#122332" stroke="#29485b"/><text x="28" y="47" fill="#31e6c2" font-size="18" font-weight="800">04 · VERIFY</text><text x="28" y="89" fill="#e8f6f5" font-size="21" font-weight="800">Evidence packet</text><text x="28" y="126" fill="#9eb3b8" font-size="17">Diff, tests, logs</text><text x="28" y="151" fill="#9eb3b8" font-size="17">and tool receipts</text></g>
+    <path d="M1066 435h38" stroke="#31e6c2" stroke-width="4"/><path d="m1096 425 12 10-12 10" fill="none" stroke="#31e6c2" stroke-width="4"/>
+    <g transform="translate(1116 344)"><rect width="90" height="182" rx="22" fill="#0e9e8c"/><text x="45" y="63" text-anchor="middle" fill="#061018" font-size="18" font-weight="900">ACCEPT</text><text x="45" y="96" text-anchor="middle" fill="#061018" font-size="14">REWORK</text><text x="45" y="129" text-anchor="middle" fill="#061018" font-size="14">REJECT</text></g>
+  </g>
+  <rect x="76" y="616" width="1128" height="74" rx="18" fill="#0a1822" stroke="#203746"/>
+  <text x="102" y="662" fill="#9eb3b8" font-family="Inter,Segoe UI,sans-serif" font-size="20">Repository-local authority · durable callbacks · truthful terminal states · no cloud account</text>
+</svg>

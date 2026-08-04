@@ -400,6 +400,45 @@ def adapter_readiness(
 
             adapters.append(glm_credentials.credential_status(repo=repo))
             continue
+        if adapter_id == "claude_cli":
+            # The completion-inbox compatibility surface must consume the same
+            # live-auth authority as environment preflight. Executable presence
+            # alone is not launchability after a provider-observed 401/403.
+            from . import claude_auth
+
+            resolution = runtime_adapters.resolve_executable(adapter_id)
+            installed = bool(resolution.ok)
+            auth = (
+                claude_auth.auth_status(resolution.executable)
+                if installed
+                else {
+                    "authenticated": False,
+                    "launchable": False,
+                    "blocker_reason": resolution.reason or "not_installed",
+                    "runtime_observed": False,
+                }
+            )
+            launchable = installed and bool(auth.get("launchable"))
+            adapters.append({
+                "adapter_id": adapter_id,
+                "kind": "local_cli",
+                "installed": installed,
+                "credential_present": bool(auth.get("authenticated")),
+                "endpoint": None,
+                "supported_models": [],
+                "launchable": launchable,
+                "blocker_reason": (
+                    ""
+                    if launchable
+                    else str(
+                        auth.get("blocker_reason")
+                        or resolution.reason
+                        or "not_launchable"
+                    )
+                ),
+                "runtime_observed": bool(auth.get("runtime_observed")),
+            })
+            continue
         if adapter_id in runtime_adapters.MANUAL_ONLY_ADAPTERS:
             adapters.append({
                 "adapter_id": adapter_id,

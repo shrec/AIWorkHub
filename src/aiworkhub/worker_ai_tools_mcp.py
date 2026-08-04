@@ -83,6 +83,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -100,6 +101,7 @@ except ImportError:  # minimal copied worker package / direct-script mode
             fchmod(fd, mode)
 
 from .repository_state import RepositoryStateError
+from . import semantic_edit
 
 
 SERVER_NAME = "aiworkhub_worker_ai_tools"
@@ -115,6 +117,7 @@ ENV_REQUEST_ID = "AIWORKHUB_WORKER_MCP_REQUEST_ID"
 ENV_REPO = "AIWORKHUB_WORKER_MCP_REPO"
 ENV_AUTHORITY_REPO = "AIWORKHUB_WORKER_MCP_AUTHORITY_REPO"
 ENV_SOURCE_GRAPH_TARGETS = "AIWORKHUB_WORKER_MCP_SOURCE_GRAPH_TARGETS"
+ENV_ALLOWED_WRITES = "AIWORKHUB_WORKER_MCP_ALLOWED_WRITES"
 ENV_SESSION_TOPIC = "AIWORKHUB_WORKER_MCP_SESSION_TOPIC"
 ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
@@ -126,7 +129,7 @@ ENV_PYTHONPATH = "PYTHONPATH"
 
 BOUND_ENV_VARS: tuple[str, ...] = (
     ENV_TASK_ID, ENV_RUNNER, ENV_TOPIC, ENV_REQUEST_ID, ENV_REPO, ENV_AUTHORITY_REPO,
-    ENV_SOURCE_GRAPH_TARGETS, ENV_SESSION_TOPIC,
+    ENV_SOURCE_GRAPH_TARGETS, ENV_ALLOWED_WRITES, ENV_SESSION_TOPIC,
     ENV_AUDIT_LEDGER_PATH, ENV_AUDIT_HMAC_KEY_PATH,
 )
 
@@ -167,6 +170,8 @@ MAX_BUDGET = 160
 MIN_LIMIT = 1
 MAX_LIMIT = 20
 MAX_TOOL_OUTPUT_BYTES = 16 * 1024
+SOURCE_GRAPH_ORIENTATION_OUTPUT_BYTES = 8 * 1024
+SOURCE_GRAPH_ANALYSIS_OUTPUT_BYTES = 12 * 1024
 MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
 MAX_DECLARED_INPUT_PREVIEW_BYTES = 12 * 1024
 MAX_DECLARED_INPUT_HASH_BYTES = 8 * 1024 * 1024
@@ -178,6 +183,27 @@ SESSION_SNIPPET_CHARS = 280
 
 class WorkerToolError(RuntimeError):
     """A bounded, fail-closed worker MCP tool failure."""
+
+
+def _source_graph_output_cap(mode: SourceGraphMode) -> int:
+    """Return the response-byte ceiling appropriate for one graph mode.
+
+    ``focus`` and ``slice`` are the low-token orientation path advertised to
+    managers and workers, so they receive the smallest envelope.  Execution
+    flow, impact and validation-ownership modes retain a larger analysis
+    budget, while content-rich and repository-wide modes keep the existing
+    global ceiling.  The structure-aware JSON renderer preserves semantic
+    priority keys whenever truncation is required.
+    """
+
+    if mode in {"focus", "slice"}:
+        return SOURCE_GRAPH_ORIENTATION_OUTPUT_BYTES
+    if mode in {
+        "context", "impact", "trace", "deps", "coverage", "testmap",
+        "calls", "symbols", "bottlenecks", "auditmap", "complexity",
+    }:
+        return SOURCE_GRAPH_ANALYSIS_OUTPUT_BYTES
+    return MAX_TOOL_OUTPUT_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +221,7 @@ class WorkerToolContext:
     audit_ledger_path: Path | None
     audit_hmac_key_path: Path | None
     quality_review_packet_path: Path | None = None
+    allowed_writes: tuple[str, ...] = ()
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -228,6 +255,14 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
     targets = tuple(
         str(item) for item in targets_parsed if isinstance(item, str) and item.strip()
     ) if isinstance(targets_parsed, list) else ()
+    allowed_raw = str(source.get(ENV_ALLOWED_WRITES) or "[]")
+    try:
+        allowed_parsed = json.loads(allowed_raw)
+    except json.JSONDecodeError:
+        allowed_parsed = []
+    allowed_writes = tuple(
+        str(item) for item in allowed_parsed if isinstance(item, str) and item.strip()
+    ) if isinstance(allowed_parsed, list) else ()
     ledger_raw = source.get(ENV_AUDIT_LEDGER_PATH) or ""
     key_raw = source.get(ENV_AUDIT_HMAC_KEY_PATH) or ""
     review_packet_raw = source.get(ENV_QUALITY_REVIEW_PACKET_PATH) or ""
@@ -239,6 +274,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         repo=repo,
         authority_repo=authority_repo,
         source_graph_targets=targets,
+        allowed_writes=allowed_writes,
         session_topic=str(source.get(ENV_SESSION_TOPIC) or source[ENV_TOPIC]),
         audit_ledger_path=Path(str(ledger_raw)) if ledger_raw else None,
         audit_hmac_key_path=Path(str(key_raw)) if key_raw else None,
@@ -865,6 +901,7 @@ def verify_audit_ledger(
         "source_graph_index_sequence": [],
         "authority_index_identity": [],
         "verified_payloads": [],
+        "semantic_edit_apply_receipts": [],
         "reason": "",
     }
     try:
@@ -987,11 +1024,25 @@ def verify_audit_ledger(
         authority_source = str(entry.get("authority_source") or "")
         authority_state = str(entry.get("authority_state") or "")
         authority_repo = str(entry.get("authority_repo") or "")
+        semantic_edit_authority = (
+            tool == "semantic_edit_prepare"
+            and authority_source == "worker_workspace"
+            and authority_state == "hash_bound_fragment"
+        ) or (
+            tool == "semantic_edit_apply"
+            and authority_source == "worker_workspace"
+            and authority_state == "deterministic_apply"
+        )
         if (
             entry.get("ok")
             and not entry.get("violation")
-            and authority_source == "canonical"
-            and authority_state in {"canonical_active", "sole_authority"}
+            and (
+                (
+                    authority_source == "canonical"
+                    and authority_state in {"canonical_active", "sole_authority"}
+                )
+                or semantic_edit_authority
+            )
         ):
             successful_call_count[tool] = successful_call_count.get(tool, 0) + 1
         if authority_source or authority_state:
@@ -1003,6 +1054,31 @@ def verify_audit_ledger(
             and len(result["verified_payloads"]) < 12
         ):
             result["verified_payloads"].append(payload)
+        if (
+            tool == "semantic_edit_apply"
+            and entry.get("ok")
+            and not entry.get("violation")
+            and semantic_edit_authority
+            and isinstance(payload, dict)
+            and len(result["semantic_edit_apply_receipts"]) < 128
+        ):
+            # Only deterministic byte counts leave the authenticated ledger.
+            # Replacement text, paths, hashes and idempotency keys remain
+            # private to the worker runtime.
+            result["semantic_edit_apply_receipts"].append({
+                "file_bytes": max(0, int(payload.get("file_bytes") or 0)),
+                "range_count": max(0, int(payload.get("range_count") or 0)),
+                "old_region_bytes": max(
+                    0, int(payload.get("old_region_bytes") or 0)
+                ),
+                "replacement_bytes": max(
+                    0, int(payload.get("replacement_bytes") or 0)
+                ),
+                "model_reemitted_old_bytes": max(
+                    0, int(payload.get("model_reemitted_old_bytes") or 0)
+                ),
+                "token_savings_claimed": False,
+            })
         authoritative_source_graph = (
             authority_source == "canonical"
             and authority_state in {"canonical_active", "sole_authority"}
@@ -1323,6 +1399,7 @@ def source_graph_query(
                 "index_revision": index_identity["build_revision"],
                 "index_finished_at": index_identity["finished_at"],
                 "evidence_counts": cached["evidence_counts"],
+                "output_cap_bytes": cached["result"].get("output_cap_bytes"),
             },
         )
         return {**cached["result"], "cache_hit": True}
@@ -1384,17 +1461,20 @@ def source_graph_query(
         payload = _filter_by_scope(payload, scope) or {}
         if isinstance(payload, dict) and payload:
             payload["scope"] = "target"
+    hit_count = _json_hit_count(payload)
+    evidence_counts = _source_graph_evidence_counts(payload)
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     truncated = len(raw_text.encode("utf-8")) > MAX_RAW_TOOL_OUTPUT_BYTES
+    output_cap_bytes = _source_graph_output_cap(mode)
     try:
-        text, json_truncated = _canonical_json_output(tool, raw_text, max_bytes=MAX_TOOL_OUTPUT_BYTES)
+        text, json_truncated = _canonical_json_output(
+            tool, raw_text, max_bytes=output_cap_bytes,
+        )
     except WorkerToolError as exc:
         return _violation(ctx, tool, str(exc)[:160])
     truncated = truncated or json_truncated
 
     payload = json.loads(text)
-    hit_count = _json_hit_count(payload)
-    evidence_counts = _source_graph_evidence_counts(payload)
     bytes_returned = len(text.encode("utf-8"))
     result = {
         "ok": True,
@@ -1406,6 +1486,7 @@ def source_graph_query(
         "truncated": truncated,
         "hit_count": hit_count,
         "bytes": bytes_returned,
+        "output_cap_bytes": output_cap_bytes,
         "content": text,
         "cache_hit": False,
         "authority_source": binding.authority_source,
@@ -1434,6 +1515,7 @@ def source_graph_query(
             "index_revision": index_identity["build_revision"],
             "index_finished_at": index_identity["finished_at"],
             "evidence_counts": evidence_counts,
+            "output_cap_bytes": output_cap_bytes,
             "target_request_id": binding.target_request_id,
             "target_task_id": binding.target_task_id,
             "packet_sha256": binding.packet_sha256,
@@ -2042,6 +2124,141 @@ def quality_review_submit(
     }
 
 
+class WorkerSemanticEditSession:
+    """Request-local handles for Source-Graph-sized deterministic edits."""
+
+    def __init__(self, ctx: WorkerToolContext) -> None:
+        self.ctx = ctx
+        self._targets: dict[str, semantic_edit.PreparedLineTarget] = {}
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def prepare(
+        self, *, file_path: str, start_line: int, end_line: int
+    ) -> dict[str, Any]:
+        tool = "semantic_edit_prepare"
+        try:
+            target = semantic_edit.prepare_line_target(
+                self.ctx.repo,
+                path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                allowed_writes=self.ctx.allowed_writes,
+            )
+        except semantic_edit.SemanticEditError as exc:
+            return _violation(self.ctx, tool, str(exc))
+        target_id = secrets.token_hex(16)
+        with self._lock:
+            self._targets[target_id] = target
+        receipt = target.receipt(target_id=target_id)
+        _append_audit(
+            self.ctx,
+            tool=tool,
+            ok=True,
+            cache_hit=False,
+            hit_count=1,
+            bytes_returned=target.fragment_bytes,
+            authority_source="worker_workspace",
+            authority_state="hash_bound_fragment",
+            payload={key: value for key, value in receipt.items() if key != "fragment"},
+        )
+        return {"ok": True, "tool": tool, **receipt}
+
+    def apply(
+        self, *, target_id: str, new: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        tool = "semantic_edit_apply"
+        if (
+            not isinstance(target_id, str)
+            or not target_id
+            or not isinstance(new, str)
+            or not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key.encode("utf-8")) > 256
+        ):
+            return _violation(self.ctx, tool, "semantic_edit_apply_input_invalid")
+        with self._lock:
+            existing = self._receipts.get(idempotency_key)
+            target = self._targets.get(target_id)
+        if existing is not None:
+            return {**existing, "idempotent_replay": True}
+        if target is None:
+            return _violation(self.ctx, tool, "semantic_edit_target_unknown")
+        try:
+            current = semantic_edit.prepare_line_target(
+                self.ctx.repo,
+                path=target.path,
+                start_line=target.start_line,
+                end_line=target.end_line,
+                allowed_writes=self.ctx.allowed_writes,
+            )
+            if current.current_sha256 != target.current_sha256:
+                raise semantic_edit.SemanticEditError(
+                    f"semantic_edit_stale_file:{target.path}"
+                )
+            if current.fragment_sha256 != target.fragment_sha256:
+                raise semantic_edit.SemanticEditError(
+                    f"semantic_edit_stale_fragment:{target.path}"
+                )
+            file_path = semantic_edit.resolve_existing_file(self.ctx.repo, target.path)
+            _data, current_text = semantic_edit.read_utf8_file(file_path, target.path)
+            next_text, metrics = semantic_edit.apply_line_ranges(
+                current_text,
+                [{
+                    "start_line": target.start_line,
+                    "end_line": target.end_line,
+                    "new": new,
+                    "fragment_sha256": target.fragment_sha256,
+                }],
+            )
+            fd, temp_name = tempfile.mkstemp(prefix=f".{file_path.name}.aiworkhub-", dir=file_path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="", closefd=False) as handle:
+                    handle.write(next_text)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.close(fd)
+                fd = -1
+                os.replace(temp_name, file_path)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+        except (OSError, semantic_edit.SemanticEditError) as exc:
+            return _violation(self.ctx, tool, str(exc))
+        next_bytes = next_text.encode("utf-8")
+        receipt = {
+            "ok": True,
+            "tool": tool,
+            "schema_id": "aiworkhub.semantic_edit_apply_receipt.v1",
+            "target_id": target_id,
+            "path": target.path,
+            "before_sha256": target.current_sha256,
+            "after_sha256": hashlib.sha256(next_bytes).hexdigest(),
+            "idempotency_key": idempotency_key,
+            "idempotent_replay": False,
+            "file_bytes": target.file_bytes,
+            **metrics,
+        }
+        with self._lock:
+            self._receipts[idempotency_key] = receipt
+        _append_audit(
+            self.ctx,
+            tool=tool,
+            ok=True,
+            cache_hit=False,
+            hit_count=1,
+            bytes_returned=len(json.dumps(receipt, sort_keys=True).encode("utf-8")),
+            authority_source="worker_workspace",
+            authority_state="deterministic_apply",
+            payload=receipt,
+        )
+        return receipt
+
+
 # ---------------------------------------------------------------------------
 # Per-request MCP runtime generation (host-side; called BEFORE the sandboxed
 # adapter process starts, so it may write freely under the isolated home)
@@ -2109,6 +2326,7 @@ def generate_worker_mcp_runtime(
     source_graph_targets: list[str] | tuple[str, ...],
     session_topic: str,
     package_import_root: Path,
+    allowed_writes: list[str] | tuple[str, ...] = (),
     python_executable: str | None = None,
     quality_review_packet_path: Path | None = None,
 ) -> WorkerMcpRuntime:
@@ -2176,6 +2394,7 @@ def generate_worker_mcp_runtime(
         ENV_REPO: str(repo),
         ENV_AUTHORITY_REPO: str(authority_repo),
         ENV_SOURCE_GRAPH_TARGETS: json.dumps(list(source_graph_targets)),
+        ENV_ALLOWED_WRITES: json.dumps(list(allowed_writes)),
         ENV_SESSION_TOPIC: session_topic,
         ENV_AUDIT_LEDGER_PATH: str(ledger_path),
         ENV_AUDIT_HMAC_KEY_PATH: str(key_path),
@@ -2244,6 +2463,8 @@ def generate_worker_mcp_runtime(
 
 MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_semantic_edit_prepare",
+    "aiworkhub_worker_semantic_edit_apply",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
@@ -2266,6 +2487,8 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
     ``ctx`` and cannot be overridden by the caller.
     """
 
+    semantic_edits = WorkerSemanticEditSession(ctx)
+
     @mcp.tool(name="aiworkhub_worker_source_graph_query")
     def _source_graph_query(
         mode: SourceGraphMode, query: str, budget: int = 64,
@@ -2276,6 +2499,24 @@ def register_tools(mcp: Any, ctx: WorkerToolContext) -> tuple[str, ...]:
         return source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
+        )
+
+    @mcp.tool(name="aiworkhub_worker_semantic_edit_prepare")
+    def _semantic_edit_prepare(
+        file_path: str, start_line: int, end_line: int,
+    ) -> dict[str, Any]:
+        """Read only one Source Graph-selected line range and bind its hashes."""
+        return semantic_edits.prepare(
+            file_path=file_path, start_line=start_line, end_line=end_line
+        )
+
+    @mcp.tool(name="aiworkhub_worker_semantic_edit_apply")
+    def _semantic_edit_apply(
+        target_id: str, new: str, idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Apply replacement-only code to an immutable prepared target."""
+        return semantic_edits.apply(
+            target_id=target_id, new=new, idempotency_key=idempotency_key
         )
 
     @mcp.tool(name="aiworkhub_worker_session_current_state")
@@ -2394,6 +2635,7 @@ __all__ = [
     "ENV_AUDIT_HMAC_KEY_PATH",
     "ENV_AUDIT_LEDGER_PATH",
     "ENV_AUTHORITY_REPO",
+    "ENV_ALLOWED_WRITES",
     "ENV_REPO",
     "ENV_PYTHONPATH",
     "ENV_REQUEST_ID",

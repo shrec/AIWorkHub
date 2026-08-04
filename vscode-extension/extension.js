@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.58";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.81";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -200,7 +200,8 @@ const VSCODE_LM_REQUEST_SCHEMA = "aiworkhub.vscode_lm.request.v1";
 const VSCODE_LM_HOST_SCHEMA = "aiworkhub.vscode_lm.host.v1";
 const VSCODE_LM_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.response.v1";
 const VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1 = "aiworkhub.vscode_lm.edit_response.v1";
-const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.edit_response.v2";
+const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.semantic_edit_response.v3";
+const VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 = "aiworkhub.vscode_lm.edit_response.v2";
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_MODEL = "glm-5.2";
@@ -2233,9 +2234,12 @@ function vscodeLmModelFields(model) {
 }
 
 function isCallableVscodeLmProvider(model) {
-  // `copilotcli` contributes internal agent/picker entries to model
+  // `copilotcli` and the first-party `claude-code` extension contribute
+  // internal agent/picker entries to model
   // discovery, but those entries return empty streams when invoked through
-  // the public VS Code Language Model API. Copilot also contributes
+  // the public VS Code Language Model API. The latter was verified with a
+  // stream-first live canary: both text and tool-part populations were zero.
+  // Copilot also contributes
   // `copilot-utility*` picker entries whose display name mirrors the selected
   // model but whose request metadata has no tokenizer. Calling one through
   // sendRequest fails with `Unknown tokenizer: undefined`. The public
@@ -2243,10 +2247,12 @@ function isCallableVscodeLmProvider(model) {
   // custom endpoints such as GLM use their own vendor.
   const id = normalizedVscodeLmModelName(model && model.id);
   const family = normalizedVscodeLmModelName(model && model.family);
+  const vendor = normalizedVscodeLmModelName(model && model.vendor);
   return Boolean(
     model &&
     typeof model === "object" &&
-    normalizedVscodeLmModelName(model.vendor) !== "copilotcli" &&
+    vendor !== "copilotcli" &&
+    vendor !== "claude-code" &&
     !id.startsWith("copilot-utility") &&
     !family.startsWith("copilot-utility")
   );
@@ -2417,6 +2423,20 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     },
   },
   {
+    name: "aiworkhub_manager_semantic_edit_prepare",
+    description: "Bind one Source Graph-selected line range in the isolated worktree. Returns only that old fragment plus full-file/fragment hashes for replacement-only output.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["file_path", "start_line", "end_line"],
+      properties: {
+        file_path: { type: "string", minLength: 1, maxLength: 512 },
+        start_line: { type: "integer", minimum: 1 },
+        end_line: { type: "integer", minimum: 1 },
+      },
+    },
+  },
+  {
     name: "aiworkhub_manager_session_current_state",
     description: "Recover bounded current project session state before non-trivial assumptions.",
     inputSchema: { type: "object", additionalProperties: false, properties: { topic: { type: "string", maxLength: 128 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
@@ -2556,13 +2576,17 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Source Graph file lookup: mode=file with query and target both equal to one declared repo-relative path returns source_hash for that file.\n` +
     `- Source Graph body lookup: mode=body with query equal to the exact indexed symbol name and target equal to that file path returns bounded source.\n` +
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
-    `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}; legacy ${VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1} is accepted only for small complete-file writes.\n` +
-    `- v2 edits must name an allowed path, current_sha256 as exact lowercase SHA-256 of current workspace bytes, and bounded exact replacements with nonempty old, nonempty new, and expected_count.\n` +
-    `- v2 creates must name an allowed path and complete UTF-8 content. A path_contract action=create means the runtime owns an empty placeholder and the final response MUST use creates for that path.\n` +
-    `- For action=edit, copy current_sha256 exactly from path_contracts; do not infer or recompute it from a Source Graph response.\n` +
+    `- At completion output ONLY one JSON object with schema_id ${VSCODE_LM_EDIT_RESPONSE_SCHEMA}.\n` +
+    `- Never read or emit a complete existing file. Use Source Graph body mode for the smallest exact symbol, then return only its replacement in a line range.\n` +
+    `- After body discovery call aiworkhub_manager_semantic_edit_prepare with that file and exact line range. Copy current_sha256 from its receipt; the receipt returns only the selected old fragment, never the whole file.\n` +
+    `- The prepare tool input is exactly {"file_path":"repo/relative/path","start_line":1,"end_line":1}; use file_path, not path, in that tool request.\n` +
+    `- Semantic edits must name an allowed path, copy current_sha256 from path_contracts, and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
+    `- new contains only replacement code; it may be empty for deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
+    `- creates must name an allowed path and complete UTF-8 content. A path_contract action=create means the runtime owns an empty placeholder and the final response MUST use creates for that path.\n` +
+    `- For action=edit, copy current_sha256 exactly from semantic-edit prepare (or the identical exact path_contract); do not infer or recompute it.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
     `- path_contracts=${JSON.stringify(pathContracts || {})}\n` +
-    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<lowercase sha256>","replacements":[{"old":"exact current text","new":"replacement text","expected_count":1}]}],"creates":[]}`;
+    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<copy from path_contracts>","ranges":[{"start_line":10,"end_line":18,"new":"replacement code only","preserve_trailing_newline":true}]}],"creates":[]}`;
 }
 
 function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
@@ -2598,23 +2622,38 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
     }
     return "";
   }
+  if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2) {
+    if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) return "final_v2_shape_invalid";
+    for (const edit of envelope.edits) {
+      if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) return "final_edit_invalid";
+      if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
+      if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) return `final_path_not_allowed:${edit.path}`;
+      for (const replacement of edit.replacements) {
+        if (!replacement || typeof replacement.old !== "string" || !replacement.old ||
+            typeof replacement.new !== "string" || !replacement.new ||
+            !Number.isSafeInteger(replacement.expected_count) || replacement.expected_count < 1) return `final_replacement_invalid:${edit.path}`;
+      }
+    }
+    return "";
+  }
   if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) return "final_schema_invalid";
   if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
     return "final_v2_shape_invalid";
   }
   for (const edit of envelope.edits) {
-    if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) {
+    if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.ranges)) {
       return "final_edit_invalid";
     }
     if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
     if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) {
       return `final_path_not_allowed:${edit.path}`;
     }
-    for (const replacement of edit.replacements) {
-      if (!replacement || typeof replacement.old !== "string" || !replacement.old ||
-          typeof replacement.new !== "string" || !replacement.new ||
-          !Number.isSafeInteger(replacement.expected_count) || replacement.expected_count < 1) {
-        return `final_replacement_invalid:${edit.path}`;
+    for (const range of edit.ranges) {
+      if (!range || !Number.isSafeInteger(range.start_line) || range.start_line < 1 ||
+          !Number.isSafeInteger(range.end_line) || range.end_line < range.start_line ||
+          typeof range.new !== "string" ||
+          (range.preserve_trailing_newline !== undefined && typeof range.preserve_trailing_newline !== "boolean")) {
+        return `final_range_invalid:${edit.path}`;
       }
     }
   }
@@ -2644,22 +2683,47 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
 
 async function collectVscodeLmResponseText(response) {
   const textParts = [];
-  // VS Code's LanguageModelChatResponse exposes both a typed `stream` and a
-  // text-only async iterable. Some contributed providers (notably Claude in
-  // Copilot Chat) advertise toolCalling=false and place their content only on
-  // `response.text`; draining `stream` for those models yields zero parts.
-  // Prefer the standard text channel for the emulated JSON protocol and keep
-  // stream as a compatibility fallback for older/custom implementations.
+  const observations = { text: [], stream: [] };
+  // VS Code documents `response.text` as a filtered view of `response.stream`,
+  // not an independent response channel.  Draining the filtered view first
+  // can consume and discard non-text parts before diagnostics or a native
+  // compatibility path can observe them.  The typed stream is therefore the
+  // authority; use `text` only for older/custom responses with no stream.
+  const collectParts = async (iterable, channel) => {
+    if (!iterable || typeof iterable[Symbol.asyncIterator] !== "function") return;
+    for await (const part of iterable) {
+      if (part && typeof part.value === "string") textParts.push(part.value);
+      else if (typeof part === "string") textParts.push(part);
+      else if (observations[channel].length < 4) {
+        const value = part && part.value;
+        observations[channel].push({
+          part_type: typeof part,
+          part_constructor: String(part && part.constructor && part.constructor.name || ""),
+          keys: part && typeof part === "object" ? Object.keys(part).slice(0, 8) : [],
+          value_type: typeof value,
+          value_constructor: String(value && value.constructor && value.constructor.name || ""),
+        });
+      }
+    }
+  };
   const textChannel = response && response.text;
-  const iterable = textChannel && typeof textChannel[Symbol.asyncIterator] === "function"
-    ? textChannel
-    : response.stream;
-  for await (const part of iterable) {
-    if (part && typeof part.value === "string") textParts.push(part.value);
-    else if (typeof part === "string") textParts.push(part);
+  const streamChannel = response && response.stream;
+  if (streamChannel && typeof streamChannel[Symbol.asyncIterator] === "function") {
+    await collectParts(streamChannel, "stream");
+  } else {
+    await collectParts(textChannel, "text");
   }
   const text = textParts.join("").trim();
-  if (!text) throw new Error("vscode_lm_empty_response");
+  if (!text) {
+    const error = new Error("vscode_lm_empty_response");
+    error.responseDiagnostics = {
+      text_channel_available: Boolean(textChannel && typeof textChannel[Symbol.asyncIterator] === "function"),
+      stream_channel_available: Boolean(streamChannel && typeof streamChannel[Symbol.asyncIterator] === "function"),
+      text_parts: observations.text,
+      stream_parts: observations.stream,
+    };
+    throw error;
+  }
   if (Buffer.byteLength(text, "utf8") > VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES) {
     throw new Error("vscode_lm_text_response_too_large");
   }
@@ -2670,7 +2734,7 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
   const source = String(text || "").trim();
   const normalize = (candidate) => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
-    if ([VSCODE_LM_TOOL_REQUEST_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1].includes(candidate.schema_id)) {
+    if ([VSCODE_LM_TOOL_REQUEST_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA, VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1].includes(candidate.schema_id)) {
       return candidate;
     }
     // GLM custom endpoints commonly serialize a function request using an
@@ -2758,7 +2822,7 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
     if (uniqueCandidates.length === 1) return uniqueCandidates[0];
     if (preferFinal) {
       const finals = uniqueCandidates.filter((candidate) =>
-        candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1
+        candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 || candidate.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1
       );
       // Text-only GLM endpoints may narrate or restate the prompt's example
       // envelope before emitting the real final object. The last complete
@@ -2856,7 +2920,12 @@ async function runVscodeLmTextProtocol(
             `${VSCODE_LM_TOOL_REQUEST_SCHEMA} tool request or final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
       ));
       if (sourceGraphAcknowledged) postSourceTurns += 1;
-      protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
+      protocolTrace.push({
+        turn,
+        phase: forceFinal ? "final" : "work",
+        outcome: "empty",
+        response: err && err.responseDiagnostics || {},
+      });
       continue;
     }
     if (sourceGraphAcknowledged) postSourceTurns += 1;
@@ -2875,7 +2944,7 @@ async function runVscodeLmTextProtocol(
       ));
       continue;
     }
-    if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
+    if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
       if (finalError) {
@@ -3014,7 +3083,7 @@ async function runVscodeLmAgent(
         ));
         continue;
       }
-      if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA && envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
+      if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA && envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 && envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "non_final_envelope" });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
         messages.push(vscode.LanguageModelChatMessage.User(
@@ -4988,7 +5057,7 @@ async function pushSnapshotOnce(view) {
     try {
       debugTrace("snapshot.attempt.begin", { request_seq: requestSeq, attempt: attempt + 1 });
       refreshCoordinatorRouteBeforeSnapshot();
-      const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
+      const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true });
       debugTrace("snapshot.payload.received", {
         request_seq: requestSeq,
         attempt: attempt + 1,
@@ -5045,7 +5114,7 @@ async function pushSnapshotNoRetry(view, options = {}) {
     const client = options.client || getMcpClient();
     view.bindClient(client);
     refreshCoordinatorRouteBeforeSnapshot();
-    const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, {});
+    const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true });
     if (payload && view.stillBoundTo(client) && (authoritative || requestSeq === view.snapshotRequestSeq)) {
       view.postMessage({
         type: OUTBOUND_TYPES.snapshot,
@@ -7062,6 +7131,7 @@ module.exports = {
       VSCODE_LM_HOST_SCHEMA,
       VSCODE_LM_RESPONSE_SCHEMA,
       VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1,
+      VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2,
       VSCODE_LM_EDIT_RESPONSE_SCHEMA,
       VSCODE_LM_TOOL_REQUEST_SCHEMA,
       VSCODE_LM_TOOL_RESULT_SCHEMA,

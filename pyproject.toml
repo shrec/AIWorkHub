@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+source-graph-semantic = [
+  "tree-sitter-language-pack>=1.13,<2",
+]
 dev = [
   "mypy>=1.14,<2",
   "pytest>=8,<10",

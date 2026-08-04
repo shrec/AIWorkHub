@@ -6,6 +6,7 @@ import sys
 import threading
 import types
 import typing
+from collections.abc import Mapping
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
@@ -744,6 +745,8 @@ def aiworkhub_task_create(
     allowed_writes: list[str],
     forbidden: list[str] | None = None,
     required_outputs: list[str] | None = None,
+    allow_empty_required_outputs: list[str] | None = None,
+    allow_unchanged_required_outputs: list[str] | None = None,
     validation: list[str] | None = None,
     priority: str = "normal",
     task_type: str = "code",
@@ -768,6 +771,11 @@ def aiworkhub_task_create(
     patterns covered by ``allowed_writes``. Human-readable outcome
     descriptions belong in ``acceptance``; mixing prose into
     ``required_outputs`` is rejected before a provider run is launched.
+    ``allow_unchanged_required_outputs`` explicitly names required files that
+    are evidence inputs/outputs permitted to remain byte-identical to both
+    launch baselines; they are verified and hashed but never promoted.
+    ``allow_empty_required_outputs`` is the equivalent explicit exception for
+    deliberately zero-byte outputs. Neither exception is inferred.
     """
 
     return core.create_task(
@@ -780,6 +788,8 @@ def aiworkhub_task_create(
         allowed_writes=allowed_writes,
         forbidden=forbidden,
         required_outputs=required_outputs,
+        allow_empty_required_outputs=allow_empty_required_outputs,
+        allow_unchanged_required_outputs=allow_unchanged_required_outputs,
         validation=validation,
         priority=priority,
         task_type=task_type,
@@ -790,19 +800,97 @@ def aiworkhub_task_create(
     )
 
 
-@mcp.tool()
-def aiworkhub_task_plan_snapshot() -> dict[str, Any]:
-    """READ-ONLY: Plan-DAG snapshot for dashboard/explanation use.
+_PLAN_SUMMARY_FIELDS = (
+    "ready",
+    "ready_capacity",
+    "active_count",
+    "blocked_count",
+    "blocked_task_ids",
+    "dependency_blocked_count",
+    "dependency_blocked_task_ids",
+    "lifecycle_blocked_count",
+    "lifecycle_blocked_task_ids",
+    "operational_blockers",
+    "operational_blocked_task_ids",
+    "operational_blocked_count",
+    "explicit_retry_task_ids",
+    "explicit_retry_count",
+    "orphaned_processing",
+    "orphaned_processing_count",
+    "invalid_depends_on",
+    "write_scope_overlaps",
+    "critical_path",
+    "critical_path_length",
+    "edge_count",
+    "dag_valid",
+    "cycle_nodes",
+)
 
-    Reports, for every canonical card in this repo: its dependencies,
-    unmet blockers, write-scope overlaps with processing/review cards, and
-    the deterministic set of task_ids ready to be claimed right now. Never
-    computes readiness/pass-fail for the model to act on directly -- it is a
-    read-only report; ``aiworkhub_task_auto_pickup``/``_dryrun`` are the only
-    tools that claim work.
+
+def _compact_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep current planning truth without replaying the historical DAG.
+
+    The full plan is useful for the visual DAG and exact dependency audits, but
+    managers normally need only ready work, live blockers, collisions and
+    malformed/orphaned state.  Finished cards remain counted while their
+    per-node lifecycle/dependency/dependent entries stay behind ``full=True``.
     """
 
-    return core.task_plan_snapshot()
+    lifecycle = snapshot.get("lifecycle")
+    lifecycle_map = dict(lifecycle) if isinstance(lifecycle, Mapping) else {}
+    actionable_lifecycle = {
+        str(task_id): str(state)
+        for task_id, state in lifecycle_map.items()
+        if str(state).strip().lower() not in {"finished", "archived"}
+    }
+    task_ids = snapshot.get("task_ids")
+    task_count = len(task_ids) if isinstance(task_ids, list) else len(lifecycle_map)
+    terminal_task_count = max(0, task_count - len(actionable_lifecycle))
+    layers = snapshot.get("layers")
+
+    result: dict[str, Any] = {
+        "ok": bool(snapshot.get("ok", True)),
+        "schema_id": snapshot.get("schema_id", "aiworkhub.task_plan_snapshot.v1"),
+        "snapshot_mode": "summary",
+        "full_snapshot_available": True,
+        "task_count": task_count,
+        "actionable_task_count": len(actionable_lifecycle),
+        "terminal_task_count": terminal_task_count,
+        "actionable_lifecycle": actionable_lifecycle,
+        "layer_count": len(layers) if isinstance(layers, list) else 0,
+    }
+    for field in _PLAN_SUMMARY_FIELDS:
+        if field in snapshot:
+            result[field] = snapshot[field]
+    result["omitted_fields"] = [
+        "dependencies",
+        "dependents",
+        "layers",
+        "lifecycle",
+        "task_ids",
+    ]
+    return result
+
+
+@mcp.tool()
+def aiworkhub_task_plan_snapshot(full: bool = False) -> dict[str, Any]:
+    """READ-ONLY: bounded Plan-DAG summary, or the complete DAG with ``full``.
+
+    Default mode reports actionable lifecycle, ready work, blockers,
+    write-scope overlaps, orphaned processing and DAG validity without
+    repeating every finished card's dependency history.  Use ``full=true``
+    for exact historical dependency/layer inspection.  This tool never claims
+    work; ``aiworkhub_task_auto_pickup``/``_dryrun`` remain the claim surfaces.
+    """
+
+    snapshot = core.task_plan_snapshot()
+    if full:
+        return {
+            **snapshot,
+            "snapshot_mode": "full",
+            "full_snapshot_available": True,
+        }
+    return _compact_task_plan_snapshot(snapshot)
 
 
 @mcp.tool()
@@ -1412,15 +1500,42 @@ def aiworkhub_task_cost_ledger(
     topic: str | None = None,
     status: str | None = None,
     include_tasks: bool = False,
+    full: bool = False,
 ) -> dict[str, Any]:
-    """READ-ONLY: aggregate task usage and launch-log cost evidence."""
+    """READ-ONLY: bounded cost summary, with opt-in detailed dimensions.
 
-    return cost_ledger.build_cost_ledger(
+    Default mode retains cost/cache truth plus provider, model and day
+    aggregates.  Per-runner and per-topic maps are available with
+    ``full=true``; task rows remain independently opt-in through
+    ``include_tasks``.
+    """
+
+    result = cost_ledger.build_cost_ledger(
         runner=runner,
         topic=topic,
         status=status,
         include_tasks=include_tasks,
     )
+    if full:
+        return {
+            **result,
+            "snapshot_mode": "full",
+            "full_snapshot_available": True,
+        }
+
+    aggregates = result.get("aggregates")
+    aggregate_map = dict(aggregates) if isinstance(aggregates, Mapping) else {}
+    result["aggregates"] = {
+        key: aggregate_map.get(key, {})
+        for key in ("by_model", "by_provider", "by_day")
+    }
+    result.update({
+        "snapshot_mode": "summary",
+        "full_snapshot_available": True,
+        "omitted_dimensions": ["by_topic", "by_runner"],
+        "detail_request": {"full": True},
+    })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1464,9 +1579,70 @@ def aiworkhub_completion_inbox(
     # Additive process evidence: taskctl remains lifecycle authority, while
     # launcher exits/timeouts are visible in the same polling call Codex uses
     # for review-ready work.
-    result["agent_processes"] = process_launcher.default_manager().list_processes(
-        limit=limit
-    )
+    process_report = process_launcher.default_manager().list_processes(limit=limit)
+    compact_processes: list[dict[str, Any]] = []
+    for row in process_report.get("processes", []):
+        if not isinstance(row, Mapping):
+            continue
+        compact: dict[str, Any] = {}
+        for key in (
+            "request_id",
+            "task_id",
+            "runner",
+            "topic",
+            "adapter_id",
+            "model",
+            "state",
+            "exit_code",
+            "timestamp",
+            "finished_at",
+            "accepted",
+            "review_ready",
+            "liveness_lost",
+            "workspace_retained",
+        ):
+            if key in row:
+                compact[key] = row[key]
+        if row.get("error"):
+            compact["error"] = str(row["error"])[:500]
+        usage = row.get("usage")
+        if isinstance(usage, Mapping):
+            compact["usage"] = {
+                key: usage[key]
+                for key in (
+                    "usage_observed",
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_input_tokens",
+                    "cost_observed",
+                    "cost_usd",
+                )
+                if key in usage
+            }
+        token_budget = row.get("token_budget")
+        if isinstance(token_budget, Mapping):
+            compact["token_budget"] = {
+                key: token_budget[key]
+                for key in (
+                    "cap_tokens",
+                    "accepted_total_tokens",
+                    "cap_enforceable",
+                    "telemetry_authority",
+                )
+                if key in token_budget
+            }
+        compact_processes.append(compact)
+    result["agent_processes"] = {
+        key: value
+        for key, value in process_report.items()
+        if key != "processes"
+    }
+    result["agent_processes"].update({
+        "schema_id": "aiworkhub.completion_process_summary.v1",
+        "processes": compact_processes,
+        "detail_fields_omitted": True,
+        "detail_tool": "aiworkhub_agent_task_status",
+    })
     # Additive read-only adapter readiness (installed / credential_present /
     # endpoint / supported_models / launchable / exact blocker_reason) so Codex
     # sees whether a deepseek_copilot_cli launch is possible BEFORE claiming a

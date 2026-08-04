@@ -7,6 +7,8 @@
   "server_name": "aiworkhub_worker_ai_tools",
   "mcp_tool_names": [
     "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_semantic_edit_prepare",
+    "aiworkhub_worker_semantic_edit_apply",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
@@ -27,6 +29,7 @@
     "AIWORKHUB_WORKER_MCP_REPO",
     "AIWORKHUB_WORKER_MCP_AUTHORITY_REPO",
     "AIWORKHUB_WORKER_MCP_SOURCE_GRAPH_TARGETS",
+    "AIWORKHUB_WORKER_MCP_ALLOWED_WRITES",
     "AIWORKHUB_WORKER_MCP_SESSION_TOPIC",
     "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH",
     "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"

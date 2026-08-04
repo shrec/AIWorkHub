@@ -707,7 +707,22 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
     monkeypatch.setattr(server.completion_inbox, "build_completion_inbox",
                         lambda **_k: {"review_queue": [], "stale_processing": []})
     monkeypatch.setattr(server.process_launcher, "default_manager",
-                        lambda: SimpleNamespace(list_processes=lambda limit: {"ok": True, "processes": []}))
+                        lambda: SimpleNamespace(list_processes=lambda limit: {
+                            "ok": True,
+                            "total_requests": 1,
+                            "processes": [{
+                                "request_id": "r1",
+                                "task_id": "T1",
+                                "state": "review_ready",
+                                "project_context": {"large": "x" * 20_000},
+                                "usage": {
+                                    "usage_observed": True,
+                                    "input_tokens": 12,
+                                    "output_tokens": 3,
+                                    "private_detail": "omit-me",
+                                },
+                            }],
+                        }))
     monkeypatch.setattr(server.core, "repo_root", lambda: repo_dir)
 
     result = server.aiworkhub_completion_inbox()
@@ -717,6 +732,21 @@ def test_completion_inbox_mcp_tool_surfaces_adapter_readiness(monkeypatch, tmp_p
     ds = next(a for a in readiness["adapters"] if a["adapter_id"] == ADAPTER)
     assert ds["credential_present"] is True
     assert ds["endpoint"] == dc.DEEPSEEK_BASE_URL
+    process_report = result["agent_processes"]
+    assert process_report["schema_id"] == "aiworkhub.completion_process_summary.v1"
+    assert process_report["detail_fields_omitted"] is True
+    assert process_report["processes"] == [{
+        "request_id": "r1",
+        "task_id": "T1",
+        "state": "review_ready",
+        "usage": {
+            "usage_observed": True,
+            "input_tokens": 12,
+            "output_tokens": 3,
+        },
+    }]
+    assert "project_context" not in json.dumps(process_report)
+    assert "omit-me" not in json.dumps(process_report)
     assert FAKE_KEY not in json.dumps(result)
 
 

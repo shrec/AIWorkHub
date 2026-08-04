@@ -35,6 +35,8 @@ jobs:
         run: mypy
       - name: Public documentation contract
         run: python scripts/check_public_docs.py
+      - name: Recompute checked-in benchmark evidence
+        run: python scripts/check_semantic_edit_benchmark.py
 
   cross-platform:
     name: Fresh install (${{ matrix.name }})
@@ -66,9 +68,9 @@ jobs:
           AIWORKHUB_QUALIFICATION_MODE: ${{ matrix.mode }}
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install .
+          python -m pip install ".[source-graph-semantic]"
           python -m pip install "pytest>=8,<10"
-          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
+          python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py tests/test_source_graph_tree_sitter_semantic.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

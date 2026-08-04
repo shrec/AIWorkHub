@@ -932,7 +932,10 @@ def _canonical_write_gate(
 # their prior behavior.
 # ---------------------------------------------------------------------------
 
-_RUNNER_TOPIC_TOKEN_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# Runner/topic identity is created under the same canonical grammar used by
+# task_create. Keeping a second underscore-only regex here made a card with a
+# valid dotted or dashed topic creatable but permanently unlaunchable.
+_RUNNER_TOPIC_TOKEN_RE = _TASK_IDENTITY_RE
 
 # (runner, topic) -> allowed write_actions.
 RUNNER_TOPIC_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
@@ -1394,9 +1397,9 @@ def _is_malformed_identity_token(value: str) -> str | None:
     """Return a short reason string if ``value`` fails sanity checks, else None.
 
     Rejects: empty string, embedded null bytes, and anything outside the
-    conservative ``[A-Za-z0-9_]+`` charset (this rejects whitespace, path
-    traversal like ``../``, and shell metacharacters like ``; | & $`` in one
-    check). Matching is exact/case-sensitive against ``RUNNER_TOPIC_ALLOWLIST``
+    canonical ``[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`` identity grammar (this
+    rejects whitespace, path separators/traversal, and shell metacharacters
+    like ``; | & $`` in one check). Matching is exact/case-sensitive against ``RUNNER_TOPIC_ALLOWLIST``
     keys -- no case normalization is performed anywhere in this module, so a
     case-mismatched runner (e.g. ``CLAUDE_CODING``) passes this sanity check
     but is then rejected as an unknown pair by the allowlist lookup.
@@ -2925,6 +2928,8 @@ def create_task(
     allowed_writes: list[str],
     forbidden: list[str] | None = None,
     required_outputs: list[str] | None = None,
+    allow_empty_required_outputs: list[str] | None = None,
+    allow_unchanged_required_outputs: list[str] | None = None,
     validation: list[str] | None = None,
     priority: str = "normal",
     callback_required: bool = True,
@@ -3007,6 +3012,14 @@ def create_task(
         writes2 = bounded_strings(allowed_writes, "allowed_writes")
         forbidden2 = bounded_strings(forbidden or [], "forbidden")
         outputs2 = bounded_strings(required_outputs or [], "required_outputs")
+        allow_empty_outputs2 = bounded_strings(
+            allow_empty_required_outputs or [],
+            "allow_empty_required_outputs",
+        )
+        allow_unchanged_outputs2 = bounded_strings(
+            allow_unchanged_required_outputs or [],
+            "allow_unchanged_required_outputs",
+        )
         validation2 = bounded_strings(validation or [], "validation")
         read_first2 = bounded_strings(read_first or [], "read_first")
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
@@ -3050,6 +3063,73 @@ def create_task(
             })
             return result
 
+    def validate_required_output_exceptions(
+        values: list[str],
+        *,
+        field: str,
+        allow_required_glob_match: bool,
+        allow_write_glob_match: bool,
+    ) -> dict[str, Any] | None:
+        for index, raw_path in enumerate(values):
+            try:
+                normalized = worker_workspace._relative_repo_path(raw_path)
+            except worker_workspace.WorkspaceError as exc:
+                result = _lifecycle_error(f"invalid_{field}:{exc}", 2)
+                result.update({f"{field}_index": index, field: raw_path[:240]})
+                return result
+            if any(ch in normalized for ch in "*?["):
+                result = _lifecycle_error(f"invalid_{field}:glob_forbidden", 2)
+                result.update({f"{field}_index": index, field: raw_path[:240]})
+                return result
+            output_match = any(
+                normalized == required
+                or (
+                    allow_required_glob_match
+                    and fnmatch.fnmatchcase(normalized, required)
+                )
+                for required in outputs2
+            )
+            if not output_match:
+                result = _lifecycle_error(
+                    f"{field.removesuffix('s')}_not_in_required_outputs:{normalized}",
+                    2,
+                )
+                result.update({f"{field}_index": index, field: raw_path[:240]})
+                return result
+            write_match = any(
+                normalized == allowed
+                or (
+                    allow_write_glob_match
+                    and fnmatch.fnmatchcase(normalized, allowed)
+                )
+                for allowed in writes2
+            )
+            if not write_match:
+                result = _lifecycle_error(
+                    f"{field.removesuffix('s')}_not_in_allowed_writes:{normalized}",
+                    2,
+                )
+                result.update({f"{field}_index": index, field: raw_path[:240]})
+                return result
+        return None
+
+    exception_error = validate_required_output_exceptions(
+        allow_empty_outputs2,
+        field="allow_empty_required_outputs",
+        allow_required_glob_match=True,
+        allow_write_glob_match=True,
+    )
+    if exception_error is not None:
+        return exception_error
+    exception_error = validate_required_output_exceptions(
+        allow_unchanged_outputs2,
+        field="allow_unchanged_required_outputs",
+        allow_required_glob_match=False,
+        allow_write_glob_match=False,
+    )
+    if exception_error is not None:
+        return exception_error
+
     for validation_index, validation_command in enumerate(validation2):
         try:
             worker_workspace.validation_argv(validation_command)
@@ -3078,6 +3158,16 @@ def create_task(
         "validation": validation2,
         "allowed_writes": writes2,
         "required_outputs": outputs2,
+        **(
+            {"allow_empty_required_outputs": allow_empty_outputs2}
+            if allow_empty_outputs2
+            else {}
+        ),
+        **(
+            {"allow_unchanged_required_outputs": allow_unchanged_outputs2}
+            if allow_unchanged_outputs2
+            else {}
+        ),
         "read_first": read_first2,
         "immutable_inputs": immutable_inputs2,
         "forbidden": forbidden2,
@@ -3145,6 +3235,16 @@ def create_task(
         "allowed_writes": writes2,
         "forbidden": forbidden2,
         "required_outputs": outputs2,
+        **(
+            {"allow_empty_required_outputs": allow_empty_outputs2}
+            if allow_empty_outputs2
+            else {}
+        ),
+        **(
+            {"allow_unchanged_required_outputs": allow_unchanged_outputs2}
+            if allow_unchanged_outputs2
+            else {}
+        ),
         "read_first": read_first2,
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
@@ -3187,6 +3287,8 @@ def create_task(
         "allowed_writes": writes2,
         "forbidden": forbidden2,
         "required_outputs": outputs2,
+        "allow_empty_required_outputs": allow_empty_outputs2,
+        "allow_unchanged_required_outputs": allow_unchanged_outputs2,
         "validation": validation2,
         "priority": priority,
         "task_type": task_type,
@@ -3215,6 +3317,12 @@ def create_task(
             "allowed_writes": existing_card.get("allowed_writes") or [],
             "forbidden": existing_card.get("forbidden") or [],
             "required_outputs": existing_card.get("required_outputs") or [],
+            "allow_empty_required_outputs": (
+                existing_card.get("allow_empty_required_outputs") or []
+            ),
+            "allow_unchanged_required_outputs": (
+                existing_card.get("allow_unchanged_required_outputs") or []
+            ),
             "validation": existing_card.get("validation") or [],
             "priority": str(existing_card.get("priority") or "normal"),
             "task_type": str(existing_context.get("task_type") or "code"),

@@ -141,20 +141,23 @@ class TestOpenAICacheSubset(unittest.TestCase):
             result["cache_semantics"]["provider_shape"], "openai_subset"
         )
 
-    def test_openai_zero_cache_null(self):
+    def test_openai_observed_zero_cache_is_zero(self):
         result = measure_context_delivery(
             usage={"input_tokens": 5000, "cached_input_tokens": 0},
             adapter_id="deepseek_v4_pro",
             task_id="T05",
         )
-        self.assertIsNone(result["populations"]["cached_input_tokens"])
-        self.assertIsNone(result["ratios"]["cache_hit_rate_of_input"])
+        self.assertEqual(result["populations"]["cached_input_tokens"], 0)
+        self.assertEqual(
+            result["populations"]["cache_eligible_input_tokens"], 5000
+        )
+        self.assertEqual(result["ratios"]["cache_hit_rate_of_input"], 0.0)
 
 
 class TestClaudeDisjointCache(unittest.TestCase):
     """4. Claude disjoint cache fields."""
 
-    def test_claude_cache_summed(self):
+    def test_claude_cache_read_is_hit_and_creation_is_not(self):
         result = measure_context_delivery(
             usage={
                 "input_tokens": 8000,
@@ -167,8 +170,9 @@ class TestClaudeDisjointCache(unittest.TestCase):
             task_id="T06",
         )
         pops = result["populations"]
-        self.assertEqual(pops["cached_input_tokens"], 3500)
+        self.assertEqual(pops["cached_input_tokens"], 3000)
         self.assertEqual(pops["cache_creation_input_tokens"], 500)
+        self.assertEqual(pops["cache_eligible_input_tokens"], 11500)
         self.assertEqual(
             result["cache_semantics"]["provider_shape"], "claude_disjoint"
         )
@@ -176,7 +180,8 @@ class TestClaudeDisjointCache(unittest.TestCase):
             result["cache_semantics"]["cache_subset_of_input_tokens"]
         )
         self.assertAlmostEqual(
-            result["ratios"]["cache_hit_rate_of_input"], 3500 / 8000
+            result["ratios"]["cache_hit_rate_of_input"], 3000 / 11500,
+            places=4,
         )
 
     def test_claude_launcher_cached_field_is_accepted_as_cache_read(self):
@@ -189,7 +194,23 @@ class TestClaudeDisjointCache(unittest.TestCase):
             adapter_id="claude_cli",
             task_id="T06-launcher",
         )
-        self.assertEqual(result["populations"]["cached_input_tokens"], 3500)
+        self.assertEqual(result["populations"]["cached_input_tokens"], 3000)
+        self.assertEqual(
+            result["populations"]["cache_eligible_input_tokens"], 11500
+        )
+
+    def test_impossible_openai_cache_ratio_is_invalid_not_clamped(self):
+        result = measure_context_delivery(
+            usage={"input_tokens": 100, "cached_input_tokens": 200},
+            adapter_id="deepseek_v4_pro",
+            task_id="T06-invalid",
+        )
+        self.assertFalse(result["populations"]["cache_metric_valid"])
+        self.assertIsNone(result["ratios"]["cache_hit_rate_of_input"])
+        self.assertEqual(
+            result["cache_semantics"]["invalid_reason"],
+            "cached_tokens_exceed_eligible_input",
+        )
 
     def test_claude_no_cache_null(self):
         result = measure_context_delivery(

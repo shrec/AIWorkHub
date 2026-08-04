@@ -32,6 +32,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -76,6 +77,9 @@ MAX_COMPONENT_NODES = 500
 MAX_PATH_VISITS = 5000
 SOURCE_GRAPH_COMPACT_MIN_BYTES = 64 * 1024 * 1024
 SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO = 0.20
+_INDEXED_EXTENSION_SET = frozenset(
+    suffix.casefold() for suffix in sglanguages.INDEXED_EXTENSIONS
+)
 
 DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
@@ -638,19 +642,27 @@ def _write_extraction(
 
 
 def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
-    """Resolve lexical-language call/inheritance targets only when unique.
+    """Resolve lexical-language targets only with unique bounded evidence.
 
     Lexical extraction proves that call syntax exists but not which overload or
     translation unit owns the callee.  A unique canonical entity name is safe
-    to bind as inferred evidence; zero or multiple candidates remain visibly
-    unresolved. Recomputing after every build also clears targets made stale by
-    a rename/delete during an incremental refresh.
+    to bind as inferred evidence. When a name is globally ambiguous, an exact
+    import/include-to-file match may disambiguate one candidate. Zero or
+    multiple candidates remain visibly unresolved. Recomputing after every
+    build also clears targets made stale by a rename/delete during an
+    incremental refresh.
     """
 
+    resolvable_extractors = (
+        sgast.CPP_LEXICAL_EXTRACTOR_ID,
+        sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID,
+        sgast.TREE_SITTER_JS_TS_EXTRACTOR_ID,
+    )
+    placeholders = ",".join("?" for _ in resolvable_extractors)
     conn.execute(
-        "UPDATE edges SET dst_qualname=NULL WHERE extractor IN (?,?) "
+        f"UPDATE edges SET dst_qualname=NULL WHERE extractor IN ({placeholders}) "
         "AND kind IN ('calls','inherits')",
-        (sgast.CPP_LEXICAL_EXTRACTOR_ID, sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID),
+        resolvable_extractors,
     )
     rows = conn.execute(
         "SELECT name, MIN(qualname) qualname, COUNT(*) c FROM entities "
@@ -660,15 +672,94 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     resolved = 0
     for row in rows:
         cur = conn.execute(
-            "UPDATE edges SET dst_qualname=? WHERE extractor IN (?,?) "
+            f"UPDATE edges SET dst_qualname=? WHERE extractor IN ({placeholders}) "
             "AND kind IN ('calls','inherits') AND dst_name=? AND dst_qualname IS NULL",
-            (
-                row["qualname"], sgast.CPP_LEXICAL_EXTRACTOR_ID,
-                sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID, row["name"],
-            ),
+            (row["qualname"], *resolvable_extractors, row["name"]),
+        )
+        resolved += int(cur.rowcount or 0)
+
+    # Second pass: imported-file evidence can safely narrow a globally
+    # ambiguous short name. This remains INFERRED authority; the resolver only
+    # fills the canonical target identity already carried by the edge.
+    unresolved = conn.execute(
+        f"SELECT id, file_path, dst_name FROM edges WHERE extractor IN ({placeholders}) "
+        "AND kind IN ('calls','inherits') AND dst_qualname IS NULL "
+        "ORDER BY id",
+        resolvable_extractors,
+    ).fetchall()
+    imports_by_file: dict[str, list[str]] = {}
+    candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+    for edge in unresolved:
+        file_path = str(edge["file_path"])
+        if file_path not in imports_by_file:
+            imports_by_file[file_path] = [
+                str(row["dst_name"])
+                for row in conn.execute(
+                    "SELECT dst_name FROM edges WHERE file_path=? AND kind='imports' "
+                    "ORDER BY id",
+                    (file_path,),
+                )
+            ]
+        imports = imports_by_file[file_path]
+        if not imports:
+            continue
+        name = str(edge["dst_name"])
+        if name not in candidates_by_name:
+            candidates_by_name[name] = conn.execute(
+                "SELECT file_path, qualname FROM entities WHERE name=? AND "
+                "kind IN ('function','method','class','struct','union','enum') "
+                "ORDER BY file_path, qualname",
+                (name,),
+            ).fetchall()
+        candidates = [
+            row for row in candidates_by_name[name]
+            if any(
+                _import_target_matches_file(target, str(row["file_path"]))
+                for target in imports
+            )
+        ]
+        if len(candidates) != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (candidates[0]["qualname"], edge["id"]),
         )
         resolved += int(cur.rowcount or 0)
     return resolved
+
+
+def _import_target_matches_file(target: str, file_path: str) -> bool:
+    """Match an observed import/include target to one candidate source file."""
+
+    normalized_target = str(target).strip().replace("\\", "/")
+    normalized_target = normalized_target.removeprefix("./")
+    while normalized_target.startswith("../"):
+        normalized_target = normalized_target[3:]
+    target_path = Path(normalized_target)
+    if target_path.suffix.casefold() in _INDEXED_EXTENSION_SET:
+        normalized_target = target_path.with_suffix("").as_posix()
+    normalized_target = normalized_target.replace("::", "/").replace(".", "/")
+    normalized_file = str(file_path).strip().replace("\\", "/")
+    target_path = Path(normalized_target)
+    file_path_obj = Path(normalized_file)
+    target_stem = target_path.stem.casefold()
+    file_stem = file_path_obj.stem.casefold()
+    # A bare include/module name may match by stem. Once the import carries a
+    # directory component, discarding that path would turn ``../b/math`` into
+    # a match for both ``a/math.ts`` and ``b/math.ts`` and destroy the exact
+    # disambiguating evidence.
+    if "/" not in normalized_target and target_stem and target_stem == file_stem:
+        return True
+    target_no_suffix = target_path.with_suffix("").as_posix().casefold().strip("/")
+    file_no_suffix = file_path_obj.with_suffix("").as_posix().casefold().strip("/")
+    return bool(
+        target_no_suffix
+        and (
+            file_no_suffix.endswith(target_no_suffix)
+            or file_no_suffix.endswith(f"{target_no_suffix}/index")
+            or file_no_suffix.endswith(f"{target_no_suffix}/mod")
+        )
+    )
 
 
 def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, incremental: bool = True) -> BuildReport:
@@ -690,14 +781,27 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 row["file_path"]: (row["source_hash"], row["build_revision"])
                 for row in conn.execute("SELECT file_path, source_hash, build_revision FROM files")
             }
+            existing_extractors: dict[str, set[str]] = {}
+            for row in conn.execute(
+                "SELECT file_path, extractor FROM entities "
+                "UNION SELECT file_path, extractor FROM edges"
+            ):
+                existing_extractors.setdefault(str(row["file_path"]), set()).add(
+                    str(row["extractor"])
+                )
             for path in files_on_disk:
                 extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
                 seen_rel.add(extraction.file_path)
                 prior = existing.get(extraction.file_path)
+                expected_extractors = {
+                    item.extractor for item in (*extraction.entities, *extraction.edges)
+                }
                 if (
                     incremental and prior is not None
                     and prior[0] == extraction.source_hash
                     and prior[1] == BUILD_REVISION
+                    and existing_extractors.get(extraction.file_path, set())
+                    == expected_extractors
                 ):
                     unchanged += 1
                     continue
@@ -782,6 +886,29 @@ def _fts_phrase(term: str) -> str:
     return f'"{cleaned}"*' if cleaned else '""'
 
 
+def _query_tokens(term: str) -> list[str]:
+    """Normalize code identifiers and qualified names into FTS tokens.
+
+    The transformation is deterministic and deliberately syntax-light: it
+    splits camel/Pascal case and common namespace/path separators without
+    guessing synonyms. Exact phrase lookup still runs first, so normalization
+    only broadens a query after the highest-precision pass misses.
+    """
+
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", term or "")
+    expanded = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", expanded)
+    # Preserve Unicode words (including Georgian); only punctuation and
+    # namespace/path separators become boundaries.
+    expanded = "".join(char if char.isalnum() else " " for char in expanded)
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in expanded.casefold().split():
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
 def _fts_terms(term: str, *, operator: str) -> str:
     """Build a safe token query without treating whitespace as one phrase.
 
@@ -791,9 +918,16 @@ def _fts_terms(term: str, *, operator: str) -> str:
     single indexed field.
     """
 
-    tokens = [token for token in term.split() if token]
+    tokens = _query_tokens(term)
     escaped = [f'"{token.replace(chr(34), chr(34) * 2)}"*' for token in tokens]
     return f" {operator} ".join(escaped)
+
+
+def _looks_like_identifier_query(term: str) -> bool:
+    return bool(
+        any(separator in term for separator in ("_", "::", ".", "/", "\\"))
+        or re.search(r"[a-z0-9][A-Z]", term)
+    )
 
 
 def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[str, Any]]:
@@ -803,8 +937,10 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
     limit = max(1, min(int(limit), MAX_BUDGET_ROWS))
     rows = []
     expressions = [_fts_phrase(term)]
-    if len(term.split()) > 1:
-        expressions.extend((_fts_terms(term, operator="AND"), _fts_terms(term, operator="OR")))
+    if len(_query_tokens(term)) > 1:
+        expressions.append(_fts_terms(term, operator="AND"))
+        if not _looks_like_identifier_query(term):
+            expressions.append(_fts_terms(term, operator="OR"))
     for expression in expressions:
         try:
             rows = conn.execute(
@@ -1377,7 +1513,7 @@ def _query_payload(repo_root: Path, mode: str, query: str, budget: int) -> dict[
         files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {
             "mode": mode, "query": query, "budget": budget, "matches": matches,
-            "candidate_files": files,
+            "query_tokens": _query_tokens(query), "candidate_files": files,
             "truncated": truncated,
         }
         if mode == "focus" and matches:

@@ -33,6 +33,7 @@ const exact = { id: "glm-5.2", family: "glm-5.2", name: "GLM-5.2", vendor: "cust
 const unrelated = { id: "gpt-5.4", family: "gpt-5.4", name: "GPT-5.4", vendor: "copilot", version: "1", capabilities: { toolCalling: true } };
 const deepseek = { id: "deepseek-v4-pro", family: "deepseek-v4-pro", name: "DeepSeek V4 Pro", vendor: "copilot", version: "1", capabilities: { toolCalling: true } };
 const internalClaude = { id: "claude-haiku-4.5", family: "claude-haiku-4.5", name: "Claude Haiku 4.5", vendor: "copilotcli", version: "1", capabilities: { toolCalling: false } };
+const firstPartyClaudeExtensionModel = { id: "claude-sonnet-5", family: "claude-sonnet-5", name: "Claude Sonnet 5", vendor: "claude-code", version: "1", capabilities: { toolCalling: false } };
 const publicClaude = { id: "auto", family: "claude-sonnet-4.6", name: "Auto", vendor: "copilot", version: "claude-sonnet-4.6", capabilities: { toolCalling: false } };
 const aliasedGlm = { id: "custom-auto", family: "glm52", name: "GLM 5.2", vendor: "customendpoint", version: "latest", capabilities: { toolCalling: true } };
 const aliasedDeepseek = { id: "auto", family: "deepseek-v4pro", name: "DeepSeek V4 Pro", vendor: "copilot", version: "latest", capabilities: { toolCalling: true } };
@@ -54,6 +55,7 @@ assert.ok(
     internals.vscodeLmModelSelectionRank(internalDeepseekUtility, "deepseek-v4-flash"),
 );
 assert.strictEqual(internals.isCallableVscodeLmProvider(internalClaude), false);
+assert.strictEqual(internals.isCallableVscodeLmProvider(firstPartyClaudeExtensionModel), false);
 assert.strictEqual(internals.isCallableVscodeLmProvider(publicClaude), true);
 assert.strictEqual(internals.isCallableVscodeLmProvider(null), false);
 assert.strictEqual(internals.isCallableVscodeLmProvider(undefined), false);
@@ -65,6 +67,7 @@ assert.strictEqual(internals.vscodeLmAccessState(exact), "unknown");
 assert.strictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vscodeLmPermissionStorageKey(exact));
 assert.notStrictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vscodeLmPermissionStorageKey(deepseek));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_session_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_ai_memory_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_kb_write_intent"));
@@ -73,6 +76,8 @@ assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", 
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=body with query equal to the exact indexed symbol name"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_prepare"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"file_path":"repo/relative/path"'));
 assert.strictEqual(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -80,7 +85,7 @@ assert.strictEqual(
     edits: [{
       path: "src/app.py",
       current_sha256: "a".repeat(64),
-      replacements: [{ old: "before", new: "after", expected_count: 1 }],
+      ranges: [{ start_line: 10, end_line: 12, new: "after", preserve_trailing_newline: true }],
     }],
     creates: [],
   }, ["src/*.py"]),
@@ -98,7 +103,7 @@ assert.match(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "bad",
-    edits: [{ path: "src/app.py", current_sha256: "A".repeat(64), replacements: [] }],
+    edits: [{ path: "src/app.py", current_sha256: "A".repeat(64), ranges: [] }],
     creates: [],
   }, ["src/*.py"]),
   /final_hash_invalid/,
@@ -302,7 +307,6 @@ async function textProtocolChecks() {
   const textChannelModel = {
     capabilities: { toolCalling: false },
     sendRequest: async () => ({
-      stream: (async function* stream() {})(),
       text: (async function* text() { yield finalResponse; }()),
     }),
   };
@@ -317,6 +321,55 @@ async function textProtocolChecks() {
     async () => ({ ok: true, content: "graph" }),
   );
   assert.strictEqual(textChannelResult, finalResponse);
+
+  const emptyTextChannelModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      text: (async function* text() {})(),
+      stream: (async function* stream() { yield { value: finalResponse }; }()),
+    }),
+  };
+  const streamFallbackResult = await internals.runVscodeLmTextProtocol(
+    emptyTextChannelModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.strictEqual(streamFallbackResult, finalResponse);
+
+  const unsupportedPartModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      text: (async function* text() { yield { metadata: true }; }()),
+      stream: (async function* stream() { yield { value: { nested: true }, marker: "opaque" }; }()),
+    }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      unsupportedPartModel,
+      {
+        prompt: "bounded",
+        allowedWrites: [],
+        initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
+      },
+      undefined,
+      async () => ({ ok: true, content: "graph" }),
+    ),
+    (error) => {
+      assert.match(error.message, /vscode_lm_finalization_limit/);
+      const first = error.protocolTrace[0];
+      assert.strictEqual(first.outcome, "empty");
+      assert.strictEqual(first.response.text_channel_available, true);
+      assert.strictEqual(first.response.stream_channel_available, true);
+      assert.deepStrictEqual(first.response.text_parts, []);
+      assert.strictEqual(first.response.stream_parts[0].value_type, "object");
+      return true;
+    },
+  );
 }
 
 async function malformedCatalogChecks() {

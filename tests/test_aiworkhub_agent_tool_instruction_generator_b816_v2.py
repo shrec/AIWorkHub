@@ -61,6 +61,7 @@ def test_exact_validation_exception_is_not_discovery_escape_hatch() -> None:
     text = instr.render_canonical()
     assert "Exact validation/build/test commands named by the card are allowed." in text
     assert "Exact known-path reads from the card or Source Graph are allowed" in text
+    assert "use a bounded read and never reread an unchanged range" in text
     assert "they are not broad discovery" in text
 
 

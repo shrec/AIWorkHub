@@ -91,6 +91,34 @@ degraded reasons remain distinguishable. See the
 [Source Graph economics](docs/PRODUCT_ROADMAP.md#p1--source-graph-economics-and-enforcement-080)
 contract.
 
+For existing-file changes, the worker can stay on a focused path end to end.
+Source Graph `body` returns one bounded symbol with exact line evidence; the
+model emits only replacement code; AIWorkHub's local Python applier verifies
+the complete-file preimage, the prepared fragment, write scope and range before
+changing the isolated worktree. Full-file output remains available only as a
+legacy fallback or for genuinely new files. Receipts report file, fragment and
+replacement bytes, but do not turn those byte counts into an invented token
+savings multiplier.
+
+## Measured semantic-edit pilot
+
+Two exact paired Codex GPT-5.5 observations compared the focused semantic-edit
+path with the full-file baseline on the same task family. The checked-in ledger
+is recomputed in CI.
+
+| Observed metric | Focused edit | Full-file baseline | Difference |
+| --- | ---: | ---: | ---: |
+| Total tokens | 256,384 | 353,872 | 27.5% fewer |
+| Output tokens | 2,190 | 2,918 | 24.9% fewer |
+| Elapsed time | 73.1 s | 93.2 s | 21.5% less |
+| Uncached input tokens | 50,162 | 41,706 | 20.3% more |
+
+This is an honest pilot result, **not a general product claim**: `n=2`, one
+model/task family, non-randomized order, cache-confounded runs and no canonical
+manager-acceptance measurement. See [Benchmarks](docs/BENCHMARKS.md) for exact
+request identities, raw evidence, limitations and the promotion gate required
+before publishing a savings multiplier.
+
 ## How it works
 
 ```mermaid
@@ -263,7 +291,7 @@ never inherit the manager launch capability.
 | Area | Current capability |
 | --- | --- |
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
-| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing and continuous-use telemetry |
+| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing, replacement-only semantic edits and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
 | Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
@@ -273,7 +301,10 @@ The KPI view separates explicit manager decisions from worker terminal
 outcomes and plots only bounded repository evidence. Its larger aggregate-only
 history shows Source Graph modes, workflow stages, latency, inter-call gaps,
 returned structural evidence, index generations, tool-use cohorts and
-deterministic raw-path-versus-delivered-bundle byte economics. Every rate
+deterministic raw-path-versus-delivered-bundle byte economics. Focused semantic
+edits additionally report authenticated source-file, selected-region and
+replacement byte totals, including how many whole-file bytes the model did not
+re-emit. This is structural evidence, not a token multiplier. Every rate
 carries its sample window or denominator; token savings and causal quality
 gains are deliberately not inferred. Inter-call gaps at or above the bounded
 15-minute informational threshold are surfaced, but never mislabeled as proof

@@ -375,6 +375,9 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     workspace = tmp_path / request_id / "worktree"
     home = tmp_path / request_id / "home"
     workspace.mkdir(parents=True)
+    source_file = workspace / "src" / "app.py"
+    source_file.parent.mkdir()
+    source_file.write_text("before\ndef target():\n    return 1\nafter\n", encoding="utf-8")
     home.mkdir()
     ledger = home / "audit.jsonl"
     key = home / "audit.key"
@@ -391,6 +394,7 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
         "worker_mcp": {
             "authority_repo": str(repo),
             "source_graph_targets": ["src/aiworkhub"],
+            "allowed_writes": ["src/*.py"],
             "session_topic": "bounded bridge test",
             "audit_ledger_path": str(ledger),
             "audit_hmac_key_path": str(key),
@@ -429,6 +433,25 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     assert ctx.authority_repo == repo.resolve()
     assert ctx.audit_ledger_path == ledger
     assert observed["kwargs"] == {"mode": "focus", "query": "bridge", "budget": 16}
+
+    prepared = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_semantic_edit_prepare",
+        {"file_path": "src/app.py", "start_line": 2, "end_line": 3},
+    )
+    assert prepared["ok"] is True
+    assert prepared["fragment"] == "def target():\n    return 1\n"
+    assert prepared["file_bytes"] > prepared["fragment_bytes"]
+    assert prepared["token_savings_claimed"] is False
+
+    text_provider_alias = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_semantic_edit_prepare",
+        {"path": "src/app.py", "start_line": 2, "end_line": 3},
+    )
+    assert text_provider_alias["ok"] is True
+    assert text_provider_alias["path"] == "src/app.py"
+    assert text_provider_alias["fragment"] == prepared["fragment"]
 
     def _session_intent(
         bound_ctx: worker_ai_tools_mcp.WorkerToolContext, **kwargs: object,

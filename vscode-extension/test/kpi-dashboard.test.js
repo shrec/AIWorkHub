@@ -35,12 +35,17 @@ test("KPI visualizations include responsive chart and bar primitives", () => {
   assert.match(cssSource, /@media \(max-width: 820px\)/);
 });
 
-test("KPI v3 renders Source Graph workflow, generations, call gaps and byte economics", () => {
-  assert.match(appSource, /aiworkhub\.kpi\.dashboard\.v3/);
+test("KPI v4 renders Source Graph workflow, generations, call gaps and byte economics", () => {
+  assert.match(appSource, /aiworkhub\.kpi\.dashboard\.v4/);
   assert.match(appSource, /Source Graph workflow stages/);
   assert.match(appSource, /Source Graph modes/);
   assert.match(appSource, /Tool-use cohorts/);
-  assert.match(appSource, /Context compression/);
+  assert.match(appSource, /Delivery reduction/);
+  assert.match(appSource, /Delivery overhead/);
+  assert.match(appSource, /estimated bytes added/);
+  assert.match(appSource, /Optional suppression/);
+  assert.match(appSource, /Envelope overhead/);
+  assert.match(appSource, /serialization bytes added/);
   assert.match(appSource, /Provider cache hit/);
   assert.match(appSource, /Cost \/ review-ready/);
   assert.match(appSource, /Source Graph latency p50/);
@@ -49,5 +54,25 @@ test("KPI v3 renders Source Graph workflow, generations, call gaps and byte econ
   assert.match(appSource, /not proof that the model was inactive/);
   assert.match(appSource, /SG evidence rows/);
   assert.match(appSource, /Source Graph index generations/);
-  assert.match(appSource, /Byte compression uses declared raw paths/);
+  assert.match(appSource, /signed net delta between pre-optimization tool-section payload and delivered bundle bytes/);
+  assert.match(appSource, /not raw repository-file, counterfactual read, or token-savings evidence/);
+});
+
+test("Operations KPIs render semantic-edit structural evidence without token claims", () => {
+  assert.match(appSource, /Focused semantic edits/);
+  assert.match(appSource, /Replacement \/ file bytes/);
+  assert.match(appSource, /Old bytes re-emitted by model/);
+  assert.match(appSource, /byte-shape evidence, not a token, cost, speed, or quality-savings claim/i);
+  assert.match(appSource, /Paired baselines are required/);
+});
+
+test("Operations KPIs render truthful worker read-efficiency evidence", () => {
+  assert.match(appSource, /snapshot\.read_efficiency_telemetry/);
+  assert.match(appSource, /Read trace coverage/);
+  assert.match(appSource, /Bounded file reads/);
+  assert.match(appSource, /Worker read efficiency/);
+  assert.match(appSource, /Read evidence by adapter/);
+  assert.match(appSource, /legacy excluded/);
+  assert.match(appSource, /incompatible legacy task\(s\) excluded/);
+  assert.match(appSource, /Provider event\/byte evidence only; no token or savings claim/);
 });

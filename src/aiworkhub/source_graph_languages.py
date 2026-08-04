@@ -89,16 +89,27 @@ def language_for_path(path: Path) -> str | None:
 
 
 def public_registry(*, disabled_languages: frozenset[str] = frozenset()) -> list[dict[str, object]]:
-    return [
-        {
+    from . import source_graph_semantic
+
+    rows: list[dict[str, object]] = []
+    for spec in LANGUAGE_SPECS:
+        row: dict[str, object] = {
             "id": spec.id,
             "label": spec.label,
             "extensions": list(spec.extensions),
             "capability": spec.capability,
             "enabled": spec.id not in disabled_languages,
         }
-        for spec in LANGUAGE_SPECS
-    ]
+        if spec.id in source_graph_semantic.SUPPORTED_LANGUAGES:
+            semantic = source_graph_semantic.parser_capability(spec.id)
+            row["active_capability"] = (
+                "semantic_tree_sitter" if semantic["available"] else spec.capability
+            )
+            row["semantic_parser"] = semantic
+        else:
+            row["active_capability"] = spec.capability
+        rows.append(row)
+    return rows
 
 
 __all__ = [

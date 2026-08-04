@@ -97,7 +97,7 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
         "dispatcher_repo_id": "repo_canon",
         "problems": [],
     })
-    result = dashboard_mcp_app.snapshot_view()
+    result = dashboard_mcp_app.snapshot_view(full=True)
 
     assert calls == [((), {})]
     assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
@@ -105,6 +105,7 @@ def test_snapshot_view_reuses_build_snapshot_as_sole_data_builder(monkeypatch):
     assert result["callback_delivery"]["status"] == "running"
     assert result["callback_delivery"]["dispatcher_running"] is True
     assert result["server_tool"] == "aiworkhub_dashboard_snapshot"
+    assert result["snapshot_mode"] == "full"
     assert result["authority_flags"]["readonly"] is True
     assert result["authority_flags"]["queue_write"] is False
     assert "transport_truncated_fields" not in result
@@ -137,12 +138,26 @@ def test_snapshot_identity_does_not_hide_stopped_callback_dispatcher(monkeypatch
     assert result["callback_delivery"]["problems"] == ["dispatcher_unregistered"]
 
 
+def test_snapshot_default_is_bounded_manager_summary(monkeypatch):
+    monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(FAKE_SNAPSHOT))
+
+    result = dashboard_mcp_app.snapshot_view()
+
+    assert result["snapshot_mode"] == "summary"
+    assert result["full_snapshot_available"] is True
+    assert result["status_counts"] == FAKE_SNAPSHOT["status_counts"]
+    assert result["row_counts"] == FAKE_SNAPSHOT["row_counts"]
+    assert "tasks" not in result
+    assert "agent_processes" not in result
+    assert "tasks" in result["omitted_fields"]
+
+
 def test_snapshot_view_bounds_oversized_secondary_sections(monkeypatch):
     oversized = dict(FAKE_SNAPSHOT)
     oversized["agent_processes"] = {"processes": ["x" * 1024 for _ in range(6000)]}
     monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(oversized))
 
-    result = dashboard_mcp_app.snapshot_view()
+    result = dashboard_mcp_app.snapshot_view(full=True)
 
     assert result["agent_processes"] == {"transport_truncated": True}
     assert "agent_processes" in result["transport_truncated_fields"]
@@ -158,7 +173,7 @@ def test_snapshot_view_never_exceeds_response_bound_even_when_everything_is_huge
         huge[field] = {"blob": "y" * (1024 * 1024)}
     monkeypatch.setattr(dashboard, "build_snapshot", lambda: dict(huge))
 
-    result = dashboard_mcp_app.snapshot_view()
+    result = dashboard_mcp_app.snapshot_view(full=True)
 
     assert dashboard_mcp_app._byte_len(result) <= dashboard_mcp_app.MAX_SNAPSHOT_RESPONSE_BYTES
     truncated = result["transport_truncated_fields"]

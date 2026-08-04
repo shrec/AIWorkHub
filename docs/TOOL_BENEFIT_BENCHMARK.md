@@ -115,3 +115,8 @@ observations. After execution, publish the raw run ledger, paired identities,
 known/unknown denominators and uncertainty intervals. A statement such as
 "10x" or "71x" is allowed only if the matched estimator directly supports it;
 otherwise say that no causal multiplier has been established.
+
+The current checked-in preliminary result and its explicit non-claim status are
+documented in [AIWorkHub Benchmarks](BENCHMARKS.md). The raw pilot ledger is
+machine checked in CI; it does not yet satisfy this protocol's public claim
+gate.

@@ -346,6 +346,28 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert bundled["insights"]["ranked_symbols"]
 
 
+def test_import_evidence_disambiguates_duplicate_cross_file_names(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "native" / "math_fast.cpp", "int helper(int x) { return x + 1; }\n")
+    _write(repo / "legacy" / "math_slow.cpp", "int helper(int x) { return x - 1; }\n")
+    _write(
+        repo / "native" / "engine.cpp",
+        '#include "math_fast.hpp"\nint run_engine(int x) { return helper(x); }\n',
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        edge = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='native/engine.cpp' "
+            "AND kind='calls' AND dst_name='helper'"
+        ).fetchone()
+        assert edge is not None
+        assert edge["dst_qualname"].endswith("native/math_fast.cpp::helper")
+    finally:
+        conn.close()
+
+
 def test_multi_term_find_and_indexed_body_modes_are_non_empty(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(
@@ -418,7 +440,10 @@ def test_js_ts_family_gets_semantic_lexical_evidence(tmp_path, suffix, expected_
     assert function.name == "widget"
     assert function.evidence_label == sgast.EXTRACTED
     assert function.file_path == f"pkg/widget{suffix}"
-    assert function.extractor == sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID
+    assert function.extractor in {
+        sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID,
+        sgast.TREE_SITTER_JS_TS_EXTRACTOR_ID,
+    }
     assert any(edge.kind == "defines" and edge.dst_name == "widget" for edge in extraction.edges)
 
 
@@ -838,7 +863,10 @@ def test_polyglot_semantic_adapters_extract_types_functions_imports_and_calls(
         for edge in extraction.edges
     )
     assert all(
-        entity.extractor == sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID
+        entity.extractor in {
+            sgast.POLYGLOT_LEXICAL_EXTRACTOR_ID,
+            sgast.TREE_SITTER_JS_TS_EXTRACTOR_ID,
+        }
         for entity in extraction.entities
     )
 

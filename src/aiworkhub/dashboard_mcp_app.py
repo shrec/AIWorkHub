@@ -64,6 +64,25 @@ _SNAPSHOT_TRIM_ORDER: tuple[str, ...] = (
     "warnings",
 )
 
+_COMPACT_SNAPSHOT_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "generated_at",
+    "readonly",
+    "storage",
+    "storage_usage",
+    "health",
+    "status_counts",
+    "row_counts",
+    "warnings",
+    "errors",
+    "manager_identity",
+    "callback_delivery",
+    "manager_identity_target",
+    "known_repositories",
+    "server_tool",
+    "authority_flags",
+)
+
 # Detail fields trimmed, largest first, only if the single-task payload is
 # still over budget (a huge validation_output/result blob on one card).
 _DETAIL_TRIM_FIELDS: tuple[str, ...] = (
@@ -287,6 +306,29 @@ def _bound_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _compact_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bounded manager-facing operational snapshot.
+
+    The native Webview explicitly requests the full shape. Model callers get
+    queue counts, health, warnings and route truth by default without pulling
+    repeated task rows, process evidence, cost ledgers, workforce history or
+    analytics into their context. Dedicated bounded tools own those details.
+    """
+
+    result = {
+        key: snapshot[key]
+        for key in _COMPACT_SNAPSHOT_FIELDS
+        if key in snapshot
+    }
+    omitted = sorted(key for key in snapshot if key not in result)
+    result.update({
+        "snapshot_mode": "summary",
+        "full_snapshot_available": True,
+        "omitted_fields": omitted,
+    })
+    return result
+
+
 def _bound_task_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
     """Trim the largest task fields until one task's detail fits the bound."""
     result = dict(detail)
@@ -306,16 +348,16 @@ def _bound_task_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def snapshot_view() -> dict[str, Any]:
+def snapshot_view(full: bool = False) -> dict[str, Any]:
     """READ-ONLY: canonical dashboard snapshot for the native Webview.
 
     Calls ``dashboard.build_snapshot()`` -- the SAME builder the HTTP
     dashboard's ``/api/snapshot`` route uses -- and returns the identical
     ``status_counts``, ``tasks``, ``row_counts``, ``summaries``,
     ``cost_usage``, ``agent_processes``, and ``warnings`` shape the existing
-    dashboard.js already renders. Adds no second SQLite/taskctl read; only
-    applies the defensive transport bound documented on
-    ``MAX_SNAPSHOT_RESPONSE_BYTES``.
+    dashboard.js already renders when ``full=true``. The default manager call
+    is a bounded operational summary; the native Webview requests full mode
+    explicitly. Adds no second SQLite/taskctl read.
     """
     started = time.perf_counter()
     _debug_trace("snapshot.begin")
@@ -383,7 +425,14 @@ def snapshot_view() -> dict[str, Any]:
         snapshot["manager_identity_target"] = {}
     snapshot["server_tool"] = "aiworkhub_dashboard_snapshot"
     snapshot["authority_flags"] = _readonly_authority_flags()
-    result = _debug_stage("bound_snapshot", lambda: _bound_snapshot(snapshot))
+    if full:
+        snapshot["snapshot_mode"] = "full"
+        result = _debug_stage("bound_snapshot", lambda: _bound_snapshot(snapshot))
+    else:
+        result = _debug_stage(
+            "compact_snapshot",
+            lambda: _bound_snapshot(_compact_snapshot(snapshot)),
+        )
     _debug_trace(
         "snapshot.end",
         duration_ms=round((time.perf_counter() - started) * 1000, 3),

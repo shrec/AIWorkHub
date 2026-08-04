@@ -70,6 +70,62 @@ def _latest_task_runs(process_report: Mapping[str, Any]) -> list[Mapping[str, An
     return [*latest.values(), *anonymous]
 
 
+def _semantic_edit_telemetry(runs: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate path-free semantic-edit receipts without inferring tokens."""
+
+    fields = (
+        "file_count",
+        "range_count",
+        "file_bytes",
+        "old_region_bytes",
+        "replacement_bytes",
+        "model_reemitted_old_bytes",
+    )
+    totals: dict[str, Any] = {
+        "schema_id": "aiworkhub.semantic_edit.telemetry.v1",
+        "bounded_runs": len(runs),
+        "evidence_observed_runs": 0,
+        "evidence_unobserved_runs": 0,
+        **{field: 0 for field in fields},
+        "replacement_to_file_byte_rate": None,
+        "structural_bytes_not_reemitted": 0,
+        "structural_byte_ratio": None,
+        "measurement_label": (
+            "authenticated_semantic_edit_byte_receipts_not_token_or_cost_savings"
+        ),
+        "token_savings_available": False,
+        "cost_savings_available": False,
+    }
+    for row in runs:
+        infra = row.get("ai_infra_context")
+        evidence = infra.get("semantic_edit") if isinstance(infra, Mapping) else None
+        if not isinstance(evidence, Mapping) or not evidence.get("observed"):
+            totals["evidence_unobserved_runs"] += 1
+            continue
+        if str(evidence.get("schema_id") or "") != (
+            "aiworkhub.semantic_edit_runtime_evidence.v1"
+        ):
+            totals["evidence_unobserved_runs"] += 1
+            continue
+        totals["evidence_observed_runs"] += 1
+        for field in fields:
+            totals[field] += _count(evidence.get(field))
+
+    file_bytes = totals["file_bytes"]
+    replacement_bytes = totals["replacement_bytes"]
+    if file_bytes > 0:
+        totals["replacement_to_file_byte_rate"] = round(
+            100.0 * replacement_bytes / file_bytes,
+            2,
+        )
+        totals["structural_bytes_not_reemitted"] = max(
+            0, file_bytes - replacement_bytes
+        )
+    if replacement_bytes > 0:
+        totals["structural_byte_ratio"] = round(file_bytes / replacement_bytes, 2)
+    return totals
+
+
 def build_kpi_snapshot(
     *,
     process_report: Mapping[str, Any],
@@ -133,9 +189,21 @@ def build_kpi_snapshot(
     )
     economics = {
         "measured_tasks": 0,
+        "pre_optimization_section_bytes": 0,
         "raw_context_bytes": 0,
         "delivered_bundle_bytes": 0,
         "estimated_context_bytes_avoided": 0,
+        "estimated_context_bytes_added": 0,
+        "gross_context_bytes_avoided": 0,
+        "gross_context_bytes_added": 0,
+        "compressed_tasks": 0,
+        "expanded_tasks": 0,
+        "unchanged_tasks": 0,
+        "optimization_measured_tasks": 0,
+        "optimized_section_bytes": 0,
+        "optimization_bytes_removed": 0,
+        "envelope_measured_tasks": 0,
+        "envelope_bytes_added": 0,
         "prompt_measured_tasks": 0,
         "initial_prompt_tasks": 0,
         "rework_prompt_tasks": 0,
@@ -213,15 +281,44 @@ def build_kpi_snapshot(
 
         estimate = infra.get("estimate") if isinstance(infra, Mapping) else None
         if isinstance(estimate, Mapping):
-            raw_bytes = _count(estimate.get("raw_context_bytes"))
+            pre_optimization_bytes = _count(
+                estimate.get("pre_optimization_section_bytes")
+            ) or _count(estimate.get("raw_context_bytes"))
             bundle_bytes = _count(estimate.get("bundle_bytes"))
-            if raw_bytes > 0:
+            if pre_optimization_bytes > 0:
                 economics["measured_tasks"] += 1
-                economics["raw_context_bytes"] += raw_bytes
-                economics["delivered_bundle_bytes"] += bundle_bytes
-                economics["estimated_context_bytes_avoided"] += max(
-                    0, raw_bytes - bundle_bytes
+                economics["pre_optimization_section_bytes"] += (
+                    pre_optimization_bytes
                 )
+                economics["raw_context_bytes"] += pre_optimization_bytes
+                economics["delivered_bundle_bytes"] += bundle_bytes
+                task_delta = pre_optimization_bytes - bundle_bytes
+                if task_delta > 0:
+                    economics["compressed_tasks"] += 1
+                    economics["gross_context_bytes_avoided"] += task_delta
+                elif task_delta < 0:
+                    economics["expanded_tasks"] += 1
+                    economics["gross_context_bytes_added"] += -task_delta
+                else:
+                    economics["unchanged_tasks"] += 1
+                optimized_observed = estimate.get(
+                    "optimized_section_bytes_observed"
+                )
+                if optimized_observed is None:
+                    optimized_observed = "optimized_section_bytes" in estimate
+                if optimized_observed:
+                    optimized_bytes = _count(
+                        estimate.get("optimized_section_bytes")
+                    )
+                    economics["optimization_measured_tasks"] += 1
+                    economics["optimized_section_bytes"] += optimized_bytes
+                    economics["optimization_bytes_removed"] += (
+                        pre_optimization_bytes - optimized_bytes
+                    )
+                    economics["envelope_measured_tasks"] += 1
+                    economics["envelope_bytes_added"] += (
+                        bundle_bytes - optimized_bytes
+                    )
         prompt_budget = infra.get("prompt_budget") if isinstance(infra, Mapping) else None
         if isinstance(prompt_budget, Mapping):
             prompt_bytes = _count(prompt_budget.get("total_bytes"))
@@ -268,11 +365,9 @@ def build_kpi_snapshot(
                             "sections": sections,
                             "bundle_bytes": bundle_bytes or None,
                         },
-                        naive_discover_bytes=(
-                            _count(estimate.get("raw_context_bytes")) or None
-                            if isinstance(estimate, Mapping)
-                            else None
-                        ),
+                        # Process events currently contain pre-optimization
+                        # tool-section bytes, not a raw-file counterfactual.
+                        naive_discover_bytes=None,
                         usage=dict(usage) if isinstance(usage, Mapping) else None,
                         adapter_id=adapter,
                         outcome=state,
@@ -404,17 +499,73 @@ def build_kpi_snapshot(
     ordered_days = sorted(daily)[-MAX_DAILY_BUCKETS:]
     daily_rows = [{"date": day, **daily[day]} for day in ordered_days]
 
-    raw_context_bytes = economics["raw_context_bytes"]
-    context_compression_rate = (
-        round(
-            100.0 * economics["estimated_context_bytes_avoided"] / raw_context_bytes,
+    raw_context_bytes = economics["pre_optimization_section_bytes"]
+    delivered_bundle_bytes = economics["delivered_bundle_bytes"]
+    net_context_bytes_delta = raw_context_bytes - delivered_bundle_bytes
+    economics["net_context_bytes_delta"] = net_context_bytes_delta
+    economics["estimated_context_bytes_avoided"] = max(0, net_context_bytes_delta)
+    economics["estimated_context_bytes_added"] = max(0, -net_context_bytes_delta)
+    if raw_context_bytes <= 0:
+        context_delivery_direction = "unmeasured"
+        context_delta_rate = None
+        context_compression_rate = None
+        context_expansion_rate = None
+    elif net_context_bytes_delta > 0:
+        context_delivery_direction = "compressed"
+        context_delta_rate = round(100.0 * net_context_bytes_delta / raw_context_bytes, 1)
+        context_compression_rate = context_delta_rate
+        context_expansion_rate = None
+    elif net_context_bytes_delta < 0:
+        context_delivery_direction = "expanded"
+        context_delta_rate = round(100.0 * net_context_bytes_delta / raw_context_bytes, 1)
+        context_compression_rate = None
+        context_expansion_rate = round(
+            100.0 * -net_context_bytes_delta / raw_context_bytes,
             1,
         )
-        if raw_context_bytes > 0 else None
+    else:
+        context_delivery_direction = "unchanged"
+        context_delta_rate = 0.0
+        context_compression_rate = 0.0
+        context_expansion_rate = 0.0
+    optimization_reduction_rate = (
+        round(
+            100.0
+            * economics["optimization_bytes_removed"]
+            / raw_context_bytes,
+            1,
+        )
+        if economics["optimization_measured_tasks"] and raw_context_bytes > 0
+        else None
+    )
+    optimized_section_bytes = economics["optimized_section_bytes"]
+    envelope_overhead_rate = (
+        round(
+            100.0
+            * economics["envelope_bytes_added"]
+            / optimized_section_bytes,
+            1,
+        )
+        if economics["envelope_measured_tasks"] and optimized_section_bytes > 0
+        else None
     )
     economics.update({
+        "context_delivery_direction": context_delivery_direction,
+        "context_delta_rate": context_delta_rate,
         "context_compression_rate": context_compression_rate,
-        "measurement_label": "declared_raw_context_paths_vs_delivered_project_context_bundle_bytes",
+        "context_expansion_rate": context_expansion_rate,
+        "optimization_reduction_rate": optimization_reduction_rate,
+        "envelope_overhead_rate": envelope_overhead_rate,
+        "measurement_label": (
+            "pre_optimization_tool_section_bytes_vs_delivered_bundle_bytes"
+        ),
+        "population_definition": (
+            "tool_section_payload_before_optional_suppression_not_raw_"
+            "repository_files_or_counterfactual_reads"
+        ),
+        "raw_file_counterfactual_available": False,
+        "source_selection_savings_available": False,
+        "source_selection_savings_reason": "no_raw_file_counterfactual_baseline",
         "token_savings_available": False,
         "token_savings_reason": "no_tokenizer_bound_counterfactual_baseline",
         "average_prompt_bytes": (
@@ -434,9 +585,10 @@ def build_kpi_snapshot(
     provider_economics = context_economics.dashboard_record(context_measurements)
     provider_summary = provider_economics["summary"]
     economics["provider_measurement"] = provider_economics
+    semantic_edit = _semantic_edit_telemetry(runs)
 
     return {
-        "schema_id": "aiworkhub.kpi.dashboard.v3",
+        "schema_id": "aiworkhub.kpi.dashboard.v4",
         "measurement": "bounded_worker_outcomes_and_explicit_manager_decisions",
         "window": {
             "label": f"latest {process_limit} process runs",
@@ -482,8 +634,16 @@ def build_kpi_snapshot(
             "source_graph_edge_rows": _count(evidence_rows.get("edge_rows")),
             "source_graph_file_rows": _count(evidence_rows.get("file_rows")),
             "source_graph_index_revisions": len(revision_rows),
+            "context_delivery_direction": context_delivery_direction,
+            "context_delta_rate": context_delta_rate,
             "context_compression_rate": context_compression_rate,
+            "context_expansion_rate": context_expansion_rate,
             "estimated_context_bytes_avoided": economics["estimated_context_bytes_avoided"],
+            "estimated_context_bytes_added": economics["estimated_context_bytes_added"],
+            "optimization_reduction_rate": optimization_reduction_rate,
+            "optimization_bytes_removed": economics["optimization_bytes_removed"],
+            "envelope_overhead_rate": envelope_overhead_rate,
+            "envelope_bytes_added": economics["envelope_bytes_added"],
             "average_prompt_bytes": economics["average_prompt_bytes"],
             "prompt_budget_utilization_rate": economics["prompt_budget_utilization_rate"],
             "provider_measured_tasks": provider_summary["total_tasks"],
@@ -504,6 +664,13 @@ def build_kpi_snapshot(
             "cost_complete": bool(cost_totals.get("cost_complete")),
             "cost_unknown_records": _count(cost_totals.get("cost_unknown_records")),
             "tokens_with_unknown_cost": _count(cost_totals.get("tokens_with_unknown_cost")),
+            "semantic_edit_observed_runs": semantic_edit["evidence_observed_runs"],
+            "semantic_edit_replacement_to_file_byte_rate": semantic_edit[
+                "replacement_to_file_byte_rate"
+            ],
+            "semantic_edit_structural_byte_ratio": semantic_edit[
+                "structural_byte_ratio"
+            ],
         },
         "outcome_mix": [
             {"state": state, "count": count}
@@ -519,6 +686,7 @@ def build_kpi_snapshot(
         "source_graph_index_revisions": revision_rows,
         "tool_use_cohorts": cohort_rows,
         "economics": economics,
+        "semantic_edit": semantic_edit,
         "context": context_rows,
         "data_quality": {
             "acceptance_rate_available": manager_decisions > 0,

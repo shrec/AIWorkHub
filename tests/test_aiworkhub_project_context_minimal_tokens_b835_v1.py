@@ -362,8 +362,18 @@ def test_representative_fixture_meets_bootstrap_byte_gate(tmp_path: Path) -> Non
     assert result.metadata["bundle_bytes"] == after_bytes
     assert result.metadata["bundle_bytes"] <= project_context.MAX_BUNDLE_BYTES
     assert result.metadata["estimated_raw_context_vs_bundle_bytes"]["label"] == (
-        "deterministic_byte_estimate_not_token_or_cost_truth"
+        "pre_optimization_tool_sections_vs_optimized_sections_and_"
+        "bundle_bytes_not_token_or_cost_truth"
     )
+    estimate = result.metadata["estimated_raw_context_vs_bundle_bytes"]
+    assert estimate["pre_optimization_section_bytes"] == (
+        result.metadata["estimated_raw_context_bytes"]
+    )
+    assert estimate["optimized_section_bytes"] == (
+        result.metadata["optimized_context_bytes"]
+    )
+    assert estimate["raw_file_counterfactual_available"] is False
+    assert estimate["token_savings_available"] is False
     assert result.metadata["optimization"]["byte_labels_are_token_truth"] is False
 
 

@@ -933,6 +933,7 @@ def provision_worker_mcp_runtime(
     backend: str,
     source_graph_targets: list[str] | tuple[str, ...],
     session_topic: str,
+    allowed_writes: list[str] | tuple[str, ...] = (),
     quality_review_packet_path: Path | None = None,
 ) -> Any:
     """B834: provision this request's isolated worker MCP config + audit ledger.
@@ -1015,6 +1016,7 @@ def provision_worker_mcp_runtime(
             repo=worker_repo,
             authority_repo=authority_repo,
             source_graph_targets=source_graph_targets,
+            allowed_writes=allowed_writes,
             session_topic=session_topic,
             package_import_root=package_import_root,
             quality_review_packet_path=worker_review_packet_path,

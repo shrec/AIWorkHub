@@ -89,6 +89,10 @@ def test_ready_vscode_lm_route_does_not_require_subprocess_sandbox(monkeypatch, 
     assert "selected_adapter_not_launchable" not in report["errors"]
     assert by_adapter[runtime_adapters.VSCODE_LM_ADAPTER]["launchable"] is True
     assert by_adapter[runtime_adapters.VSCODE_LM_ADAPTER]["sandbox_backend"] == "vscode_lm_in_process"
+    assert report["sandbox"]["enforceable"] is True
+    assert report["sandbox"]["backend"] == "vscode_lm_in_process"
+    assert report["sandbox"]["native_cli_enforceable"] is False
+    assert report["provider_summary"]["launchable_route_count"] >= 1
 
 
 def test_visible_vscode_lm_route_reports_consent_required_without_global_blocker(monkeypatch, tmp_path):

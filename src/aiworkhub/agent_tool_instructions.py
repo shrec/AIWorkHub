@@ -63,6 +63,7 @@ POLICY = ToolPolicy(
         "Set workflow_stage on every Source Graph call: orientation, implementation, validation, review or rework; never relabel old calls after the fact.",
         "Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.",
         "Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.",
+        "After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.",
         "Final receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.",
     ),
     validation=(
@@ -100,6 +101,8 @@ POLICY = ToolPolicy(
 # hand-duplicating the list.
 WORKER_MCP_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_worker_source_graph_query",
+    "aiworkhub_worker_semantic_edit_prepare",
+    "aiworkhub_worker_semantic_edit_apply",
     "aiworkhub_worker_session_current_state",
     "aiworkhub_worker_ai_memory_search",
     "aiworkhub_worker_ai_memory_get",
