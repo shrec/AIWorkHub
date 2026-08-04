@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.58] - 2026-08-04
+
+### Fixed
+
+- Rejected descriptive prose and out-of-scope patterns in `required_outputs`
+  before launching a provider, with explicit guidance to place human-readable
+  outcome requirements in `acceptance`.
+- Retried completed-worker reconciliation across transient filesystem or
+  SQLite races and converted exhausted finalizer failures into a durable,
+  callback-emitting `finalize_failed` state instead of leaving tasks stranded
+  in `processing`.
+- Made `finalize_failed` a retryable operational terminal outcome while
+  retaining the isolated workspace for diagnosis.
+
 ## [0.8.57] - 2026-08-04
 
 ### Fixed
