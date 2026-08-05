@@ -327,6 +327,10 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert focus["matches"] and focus["candidate_files"][0] == "native/engine.cpp"
     assert focus["ranked_symbols"]
     assert focus["ranked_symbols"][0]["metrics_evidence"] == "deterministic_lexical_and_graph"
+    assert all(
+        set(row) == {"qualname", "file_path", "priority_score"}
+        for row in focus["hot_symbols"]
+    )
     assert sliced["outgoing_calls"]
     assert any(row["file_path"] == "tests/test_engine.cpp" for row in sliced["related_tests"])
     assert contextual["contexts"][0]["entities"]
@@ -345,6 +349,50 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert impacted["impact_evidence"].startswith("bidirectional_resolved_calls")
     assert bundled["sections"] and bundled["outgoing_calls"]
     assert bundled["insights"]["ranked_symbols"]
+
+
+def test_every_focus_emitted_next_step_resolves_without_replacing_task_query(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def emitted_target(value):\n    return value + 1\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    focused = sg.focus(repo, "emitted_target", 16)
+    task_query = "investigate the service execution boundary"
+    assert focused["recommended_next_steps"]
+    for step in focused["recommended_next_steps"]:
+        mode, target = step.split(":", 1)
+        if mode == "slice":
+            payload = sg.slice_(repo, task_query, 16, target=target)
+            assert payload["query"] == task_query
+            assert payload["target"] == target
+            assert payload["query_tokens_source"] == "target"
+            assert any(row["qualname"] == target for row in payload["matches"])
+        elif mode == "context":
+            payload = sg.context_query(repo, target, 16)
+            assert payload["contexts"]
+            assert payload["contexts"][0]["file_path"] == target
+        else:  # pragma: no cover - emitted modes must be added explicitly
+            pytest.fail(f"unhandled recommended step: {step}")
+
+
+def test_payload_trimming_preserves_query_receipt_metadata(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    body = "\n".join(
+        f"def metadata_probe_{index}():\n    return '{'x' * 400}'\n"
+        for index in range(24)
+    )
+    _write(repo / "pkg" / "metadata.py", body)
+    sg.build_index(repo, incremental=False)
+
+    payload = sg.focus(repo, "metadata_probe", budget=2)
+
+    assert payload["query"] == "metadata_probe"
+    assert payload["query_tokens"] == ["metadata", "probe"]
+    assert payload["candidate_files"] == ["pkg/metadata.py"]
+    assert len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= 1024
 
 
 def test_import_evidence_disambiguates_duplicate_cross_file_names(tmp_path):
@@ -555,6 +603,22 @@ def test_runtime_logs_are_default_excluded_without_repo_config(tmp_path):
     rels = {p.relative_to(repo).as_posix() for p in sg.iter_source_files(repo)}
     assert "src/live.py" in rels
     assert not any(rel.startswith("logs/") for rel in rels)
+
+
+def test_new_repo_policy_excludes_eval_artifacts_without_disabling_json(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    sg.ensure_ignore_config(repo)
+    _write(repo / "eval" / "generated.json", '{"measurement": 1}\n')
+    _write(repo / "eval" / "nested" / "rows.jsonl", '{"row": 1}\n')
+    _write(repo / "config" / "runtime.json", '{"enabled": true}\n')
+
+    rels = {path.relative_to(repo).as_posix() for path in sg.iter_source_files(repo)}
+
+    assert "eval/generated.json" not in rels
+    assert "eval/nested/rows.jsonl" not in rels
+    assert "config/runtime.json" in rels
+    policy = sg.source_graph_policy_view(repo)
+    assert policy["exclude_globs"] == list(sg.DEFAULT_CONFIG_EXCLUDE_GLOBS)
 
 
 def test_repo_ignore_policy_extends_defaults_with_dirs_and_globs(tmp_path):
@@ -976,18 +1040,30 @@ def test_no_llm_network_or_second_graph_product_import(tmp_path):
 # Incremental indexing: stale-edge invalidation on change / rename / delete
 # ---------------------------------------------------------------------------
 
-def test_incremental_build_skips_unchanged_reindexes_changed(tmp_path):
+def test_incremental_build_skips_unchanged_without_reparsing(tmp_path, monkeypatch):
     repo = _new_repo(tmp_path, "repo")
     _write(repo / "pkg" / "a.py", "def a():\n    return 1\n")
+    original_extract = sgast.extract_file
+    extracted: list[str] = []
+
+    def counted_extract(repo_root, path, *, build_revision):
+        extracted.append(path.relative_to(repo_root).as_posix())
+        return original_extract(repo_root, path, build_revision=build_revision)
+
+    monkeypatch.setattr(sgast, "extract_file", counted_extract)
     r1 = sg.build_index(repo, incremental=True)
     assert r1.files_changed == 1 and r1.files_unchanged == 0
+    assert extracted == ["pkg/a.py"]
 
+    extracted.clear()
     r2 = sg.build_index(repo, incremental=True)
     assert r2.files_changed == 0 and r2.files_unchanged == 1
+    assert extracted == []
 
     _write(repo / "pkg" / "a.py", "def a():\n    return 2\n\ndef b():\n    return 3\n")
     r3 = sg.build_index(repo, incremental=True)
     assert r3.files_changed == 1 and r3.files_unchanged == 0
+    assert extracted == ["pkg/a.py"]
 
 
 def test_rename_regression_no_stale_edge_survives(tmp_path):

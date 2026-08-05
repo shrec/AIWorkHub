@@ -188,7 +188,13 @@ def _stub_source_graph_engine(
         return {"target": query, "relevant_files": list(relevant_files)}
 
     monkeypatch.setattr(source_graph_mod, "focus", lambda repo_root, query, budget=64: _payload("focus", query, budget))
-    monkeypatch.setattr(source_graph_mod, "slice_", lambda repo_root, query, budget=64: _payload("slice", query, budget))
+    monkeypatch.setattr(
+        source_graph_mod,
+        "slice_",
+        lambda repo_root, query, budget=64, target=None: _payload(
+            "slice", target or query, budget
+        ),
+    )
     monkeypatch.setattr(
         source_graph_mod, "bundle",
         lambda repo_root, bundle_type, query, max_lines=64: _payload("bundle", query, max_lines),
@@ -323,7 +329,12 @@ def test_source_graph_query_rejects_invalid_mode_and_bundle_type(monkeypatch: py
 def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _mute_chmod(monkeypatch)
     repo = _fake_repo(tmp_path)
-    _stub_source_graph_engine(monkeypatch)
+    _stub_source_graph_engine(
+        monkeypatch,
+        relevant_files=tuple(
+            f"src/large_module_{index:03d}.py" for index in range(80)
+        ),
+    )
     ctx = _ctx(repo, home=tmp_path / "home", targets=("AITools/source_graph.py",))
 
     first = w.source_graph_query(
@@ -341,7 +352,13 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
         ctx, mode="focus", query="ignored", budget=32, workflow_stage="validation"
     )
     assert second["cache_hit"] is True
-    assert second["content"] == first["content"]
+    assert second["cache_receipt"] is True
+    assert second["content_sha256"] == first["content_sha256"]
+    assert second["content"] != first["content"]
+    receipt = json.loads(second["content"])
+    assert receipt["reuse_previous_result"] is True
+    assert receipt["content_sha256"] == first["content_sha256"]
+    assert second["bytes"] < first["bytes"]
 
     verification = w.verify_audit_ledger(
         ctx.audit_ledger_path, ctx.audit_hmac_key_path,

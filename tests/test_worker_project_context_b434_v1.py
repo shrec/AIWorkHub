@@ -192,6 +192,46 @@ def test_project_context_collects_source_modes_bounded_session_and_optional_kb(
     assert '"mode":"explore"' in seen["bundle"]
 
 
+def test_project_context_preserves_declared_mode_query_and_slice_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    analytics_calls: list[tuple[str, str, int]] = []
+    slice_calls: list[tuple[str, int, str | None]] = []
+
+    from aiworkhub import source_graph
+
+    monkeypatch.setattr(
+        source_graph,
+        "analytics_query",
+        lambda _repo, mode, query, budget: (
+            analytics_calls.append((mode, query, budget))
+            or {"mode": mode, "query": query}
+        ),
+    )
+    monkeypatch.setattr(
+        source_graph,
+        "slice_",
+        lambda _repo, query, budget, target=None: (
+            slice_calls.append((query, budget, target))
+            or {"mode": "slice", "query": query, "target": target}
+        ),
+    )
+
+    analytics_card = _project_context_card("complexity")
+    analytics_card["project_context"]["source_graph"]["targets"] = ["pkg/wrong.py"]
+    analytics_contract = project_context._validate_contract(analytics_card)
+    analytics_raw, _ = project_context._source_graph_direct(Path("/repo"), analytics_contract)
+    assert json.loads(analytics_raw)["mode"] == "complexity"
+    assert analytics_calls == [("complexity", "ProcessManager", 32)]
+
+    slice_card = _project_context_card("slice")
+    slice_card["project_context"]["source_graph"]["targets"] = ["pkg.Service.run"]
+    slice_contract = project_context._validate_contract(slice_card)
+    slice_raw, _ = project_context._source_graph_direct(Path("/repo"), slice_contract)
+    assert json.loads(slice_raw)["query"] == "ProcessManager"
+    assert slice_calls == [("ProcessManager", 32, "pkg.Service.run")]
+
+
 def test_project_context_validates_types_and_rejects_shellish_or_overbudget_values(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

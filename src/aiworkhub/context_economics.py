@@ -416,9 +416,17 @@ def context_optimization_report(
         "cache_creation_input_tokens": _sum_usage(telemetry_rows, "cache_creation_input_tokens"),
     } if telemetry_rows else None
 
+    if not records:
+        measurement_status = "inconclusive_no_records"
+    elif not comparable:
+        measurement_status = "inconclusive_no_comparable_records"
+    else:
+        measurement_status = "measured"
+
     return {
         "schema_id": SCHEMA_ID,
         "record_type": "context_optimization_report",
+        "measurement_status": measurement_status,
         "record_count": len(records),
         "comparable_record_count": len(comparable),
         "before_bundle_bytes": before_bytes if comparable else None,

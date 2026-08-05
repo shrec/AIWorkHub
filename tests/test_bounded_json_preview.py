@@ -67,6 +67,37 @@ def test_truncated_json_preview_preserves_semantic_priority_keys(renderer) -> No
         ),
     ],
 )
+def test_nested_symbol_preview_prioritizes_semantic_identity(renderer) -> None:
+    symbol = {f"aaa_noise_{index}": "x" * 200 for index in range(14)}
+    symbol.update({
+        "name": "critical_symbol",
+        "qualname": "pkg.module.critical_symbol",
+        "file_path": "pkg/module.py",
+        "priority_score": 99,
+    })
+    payload = {"mode": "focus", "query": "critical", "ranked_symbols": [symbol]}
+
+    bounded, truncated = renderer(json.dumps(payload), 1800)
+
+    assert truncated is True
+    preview = json.loads(bounded)["preview"]["ranked_symbols"][0]
+    assert preview["name"] == "critical_symbol"
+    assert preview["qualname"] == "pkg.module.critical_symbol"
+    assert preview["file_path"] == "pkg/module.py"
+    assert preview["priority_score"] == 99
+
+
+@pytest.mark.parametrize(
+    "renderer",
+    [
+        lambda text, cap: project_context._canonical_json_output(
+            "source_graph", text, max_bytes=cap
+        ),
+        lambda text, cap: worker_ai_tools_mcp._canonical_json_output(
+            "source_graph", text, max_bytes=cap
+        ),
+    ],
+)
 def test_small_json_remains_complete(renderer) -> None:
     bounded, truncated = renderer('{"b":2,"a":1}', 1800)
 

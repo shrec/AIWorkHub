@@ -373,7 +373,17 @@ def focus_insights(
     ]
     return {
         "ranked_symbols": ranked,
-        "hot_symbols": [row for row in ranked if int(row["priority_score"]) >= 8][:8],
+        # ``ranked_symbols`` already owns the full symbol rows.  Keep the hot
+        # projection as stable references plus the one differentiating score
+        # instead of repeating signatures, ranges and evidence byte-for-byte.
+        "hot_symbols": [
+            {
+                "qualname": row["qualname"],
+                "file_path": row["file_path"],
+                "priority_score": row["priority_score"],
+            }
+            for row in ranked if int(row["priority_score"]) >= 8
+        ][:8],
         "risks": risks[:8],
         "related_tests": tests,
         "git_signals": git,

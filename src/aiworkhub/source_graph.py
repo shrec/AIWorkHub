@@ -97,6 +97,17 @@ DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".claude", ".hg", ".svn", ".cache",
 })
 
+# New repository policy files start with only high-confidence generated
+# measurement artifacts excluded.  JSON/XML remain enabled languages and
+# ordinary configuration/data files remain indexable; owners can remove any
+# of these editable globs from ``.aiworkhub/config/source_graph.json``.
+DEFAULT_CONFIG_EXCLUDE_GLOBS: tuple[str, ...] = (
+    "eval/*.json",
+    "eval/**/*.json",
+    "eval/*.jsonl",
+    "eval/**/*.jsonl",
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -108,6 +119,8 @@ CREATE TABLE IF NOT EXISTS files (
     language TEXT NOT NULL,
     status TEXT NOT NULL,
     source_hash TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT -1,
+    mtime_ns INTEGER NOT NULL DEFAULT -1,
     indexed_at TEXT NOT NULL,
     build_revision TEXT NOT NULL
 );
@@ -227,6 +240,17 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
             )
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
+        file_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(files)")
+        }
+        if "file_size" not in file_columns:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN file_size INTEGER NOT NULL DEFAULT -1"
+            )
+        if "mtime_ns" not in file_columns:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT -1"
+            )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     return conn
@@ -341,7 +365,7 @@ def ensure_ignore_config(repo_root: Path) -> Path:
         "schema_id": POLICY_SCHEMA_ID,
         "revision": 1,
         "exclude_dirs": [],
-        "exclude_globs": [],
+        "exclude_globs": list(DEFAULT_CONFIG_EXCLUDE_GLOBS),
         "disabled_languages": [],
     }
     try:
@@ -596,6 +620,9 @@ def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
 def _write_extraction(
     conn: sqlite3.Connection,
     extraction: sgast.FileExtraction,
+    *,
+    file_size: int = -1,
+    mtime_ns: int = -1,
 ) -> tuple[int, int]:
     """Persist one extraction and return the rows actually inserted.
 
@@ -605,10 +632,10 @@ def _write_extraction(
     population.
     """
     conn.execute(
-        "INSERT INTO files(file_path, language, status, source_hash, indexed_at, build_revision) "
-        "VALUES (?,?,?,?,?,?)",
+        "INSERT INTO files(file_path, language, status, source_hash, file_size, mtime_ns, "
+        "indexed_at, build_revision) VALUES (?,?,?,?,?,?,?,?)",
         (extraction.file_path, extraction.language, extraction.status,
-         extraction.source_hash, _now_iso(), BUILD_REVISION),
+         extraction.source_hash, file_size, mtime_ns, _now_iso(), BUILD_REVISION),
     )
     for entity in extraction.entities:
         cur = conn.execute(
@@ -788,8 +815,13 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         # rollback journal alive for that whole interval unnecessarily widens
         # the writer lock and makes concurrent worker context queries fragile.
         existing = {
-            row["file_path"]: (row["source_hash"], row["build_revision"])
-            for row in conn.execute("SELECT file_path, source_hash, build_revision FROM files")
+            row["file_path"]: (
+                row["source_hash"], row["build_revision"],
+                int(row["file_size"]), int(row["mtime_ns"]),
+            )
+            for row in conn.execute(
+                "SELECT file_path, source_hash, build_revision, file_size, mtime_ns FROM files"
+            )
         }
         existing_extractors: dict[str, set[str]] = {}
         for row in conn.execute(
@@ -799,9 +831,29 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             existing_extractors.setdefault(str(row["file_path"]), set()).add(
                 str(row["extractor"])
             )
-        pending_extractions: list[sgast.FileExtraction] = []
+        pending_extractions: list[tuple[sgast.FileExtraction, int, int]] = []
+        pending_stat_updates: list[tuple[int, int, str]] = []
         for path in files_on_disk:
+            rel = path.relative_to(repo_root).as_posix()
+            seen_rel.add(rel)
+            try:
+                path_stat = path.stat()
+                file_size = int(path_stat.st_size)
+                mtime_ns = int(path_stat.st_mtime_ns)
+            except OSError:
+                file_size = -1
+                mtime_ns = -1
+            prior = existing.get(rel)
+            if (
+                incremental and prior is not None
+                and prior[1] == BUILD_REVISION
+                and file_size >= 0 and mtime_ns >= 0
+                and prior[2] == file_size and prior[3] == mtime_ns
+            ):
+                unchanged += 1
+                continue
             extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
+            seen_rel.discard(rel)
             seen_rel.add(extraction.file_path)
             prior = existing.get(extraction.file_path)
             expected_extractors = {
@@ -815,13 +867,22 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 == expected_extractors
             ):
                 unchanged += 1
+                if prior[2] != file_size or prior[3] != mtime_ns:
+                    pending_stat_updates.append((file_size, mtime_ns, extraction.file_path))
                 continue
-            pending_extractions.append(extraction)
+            pending_extractions.append((extraction, file_size, mtime_ns))
 
         with conn:
-            for extraction in pending_extractions:
+            if pending_stat_updates:
+                conn.executemany(
+                    "UPDATE files SET file_size=?, mtime_ns=? WHERE file_path=?",
+                    pending_stat_updates,
+                )
+            for extraction, file_size, mtime_ns in pending_extractions:
                 _invalidate_file(conn, extraction.file_path)
-                inserted_entities, inserted_edges = _write_extraction(conn, extraction)
+                inserted_entities, inserted_edges = _write_extraction(
+                    conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                )
                 changed += 1
                 entities_written += inserted_entities
                 edges_written += inserted_edges
@@ -834,7 +895,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 if rel not in seen_rel:
                     _invalidate_file(conn, rel)
                     removed += 1
-            _resolve_cpp_cross_file_edges(conn)
+            if changed or removed:
+                _resolve_cpp_cross_file_edges(conn)
             sginsights.materialize_git_metrics(
                 conn, repo_root, sorted(seen_rel), limit=10000,
             )
@@ -1460,6 +1522,17 @@ def _bounded_rows(rows: list[dict[str, Any]], row_cap: int, byte_cap: int) -> tu
 def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]:
     """Deterministically trim nested optional evidence to the public byte cap."""
 
+    protected_keys = {
+        "mode",
+        "query",
+        "budget",
+        "target",
+        "query_tokens",
+        "query_tokens_source",
+        "candidate_files",
+        "truncated",
+    }
+
     def encoded_size() -> int:
         return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
@@ -1470,6 +1543,8 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
         def visit(value: Any) -> None:
             if isinstance(value, dict):
                 for key, item in value.items():
+                    if key in protected_keys:
+                        continue
                     if isinstance(item, str) and len(item) > 256:
                         strings.append((len(item), value, key))
                     else:
@@ -1489,7 +1564,7 @@ def _fit_payload_bytes(payload: dict[str, Any], byte_cap: int) -> dict[str, Any]
             continue
         if lists:
             _, target = max(lists, key=lambda item: item[0])
-            target.pop()
+            del target[len(target) // 2:]
             payload["truncated"] = True
             continue
         break
@@ -1519,20 +1594,31 @@ def _source_snippet(repo_root: Path, row: dict[str, Any], *, max_chars: int = 40
         return ""
 
 
-def _query_payload(repo_root: Path, mode: str, query: str, budget: int) -> dict[str, Any]:
+def _query_payload(
+    repo_root: Path,
+    mode: str,
+    query: str,
+    budget: int,
+    *,
+    target: str | None = None,
+) -> dict[str, Any]:
     budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
     byte_cap = max(512, budget * 512)
     db_path = resolve_db_path(repo_root)
     conn = connect(db_path, read_only=True)
     try:
-        matches = find(conn, query, limit=budget)
+        lookup = str(target or query).strip()
+        matches = find(conn, lookup, limit=budget)
         matches, truncated = _bounded_rows(matches, budget, byte_cap)
         files = _candidate_files(matches, limit=min(budget, 16))
         payload: dict[str, Any] = {
             "mode": mode, "query": query, "budget": budget, "matches": matches,
-            "query_tokens": _query_tokens(query), "candidate_files": files,
+            "query_tokens": _query_tokens(lookup), "candidate_files": files,
             "truncated": truncated,
         }
+        if target:
+            payload["target"] = target
+            payload["query_tokens_source"] = "target"
         if mode == "focus" and matches:
             payload.update(sginsights.focus_insights(
                 conn, repo_root, matches, budget=budget,
@@ -1554,8 +1640,14 @@ def focus(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
     return _query_payload(repo_root, "focus", query, budget)
 
 
-def slice_(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
-    return _query_payload(repo_root, "slice", query, budget)
+def slice_(
+    repo_root: Path,
+    query: str,
+    budget: int = 64,
+    *,
+    target: str | None = None,
+) -> dict[str, Any]:
+    return _query_payload(repo_root, "slice", query, budget, target=target)
 
 
 def context_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:

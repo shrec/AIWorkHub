@@ -21,8 +21,6 @@ from aiworkhub.project_context import (
 TASK_ID = "CODEX_GPT55_AIWORKHUB_CONTEXT_OPTIMIZATION_B829_V1"
 RUNNER = "codex_gpt55_aiworkhub_context_optimization_b829_v1"
 _REPO_TESTS_DIR = Path(__file__).resolve().parents[1]
-EVAL_JSON = _REPO_TESTS_DIR / "eval" / "aiworkhub_context_optimization_b829_v1.json"
-EVAL_ROWS = _REPO_TESTS_DIR / "eval" / "aiworkhub_context_optimization_rows_b829_v1.jsonl"
 PROCESS_DIRS = [_REPO_TESTS_DIR / "logs" / "processes"]
 
 
@@ -136,6 +134,9 @@ def test_query_cache_key_reuses_exact_generation_and_invalidates_structure():
 
 
 def test_context_economics_reports_tokens_only_when_telemetry_exists():
+    empty = context_optimization_report(records=[])
+    assert empty["measurement_status"] == "inconclusive_no_records"
+
     no_tokens = context_optimization_report(records=[
         {
             "before_bundle_bytes": 1000,
@@ -163,15 +164,16 @@ def test_context_economics_reports_tokens_only_when_telemetry_exists():
     assert with_tokens["notes"]["bundle_bytes_are_deterministic_bytes_not_tokens"] is True
 
 
-def test_real_process_context_optimization_evidence_written():
+def test_real_process_context_optimization_evidence_written(tmp_path: Path):
     rows = _real_process_rows()
     if _available_project_context_records() >= 30:
         assert len(rows) >= 30
     report = context_optimization_report(records=rows)
+    verdict = "PASS" if report["measurement_status"] == "measured" else "INCONCLUSIVE"
     report.update({
         "task_id": TASK_ID,
         "runner": RUNNER,
-        "verdict": "PASS",
+        "verdict": verdict,
         "real_process_records_used": len(rows),
         "minimum_real_records_when_available": 30,
         "byte_semantics": "before bytes are recorded delivered bundle bytes; after bytes are deterministic replay estimates after optional zero-hit and duplicate relevance suppression",
@@ -183,8 +185,10 @@ def test_real_process_context_optimization_evidence_written():
             "exact_validation_weakened": False,
         },
     })
-    EVAL_JSON.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    EVAL_ROWS.write_text(
+    eval_json = tmp_path / "aiworkhub_context_optimization_b829_v1.json"
+    eval_rows = tmp_path / "aiworkhub_context_optimization_rows_b829_v1.jsonl"
+    eval_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    eval_rows.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
         or json.dumps({
             "schema_id": "aiworkhub.task_mcp.context_optimization.row.b829.v1",
@@ -193,10 +197,10 @@ def test_real_process_context_optimization_evidence_written():
         }, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    assert report["verdict"] == "PASS"
+    assert report["verdict"] == ("PASS" if rows else "INCONCLUSIVE")
     assert report["before_bundle_bytes"] is None or report["after_bundle_bytes"] <= report["before_bundle_bytes"]
-    assert EVAL_JSON.stat().st_size > 0
-    assert EVAL_ROWS.stat().st_size > 0
+    assert eval_json.stat().st_size > 0
+    assert eval_rows.stat().st_size > 0
 
 
 def _available_project_context_records() -> int:

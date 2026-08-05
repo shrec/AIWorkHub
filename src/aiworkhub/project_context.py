@@ -370,6 +370,16 @@ def _canonical_json_output(
     identity_keys = (
         "schema_id", "ok", "tool", "mode", "query", "target", "hit_count", "budget",
     )
+    semantic_keys = (
+        "name", "qualname", "file_path", "kind", "signature",
+        "line_start", "line_end", "priority_score", "risk_reasons",
+        "metrics_evidence", "confidence", "evidence_label",
+    )
+
+    def ordered_mapping_keys(value: dict[Any, Any]) -> list[Any]:
+        ordered = [key for key in semantic_keys if key in value]
+        ordered.extend(key for key in sorted(value, key=str) if key not in ordered)
+        return ordered
 
     def preview_value(value: Any, depth: int = 0) -> Any:
         if depth >= 3:
@@ -384,7 +394,7 @@ def _canonical_json_output(
         if isinstance(value, dict):
             return {
                 str(key): preview_value(value[key], depth + 1)
-                for key in sorted(value, key=str)[:10]
+                for key in ordered_mapping_keys(value)[:10]
             }
         return value
 
@@ -603,20 +613,49 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
 
     source = contract["source_graph"]
     mode = source["mode"]
-    target = source["targets"][0] if source["targets_origin"] == "declared" and source["targets"] else source["query"]
+    query = source["query"]
+    target = (
+        source["targets"][0]
+        if source["targets_origin"] == "declared" and source["targets"]
+        else None
+    )
     try:
         if mode == "bundle":
-            payload = _source_graph_mod.bundle(repo, source["bundle_type"], target, source["budget"])
+            payload = _source_graph_mod.bundle(
+                repo, source["bundle_type"], query, source["budget"]
+            )
         elif mode == "slice":
-            payload = _source_graph_mod.slice_(repo, target, source["budget"])
+            payload = _source_graph_mod.slice_(
+                repo, query, source["budget"], target=target,
+            )
         elif mode == "context":
-            payload = _source_graph_mod.context_query(repo, target, source["budget"])
+            payload = _source_graph_mod.context_query(repo, query, source["budget"])
+        elif mode == "file":
+            payload = _source_graph_mod.file_query(repo, target or query, source["budget"])
+        elif mode == "function":
+            payload = _source_graph_mod.function_query(repo, query, source["budget"])
+        elif mode == "class":
+            payload = _source_graph_mod.class_query(repo, query, source["budget"])
+        elif mode == "body":
+            payload = _source_graph_mod.body_query(repo, query, source["budget"])
+        elif mode == "bodygrep":
+            payload = _source_graph_mod.bodygrep_query(
+                repo, query, source["budget"], target=target,
+            )
         elif mode == "impact":
-            payload = _source_graph_mod.impact(repo, target, source["budget"])
+            payload = _source_graph_mod.impact(repo, query, source["budget"])
         elif mode == "trace":
-            payload = _source_graph_mod.trace(repo, target, source["budget"])
+            payload = _source_graph_mod.trace(repo, query, source["budget"])
+        elif mode == "deps":
+            payload = _source_graph_mod.deps_query(repo, query, source["budget"])
+        elif mode == "focus":
+            payload = _source_graph_mod.focus(repo, query, source["budget"])
+        elif mode in _source_graph_mod.SOURCE_GRAPH_MODES:
+            payload = _source_graph_mod.analytics_query(
+                repo, mode, query, source["budget"]
+            )
         else:
-            payload = _source_graph_mod.focus(repo, target, source["budget"])
+            raise ProjectContextError(f"source_graph_mode_unimplemented:{mode}")
     except (_source_graph_mod.SourceGraphError, sqlite3.Error, OSError) as exc:
         raise ProjectContextError(f"source_graph_query_failed:{exc}") from exc
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.91] - 2026-08-05
+
+### Changed
+
+- Repeated worker Source Graph calls return a SHA-bound cache receipt when it
+  is smaller than retransmitting the prior content; small results retain their
+  full payload when that is cheaper.
+- New repository Source Graph policies exclude generated JSON/JSONL
+  measurement artifacts under `eval/` while keeping JSON/XML languages and
+  ordinary configuration data enabled and user-configurable.
+- Focus results represent hot symbols as compact references to their canonical
+  ranked rows instead of repeating full symbol evidence.
+- Incremental Source Graph refreshes persist file size and nanosecond mtime,
+  skip AST extraction for unchanged files, and avoid cross-file edge relinking
+  when no indexed file changed or disappeared.
+
+### Fixed
+
+- Worker `slice` accepts the exact qualname targets emitted by
+  `recommended_next_steps` instead of treating them as file-prefix filters.
+- Manager project-context queries preserve the declared query and execute the
+  requested Source Graph mode instead of silently substituting the first
+  target or falling back to `focus`.
+- Source Graph byte fitting preserves query/target receipt metadata, trims
+  optional evidence in convergent chunks, and no longer loops on a one-item
+  list.
+- Truncated symbol previews keep semantic identity and ranking fields ahead of
+  alphabetic noise.
+- Empty context-optimization evidence is reported as `INCONCLUSIVE`; its test
+  writes only to an isolated temporary directory and can no longer overwrite
+  the tracked benchmark artifacts with a vacuous `PASS`.
+
 ## [0.8.90] - 2026-08-05
 
 ### Changed

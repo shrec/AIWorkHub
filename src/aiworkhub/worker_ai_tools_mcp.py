@@ -383,6 +383,16 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
     identity_keys = (
         "schema_id", "ok", "tool", "mode", "query", "target", "hit_count", "budget",
     )
+    semantic_keys = (
+        "name", "qualname", "file_path", "kind", "signature",
+        "line_start", "line_end", "priority_score", "risk_reasons",
+        "metrics_evidence", "confidence", "evidence_label",
+    )
+
+    def ordered_mapping_keys(value: dict[Any, Any]) -> list[Any]:
+        ordered = [key for key in semantic_keys if key in value]
+        ordered.extend(key for key in sorted(value, key=str) if key not in ordered)
+        return ordered
 
     def preview_value(value: Any, depth: int = 0) -> Any:
         if depth >= 3:
@@ -397,7 +407,7 @@ def _canonical_json_output(name: str, text: str, *, max_bytes: int) -> tuple[str
         if isinstance(value, dict):
             return {
                 str(key): preview_value(value[key], depth + 1)
-                for key in sorted(value, key=str)[:10]
+                for key in ordered_mapping_keys(value)[:10]
             }
         return value
 
@@ -1390,9 +1400,25 @@ def source_graph_query(
     )
     cached = _CACHE.get(cache_key)
     if cached is not None:
+        cached_result = cached["result"]
+        receipt_content = json.dumps(
+            {
+                "schema_id": "aiworkhub.source_graph.cache_receipt.v1",
+                "reuse_previous_result": True,
+                "content_sha256": cached["content_sha256"],
+                "original_content_bytes": cached["bytes"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        receipt_bytes = len(receipt_content.encode("utf-8"))
+        use_receipt = receipt_bytes < int(cached["bytes"])
+        returned_content = receipt_content if use_receipt else str(cached_result["content"])
+        returned_bytes = receipt_bytes if use_receipt else int(cached["bytes"])
         _append_audit(
             ctx, tool=tool, ok=True, cache_hit=True,
-            hit_count=cached["hit_count"], bytes_returned=cached["bytes"],
+            hit_count=cached["hit_count"], bytes_returned=returned_bytes,
             authority_source=cached["authority_source"], authority_state=cached["authority_state"],
             authority_repo=query_repo,
             payload={
@@ -1406,9 +1432,13 @@ def source_graph_query(
             },
         )
         return {
-            **cached["result"],
+            **cached_result,
             "workflow_stage": workflow_stage,
+            "content": returned_content,
+            "bytes": returned_bytes,
             "cache_hit": True,
+            "cache_receipt": use_receipt,
+            "content_sha256": cached["content_sha256"],
         }
 
     try:
@@ -1416,7 +1446,9 @@ def source_graph_query(
             if mode == "bundle":
                 payload = _source_graph_mod.bundle(query_repo, bundle_type, bounded_query, budget)
             elif mode == "slice":
-                payload = _source_graph_mod.slice_(query_repo, bounded_query, budget)
+                payload = _source_graph_mod.slice_(
+                    query_repo, bounded_query, budget, target=scope,
+                )
             elif mode == "context":
                 payload = _source_graph_mod.context_query(query_repo, bounded_query, budget)
             elif mode == "file":
@@ -1464,7 +1496,15 @@ def source_graph_query(
         exact_payload = _declared_input_file_payload(ctx, scope)
         if exact_payload is not None:
             payload = exact_payload
-    if scope is not None:
+    if scope is not None and mode == "slice":
+        # ``slice`` target is an exact selector (often a qualname emitted by
+        # focus.recommended_next_steps), not a file-prefix response filter.
+        # It was already validated against the immutable task allowlist and
+        # resolved by the engine above; its dependency neighborhood is the
+        # intended bounded result.
+        if isinstance(payload, dict):
+            payload["scope"] = "target_selector"
+    elif scope is not None:
         unscoped_payload = payload
         payload = _filter_by_scope(payload, scope) or {}
         # An exact body symbol can legitimately live in a second coordinator-
@@ -1520,6 +1560,7 @@ def source_graph_query(
 
     payload = json.loads(text)
     bytes_returned = len(text.encode("utf-8"))
+    content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     result = {
         "ok": True,
         "tool": tool,
@@ -1533,7 +1574,9 @@ def source_graph_query(
         "bytes": bytes_returned,
         "output_cap_bytes": output_cap_bytes,
         "content": text,
+        "content_sha256": content_sha256,
         "cache_hit": False,
+        "cache_receipt": False,
         "authority_source": binding.authority_source,
         "authority_state": binding.authority_state,
         "authority_repo": str(query_repo),
@@ -1546,6 +1589,7 @@ def source_graph_query(
     }
     _CACHE[cache_key] = {
         "result": result, "hit_count": hit_count, "bytes": bytes_returned,
+        "content_sha256": content_sha256,
         "authority_source": binding.authority_source, "authority_state": binding.authority_state,
         "evidence_counts": evidence_counts,
     }
