@@ -4120,10 +4120,13 @@ class ProcessManager:
         total_output = _ledger_output_tokens(usage)
         usage["recorded_input_tokens"] = total_input
         usage["recorded_output_tokens"] = total_output
+        usage_role = "worker"
         note = f"task_mcp_request:{request_id}"
         try:
             card = _parse_card(self._show_task(task_id), task_id)
             topic = topic or str(card.get("topic") or "")
+            if _card_is_readonly_quality_review(card):
+                usage_role = "reviewer"
             records = card.get("usage_records") or []
             if isinstance(records, list) and any(
                 isinstance(record, dict)
@@ -4134,12 +4137,14 @@ class ProcessManager:
                 return usage, True, ""
         except Exception:
             pass
+        usage["role"] = usage_role
         args = [
             "usage", task_id,
             "--runner", runner,
             "--model", str(usage.get("observed_model") or model),
             "--requested-model", model,
             "--observed-model", str(usage.get("observed_model") or ""),
+            "--role", usage_role,
             "--provider", adapter_id.removesuffix("_cli"),
             "--source", "task_mcp_launcher",
             "--note", note,

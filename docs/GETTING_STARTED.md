@@ -135,6 +135,31 @@ the bootstrap tool is called. `aiworkhub_manager_bootstrap` returns the same
 contract as structured data so the model can reason over its startup order,
 task state machine, parallelism, callback ownership and recovery rules.
 
+### Claude Code direct-chat behavior
+
+Repository initialization installs a managed `CLAUDE.md` block specifically
+for Claude Code. In a new direct Claude chat, no copy/pasted ritual should be
+needed for normal code work: Claude is instructed to call
+`aiworkhub_manager_bootstrap` before built-in filesystem discovery, verify the
+repository/manager route, then begin with
+`aiworkhub_manager_source_graph_query` in `focus` or `slice` mode. It must
+re-query at implementation, validation, review or rework when the active
+boundary changes.
+
+The same short discovery contract is also carried in the MCP initialize
+response and manager tool descriptions. This provides a second instruction
+surface if a repository's `CLAUDE.md` is stale. Re-running **Initialize
+AIWorkHub** is idempotent and refreshes only AIWorkHub's managed block while
+preserving owner-authored text outside the markers. Open a new Claude chat
+afterward because an existing chat may retain its old instructions and tool
+schema.
+
+Claude may use built-in `Read` only for an exact bounded path/range returned
+by Source Graph or after Source Graph explicitly reports that target
+unsupported/unindexed. If required MCP tools are unavailable, it must report
+the connection problem rather than silently falling back to broad
+`Grep`/`Glob`/shell discovery.
+
 ## 6. Run the first task
 
 Tell the verified manager what outcome you want; you do not need to translate

@@ -96,11 +96,25 @@ def test_three_provider_projections_derive_from_same_policy_and_stay_bounded() -
         assert text.count(instr.START) == 1
         assert text.count(instr.END) == 1
         assert len(text.encode("utf-8")) <= instr.PROJECTION_MAX_BYTES
-    bodies = {
-        text.split("\n", 2)[2].rsplit(instr.END, 1)[0]
-        for text in rendered.values()
-    }
-    assert bodies == {canonical}
+    assert instr.CLAUDE_MANAGER_PREAMBLE in rendered["CLAUDE.md"]
+    assert instr.CLAUDE_MANAGER_PREAMBLE not in rendered["AGENTS.md"]
+    assert instr.CLAUDE_MANAGER_PREAMBLE not in rendered[".github/copilot-instructions.md"]
+
+
+def test_claude_projection_starts_with_manager_graph_loop() -> None:
+    text = instr.render_projection("CLAUDE.md")
+    preamble_at = text.index("Claude Code manager startup")
+    canonical_at = text.index("# AIWorkHub MCP tool-use policy")
+    assert preamble_at < canonical_at
+    for required in (
+        "Before Read, Grep, Glob, Bash or filesystem discovery",
+        "call aiworkhub_manager_bootstrap",
+        "aiworkhub_manager_source_graph_query first with focus or slice",
+        "workflow_stage=orientation",
+        "report the MCP problem instead of silently bypassing AIWorkHub",
+        "Direct Claude chats use manager tools",
+    ):
+        assert required in text
 
 
 def test_unsupported_provider_fails_closed() -> None:

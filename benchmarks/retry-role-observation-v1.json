@@ -1,0 +1,50 @@
+{
+  "schema_id": "aiworkhub.retry_role_observation.v1",
+  "captured_at": "2026-08-05",
+  "source": {
+    "kind": "canonical_repo_local_usage_ledger_snapshot",
+    "usage_records": 114,
+    "tasks_with_usage": 67,
+    "raw_private_events_published": false,
+    "reproducibility": "checked_arithmetic_and_claim_boundaries; private repo-local event rows are not published"
+  },
+  "retry_economics": {
+    "attempt_records": 114,
+    "tasks_with_retries": 26,
+    "retry_records": 47,
+    "retry_record_rate_percent": 41.2,
+    "retry_tokens": 88311967,
+    "retry_cost_known_records": 6,
+    "retry_cost_unknown_records": 41,
+    "retry_known_cost_usd": 20.885962,
+    "accepted_retried_tasks": 6,
+    "accepted_rate_among_retried_tasks_percent": 23.1
+  },
+  "role_attribution": {
+    "explicit_role_records": 0,
+    "legacy_inferred_role_records": 114,
+    "worker": {
+      "records": 112,
+      "total_tokens": 195782165,
+      "cost_known_records": 22,
+      "cost_unknown_records": 90,
+      "known_cost_usd": 63.567262
+    },
+    "reviewer": {
+      "records": 2,
+      "total_tokens": 1251357,
+      "cost_known_records": 1,
+      "cost_unknown_records": 1,
+      "known_cost_usd": 0.873076
+    },
+    "legacy_inference": "quality_review_topic_is_reviewer_otherwise_worker",
+    "future_rows": "role_is_persisted_explicitly_from_0.8.88"
+  },
+  "claim_boundaries": {
+    "association_only": true,
+    "retry_tokens_are_avoidable_savings": false,
+    "retry_caused_acceptance": false,
+    "role_cost_is_complete": false,
+    "reason": "41 retry rows and 91 total rows have unknown provider cost; historical roles are inferred from topic"
+  }
+}

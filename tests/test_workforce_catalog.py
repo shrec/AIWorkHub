@@ -298,6 +298,50 @@ def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: P
     assert worker["outcomes"]["tokens_with_unknown_cost"] == 1702755
 
 
+def test_effective_cost_rate_excludes_tokens_with_unknown_cost(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[
+            {"task_id": "T1", "status": "finished", "terminal_substatus": "review_ready"},
+            {"task_id": "T2", "status": "finished", "terminal_substatus": "review_ready"},
+        ],
+        process_rows=[
+            {
+                "request_id": "r1", "task_id": "T1", "runner": "codex_runner",
+                "adapter_id": "codex_cli", "model": "gpt-5.5",
+            },
+            {
+                "request_id": "r2", "task_id": "T2", "runner": "codex_runner",
+                "adapter_id": "codex_cli", "model": "gpt-5.5",
+            },
+        ],
+        usage_rows=[
+            {
+                "task_id": "T1", "runner": "codex_runner", "model": "gpt-5.5",
+                "total_tokens": 1_000, "cost_usd": 1.0, "cost_known": True,
+            },
+            {
+                "task_id": "T2", "runner": "codex_runner", "model": "gpt-5.5",
+                "total_tokens": 9_000, "cost_usd": 0.0, "cost_known": False,
+            },
+        ],
+        preflight={
+            "providers": [{
+                "adapter_id": "codex_cli", "launchable": True, "status": "ready",
+            }],
+        },
+    )
+
+    worker = next(row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5")
+    outcomes = worker["outcomes"]
+    assert outcomes["cost_known_records"] == 1
+    assert outcomes["cost_unknown_records"] == 1
+    assert outcomes["tokens_with_known_cost"] == 1_000
+    assert outcomes["tokens_with_unknown_cost"] == 9_000
+    assert outcomes["cost_usd_per_1k_tokens"] == 1.0
+
+
 def test_missing_process_identity_is_recovered_only_from_canonical_terminal_evidence(
     tmp_path: Path,
 ) -> None:

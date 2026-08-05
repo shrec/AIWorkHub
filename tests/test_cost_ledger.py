@@ -54,6 +54,9 @@ def test_repo_bound_usage_preserves_model_and_unknown_cost_truth(monkeypatch, tm
     assert result["tasks"][0]["observed_model"] == "gpt-5.5-codex"
     assert result["tasks"][0]["reasoning_output_tokens"] == 5
     assert result["tasks"][0]["provider"] == "openai"
+    assert result["tasks"][0]["role"] == "worker"
+    assert result["tasks"][0]["role_observed"] is False
+    assert result["tasks"][0]["created_at"] == "2026-08-03T01:02:03+00:00"
     assert result["tasks"][0]["cost_known"] is False
     assert result["aggregates"]["by_day"]["2026-08-03"]["total_tokens"] == 120
 
@@ -66,6 +69,7 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
             "topic": "code",
             "model": "gpt-5.5",
             "provider": "codex",
+            "role": "reviewer",
             "source": "task_mcp_launcher",
             "note": f"task_mcp_request:req-{attempt}",
             "input_tokens": 100,
@@ -112,6 +116,30 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
     assert provider["total_tokens"] == 240
     assert provider["cache_hit_ratio"] == 0.5
     assert result["aggregates"]["by_model"]["gpt-5.5"]["records"] == 2
+    assert result["aggregates"]["by_role"]["reviewer"]["records"] == 2
+    assert result["role_quality"] == {
+        "explicit_records": 2,
+        "legacy_inferred_records": 0,
+        "legacy_inference": "quality_review_topic_is_reviewer_otherwise_worker",
+    }
+    assert result["retry_economics"] == {
+        "schema_id": "aiworkhub.retry_economics.v1",
+        "association_only": True,
+        "tasks_with_usage": 1,
+        "attempt_records": 2,
+        "tasks_with_retries": 1,
+        "retry_records": 1,
+        "retry_record_rate_percent": 50.0,
+        "retry_tokens": 120,
+        "retry_cost_usd": 0.0,
+        "retry_cost_unknown_records": 0,
+        "accepted_retried_tasks": 1,
+        "accepted_rate_among_retried_tasks_percent": 100.0,
+        "claim_boundary": (
+            "Repeated usage records are measured attempts. They do not prove "
+            "that the retry caused acceptance or that its tokens were avoidable."
+        ),
+    }
     assert result["model_outcomes"]["models"]["gpt-5.5"] == {
         "decided_tasks": 1,
         "accepted": 1,

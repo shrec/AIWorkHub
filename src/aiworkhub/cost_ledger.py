@@ -29,6 +29,8 @@ def _parse_usage_stdout(stdout: str) -> list[dict[str, Any]]:
             "runner": data["runner"].strip(),
             "topic": data["topic"].strip(),
             "model": "",
+            "role": "unknown",
+            "role_observed": False,
             "records": int(data["records"]),
             "input_tokens": int(data["input_tokens"]),
             "output_tokens": int(data["output_tokens"]),
@@ -63,6 +65,8 @@ def _launch_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             "runner": entry.get("runner") or "",
             "topic": entry.get("topic") or "",
             "model": entry.get("model") or "",
+            "role": "unknown",
+            "role_observed": False,
             "records": 1,
             "input_tokens": int(entry.get("usage_input_tokens") or 0),
             "output_tokens": int(entry.get("usage_output_tokens") or 0),
@@ -84,6 +88,13 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for entry in task_store.list_usage_events(repo_root, limit=10_000):
         created_at = str(entry.get("created_at") or "")
+        topic = str(entry.get("topic") or "")
+        explicit_role = str(entry.get("role") or "").strip().lower()
+        role = (
+            explicit_role
+            if explicit_role in {"worker", "reviewer"}
+            else "reviewer" if topic == "quality_review" else "worker"
+        )
         total_tokens = int(entry.get("total_tokens") or 0)
         cost_usd = float(entry.get("cost_usd") or 0.0)
         cost_observed = entry.get("cost_observed")
@@ -99,8 +110,10 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "source": "canonical_usage_event",
             "task_id": str(entry.get("task_id") or ""),
             "runner": str(entry.get("runner") or ""),
-            "topic": str(entry.get("topic") or ""),
+            "topic": topic,
             "model": str(entry.get("model") or ""),
+            "role": role,
+            "role_observed": explicit_role in {"worker", "reviewer"},
             "requested_model": str(entry.get("requested_model") or ""),
             "observed_model": str(entry.get("observed_model") or ""),
             "model_observed": bool(entry.get("model_observed")),
@@ -125,6 +138,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "source_detail": str(entry.get("source") or ""),
             "note": note,
             "attempt_id": note.removeprefix("task_mcp_request:") if note.startswith("task_mcp_request:") else "",
+            "created_at": created_at,
             "day": created_at[:10] if len(created_at) >= 10 else "",
         })
     return rows
@@ -265,6 +279,64 @@ def _model_outcome_matrix(
     }
 
 
+def _retry_economics(
+    usage_rows: list[dict[str, Any]],
+    decisions: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Measure durable repeated attempts without calling activity savings."""
+
+    by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in usage_rows:
+        task_id = str(row.get("task_id") or "")
+        if task_id:
+            by_task[task_id].append(row)
+    retry_rows: list[dict[str, Any]] = []
+    retried_tasks: set[str] = set()
+    for task_id, rows in by_task.items():
+        ordered = sorted(rows, key=lambda row: str(row.get("created_at") or ""))
+        if len(ordered) > 1:
+            retried_tasks.add(task_id)
+            retry_rows.extend(ordered[1:])
+    accepted_retried = sum(
+        1
+        for task_id in retried_tasks
+        if str((decisions.get(task_id) or {}).get("decision") or "") == "accepted"
+    )
+    return {
+        "schema_id": "aiworkhub.retry_economics.v1",
+        "association_only": True,
+        "tasks_with_usage": len(by_task),
+        "attempt_records": len(usage_rows),
+        "tasks_with_retries": len(retried_tasks),
+        "retry_records": len(retry_rows),
+        "retry_record_rate_percent": (
+            round(100.0 * len(retry_rows) / len(usage_rows), 1)
+            if usage_rows else None
+        ),
+        "retry_tokens": sum(int(row.get("total_tokens") or 0) for row in retry_rows),
+        "retry_cost_usd": round(
+            sum(
+                float(row.get("cost_usd") or 0.0)
+                for row in retry_rows
+                if row.get("cost_known")
+            ),
+            6,
+        ),
+        "retry_cost_unknown_records": sum(
+            1 for row in retry_rows if not row.get("cost_known")
+        ),
+        "accepted_retried_tasks": accepted_retried,
+        "accepted_rate_among_retried_tasks_percent": (
+            round(100.0 * accepted_retried / len(retried_tasks), 1)
+            if retried_tasks else None
+        ),
+        "claim_boundary": (
+            "Repeated usage records are measured attempts. They do not prove "
+            "that the retry caused acceptance or that its tokens were avoidable."
+        ),
+    }
+
+
 def build_cost_ledger(
     *,
     repo_root: Path | str | None = None,
@@ -359,14 +431,29 @@ def build_cost_ledger(
             ),
             "absent_metrics_are_unknown_not_zero": True,
         },
+        "role_quality": {
+            "explicit_records": sum(
+                int(row.get("records") or 0)
+                for row in union_rows
+                if row.get("role_observed")
+            ),
+            "legacy_inferred_records": sum(
+                int(row.get("records") or 0)
+                for row in union_rows
+                if not row.get("role_observed")
+            ),
+            "legacy_inference": "quality_review_topic_is_reviewer_otherwise_worker",
+        },
         "aggregates": {
             "by_topic": _aggregate(union_rows, "topic"),
             "by_runner": _aggregate(union_rows, "runner"),
             "by_model": _aggregate(union_rows, "model"),
             "by_provider": _aggregate(union_rows, "provider"),
+            "by_role": _aggregate(union_rows, "role"),
             "by_day": _aggregate(union_rows, "day"),
         },
         "model_outcomes": _model_outcome_matrix(usage_rows, manager_decisions),
+        "retry_economics": _retry_economics(usage_rows, manager_decisions),
         "tasks": union_rows if include_tasks else [],
         "authority_flags": {
             "runtime_authority": False,

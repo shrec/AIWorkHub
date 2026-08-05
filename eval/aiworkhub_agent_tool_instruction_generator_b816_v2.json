@@ -13,9 +13,9 @@
       "sha256": "071928218dc992c1fe8442a0c3c03078810cfd6e4e0a800895db3579a0034ae3"
     },
     "CLAUDE.md": {
-      "bytes": 3847,
+      "bytes": 4758,
       "canonical_sha256": "a8e227d183b0987ac11a756f0a76209b112db954e45a8d96f481f0187c1fd6ee",
-      "sha256": "205036e0147d4dd2f7df2db93e7f8664d8e62ed58f77cf4ab176bd1a5c7e28a1"
+      "sha256": "3fb93e354ccfbd5b7fc1042ba100da5842f1ed42a56a4b03443789b7ed48e597"
     }
   },
   "schema_id": "aiworkhub.task_mcp.agent_tool_instruction_generator_b816_v2.eval.v1"

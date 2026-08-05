@@ -45,7 +45,6 @@ CONSERVATIVE_PRIORS: Mapping[str, float] = {
     "validation_failure_rate": 0.25,
     "p50_latency_seconds": 3600.0,
     "p95_latency_seconds": 14_400.0,
-    "cost_usd_per_1k_tokens": 99.0,
     "estimated_tokens": 100_000.0,
 }
 
@@ -176,7 +175,7 @@ class OutcomeEvidence:
     estimated_tokens: int | None = None
     sample_count: int = 0
 
-    def normalized(self) -> tuple[dict[str, float], dict[str, str]]:
+    def normalized(self) -> tuple[dict[str, float | None], dict[str, str]]:
         values = {
             "accepted_rate": _bounded_rate(
                 self.accepted_rate, CONSERVATIVE_PRIORS["accepted_rate"]
@@ -196,9 +195,10 @@ class OutcomeEvidence:
                 self.p95_latency_seconds,
                 CONSERVATIVE_PRIORS["p95_latency_seconds"],
             ),
-            "cost_usd_per_1k_tokens": _bounded_positive(
-                self.cost_usd_per_1k_tokens,
-                CONSERVATIVE_PRIORS["cost_usd_per_1k_tokens"],
+            "cost_usd_per_1k_tokens": (
+                _bounded_positive(self.cost_usd_per_1k_tokens, 0.0)
+                if self.cost_usd_per_1k_tokens is not None
+                else None
             ),
             "estimated_tokens": _bounded_positive(
                 float(self.estimated_tokens) if self.estimated_tokens is not None else None,
@@ -213,6 +213,8 @@ class OutcomeEvidence:
             )
             for key in values
         }
+        if self.cost_usd_per_1k_tokens is None:
+            sources["cost_usd_per_1k_tokens"] = "unknown"
         return values, sources
 
     def as_dict(self) -> dict[str, Any]:
@@ -400,9 +402,12 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         0.0,
         min(1.0, effective_success + (worker.manager_score_adjustment / 100.0)),
     )
-    estimated_cost = round(
-        values["cost_usd_per_1k_tokens"] * values["estimated_tokens"] / 1000.0,
-        6,
+    cost_rate = values["cost_usd_per_1k_tokens"]
+    estimated_tokens = float(values["estimated_tokens"] or 0.0)
+    estimated_cost = (
+        round(float(cost_rate) * estimated_tokens / 1000.0, 6)
+        if cost_rate is not None
+        else None
     )
     deadline_penalty = 0
     if task.deadline_seconds is not None and values["p95_latency_seconds"] > task.deadline_seconds:
@@ -417,8 +422,9 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         "p50_latency_seconds": values["p50_latency_seconds"],
         "p95_latency_seconds": values["p95_latency_seconds"],
         "cost_usd_per_1k_tokens": values["cost_usd_per_1k_tokens"],
-        "estimated_tokens": int(values["estimated_tokens"]),
+        "estimated_tokens": int(estimated_tokens),
         "estimated_cost_usd": estimated_cost,
+        "cost_known": cost_rate is not None,
         "quality_floor": task.quality_floor,
         "meets_quality_floor": effective_success >= task.quality_floor,
         "deadline_penalty": deadline_penalty,
@@ -429,10 +435,12 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
 
 def _candidate_sort_key(candidate: CandidateRecord) -> tuple[Any, ...]:
     components = candidate.score_components
+    estimated_cost = components.get("estimated_cost_usd")
     return (
         int(candidate.excluded),
         components.get("deadline_penalty", 0),
-        components.get("estimated_cost_usd", CONSERVATIVE_PRIORS["cost_usd_per_1k_tokens"]),
+        int(estimated_cost is None),
+        float(estimated_cost) if estimated_cost is not None else float("inf"),
         -components.get("manager_adjusted_success_rate", 0.0),
         components.get("validation_failure_rate", 1.0),
         components.get("p50_latency_seconds", CONSERVATIVE_PRIORS["p50_latency_seconds"]),
@@ -491,6 +499,7 @@ def rank_workforce(
                 "availability/credentials/quota",
                 "capability/tool/context/risk/quality compatibility",
                 "cheapest estimated cost",
+                "unknown cost after observed cost; never fabricate a dollar prior",
                 "higher effective accepted/review-ready outcome",
                 "lower validation failure",
                 "lower latency",

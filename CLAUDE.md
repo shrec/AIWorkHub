@@ -1,5 +1,12 @@
 <!-- AIWORKHUB_TOOL_USE_POLICY_START -->
 Target: CLAUDE.md
+Claude Code manager startup (mandatory when AIWorkHub MCP is available):
+- Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
+- Continue as manager only when its repository identity and manager route are verified.
+- For every non-trivial code request, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query at implementation, validation, review or rework when the active symbol, dependency boundary or hypothesis changes.
+- Use Claude's built-in file tools only for an exact bounded path/range returned by Source Graph or when Source Graph explicitly reports the target unsupported or unindexed; record that fallback.
+- If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
+- Direct Claude chats use manager tools; launched task workers use worker tools.
 # AIWorkHub MCP tool-use policy
 Order:
 1. validate the injected AIWorkHub Task MCP receipt, identity and scope.
@@ -20,6 +27,12 @@ Source Graph gate:
 - When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.
 - Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.
 - A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.
+- Re-query whenever the active symbol, dependency boundary, failure hypothesis, edit scope or validation target materially changes.
+- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review or rework; never relabel old calls after the fact.
+- Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.
+- Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.
+- After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.
+- Final receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.
 - Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.

@@ -63,6 +63,29 @@ also recognizes `cache_write_input_tokens`; the audited runs contained zero,
 so that field closes a latent accounting gap rather than claiming recovered
 cost.
 
+## Retry and reviewer observation (114 canonical attempts)
+
+The 2026-08-05 canonical repo-local ledger contains 114 usage attempts across
+67 tasks. Of those, 47 records (41.2%) are attempts after the first recorded
+attempt for their task and account for 88,311,967 tokens. Only six retry rows
+have known provider cost ($20.885962); 41 retry rows have unknown cost. Six of
+the 26 tasks with retries were ultimately accepted (23.1%). This is a measured
+location of spend, **not** proof that the retry tokens were avoidable or that a
+retry caused acceptance.
+
+Historical topic-based attribution identifies two reviewer records with
+1,251,357 tokens and 112 worker records with 195,782,165 tokens. All 114 roles
+in this frozen population are inferred because the old event schema did not
+persist role. From 0.8.88 onward, usage events explicitly store
+`role=worker|reviewer`, while the ledger reports old inferred rows separately.
+
+The checked snapshot is
+[`benchmarks/retry-role-observation-v1.json`](../benchmarks/retry-role-observation-v1.json),
+and [`scripts/check_retry_role_observation.py`](../scripts/check_retry_role_observation.py)
+verifies its populations, arithmetic and non-causal claim boundaries. Raw
+repo-local task events are private and are not published, so this is a checked
+snapshot rather than a fully reproducible public raw-event benchmark.
+
 ## System benefit evidence snapshot for 0.8.81
 
 Captured from AIWorkHub managing its own repository on 2026-08-04. The

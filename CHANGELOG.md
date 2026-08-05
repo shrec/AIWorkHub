@@ -6,6 +6,37 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.88] - 2026-08-05
+
+### Added
+
+- Claude Code direct chats receive an explicit manager startup contract through
+  both the managed `CLAUDE.md` block and MCP bootstrap/tool descriptions. New
+  chats must bootstrap AIWorkHub and use manager Source Graph discovery before
+  broad built-in filesystem tools, then re-query as the working boundary
+  changes.
+- Durable usage evidence distinguishes worker and reviewer activity and exposes
+  retry economics without presenting historical role inference as directly
+  observed fact.
+- A checked retry/role observation artifact and CI verifier preserve the
+  evidence behind the public benchmark narrative.
+
+### Changed
+
+- Unknown provider cost remains unknown during workforce routing. Candidates
+  are no longer assigned a fabricated `$9,900` estimate, and mixed
+  known/unknown usage cannot dilute an observed effective token price.
+- The token-economy audit now separates verified provider accounting from
+  unmeasured tokenizer, cache and compaction hypotheses and requires controlled
+  benchmarks before public savings claims.
+
+### Fixed
+
+- Repository re-initialization refreshes Claude's managed AIWorkHub policy
+  while preserving owner-authored text outside the managed markers.
+- Usage timestamps survive canonical ledger normalization, keeping attempt
+  order and model-to-manager-outcome association stable.
+
 ## [0.8.87] - 2026-08-04
 
 ### Added

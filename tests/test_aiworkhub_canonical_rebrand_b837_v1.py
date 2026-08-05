@@ -27,6 +27,7 @@ def test_server_and_worker_tools_use_aiworkhub_namespace() -> None:
     worker = _read("src/aiworkhub/worker_ai_tools_mcp.py")
     assert '"AIWorkHub MCP",' in server
     assert "instructions=core.MCP_MANAGER_CONTRACT_BANNER" in server
+    assert "MANAGER CODE DISCOVERY: use first and continuously" in server
     assert "def aiworkhub_task_health" in server
     assert "def aiworkhub_agent_launch_task" in server
     assert 'SERVER_NAME = "aiworkhub_worker_ai_tools"' in worker

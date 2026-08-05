@@ -1856,6 +1856,7 @@ def run_taskctl(
                 requested_model=_value("--requested-model", ""),
                 observed_model=_value("--observed-model", ""),
                 model_observed="--model-observed" in args,
+                role=_value("--role", "worker"),
                 provider=_value("--provider", ""),
                 source=_value("--source", ""),
                 note=_value("--note", ""),
@@ -2604,7 +2605,11 @@ def _live_card(task_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | No
 MCP_MANAGER_CONTRACT_BANNER = (
     "AIWORKHUB MANAGER CONTRACT (MANDATORY): call "
     "aiworkhub_manager_bootstrap first and trust only repository-bound MCP "
-    "receipts. Creating a task leaves it pending; only an exact claim plus "
+    "receipts. For every non-trivial code request, use "
+    "aiworkhub_manager_source_graph_query before built-in filesystem discovery; "
+    "start with focus/slice and re-query when the active boundary changes. If "
+    "required Source Graph is unavailable, report it instead of silently "
+    "bypassing AIWorkHub. Creating a task leaves it pending; only an exact claim plus "
     "launch may make it processing. Launch independent tasks in parallel only "
     "after dependency, write-scope, preflight and collision checks. Workers "
     "stop at review_ready; every review/terminal transition emits a callback, "
@@ -2640,8 +2645,8 @@ def manager_bootstrap() -> dict[str, Any]:
             "start_sequence": [
                 "aiworkhub_manager_bootstrap",
                 "aiworkhub_repository_current and aiworkhub_task_health",
+                "aiworkhub_manager_source_graph_query with focus/slice and workflow_stage=orientation before built-in code discovery",
                 "aiworkhub_manager_session_current_state, one task-specific AI Memory query, and KB only when relevant",
-                "aiworkhub_manager_source_graph_query for code discovery",
                 "aiworkhub_task_plan_snapshot before creating or launching a dependency wave",
             ],
             "task_state_machine": {
@@ -2697,6 +2702,7 @@ def manager_bootstrap() -> dict[str, Any]:
         },
         "rules": [
             "Managers use AIWorkHub manager AI tools before repository discovery, review, rebase, and planning.",
+            "For non-trivial code work, Source Graph is the first discovery surface and must be re-queried as the working boundary changes.",
             "Create tasks through aiworkhub_task_create; never require repository-local AITools/taskctl.py.",
             "Use the returned task_id exactly and never fabricate callback batch/lease ids.",
             "Workers stop at review; a verified manager finalizes or rejects review.",
@@ -4442,6 +4448,7 @@ def record_usage(
     requested_model: str | None = None,
     observed_model: str | None = None,
     model_observed: bool = False,
+    role: str = "worker",
     provider: str | None = None,
     source: str | None = None,
     note: str | None = None,
@@ -4491,6 +4498,14 @@ def record_usage(
             or cost_observed
         )
     )
+    normalized_role = str(role or "worker").strip().lower()
+    if normalized_role not in {"worker", "reviewer"}:
+        return _canonical_result(
+            ok=False,
+            returncode=2,
+            stderr="usage_role_invalid",
+            command=command,
+        )
     payload = {
         "runner": runner,
         "topic": live_topic,
@@ -4500,6 +4515,7 @@ def record_usage(
         "requested_model": requested_model or model or "",
         "observed_model": observed_model or "",
         "model_observed": bool(model_observed and observed_model),
+        "role": normalized_role,
         "provider": provider or "",
         "source": source or "",
         "note": note or "",

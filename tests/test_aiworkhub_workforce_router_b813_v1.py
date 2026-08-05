@@ -98,8 +98,45 @@ def test_missing_evidence_uses_labeled_conservative_priors_and_can_fail_floor():
     assert decision.selected_worker_id is None
     assert "observed_or_prior_quality_below_floor" in candidate["exclusion_reasons"]
     assert candidate["score_components"]["evidence_sources"]["accepted_rate"] == "conservative_prior"
-    assert candidate["score_components"]["evidence_sources"]["cost_usd_per_1k_tokens"] == "conservative_prior"
-    assert candidate["score_components"]["cost_usd_per_1k_tokens"] == 99.0
+    assert candidate["score_components"]["evidence_sources"]["cost_usd_per_1k_tokens"] == "unknown"
+    assert candidate["score_components"]["cost_usd_per_1k_tokens"] is None
+    assert candidate["score_components"]["estimated_cost_usd"] is None
+    assert candidate["score_components"]["cost_known"] is False
+
+
+def test_unknown_cost_never_becomes_a_fake_cheapest_candidate():
+    decision = select_worker(
+        _task(),
+        [
+            _worker(
+                "unknown-cost",
+                "glm-5.2",
+                "zhipu",
+                adapter_id="glm_cli",
+                cost=None,
+                accepted=0.9,
+                review_ready=0.9,
+                validation_failure=0.0,
+            ),
+            _worker(
+                "observed-cost",
+                "deepseek-v4-pro",
+                "deepseek",
+                adapter_id="deepseek_copilot_cli",
+                cost=1.0,
+                accepted=0.9,
+                review_ready=0.9,
+                validation_failure=0.0,
+            ),
+        ],
+    )
+
+    assert decision.selected_worker_id == "observed-cost"
+    unknown = next(
+        candidate for candidate in decision.candidates
+        if candidate.worker_id == "unknown-cost"
+    )
+    assert unknown.score_components["estimated_cost_usd"] is None
 
 
 def test_authoritative_owner_pin_and_no_provider_constraints_are_enforced():

@@ -175,7 +175,14 @@ on Linux, macOS, native Windows, WSL and the workspace host in Remote-SSH.
 
 Open a new Codex, Claude or other MCP-capable chat **after** initializing (or
 upgrading) AIWorkHub. The new chat performs tool discovery and receives the
-MCP Manager Contract banner. Start with this copy/paste prompt:
+MCP Manager Contract banner. Claude Code also reads the repository-local
+`.mcp.json` registration and AIWorkHub-managed `CLAUDE.md` block: direct
+Claude chats must bootstrap as managers and use Source Graph before broad
+built-in file discovery. They are not worker sessions.
+
+The prompt below is a portable first-run diagnostic for clients that do not
+automatically honor repository instructions; it is not required in a correctly
+initialized new Claude Code chat:
 
 ```text
 Use AIWorkHub as the manager for the currently bound repository.

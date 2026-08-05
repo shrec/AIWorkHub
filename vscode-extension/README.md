@@ -66,6 +66,14 @@ Initialization is explicit and idempotent. It creates repository-local state
 only under `.aiworkhub/` and starts the first Source Graph index in the
 background.
 
+For Claude Code, initialization also maintains the repository-local
+`.mcp.json` server registration and the bounded AIWorkHub block in `CLAUDE.md`.
+Open a **new** Claude chat after initialization or an AIWorkHub upgrade. That
+direct chat is instructed to bootstrap as the manager, call manager Source
+Graph before broad `Read`/`Grep`/`Glob` discovery, and re-query the graph when
+its implementation or validation boundary changes. AIWorkHub-launched task
+processes use the separate worker tool surface.
+
 ## Run your first task
 
 AIWorkHub is designed for a manager chat that delegates bounded work instead

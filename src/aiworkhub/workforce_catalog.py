@@ -397,12 +397,21 @@ def build_catalog(
         retries = max(0, attempts - sample_count)
         usage_source = matched_usage or matched
         tokens = sum(int(item.get("total_tokens") or 0) for item in usage_source)
-        known_cost_rows = [item for item in usage_source if item.get("cost_known") is not False]
+        def cost_known(item: Mapping[str, Any]) -> bool:
+            declared = item.get("cost_known")
+            if declared is not None:
+                return declared is True
+            return float(item.get("cost_usd") or 0.0) > 0.0
+
+        known_cost_rows = [item for item in usage_source if cost_known(item)]
+        known_cost_tokens = sum(
+            int(item.get("total_tokens") or 0) for item in known_cost_rows
+        )
         cost = sum(float(item.get("cost_usd") or 0.0) for item in known_cost_rows)
         unknown_cost_tokens = sum(
             int(item.get("total_tokens") or 0)
             for item in usage_source
-            if item.get("cost_known") is False
+            if not cost_known(item)
         )
         accepted_rate = accepted / sample_count if sample_count else None
         review_rate = review_ready / sample_count if sample_count else None
@@ -438,9 +447,18 @@ def build_catalog(
                 "p50_latency_seconds": median(latencies) if latencies else None,
                 "p95_latency_seconds": _percentile(latencies, 0.95),
                 "total_tokens": tokens,
+                "estimated_tokens_per_attempt": (
+                    round(tokens / attempts) if tokens and attempts else None
+                ),
                 "cost_usd": round(cost, 6) if cost else None,
+                "cost_known_records": len(known_cost_rows),
+                "cost_unknown_records": len(usage_source) - len(known_cost_rows),
+                "tokens_with_known_cost": known_cost_tokens,
                 "tokens_with_unknown_cost": unknown_cost_tokens,
-                "cost_usd_per_1k_tokens": round(cost * 1000.0 / tokens, 6) if cost and tokens else None,
+                "cost_usd_per_1k_tokens": (
+                    round(cost * 1000.0 / known_cost_tokens, 6)
+                    if cost and known_cost_tokens else None
+                ),
                 "evidence_source": "observed" if sample_count else "conservative_prior",
             },
             "observed_score": observed_score,
@@ -492,6 +510,7 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
                 accepted_rate=outcomes.get("accepted_rate"), review_ready_rate=outcomes.get("review_ready_rate"),
                 validation_failure_rate=outcomes.get("validation_failure_rate"), p50_latency_seconds=outcomes.get("p50_latency_seconds"),
                 p95_latency_seconds=outcomes.get("p95_latency_seconds"), cost_usd_per_1k_tokens=outcomes.get("cost_usd_per_1k_tokens"),
+                estimated_tokens=outcomes.get("estimated_tokens_per_attempt"),
                 sample_count=int(outcomes.get("sample_count") or 0),
             ),
         ))

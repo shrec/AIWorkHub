@@ -940,6 +940,8 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
             "--observed-model",
             "observed-model",
             "--model-observed",
+            "--role",
+            "reviewer",
             "--provider",
             "test-provider",
             "--source",
@@ -982,6 +984,7 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
     assert event["requested_model"] == "requested-model"
     assert event["observed_model"] == "observed-model"
     assert event["model_observed"] is True
+    assert event["role"] == "reviewer"
     assert event["visible_output_tokens"] == 5
     assert event["reasoning_output_tokens"] == 2
 

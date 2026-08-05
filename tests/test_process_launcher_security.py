@@ -662,7 +662,60 @@ def test_cached_token_accounting_matches_provider_semantics(
     assert args[args.index("--total-tokens") + 1] == str(expected_input + 45)
     assert args[args.index("--cached-input-tokens") + 1] == "80"
     assert args[args.index("--cache-creation-input-tokens") + 1] == "25"
+    assert args[args.index("--role") + 1] == "worker"
     assert "--cache-metrics-observed" in args
+
+
+def test_readonly_quality_review_usage_is_attributed_to_reviewer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "reviewer.json"
+    output.write_text(
+        json.dumps({
+            "type": "result",
+            "usage": {"input_tokens": 12, "output_tokens": 3},
+        }),
+        encoding="utf-8",
+    )
+    card = {
+        **_card(),
+        "topic": "quality_review",
+        "read_only": True,
+        "allowed_writes": [],
+        "required_outputs": [],
+        "project_context": {"task_type": "research"},
+    }
+    captured: list[list[str]] = []
+
+    def run_taskctl(args: list[str], **_kwargs):
+        captured.append(args)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(process_launcher.core, "run_taskctl", run_taskctl)
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(card),
+        collision_guard=_collision,
+        adapter_builder=_plan([]),
+        isolation_enabled=False,
+    )
+
+    usage, recorded, error = manager._record_usage(
+        "request-reviewer",
+        card["task_id"],
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+    )
+
+    assert recorded is True
+    assert error == ""
+    assert usage["role"] == "reviewer"
+    assert captured[0][captured[0].index("--role") + 1] == "reviewer"
 
 
 def test_unobserved_provider_usage_still_records_one_truthful_attempt(

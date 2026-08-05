@@ -12,12 +12,22 @@ from typing import Any, Literal
 
 
 CANONICAL_MAX_BYTES = 3800
-PROJECTION_MAX_BYTES = 4000
+PROJECTION_MAX_BYTES = 5200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
 PROVIDERS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
 
 Provider = Literal["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
+
+
+CLAUDE_MANAGER_PREAMBLE = """Claude Code manager startup (mandatory when AIWorkHub MCP is available):
+- Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
+- Continue as manager only when its repository identity and manager route are verified.
+- For every non-trivial code request, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query at implementation, validation, review or rework when the active symbol, dependency boundary or hypothesis changes.
+- Use Claude's built-in file tools only for an exact bounded path/range returned by Source Graph or when Source Graph explicitly reports the target unsupported or unindexed; record that fallback.
+- If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
+- Direct Claude chats use manager tools; launched task workers use worker tools.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +176,8 @@ def render_projection(provider: Provider, policy: ToolPolicy = POLICY) -> str:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported_provider:{provider}")
     body = render_canonical(policy)
-    text = f"{START}\nTarget: {provider}\n{body}{END}\n"
+    provider_preamble = CLAUDE_MANAGER_PREAMBLE if provider == "CLAUDE.md" else ""
+    text = f"{START}\nTarget: {provider}\n{provider_preamble}{body}{END}\n"
     _assert_size(f"projection:{provider}", text, PROJECTION_MAX_BYTES)
     return text
 
@@ -239,6 +250,7 @@ def diff_projection(provider: Provider, owner_text: str, policy: ToolPolicy = PO
 
 __all__ = [
     "CANONICAL_MAX_BYTES",
+    "CLAUDE_MANAGER_PREAMBLE",
     "END",
     "MANAGER_CONTEXT_GRAPH_TOOL_NAMES",
     "POLICY",

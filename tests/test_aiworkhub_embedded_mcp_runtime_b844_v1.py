@@ -274,6 +274,7 @@ def test_stdlib_fallback_initialize_and_tools_call_shape(fallback_server_module)
     )
     assert "AIWORKHUB MANAGER CONTRACT" in with_banner["instructions"]
     assert "Creating a task leaves it pending" in with_banner["instructions"]
+    assert "aiworkhub_manager_source_graph_query before built-in filesystem discovery" in with_banner["instructions"]
     assert server_module.mcp.instructions == server_module.core.MCP_MANAGER_CONTRACT_BANNER
     assert server_module._stdio_dispatch(
         "AIWorkHub MCP", tools, "resources/list", {}
