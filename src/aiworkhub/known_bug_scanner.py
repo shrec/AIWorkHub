@@ -11,9 +11,21 @@ from pathlib import Path
 from typing import Iterable
 
 SCHEMA_ID = "aiworkhub.known_bug_scan.v1"
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_PATHS = 500
 MAX_FINDINGS = 200
+
+CWE_BY_CATEGORY = {
+    "memory_safety": "CWE-119",
+    "command_injection": "CWE-78",
+    "correctness": "CWE-682",
+    "cryptography": "CWE-327",
+    "code_injection": "CWE-94",
+    "deserialization": "CWE-502",
+    "transport_security": "CWE-295",
+    "filesystem_race": "CWE-377",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +140,16 @@ def _finding(rule: Rule, path: str, line: int, column: int, snippet: str) -> dic
     digest = hashlib.sha256(f"{rule.rule_id}\0{path}\0{line}\0{snippet}".encode()).hexdigest()
     return {"rule_id": rule.rule_id, "path": path, "line": line, "column": column,
             "severity": rule.severity, "category": rule.category, "message": rule.message,
-            "snippet": snippet.strip()[:300], "fingerprint": digest}
+            "cwe": CWE_BY_CATEGORY.get(rule.category, ""),
+            "snippet": snippet.strip()[:300], "fingerprint": digest,
+            # A deterministic source pattern can be blocking without being a
+            # claim that the defect was exercised at runtime.  Keeping this
+            # boundary explicit prevents static candidates from masquerading
+            # as reproduced vulnerabilities.
+            "verification_state": "static_candidate",
+            "evidence_class": "deterministic_source_pattern",
+            "runtime_validated": False,
+            "required_next_evidence": "targeted_test_or_reproduction"}
 
 
 def _python_code_lines(text: str) -> list[str]:
@@ -233,4 +254,80 @@ def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> d
     return {"schema_id": SCHEMA_ID, "passed": errors == 0, "errors": errors,
             "warnings": sum(row["severity"] == "warning" for row in findings),
             "paths_considered": len(paths), "findings": findings[:MAX_FINDINGS],
-            "truncated": len(findings) > MAX_FINDINGS}
+            "truncated": len(findings) > MAX_FINDINGS,
+            "evidence_summary": {
+                "static_candidates": min(len(findings), MAX_FINDINGS),
+                "runtime_validated": 0,
+                "claim_boundary": "static_pattern_not_runtime_reproduction",
+            }}
+
+
+def to_sarif(report: dict) -> dict:
+    """Convert one bounded native report to deterministic SARIF 2.1.0.
+
+    The export preserves the native verification boundary in result
+    properties.  It never upgrades a static pattern to a reproduced finding.
+    """
+
+    findings = [row for row in report.get("findings", []) if isinstance(row, dict)]
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    for finding in findings[:MAX_FINDINGS]:
+        rule_id = str(finding.get("rule_id") or "aiworkhub.unknown")
+        category = str(finding.get("category") or "quality")
+        cwe = str(finding.get("cwe") or "")
+        rules.setdefault(rule_id, {
+            "id": rule_id,
+            "name": rule_id.replace(".", "_"),
+            "shortDescription": {"text": str(finding.get("message") or rule_id)},
+            "properties": {
+                "category": category,
+                "cwe": cwe,
+                "evidenceClass": "deterministic_source_pattern",
+            },
+        })
+        line = max(1, int(finding.get("line") or 1))
+        column = max(1, int(finding.get("column") or 1))
+        severity = str(finding.get("severity") or "warning")
+        results.append({
+            "ruleId": rule_id,
+            "level": "error" if severity == "error" else "warning",
+            "message": {"text": str(finding.get("message") or rule_id)},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": str(finding.get("path") or "")},
+                    "region": {"startLine": line, "startColumn": column},
+                }
+            }],
+            "partialFingerprints": {
+                "aiworkhubFindingFingerprint": str(finding.get("fingerprint") or "")
+            },
+            "properties": {
+                "category": category,
+                "cwe": cwe,
+                "verificationState": str(
+                    finding.get("verification_state") or "static_candidate"
+                ),
+                "runtimeValidated": bool(finding.get("runtime_validated")),
+                "requiredNextEvidence": str(
+                    finding.get("required_next_evidence") or "targeted_test_or_reproduction"
+                ),
+            },
+        })
+    return {
+        "$schema": SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "AIWorkHub Known Bug Scanner",
+                "informationUri": "https://shrec.github.io/AIWorkHub/",
+                "rules": [rules[key] for key in sorted(rules)],
+            }},
+            "results": results,
+            "properties": {
+                "sourceSchema": str(report.get("schema_id") or SCHEMA_ID),
+                "claimBoundary": "static_pattern_not_runtime_reproduction",
+                "truncated": bool(report.get("truncated")),
+            },
+        }],
+    }

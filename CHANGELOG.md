@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.97] - 2026-08-05
+
+### Added
+
+- The diff-scoped Known Bug Scanner can emit deterministic SARIF 2.1.0 for CI
+  and code-scanning ingestion, including stable fingerprints and CWE metadata.
+- Native and SARIF security findings explicitly distinguish a static source
+  candidate from runtime-validated reproduction evidence.
+
 ## [0.8.96] - 2026-08-05
 
 ### Added

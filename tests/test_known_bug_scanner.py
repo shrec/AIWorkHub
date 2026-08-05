@@ -48,6 +48,7 @@ def test_completion_builtin_blocks_high_confidence_pattern(tmp_path: Path):
     check = next(row for row in checks if row.check_id == "builtin:known_bug_patterns")
     assert check.status == quality_evidence.STATUS_FAILED
     assert "python.shell_true" in check.summary
+    assert "static_pattern_not_runtime_reproduction" in check.summary
 
 
 def test_transport_security_rules_cover_multiple_languages(tmp_path: Path):
@@ -97,3 +98,35 @@ def test_cpp_release_reassignment_clears_lifetime_candidate(tmp_path: Path):
         row["rule_id"] == "cpp.use_after_release_candidate"
         for row in report["findings"]
     )
+
+
+def test_findings_preserve_static_candidate_truth_boundary(tmp_path: Path):
+    (tmp_path / "client.py").write_text(
+        "requests.get(url, verify=False)\n", encoding="utf-8"
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["client.py"])
+    finding = report["findings"][0]
+    assert finding["cwe"] == "CWE-295"
+    assert finding["verification_state"] == "static_candidate"
+    assert finding["runtime_validated"] is False
+    assert report["evidence_summary"] == {
+        "static_candidates": 1,
+        "runtime_validated": 0,
+        "claim_boundary": "static_pattern_not_runtime_reproduction",
+    }
+
+
+def test_sarif_export_is_stable_and_does_not_upgrade_evidence(tmp_path: Path):
+    (tmp_path / "runner.py").write_text(
+        "subprocess.run(value, shell=True)\n", encoding="utf-8"
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    sarif = known_bug_scanner.to_sarif(report)
+    run = sarif["runs"][0]
+    result = run["results"][0]
+    assert sarif["version"] == "2.1.0"
+    assert result["ruleId"] == "python.shell_true"
+    assert result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "runner.py"
+    assert result["properties"]["verificationState"] == "static_candidate"
+    assert result["properties"]["runtimeValidated"] is False
+    assert run["properties"]["claimBoundary"] == "static_pattern_not_runtime_reproduction"

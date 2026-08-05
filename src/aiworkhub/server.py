@@ -333,6 +333,7 @@ from . import deepseek_credentials
 from . import evidence_instruments
 from . import launch_queue_contract
 from . import launch_queue_persist
+from . import known_bug_scanner
 from . import manager_ai_tools
 from . import process_launcher
 from . import review_summarizer
@@ -1940,6 +1941,21 @@ def aiworkhub_quality_profile() -> dict[str, Any]:
     """READ-ONLY: zero-config detected languages/declared/installed tools."""
 
     return quality_evidence.build_zero_config_profile(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_known_bug_scan(
+    changed_paths: list[str],
+    output_format: Literal["native", "sarif"] = "native",
+) -> dict[str, Any]:
+    """READ-ONLY: scan bounded changed paths for known bug patterns.
+
+    Native and SARIF outputs preserve the same truth boundary: a static
+    candidate is not reported as runtime-reproduced evidence.
+    """
+
+    report = known_bug_scanner.scan_changed_paths(core.repo_root(), changed_paths)
+    return known_bug_scanner.to_sarif(report) if output_format == "sarif" else report
 
 
 @mcp.tool()

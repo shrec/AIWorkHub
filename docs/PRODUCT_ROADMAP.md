@@ -367,6 +367,13 @@ irrelevant checks; absent selectors and absent delta evidence preserve the
 historical conservative always-run behavior. Skips remain explicit evidence,
 while every applicable declared check is still mandatory and fail-closed.
 
+The diff-scoped Known Bug Scanner now emits the same bounded findings as native
+JSON or SARIF 2.1.0. Every result remains explicitly a `static_candidate` with
+`runtime_validated=false` until a targeted test or reproduction supplies that
+stronger evidence. This adopts the useful validated-finding/CI handoff pattern
+seen in agentic security tools without importing their runtime, code, or a
+security-specific orchestration model into AIWorkHub.
+
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and
   requirements/scope. Models emit findings; no model computes PASS/FAIL.

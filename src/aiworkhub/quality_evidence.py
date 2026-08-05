@@ -1121,6 +1121,7 @@ def run_builtin_static_checks(
         summary=json.dumps({
             "errors": bug_report["errors"], "warnings": bug_report["warnings"],
             "findings": bug_report["findings"][:20], "truncated": bug_report["truncated"],
+            "evidence_summary": bug_report["evidence_summary"],
         }, sort_keys=True)[:MAX_SUMMARY_CHARS],
         provenance="builtin:diff_scoped_known_bug_registry.v1",
         error="" if bug_report["passed"] else "high_confidence_known_bug_pattern",

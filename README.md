@@ -331,7 +331,7 @@ never inherit the manager launch capability.
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
 | Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing, replacement-only semantic edits and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
-| Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner and configurable evidence gates |
+| Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner, truth-preserving SARIF 2.1.0 export and configurable evidence gates |
 | Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
 | Platforms | Linux, Windows, macOS and Remote-SSH release qualification |
 
