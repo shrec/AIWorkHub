@@ -833,6 +833,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             )
         pending_extractions: list[tuple[sgast.FileExtraction, int, int]] = []
         pending_stat_updates: list[tuple[int, int, str]] = []
+        expected_extractors_by_suffix: dict[str, frozenset[str]] = {}
         for path in files_on_disk:
             rel = path.relative_to(repo_root).as_posix()
             seen_rel.add(rel)
@@ -844,11 +845,17 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 file_size = -1
                 mtime_ns = -1
             prior = existing.get(rel)
+            capability_key = path.suffix.casefold()
+            expected_extractors = expected_extractors_by_suffix.get(capability_key)
+            if expected_extractors is None:
+                expected_extractors = sgast.expected_extractor_ids(path)
+                expected_extractors_by_suffix[capability_key] = expected_extractors
             if (
                 incremental and prior is not None
                 and prior[1] == BUILD_REVISION
                 and file_size >= 0 and mtime_ns >= 0
                 and prior[2] == file_size and prior[3] == mtime_ns
+                and existing_extractors.get(rel, set()) == expected_extractors
             ):
                 unchanged += 1
                 continue

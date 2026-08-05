@@ -74,6 +74,41 @@ POLYGLOT_LEXICAL_LANGUAGES = frozenset({
 })
 
 
+def expected_extractor_ids(file_path: Path) -> frozenset[str]:
+    """Return the extractor generation expected for an unchanged file.
+
+    Incremental indexing may skip reading a file only when its persisted
+    extractor set still matches the currently available parser backend.  This
+    keeps optional Tree-sitter installation/removal observable even though the
+    repository file's size and mtime did not change.
+    """
+
+    suffix = file_path.suffix.casefold()
+    language = languages.language_for_path(file_path)
+    if suffix in PHP_EXTENSIONS:
+        return frozenset({PHP_LEXICAL_EXTRACTOR_ID})
+    if suffix in CPP_EXTENSIONS:
+        return frozenset({CPP_LEXICAL_EXTRACTOR_ID})
+    if language in {"javascript", "typescript"}:
+        from . import source_graph_semantic
+
+        capability = source_graph_semantic.parser_capability(
+            language, file_path=file_path.as_posix(),
+        )
+        return frozenset({
+            TREE_SITTER_JS_TS_EXTRACTOR_ID
+            if capability.get("available")
+            else POLYGLOT_LEXICAL_EXTRACTOR_ID
+        })
+    if language in POLYGLOT_LEXICAL_LANGUAGES:
+        return frozenset({POLYGLOT_LEXICAL_EXTRACTOR_ID})
+    if suffix in PYTHON_EXTENSIONS:
+        return frozenset({EXTRACTOR_ID})
+    if language is not None:
+        return frozenset({FILE_EVIDENCE_EXTRACTOR_ID})
+    return frozenset()
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

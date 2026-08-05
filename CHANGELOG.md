@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.92] - 2026-08-05
+
+### Fixed
+
+- Incremental Source Graph stat caching now verifies the active extractor
+  capability before skipping a file, so installing or restoring the optional
+  Tree-sitter backend upgrades unchanged JavaScript/TypeScript files from
+  lexical to semantic evidence on the next refresh.
+
 ## [0.8.91] - 2026-08-05
 
 ### Changed
