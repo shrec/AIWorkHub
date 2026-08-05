@@ -322,6 +322,7 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     contextual = sg.context_query(repo, "run_engine", 32)
     traced = sg.trace(repo, "helper", 32)
     impacted = sg.impact(repo, "helper", 32)
+    dependencies = sg.deps_query(repo, "run_engine", 32)
     bundled = sg.bundle(repo, "bugfix", "run_engine", 32)
 
     assert focus["matches"] and focus["candidate_files"][0] == "native/engine.cpp"
@@ -347,6 +348,13 @@ def test_cpp_cross_file_calls_and_all_six_compact_query_modes(tmp_path):
     assert any(row["caller_symbol"].endswith("run_engine") for row in traced["incoming_calls"])
     assert {row["file_path"] for row in impacted["impacted_files"]} >= {"native/math.cpp"}
     assert impacted["impact_evidence"].startswith("bidirectional_resolved_calls")
+    assert dependencies["mode"] == "deps"
+    assert dependencies["dependency_kinds"] == ["calls", "imports", "inherits"]
+    assert any(
+        row["kind"] == "calls" and row["dst_name"] == "helper"
+        for row in dependencies["dependency_edges"]
+    )
+    assert "outgoing_calls" not in dependencies
     assert bundled["sections"] and bundled["outgoing_calls"]
     assert bundled["insights"]["ranked_symbols"]
 
@@ -376,6 +384,110 @@ def test_every_focus_emitted_next_step_resolves_without_replacing_task_query(tmp
             assert payload["contexts"][0]["file_path"] == target
         else:  # pragma: no cover - emitted modes must be added explicitly
             pytest.fail(f"unhandled recommended step: {step}")
+
+
+def test_slice_is_symbol_scoped_and_excludes_unrelated_same_file_calls(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def wanted_helper():\n"
+        "    return 1\n\n"
+        "def unrelated_helper():\n"
+        "    return 2\n\n"
+        "def wanted_entry():\n"
+        "    return wanted_helper()\n\n"
+        "def unrelated_entry():\n"
+        "    return unrelated_helper()\n",
+    )
+    _write(
+        repo / "tests" / "test_service.py",
+        "from pkg.service import wanted_entry\n\n"
+        "def test_wanted_entry():\n"
+        "    assert wanted_entry() == 1\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    focused = sg.focus(repo, "wanted_entry", 16)
+    target = focused["ranked_symbols"][0]["qualname"]
+    sliced = sg.slice_(repo, "change wanted behavior", 16, target=target)
+
+    assert sliced["matches"][0]["qualname"] == target
+    assert {row["callee_symbol"] for row in sliced["outgoing_calls"]} == {
+        "wanted_helper"
+    }
+    assert all(
+        row["callee_symbol"] != "unrelated_helper"
+        for row in sliced["outgoing_calls"]
+    )
+
+
+def test_exact_qualname_ranking_and_body_are_deterministic_with_duplicate_names(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "alpha.py", "def shared():\n    return 'alpha'\n")
+    _write(repo / "pkg" / "beta.py", "def shared():\n    return 'beta'\n")
+    sg.build_index(repo, incremental=False)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        qualnames = [
+            row["qualname"]
+            for row in conn.execute(
+                "SELECT qualname FROM entities WHERE name='shared' ORDER BY qualname"
+            )
+        ]
+    finally:
+        conn.close()
+    target = next(item for item in qualnames if "beta" in item)
+
+    focused = sg.focus(repo, target, 8)
+    body = sg.body_query(repo, target, 8)
+
+    assert focused["matches"][0]["qualname"] == target
+    assert body["matches"][0]["qualname"] == target
+    assert "return 'beta'" in body["matches"][0]["source"]
+
+
+def test_cross_file_resolver_never_binds_calls_across_language_families(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "python_owner.py", "def shared_target():\n    return 1\n")
+    _write(
+        repo / "web" / "caller.js",
+        "export function run() { return shared_target(); }\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        edge = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='web/caller.js' "
+            "AND kind='calls' AND dst_name='shared_target'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert edge is not None
+    assert edge["dst_qualname"] is None
+
+
+def test_focus_todos_require_comment_evidence_not_identifiers_or_strings(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "todos.py",
+        "TODO_VALUE = 'TODO: not work evidence'\n"
+        "def todo_probe():\n"
+        "    value = 'FIXME: still a string'\n"
+        "    return value  # TODO: replace fixture value\n",
+    )
+    sg.build_index(repo, incremental=False)
+
+    payload = sg.focus(repo, "todo_probe", 16)
+
+    assert payload["todos"] == [{
+        "file_path": "pkg/todos.py",
+        "line": 4,
+        "marker": "TODO",
+        "text": "replace fixture value",
+    }]
 
 
 def test_payload_trimming_preserves_query_receipt_metadata(tmp_path):

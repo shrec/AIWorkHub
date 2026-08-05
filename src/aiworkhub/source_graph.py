@@ -695,17 +695,40 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         "AND kind IN ('calls','inherits')",
         resolvable_extractors,
     )
-    rows = conn.execute(
-        "SELECT name, MIN(qualname) qualname, COUNT(*) c FROM entities "
-        "WHERE kind IN ('function','method','class','struct','union','enum') "
-        "GROUP BY name HAVING c=1"
-    ).fetchall()
     resolved = 0
-    for row in rows:
+    unresolved_with_language = conn.execute(
+        f"SELECT e.id, e.file_path, e.dst_name, f.language FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        f"WHERE e.extractor IN ({placeholders}) "
+        "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
+        "ORDER BY e.id",
+        resolvable_extractors,
+    ).fetchall()
+    candidates_by_language_and_name: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for edge in unresolved_with_language:
+        source_language = str(edge["language"])
+        name = str(edge["dst_name"])
+        key = (source_language, name)
+        if key not in candidates_by_language_and_name:
+            candidates = conn.execute(
+                "SELECT e.file_path, e.qualname, f.language FROM entities e "
+                "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
+                "e.kind IN ('function','method','class','struct','union','enum') "
+                "ORDER BY e.file_path, e.qualname",
+                (name,),
+            ).fetchall()
+            candidates_by_language_and_name[key] = [
+                candidate for candidate in candidates
+                if _resolution_languages_compatible(
+                    source_language, str(candidate["language"])
+                )
+            ]
+        candidates = candidates_by_language_and_name[key]
+        if len(candidates) != 1:
+            continue
         cur = conn.execute(
-            f"UPDATE edges SET dst_qualname=? WHERE extractor IN ({placeholders}) "
-            "AND kind IN ('calls','inherits') AND dst_name=? AND dst_qualname IS NULL",
-            (row["qualname"], *resolvable_extractors, row["name"]),
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (candidates[0]["qualname"], edge["id"]),
         )
         resolved += int(cur.rowcount or 0)
 
@@ -713,13 +736,15 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     # ambiguous short name. This remains INFERRED authority; the resolver only
     # fills the canonical target identity already carried by the edge.
     unresolved = conn.execute(
-        f"SELECT id, file_path, dst_name FROM edges WHERE extractor IN ({placeholders}) "
-        "AND kind IN ('calls','inherits') AND dst_qualname IS NULL "
+        f"SELECT e.id, e.file_path, e.dst_name, f.language FROM edges e "
+        "JOIN files f ON f.file_path=e.file_path "
+        f"WHERE e.extractor IN ({placeholders}) "
+        "AND e.kind IN ('calls','inherits') AND e.dst_qualname IS NULL "
         "ORDER BY id",
         resolvable_extractors,
     ).fetchall()
     imports_by_file: dict[str, list[str]] = {}
-    candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+    candidates_by_name: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for edge in unresolved:
         file_path = str(edge["file_path"])
         if file_path not in imports_by_file:
@@ -735,15 +760,24 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         if not imports:
             continue
         name = str(edge["dst_name"])
-        if name not in candidates_by_name:
-            candidates_by_name[name] = conn.execute(
-                "SELECT file_path, qualname FROM entities WHERE name=? AND "
-                "kind IN ('function','method','class','struct','union','enum') "
-                "ORDER BY file_path, qualname",
+        source_language = str(edge["language"])
+        candidate_key = (source_language, name)
+        if candidate_key not in candidates_by_name:
+            rows = conn.execute(
+                "SELECT e.file_path, e.qualname, f.language FROM entities e "
+                "JOIN files f ON f.file_path=e.file_path WHERE e.name=? AND "
+                "e.kind IN ('function','method','class','struct','union','enum') "
+                "ORDER BY e.file_path, e.qualname",
                 (name,),
             ).fetchall()
+            candidates_by_name[candidate_key] = [
+                row for row in rows
+                if _resolution_languages_compatible(
+                    source_language, str(row["language"])
+                )
+            ]
         candidates = [
-            row for row in candidates_by_name[name]
+            row for row in candidates_by_name[candidate_key]
             if any(
                 _import_target_matches_file(target, str(row["file_path"]))
                 for target in imports
@@ -757,6 +791,14 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
         )
         resolved += int(cur.rowcount or 0)
     return resolved
+
+
+def _resolution_languages_compatible(source: str, target: str) -> bool:
+    """Conservatively bound lexical resolution to interoperable families."""
+
+    if source == target:
+        return True
+    return {source, target} <= {"javascript", "typescript"}
 
 
 def _import_target_matches_file(target: str, file_path: str) -> bool:
@@ -1033,12 +1075,18 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
             "SELECT e.file_path, e.kind, e.name, e.qualname, e.line_start, e.line_end, "
             "e.signature, e.evidence_label, e.confidence FROM entities_fts f "
             "JOIN entities e ON e.id = f.entity_id WHERE entities_fts MATCH ? "
-            "ORDER BY CASE WHEN lower(e.name)=lower(?) THEN 0 "
-            "WHEN lower(e.name) LIKE lower(?) THEN 1 ELSE 2 END, "
+            "ORDER BY CASE WHEN lower(e.qualname)=lower(?) THEN 0 "
+            "WHEN lower(e.name)=lower(?) THEN 1 "
+            "WHEN lower(e.name) LIKE lower(?) THEN 2 ELSE 3 END, "
             "CASE WHEN e.kind IN ('function','method','class','struct','union','enum') "
             "THEN 0 WHEN e.kind='file' THEN 1 ELSE 2 END, "
-            "bm25(entities_fts), e.file_path, e.line_start LIMIT ?",
-                (expression, term, f"{term}%", limit),
+            # Symbol identity is stronger evidence than incidental signature
+            # or path text.  Keep the decomposition explicit so generated/data
+            # paths cannot outrank an exact code authority merely by repeating
+            # the query term in their filename.
+            "bm25(entities_fts, 10.0, 6.0, 2.0, 0.5), "
+            "e.file_path, e.line_start LIMIT ?",
+                (expression, term, term, f"{term}%", limit),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
@@ -1049,8 +1097,10 @@ def find(conn: sqlite3.Connection, term: str, *, limit: int = 24) -> list[dict[s
         rows = conn.execute(
             "SELECT file_path, kind, name, qualname, line_start, line_end, signature, "
             "evidence_label, confidence FROM entities WHERE name LIKE ? OR qualname LIKE ? "
-            "LIMIT ?",
-            (like, like, limit),
+            "ORDER BY CASE WHEN lower(qualname)=lower(?) THEN 0 "
+            "WHEN lower(name)=lower(?) THEN 1 ELSE 2 END, "
+            "confidence DESC, file_path, line_start LIMIT ?",
+            (like, like, term, term, limit),
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1299,10 +1349,60 @@ def class_query(repo_root: Path, name: str, budget: int = 64) -> dict[str, Any]:
 
 
 def deps_query(repo_root: Path, query: str, budget: int = 64) -> dict[str, Any]:
-    """Expose the bidirectional call/import dependency surface explicitly."""
+    """Expose symbol dependencies without duplicating the ``trace`` payload.
 
-    payload = trace(repo_root, query, budget)
-    return {**payload, "mode": "deps"}
+    ``trace`` is an execution-call view.  ``deps`` instead partitions calls,
+    imports and inheritance edges around the selected authorities so an agent
+    can choose the next boundary without paying for an identical response.
+    """
+
+    budget = max(1, min(int(budget), MAX_BUDGET_ROWS))
+    conn = connect(resolve_db_path(repo_root), read_only=True)
+    try:
+        matches = find(conn, query, limit=budget)
+        qualnames = list(dict.fromkeys(
+            str(row.get("qualname") or "") for row in matches
+            if row.get("qualname")
+        ))
+        if not qualnames:
+            return {
+                "mode": "deps", "query": query, "budget": budget,
+                "direct_matches": [], "dependency_edges": [],
+                "dependent_edges": [], "candidate_files": [],
+                "dependency_kinds": ["calls", "imports", "inherits"],
+                "truncated": False,
+            }
+        placeholders = ",".join("?" for _ in qualnames)
+        edge_select = (
+            "SELECT file_path, kind, src_qualname, dst_name, dst_qualname, line, "
+            "evidence_label, confidence FROM edges "
+        )
+        outgoing = [dict(row) for row in conn.execute(
+            edge_select
+            + f"WHERE kind IN ('calls','imports','inherits') "
+            f"AND src_qualname IN ({placeholders}) "
+            "ORDER BY confidence DESC, kind, file_path, line LIMIT ?",
+            (*qualnames, budget + 1),
+        )]
+        incoming = [dict(row) for row in conn.execute(
+            edge_select
+            + f"WHERE kind IN ('calls','inherits') "
+            f"AND dst_qualname IN ({placeholders}) "
+            "ORDER BY confidence DESC, kind, file_path, line LIMIT ?",
+            (*qualnames, budget + 1),
+        )]
+        truncated = len(outgoing) > budget or len(incoming) > budget
+        return _fit_payload_bytes({
+            "mode": "deps", "query": query, "budget": budget,
+            "direct_matches": matches[:budget],
+            "dependency_edges": outgoing[:budget],
+            "dependent_edges": incoming[:budget],
+            "candidate_files": _candidate_files(matches, limit=min(16, budget)),
+            "dependency_kinds": ["calls", "imports", "inherits"],
+            "truncated": truncated,
+        }, max(512, budget * 768))
+    finally:
+        conn.close()
 
 
 def func(conn: sqlite3.Connection, name: str, *, limit: int = 24) -> list[dict[str, Any]]:
@@ -1331,9 +1431,11 @@ def body(conn: sqlite3.Connection, repo_root: Path, name: str) -> dict[str, Any]
     row = conn.execute(
         "SELECT file_path, kind, name, qualname, line_start, line_end, signature "
         "FROM entities WHERE kind IN "
-        "('function','method','class','struct','union','enum','namespace') AND name = ? "
-        "ORDER BY kind LIMIT 1",
-        (name,),
+        "('function','method','class','struct','union','enum','namespace') "
+        "AND (name = ? OR qualname = ?) "
+        "ORDER BY CASE WHEN qualname=? THEN 0 ELSE 1 END, "
+        "confidence DESC, file_path, line_start LIMIT 1",
+        (name, name, name),
     ).fetchone()
     if row is None:
         return None

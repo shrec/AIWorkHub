@@ -42,6 +42,7 @@ jobs:
           python scripts/check_provider_routing_observation.py
           python scripts/check_retry_role_observation.py
           python scripts/check_system_benefit_snapshot.py
+          python scripts/check_source_graph_slice_benchmark.py
 
   cross-platform:
     name: Fresh install (${{ matrix.name }})

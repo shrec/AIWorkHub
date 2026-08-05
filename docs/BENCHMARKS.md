@@ -25,6 +25,21 @@ The machine-readable fixture is
 and CI recomputes its arithmetic and claim boundaries with
 [`scripts/check_context_envelope_benchmark.py`](../scripts/check_context_envelope_benchmark.py).
 
+## Source Graph exact-symbol slice precision
+
+One deterministic noisy-file fixture contains 80 unrelated entry/helper call
+pairs plus one target pair. The legacy file-scoped slice collected 100 edge
+rows (`21,921` bytes); the exact-symbol slice collects the one relevant edge
+(`277` bytes): **98.736% less edge payload, a 79.14× structural ratio**.
+
+This result proves that an exact `focus → slice:<qualname>` transition no
+longer pays for unrelated calls merely because they share a large file. It is
+not a provider-token, latency, quality or end-to-end cost claim. The checked
+fixture is
+[`benchmarks/source-graph-slice-precision-v1.json`](../benchmarks/source-graph-slice-precision-v1.json),
+reproduced by
+[`scripts/check_source_graph_slice_benchmark.py`](../scripts/check_source_graph_slice_benchmark.py).
+
 ## Provider routing observation (65 real runs)
 
 This 2026-08-04 audit used the retained provider streams under

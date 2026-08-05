@@ -6,6 +6,23 @@ ratio. A change is useful only when the same coding tasks consume less
 provider input, retain or improve verified outcome quality, and preserve exact
 source provenance.
 
+## Current delivery status
+
+The original wrapper/economy defects are closed: exact `focus → slice` target
+propagation, manager/worker mode parity, metadata-safe byte fitting, compact
+hot-symbol references, SHA-only cache reuse, generated-eval exclusions,
+incremental stat short-circuiting and extractor-generation refresh all ship on
+the canonical repository graph. Exact-symbol slice also excludes unrelated
+same-file calls, exact qualnames win retrieval ties, lexical cross-file binding
+is language-bounded, and `deps` is distinct from execution `trace`.
+
+The remaining tracks below are deliberately not labeled complete. A general
+Source Graph economy claim still requires the 30-pair raw-vs-graph ledger;
+semantic parser depth beyond the optional JavaScript/TypeScript backend and
+cross-file resolver precision must advance one fixture-gated language at a
+time; deterministic communities remain an optional experiment rather than
+source authority.
+
 ## Non-negotiable measurement contract
 
 No token-saving multiplier is published from `corpus_bytes / result_bytes`.

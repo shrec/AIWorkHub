@@ -18,6 +18,9 @@ from typing import Any
 
 _TEST_PATH_RE = re.compile(r"(^|/)(tests?|specs?)(/|$)|(^|/)(test_|spec_)", re.IGNORECASE)
 _TODO_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s-]*(.{0,180})", re.IGNORECASE)
+_COMMENT_PREFIX_RE = re.compile(
+    r"(?:^|\s)(?:#|//|/\*|\*|<!--|--|;|REM\s+)", re.IGNORECASE,
+)
 _BRANCH_RE = re.compile(r"\b(if|elif|else|switch|case|match|catch|except)\b|\?")
 _LOOP_RE = re.compile(r"\b(for|while|loop)\b")
 _SECURITY_RE = re.compile(
@@ -62,6 +65,45 @@ def call_edges(
         select + f"WHERE e.kind='calls' AND t.file_path IN ({placeholders}) "
         "ORDER BY e.confidence DESC, t.file_path, e.line LIMIT ?",
         (*files, cap),
+    )]
+    return outgoing, incoming
+
+
+def call_edges_for_symbols(
+    conn: sqlite3.Connection,
+    qualnames: list[str],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return only call edges that touch the selected symbol authorities.
+
+    A file can contain hundreds of unrelated functions.  ``slice`` is a
+    symbol-level operation, so widening an exact target to every call in the
+    containing file wastes response bytes and can send an agent toward the
+    wrong implementation boundary.  Keep file-level expansion available to
+    ``impact``/``trace`` while making the minimal slice exact.
+    """
+
+    selected = list(dict.fromkeys(item for item in qualnames if item))
+    if not selected:
+        return [], []
+    placeholders = ",".join("?" for _ in selected)
+    select = (
+        "SELECT DISTINCT e.src_qualname AS caller_symbol, e.file_path AS caller_file, "
+        "e.dst_name AS callee_symbol, e.dst_qualname, t.file_path AS callee_file, "
+        "e.line, e.evidence_label, e.confidence FROM edges e "
+        "LEFT JOIN entities t ON t.qualname=e.dst_qualname "
+    )
+    cap = max(1, limit)
+    outgoing = [dict(row) for row in conn.execute(
+        select + f"WHERE e.kind='calls' AND e.src_qualname IN ({placeholders}) "
+        "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
+        (*selected, cap),
+    )]
+    incoming = [dict(row) for row in conn.execute(
+        select + f"WHERE e.kind='calls' AND e.dst_qualname IN ({placeholders}) "
+        "ORDER BY e.confidence DESC, e.file_path, e.line LIMIT ?",
+        (*selected, cap),
     )]
     return outgoing, incoming
 
@@ -337,7 +379,10 @@ def _todos(repo_root: Path, files: list[str], *, limit: int) -> list[dict[str, A
     for path in files:
         for line_number, line in enumerate(_safe_lines(repo_root, path), start=1):
             match = _TODO_RE.search(line)
-            if match:
+            # A TODO-like identifier or string literal is not repository work
+            # evidence.  Require an observed comment marker before the tag;
+            # this stays language-neutral and deliberately conservative.
+            if match and _COMMENT_PREFIX_RE.search(line[:match.start()]):
                 rows.append({
                     "file_path": path,
                     "line": line_number,
@@ -403,7 +448,14 @@ def slice_insights(
     budget: int,
 ) -> dict[str, Any]:
     files = candidate_files(matches, limit=min(12, budget))
-    outgoing, incoming = call_edges(conn, files, limit=min(50, budget))
+    qualnames = [
+        str(row.get("qualname") or "")
+        for row in matches
+        if row.get("qualname")
+    ]
+    outgoing, incoming = call_edges_for_symbols(
+        conn, qualnames, limit=min(50, budget),
+    )
     return {
         "entry_symbols": _symbol_metrics(conn, repo_root, matches, limit=min(16, budget)),
         "outgoing_calls": outgoing,
@@ -468,6 +520,7 @@ def impact_insights(
 
 __all__ = [
     "call_edges",
+    "call_edges_for_symbols",
     "candidate_files",
     "focus_insights",
     "impact_insights",

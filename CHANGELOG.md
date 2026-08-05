@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.94] - 2026-08-05
+
+### Changed
+
+- Source Graph `slice` is now exact-symbol scoped: call evidence is selected
+  by the resolved qualname instead of widening to every unrelated function in
+  the containing file.
+- Exact qualnames outrank incidental FTS/path matches, with explicit FTS column
+  weights favoring symbol identity over signatures and filenames.
+- `deps` now reports partitioned call/import/inheritance dependencies and
+  dependents instead of retransmitting the byte-identical `trace` response.
+- The checked noisy-file slice fixture records 100 legacy file-level edge rows
+  (`21,921` bytes) versus one exact-symbol edge (`277` bytes), a 98.736%
+  structural reduction. It explicitly makes no provider-token or quality claim.
+
+### Fixed
+
+- Exact body lookup is deterministic for duplicate short names and accepts the
+  exact qualname emitted by Source Graph discovery.
+- Conservative cross-file resolution no longer binds JavaScript/TypeScript,
+  C/C++, Java, C#, Go or Rust lexical calls to same-named authorities from an
+  incompatible language family.
+- Focus TODO evidence now requires an observed comment marker, avoiding false
+  work items from identifiers and ordinary string literals.
+
 ## [0.8.93] - 2026-08-05
 
 ### Changed
