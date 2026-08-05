@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.99] - 2026-08-05
+
+### Added
+
+- Dependency-free MCP dispatchers now return bounded recovery guidance and up
+  to three close registered names after a hallucinated tool call, without
+  aliasing or executing the suggestion automatically.
+- Known Bug Scanner findings now carry a line-movement-stable root-cause
+  fingerprint and deterministic duplicate summary alongside the existing
+  location-sensitive identity and static/runtime evidence boundary.
+- Added a source-pinned Strix capability review documenting adopted,
+  pre-existing, deferred and domain-specific concepts without importing code
+  or creating parallel authorities.
+
 ## [0.8.98] - 2026-08-05
 
 ### Fixed

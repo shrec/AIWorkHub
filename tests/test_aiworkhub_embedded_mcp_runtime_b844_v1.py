@@ -237,11 +237,15 @@ def test_stdlib_fallback_source_graph_schema_is_self_describing(fallback_server_
 def test_stdlib_fallback_rejects_unknown_tool_and_unknown_method(fallback_server_module):
     server_module = fallback_server_module
     tools = server_module.mcp._tools
-    with pytest.raises(server_module._StdioProtocolError):
+    with pytest.raises(server_module._StdioProtocolError) as unknown:
         server_module._stdio_dispatch(
             "AIWorkHub MCP", tools, "tools/call",
-            {"name": "definitely_not_a_real_tool", "arguments": {}},
+            {"name": "aiworkhub_dashboard_healt", "arguments": {}},
         )
+    payload = json.loads(unknown.value.message)
+    assert payload["retryable"] is True
+    assert payload["suggestions"][0] == "aiworkhub_dashboard_health"
+    assert len(payload["suggestions"]) <= 3
     with pytest.raises(server_module._StdioProtocolError):
         server_module._stdio_dispatch("AIWorkHub MCP", tools, "not/a/real/method", {})
 
