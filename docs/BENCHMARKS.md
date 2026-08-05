@@ -102,7 +102,7 @@ and CI checks its denominators with
 | Source Graph latency | 13 current calls | p50 15.024 ms; p95 39.014 ms | Verified snapshot | Graph lookup overhead was small in this repository/runtime snapshot |
 | Source Graph historical coverage | 175-run KPI window | 92.2% live rate, 93.8% gate satisfaction, 97.3% useful-call rate | Verified snapshot with legacy rows | Older rows reduce mode/stage attribution; they are not equivalent to the cleaner 7-task cohort |
 | Tool-use association | 170 runs across three comparable telemetry cohorts | `missing` 7.2% review-ready; `live_single_stage` 26.7%; `continuous_use` 33.3% | Observed association | Live/continuous Source Graph use coincided with higher review-ready rates, but task difficulty, model and era are confounders; this is not causality |
-| Focused semantic edits | 3 authenticated edit receipts | 31,998 file bytes vs 531 replacement bytes; 1.66% replacement/file; 60.26× structural ratio; 0 old bytes re-emitted | Verified structural snapshot | Models returned small replacement bodies rather than full existing files; the 60.26× figure is a byte-shape ratio, not token savings |
+| Focused semantic edits | 3 authenticated edit receipts | 31,998 file bytes vs 531 replacement bytes; 1.66% replacement/file; 60.26× structural ratio; 0 old bytes re-emitted | Verified structural snapshot | This directly removes full-file code re-emission when that is the baseline and therefore reduces that code-output component; it is not a 60.26× claim for all provider output, reasoning, retries or total cost |
 | Semantic-edit provider A/B | 2 historical Codex GPT-5.5 pairs | Observed 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time; uncached input **20.3% higher** | Invalid for an uncapped causal claim | Explicit caps were present and pair 1 mismatched (`20k` vs `200k`); retain as historical observation only and rerun uncapped |
 | Provider read behavior | 5 tasks exposed usable provider evidence | 4 recognized read operations, all 4 bounded; 0 exact/overlap rereads; 15,820 bytes observed | Pilot telemetry | The measured Codex sample avoided whole-file/unbounded reads; other adapters were not observable, so no fleet-wide claim is allowed |
 | Context delivery | 156 tasks | Optional suppression removed 8,424 bytes (0.6%), but the signed envelope added 308,843 bytes; delivered context expanded by **300,419 bytes (20.0%)** | Verified negative result | Current context packaging is a measured optimization target, not a savings success; no raw-file or token counterfactual exists |
@@ -124,14 +124,22 @@ and CI checks its denominators with
 4. **Observable tool economics.** AIWorkHub records what the worker actually
    queried/read/emitted where the provider exposes evidence, and labels missing
    evidence instead of turning it into zero.
-5. **No proven universal token multiplier yet.** The Source Graph's end-to-end
+5. **A model portfolio instead of one premium default.** Codex, Claude,
+   DeepSeek, GLM and Copilot are execution routes rather than products the
+   control plane replaces. Bounded throughput can go to an economical capable
+   route while frontier models remain available for difficult judgment and
+   review. Savings count only when validation and manager acceptance preserve
+   quality.
+6. **No proven universal token multiplier yet.** The Source Graph's end-to-end
    raw-file counterfactual, accepted-quality parity and multi-model randomized
    ablation remain unmeasured.
 
-## How AIWorkHub differs from adjacent tools
+## AIWorkHub and its adjacent execution/context tools
 
 This is a capability comparison based on each project's linked official
-documentation, not a claim that AIWorkHub wins their benchmarks.
+documentation. These systems are not presented as direct competitors: coding
+agents are potential execution routes, while graph, retrieval and editing
+toolkits can be complementary context capabilities.
 
 | Capability | AIWorkHub | Graphify | Serena | Aider | Cline |
 | --- | --- | --- | --- | --- | --- |
@@ -153,9 +161,10 @@ Official comparison sources:
 Graphify currently documents richer graph-community/path analysis and broader
 non-code ingestion. Serena documents deeper LSP/IDE refactoring. Aider has a
 mature token-budgeted repo-map and coding benchmark program. Cline has a broader
-standalone agent/product ecosystem. **AIWorkHub's present differentiation is
-not proven superiority in those individual components; it is their integration
-into one local, repository-scoped, evidence-gated multi-model control loop.**
+standalone agent/product ecosystem. **AIWorkHub does not need to outperform a
+coding agent at coding or a graph toolkit at graph analysis. Its role is to
+integrate those capabilities into one local, repository-scoped,
+evidence-gated, quality-aware and cost-aware multi-model control loop.**
 
 ## Promotion gate for a real product-economics claim
 

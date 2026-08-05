@@ -62,7 +62,7 @@
       <div>
         <span class="eyebrow">Open source · Local first · Repository native</span>
         <h1>One control plane for your coding models.</h1>
-        <p class="hero-copy">AIWorkHub is an open-source multi-model AI coding agent orchestrator for VS Code and MCP. Coordinate Codex, Claude, Copilot, DeepSeek and GLM workers through dependency-aware tasks, durable project context, source-code intelligence and evidence-based review.</p>
+        <p class="hero-copy">AIWorkHub is an open-source multi-model AI coding agent control plane for VS Code and MCP. It does not replace Codex, Claude, Copilot, DeepSeek or GLM—it turns them into one repository-scoped workforce with dependency-aware tasks, durable context, source intelligence and evidence-based review.</p>
         <div class="actions">
           <a class="button primary" href="https://marketplace.visualstudio.com/items?itemName=IvaneChkheidze.aiworkhub">Install from VS Code Marketplace</a>
           <a class="button" href="/AIWorkHub/docs/">Read the documentation</a>
@@ -97,6 +97,31 @@
         <article class="card"><span class="number">05</span><h3><a href="/AIWorkHub/multi-agent-coding/">Multi-agent planning</a></h3><p>Parallelize independent cards while dependency and write-scope collision checks preserve task truth.</p></article>
         <article class="card"><span class="number">06</span><h3><a href="/AIWorkHub/vscode-extension/">VS Code and Remote SSH</a></h3><p>Use the editor models and authenticated CLIs you already have across Windows, macOS, Linux and Remote SSH.</p></article>
       </div>
+    </div></section>
+
+    <section class="section"><div class="container callout">
+      <span class="eyebrow">Model portfolio economics</span>
+      <h2>Use frontier models for judgment—not for every unit of work.</h2>
+      <p>AIWorkHub can reserve premium models for architecture, difficult reasoning and independent review while routing bounded research, tests, focused edits and mechanical throughput to lower-cost capable models. Source Graph and semantic edits reduce avoidable tokens on every route; model routing then reduces how many of the remaining tokens are bought from the most expensive model.</p>
+      <table class="evidence-table"><thead><tr><th>Layer</th><th>System action</th><th>Economic effect</th></tr></thead><tbody>
+        <tr><td><strong>Token efficiency</strong></td><td>Bounded graph context, bounded reads and replacement-only edits</td><td>Less unnecessary input and code-output payload</td></tr>
+        <tr><td><strong>Model-mix efficiency</strong></td><td>Match task difficulty to capability, readiness, observed quality and known cost</td><td>Fewer premium-model tokens for work an economical route can complete</td></tr>
+        <tr><td><strong>Attempt efficiency</strong></td><td>Preserve exact failure evidence and issue bounded residual rework</td><td>Fewer blind retries and less repeated context/work</td></tr>
+        <tr><td><strong>Deterministic offload</strong></td><td>Apply hash-bound edits and run validation locally</td><td>No model spend for operations that do not require model judgment</td></tr>
+      </tbody></table>
+      <p class="measurement-warning">The mechanism is shipped; the public system-wide ROI is not yet claimed. In the measured Claude cohort, Opus used 19% of tokens but 42.9% of known cost. AIWorkHub counts routing as a saving only after the cheaper route preserves validation and manager-accepted quality.</p>
+      <div class="actions"><a class="button primary" href="/AIWorkHub/benchmarks/#routing">Inspect routing evidence</a><a class="button" href="/AIWorkHub/ai-coding-agent-orchestration/">See the control loop</a></div>
+    </div></section>
+
+    <section class="section"><div class="container">
+      <div class="section-heading"><span class="eyebrow">The product category</span><h2>Control plane above the agents you already use.</h2><p>AIWorkHub does not compete with the models whose work it coordinates. Its real alternative is manual multi-chat orchestration or a custom stack of task boards, worktrees, context stores, scripts and review glue.</p></div>
+      <table class="evidence-table"><thead><tr><th>Layer</th><th>Examples</th><th>Role</th></tr></thead><tbody>
+        <tr><td><strong>Repository control plane</strong></td><td>AIWorkHub</td><td>Task authority, routing, context, isolation, evidence, callbacks, review and economics</td></tr>
+        <tr><td><strong>Supported workforce</strong></td><td>Codex, Claude, Copilot-hosted models, DeepSeek, GLM</td><td>Execution routes coordinated by AIWorkHub—not competitors</td></tr>
+        <tr><td><strong>Adjacent context/edit tools</strong></td><td>Graphify, Serena and similar toolkits</td><td>Complementary graph, retrieval or semantic capabilities</td></tr>
+        <tr><td><strong>Standalone agent clients</strong></td><td>Aider, Cline and similar products</td><td>Alternative execution experiences, not the same control-plane layer</td></tr>
+        <tr><td><strong>Actual alternative</strong></td><td>Manual coordination or custom in-house glue</td><td>Copy/paste context, hand-managed worktrees, retries and review state</td></tr>
+      </tbody></table>
     </div></section>
 
     <section class="section"><div class="container callout">

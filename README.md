@@ -53,8 +53,12 @@ is never presented as a missing model or repository blocker.
 
 ## Why AIWorkHub
 
-- **Spend less context.** Agents query a structural Source Graph and durable
-  project context instead of repeatedly scanning the same source tree.
+- **Use models as a portfolio.** Keep frontier models for difficult judgment,
+  route bounded throughput to lower-cost capable models, and use deterministic
+  tools where no model is needed.
+- **Reduce avoidable model work.** Agents query a structural Source Graph,
+  read bounded regions and emit focused replacements instead of repeatedly
+  scanning or regenerating whole files.
 - **Delegate safely.** Dependency-aware tasks run in bounded workspaces with
   explicit write scopes, timeouts and cancellation.
 - **Review evidence, not claims.** Diffs, tests, tool-use receipts, artifacts
@@ -63,6 +67,34 @@ is never presented as a missing model or repository blocker.
   state, callbacks, indexes, memories and audit trail.
 - **Use multiple models.** Route work by capability, readiness, cost and
   observed quality without moving project authority into a hosted service.
+
+Codex, Claude, Copilot, DeepSeek and GLM are not products AIWorkHub tries to
+replace. They are execution routes in its workforce. AIWorkHub supplies the
+repository-scoped planning, context, isolation, evidence, review and economics
+layer that lets expensive and economical models work together as one system.
+
+### Three layers of model economics
+
+| Lever | What AIWorkHub changes | User benefit | Current evidence boundary |
+| --- | --- | --- | --- |
+| **Token efficiency** | Source Graph discovery, bounded reads, focused context and replacement-only semantic edits | Less avoidable input and code-generation output on eligible work | 31,998 file bytes versus 531 replacement bytes is a verified 60.26× code-output shape ratio; total provider-token multiplier remains unmeasured |
+| **Model-mix efficiency** | Routes bounded throughput to lower-cost capable models and reserves premium models for hard judgment or review | The same useful workload can consume fewer expensive-model tokens even when total tokens are unchanged | In one 36-run Claude cohort, Opus was 19% of tokens but 42.9% of known cost; quality-adjusted cross-model savings are the next required measurement |
+| **Attempt efficiency** | Separates launch, validation, timeout and review failures so residual work can be repaired instead of blindly repeated | Fewer expensive retries and clearer reasons for rework | 47 of 114 historical attempts were retries and used 88.31M tokens; this locates the opportunity but does not claim every retry was avoidable |
+
+These levers compound: reducing a task's unnecessary tokens and then running
+the remaining bounded work on a cheaper capable model can lower cost more than
+either optimization alone. Every saving still has to preserve validation and
+manager-accepted quality; a cheap failed run is not an economic success.
+
+### Where AIWorkHub sits
+
+| Layer | Examples | Relationship to AIWorkHub |
+| --- | --- | --- |
+| **Repository control plane** | AIWorkHub | Owns task truth, dependencies, routing, context authorities, isolation, evidence, callbacks, review and economics telemetry |
+| **Supported execution workforce** | Codex, Claude, Copilot-hosted models, DeepSeek, GLM | Models and agent runtimes AIWorkHub coordinates; they are not competitors |
+| **Adjacent context/edit tooling** | Graphify, Serena and similar graph or semantic toolkits | Complementary ideas/capabilities; they do not provide the same complete repository control loop |
+| **Standalone coding-agent products** | Aider, Cline and similar clients | Alternative execution experiences, not the same product layer |
+| **Actual alternative today** | Manual multi-chat coordination or custom in-house glue | The workflow AIWorkHub replaces: copy/paste context, hand-managed worktrees, retries and review state |
 
 ## Source intelligence and durable context
 
@@ -108,14 +140,14 @@ negative and still-unmeasured results.
 | Evidence | Current observation | Status |
 | --- | --- | --- |
 | Focused-edit paired pilot | 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time; uncached input was 20.3% higher | Pilot, `n=2`; not a product multiplier |
-| Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified byte shape; not token savings |
+| Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified reduction in emitted code payload when a full-file baseline applies; not a 60.26× claim for the complete provider bill |
 | Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
 | Tool-use cohorts | Review-ready rate was 7.2% with missing graph use, 26.7% with live single-stage use and 33.3% with continuous use | Observational association; not causality |
 | Context packaging | 156-task payload expanded 20.0% after envelope overhead | Verified negative result and optimization target |
 | Callback durability | 271 events, zero dead letters and zero backlog | Verified runtime snapshot |
 
 See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators,
-competitor capability comparison, raw ledgers and the promotion gate required
+adjacent-tool capability boundaries, raw ledgers and the promotion gate required
 before publishing any universal savings claim.
 
 ## How it works
