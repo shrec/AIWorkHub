@@ -109,10 +109,44 @@ def test_findings_preserve_static_candidate_truth_boundary(tmp_path: Path):
     assert finding["cwe"] == "CWE-295"
     assert finding["verification_state"] == "static_candidate"
     assert finding["runtime_validated"] is False
+    assert len(finding["root_cause_fingerprint"]) == 64
     assert report["evidence_summary"] == {
         "static_candidates": 1,
         "runtime_validated": 0,
         "claim_boundary": "static_pattern_not_runtime_reproduction",
+    }
+
+
+def test_root_cause_identity_survives_unrelated_line_movement(tmp_path: Path):
+    path = tmp_path / "runner.py"
+    path.write_text("subprocess.run(value, shell=True)\n", encoding="utf-8")
+    first = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    path.write_text(
+        "unrelated = 1\nsubprocess.run(value, shell=True)\n",
+        encoding="utf-8",
+    )
+    second = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    assert first["findings"][0]["fingerprint"] != second["findings"][0]["fingerprint"]
+    assert first["findings"][0]["root_cause_fingerprint"] == (
+        second["findings"][0]["root_cause_fingerprint"]
+    )
+
+
+def test_duplicate_static_candidates_are_counted_without_being_dropped(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "runner.py").write_text(
+        "subprocess.run(value, shell=True)\n"
+        "subprocess.run(value, shell=True)\n",
+        encoding="utf-8",
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    assert len(report["findings"]) == 2
+    assert report["dedupe_summary"] == {
+        "candidate_count": 2,
+        "unique_root_causes": 1,
+        "duplicate_candidates": 1,
+        "identity_scope": "rule_path_normalized_source",
     }
 
 
@@ -129,4 +163,5 @@ def test_sarif_export_is_stable_and_does_not_upgrade_evidence(tmp_path: Path):
     assert result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "runner.py"
     assert result["properties"]["verificationState"] == "static_candidate"
     assert result["properties"]["runtimeValidated"] is False
+    assert len(result["partialFingerprints"]["aiworkhubRootCauseFingerprint"]) == 64
     assert run["properties"]["claimBoundary"] == "static_pattern_not_runtime_reproduction"

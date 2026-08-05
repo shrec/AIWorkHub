@@ -276,7 +276,8 @@ model usage records.
 
 ### Evidence instrumentation closure
 
-The 16-item evidence/tool-economics instrument set is implemented. It includes
+**Closed in 0.8.96 and regression-verified for 0.8.99:** the 16-item
+evidence/tool-economics instrument set is implemented. It includes
 Source Graph recommendation roundtrips and retrieval precision, registry-driven
 eval truth, attempt-bound provider usage with retention protection, generation
 quality, compact replay, authenticated receipt conformance, pre-promotion review
@@ -373,6 +374,13 @@ JSON or SARIF 2.1.0. Every result remains explicitly a `static_candidate` with
 stronger evidence. This adopts the useful validated-finding/CI handoff pattern
 seen in agentic security tools without importing their runtime, code, or a
 security-specific orchestration model into AIWorkHub.
+
+The bounded [Strix capability review](STRIX_CAPABILITY_REVIEW.md) added two
+repository-neutral refinements without importing its runtime: recoverable
+unknown-tool guidance and stable deterministic root-cause fingerprints for
+static findings. Agent graph, durable state, notes/todos, SARIF, usage ledgers,
+sandboxing and progressive context already map to existing canonical AIWorkHub
+authorities, so no parallel lifecycle or storage layer was added.
 
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and

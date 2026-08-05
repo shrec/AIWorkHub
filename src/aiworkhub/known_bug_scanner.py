@@ -138,10 +138,15 @@ def _rotation(selector: int) -> int | None:
 
 def _finding(rule: Rule, path: str, line: int, column: int, snippet: str) -> dict:
     digest = hashlib.sha256(f"{rule.rule_id}\0{path}\0{line}\0{snippet}".encode()).hexdigest()
+    normalized_snippet = " ".join(snippet.strip().split())[:300]
+    root_cause_fingerprint = hashlib.sha256(
+        f"{rule.rule_id}\0{path}\0{normalized_snippet}".encode()
+    ).hexdigest()
     return {"rule_id": rule.rule_id, "path": path, "line": line, "column": column,
             "severity": rule.severity, "category": rule.category, "message": rule.message,
             "cwe": CWE_BY_CATEGORY.get(rule.category, ""),
             "snippet": snippet.strip()[:300], "fingerprint": digest,
+            "root_cause_fingerprint": root_cause_fingerprint,
             # A deterministic source pattern can be blocking without being a
             # claim that the defect was exercised at runtime.  Keeping this
             # boundary explicit prevents static candidates from masquerading
@@ -251,10 +256,20 @@ def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> d
         if len(findings) >= MAX_FINDINGS:
             break
     errors = sum(row["severity"] == "error" for row in findings)
+    retained = findings[:MAX_FINDINGS]
+    unique_root_causes = len({
+        row["root_cause_fingerprint"] for row in retained
+    })
     return {"schema_id": SCHEMA_ID, "passed": errors == 0, "errors": errors,
             "warnings": sum(row["severity"] == "warning" for row in findings),
-            "paths_considered": len(paths), "findings": findings[:MAX_FINDINGS],
+            "paths_considered": len(paths), "findings": retained,
             "truncated": len(findings) > MAX_FINDINGS,
+            "dedupe_summary": {
+                "candidate_count": len(retained),
+                "unique_root_causes": unique_root_causes,
+                "duplicate_candidates": len(retained) - unique_root_causes,
+                "identity_scope": "rule_path_normalized_source",
+            },
             "evidence_summary": {
                 "static_candidates": min(len(findings), MAX_FINDINGS),
                 "runtime_validated": 0,
@@ -300,7 +315,10 @@ def to_sarif(report: dict) -> dict:
                 }
             }],
             "partialFingerprints": {
-                "aiworkhubFindingFingerprint": str(finding.get("fingerprint") or "")
+                "aiworkhubFindingFingerprint": str(finding.get("fingerprint") or ""),
+                "aiworkhubRootCauseFingerprint": str(
+                    finding.get("root_cause_fingerprint") or ""
+                ),
             },
             "properties": {
                 "category": category,

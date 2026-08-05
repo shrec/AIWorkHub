@@ -15,6 +15,7 @@ import typing
 from typing import Any
 
 from . import __version__
+from .tool_recovery import unknown_tool_message
 
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -135,7 +136,7 @@ def _tool_result(tools: dict[str, Any], params: Any) -> dict[str, Any]:
         raise ProtocolError(-32602, "invalid_params")
     name = params.get("name")
     if not isinstance(name, str) or name not in tools:
-        raise ProtocolError(-32602, f"unknown_tool:{name!r}")
+        raise ProtocolError(-32602, unknown_tool_message(name, tools))
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         raise ProtocolError(-32602, "arguments_must_be_object")

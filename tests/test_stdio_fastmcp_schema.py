@@ -54,3 +54,30 @@ def test_worker_stdio_writes_georgian_as_binary_utf8(monkeypatch) -> None:
 
     decoded = json.loads(output.getvalue().decode("utf-8"))
     assert decoded["result"]["text"] == "ქართული პასუხი"
+
+
+def test_unknown_tool_error_does_not_terminate_following_requests(monkeypatch) -> None:
+    request_stream = io.BytesIO(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"real_tol","arguments":{}}}\n'
+        b'{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}\n'
+    )
+    response_stream = io.BytesIO()
+
+    class Input:
+        buffer = request_stream
+
+    class Output:
+        buffer = response_stream
+
+    monkeypatch.setattr(stdio_fastmcp.sys, "stdin", Input())
+    monkeypatch.setattr(stdio_fastmcp.sys, "stdout", Output())
+    stdio_fastmcp._run("worker", {"real_tool": lambda: {}})
+
+    responses = [
+        json.loads(line)
+        for line in response_stream.getvalue().decode("utf-8").splitlines()
+    ]
+    error = json.loads(responses[0]["error"]["message"])
+    assert error["suggestions"] == ["real_tool"]
+    assert responses[1] == {"jsonrpc": "2.0", "id": 2, "result": {}}

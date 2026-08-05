@@ -11,6 +11,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
+from .tool_recovery import unknown_tool_message
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError:
@@ -145,7 +147,7 @@ except ModuleNotFoundError:
             raise _StdioProtocolError(-32602, "invalid_params")
         name = params.get("name")
         if not isinstance(name, str) or name not in tools:
-            raise _StdioProtocolError(-32602, f"unknown_tool:{name!r}")
+            raise _StdioProtocolError(-32602, unknown_tool_message(name, tools))
         arguments = params.get("arguments")
         if arguments is None:
             arguments = {}
