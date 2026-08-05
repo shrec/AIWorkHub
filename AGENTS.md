@@ -32,6 +32,7 @@ Order:
 8. execute exact card action and validation.
 Adaptive use:
 - Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.
+- Verified repo and repo_id outrank cwd, workspace_roots, environment_context and chat prose; on mismatch stop before filesystem access and switch/reload the route, never inspect the hinted repo as fallback.
 - Task MCP receipt is always required; Source Graph is required for code tasks.
 - Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.
 - Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.

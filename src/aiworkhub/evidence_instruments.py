@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -27,6 +29,10 @@ MAX_ROWS = 100_000
 
 class EvidenceInstrumentError(ValueError):
     pass
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_FILE_RECEIPT_SHA256_RE = re.compile(r"file:[0-7]{3,4}:([0-9a-f]{64})")
 
 
 def _relative(value: Any) -> str:
@@ -57,6 +63,36 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _receipt_sha256(value: Any) -> str:
+    """Return one exact legacy/raw content digest, or an empty string.
+
+    Changed-path receipts use this raw form. Required-output manifests have a
+    richer token and are checked by ``_required_output_hash_matches`` so the
+    file mode is not discarded.
+    """
+
+    text = str(value or "")
+    if _SHA256_RE.fullmatch(text):
+        return text
+    return ""
+
+
+def _required_output_hash_matches(path: Path, value: Any) -> bool:
+    """Compare raw legacy hashes or exact ``file:<mode>:<sha>`` tokens."""
+
+    text = str(value or "")
+    raw = _receipt_sha256(text)
+    if raw:
+        return _sha256(path) == raw
+    match = _FILE_RECEIPT_SHA256_RE.fullmatch(text)
+    if not match:
+        return False
+    observed = (
+        f"file:{stat.S_IMODE(path.stat().st_mode):o}:{_sha256(path)}"
+    )
+    return observed == text
 
 
 def _json_rows(root: Path, relative: str) -> list[dict[str, Any]]:
@@ -102,7 +138,7 @@ def review_evidence_audit(
             relative = _relative(raw)
             normalized.append(relative)
             path = _regular(candidate, relative)
-            expected = str(stored_hashes.get(relative) or "")
+            expected = _receipt_sha256(stored_hashes.get(relative))
             observed = _sha256(path)
             if len(expected) != 64 or observed != expected:
                 blockers.append(f"changed_path_hash_mismatch:{relative}")
@@ -120,8 +156,10 @@ def review_evidence_audit(
             continue
         try:
             path = _regular(candidate, relative)
-            expected = str(record.get("sha256") or "")
-            if expected and _sha256(path) != expected:
+            expected_value = record.get("sha256")
+            if expected_value and not _required_output_hash_matches(
+                path, expected_value
+            ):
                 blockers.append(f"required_output_hash_mismatch:{relative}")
             declared_bytes = record.get("bytes")
             if declared_bytes is not None and int(declared_bytes) != path.stat().st_size:

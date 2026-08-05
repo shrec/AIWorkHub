@@ -495,6 +495,9 @@ def test_manager_bootstrap_describes_current_repo_manager_callback_ownership(tmp
     assert "audit provenance" in contract["callback"]["codex"]
     assert "optional explicit claim" in contract["operating_contract"]["task_state_machine"]["claim"]
     assert "always required" in contract["operating_contract"]["task_state_machine"]["launch"]
+    authority = " ".join(contract["operating_contract"]["authority"])
+    assert "override host cwd, workspace_roots, environment_context" in authority
+    assert "never inspect the hinted repository as fallback" in authority
     assert not any("auto_pickup or" in step for step in contract["workflow"])
 
 

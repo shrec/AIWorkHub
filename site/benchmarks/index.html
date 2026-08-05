@@ -12,7 +12,7 @@
 <tr><td>Source Graph gate</td><td>7 current gated tasks</td><td>7/7 live and satisfied; 13 calls, 0 failures, 846 hits; p50 15.024 ms</td><td>Verified snapshot</td></tr>
 <tr><td>Tool-use cohorts</td><td>170 observed runs</td><td>Review-ready: missing 7.2%; live single-stage 26.7%; continuous 33.3%</td><td>Association, not causality</td></tr>
 <tr><td>Focused edit shape</td><td>3 authenticated receipts</td><td>531 replacement bytes / 31,998 file bytes; 1.66%; 60.26× structural ratio; 0 old bytes re-emitted</td><td>Structural only</td></tr>
-<tr><td>Focused edit A/B</td><td>2 paired Codex runs</td><td>27.5% fewer total tokens; 24.9% fewer output tokens; 21.5% less time; uncached input <strong>20.3% higher</strong></td><td>Pilot only</td></tr>
+<tr><td>Focused edit A/B</td><td>2 paired Codex runs</td><td>Historical capped A/B observation: 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less time; pair 1 used mismatched <code>20k</code>/<code>200k</code> token ceilings</td><td>Not eligible for a causal or product-savings claim; uncapped matched rerun required</td></tr>
 <tr><td>Read behavior</td><td>5 trace-visible tasks</td><td>4/4 recognized reads bounded; 0 exact/overlap rereads; 15,820 bytes</td><td>Small Codex-only pilot</td></tr>
 <tr><td>Legacy Context Bundle v1</td><td>156 tasks on 0.8.81</td><td class="contrary">300,419 net bytes added; 20.0% expansion after envelope overhead</td><td>Verified historical baseline; not current v2 behavior</td></tr>
 <tr><td>Context Bundle v2 structural fix</td><td>One deterministic same-evidence fixture</td><td>849 legacy bytes → 600 nested bytes; 29.329% structural reduction</td><td>Shipped in 0.8.82; equivalent live fleet remeasurement pending</td></tr>

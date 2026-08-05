@@ -11,6 +11,35 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNAPSHOT = ROOT / "benchmarks" / "system-benefit-snapshot-v1.json"
 DEFAULT_SEMANTIC_EDIT_PILOT = ROOT / "benchmarks" / "semantic-edit-pilot-v1.json"
+PUBLIC_CLAIM_SURFACES = (
+    "README.md",
+    "site/index.html",
+    "site/benchmarks/index.html",
+)
+
+
+def check_public_claim_surfaces(root: Path = ROOT) -> list[str]:
+    """Keep public copy behind the canonical paired-evidence verdict."""
+
+    errors: list[str] = []
+    for relative in PUBLIC_CLAIM_SURFACES:
+        path = root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"public_claim_surface_unreadable:{relative}:{exc}")
+            continue
+        if "historical capped a/b observation" not in text.lower():
+            errors.append(f"public_claim_boundary_missing:{relative}")
+        if "20k" not in text or "200k" not in text:
+            errors.append(f"public_claim_cap_mismatch_missing:{relative}")
+        if relative == "README.md" and "| Pilot, `n=2`;" in text:
+            errors.append("public_claim_stale_pilot_status:README.md")
+        if relative == "site/benchmarks/index.html" and ">Pilot only<" in text:
+            errors.append("public_claim_stale_pilot_status:site/benchmarks/index.html")
+        if relative == "site/index.html" and "<strong>27.5%</strong>" in text:
+            errors.append("public_claim_standalone_metric:site/index.html")
+    return errors
 
 
 def _rate(numerator: float, denominator: float, digits: int = 1) -> float:
@@ -194,6 +223,11 @@ def check(
     for key, expected_value in required_limits.items():
         if claims.get(key) != expected_value:
             errors.append(f"unsafe_claim_status:{key}")
+    if (
+        path.resolve() == DEFAULT_SNAPSHOT.resolve()
+        and semantic_edit_path.resolve() == DEFAULT_SEMANTIC_EDIT_PILOT.resolve()
+    ):
+        errors.extend(check_public_claim_surfaces())
     return errors
 
 

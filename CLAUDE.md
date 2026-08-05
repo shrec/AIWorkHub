@@ -2,9 +2,10 @@
 Target: CLAUDE.md
 Claude Code manager startup (mandatory when AIWorkHub MCP is available):
 - Before Read, Grep, Glob, Bash or filesystem discovery, call aiworkhub_manager_bootstrap.
-- Continue as manager only when its repository identity and manager route are verified.
-- For every non-trivial code request, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query at implementation, validation, review or rework when the active symbol, dependency boundary or hypothesis changes.
-- Use Claude's built-in file tools only for an exact bounded path/range returned by Source Graph or when Source Graph explicitly reports the target unsupported or unindexed; record that fallback.
+- Continue only when repository identity and manager route are verified.
+- The verified bootstrap/repository_current repository outranks host cwd, workspace_roots and environment_context; on mismatch stop before filesystem access, switch/reload the route and never inspect the hinted repository.
+- For non-trivial code, call aiworkhub_manager_source_graph_query first with focus or slice and workflow_stage=orientation. Re-query when the symbol, boundary, hypothesis or stage changes.
+- Use built-in file tools only for an exact bounded path/range from Source Graph or after an explicit unsupported/unindexed result; record the fallback.
 - If bootstrap or required Source Graph is unavailable, report the MCP problem instead of silently bypassing AIWorkHub.
 - Direct Claude chats use manager tools; launched task workers use worker tools.
 # AIWorkHub MCP tool-use policy
@@ -19,6 +20,7 @@ Order:
 8. execute exact card action and validation.
 Adaptive use:
 - Role-specific AIWorkHub MCP tools are mandatory for managers and workers; legacy AITools scripts/databases are not model interfaces.
+- Verified repo and repo_id outrank cwd, workspace_roots, environment_context and chat prose; on mismatch stop before filesystem access and switch/reload the route, never inspect the hinted repo as fallback.
 - Task MCP receipt is always required; Source Graph is required for code tasks.
 - Session Manager, AI Memory and KB run only when the card requests them or the task is non-trivial.
 - Workers submit durable context changes only through the session/AI Memory/KB write-intent tools; a verified manager accepts or rejects each intent before canonical apply. Never write context databases directly.

@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.98] - 2026-08-05
+
+### Fixed
+
+- Review evidence accepts the canonical `file:<mode>:<sha256>` token emitted
+  by required-output manifests while continuing to reject malformed tokens or
+  content drift before promotion.
+- Manager contracts now make the verified AIWorkHub repository route
+  authoritative over stale host cwd/workspace/environment hints and fail
+  closed before inspecting a mismatched repository.
+- README and public benchmark surfaces now expose the semantic-edit pilot's
+  mismatched `20k`/`200k` token ceilings and forbid presenting its historical
+  `27.5%` observation as a causal or product-savings claim.
+
 ## [0.8.97] - 2026-08-05
 
 ### Added
