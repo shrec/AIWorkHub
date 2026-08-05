@@ -27,6 +27,7 @@ from aiworkhub import (
     deepseek_credentials,
     process_launcher,
     repo_policy,
+    source_graph_daemon,
     storage_observability,
     task_plan,
     task_store,
@@ -1715,6 +1716,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "agent_processes": {},
             "adapter_readiness": {},
             "source_graph_telemetry": _source_graph_telemetry({}),
+            "source_graph_index_health": {},
             "read_efficiency_telemetry": _read_efficiency_telemetry({}),
             "project_context_telemetry": _project_context_telemetry({}),
             "kpi_analytics": dashboard_kpis.build_kpi_snapshot(
@@ -1971,6 +1973,15 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         row_counts[status] = {"returned": 0, "exact": exact, "truncated": exact > 0}
 
     source_graph_telemetry = _source_graph_telemetry(process_report)
+    source_graph_index_health = _safe_read(
+        "source_graph_index_health",
+        partial(
+            source_graph_daemon.daemon_health,
+            Path(provider_root or _default_repo_root()).resolve(),
+        ),
+        errors,
+        {},
+    )
     read_efficiency_telemetry = _read_efficiency_telemetry(process_report)
     project_context_telemetry = _project_context_telemetry(process_report)
     cost_totals = _cost_totals(ledger)
@@ -2021,6 +2032,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "environment_preflight": dict(environment_preflight),
         "workforce_catalog": dict(workforce),
         "source_graph_telemetry": source_graph_telemetry,
+        "source_graph_index_health": dict(source_graph_index_health),
         "read_efficiency_telemetry": read_efficiency_telemetry,
         "project_context_telemetry": project_context_telemetry,
         "kpi_analytics": kpi_analytics,

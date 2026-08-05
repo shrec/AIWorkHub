@@ -279,7 +279,57 @@ class SourceGraphDaemon:
                     return True
                 if kind != "success":
                     raise RuntimeError(str(outcome.get("error") or "index_build_failed"))
-                report = outcome["report"]
+                report = dict(outcome["report"])
+                # The query engine and MCP wrapper have different failure
+                # surfaces.  Exercise the exact shared manager/worker wrapper
+                # once per committed generation so health can distinguish an
+                # emission/index fault from a wrapper regression instead of
+                # discovering it after a worker wastes a follow-up call.
+                try:
+                    from . import worker_ai_tools_mcp
+
+                    selfcheck_context = worker_ai_tools_mcp.WorkerToolContext(
+                        task_id="source-graph:selfcheck",
+                        runner="source_graph_daemon",
+                        topic="source_graph_health",
+                        request_id=f"source-graph:{report.get('finished_at') or _utcnow()}",
+                        repo=self.repo_root,
+                        authority_repo=self.repo_root,
+                        source_graph_targets=(),
+                        session_topic="source_graph_health",
+                        audit_ledger_path=None,
+                        audit_hmac_key_path=None,
+                    )
+                    recommendation = (
+                        worker_ai_tools_mcp.source_graph_recommendation_roundtrip_gate(
+                            selfcheck_context,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 -- telemetry cannot erase a good index
+                    recommendation = {
+                        "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
+                        "ok": False,
+                        "status": "probe_failed",
+                        "error": f"{type(exc).__name__}:{exc}"[:300],
+                        "sampled_symbols": 0,
+                        "emitted": 0,
+                        "resolved": 0,
+                        "resolvability_ratio": None,
+                        "failures": [],
+                    }
+                recommendation["build_revision"] = str(
+                    report.get("build_revision") or source_graph.BUILD_REVISION
+                )
+                recommendation["finished_at"] = str(report.get("finished_at") or "")
+                try:
+                    source_graph.record_recommendation_roundtrip(
+                        self.repo_root, recommendation,
+                    )
+                except (OSError, sqlite3.Error, source_graph.SourceGraphError) as exc:
+                    recommendation["persistence_error"] = (
+                        f"{type(exc).__name__}:{exc}"[:300]
+                    )
+                report["recommendation_resolvability"] = recommendation
                 with self._state_lock:
                     # A successful SQLite transaction is not the same thing
                     # as a usable Source Graph.  Keep empty repositories
@@ -532,6 +582,9 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "last_error": "",
             "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
             "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
+            "index_quality": None,
+            "recommendation_resolvability": None,
+            "guidance_degraded": False,
             "registered": False,
         }
     out = daemon.health()
@@ -548,17 +601,24 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
         and int(out.get("files_seen") or 0) > 0
     )
     out["generation_read_error"] = ""
+    out["index_quality"] = None
+    out["recommendation_resolvability"] = None
+    out["guidance_degraded"] = False
     try:
         db_path = source_graph.resolve_db_path(Path(repo_root).resolve())
         if db_path.exists():
             conn = source_graph.connect(db_path, read_only=True)
             try:
-                row = conn.execute(
-                    "SELECT value FROM meta WHERE key='last_build'"
-                ).fetchone()
+                rows = {
+                    str(row["key"]): str(row["value"])
+                    for row in conn.execute(
+                        "SELECT key, value FROM meta WHERE key IN "
+                        "('last_build','index_quality','recommendation_roundtrip')"
+                    )
+                }
             finally:
                 conn.close()
-            payload = json.loads(row["value"]) if row is not None else {}
+            payload = json.loads(rows.get("last_build", "{}"))
             finished_at = str(payload.get("finished_at") or "")
             build_revision = str(payload.get("build_revision") or "")
             files_seen = int(payload.get("files_seen") or 0)
@@ -588,6 +648,29 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
                         # remains visible through writer_state/running.
                         out["ok"] = True
                         out["stale_reason"] = ""
+            for meta_key, health_key in (
+                ("index_quality", "index_quality"),
+                ("recommendation_roundtrip", "recommendation_resolvability"),
+            ):
+                raw = rows.get(meta_key)
+                metric = json.loads(raw) if raw else None
+                if not isinstance(metric, dict):
+                    out[health_key] = None
+                    continue
+                same_generation = (
+                    str(metric.get("build_revision") or "") == build_revision
+                    and str(metric.get("finished_at") or "") == finished_at
+                )
+                out[health_key] = {
+                    **metric,
+                    "current_generation": same_generation,
+                }
+            recommendation = out.get("recommendation_resolvability")
+            out["guidance_degraded"] = bool(
+                isinstance(recommendation, dict)
+                and recommendation.get("current_generation")
+                and recommendation.get("status") != "ready"
+            )
     except (
         OSError,
         ValueError,

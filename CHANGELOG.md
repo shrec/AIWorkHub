@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.95] - 2026-08-05
+
+### Added
+
+- Source Graph now stores a generation-bound index-quality scorecard with
+  resolved-edge ratio, cross-language bindings, artifact share, per-language
+  density, database/freelist measurements and a bounded 100-generation trend.
+- Every completed Source Graph refresh replays sampled `focus` guidance and
+  candidate files through the production manager/worker MCP wrapper. Health
+  reports the resolvability ratio and attributes misses to the wrapper or the
+  engine/emitter layer.
+- Operations → Tool Use displays recommendation resolvability and structural
+  index-quality metrics without converting them into token or quality claims.
+
 ## [0.8.94] - 2026-08-05
 
 ### Changed

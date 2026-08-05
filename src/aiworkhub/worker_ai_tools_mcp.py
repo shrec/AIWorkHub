@@ -1613,6 +1613,139 @@ def source_graph_query(
     return result
 
 
+def source_graph_recommendation_roundtrip_gate(
+    ctx: WorkerToolContext,
+    *,
+    sample_limit: int = 6,
+) -> dict[str, Any]:
+    """Replay emitted guidance through the production MCP wrapper path.
+
+    The manager MCP delegates to :func:`source_graph_query`, so this single
+    probe exercises the shared manager/worker wrapper, including authority
+    resolution, bounded canonical JSON, hit counting and cache behavior.  A
+    direct engine replay is performed only after a wrapper miss so the defect
+    is attributed to either emission/engine or wrapper handling.
+    """
+
+    from . import source_graph as _source_graph_mod
+
+    sample_limit = max(1, min(int(sample_limit), 16))
+    try:
+        binding = _resolve_source_graph_db(ctx)
+        conn = _source_graph_mod.connect(binding.db_path, read_only=True)
+        try:
+            seeds = [
+                str(row["qualname"])
+                for row in conn.execute(
+                    "SELECT qualname FROM entities WHERE qualname != '' "
+                    "ORDER BY confidence DESC, qualname, file_path LIMIT ?",
+                    (sample_limit,),
+                )
+            ]
+        finally:
+            conn.close()
+    except (WorkerToolError, OSError, sqlite3.Error) as exc:
+        return {
+            "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
+            "ok": False,
+            "status": "probe_unavailable",
+            "error": f"{type(exc).__name__}:{exc}"[:240],
+            "sampled_symbols": 0,
+            "emitted": 0,
+            "resolved": 0,
+            "resolvability_ratio": None,
+            "failures": [],
+        }
+
+    emitted: dict[tuple[str, str], dict[str, str]] = {}
+    seed_failures: list[dict[str, str]] = []
+    for seed in seeds:
+        focus_result = source_graph_query(
+            ctx, mode="focus", query=seed, budget=16,
+            workflow_stage="orientation",
+        )
+        if not focus_result.get("ok") or int(focus_result.get("hit_count") or 0) < 1:
+            seed_failures.append({
+                "kind": "focus_seed",
+                "value": seed,
+                "layer": "wrapper",
+                "reason": str(focus_result.get("error") or "zero_hits")[:160],
+            })
+            continue
+        try:
+            payload = json.loads(str(focus_result.get("content") or "{}"))
+        except json.JSONDecodeError:
+            seed_failures.append({
+                "kind": "focus_seed",
+                "value": seed,
+                "layer": "wrapper",
+                "reason": "non_json_content",
+            })
+            continue
+        for raw_step in payload.get("recommended_next_steps") or []:
+            if not isinstance(raw_step, str) or ":" not in raw_step:
+                continue
+            mode, value = raw_step.split(":", 1)
+            if mode in {"slice", "context"} and value.strip():
+                emitted[(mode, value.strip())] = {
+                    "kind": "recommended_next_step", "source": seed,
+                }
+        for raw_file in payload.get("candidate_files") or []:
+            if isinstance(raw_file, str) and raw_file.strip():
+                emitted[("file", raw_file.strip())] = {
+                    "kind": "candidate_file", "source": seed,
+                }
+
+    failures = list(seed_failures)
+    resolved = 0
+    for (mode, value), origin in sorted(emitted.items()):
+        wrapped = source_graph_query(
+            ctx,
+            mode=mode,  # type: ignore[arg-type]
+            query=value,
+            budget=16,
+            workflow_stage="orientation",
+        )
+        if wrapped.get("ok") and int(wrapped.get("hit_count") or 0) >= 1:
+            resolved += 1
+            continue
+        try:
+            if mode == "slice":
+                direct = _source_graph_mod.slice_(ctx.authority_repo, value, 16)
+            elif mode == "context":
+                direct = _source_graph_mod.context_query(ctx.authority_repo, value, 16)
+            else:
+                direct = _source_graph_mod.file_query(ctx.authority_repo, value, 16)
+            direct_hits = _json_hit_count(direct)
+        except (OSError, sqlite3.Error, _source_graph_mod.SourceGraphError):
+            direct_hits = 0
+        failures.append({
+            "kind": origin["kind"],
+            "value": f"{mode}:{value}",
+            "source": origin["source"],
+            "layer": "wrapper" if direct_hits >= 1 else "engine_or_emission",
+            "reason": str(wrapped.get("error") or "zero_hits")[:160],
+        })
+
+    total = len(emitted)
+    ratio = (resolved / total) if total else None
+    no_guidance = bool(seeds) and total == 0
+    ok = not failures and not no_guidance
+    return {
+        "schema_id": "aiworkhub.source_graph.recommendation_roundtrip.v1",
+        "ok": ok,
+        "status": "ready" if ok else "guidance_degraded",
+        "build_revision": _source_graph_mod.BUILD_REVISION,
+        "sampled_symbols": len(seeds),
+        "emitted": total,
+        "resolved": resolved,
+        "resolvability_ratio": round(ratio, 6) if ratio is not None else None,
+        "no_guidance_emitted": no_guidance,
+        "failures": failures[:32],
+        "measurement_boundary": "full_shared_mcp_wrapper_roundtrip",
+    }
+
+
 def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[str, Any]:
     """Bounded Session Manager current-state, scoped to this task's topic.
 
@@ -2758,5 +2891,6 @@ __all__ = [
     "resolve_host_package_import_root",
     "session_current_state",
     "source_graph_query",
+    "source_graph_recommendation_roundtrip_gate",
     "verify_audit_ledger",
 ]

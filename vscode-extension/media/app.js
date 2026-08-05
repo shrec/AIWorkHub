@@ -365,17 +365,28 @@ function renderSummary(snapshot) {
     && typeof snapshot.source_graph_telemetry === "object"
     ? snapshot.source_graph_telemetry
     : null;
+  const sourceGraphHealth = snapshot && snapshot.source_graph_index_health
+    && typeof snapshot.source_graph_index_health === "object"
+    ? snapshot.source_graph_index_health
+    : null;
   if (elements.headerSourceGraphRate && elements.headerSourceGraphDetail) {
     const gated = sourceGraph ? numberValue(sourceGraph.gated_tasks) : 0;
     const live = sourceGraph ? numberValue(sourceGraph.source_graph_live_tasks) : 0;
-    const injected = sourceGraph ? numberValue(sourceGraph.source_graph_injected_only_tasks) : 0;
     const violations = sourceGraph ? numberValue(sourceGraph.policy_violations) : 0;
     elements.headerSourceGraphRate.textContent = gated ? `${numberValue(sourceGraph.live_rate).toFixed(1)}% live` : "No sample";
+    const recommendation = sourceGraphHealth && sourceGraphHealth.recommendation_resolvability;
+    const resolvability = recommendation && Number.isFinite(Number(recommendation.resolvability_ratio))
+      ? `${(Number(recommendation.resolvability_ratio) * 100).toFixed(1)}% guidance`
+      : "guidance unmeasured";
     elements.headerSourceGraphDetail.textContent = gated
-      ? `${live}/${gated} live · ${injected} injected-only`
-      : "No gated tasks";
+      ? `${live}/${gated} live · ${resolvability}`
+      : resolvability;
+    const quality = sourceGraphHealth && sourceGraphHealth.index_quality;
+    const edgeRatio = quality && quality.edges && Number.isFinite(Number(quality.edges.resolved_ratio))
+      ? `${(Number(quality.edges.resolved_ratio) * 100).toFixed(1)}% resolved edges`
+      : "resolved edges unmeasured";
     elements.headerSourceGraph.title = sourceGraph
-      ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${numberValue(sourceGraph.source_graph_hit_count)} hits · ${numberValue(sourceGraph.source_graph_zero_hit_calls)} zero-hit · ${formatBytes(sourceGraph.source_graph_bytes)} measured return bytes · ${violations} MCP contract violations`
+      ? `${numberValue(sourceGraph.source_graph_calls)} calls · ${numberValue(sourceGraph.source_graph_hit_count)} hits · ${numberValue(sourceGraph.source_graph_zero_hit_calls)} zero-hit · ${formatBytes(sourceGraph.source_graph_bytes)} measured return bytes · ${resolvability} · ${edgeRatio} · ${violations} MCP contract violations`
       : "Source Graph telemetry unavailable";
   }
   const contextTelemetry = snapshot && snapshot.project_context_telemetry
@@ -807,7 +818,18 @@ function renderToolUse(snapshot) {
     && typeof telemetry.tool_call_counts === "object"
     ? telemetry.tool_call_counts
     : {};
-  if (!telemetry || (!numberValue(telemetry.gated_tasks) && !Object.keys(observedToolCounts).length)) {
+  const indexHealth = snapshot && snapshot.source_graph_index_health
+    && typeof snapshot.source_graph_index_health === "object"
+    ? snapshot.source_graph_index_health
+    : {};
+  const hasIndexHealth = Boolean(
+    indexHealth.index_quality || indexHealth.recommendation_resolvability,
+  );
+  if (!telemetry || (
+    !numberValue(telemetry.gated_tasks)
+    && !Object.keys(observedToolCounts).length
+    && !hasIndexHealth
+  )) {
     elements.toolUseList.replaceChildren(
       createElement("div", "panel-list-empty", "No authenticated worker tool-use evidence yet"),
     );
@@ -816,6 +838,22 @@ function renderToolUse(snapshot) {
 
   const fragment = document.createDocumentFragment();
   const overview = createElement("div", "usage-overview tool-use-overview");
+  const indexQuality = indexHealth.index_quality && typeof indexHealth.index_quality === "object"
+    ? indexHealth.index_quality
+    : {};
+  const edgeQuality = indexQuality.edges && typeof indexQuality.edges === "object"
+    ? indexQuality.edges
+    : {};
+  const artifactQuality = indexQuality.artifacts && typeof indexQuality.artifacts === "object"
+    ? indexQuality.artifacts
+    : {};
+  const storageQuality = indexQuality.storage && typeof indexQuality.storage === "object"
+    ? indexQuality.storage
+    : {};
+  const recommendation = indexHealth.recommendation_resolvability
+    && typeof indexHealth.recommendation_resolvability === "object"
+    ? indexHealth.recommendation_resolvability
+    : {};
   const overviewValues = [
     ["Live", `${numberValue(telemetry.live_rate).toFixed(1)}%`],
     ["Live tasks", `${formatCount(telemetry.source_graph_live_tasks)}/${formatCount(telemetry.gated_tasks)}`],
@@ -835,6 +873,17 @@ function renderToolUse(snapshot) {
     ["Raw discovery denied", formatCount(telemetry.raw_discovery_denials)],
     ["Denial evidence", `${formatCount(telemetry.provider_denial_evidence_tasks)}/${formatCount(telemetry.gated_tasks)} tasks`],
     ["Tampered", formatCount(telemetry.tampered_ledger_tasks)],
+    ["Guidance resolves", Number.isFinite(Number(recommendation.resolvability_ratio))
+      ? `${(Number(recommendation.resolvability_ratio) * 100).toFixed(1)}%`
+      : "Unmeasured"],
+    ["Resolved edges", Number.isFinite(Number(edgeQuality.resolved_ratio))
+      ? `${(Number(edgeQuality.resolved_ratio) * 100).toFixed(1)}%`
+      : "Unmeasured"],
+    ["Cross-language", formatCount(edgeQuality.cross_language)],
+    ["Artifact entities", Number.isFinite(Number(artifactQuality.entity_share))
+      ? `${(Number(artifactQuality.entity_share) * 100).toFixed(1)}%`
+      : "Unmeasured"],
+    ["Index DB", formatBytes(storageQuality.db_bytes)],
   ];
   for (const [label, value] of overviewValues) {
     const metric = createElement("div", "usage-metric");
@@ -846,6 +895,11 @@ function renderToolUse(snapshot) {
     "div",
     "telemetry-note",
     "Bytes are authenticated bounded tool return bytes. They are not inferred token or cost savings. Denial counts appear only when the provider emitted structured denial evidence.",
+  ));
+  fragment.appendChild(createElement(
+    "div",
+    "telemetry-note",
+    "Guidance and index-quality values are generation-bound structural measurements. They do not claim provider-token savings or model correctness.",
   ));
 
   const toolCounts = observedToolCounts;

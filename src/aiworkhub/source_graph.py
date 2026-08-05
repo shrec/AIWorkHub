@@ -38,7 +38,7 @@ import stat
 import sys
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -176,6 +176,12 @@ CREATE TABLE IF NOT EXISTS file_history (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
     name, qualname, signature, file_path, entity_id UNINDEXED
+);
+
+CREATE TABLE IF NOT EXISTS index_quality_history (
+    finished_at TEXT PRIMARY KEY,
+    build_revision TEXT NOT NULL,
+    payload TEXT NOT NULL
 );
 """
 
@@ -582,6 +588,7 @@ class BuildReport:
     compaction_error: str = ""
     compaction_recommended: bool = False
     compaction_deferred_reason: str = ""
+    index_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -598,7 +605,196 @@ class BuildReport:
             "compaction_error": self.compaction_error,
             "compaction_recommended": self.compaction_recommended,
             "compaction_deferred_reason": self.compaction_deferred_reason,
+            "index_quality": self.index_quality,
         }
+
+
+def _index_quality_scorecard(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    *,
+    finished_at: str,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute cheap, generation-bound truth about one committed index.
+
+    These are structural database measurements, not retrieval-quality or
+    provider-token claims.  Keeping that boundary explicit lets health flag
+    a thin graph without pretending that a high edge ratio proves a model
+    will produce a correct change.
+    """
+
+    total_edges = int(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0])
+    resolved_edges = int(conn.execute(
+        "SELECT COUNT(*) FROM edges e WHERE e.dst_qualname IS NOT NULL "
+        "AND e.dst_qualname != '' AND EXISTS ("
+        "SELECT 1 FROM entities d WHERE d.qualname=e.dst_qualname)"
+    ).fetchone()[0])
+    cross_language_edges = int(conn.execute(
+        "SELECT COUNT(DISTINCT e.id) FROM edges e "
+        "JOIN files sf ON sf.file_path=e.file_path "
+        "JOIN entities d ON d.qualname=e.dst_qualname "
+        "JOIN files df ON df.file_path=d.file_path "
+        "WHERE sf.language != df.language"
+    ).fetchone()[0])
+    junk_destination_edges = int(conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE "
+        "dst_name LIKE '../%' OR dst_name LIKE './%' OR "
+        "dst_name LIKE '%/../%' OR dst_name LIKE '%\\\\%'"
+    ).fetchone()[0])
+    entity_count = int(conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0])
+    artifact_entities = int(conn.execute(
+        "SELECT COUNT(*) FROM entities WHERE "
+        "file_path LIKE 'eval/%' OR file_path LIKE 'artifacts/%' OR "
+        "file_path LIKE 'coverage/%' OR file_path LIKE 'tmp/%' OR "
+        "file_path LIKE '.tmp/%' OR file_path LIKE 'dist/%' OR "
+        "file_path LIKE 'build/%'"
+    ).fetchone()[0])
+
+    language_rows = conn.execute(
+        "WITH resolved AS ("
+        " SELECT e.id, e.file_path FROM edges e WHERE e.dst_qualname IS NOT NULL "
+        " AND e.dst_qualname != '' AND EXISTS ("
+        "  SELECT 1 FROM entities d WHERE d.qualname=e.dst_qualname)"
+        ") "
+        "SELECT f.language, COUNT(DISTINCT f.file_path) AS files, "
+        "COUNT(DISTINCT en.id) AS entities, COUNT(DISTINCT e.id) AS edges, "
+        "COUNT(DISTINCT r.id) AS resolved_edges "
+        "FROM files f LEFT JOIN entities en ON en.file_path=f.file_path "
+        "LEFT JOIN edges e ON e.file_path=f.file_path "
+        "LEFT JOIN resolved r ON r.id=e.id "
+        "GROUP BY f.language ORDER BY f.language"
+    ).fetchall()
+    span_rows = {
+        str(row["language"]): int(row["indexed_span_lines"] or 0)
+        for row in conn.execute(
+            "WITH spans AS ("
+            " SELECT file_path, MAX(line_end) AS lines FROM entities GROUP BY file_path"
+            ") SELECT f.language, COALESCE(SUM(sp.lines), 0) AS indexed_span_lines "
+            "FROM files f LEFT JOIN spans sp ON sp.file_path=f.file_path "
+            "GROUP BY f.language"
+        )
+    }
+    by_language: dict[str, dict[str, Any]] = {}
+    for row in language_rows:
+        edges = int(row["edges"] or 0)
+        resolved = int(row["resolved_edges"] or 0)
+        entities = int(row["entities"] or 0)
+        span_lines = span_rows.get(str(row["language"]), 0)
+        by_language[str(row["language"])] = {
+            "files": int(row["files"] or 0),
+            "entities": entities,
+            "edges": edges,
+            "resolved_edges": resolved,
+            "resolved_edge_ratio": round(resolved / edges, 6) if edges else None,
+            "indexed_span_lines": span_lines,
+            "entities_per_kloc": (
+                round(entities * 1000.0 / span_lines, 3) if span_lines else None
+            ),
+        }
+
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    resolved_ratio = resolved_edges / total_edges if total_edges else None
+    artifact_ratio = artifact_entities / entity_count if entity_count else None
+    degraded_reasons: list[str] = []
+    if total_edges and resolved_edges == 0:
+        degraded_reasons.append("no_resolved_edges")
+    if cross_language_edges:
+        degraded_reasons.append("cross_language_edges_present")
+    if artifact_ratio is not None and artifact_ratio > 0.25:
+        degraded_reasons.append("artifact_entity_share_above_25_percent")
+    previous_edges = (previous or {}).get("edges") or {}
+    previous_ratio = previous_edges.get("resolved_ratio")
+    resolved_ratio_delta = None
+    if resolved_ratio is not None and isinstance(previous_ratio, (int, float)):
+        resolved_ratio_delta = resolved_ratio - float(previous_ratio)
+        if resolved_ratio_delta < -0.05:
+            degraded_reasons.append("resolved_edge_ratio_dropped_over_5_points")
+
+    density_regressions: list[dict[str, Any]] = []
+    previous_languages = (previous or {}).get("by_language") or {}
+    for language, row in by_language.items():
+        prior = previous_languages.get(language) or {}
+        current_density = row.get("entities_per_kloc")
+        prior_density = prior.get("entities_per_kloc")
+        if not isinstance(current_density, (int, float)) or not isinstance(
+            prior_density, (int, float)
+        ) or prior_density <= 0:
+            continue
+        relative_delta = (float(current_density) - float(prior_density)) / float(
+            prior_density
+        )
+        row["entities_per_kloc_delta_ratio"] = round(relative_delta, 6)
+        if relative_delta < -0.20:
+            density_regressions.append({
+                "language": language,
+                "previous": prior_density,
+                "current": current_density,
+                "delta_ratio": round(relative_delta, 6),
+            })
+    if density_regressions:
+        degraded_reasons.append("language_entity_density_dropped_over_20_percent")
+
+    thin_language_guidance: list[dict[str, Any]] = []
+    for family, members in {
+        "javascript_typescript": ("javascript", "typescript", "jsx", "tsx"),
+    }.items():
+        present = [by_language[name] for name in members if name in by_language]
+        files = sum(int(row.get("files") or 0) for row in present)
+        edges = sum(int(row.get("edges") or 0) for row in present)
+        resolved = sum(int(row.get("resolved_edges") or 0) for row in present)
+        family_ratio = (resolved / edges) if edges else None
+        if files and (edges == 0 or (family_ratio is not None and family_ratio < 0.10)):
+            thin_language_guidance.append({
+                "family": family,
+                "files": files,
+                "edges": edges,
+                "resolved_edges": resolved,
+                "resolved_edge_ratio": (
+                    round(family_ratio, 6) if family_ratio is not None else None
+                ),
+                "guidance": "use_exact_symbols_and_bounded_file_context",
+            })
+
+    return {
+        "schema_id": "aiworkhub.source_graph.index_quality.v1",
+        "build_revision": BUILD_REVISION,
+        "finished_at": finished_at,
+        "edges": {
+            "total": total_edges,
+            "resolved": resolved_edges,
+            "unresolved": max(0, total_edges - resolved_edges),
+            "resolved_ratio": round(resolved_ratio, 6) if resolved_ratio is not None else None,
+            "cross_language": cross_language_edges,
+            "junk_destination": junk_destination_edges,
+        },
+        "artifacts": {
+            "entities": artifact_entities,
+            "total_entities": entity_count,
+            "entity_share": round(artifact_ratio, 6) if artifact_ratio is not None else None,
+            "path_families": ["eval", "artifacts", "coverage", "tmp", "dist", "build"],
+        },
+        "by_language": by_language,
+        "generation_delta": {
+            "previous_finished_at": str((previous or {}).get("finished_at") or ""),
+            "resolved_edge_ratio_delta": (
+                round(resolved_ratio_delta, 6)
+                if resolved_ratio_delta is not None else None
+            ),
+            "density_regressions": density_regressions,
+        },
+        "thin_language_guidance": thin_language_guidance,
+        "storage": {
+            "db_bytes": int(db_path.stat().st_size) if db_path.exists() else 0,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "freelist_ratio": round(freelist_count / page_count, 6) if page_count else 0.0,
+        },
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": degraded_reasons,
+        "measurement_boundary": "structural_index_metrics_not_retrieval_or_token_savings",
+    }
 
 
 def _invalidate_file(conn: sqlite3.Connection, rel: str) -> None:
@@ -976,13 +1172,49 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             # quiescent maintenance operation, never the query-serving build.
             compaction_deferred_reason = "live_generation_in_use"
         bytes_after_compaction = resolved_db_path.stat().st_size
+        previous_quality_row = conn.execute(
+            "SELECT value FROM meta WHERE key='index_quality'"
+        ).fetchone()
+        try:
+            previous_quality = (
+                json.loads(previous_quality_row["value"])
+                if previous_quality_row is not None else None
+            )
+        except (TypeError, json.JSONDecodeError):
+            previous_quality = None
+        index_quality = _index_quality_scorecard(
+            conn,
+            resolved_db_path,
+            finished_at=finished_at,
+            previous=previous_quality if isinstance(previous_quality, dict) else None,
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('index_quality', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(index_quality, ensure_ascii=False, sort_keys=True),),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO index_quality_history"
+                "(finished_at, build_revision, payload) VALUES(?,?,?)",
+                (
+                    finished_at,
+                    BUILD_REVISION,
+                    json.dumps(index_quality, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM index_quality_history WHERE finished_at NOT IN ("
+                "SELECT finished_at FROM index_quality_history "
+                "ORDER BY finished_at DESC LIMIT 100)"
+            )
     finally:
         conn.close()
     return BuildReport(
         repo_root=str(repo_root), db_path=str(resolved_db_path), incremental=incremental,
         files_seen=len(files_on_disk), files_changed=changed, files_unchanged=unchanged,
         files_removed=removed, entities_written=entities_written, edges_written=edges_written,
-        errors=errors, build_revision=BUILD_REVISION, finished_at=_now_iso(),
+        errors=errors, build_revision=BUILD_REVISION, finished_at=finished_at,
         compaction_performed=compaction_performed,
         database_bytes_before_compaction=bytes_before_compaction,
         database_bytes_after_compaction=bytes_after_compaction,
@@ -990,6 +1222,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         compaction_error=compaction_error,
         compaction_recommended=compaction_recommended,
         compaction_deferred_reason=compaction_deferred_reason,
+        index_quality=index_quality,
     )
 
 
@@ -1502,12 +1735,39 @@ def summary(conn: sqlite3.Connection) -> dict[str, Any]:
         for row in conn.execute("SELECT language, COUNT(*) c FROM files GROUP BY language")
     }
     last_build_row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
+    quality_row = conn.execute("SELECT value FROM meta WHERE key='index_quality'").fetchone()
+    roundtrip_row = conn.execute(
+        "SELECT value FROM meta WHERE key='recommendation_roundtrip'"
+    ).fetchone()
     return {
         "files": file_count, "entities": entity_count, "edges": edge_count,
         "entities_by_kind": by_kind, "edges_by_evidence_label": by_evidence,
         "files_by_status": by_status, "files_by_language": by_language,
         "last_build": json.loads(last_build_row["value"]) if last_build_row else None,
+        "index_quality": json.loads(quality_row["value"]) if quality_row else None,
+        "recommendation_resolvability": (
+            json.loads(roundtrip_row["value"]) if roundtrip_row else None
+        ),
     }
+
+
+def record_recommendation_roundtrip(
+    repo_root: Path,
+    payload: dict[str, Any],
+) -> None:
+    """Persist one manager-owned self-check for the current generation."""
+
+    db_path = resolve_db_path(repo_root.resolve())
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('recommendation_roundtrip', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True),),
+            )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2099,6 +2359,7 @@ __all__ = [
     "summary",
     "trace",
     "neighbors",
+    "record_recommendation_roundtrip",
     "resolve_db_path",
     "shortest_path",
 ]

@@ -112,6 +112,27 @@ def test_initialized_repo_indexes_instruction_documents_without_source_files(tmp
     assert health["last_report"]["entities_written"] == 3
 
 
+def test_health_exposes_current_generation_quality_and_roundtrip_scorecards(
+    tmp_path, cleanup_daemons,
+):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    (root / "app.py").write_text(
+        "def health_target():\n    return 1\n",
+        encoding="utf-8",
+    )
+    daemon = source_graph_daemon.ensure_started(root)
+
+    assert daemon.wait_for_first_build(timeout=10)
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["index_quality"]["current_generation"] is True
+    assert health["index_quality"]["build_revision"] == source_graph.BUILD_REVISION
+    assert health["recommendation_resolvability"]["current_generation"] is True
+    assert health["recommendation_resolvability"]["resolvability_ratio"] == 1.0
+    assert health["guidance_degraded"] is False
+
+
 def test_production_default_build_runs_in_dedicated_subprocess(tmp_path, monkeypatch):
     root = _init_repo(tmp_path)
     (root / "app.py").write_text("def live_probe():\n    return 1\n", encoding="utf-8")

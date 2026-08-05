@@ -16,6 +16,24 @@ the canonical repository graph. Exact-symbol slice also excludes unrelated
 same-file calls, exact qualnames win retrieval ties, lexical cross-file binding
 is language-bounded, and `deps` is distinct from execution `trace`.
 
+Every committed index generation now carries two independently useful health
+receipts:
+
+- `index_quality` recomputes resolved/unresolved and cross-language edges,
+  artifact entity share, per-language structural density, database bytes and
+  freelist ratio directly from canonical SQLite rows. The last 100 generations
+  are retained for ratio/density regression detection.
+- `recommendation_resolvability` samples high-confidence authorities and
+  replays every emitted `recommended_next_steps` and `candidate_files` item
+  through the shared manager/worker MCP wrapper. A miss is replayed directly
+  against the engine to attribute the defect to `wrapper` or
+  `engine_or_emission`.
+
+Both receipts are bound to `build_revision + finished_at`; stale scorecards
+are never presented as measurements of the current generation. Operations →
+Tool Use renders these structural metrics with an explicit boundary: they are
+not provider-token savings or model-correctness claims.
+
 The remaining tracks below are deliberately not labeled complete. A general
 Source Graph economy claim still requires the 30-pair raw-vs-graph ledger;
 semantic parser depth beyond the optional JavaScript/TypeScript backend and
@@ -140,11 +158,11 @@ from weakening exact repository evidence.
 
 ## Delivery order
 
-1. Correct impossible/false dashboard cost, cache and freshness metrics.
-2. Land the paired raw-vs-graph benchmark ledger and reproducible fixtures.
-3. Improve retrieval normalization and bounded graph expansion.
-4. Add semantic extractor backends one language family at a time.
-5. Add cross-file resolvers behind precision gates.
+1. Extend the paired raw-vs-graph benchmark ledger to 30 reproducible pairs.
+2. Add a live wrapper-path retrieval corpus with precision@k/MRR evidence.
+3. Improve semantic extractor backends one language family at a time.
+4. Add cross-file resolvers behind measured precision gates.
+5. Import runtime coverage only through provenance-bound evidence.
 6. Evaluate deterministic communities as an optional orientation layer.
 
 Each step must leave a reproducible evidence bundle. Unmeasured improvement is

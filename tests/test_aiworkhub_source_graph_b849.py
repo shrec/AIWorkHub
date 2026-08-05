@@ -386,6 +386,89 @@ def test_every_focus_emitted_next_step_resolves_without_replacing_task_query(tmp
             pytest.fail(f"unhandled recommended step: {step}")
 
 
+def test_index_quality_scorecard_is_generation_bound_and_recomputable(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "service.py",
+        "def resolved_target():\n    return 1\n\n"
+        "def caller():\n    resolved_target()\n    missing_target()\n",
+    )
+
+    report = sg.build_index(repo, incremental=False)
+    quality = report.index_quality
+
+    assert quality["schema_id"] == "aiworkhub.source_graph.index_quality.v1"
+    assert quality["finished_at"] == report.finished_at
+    assert quality["build_revision"] == report.build_revision
+    assert quality["edges"]["total"] >= 2
+    assert quality["edges"]["resolved"] >= 1
+    assert quality["edges"]["unresolved"] >= 1
+    assert quality["by_language"]["python"]["entities"] >= 2
+    assert quality["storage"]["db_bytes"] > 0
+    assert quality["measurement_boundary"] == (
+        "structural_index_metrics_not_retrieval_or_token_savings"
+    )
+
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        persisted = sg.summary(conn)["index_quality"]
+    finally:
+        conn.close()
+    assert persisted == quality
+
+
+def test_recommendation_roundtrip_gate_uses_full_shared_wrapper(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "service.py", "def roundtrip_target():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    ctx = w.WorkerToolContext(
+        task_id="source-graph:selfcheck", runner="daemon", topic="health",
+        request_id="generation-1", repo=repo, authority_repo=repo,
+        source_graph_targets=(), session_topic="health",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+    result = w.source_graph_recommendation_roundtrip_gate(ctx, sample_limit=1)
+
+    assert result["ok"] is True
+    assert result["status"] == "ready"
+    assert result["emitted"] >= 3
+    assert result["resolved"] == result["emitted"]
+    assert result["resolvability_ratio"] == 1.0
+    assert result["failures"] == []
+
+
+def test_recommendation_roundtrip_gate_attributes_wrapper_only_failure(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "service.py", "def roundtrip_target():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    ctx = w.WorkerToolContext(
+        task_id="source-graph:selfcheck", runner="daemon", topic="health",
+        request_id="generation-2", repo=repo, authority_repo=repo,
+        source_graph_targets=(), session_topic="health",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+    real_query = w.source_graph_query
+
+    def wrapper_with_slice_regression(context, *, mode, query, **kwargs):
+        if mode == "slice":
+            return {"ok": True, "hit_count": 0, "content": "{}"}
+        return real_query(context, mode=mode, query=query, **kwargs)
+
+    monkeypatch.setattr(w, "source_graph_query", wrapper_with_slice_regression)
+
+    result = w.source_graph_recommendation_roundtrip_gate(ctx, sample_limit=1)
+
+    assert result["ok"] is False
+    assert result["status"] == "guidance_degraded"
+    assert any(
+        row["layer"] == "wrapper" and row["value"].startswith("slice:")
+        for row in result["failures"]
+    )
+
+
 def test_slice_is_symbol_scoped_and_excludes_unrelated_same_file_calls(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(
