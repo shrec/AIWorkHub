@@ -400,16 +400,19 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     if missing_checks:
         errors.append("required_validation_missing")
     source_health = source_graph_daemon.daemon_health(root)
+    source_age = source_health.get("index_age_seconds")
+    source_stale_after = source_health.get("stale_after_seconds")
+    source_generation_fresh = not (
+        source_age is not None
+        and source_stale_after is not None
+        and float(source_age) > float(source_stale_after)
+    )
     source_graph_ready_for_code = (
-        bool(source_health.get("ok"))
-        and bool(source_health.get("running"))
-        and source_health.get("status") in {
-            source_graph_daemon.STATUS_READY,
-            source_graph_daemon.STATUS_STANDBY,
-        }
+        bool(source_health.get("readable_generation"))
         and bool(source_health.get("last_success_at"))
         and bool(source_health.get("build_revision"))
         and int(source_health.get("files_seen") or 0) > 0
+        and source_generation_fresh
     )
     if policy["tools"]["source_graph_required_for_code"] and not source_graph_ready_for_code:
         errors.append("source_graph_not_ready")

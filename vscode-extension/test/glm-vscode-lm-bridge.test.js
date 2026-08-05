@@ -260,6 +260,29 @@ async function textProtocolChecks() {
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes('"action":"create"'));
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes("e3b0c44298fc1c149"));
 
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      prefetchedModel,
+      {
+        prompt: "bounded",
+        allowedWrites: [],
+        initial_source_graph_request: {
+          mode: "focus", query: "DBAccountStatus", budget: 48,
+        },
+      },
+      undefined,
+      async () => { throw new Error("database is locked"); },
+    ),
+    (error) => {
+      assert.strictEqual(error.message, "vscode_lm_initial_source_graph_failed");
+      assert.strictEqual(error.protocolPhase, "initial_source_graph");
+      assert.match(error.protocolCause, /database is locked/);
+      assert.strictEqual(error.protocolRequest.query, "DBAccountStatus");
+      assert.strictEqual(error.protocolTrace[0].phase, "initial_source_graph");
+      return true;
+    },
+  );
+
   const wrongPath = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "placeholder",

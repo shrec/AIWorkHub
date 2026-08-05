@@ -6,6 +6,37 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.89] - 2026-08-05
+
+### Changed
+
+- Source Graph refreshes parse files before opening their bounded write
+  transaction and defer exclusive `VACUUM` maintenance while the live
+  generation is serving manager and worker queries.
+- Task-created project context now prioritizes declared files and concrete
+  code entities over generic project/provider words.
+- Benchmark documentation uses the durable `Evidence matrix` heading instead
+  of presenting an old release number as the current product version.
+
+### Fixed
+
+- Preflight hydrates the committed Source Graph generation during indexing,
+  standby and restart states, preserving truthful readability during a
+  transient SQLite health-probe lock.
+- Optional project context converts SQLite/query failures into bounded
+  degraded evidence instead of aborting unrelated worker launches.
+- Successful Windows VS Code LM workers with no validation commands no longer
+  fail finalization by resolving an unavailable native AppContainer sandbox.
+- Generic `task_mark_done` rejects failed terminal reviews and cannot bypass
+  the isolated candidate revalidation/promotion path owned by
+  `agent_accept_review`.
+- VS Code LM failures now preserve the failing phase, bounded cause, initial
+  Source Graph request and MCP timeout identity instead of returning empty
+  diagnostics.
+- Policy-warning telemetry remains consistent for observation-only tasks, and
+  dashboard usage renders unavailable provider counters as unavailable rather
+  than as measured zero.
+
 ## [0.8.88] - 2026-08-05
 
 ### Added

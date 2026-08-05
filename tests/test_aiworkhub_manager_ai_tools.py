@@ -527,7 +527,10 @@ def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
     assert context["required"] is True
     assert context["task_type"] == "code"
     assert context["source_graph"]["required"] is True
-    assert context["source_graph"]["query"] == "task"
+    assert context["source_graph"]["query"].startswith(
+        "research/context_default.json"
+    )
+    assert context["source_graph"]["query"] != "task"
     assert context["session"]["topic"] == "Strict task context"
     assert context["ai_memory"]["query"]
     assert context["kb"]["query"]

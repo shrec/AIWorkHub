@@ -1625,6 +1625,8 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
         "cost_known_records": 0,
         "cost_unknown_records": 0,
         "tokens_with_unknown_cost": 0,
+        "usage_observed_records": 0,
+        "usage_unknown_records": 0,
     }
     if not ledger:
         return totals
@@ -1642,8 +1644,19 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
         totals["cost_known_records"] += int(bucket.get("cost_known_records") or 0)
         totals["cost_unknown_records"] += int(bucket.get("cost_unknown_records") or 0)
         totals["tokens_with_unknown_cost"] += int(bucket.get("tokens_with_unknown_cost") or 0)
+        totals["usage_observed_records"] += int(
+            bucket.get("usage_observed_records") or 0
+        )
+        totals["usage_unknown_records"] += int(
+            bucket.get("usage_unknown_records") or 0
+        )
     totals["cost_usd"] = round(totals["cost_usd"], 6)
     totals["cost_complete"] = totals["cost_unknown_records"] == 0
+    totals["usage_complete"] = (
+        totals["records"] > 0
+        and totals["usage_unknown_records"] == 0
+        and totals["usage_observed_records"] == totals["records"]
+    )
     return totals
 
 

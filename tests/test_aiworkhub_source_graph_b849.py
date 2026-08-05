@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -705,7 +706,7 @@ def test_isolated_readonly_directory_supports_repeated_queries_without_wal_sidec
         graph_dir.chmod(original_mode)
 
 
-def test_incremental_build_compacts_large_stale_page_population(tmp_path, monkeypatch):
+def test_incremental_build_defers_live_database_compaction(tmp_path, monkeypatch):
     repo = _new_repo(tmp_path, "repo")
     for index in range(300):
         _write(
@@ -724,9 +725,55 @@ def test_incremental_build_compacts_large_stale_page_population(tmp_path, monkey
     report = sg.build_index(repo, incremental=True)
     assert report.files_removed == 300
     assert report.freelist_ratio_before_compaction > 0
-    assert report.compaction_performed is True
+    assert report.compaction_performed is False
     assert report.compaction_error == ""
-    assert report.database_bytes_after_compaction <= report.database_bytes_before_compaction
+    assert report.compaction_recommended is True
+    assert report.compaction_deferred_reason == "live_generation_in_use"
+    assert report.database_bytes_after_compaction == report.database_bytes_before_compaction
+
+
+def test_committed_generation_remains_queryable_during_next_build_extraction(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "repo")
+    target = repo / "src" / "worker.py"
+    _write(target, "def stable_probe():\n    return 1\n")
+    sg.build_index(repo, incremental=False)
+    _write(target, "def stable_probe():\n    return 2\n")
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_extract = sgast.extract_file
+    blocked_once = False
+
+    def delayed_extract(*args, **kwargs):
+        nonlocal blocked_once
+        if not blocked_once:
+            blocked_once = True
+            entered.set()
+            assert release.wait(5)
+        return original_extract(*args, **kwargs)
+
+    monkeypatch.setattr(sgast, "extract_file", delayed_extract)
+    outcome: list[object] = []
+
+    def build() -> None:
+        try:
+            outcome.append(sg.build_index(repo, incremental=True))
+        except Exception as exc:  # pragma: no cover - asserted below
+            outcome.append(exc)
+
+    thread = threading.Thread(target=build, daemon=True)
+    thread.start()
+    assert entered.wait(5)
+    try:
+        queries = [sg.focus(repo, "stable_probe", 8) for _ in range(3)]
+        assert all(result["matches"] for result in queries)
+    finally:
+        release.set()
+        thread.join(10)
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], sg.BuildReport)
 
 
 def test_cmake_generated_ts_timestamp_files_excluded_not_mislabeled_typescript(tmp_path):

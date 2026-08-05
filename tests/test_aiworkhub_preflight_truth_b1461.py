@@ -33,6 +33,7 @@ def _ready_graph() -> dict[str, object]:
         "status": source_graph_daemon.STATUS_READY,
         "running": True,
         "registered": True,
+        "readable_generation": True,
         "last_success_at": "2026-08-03T12:00:00+00:00",
         "stale_reason": "",
         "build_revision": "aiworkhub.source_graph.semantic.v5",
@@ -149,6 +150,23 @@ def test_source_graph_fresh_standby_generation_is_ready_for_code(monkeypatch, tm
     graph["readable_generation"] = True
     _common(monkeypatch, graph=graph)
     monkeypatch.setattr(repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap")
+
+    report = repo_policy.build_preflight(root)
+
+    assert "source_graph_not_ready" not in report["errors"]
+    assert report["source_graph"]["ready_for_code"] is True
+
+
+def test_source_graph_fresh_readable_generation_remains_ready_while_indexing(
+    monkeypatch, tmp_path,
+):
+    root = _root(tmp_path)
+    graph = _ready_graph()
+    graph["status"] = source_graph_daemon.STATUS_INDEXING
+    _common(monkeypatch, graph=graph)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace, "select_sandbox_backend", lambda: "bubblewrap"
+    )
 
     report = repo_policy.build_preflight(root)
 

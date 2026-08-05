@@ -1073,6 +1073,23 @@ def test_validation_pythonpath_override_is_scoped_to_one_subprocess(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_empty_validation_list_never_resolves_host_sandbox(monkeypatch, tmp_path, repo):
+    workspace = _workspace(monkeypatch, tmp_path, repo, "empty-validations")
+    monkeypatch.setattr(
+        worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable"
+            )
+        ),
+    )
+    try:
+        assert worker_workspace.run_validations(workspace, []) == []
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_validation_cd_prefix_is_removed_from_executable_argv() -> None:
     argv, components, tmpdir_override, cwd = worker_workspace._parse_validation_command_detailed(
         "cd read && python3 x.py"

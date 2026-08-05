@@ -84,7 +84,7 @@ _INDEXED_EXTENSION_SET = frozenset(
 DEFAULT_EXCLUDE_DIR_NAMES = frozenset({
     ".git", "__pycache__", ".venv", "venv", "env", "node_modules",
     HUB_DIRNAME, ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache",
-    "dist", "build", "archive", "logs",
+    "dist", "build", "archive", "logs", ".tmp",
     # CMake writes non-source ``.ts`` timestamp/dependency-tracking files
     # here (e.g. ``compiler_depend.ts``) -- indexing them as file-level
     # "typescript" evidence would be a false language label, not truthful
@@ -556,6 +556,8 @@ class BuildReport:
     database_bytes_after_compaction: int = 0
     freelist_ratio_before_compaction: float = 0.0
     compaction_error: str = ""
+    compaction_recommended: bool = False
+    compaction_deferred_reason: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -570,6 +572,8 @@ class BuildReport:
             "database_bytes_after_compaction": self.database_bytes_after_compaction,
             "freelist_ratio_before_compaction": self.freelist_ratio_before_compaction,
             "compaction_error": self.compaction_error,
+            "compaction_recommended": self.compaction_recommended,
+            "compaction_deferred_reason": self.compaction_deferred_reason,
         }
 
 
@@ -775,36 +779,47 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     bytes_before_compaction = 0
     bytes_after_compaction = 0
     freelist_ratio = 0.0
+    compaction_recommended = False
+    compaction_deferred_reason = ""
     try:
-        with conn:
-            existing = {
-                row["file_path"]: (row["source_hash"], row["build_revision"])
-                for row in conn.execute("SELECT file_path, source_hash, build_revision FROM files")
+        # Read the prior generation before extraction, but do not begin the
+        # write transaction until every source file has been parsed.  Large
+        # repositories can spend minutes in AST/lexical extraction; keeping a
+        # rollback journal alive for that whole interval unnecessarily widens
+        # the writer lock and makes concurrent worker context queries fragile.
+        existing = {
+            row["file_path"]: (row["source_hash"], row["build_revision"])
+            for row in conn.execute("SELECT file_path, source_hash, build_revision FROM files")
+        }
+        existing_extractors: dict[str, set[str]] = {}
+        for row in conn.execute(
+            "SELECT file_path, extractor FROM entities "
+            "UNION SELECT file_path, extractor FROM edges"
+        ):
+            existing_extractors.setdefault(str(row["file_path"]), set()).add(
+                str(row["extractor"])
+            )
+        pending_extractions: list[sgast.FileExtraction] = []
+        for path in files_on_disk:
+            extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
+            seen_rel.add(extraction.file_path)
+            prior = existing.get(extraction.file_path)
+            expected_extractors = {
+                item.extractor for item in (*extraction.entities, *extraction.edges)
             }
-            existing_extractors: dict[str, set[str]] = {}
-            for row in conn.execute(
-                "SELECT file_path, extractor FROM entities "
-                "UNION SELECT file_path, extractor FROM edges"
+            if (
+                incremental and prior is not None
+                and prior[0] == extraction.source_hash
+                and prior[1] == BUILD_REVISION
+                and existing_extractors.get(extraction.file_path, set())
+                == expected_extractors
             ):
-                existing_extractors.setdefault(str(row["file_path"]), set()).add(
-                    str(row["extractor"])
-                )
-            for path in files_on_disk:
-                extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
-                seen_rel.add(extraction.file_path)
-                prior = existing.get(extraction.file_path)
-                expected_extractors = {
-                    item.extractor for item in (*extraction.entities, *extraction.edges)
-                }
-                if (
-                    incremental and prior is not None
-                    and prior[0] == extraction.source_hash
-                    and prior[1] == BUILD_REVISION
-                    and existing_extractors.get(extraction.file_path, set())
-                    == expected_extractors
-                ):
-                    unchanged += 1
-                    continue
+                unchanged += 1
+                continue
+            pending_extractions.append(extraction)
+
+        with conn:
+            for extraction in pending_extractions:
                 _invalidate_file(conn, extraction.file_path)
                 inserted_entities, inserted_edges = _write_extraction(conn, extraction)
                 changed += 1
@@ -837,18 +852,18 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
         freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         freelist_ratio = (freelist_count / page_count) if page_count else 0.0
-        if (
+        compaction_recommended = bool(
             bytes_before_compaction >= SOURCE_GRAPH_COMPACT_MIN_BYTES
             and freelist_ratio >= SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO
-        ):
-            try:
-                conn.execute("VACUUM")
-                compaction_performed = True
-            except sqlite3.OperationalError as exc:
-                # Index convergence already committed. Preserve a truthful
-                # maintenance signal and retry compaction on a later build
-                # instead of converting usable graph data into a failure.
-                compaction_error = f"{type(exc).__name__}:{exc}"[:500]
+        )
+        if compaction_recommended:
+            # VACUUM takes an exclusive SQLite lock and rewrites the complete
+            # database. Running it synchronously after every qualifying live
+            # refresh blocked all manager/worker readers and made a killed
+            # refresh capable of stranding a hot rollback journal. Report the
+            # maintenance need truthfully; compaction belongs to an explicit
+            # quiescent maintenance operation, never the query-serving build.
+            compaction_deferred_reason = "live_generation_in_use"
         bytes_after_compaction = resolved_db_path.stat().st_size
     finally:
         conn.close()
@@ -862,6 +877,8 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         database_bytes_after_compaction=bytes_after_compaction,
         freelist_ratio_before_compaction=freelist_ratio,
         compaction_error=compaction_error,
+        compaction_recommended=compaction_recommended,
+        compaction_deferred_reason=compaction_deferred_reason,
     )
 
 

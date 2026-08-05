@@ -86,7 +86,7 @@ verifies its populations, arithmetic and non-causal claim boundaries. Raw
 repo-local task events are private and are not published, so this is a checked
 snapshot rather than a fully reproducible public raw-event benchmark.
 
-## System benefit evidence snapshot for 0.8.81
+## Evidence matrix
 
 Captured from AIWorkHub managing its own repository on 2026-08-04. The
 machine-readable snapshot is

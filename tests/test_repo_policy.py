@@ -115,9 +115,10 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
         lambda _root: {
             "ok": True,
             "status": "ready",
-            "running": True,
-            "registered": True,
-            "last_success_at": "2026-07-30T14:00:00+00:00",
+                "running": True,
+                "registered": True,
+                "readable_generation": True,
+                "last_success_at": "2026-07-30T14:00:00+00:00",
             "stale_reason": "",
             "build_revision": "aiworkhub.source_graph.semantic.v5",
             "files_seen": 4,

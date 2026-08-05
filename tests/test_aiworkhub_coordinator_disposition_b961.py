@@ -383,6 +383,55 @@ def test_mark_done_refreshes_source_graph_before_reconcile(coord):
     assert "dependency_autolaunch" in res
 
 
+def test_mark_done_rejects_finalize_failed_terminal_review(coord):
+    _insert(
+        coord,
+        "T_FINALIZE_FAILED",
+        card={
+            "terminal_review": {
+                "substatus": "finalize_failed",
+                "deterministic_verification": {
+                    "applicable": True,
+                    "pass": False,
+                },
+            }
+        },
+    )
+
+    res = core.mark_done("T_FINALIZE_FAILED")
+
+    assert res["ok"] is False
+    assert "done_terminal_review_not_acceptable:finalize_failed" in res["stderr"]
+    row = _row(coord, "T_FINALIZE_FAILED")
+    assert row["status"] == "review"
+    assert row["worker_status"] == "review"
+
+
+def test_mark_done_requires_accept_review_for_isolated_candidate(coord):
+    _insert(
+        coord,
+        "T_REVIEW_FIRST",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "request-123"},
+                },
+                "deterministic_verification": {
+                    "applicable": True,
+                    "pass": True,
+                },
+            }
+        },
+    )
+
+    res = core.mark_done("T_REVIEW_FIRST")
+
+    assert res["ok"] is False
+    assert "agent_accept_review_required" in res["stderr"]
+    assert _row(coord, "T_REVIEW_FIRST")["status"] == "review"
+
+
 # --- issue 7: terminal substatus -> callback transition map ----------------
 
 def test_callback_transition_map_is_exhaustive_for_blocked_substatuses():

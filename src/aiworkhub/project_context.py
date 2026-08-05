@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -616,7 +617,7 @@ def _source_graph_direct(repo: Path, contract: dict[str, Any]) -> tuple[str, boo
             payload = _source_graph_mod.trace(repo, target, source["budget"])
         else:
             payload = _source_graph_mod.focus(repo, target, source["budget"])
-    except _source_graph_mod.SourceGraphError as exc:
+    except (_source_graph_mod.SourceGraphError, sqlite3.Error, OSError) as exc:
         raise ProjectContextError(f"source_graph_query_failed:{exc}") from exc
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return canonical, False

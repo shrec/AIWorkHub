@@ -39,6 +39,23 @@ def test_manager_origin_identity_accepts_modern_uuid_versions():
     assert not core._UUID_RE.fullmatch("019f5097-6dbe-9172-870a-945afc5f3bfa")
 
 
+def test_task_context_query_prioritizes_declared_files_and_code_entities():
+    query = core._task_context_query(
+        title="Audit AIWorkHub database routing",
+        topic="aiworkhub_runtime_audit",
+        objective="Trace DBAccountStatus callers and accounts_status writes.",
+        acceptance=["Verify LoginQueue concurrency."],
+        read_first=["LoginServer/LoginQueue.cpp"],
+        immutable_inputs=["Common/LoginDatabase.cpp"],
+        allowed_writes=[],
+    )
+
+    assert query.startswith(
+        "LoginServer/LoginQueue.cpp Common/LoginDatabase.cpp DBAccountStatus"
+    )
+    assert "aiworkhub" not in query.casefold()
+
+
 def _init_repo(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()

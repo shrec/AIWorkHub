@@ -362,6 +362,52 @@ def test_daemon_health_hydrates_fresh_canonical_generation_for_standby(
     assert health["files_seen"] == report.files_seen
 
 
+def test_daemon_health_hydrates_canonical_generation_while_indexing(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "indexing_reader")
+    report = source_graph.build_index(root, incremental=False)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon._status = source_graph_daemon.STATUS_INDEXING
+    monkeypatch.setattr(daemon, "is_running", lambda: True)
+    monkeypatch.setattr(source_graph_daemon, "get_daemon", lambda _root: daemon)
+
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["status"] == source_graph_daemon.STATUS_INDEXING
+    assert health["readable_generation"] is True
+    assert health["build_revision"] == report.build_revision
+    assert health["files_seen"] == report.files_seen
+
+
+def test_daemon_health_probe_lock_preserves_known_readable_generation(
+    tmp_path, monkeypatch,
+):
+    root = _init_repo(tmp_path, "locked_health_probe")
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    daemon._status = source_graph_daemon.STATUS_READY
+    daemon._last_success_at = "2026-08-05T08:00:00+00:00"
+    daemon._last_report = {
+        "build_revision": source_graph.BUILD_REVISION,
+        "files_seen": 7,
+    }
+    monkeypatch.setattr(source_graph_daemon, "get_daemon", lambda _root: daemon)
+    monkeypatch.setattr(
+        source_graph,
+        "connect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            source_graph_daemon.sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["readable_generation"] is True
+    assert health["build_revision"] == source_graph.BUILD_REVISION
+    assert health["files_seen"] == 7
+    assert "database is locked" in health["generation_read_error"]
+
+
 def test_health_exposes_successful_build_identity_at_top_level(tmp_path, cleanup_daemons):
     root = tmp_path / "never_initialized"
     root.mkdir()

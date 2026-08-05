@@ -245,6 +245,22 @@ def test_live_calls_with_denied_request_recover_as_policy_warning(tmp_path, monk
     assert gate["warnings"] == ["denied_aiworkhub_tool_requests_recovered:1"]
 
 
+def test_observation_only_task_surfaces_authenticated_policy_warning(tmp_path, monkeypatch):
+    _patch_verify(monkeypatch, policy_violations=1)
+    stdout = tmp_path / "research-worker.log"
+    stdout.write_text("read-only research output\n", encoding="utf-8")
+    metadata = _metadata(tmp_path, bundle_sha=_sha(), sections=[], stdout=stdout)
+    metadata["project_context"]["task_context_policy"]["task_type"] = "research"
+
+    gate = pl._worker_mcp_live_call_gate(metadata, "req")
+
+    assert gate["gated"] is False
+    assert gate["satisfied"] is True
+    assert gate["policy_warning"] is True
+    assert gate["policy_warning_count"] == 1
+    assert gate["verification"]["policy_violations"] == 1
+
+
 def test_policy_warning_never_overrides_a_missing_required_source_graph_call(tmp_path, monkeypatch):
     _patch_verify(monkeypatch, policy_violations=1)
     stdout = tmp_path / "worker.log"

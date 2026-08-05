@@ -2942,6 +2942,73 @@ def task_card_path_conflicts(card: dict[str, Any]) -> list[dict[str, str]]:
     return conflicts
 
 
+_CONTEXT_QUERY_STOPWORDS = frozenset({
+    "aiworkhub", "task", "worker", "review", "audit", "repair", "implement",
+    "validate", "validation", "code", "source", "graph", "model", "manager",
+    "claude", "codex", "deepseek", "glm", "vscode", "the", "and", "for",
+    "with", "from", "into", "this", "that", "using",
+})
+
+
+def _task_context_query(
+    *,
+    title: str,
+    topic: str,
+    objective: str,
+    acceptance: list[str],
+    read_first: list[str],
+    immutable_inputs: list[str],
+    allowed_writes: list[str],
+) -> str:
+    """Derive a bounded task-entity query instead of a project-name token."""
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        token = raw.strip(" ./\\,:;()[]{}<>`'\"")
+        if len(token) < 3 or len(token) > 160:
+            return
+        identity = token.casefold()
+        if (
+            identity in _CONTEXT_QUERY_STOPWORDS
+            or identity.startswith("aiworkhub_")
+            or identity in seen
+        ):
+            return
+        seen.add(identity)
+        ranked.append(token)
+
+    # Exact declared files/symbol-bearing paths are the strongest authority.
+    for raw in (*read_first, *immutable_inputs, *allowed_writes):
+        if any(ch in raw for ch in "*?["):
+            continue
+        normalized = raw.replace("\\", "/").strip()
+        if normalized and not normalized.startswith(".git"):
+            add(normalized)
+
+    text = " ".join((title, objective, *acceptance, topic))
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_:.+/-]{2,}", text)
+    # Prefer identifiers (CamelCase, snake_case, qualified names and paths)
+    # over ordinary prose words, then retain a few meaningful fallbacks.
+    identifiers = [
+        token for token in tokens
+        if "_" in token
+        or "::" in token
+        or "/" in token
+        or "." in token
+        or any(ch.isupper() for ch in token[1:])
+    ]
+    for token in (*identifiers, *tokens):
+        add(token)
+        if len(ranked) >= 8:
+            break
+    query = " ".join(ranked[:8]).encode("utf-8")[:512].decode(
+        "utf-8", errors="ignore"
+    ).strip()
+    return query or "repository"
+
+
 def create_task(
     task_id: str,
     title: str,
@@ -3243,9 +3310,14 @@ def create_task(
         )
     provider = str(identity["provider"])
     now = datetime.now(timezone.utc).isoformat()
-    context_query = next(
-        (part for part in re.split(r"[^A-Za-z0-9]+", topic) if part),
-        "task",
+    context_query = _task_context_query(
+        title=title,
+        topic=topic,
+        objective=objective,
+        acceptance=acceptance2,
+        read_first=read_first2,
+        immutable_inputs=immutable_inputs2,
+        allowed_writes=writes2,
     )
     session_topic = title.encode("utf-8")[:128].decode("utf-8", errors="ignore").strip() or topic
     semantic_query = f"{title} {topic}".encode("utf-8")[:512].decode(
@@ -3575,6 +3647,34 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    terminal_review = card.get("terminal_review")
+    if isinstance(terminal_review, dict) and terminal_review:
+        terminal_substatus = str(terminal_review.get("substatus") or "")
+        if terminal_substatus != "review_ready":
+            return _lifecycle_error(
+                "done_terminal_review_not_acceptable:"
+                + (terminal_substatus or "missing_substatus")
+            )
+        evidence = terminal_review.get("evidence")
+        request_identity = (
+            evidence.get("request_identity")
+            if isinstance(evidence, dict)
+            else None
+        )
+        if isinstance(request_identity, dict) and str(
+            request_identity.get("request_id") or ""
+        ).strip():
+            # A review-first isolated candidate is not in the canonical tree
+            # yet. Only ProcessManager.accept_review may revalidate hashes,
+            # promote it, and atomically finish the exact request. The generic
+            # mark-done surface must never bypass that phase.
+            return _lifecycle_error("agent_accept_review_required")
+        verification = terminal_review.get("deterministic_verification")
+        if not isinstance(verification, dict):
+            verification = card.get("deterministic_verification")
+        if isinstance(verification, dict) and verification.get("applicable"):
+            if not verification.get("pass"):
+                return _lifecycle_error("done_deterministic_verification_failed")
     command = ["done", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic)]
     blocked = _canonical_write_gate(
         "done", runner=CODEX_RUNNER, topic=str(live_topic), coordinator_capability=True

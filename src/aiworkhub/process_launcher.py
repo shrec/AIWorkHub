@@ -2318,6 +2318,13 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["verification"] = {k: v for k, v in verification.items() if k != "schema_id"}
     result["telemetry_observed"] = bool(verification.get("ok"))
     result["telemetry_reason"] = str(verification.get("reason") or "")
+    policy_violations = int(verification.get("policy_violations") or 0)
+    result["policy_warning"] = policy_violations > 0
+    result["policy_warning_count"] = policy_violations
+    if policy_violations:
+        result["warnings"] = [
+            f"denied_aiworkhub_tool_requests_recovered:{policy_violations}"
+        ]
     if not gated:
         return result
     successful = verification.get("successful_call_count_by_tool") or {}
@@ -2358,13 +2365,6 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     result["missing_tools"] = missing
     result["stale_tools"] = stale
     result["satisfaction_by_tool"] = satisfaction_by_tool
-    policy_violations = int(verification.get("policy_violations") or 0)
-    result["policy_warning"] = policy_violations > 0
-    result["policy_warning_count"] = policy_violations
-    if policy_violations:
-        result["warnings"] = [
-            f"denied_aiworkhub_tool_requests_recovered:{policy_violations}"
-        ]
     if not verification.get("ok") or missing or stale:
         result["satisfied"] = False
         reasons: list[str] = []

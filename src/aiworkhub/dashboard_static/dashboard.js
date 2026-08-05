@@ -460,11 +460,13 @@ function renderUsage(snapshot) {
 
   const fragment = document.createDocumentFragment();
   const overview = createElement("div", "usage-overview");
+  const usageObserved = numberValue(totals.usage_observed_records) > 0;
+  const costObserved = numberValue(totals.cost_known_records) > 0;
   const overviewValues = [
     ["Records", formatCount(totals.records)],
-    ["Input", formatCount(totals.input_tokens)],
-    ["Output", formatCount(totals.output_tokens)],
-    ["Cost", formatMoney(totals.cost_usd)],
+    ["Input", usageObserved ? formatCount(totals.input_tokens) : "Unavailable"],
+    ["Output", usageObserved ? formatCount(totals.output_tokens) : "Unavailable"],
+    ["Cost", costObserved ? formatMoney(totals.cost_usd) : "Unavailable"],
   ];
   for (const [label, value] of overviewValues) {
     const metric = createElement("div", "usage-metric");
@@ -487,7 +489,11 @@ function renderUsage(snapshot) {
   const maximum = Math.max(...rows.map((row) => numberValue(row.total_tokens)), 1);
   for (const item of rows.slice(0, 40)) {
     const row = createElement("div", "stat-row usage-row");
-    row.title = `${numberValue(item.records)} records, ${numberValue(item.total_tokens)} total tokens, ${formatMoney(item.cost_usd)}`;
+    const itemUsageObserved = numberValue(item.usage_observed_records) > 0;
+    const itemCostObserved = numberValue(item.cost_known_records) > 0;
+    const itemTokens = itemUsageObserved ? formatCount(item.total_tokens) : "usage unavailable";
+    const itemCost = itemCostObserved ? formatMoney(item.cost_usd) : "cost unavailable";
+    row.title = `${numberValue(item.records)} records, ${itemTokens}, ${itemCost}`;
     const main = createElement("div", "stat-main");
     const labels = createElement("div", "stat-labels");
     const name = createElement("span", "stat-name", item.name || "unknown");
@@ -495,7 +501,9 @@ function renderUsage(snapshot) {
     const breakdown = createElement(
       "span",
       "stat-breakdown",
-      `${formatCount(item.input_tokens)} in | ${formatCount(item.output_tokens)} out | ${formatMoney(item.cost_usd)}`,
+      itemUsageObserved
+        ? `${formatCount(item.input_tokens)} in | ${formatCount(item.output_tokens)} out | ${itemCost}`
+        : `usage unavailable | ${itemCost}`,
     );
     labels.append(name, breakdown);
     const track = createElement("div", "stat-track");
@@ -503,7 +511,7 @@ function renderUsage(snapshot) {
     fill.style.width = `${Math.max(3, Math.round((numberValue(item.total_tokens) / maximum) * 100))}%`;
     track.appendChild(fill);
     main.append(labels, track);
-    row.append(main, createElement("strong", "stat-total", formatCount(item.total_tokens)));
+    row.append(main, createElement("strong", "stat-total", itemUsageObserved ? formatCount(item.total_tokens) : "N/A"));
     fragment.appendChild(row);
   }
   elements.usageList.replaceChildren(fragment);

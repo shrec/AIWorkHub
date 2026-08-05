@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.88";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.89";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2025,7 +2025,16 @@ class McpStdioClient {
           this._terminateOwnedChild(requestChild);
         }
         debugTrace("mcp.request.timeout", { child_pid: requestChild.pid, id, method, tool });
-        reject(new Error("mcp_request_timeout"));
+        const error = new Error("mcp_request_timeout");
+        error.mcpDiagnostics = {
+          phase: "request_wait",
+          request_id: id,
+          method,
+          tool,
+          child_pid: requestChild.pid || 0,
+          timeout_ms: timeoutMs,
+        };
+        reject(error);
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.pendingChildren.set(id, requestChild);
@@ -2870,12 +2879,42 @@ async function runVscodeLmTextProtocol(
   let sourceGraphAcknowledged = false;
   let initialSourceGraphResult = null;
   if (request.initial_source_graph_request) {
-    initialSourceGraphResult = await invokeTool({
-      name: "aiworkhub_manager_source_graph_query",
-      input: request.initial_source_graph_request,
-    }, request.requestId);
+    try {
+      initialSourceGraphResult = await invokeTool({
+        name: "aiworkhub_manager_source_graph_query",
+        input: request.initial_source_graph_request,
+      }, request.requestId);
+    } catch (cause) {
+      const error = vscodeLmProtocolFailure(
+        "vscode_lm_initial_source_graph_failed",
+        [{
+          turn: 0,
+          phase: "initial_source_graph",
+          outcome: sanitizeErrorMessage(cause),
+        }],
+        String((cause && cause.protocolPreview) || ""),
+      );
+      error.protocolPhase = "initial_source_graph";
+      error.protocolCause = sanitizeErrorMessage(cause);
+      error.protocolRequest = request.initial_source_graph_request;
+      throw error;
+    }
     if (!initialSourceGraphResult || initialSourceGraphResult.ok !== true) {
-      throw new Error("vscode_lm_initial_source_graph_failed");
+      const reason = sanitizeErrorMessage(
+        (initialSourceGraphResult && (
+          initialSourceGraphResult.error
+          || initialSourceGraphResult.reason
+          || initialSourceGraphResult.stderr
+        )) || "source_graph_result_not_ok",
+      );
+      const error = vscodeLmProtocolFailure(
+        "vscode_lm_initial_source_graph_failed",
+        [{ turn: 0, phase: "initial_source_graph", outcome: reason }],
+      );
+      error.protocolPhase = "initial_source_graph";
+      error.protocolCause = reason;
+      error.protocolRequest = request.initial_source_graph_request;
+      throw error;
     }
     sourceGraphAcknowledged = true;
   }
@@ -3331,6 +3370,11 @@ class VscodeLmBridgeHost {
       catch (err) {
         error = sanitizeErrorMessage(err);
         diagnostics = {
+          phase: String((err && err.protocolPhase) || "provider_request"),
+          error_code: error,
+          cause: sanitizeStderrChunk(String((err && err.protocolCause) || "")).slice(0, 500),
+          source_graph_request: (err && err.protocolRequest) || null,
+          mcp: (err && err.mcpDiagnostics) || null,
           protocol_preview: sanitizeStderrChunk(String((err && err.protocolPreview) || "")).slice(0, 768),
           turn_trace: Array.isArray(err && err.protocolTrace) ? err.protocolTrace.slice(-16) : [],
         };

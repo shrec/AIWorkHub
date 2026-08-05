@@ -2600,6 +2600,13 @@ def run_validations(
     rows = list(commands)
     if len(rows) > MAX_VALIDATION_COMMANDS:
         raise WorkspaceError(f"validation_command_limit_exceeded:{len(rows)}")
+    # A task with no validation commands has nothing to execute. Resolve no
+    # host sandbox in this case: on Windows, VS Code LM workers already ran in
+    # the editor-host boundary, and selecting a native CLI/AppContainer
+    # backend here falsely converted their successful no-validation result to
+    # ``finalize_failed:windows_appcontainer_sandbox_unavailable``.
+    if not rows:
+        return []
     results: list[dict[str, Any]] = []
     backend = select_sandbox_backend()
     validation_home = workspace.home if backend == "landlock" else None
