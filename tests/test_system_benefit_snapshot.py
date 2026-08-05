@@ -1,12 +1,25 @@
 import json
 from pathlib import Path
 
-from scripts.check_system_benefit_snapshot import check
+from scripts.check_system_benefit_snapshot import check, check_public_claim_surfaces
 
 
 def test_checked_in_system_benefit_snapshot_is_internally_consistent() -> None:
     root = Path(__file__).resolve().parents[1]
     assert check(root / "benchmarks" / "system-benefit-snapshot-v1.json") == []
+
+
+def test_public_claim_surfaces_fail_closed_on_stale_pilot_copy(
+    tmp_path: Path,
+) -> None:
+    for relative in ("README.md", "site/index.html", "site/benchmarks/index.html"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("27.5% fewer tokens. Pilot only.", encoding="utf-8")
+
+    errors = check_public_claim_surfaces(tmp_path)
+    assert "public_claim_boundary_missing:README.md" in errors
+    assert "public_claim_cap_mismatch_missing:site/index.html" in errors
 
 
 def test_system_snapshot_rejects_paired_metric_drift(tmp_path: Path) -> None:

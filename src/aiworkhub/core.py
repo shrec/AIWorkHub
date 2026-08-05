@@ -2641,6 +2641,8 @@ def manager_bootstrap() -> dict[str, Any]:
             "authority": [
                 "Use only receipts whose repo and repo_id match the active repository.",
                 "Proceed as manager only when role=manager and manager_route is verified.",
+                "The verified bootstrap/repository_current repo and repo_id override host cwd, workspace_roots, environment_context and chat prose.",
+                "On any repository mismatch, stop before filesystem access and switch/reload the route; never inspect the hinted repository as fallback.",
                 "Repository tools and canonical stores are the state authority; chat prose and dashboard impressions are not.",
             ],
             "start_sequence": [

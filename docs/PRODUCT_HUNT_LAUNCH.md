@@ -68,8 +68,9 @@ outline, not a comment to paste blindly.
 > and which workflow evidence you need before trusting an agent's result.
 
 Do not add a universal token-savings multiplier. The current n=2 semantic-edit
-pilot is public and machine checked, but explicitly fails the product-claim
-gate because it is small, non-randomized and cache-confounded.
+artifact is a historical capped A/B observation and explicitly fails the
+product-claim gate: pair 1 used mismatched 20k/200k token ceilings. An uncapped
+matched rerun is required before any causal or product-savings claim.
 
 ## Media
 
@@ -155,9 +156,10 @@ providers and is shown by Preflight rather than assumed.
 
 AIWorkHub does not currently publish a universal savings multiplier. Operations
 records structural bytes, file reads, provider tokens, cost availability and
-outcomes separately. A preliminary n=2 focused-edit pilot observed lower total
-tokens (27.5%) and elapsed time (21.5%), but it is not randomized and its cache
-mix differs; uncached input increased 20.3%. Separately, the 156-task context
+outcomes separately. A historical capped n=2 focused-edit A/B observation
+recorded lower total tokens (27.5%) and elapsed time (21.5%), but pair 1 used
+mismatched 20k/200k token ceilings. It is not eligible for a causal or
+product-savings claim; an uncapped matched rerun is required. Separately, the 156-task context
 snapshot exposed a 20.0% legacy-v1 envelope expansion. The nested compact v2
 structural fix shipped in 0.8.82; an equivalent live fleet remeasurement remains
 a target. The raw ledgers, negative results and deterministic checkers are public.

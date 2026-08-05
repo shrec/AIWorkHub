@@ -33,6 +33,8 @@ def test_canonical_order_is_exact_and_compact() -> None:
 def test_adaptive_invocation_without_empty_ceremony() -> None:
     text = instr.render_canonical()
     assert "Role-specific AIWorkHub MCP tools are mandatory for managers and workers" in text
+    assert "repo and repo_id outrank cwd, workspace_roots, environment_context" in text
+    assert "never inspect the hinted repo as fallback" in text
     assert "Task MCP receipt is always required; Source Graph is required for code tasks." in text
     assert "run only when the card requests them or the task is non-trivial" in text
     assert "Do not make empty irrelevant calls" in text
@@ -109,6 +111,8 @@ def test_claude_projection_starts_with_manager_graph_loop() -> None:
     for required in (
         "Before Read, Grep, Glob, Bash or filesystem discovery",
         "call aiworkhub_manager_bootstrap",
+        "verified bootstrap/repository_current repository outranks host cwd",
+        "switch/reload the route",
         "aiworkhub_manager_source_graph_query first with focus or slice",
         "workflow_stage=orientation",
         "report the MCP problem instead of silently bypassing AIWorkHub",

@@ -139,7 +139,7 @@ negative and still-unmeasured results.
 
 | Evidence | Current observation | Status |
 | --- | --- | --- |
-| Focused-edit paired pilot | 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time; uncached input was 20.3% higher | Pilot, `n=2`; not a product multiplier |
+| Focused-edit paired pilot | Historical capped A/B observation: 27.5% fewer total tokens, 24.9% fewer output tokens and 21.5% less elapsed time across two pairs, but pair 1 used mismatched `20k`/`200k` token ceilings | Not eligible for a causal or product-savings claim; uncapped matched rerun required |
 | Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified reduction in emitted code payload when a full-file baseline applies; not a 60.26× claim for the complete provider bill |
 | Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
 | Tool-use cohorts | Review-ready rate was 7.2% with missing graph use, 26.7% with live single-stage use and 33.3% with continuous use | Observational association; not causality |

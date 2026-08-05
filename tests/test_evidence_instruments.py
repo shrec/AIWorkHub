@@ -14,6 +14,7 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
     candidate.mkdir()
     path = candidate / "result.py"
     path.write_text("answer = 42\n", encoding="utf-8")
+    path.chmod(0o644)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     report = evidence.review_evidence_audit(
         tmp_path,
@@ -24,6 +25,57 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
     )
     assert report["status"] == "pass"
     assert report["required_outputs_verified"] == 1
+    manifest_token = evidence.review_evidence_audit(
+        tmp_path,
+        candidate,
+        changed_paths=["result.py"],
+        stored_hashes={"result.py": digest},
+        required_outputs=[{
+            "path": "result.py",
+            "sha256": f"file:644:{digest}",
+            "bytes": 12,
+        }],
+    )
+    assert manifest_token["status"] == "pass"
+    path.chmod(0o4755)
+    executable_token = evidence.review_evidence_audit(
+        tmp_path,
+        candidate,
+        changed_paths=["result.py"],
+        stored_hashes={"result.py": digest},
+        required_outputs=[{
+            "path": "result.py",
+            "sha256": f"file:4755:{digest}",
+            "bytes": 12,
+        }],
+    )
+    assert executable_token["status"] == "pass"
+    path.chmod(0o644)
+    malformed_values = (
+        f"file:644:{digest[:-1]}",
+        f"file:644:{'0' * 64}",
+        f"file:755:{digest}",
+        f"file:xyz:{digest}",
+        f"file:888:{digest}",
+        f"file:644:extra:{digest}",
+        f"file:644:{digest.upper()}",
+        f" file:644:{digest}",
+    )
+    for malformed in malformed_values:
+        malformed_token = evidence.review_evidence_audit(
+            tmp_path,
+            candidate,
+            changed_paths=["result.py"],
+            stored_hashes={"result.py": digest},
+            required_outputs=[{
+                "path": "result.py",
+                "sha256": malformed,
+                "bytes": 12,
+            }],
+        )
+        assert malformed_token["blockers"] == [
+            "required_output_hash_mismatch:result.py"
+        ]
     failed = evidence.review_evidence_audit(
         tmp_path,
         candidate,
