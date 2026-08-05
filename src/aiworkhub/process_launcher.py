@@ -1502,6 +1502,35 @@ def _research_result_text(event: dict[str, Any]) -> str:
     return ""
 
 
+def _strip_project_context_receipt_prefix(text: str) -> str:
+    """Strip authenticated PROJECT_CONTEXT_RECEIPT prefixes per line.
+
+    A provider may emit the whole ``PROJECT_CONTEXT_RECEIPT: {json} |
+    evidence`` acknowledgement on one result line, or wrap the receipt
+    inside a multi-line message. Only the bounded JSON object after the
+    marker is stripped so any same-line evidence suffix survives; receipt
+    lines without a suffix and lines whose marker is not valid JSON are
+    dropped.
+    """
+
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if not stripped_line.startswith("PROJECT_CONTEXT_RECEIPT:"):
+            kept.append(line)
+            continue
+        remainder = stripped_line[len("PROJECT_CONTEXT_RECEIPT:") :].lstrip()
+        decoder = json.JSONDecoder()
+        try:
+            _, end = decoder.raw_decode(remainder)
+        except json.JSONDecodeError:
+            continue
+        suffix = remainder[end:].strip(" |")
+        if suffix:
+            kept.append(suffix)
+    return "\n".join(kept).strip()
+
+
 def _provider_auth_failure_from_output(path: Path) -> dict[str, Any] | None:
     """Return bounded, structured provider-auth evidence without secret text.
 
@@ -1664,13 +1693,10 @@ def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
         text = _research_result_text(event)
         if not text:
             continue
-        # A provider may wrap the receipt itself in an assistant message.
-        # It is acknowledgement evidence, never the research deliverable.
-        without_receipts = "\n".join(
-            line
-            for line in text.splitlines()
-            if not line.strip().startswith("PROJECT_CONTEXT_RECEIPT:")
-        ).strip()
+        # The receipt and its evidence may share one result line as
+        # "PROJECT_CONTEXT_RECEIPT: {json} | evidence". Strip only the
+        # authenticated JSON prefix; the same-line suffix is the deliverable.
+        without_receipts = _strip_project_context_receipt_prefix(text)
         if not without_receipts:
             continue
         result_count += 1

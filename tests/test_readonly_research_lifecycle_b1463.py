@@ -108,6 +108,82 @@ def _result_log(path: Path, text: str = "independent evidence trace") -> dict:
     return process_launcher._readonly_research_result_evidence(path)
 
 
+def test_result_event_after_receipt_prefix_preserves_same_line_suffix(
+    tmp_path: Path,
+) -> None:
+    receipt = {"schema_id": "aiworkhub.task_mcp.worker_context_receipt.v1"}
+    receipt_line = "PROJECT_CONTEXT_RECEIPT: " + json.dumps(receipt)
+    suffix = "Evidence-only audit: 3 independent traces"
+
+    def _evidence_from_event(name: str, event: dict) -> dict:
+        log = tmp_path / f"{name}.stdout.log"
+        log.write_text(
+            receipt_line + "\n" + json.dumps(event) + "\n", encoding="utf-8"
+        )
+        return process_launcher._readonly_research_result_evidence(log)
+
+    evidence = _evidence_from_event(
+        "with_suffix",
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": receipt_line + " | " + suffix,
+            "changed_paths": [],
+        },
+    )
+    assert evidence["meaningful_output"] is True
+    assert evidence["result_event_count"] == 1
+    assert evidence["result_chars"] == len(suffix)
+    assert evidence["reason"] == ""
+
+    fail_closed: dict[str, dict] = {
+        "receipt_only": {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": receipt_line,
+        },
+        "unverifiable_marker": {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "PROJECT_CONTEXT_RECEIPT: raw prose | evidence",
+        },
+        "error_result": {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": receipt_line + " | error evidence",
+        },
+        "empty_result": {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": " \t ",
+        },
+        "unobserved_success_type": {
+            "type": "success",
+            "is_error": False,
+            "result": "verified research output",
+        },
+        "unrelated_event": {"type": "event", "data": {"content": "tool chatter"}},
+    }
+    for name, event in fail_closed.items():
+        got = _evidence_from_event(name, event)
+        assert got["meaningful_output"] is False, name
+        assert got["result_event_count"] == 0, name
+        assert got["result_chars"] == 0, name
+        assert got["reason"] == "research_result_missing", name
+
+    malformed = tmp_path / "malformed.stdout.log"
+    malformed.write_text(receipt_line + "\n" + "{not valid json\n", encoding="utf-8")
+    malformed_evidence = process_launcher._readonly_research_result_evidence(malformed)
+    assert malformed_evidence["meaningful_output"] is False
+    assert malformed_evidence["result_event_count"] == 0
+    assert malformed_evidence["reason"] == "research_result_missing"
+
+
 def test_research_result_requires_supported_non_receipt_output(tmp_path: Path) -> None:
     output = tmp_path / "research.stdout.log"
     output.write_text(

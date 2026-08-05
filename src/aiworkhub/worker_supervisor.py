@@ -387,6 +387,8 @@ def supervise(spec: dict[str, Any]) -> int:
         )
     except (TypeError, ValueError):
         max_total_output_bytes = DEFAULT_MAX_TOTAL_OUTPUT_BYTES
+    # This byte threshold bounds capture/telemetry history only. It must not
+    # terminate useful work or masquerade as token-budget authority.
     max_total_output_bytes = max(
         MIN_MAX_OUTPUT_BYTES,
         min(max_total_output_bytes, MAX_TOTAL_OUTPUT_BYTES),
@@ -505,13 +507,6 @@ def supervise(spec: dict[str, Any]) -> int:
                 final_state = "timed_out"
                 returncode = _terminate_child(child)
                 break
-            observed_output_bytes = (
-                stdout_capture.received_bytes + stderr_capture.received_bytes
-            )
-            if observed_output_bytes > max_total_output_bytes:
-                final_state = "output_budget_exceeded"
-                returncode = _terminate_child(child)
-                break
             now_monotonic = time.monotonic()
             if now_monotonic >= next_heartbeat_monotonic:
                 # Heartbeat is a supervisor-owned liveness signal only --
@@ -585,11 +580,8 @@ def supervise(spec: dict[str, Any]) -> int:
         final_output_received_bytes = (
             stdout_capture.received_bytes + stderr_capture.received_bytes
         )
-        if (
-            final_state == "exited"
-            and final_output_received_bytes > max_total_output_bytes
-        ):
-            final_state = "output_budget_exceeded"
+        # A large captured byte count never converts a successful exit into a
+        # failure; persisted tails remain bounded independently.
         if (
             final_stdout_bytes != last_stdout_bytes
             or final_stderr_bytes != last_stderr_bytes
@@ -645,8 +637,6 @@ def supervise(spec: dict[str, Any]) -> int:
             "error": (
                 "token_budget_exceeded:provider_reported_live_usage"
                 if final_state == "token_budget_exceeded"
-                else "output_budget_exceeded:captured_output_bytes"
-                if final_state == "output_budget_exceeded"
                 else ""
             ),
         })
@@ -676,8 +666,6 @@ def supervise(spec: dict[str, Any]) -> int:
         return 124
     if final_state == "token_budget_exceeded":
         return 122
-    if final_state == "output_budget_exceeded":
-        return 121
     return int(returncode)
 
 

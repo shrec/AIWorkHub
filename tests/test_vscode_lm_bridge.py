@@ -330,6 +330,51 @@ def test_request_publishes_hash_pinned_edit_and_create_path_contracts(
     assert spec["path_contracts"] == contracts
 
 
+def test_missing_parent_baseline_with_nonempty_rework_file_is_edit_not_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "e" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "tests").mkdir(parents=True)
+    home.mkdir(mode=0o700)
+    inherited = workspace / "src" / "reworked.py"
+    inherited.write_text("print('inherited from predecessor rework')\n", encoding="utf-8")
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="bounded",
+        model="glm-5.2",
+        allowed_writes=["src/reworked.py", "tests/test_truly_new.py"],
+        workspace_parent_baseline={
+            "src/reworked.py": None,
+            "tests/test_truly_new.py": None,
+        },
+        timeout_seconds=30,
+    )
+
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    contracts = published["path_contracts"]
+    assert contracts["src/reworked.py"] == {
+        "action": "edit",
+        "current_sha256": hashlib.sha256(inherited.read_bytes()).hexdigest(),
+        "line_count": 1,
+        "parent_existed": False,
+    }
+    assert contracts["tests/test_truly_new.py"]["action"] == "create"
+    assert contracts["tests/test_truly_new.py"]["parent_existed"] is False
+    assert "src/reworked.py" not in spec["create_paths"]
+    assert spec["create_paths"] == ["tests/test_truly_new.py"]
+
+
 def test_path_contract_line_count_matches_semantic_edit_lines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -325,22 +325,28 @@ def create_request(
             candidate.relative_to(workspace_path)
         except ValueError:
             continue
-        parent_missing = relative in parent_baseline and parent_baseline[relative] is None
-        if parent_missing:
-            create_paths.append(relative)
+        declared_missing = relative in parent_baseline and parent_baseline[relative] is None
         current_sha256 = ""
         line_count = 0
+        is_existing_nonempty_file = (
+            candidate.is_file()
+            and not candidate.is_symlink()
+            and candidate.stat().st_size > 0
+        )
         if candidate.is_file() and not candidate.is_symlink():
             data = candidate.read_bytes()
             current_sha256 = hashlib.sha256(data).hexdigest()
             # Match semantic_edit.apply_line_ranges(), which addresses
             # ``splitlines(keepends=True)`` using one-based line numbers.
             line_count = len(data.splitlines(keepends=True))
+        parent_missing = declared_missing and not is_existing_nonempty_file
+        if parent_missing:
+            create_paths.append(relative)
         path_contracts[relative] = {
             "action": "create" if parent_missing else "edit",
             "current_sha256": current_sha256,
             "line_count": line_count,
-            "parent_existed": not parent_missing,
+            "parent_existed": not declared_missing,
         }
     deadline = datetime.now(timezone.utc) + timedelta(seconds=int(timeout_seconds))
     initial_source_graph_request: dict[str, Any] | None = None

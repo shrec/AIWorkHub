@@ -182,9 +182,12 @@ def test_supervisor_sums_claude_completed_turn_usage_for_live_cap(
     assert status["token_budget"]["events"][-1]["cap_enforceable"] is True
 
 
-def test_supervisor_enforces_output_bytes_without_claiming_token_truth(
+def test_supervisor_does_not_terminate_on_output_bytes(
     tmp_path: Path,
 ) -> None:
+    # Byte-count telemetry must not stop the child. This fixture deliberately
+    # sleeps after emitting more than the threshold, so timeout is the sole
+    # authoritative terminal reason.
     script = (
         "import sys,time; "
         "sys.stdout.write('x' * 4096); sys.stdout.flush(); time.sleep(30)"
@@ -193,14 +196,16 @@ def test_supervisor_enforces_output_bytes_without_claiming_token_truth(
     spec.update(
         max_total_output_bytes=2048,
         heartbeat_interval_seconds=0.05,
+        timeout_seconds=1,
     )
     write_json_0600(spec_path, spec)
 
     result = _run_supervisor(spec_path)
 
-    assert result.returncode == 121, result.stderr.decode()
+    assert result.returncode == 124, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
-    assert status["state"] == "output_budget_exceeded"
+    assert status["state"] == "timed_out"
+    assert status["state"] != "output_budget_exceeded"
     assert status["output_budget"]["cap_bytes"] == 2048
     assert status["output_budget"]["observed_bytes"] >= 4096
     assert status["output_budget"]["byte_labels_are_token_truth"] is False
