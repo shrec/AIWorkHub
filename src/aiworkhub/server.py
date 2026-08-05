@@ -753,6 +753,7 @@ def aiworkhub_task_create(
     depends_on: list[str] | None = None,
     read_first: list[str] | None = None,
     immutable_inputs: list[str] | None = None,
+    read_only: bool = False,
     max_live_tokens: int | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
@@ -781,6 +782,9 @@ def aiworkhub_task_create(
     launch baselines; they are verified and hashed but never promoted.
     ``allow_empty_required_outputs`` is the equivalent explicit exception for
     deliberately zero-byte outputs. Neither exception is inferred.
+    ``read_only=True`` is required for a task that intentionally declares
+    both ``allowed_writes=[]`` and ``required_outputs=[]``. Read-only intent is
+    never inferred from missing output authority.
     """
 
     return core.create_task(
@@ -801,6 +805,7 @@ def aiworkhub_task_create(
         depends_on=depends_on,
         read_first=read_first,
         immutable_inputs=immutable_inputs,
+        read_only=read_only,
         max_live_tokens=max_live_tokens,
     )
 

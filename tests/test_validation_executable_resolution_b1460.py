@@ -265,6 +265,10 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
     result = worker_workspace.run_validations(workspace, ["ruff check src"])
 
     assert result[0]["argv"] == [str(ruff.resolve()), "check", "src"]
+    assert result[0]["declared_command"] == "ruff check src"
+    assert result[0]["declared_argv"] == ["ruff", "check", "src"]
+    assert result[0]["executed_argv"] == [str(ruff.resolve()), "check", "src"]
+    assert result[0]["argv_rewritten"] is True
     assert captured["argv"] == [str(ruff.resolve()), "check", "src"]
     assert captured["shell"] is False
     assert captured["env"]["RUFF_CACHE_DIR"] == str(tmp_path / "scratch")

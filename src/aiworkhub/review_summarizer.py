@@ -260,11 +260,15 @@ def _derive_risks(card: dict[str, Any]) -> list[dict[str, str]]:
             "severity": "high",
             "detail": "card declares no validation commands",
         })
-    # A genuinely absent allowed_writes key, or an empty scope on a card that
-    # DOES declare required_outputs, is a real risk. An intentionally-empty
-    # readonly/no-output card (allowed_writes: [] with no required_outputs) is
-    # not flagged -- no NO_WRITES sentinel needed.
-    if raw_allowed is None or (not allowed and (card.get("required_outputs") or [])):
+    # A no-write/no-output contract is safe only when read-only intent is
+    # explicit. Missing write authority on an ordinary card remains a risk.
+    if raw_allowed is None or (
+        not allowed
+        and (
+            card.get("read_only") is not True
+            or bool(card.get("required_outputs") or [])
+        )
+    ):
         risks.append({
             "code": "missing_allowed_writes",
             "severity": "high",

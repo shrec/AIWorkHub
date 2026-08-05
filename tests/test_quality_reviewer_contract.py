@@ -37,9 +37,10 @@ def _packet() -> dict[str, object]:
 
 def test_read_only_research_reviewer_allows_no_repository_outputs() -> None:
     process_launcher._validate_required_outputs_contract(
-        {
-            "topic": "quality_review",
-            "allowed_writes": [],
+            {
+                "topic": "quality_review",
+                "read_only": True,
+                "allowed_writes": [],
             "required_outputs": [],
             "project_context": {"task_type": "research"},
         }
@@ -48,8 +49,9 @@ def test_read_only_research_reviewer_allows_no_repository_outputs() -> None:
 
 def test_no_write_code_inspection_allows_no_repository_outputs() -> None:
     process_launcher._validate_required_outputs_contract(
-        {
-            "allowed_writes": [],
+            {
+                "read_only": True,
+                "allowed_writes": [],
             "required_outputs": [],
             "project_context": {"task_type": "code"},
         }

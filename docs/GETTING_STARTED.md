@@ -180,6 +180,12 @@ non-overlapping `allowed_writes`. The manager must use the plan/collision and
 preflight receipts rather than guessing availability. A pending card never
 starts itself, and a worker never accepts its own review.
 
+For an evidence-only inspection that intentionally writes no repository
+artifact, set `read_only: true`, `allowed_writes: []` and
+`required_outputs: []`. AIWorkHub does not infer read-only intent from empty
+lists: omitting the flag fails before provider launch, preventing an accidental
+code card from spending tokens on an unpromotable result.
+
 Identical `task_create` retries are safe after an interrupted connection: the
 server returns the existing canonical receipt with `created=false`. Reusing a
 task id with different content remains an explicit conflict and never

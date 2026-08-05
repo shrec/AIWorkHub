@@ -39,6 +39,7 @@ jobs:
         run: |
           python scripts/check_semantic_edit_benchmark.py
           python scripts/check_context_envelope_benchmark.py
+          python scripts/check_provider_routing_observation.py
           python scripts/check_system_benefit_snapshot.py
 
   cross-platform:

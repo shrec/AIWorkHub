@@ -782,6 +782,7 @@ def test_task_create_callback_required_waits_for_real_origin_thread(tmp_path, mo
         objective="Should not create callback-required cards without a real thread.",
         acceptance=["Fails closed."],
         allowed_writes=[],
+        read_only=True,
         callback_required=True,
     )
 
@@ -814,6 +815,7 @@ def test_task_create_polling_only_succeeds_while_route_is_pending(tmp_path, monk
         objective="Create a route-pending manager task without callback delivery.",
         acceptance=["Card is persisted."],
         allowed_writes=[],
+        read_only=True,
         callback_required=False,
     )
 

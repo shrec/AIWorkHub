@@ -969,6 +969,34 @@ def test_usage_parser_preserves_nested_per_turn_cache_and_model_evidence(tmp_pat
     assert usage["cost_observed"] is True
 
 
+def test_usage_parser_counts_codex_reasoning_and_cache_write_tokens(tmp_path):
+    output = tmp_path / "codex-stream.jsonl"
+    output.write_text(
+        json.dumps({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 129_189,
+                "cached_input_tokens": 111_232,
+                "cache_write_input_tokens": 12,
+                "output_tokens": 1_113,
+                "reasoning_output_tokens": 285,
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    usage = process_launcher._usage_from_output(output, include_samples=True)
+
+    assert usage["reasoning_output_tokens"] == 285
+    assert usage["cache_write_input_tokens"] == 12
+    assert usage["cache_creation_input_tokens"] == 12
+    assert usage["cache_metrics_observed"] is True
+    assert process_launcher.provider_usage.cumulative_total_tokens(
+        usage, "codex_cli"
+    ) == 130_587
+    assert process_launcher._ledger_output_tokens(usage) == 1_398
+
+
 def test_termination_refuses_a_pid_without_recorded_start_ticks():
     """A bare pid is not an identity, so it must never authorise a kill.
 

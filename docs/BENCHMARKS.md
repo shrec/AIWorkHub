@@ -25,6 +25,44 @@ The machine-readable fixture is
 and CI recomputes its arithmetic and claim boundaries with
 [`scripts/check_context_envelope_benchmark.py`](../scripts/check_context_envelope_benchmark.py).
 
+## Provider routing observation (65 real runs)
+
+This 2026-08-04 audit used the retained provider streams under
+`.aiworkhub/runtime/process_logs/processes`. The parser matched the terminal
+aggregate on 63/65 runs; the remaining two differences were defects in the
+independent reference extractor, not in AIWorkHub's parser. The checked
+observation is
+[`benchmarks/provider-routing-observation-v1.json`](../benchmarks/provider-routing-observation-v1.json),
+with arithmetic and claim boundaries enforced by
+[`scripts/check_provider_routing_observation.py`](../scripts/check_provider_routing_observation.py).
+
+| Observed model | Runs | Cache hit | Observed effective $/M tokens | Observed cost |
+| --- | ---: | ---: | ---: | ---: |
+| Claude Sonnet 5 | 21 | 97.2% | $0.658 | $40.31 |
+| Claude Opus 4.8 | 9 | 96.4% | $1.929 | $31.61 |
+| Claude Haiku 4.5 | 6 | 95.0% | $0.238 | $1.79 |
+| Codex CLI | 29 | 74–97% per run | Unknown | Unknown |
+
+The result rejects the earlier cache hypothesis: the Claude CLI cohort was
+already at 95–97.2% cache hit, so more prompt-prefix work has little measured
+headroom. Model routing is the larger observed lever. Opus cost **2.93×**
+Sonnet and **8.11×** Haiku per token; its nine runs were 19% of Claude tokens
+but 42.9% of the observed Claude cost.
+
+Pricing the same Opus token volume at the observed Sonnet rate gives $10.78
+instead of $31.61, a possible $20.83 (28.3% of the $73.71 Claude total)
+difference. This is an **unrealized counterfactual, not a savings claim**.
+AIWorkHub must first compare `observed_model × manager acceptance` on fresh
+durable rows. If Opus materially improves accepted outcomes, some or all of
+that premium buys quality rather than waste.
+
+The same audit found 54,243 Codex `reasoning_output_tokens`, 22.7% of Codex
+output, omitted from the old durable ledger. Current code records visible and
+reasoning output separately while including both in billed output totals. It
+also recognizes `cache_write_input_tokens`; the audited runs contained zero,
+so that field closes a latent accounting gap rather than claiming recovered
+cost.
+
 ## System benefit evidence snapshot for 0.8.81
 
 Captured from AIWorkHub managing its own repository on 2026-08-04. The
@@ -48,7 +86,7 @@ and CI checks its denominators with
 | Callback reliability | 271 events | 176 delivered, 95 superseded, 0 dead letters, backlog 0; 100% resolved without dead letter | Verified snapshot | Terminal notifications were durably delivered or intentionally superseded; this is not a latency SLA |
 | Quality selectivity | 216 manager decisions | 25 accepted, 191 rejected; 11.6% acceptance | Verified snapshot | The manager gate is selective and catches non-acceptable work; it does not by itself show that AIWorkHub caused better code |
 | Worker outcomes | 154 terminal runs | 23 review-ready (14.9%); 59 validation-failed (38.3%); 72 other non-green | Verified snapshot | The system records failure honestly. This also shows substantial remaining efficiency headroom |
-| Provider usage | 110 usage records | 196.35M tokens observed; $63.82 known cost; 89 records and 121.14M tokens have unknown cost | Verified incomplete ledger | Token accounting is much more complete than dollar accounting; no system-wide ROI or cost-savings claim is valid yet |
+| Provider usage | 110 usage records | 196.35M tokens observed; $63.82 known cost; 89 records and 121.14M tokens have unknown cost | Verified historical incomplete ledger | This frozen 0.8.81 snapshot predates durable observed-model/reasoning-output fields; no system-wide ROI or cost-savings claim is valid from it |
 
 ## What users can reasonably expect today
 

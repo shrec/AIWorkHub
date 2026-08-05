@@ -1,0 +1,65 @@
+{
+  "schema_id": "aiworkhub.provider_routing_observation.v1",
+  "captured_at": "2026-08-04",
+  "source": {
+    "kind": "verified_runtime_log_audit",
+    "path": ".aiworkhub/runtime/process_logs/processes",
+    "total_runs": 65,
+    "parser_matches": 63,
+    "reference_extractor_mismatches": 2,
+    "parser_mismatches": 0
+  },
+  "cache_and_cost": {
+    "claude-sonnet-5": {
+      "runs": 21,
+      "cache_hit_percent": 97.2,
+      "cost_usd_per_million_tokens": 0.658,
+      "observed_cost_usd": 40.31
+    },
+    "claude-opus-4-8": {
+      "runs": 9,
+      "cache_hit_percent": 96.4,
+      "cost_usd_per_million_tokens": 1.929,
+      "observed_cost_usd": 31.61
+    },
+    "claude-haiku-4-5": {
+      "runs": 6,
+      "cache_hit_percent": 95.0,
+      "cost_usd_per_million_tokens": 0.238,
+      "observed_cost_usd": 1.79
+    },
+    "codex_cli": {
+      "runs": 29,
+      "cache_hit_percent_range": [74.0, 97.0],
+      "observed_cost_usd": null
+    }
+  },
+  "claude_observed_totals": {
+    "runs": 36,
+    "cost_usd": 73.71,
+    "opus_token_share_percent": 19.0,
+    "opus_cost_share_percent": 42.9
+  },
+  "routing_economics": {
+    "opus_cost_per_token_vs_sonnet": 2.9316,
+    "opus_cost_per_token_vs_haiku": 8.105,
+    "same_opus_volume_at_sonnet_price_usd": 10.78,
+    "potential_cost_delta_usd": 20.83,
+    "potential_total_cost_reduction_percent": 28.3,
+    "status": "unrealized_counterfactual",
+    "quality_gate": "observed_model_x_manager_acceptance_pending_fresh_durable_rows"
+  },
+  "codex_output_accounting_gap": {
+    "reasoning_output_tokens": 54243,
+    "share_of_codex_output_percent": 22.7,
+    "status_before_fix": "omitted",
+    "cache_write_input_tokens_observed": 0,
+    "cache_write_support": "latent_parser_gap_before_fix"
+  },
+  "claim_boundaries": {
+    "cache_optimization": "near_saturation_observation_not_a_savings_claim",
+    "model_routing": "association_and_counterfactual_only_until_quality_parity_is_measured",
+    "universal_token_multiplier": false,
+    "realized_cost_savings_claimed": false
+  }
+}

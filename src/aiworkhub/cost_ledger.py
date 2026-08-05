@@ -101,10 +101,15 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "runner": str(entry.get("runner") or ""),
             "topic": str(entry.get("topic") or ""),
             "model": str(entry.get("model") or ""),
+            "requested_model": str(entry.get("requested_model") or ""),
+            "observed_model": str(entry.get("observed_model") or ""),
+            "model_observed": bool(entry.get("model_observed")),
             "provider": str(entry.get("provider") or ""),
             "records": int(entry.get("records") or 1),
             "input_tokens": int(entry.get("input_tokens") or 0),
             "output_tokens": int(entry.get("output_tokens") or 0),
+            "visible_output_tokens": int(entry.get("visible_output_tokens") or 0),
+            "reasoning_output_tokens": int(entry.get("reasoning_output_tokens") or 0),
             "total_tokens": total_tokens,
             "cached_input_tokens": int(entry.get("cached_input_tokens") or 0),
             "cache_creation_input_tokens": int(entry.get("cache_creation_input_tokens") or 0),
@@ -130,6 +135,8 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         "records": 0,
         "input_tokens": 0,
         "output_tokens": 0,
+        "visible_output_tokens": 0,
+        "reasoning_output_tokens": 0,
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
@@ -147,6 +154,12 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         out[bucket]["records"] += int(row.get("records") or 0)
         out[bucket]["input_tokens"] += int(row.get("input_tokens") or 0)
         out[bucket]["output_tokens"] += int(row.get("output_tokens") or 0)
+        out[bucket]["visible_output_tokens"] += int(
+            row.get("visible_output_tokens") or 0
+        )
+        out[bucket]["reasoning_output_tokens"] += int(
+            row.get("reasoning_output_tokens") or 0
+        )
         out[bucket]["total_tokens"] += int(row.get("total_tokens") or 0)
         out[bucket]["cached_input_tokens"] += int(row.get("cached_input_tokens") or 0)
         out[bucket]["cache_creation_input_tokens"] += int(
@@ -175,6 +188,83 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
     return dict(sorted(out.items()))
 
 
+def _model_outcome_matrix(
+    usage_rows: list[dict[str, Any]],
+    decisions: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Associate each task's latest recorded model attempt with its decision."""
+
+    usage_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in usage_rows:
+        task_id = str(row.get("task_id") or "")
+        if task_id:
+            usage_by_task[task_id].append(row)
+    matrix: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "decided_tasks": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "acceptance_rate_percent": None,
+        "usage_observed_tasks": 0,
+        "cost_observed_tasks": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+    })
+    unmatched_decisions = 0
+    for task_id, decision_row in decisions.items():
+        candidates = usage_by_task.get(task_id) or []
+        if not candidates:
+            unmatched_decisions += 1
+            continue
+        decision_at = str(decision_row.get("created_at") or "")
+        eligible = [
+            row
+            for row in candidates
+            if not decision_at
+            or not str(row.get("created_at") or "")
+            or str(row.get("created_at") or "") <= decision_at
+        ]
+        if not eligible:
+            unmatched_decisions += 1
+            continue
+        usage = max(eligible, key=lambda row: str(row.get("created_at") or ""))
+        model = str(
+            usage.get("observed_model")
+            or usage.get("model")
+            or usage.get("requested_model")
+            or "unknown"
+        )
+        bucket = matrix[model]
+        decision = str(decision_row.get("decision") or "")
+        bucket["decided_tasks"] += 1
+        if decision == "accepted":
+            bucket["accepted"] += 1
+        elif decision == "rejected":
+            bucket["rejected"] += 1
+        if usage.get("usage_observed"):
+            bucket["usage_observed_tasks"] += 1
+            bucket["total_tokens"] += int(usage.get("total_tokens") or 0)
+        if usage.get("cost_known"):
+            bucket["cost_observed_tasks"] += 1
+            bucket["cost_usd"] = round(
+                float(bucket["cost_usd"]) + float(usage.get("cost_usd") or 0.0),
+                6,
+            )
+    for bucket in matrix.values():
+        decided = int(bucket["decided_tasks"] or 0)
+        bucket["acceptance_rate_percent"] = (
+            round(100.0 * int(bucket["accepted"] or 0) / decided, 1)
+            if decided
+            else None
+        )
+    return {
+        "schema_id": "aiworkhub.model_outcome_matrix.v1",
+        "association_only": True,
+        "attribution": "latest_usage_attempt_at_or_before_latest_manager_decision",
+        "models": dict(sorted(matrix.items())),
+        "unmatched_decisions": unmatched_decisions,
+    }
+
+
 def build_cost_ledger(
     *,
     repo_root: Path | str | None = None,
@@ -185,12 +275,22 @@ def build_cost_ledger(
 ) -> dict[str, Any]:
     if repo_root is not None:
         usage_rows = _canonical_usage_rows(repo_root)
+        try:
+            manager_decisions = task_store.latest_manager_decisions(repo_root)
+        except task_store.TaskStoreError:
+            manager_decisions = {}
         if runner:
             usage_rows = [row for row in usage_rows if row.get("runner") == runner]
         if topic:
             usage_rows = [row for row in usage_rows if row.get("topic") == topic]
         if status:
             usage_rows = [row for row in usage_rows if row.get("status") == status]
+        scoped_task_ids = {str(row.get("task_id") or "") for row in usage_rows}
+        manager_decisions = {
+            task_id: decision
+            for task_id, decision in manager_decisions.items()
+            if task_id in scoped_task_ids
+        }
         # The persisted launch queue is process-global and carries no complete
         # repository identity.  Never mix it into an explicitly repo-bound
         # catalog; canonical usage events are the sole authority here.
@@ -198,6 +298,7 @@ def build_cost_ledger(
         launch_summary = {"ok": True}
         launch_rows: list[dict[str, Any]] = []
     else:
+        manager_decisions = {}
         usage = core.usage_report(runner=runner, topic=topic, status=status)
         usage_stdout = usage.get("stdout", "")
         usage_rows = _parse_usage_stdout(
@@ -265,6 +366,7 @@ def build_cost_ledger(
             "by_provider": _aggregate(union_rows, "provider"),
             "by_day": _aggregate(union_rows, "day"),
         },
+        "model_outcomes": _model_outcome_matrix(usage_rows, manager_decisions),
         "tasks": union_rows if include_tasks else [],
         "authority_flags": {
             "runtime_authority": False,

@@ -41,6 +41,7 @@ def _research_card(workspace: worker_workspace.WorkerWorkspace) -> dict:
         "status": "review",
         "worker_status": "review",
         "claimed_by": RUNNER,
+        "read_only": True,
         "allowed_writes": [],
         "required_outputs": [],
         "validation": [],
@@ -145,6 +146,7 @@ def test_no_write_no_output_contract_is_readonly_for_code_inspection(
     assert process_launcher._metadata_is_readonly_research(
         {
             "project_context": {"task_context_policy": {"task_type": "code"}},
+            "read_only": True,
             "required_outputs": [],
         },
         workspace,
@@ -152,6 +154,7 @@ def test_no_write_no_output_contract_is_readonly_for_code_inspection(
     assert process_launcher._card_is_readonly_research(
         {
             "project_context": {"task_type": "code"},
+            "read_only": True,
             "allowed_writes": [],
             "required_outputs": [],
         }
@@ -208,6 +211,7 @@ def test_successful_readonly_research_reaches_review_ready(
                 "bundle_sha256": "",
             },
             "required_outputs": [],
+            "read_only": True,
             "validation": [],
             "residual_contract_manifest": [],
             "workspace": workspace.as_metadata(),

@@ -2621,6 +2621,7 @@ def run_validations(
                 tmpdir_override,
                 cd_relative,
             ) = _parse_validation_command_detailed(command)
+            declared_argv = list(tokens)
             effective_components = pythonpath_components
             if _is_pytest_validation_command(tokens):
                 # B755: bind and prepend the one trusted pytest package root
@@ -2717,6 +2718,10 @@ def run_validations(
                     {
                         "command": command,
                         "argv": tokens,
+                        "declared_command": command,
+                        "declared_argv": declared_argv,
+                        "executed_argv": tokens,
+                        "argv_rewritten": declared_argv != tokens,
                         "cwd": cd_relative,
                         "env_override": env_override_evidence,
                         "returncode": None,
@@ -2736,6 +2741,10 @@ def run_validations(
             record = {
                 "command": command,
                 "argv": tokens,
+                "declared_command": command,
+                "declared_argv": declared_argv,
+                "executed_argv": tokens,
+                "argv_rewritten": declared_argv != tokens,
                 "cwd": cd_relative,
                 "env_override": env_override_evidence,
                 "returncode": result.returncode,

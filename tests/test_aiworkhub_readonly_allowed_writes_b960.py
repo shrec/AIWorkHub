@@ -1,10 +1,9 @@
-"""Readonly/canary cards may declare allowed_writes: [] on purpose.
+"""Readonly/canary cards must explicitly declare read_only: true.
 
 The verification must distinguish a MISSING allowed_writes key (genuine
-under-specification) from an intentionally-EMPTY readonly list (a canary /
-no-output task). An empty list is accepted when the card declares no
-required_outputs; it is rejected only when the card DOES declare outputs but
-no write scope. No NO_WRITES sentinel value is required anywhere.
+under-specification) from an intentionally-empty read-only list. An empty
+list is accepted only with ``read_only: true`` and no required outputs. No
+sentinel value is required anywhere.
 """
 from __future__ import annotations
 
@@ -25,14 +24,28 @@ from aiworkhub import review_summarizer  # noqa: E402
 # --- launch-preflight scope validation -------------------------------------
 
 def test_validate_scope_readonly_empty_allowed_writes_is_accepted(tmp_path):
-    # allowed_writes: [] with no required_outputs -> readonly/canary, accepted.
-    pl._validate_scope(tmp_path, {"allowed_writes": [], "required_outputs": None})
-    pl._validate_scope(tmp_path, {"allowed_writes": []})  # required_outputs absent too
+    pl._validate_scope(
+        tmp_path,
+        {"read_only": True, "allowed_writes": [], "required_outputs": []},
+    )
+
+
+def test_validate_scope_empty_allowed_requires_explicit_readonly(tmp_path):
+    with pytest.raises(pl.LaunchRejected) as exc:
+        pl._validate_scope(tmp_path, {"allowed_writes": [], "required_outputs": []})
+    assert "read_only_declaration_required" in str(exc.value)
 
 
 def test_validate_scope_empty_allowed_with_required_outputs_is_rejected(tmp_path):
     with pytest.raises(pl.LaunchRejected) as exc:
-        pl._validate_scope(tmp_path, {"allowed_writes": [], "required_outputs": ["out/x.json"]})
+        pl._validate_scope(
+            tmp_path,
+            {
+                "read_only": True,
+                "allowed_writes": [],
+                "required_outputs": ["out/x.json"],
+            },
+        )
     assert "allowed_writes_empty" in str(exc.value)
 
 
@@ -59,8 +72,18 @@ def _codes(card) -> set[str]:
 
 
 def test_derive_risks_readonly_empty_not_flagged():
-    card = {"allowed_writes": [], "validation": ["run"], "required_outputs": []}
+    card = {
+        "read_only": True,
+        "allowed_writes": [],
+        "validation": ["run"],
+        "required_outputs": [],
+    }
     assert "missing_allowed_writes" not in _codes(card)
+
+
+def test_derive_risks_empty_without_explicit_readonly_is_flagged():
+    card = {"allowed_writes": [], "validation": ["run"], "required_outputs": []}
+    assert "missing_allowed_writes" in _codes(card)
 
 
 def test_derive_risks_absent_allowed_writes_is_flagged():

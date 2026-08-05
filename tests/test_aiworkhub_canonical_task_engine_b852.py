@@ -548,6 +548,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         acceptance=["rejected"],
         allowed_writes=[],
         validation=["python -m pytest -q"],
+        read_only=True,
     )
     assert duplicate["ok"] is False
     assert "task_already_exists" in duplicate["stderr"]
@@ -825,11 +826,43 @@ def test_manager_create_task_is_uncapped_by_default(writable_repo, monkeypatch):
         allowed_writes=[],
         required_outputs=[],
         task_type="research",
+        read_only=True,
     )
 
     assert created["ok"] is True, created
     card = json.loads(created["stdout"])
     assert card["token_budget"] is None
+
+
+def test_manager_create_requires_explicit_read_only_for_empty_output_authority(
+    writable_repo, monkeypatch
+):
+    monkeypatch.setattr(
+        core,
+        "_codex_manager_identity",
+        lambda: {
+            "provider": "codex",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "thread_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "codex_vscode_123",
+        },
+    )
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+
+    result = core.create_task(
+        task_id="TASK_EMPTY_AUTHORITY_AMBIGUOUS",
+        title="Ambiguous empty authority",
+        runner="codex_worker",
+        topic="token_economy",
+        objective="Do not infer read-only intent from empty lists.",
+        acceptance=["Rejected before provider launch."],
+        allowed_writes=[],
+        required_outputs=[],
+        task_type="research",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "read_only_declaration_required"
 
 
 def test_usage_report_empty_no_events(repo):
@@ -901,7 +934,12 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
             "--topic",
             "coding",
             "--model",
-            "test-model",
+            "observed-model",
+            "--requested-model",
+            "requested-model",
+            "--observed-model",
+            "observed-model",
+            "--model-observed",
             "--provider",
             "test-provider",
             "--source",
@@ -909,9 +947,13 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
             "--input-tokens",
             "10",
             "--output-tokens",
+            "7",
+            "--visible-output-tokens",
             "5",
+            "--reasoning-output-tokens",
+            "2",
             "--total-tokens",
-            "15",
+            "17",
             "--cached-input-tokens",
             "4",
             "--cache-creation-input-tokens",
@@ -930,12 +972,18 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
     report = core.run_taskctl(["usage-report", "--runner", "claude_coding"])
     assert report.returncode == 0
     assert "TASK_USAGE_COMPAT" in report.stdout
-    assert "tokens=15" in report.stdout
+    assert "tokens=17" in report.stdout
     [event] = task_store.list_usage_events(writable_repo)
     assert event["cached_input_tokens"] == 4
     assert event["cache_creation_input_tokens"] == 2
     assert event["cache_metrics_observed"] is True
     assert event["cost_observed"] is True
+    assert event["model"] == "observed-model"
+    assert event["requested_model"] == "requested-model"
+    assert event["observed_model"] == "observed-model"
+    assert event["model_observed"] is True
+    assert event["visible_output_tokens"] == 5
+    assert event["reasoning_output_tokens"] == 2
 
 
 def test_run_taskctl_usage_preserves_unobserved_attempt_without_fake_zero(writable_repo):

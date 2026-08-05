@@ -34,9 +34,14 @@ def test_repo_bound_usage_preserves_model_and_unknown_cost_truth(monkeypatch, tm
             "runner": "codex_runner",
             "topic": "code",
             "model": "gpt-5.5",
+            "requested_model": "gpt-5.5",
+            "observed_model": "gpt-5.5-codex",
+            "model_observed": True,
             "provider": "openai",
             "input_tokens": 100,
             "output_tokens": 20,
+            "visible_output_tokens": 15,
+            "reasoning_output_tokens": 5,
             "total_tokens": 120,
             "cost_usd": 0.0,
             "created_at": "2026-08-03T01:02:03+00:00",
@@ -45,6 +50,9 @@ def test_repo_bound_usage_preserves_model_and_unknown_cost_truth(monkeypatch, tm
     result = cost_ledger.build_cost_ledger(repo_root=tmp_path, include_tasks=True)
     assert result["counts"] == {"usage_rows": 1, "launch_rows": 0, "union_rows": 1}
     assert result["tasks"][0]["model"] == "gpt-5.5"
+    assert result["tasks"][0]["requested_model"] == "gpt-5.5"
+    assert result["tasks"][0]["observed_model"] == "gpt-5.5-codex"
+    assert result["tasks"][0]["reasoning_output_tokens"] == 5
     assert result["tasks"][0]["provider"] == "openai"
     assert result["tasks"][0]["cost_known"] is False
     assert result["aggregates"]["by_day"]["2026-08-03"]["total_tokens"] == 120
@@ -77,6 +85,16 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
         "list_usage_events",
         lambda _root, limit=10_000: events,
     )
+    monkeypatch.setattr(
+        cost_ledger.task_store,
+        "latest_manager_decisions",
+        lambda _root: {
+            "T1": {
+                "decision": "accepted",
+                "created_at": "2026-08-03T01:02:02+00:00",
+            }
+        },
+    )
 
     result = cost_ledger.build_cost_ledger(repo_root=tmp_path, include_tasks=True)
 
@@ -94,6 +112,16 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
     assert provider["total_tokens"] == 240
     assert provider["cache_hit_ratio"] == 0.5
     assert result["aggregates"]["by_model"]["gpt-5.5"]["records"] == 2
+    assert result["model_outcomes"]["models"]["gpt-5.5"] == {
+        "decided_tasks": 1,
+        "accepted": 1,
+        "rejected": 0,
+        "acceptance_rate_percent": 100.0,
+        "usage_observed_tasks": 1,
+        "cost_observed_tasks": 1,
+        "total_tokens": 120,
+        "cost_usd": 0.0,
+    }
 
 
 def test_cache_ratio_is_unknown_when_provider_did_not_report_cache_metrics() -> None:

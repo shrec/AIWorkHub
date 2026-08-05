@@ -33,6 +33,7 @@ def _insert(repo: Path, task_id: str, *, status: str = "pending", worker_status:
         "claimed_by": claimed_by,
         "launch_request_id": launch_request_id,
         "claim_epoch": 1 if status == "processing" else 0,
+        "read_only": True,
         "allowed_writes": [],
         "required_outputs": [],
         "project_context": {"task_type": "research"},
@@ -344,11 +345,18 @@ def test_preclaim_launch_blocker_gate_denial_reports_exact_operation(tmp_path, m
 
 
 def test_readonly_scope_is_valid_but_required_output_without_scope_is_not(tmp_path):
-    process_launcher._validate_scope(tmp_path, {"allowed_writes": [], "required_outputs": []})
+    process_launcher._validate_scope(
+        tmp_path,
+        {"read_only": True, "allowed_writes": [], "required_outputs": []},
+    )
     try:
         process_launcher._validate_scope(
             tmp_path,
-            {"allowed_writes": [], "required_outputs": ["out/result.json"]},
+            {
+                "read_only": True,
+                "allowed_writes": [],
+                "required_outputs": ["out/result.json"],
+            },
         )
     except process_launcher.LaunchRejected as exc:
         assert "allowed_writes_empty" in str(exc)

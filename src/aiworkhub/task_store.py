@@ -1378,6 +1378,51 @@ def manager_decision_counts(root: str | Path) -> dict[str, Any]:
         conn.close()
 
 
+def latest_manager_decisions(root: str | Path, *, limit: int = 50_000) -> dict[str, dict[str, str]]:
+    """Return the latest explicit manager review decision for each task.
+
+    Archived/superseded rows count as rejection only when their durable reason
+    is a ``reject_review:`` disposition. Other lifecycle archival is not a
+    quality judgment and is intentionally excluded.
+    """
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path, readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, event, payload_json, created_at FROM task_events "
+            "WHERE event IN ('accept_review','reject_review','archived','superseded') "
+            "ORDER BY event_id DESC LIMIT ?",
+            (max(1, min(int(limit), 50_000)),),
+        ).fetchall()
+    finally:
+        conn.close()
+    decisions: dict[str, dict[str, str]] = {}
+    for row in rows:
+        task_id = str(row["task_id"] or "")
+        if not task_id or task_id in decisions:
+            continue
+        event = str(row["event"] or "")
+        if event == "accept_review":
+            decision = "accepted"
+        elif event == "reject_review":
+            decision = "rejected"
+        else:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if not str(payload.get("reason") or "").startswith("reject_review:"):
+                continue
+            decision = "rejected"
+        decisions[task_id] = {
+            "decision": decision,
+            "event": event,
+            "created_at": str(row["created_at"] or ""),
+        }
+    return decisions
+
+
 def _activate_canonical_authority(registry_path: Path, canonical_db: Path) -> dict[str, Any]:
     """Promote task_queue authority to canonical_active for a freshly
     initialized (never-legacy-imported) repository."""

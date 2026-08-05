@@ -1294,6 +1294,14 @@ def _ledger_input_tokens(usage: dict[str, Any], adapter_id: str) -> int:
     return base
 
 
+def _ledger_output_tokens(usage: dict[str, Any]) -> int:
+    """Return provider-billed output including separately reported reasoning."""
+
+    return int(usage.get("output_tokens") or 0) + int(
+        usage.get("reasoning_output_tokens") or 0
+    )
+
+
 def _project_context_delivery(
     context_result: project_context.ProjectContextResult | None,
     prompt_hash: str,
@@ -1410,13 +1418,14 @@ def _project_context_receipt_from_output(
 def _readonly_research_contract(
     *,
     task_type: Any,
+    read_only: Any,
     allowed_writes: Any,
     required_outputs: Any,
 ) -> bool:
     """Return whether a card is the narrow no-repository-output contract.
 
-    Task type does not create write authority.  Any card with both lists
-    explicitly empty is read-only by construction and may use its
+    Task type does not create write authority.  Only a card with an explicit
+    ``read_only: true`` declaration and both lists empty may use its
     authenticated provider result as evidence.  A card that declares even one
     write or required output follows the normal candidate/diff lifecycle and
     can never use textual stdout as a substitute for repository evidence.
@@ -1431,7 +1440,7 @@ def _readonly_research_contract(
     outputs_are_empty = required_outputs is None or (
         isinstance(required_outputs, (list, tuple)) and not required_outputs
     )
-    return allowed_is_empty and outputs_are_empty
+    return read_only is True and allowed_is_empty and outputs_are_empty
 
 
 def _metadata_is_readonly_research(
@@ -1442,6 +1451,7 @@ def _metadata_is_readonly_research(
     task_type = policy.get("task_type") if isinstance(policy, dict) else ""
     return _readonly_research_contract(
         task_type=task_type,
+        read_only=metadata.get("read_only"),
         allowed_writes=workspace.allowed_writes,
         required_outputs=metadata.get("required_outputs"),
     )
@@ -1452,6 +1462,7 @@ def _card_is_readonly_research(card: dict[str, Any]) -> bool:
     task_type = context.get("task_type") if isinstance(context, dict) else ""
     return _readonly_research_contract(
         task_type=task_type,
+        read_only=card.get("read_only"),
         allowed_writes=card.get("allowed_writes"),
         required_outputs=card.get("required_outputs"),
     )
@@ -1765,12 +1776,11 @@ def _validate_scope(repo: Path, card: dict[str, Any]) -> None:
         raise LaunchRejected("allowed_writes_missing")
     if not isinstance(allowed, list):
         raise LaunchRejected("allowed_writes_invalid")
-    if not allowed and (card.get("required_outputs") or []):
-        # An empty write scope is valid ONLY for a readonly / no-output card
-        # (a canary/verification task that declares no required_outputs). A
-        # card that declares required_outputs but no allowed_writes is a real
-        # misconfiguration -- never accepted, and never via a NO_WRITES sentinel.
-        raise LaunchRejected("allowed_writes_empty")
+    if not allowed:
+        if card.get("read_only") is not True:
+            raise LaunchRejected("read_only_declaration_required")
+        if card.get("required_outputs") or []:
+            raise LaunchRejected("allowed_writes_empty")
     root = repo.resolve()
     for raw in allowed:
         if not isinstance(raw, str) or not raw.strip():
@@ -1801,12 +1811,10 @@ def _validate_required_outputs_contract(card: dict[str, Any]) -> None:
     if not isinstance(raw, list):
         raise LaunchRejected("required_outputs_invalid")
     if not raw:
-        # Any explicitly no-write/no-output card is read-only by construction.
-        # Its evidence is the authenticated worker transcript/MCP receipt, so
-        # audit and code-inspection tasks must not need a dummy repository
-        # marker merely because their task_type is not ``research``.  A write
-        # scope paired with no required output still fails closed.
-        if not (card.get("allowed_writes") or []):
+        # Its evidence is the authenticated worker transcript/MCP receipt.
+        # The intent must be explicit so an accidentally empty code card does
+        # not spend provider tokens on an unpromotable result.
+        if card.get("read_only") is True and not (card.get("allowed_writes") or []):
             return
         raise LaunchRejected("required_outputs_invalid")
     allowed = card.get("allowed_writes") or []
@@ -2474,6 +2482,7 @@ def build_worker_prompt(
         "forbidden", "review_feedback", "commit_contract",
         "project_context", "required_outputs", "allow_empty_required_outputs",
         "allow_unchanged_required_outputs", "external_readonly_sources",
+        "read_only",
     )
     contract = {
         key: card[key]
@@ -3175,6 +3184,7 @@ class ProcessManager:
             priority="high",
             callback_required=True,
             task_type="research",
+            read_only=True,
         )
         if not created.get("ok"):
             return {
@@ -3519,6 +3529,7 @@ class ProcessManager:
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
                     "required_outputs": list(card.get("required_outputs") or []),
+                    "read_only": card.get("read_only") is True,
                     "allow_empty_required_outputs": list(
                         card.get("allow_empty_required_outputs") or []
                     ),
@@ -4106,7 +4117,9 @@ class ProcessManager:
         usage_recorded = False
         usage_error = ""
         total_input = _ledger_input_tokens(usage, adapter_id)
+        total_output = _ledger_output_tokens(usage)
         usage["recorded_input_tokens"] = total_input
+        usage["recorded_output_tokens"] = total_output
         note = f"task_mcp_request:{request_id}"
         try:
             card = _parse_card(self._show_task(task_id), task_id)
@@ -4124,13 +4137,17 @@ class ProcessManager:
         args = [
             "usage", task_id,
             "--runner", runner,
-            "--model", model,
+            "--model", str(usage.get("observed_model") or model),
+            "--requested-model", model,
+            "--observed-model", str(usage.get("observed_model") or ""),
             "--provider", adapter_id.removesuffix("_cli"),
             "--source", "task_mcp_launcher",
             "--note", note,
             "--input-tokens", str(total_input),
-            "--output-tokens", str(usage["output_tokens"]),
-            "--total-tokens", str(total_input + int(usage["output_tokens"])),
+            "--output-tokens", str(total_output),
+            "--visible-output-tokens", str(usage["output_tokens"]),
+            "--reasoning-output-tokens", str(usage["reasoning_output_tokens"]),
+            "--total-tokens", str(total_input + total_output),
             "--cached-input-tokens", str(usage["cached_input_tokens"]),
             "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
             "--cost-usd", str(
@@ -4141,6 +4158,8 @@ class ProcessManager:
         ]
         if usage.get("usage_observed"):
             args.append("--usage-observed")
+        if usage.get("model_observed"):
+            args.append("--model-observed")
         if usage.get("cache_metrics_observed"):
             args.append("--cache-metrics-observed")
         if usage.get("cost_observed"):

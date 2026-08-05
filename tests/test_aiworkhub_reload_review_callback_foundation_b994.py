@@ -87,6 +87,7 @@ def test_polling_only_route_pending_creation_persists_empty_origin(tmp_path, mon
         objective="Persist without a callback route.",
         acceptance=["Persisted."],
         allowed_writes=[],
+        read_only=True,
         callback_required=False,
     )
 
@@ -117,6 +118,7 @@ def test_callback_required_route_pending_still_fails_closed(tmp_path, monkeypatc
         objective="Fail until the callback route is observed.",
         acceptance=["Fails closed."],
         allowed_writes=[],
+        read_only=True,
         callback_required=True,
     )
     assert result["ok"] is False

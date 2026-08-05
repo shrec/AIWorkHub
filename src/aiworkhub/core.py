@@ -1853,11 +1853,16 @@ def run_taskctl(
                 runner=_value("--runner", runner) or "",
                 topic=_value("--topic", topic),
                 model=_value("--model", ""),
+                requested_model=_value("--requested-model", ""),
+                observed_model=_value("--observed-model", ""),
+                model_observed="--model-observed" in args,
                 provider=_value("--provider", ""),
                 source=_value("--source", ""),
                 note=_value("--note", ""),
                 input_tokens=_int_value("--input-tokens", 0),
                 output_tokens=_int_value("--output-tokens", 0),
+                visible_output_tokens=_int_value("--visible-output-tokens", 0),
+                reasoning_output_tokens=_int_value("--reasoning-output-tokens", 0),
                 total_tokens=_int_value("--total-tokens", 0),
                 cached_input_tokens=_int_value("--cached-input-tokens", 0),
                 cache_creation_input_tokens=_int_value("--cache-creation-input-tokens", 0),
@@ -2950,6 +2955,7 @@ def create_task(
     depends_on: list[str] | None = None,
     read_first: list[str] | None = None,
     immutable_inputs: list[str] | None = None,
+    read_only: bool = False,
     max_live_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
@@ -2999,6 +3005,8 @@ def create_task(
         result["allowed_task_types"] = list(allowed_task_types)
         result["received_task_type"] = task_type[:80]
         return result
+    if not isinstance(read_only, bool):
+        return _lifecycle_error("read_only_invalid", 2)
     if (
         max_live_tokens is not None
         and (
@@ -3038,6 +3046,15 @@ def create_task(
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
     except ValueError as exc:
         return _lifecycle_error(str(exc), 2)
+    if read_only:
+        if writes2:
+            return _lifecycle_error("read_only_allowed_writes_forbidden", 2)
+        if outputs2:
+            return _lifecycle_error("read_only_required_outputs_forbidden", 2)
+        if allow_empty_outputs2 or allow_unchanged_outputs2:
+            return _lifecycle_error("read_only_output_exceptions_forbidden", 2)
+    elif not writes2 and not outputs2:
+        return _lifecycle_error("read_only_declaration_required", 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
     # Parse every validation command before persisting the card.  The worker
@@ -3245,6 +3262,7 @@ def create_task(
         "callback_supported": bool(origin_thread_id),
         "manager_route_state": str(identity.get("route_state") or ""),
         "acceptance": acceptance2,
+        "read_only": read_only,
         "allowed_writes": writes2,
         "forbidden": forbidden2,
         "required_outputs": outputs2,
@@ -3297,6 +3315,7 @@ def create_task(
         "topic": topic,
         "objective": objective,
         "acceptance": acceptance2,
+        "read_only": read_only,
         "allowed_writes": writes2,
         "forbidden": forbidden2,
         "required_outputs": outputs2,
@@ -3327,6 +3346,7 @@ def create_task(
             "topic": str(existing_card.get("topic") or ""),
             "objective": str(existing_card.get("objective") or ""),
             "acceptance": existing_card.get("acceptance") or [],
+            "read_only": existing_card.get("read_only") is True,
             "allowed_writes": existing_card.get("allowed_writes") or [],
             "forbidden": existing_card.get("forbidden") or [],
             "required_outputs": existing_card.get("required_outputs") or [],
@@ -4419,11 +4439,16 @@ def record_usage(
     runner: str,
     topic: str | None = None,
     model: str | None = None,
+    requested_model: str | None = None,
+    observed_model: str | None = None,
+    model_observed: bool = False,
     provider: str | None = None,
     source: str | None = None,
     note: str | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    visible_output_tokens: int = 0,
+    reasoning_output_tokens: int = 0,
     total_tokens: int = 0,
     cached_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
@@ -4458,6 +4483,7 @@ def record_usage(
         else bool(
             input_tokens
             or output_tokens
+            or reasoning_output_tokens
             or total_tokens
             or cached_input_tokens
             or cache_creation_input_tokens
@@ -4471,12 +4497,17 @@ def record_usage(
         "status": card.get("status"),
         "worker_status": card.get("worker_status"),
         "model": model or "",
+        "requested_model": requested_model or model or "",
+        "observed_model": observed_model or "",
+        "model_observed": bool(model_observed and observed_model),
         "provider": provider or "",
         "source": source or "",
         "note": note or "",
         "records": 1,
         "input_tokens": int(input_tokens or 0),
         "output_tokens": int(output_tokens or 0),
+        "visible_output_tokens": int(visible_output_tokens or 0),
+        "reasoning_output_tokens": int(reasoning_output_tokens or 0),
         "total_tokens": int(total_tokens or (int(input_tokens or 0) + int(output_tokens or 0))),
         "cached_input_tokens": int(cached_input_tokens or 0),
         "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),

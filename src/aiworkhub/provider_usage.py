@@ -53,8 +53,10 @@ def _empty_summary() -> dict[str, Any]:
     return {
         "input_tokens": 0,
         "output_tokens": 0,
+        "reasoning_output_tokens": 0,
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "cache_write_input_tokens": 0,
         "usage_observed": False,
         "cache_metrics_observed": False,
         "cost_usd": None,
@@ -71,6 +73,7 @@ def _empty_summary() -> dict[str, Any]:
         "completed_turn_count": 0,
         "completed_turn_input_tokens": 0,
         "completed_turn_output_tokens": 0,
+        "completed_turn_reasoning_output_tokens": 0,
         "completed_turn_cached_input_tokens": 0,
         "completed_turn_cache_creation_input_tokens": 0,
         "terminal_result_usage_observed": False,
@@ -130,10 +133,12 @@ def read_provider_usage(
             "output_tokens",
             "completion_tokens",
             "output",
+            "reasoning_output_tokens",
             "cache_read_input_tokens",
             "cached_input_tokens",
             "prompt_cache_hit_tokens",
             "cache_creation_input_tokens",
+            "cache_write_input_tokens",
         }
         if not any(key in usage for key in recognized_keys) and "cached_tokens" not in details:
             return
@@ -148,14 +153,17 @@ def read_provider_usage(
             or usage.get("completion_tokens")
             or usage.get("output")
         )
+        reasoning_output_tokens = _as_int(usage.get("reasoning_output_tokens"))
         cached_input_tokens = _as_int(
             usage.get("cache_read_input_tokens")
             or usage.get("cached_input_tokens")
             or usage.get("prompt_cache_hit_tokens")
             or details.get("cached_tokens")
         )
+        cache_write_input_tokens = _as_int(usage.get("cache_write_input_tokens"))
         cache_creation_input_tokens = _as_int(
             usage.get("cache_creation_input_tokens")
+            or cache_write_input_tokens
         )
         cache_observed = any(
             key in usage
@@ -164,6 +172,7 @@ def read_provider_usage(
                 "cached_input_tokens",
                 "prompt_cache_hit_tokens",
                 "cache_creation_input_tokens",
+                "cache_write_input_tokens",
             )
         ) or "cached_tokens" in details
 
@@ -175,6 +184,9 @@ def read_provider_usage(
             result["completed_turn_count"] += 1
             result["completed_turn_input_tokens"] += input_tokens
             result["completed_turn_output_tokens"] += output_tokens
+            result[
+                "completed_turn_reasoning_output_tokens"
+            ] += reasoning_output_tokens
             result["completed_turn_cached_input_tokens"] += cached_input_tokens
             result[
                 "completed_turn_cache_creation_input_tokens"
@@ -184,8 +196,10 @@ def read_provider_usage(
         for key, value in (
             ("input_tokens", input_tokens),
             ("output_tokens", output_tokens),
+            ("reasoning_output_tokens", reasoning_output_tokens),
             ("cached_input_tokens", cached_input_tokens),
             ("cache_creation_input_tokens", cache_creation_input_tokens),
+            ("cache_write_input_tokens", cache_write_input_tokens),
         ):
             result[key] = max(int(result[key]), value)
 
@@ -206,8 +220,10 @@ def read_provider_usage(
                 "event_type": event_type[:96],
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "reasoning_output_tokens": reasoning_output_tokens,
                 "cached_input_tokens": cached_input_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_write_input_tokens": cache_write_input_tokens,
                 "cache_metrics_observed": cache_observed,
                 "semantics": "provider_reported_snapshot",
             })
@@ -265,6 +281,7 @@ def cumulative_total_tokens(summary: dict[str, Any], adapter_id: str) -> int | N
     total = int(summary.get("input_tokens") or 0) + int(
         summary.get("output_tokens") or 0
     )
+    total += int(summary.get("reasoning_output_tokens") or 0)
     if adapter_id == "claude_cli":
         total += int(summary.get("cached_input_tokens") or 0)
         total += int(summary.get("cache_creation_input_tokens") or 0)
@@ -291,6 +308,7 @@ def live_total_tokens(summary: dict[str, Any], adapter_id: str) -> int | None:
             for key in (
                 "completed_turn_input_tokens",
                 "completed_turn_output_tokens",
+                "completed_turn_reasoning_output_tokens",
                 "completed_turn_cached_input_tokens",
                 "completed_turn_cache_creation_input_tokens",
             )

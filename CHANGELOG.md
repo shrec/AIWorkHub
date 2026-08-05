@@ -6,6 +6,32 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.87] - 2026-08-04
+
+### Added
+
+- Durable usage rows now preserve requested and observed model identities,
+  visible output, reasoning output and cache-write telemetry. The cost ledger
+  exposes an association-only model-by-manager-outcome matrix using the latest
+  usage attempt at or before the manager decision.
+- Validation receipts now retain the exact declared command/argv beside the
+  normalized argv that actually executed, including an explicit rewrite flag.
+- A checked 65-run provider-routing observation documents near-saturated
+  provider caching and identifies model routing as the next measurable cost
+  lever without presenting the $20.83 counterfactual as realized savings.
+
+### Changed
+
+- No-write/no-output tasks must declare `read_only: true`; an empty write scope
+  is no longer treated as implicit read-only intent. This prevents accidental
+  code cards from consuming provider tokens without promotable outputs.
+
+### Fixed
+
+- Codex `reasoning_output_tokens` are included in billed output and total-token
+  accounting instead of being silently omitted. `cache_write_input_tokens` is
+  recognized and normalized into durable cache-creation evidence.
+
 ## [0.8.86] - 2026-08-04
 
 ### Changed
