@@ -8,6 +8,21 @@ from pathlib import Path
 from aiworkhub import workforce_catalog, workforce_router
 
 
+def test_catalog_atomic_write_skips_redundant_chmod_when_already_private(
+    tmp_path, monkeypatch,
+):
+    root = _root(tmp_path)
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("sandbox denies chmod")
+
+    monkeypatch.setattr(workforce_catalog.os, "chmod", denied)
+    path, created = workforce_catalog.ensure_catalog(root)
+
+    assert created is True
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def _root(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     (root / ".aiworkhub/config").mkdir(parents=True)

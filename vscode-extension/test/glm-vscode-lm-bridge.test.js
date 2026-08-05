@@ -677,6 +677,38 @@ try {
 }
 
 async function main() {
+  const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
+  const allowed = ["src/*.py", "tests/*.py"];
+  const contracts = {
+    "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+    "tests/new.py": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+  };
+  const repaired = {
+    schema_id: schema,
+    summary: "repair hash",
+    edits: [{ path: "src/app.py", ranges: [{ start_line: 2, end_line: 2, new: "fixed" }] }],
+    creates: [],
+  };
+  assert.strictEqual(internals.validateVscodeLmFinalEnvelope(repaired, allowed, contracts), "");
+  assert.strictEqual(repaired.edits[0].current_sha256, "a".repeat(64));
+  assert.match(internals.validateVscodeLmFinalEnvelope({
+    ...repaired,
+    edits: [{ path: "src/app.py", current_sha256: "bad", ranges: [{ start_line: 3, end_line: 3, new: "bad" }] }],
+  }, allowed, contracts), /final_range_out_of_bounds/);
+  assert.match(internals.validateVscodeLmFinalEnvelope({
+    schema_id: schema, summary: "wrong action",
+    edits: [{ path: "tests/new.py", current_sha256: "b".repeat(64), ranges: [{ start_line: 1, end_line: 1, new: "bad" }] }],
+    creates: [],
+  }, allowed, contracts), /final_action_mismatch/);
+  assert.match(internals.validateVscodeLmFinalEnvelope({
+    schema_id: schema, summary: "wrong create", edits: [],
+    creates: [{ path: "src/app.py", content: "bad\n" }],
+  }, allowed, contracts), /final_action_mismatch/);
+  assert.match(internals.validateVscodeLmFinalEnvelope({
+    schema_id: schema, summary: "no contract",
+    edits: [{ path: "src/missing.py", current_sha256: "bad", ranges: [{ start_line: 1, end_line: 1, new: "bad" }] }],
+    creates: [],
+  }, allowed, contracts), /final_hash_invalid/);
   await textProtocolChecks();
   await nativeProtocolChecks();
   await malformedCatalogChecks();

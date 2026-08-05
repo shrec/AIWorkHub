@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.100] - 2026-08-05
+
+### Fixed
+
+- Source Graph refresh requests that collide with an active build are now
+  coalesced into one follow-up generation instead of leaving readiness stale.
+- VS Code LM edit envelopes can repair a missing or malformed final hash only
+  from a trusted launch-time path contract, with action and line-range bounds
+  enforced before the edit is accepted.
+- Delta rework preserves explicitly inherited predecessor outputs as
+  promotable changes while byte-identical placeholders remain fail-closed.
+- Finalization records an explicit non-provider `finalizing` phase and timing
+  evidence without overwriting a durable manager cancellation decision.
+- Atomic runtime writes avoid redundant `chmod` calls when a newly-created
+  file already has the required owner-only mode, preventing false failures in
+  restricted validation sandboxes.
+- The stdlib fallback MCP writer is regression-tested against locale-sensitive
+  Windows stdout with Georgian text, the `→` character, exact ASCII framing
+  and structured broken-pipe shutdown evidence.
+
 ## [0.8.99] - 2026-08-05
 
 ### Added

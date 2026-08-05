@@ -122,13 +122,18 @@ def resolve_editor_model_alias(model: str | None, observed_models: Iterable[str]
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    # Some secure validation sandboxes deny chmod/fchmod syscalls even when
+    # the freshly-created object already has the required owner-only mode.
+    # Avoid the redundant syscall, but still fail closed for a broader mode.
+    if path.parent.stat().st_mode & 0o777 != 0o700:
+        os.chmod(path.parent, 0o700)
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > MAX_REQUEST_BYTES:
         raise BridgeError("bridge_document_too_large")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        chmod_fd(fd, 0o600)
+        if os.fstat(fd).st_mode & 0o777 != 0o600:
+            chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(encoded)
             handle.flush()
@@ -139,7 +144,8 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         os.close(fd)
         fd = -1
         os.replace(tmp_name, path)
-        os.chmod(path, 0o600)
+        if path.stat().st_mode & 0o777 != 0o600:
+            os.chmod(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -323,11 +329,17 @@ def create_request(
         if parent_missing:
             create_paths.append(relative)
         current_sha256 = ""
+        line_count = 0
         if candidate.is_file() and not candidate.is_symlink():
-            current_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            data = candidate.read_bytes()
+            current_sha256 = hashlib.sha256(data).hexdigest()
+            # Match semantic_edit.apply_line_ranges(), which addresses
+            # ``splitlines(keepends=True)`` using one-based line numbers.
+            line_count = len(data.splitlines(keepends=True))
         path_contracts[relative] = {
             "action": "create" if parent_missing else "edit",
             "current_sha256": current_sha256,
+            "line_count": line_count,
             "parent_existed": not parent_missing,
         }
     deadline = datetime.now(timezone.utc) + timedelta(seconds=int(timeout_seconds))
@@ -432,6 +444,7 @@ def create_request(
         "response_path": str(response_path),
         "allowed_writes": allowed,
         "create_paths": sorted(create_paths),
+        "path_contracts": path_contracts,
         "timeout_seconds": int(timeout_seconds),
         "project_context_receipt": context_receipt,
     }

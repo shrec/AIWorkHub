@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.99";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.100";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2626,7 +2626,7 @@ function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
   return new RegExp(`${expression}$`).test(value);
 }
 
-function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
+function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}) {
   if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
   }
@@ -2661,10 +2661,20 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
     return "final_v2_shape_invalid";
   }
   for (const edit of envelope.edits) {
-    if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.ranges)) {
+    if (!edit || typeof edit.path !== "string" || !Array.isArray(edit.ranges)) {
       return "final_edit_invalid";
     }
-    if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
+    const contract = pathContracts[edit.path];
+    if (typeof edit.current_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(edit.current_sha256)) {
+      if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "")) {
+        edit.current_sha256 = contract.current_sha256;
+      } else {
+        return `final_hash_invalid:${edit.path}`;
+      }
+    }
+    if (contract && contract.action === "create") {
+      return `final_action_mismatch:${edit.path}:edit_on_create`;
+    }
     if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) {
       return `final_path_not_allowed:${edit.path}`;
     }
@@ -2675,11 +2685,17 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites) {
           (range.preserve_trailing_newline !== undefined && typeof range.preserve_trailing_newline !== "boolean")) {
         return `final_range_invalid:${edit.path}`;
       }
+      if (contract && Number.isSafeInteger(contract.line_count) && range.end_line > contract.line_count) {
+        return `final_range_out_of_bounds:${edit.path}:start=${range.start_line}:end=${range.end_line}:lines=${contract.line_count}`;
+      }
     }
   }
   for (const create of envelope.creates) {
     if (!create || typeof create.path !== "string" || typeof create.content !== "string") {
       return "final_create_invalid";
+    }
+    if (pathContracts[create.path] && pathContracts[create.path].action === "edit") {
+      return `final_action_mismatch:${create.path}:create_on_edit`;
     }
     if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) {
       return `final_path_not_allowed:${create.path}`;
@@ -2999,7 +3015,7 @@ async function runVscodeLmTextProtocol(
     }
     if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
-      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
@@ -3150,7 +3166,7 @@ async function runVscodeLmAgent(
         ));
         continue;
       }
-      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites);
+      const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
         messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));

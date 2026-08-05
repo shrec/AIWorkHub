@@ -213,6 +213,7 @@ class WorkerWorkspace:
     allowed_writes: tuple[str, ...]
     parent_baseline: dict[str, str | None]
     workspace_baseline: dict[str, str | None]
+    inherited_rework_paths: tuple[str, ...] = ()
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -223,6 +224,7 @@ class WorkerWorkspace:
             "allowed_writes": list(self.allowed_writes),
             "parent_baseline": dict(self.parent_baseline),
             "workspace_baseline": dict(self.workspace_baseline),
+            "inherited_rework_paths": list(self.inherited_rework_paths),
         }
 
     @classmethod
@@ -241,6 +243,10 @@ class WorkerWorkspace:
                 str(k): (None if v is None else str(v))
                 for k, v in dict(payload.get("workspace_baseline") or {}).items()
             },
+            inherited_rework_paths=tuple(
+                _relative_repo_path(v)
+                for v in payload.get("inherited_rework_paths") or ()
+            ),
         )
 
 
@@ -1127,6 +1133,7 @@ def create_workspace(
         allowed_writes=allowed,
         parent_baseline=baseline,
         workspace_baseline=workspace_baseline,
+        inherited_rework_paths=tuple(sorted(set(rework_seeded))),
     )
 
 
@@ -1355,7 +1362,13 @@ def changed_paths(workspace: WorkerWorkspace) -> list[str]:
         if item
     }
     for relative, initial_hash in workspace.workspace_baseline.items():
-        if _hash_path(workspace.path / relative) != initial_hash:
+        current_hash = _hash_path(workspace.path / relative)
+        inherited_change = (
+            relative in workspace.inherited_rework_paths
+            and current_hash == initial_hash
+            and current_hash != workspace.parent_baseline.get(relative)
+        )
+        if current_hash != initial_hash or inherited_change:
             rows.add(_relative_repo_path(relative))
         else:
             rows.discard(_relative_repo_path(relative))
@@ -1445,7 +1458,15 @@ def validate_required_outputs(
             if size <= 0 and (allow_empty is None or relative not in allow_empty):
                 raise WorkspaceError(f"required_output_zero_bytes:{relative}")
             current_hash = _hash_path(target)
-            is_unchanged = current_hash == workspace.workspace_baseline.get(relative)
+            inherited_change = (
+                relative in workspace.inherited_rework_paths
+                and current_hash == workspace.workspace_baseline.get(relative)
+                and current_hash != workspace.parent_baseline.get(relative)
+            )
+            is_unchanged = (
+                current_hash == workspace.workspace_baseline.get(relative)
+                and not inherited_change
+            )
             if is_unchanged:
                 if relative not in unchanged_allowed:
                     raise WorkspaceError(f"required_output_unchanged:{relative}")

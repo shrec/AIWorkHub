@@ -407,13 +407,16 @@ class SourceGraphDaemon:
     def refresh_now(self) -> dict[str, Any]:
         """Force one bounded build synchronously, respecting the same
         non-overlap lock the periodic loop uses. If a build is already in
-        flight (periodic tick or another ``refresh_now()``), this returns
-        ``triggered: False`` immediately rather than blocking or starting
-        a second overlapping build against the same database.
+        flight (periodic tick or another ``refresh_now()``), this arms the
+        binary refresh event so the loop consumes exactly one follow-up
+        build after the current build completes. Multiple concurrent
+        ``refresh_now()`` calls while one build is in flight coalesce into
+        exactly one follow-up build, with no duplicate overlap.
         """
         triggered = self._run_one_build()
         health = self.health()
         if not triggered:
+            self._refresh_event.set()
             return {**health, "ok": True, "triggered": False, "reason": "build_in_progress"}
         return {**health, "triggered": True}
 

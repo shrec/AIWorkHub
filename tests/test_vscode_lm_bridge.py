@@ -19,6 +19,23 @@ from aiworkhub import (
 )
 
 
+def test_atomic_json_skips_redundant_chmod_in_restricted_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private" / "request.json"
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("sandbox denies chmod")
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "chmod", denied)
+    monkeypatch.setattr(vscode_lm_bridge, "chmod_fd", denied)
+    vscode_lm_bridge._atomic_json(target, {"text": "ქართული → UTF-8"})
+
+    assert json.loads(target.read_text(encoding="utf-8"))["text"] == "ქართული → UTF-8"
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -300,14 +317,48 @@ def test_request_publishes_hash_pinned_edit_and_create_path_contracts(
     assert contracts["src/app.py"] == {
         "action": "edit",
         "current_sha256": hashlib.sha256(current.read_bytes()).hexdigest(),
+        "line_count": 1,
         "parent_existed": True,
     }
     assert contracts["tests/test_new.py"]["action"] == "create"
     assert contracts["tests/test_new.py"]["current_sha256"] == (
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     )
+    assert contracts["tests/test_new.py"]["line_count"] == 0
     assert "docs/*.md" not in contracts
     assert spec["create_paths"] == ["tests/test_new.py"]
+    assert spec["path_contracts"] == contracts
+
+
+def test_path_contract_line_count_matches_semantic_edit_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "0" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    (workspace / "trailing.py").write_text("one\ntwo\n", encoding="utf-8")
+    (workspace / "no_trailing.py").write_text("one\ntwo", encoding="utf-8")
+    (workspace / "empty.py").write_bytes(b"")
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="bounded",
+        model="glm-5.2",
+        allowed_writes=["trailing.py", "no_trailing.py", "empty.py"],
+        timeout_seconds=30,
+    )
+    contracts = json.loads(request.request_path.read_text(encoding="utf-8"))["path_contracts"]
+    assert contracts["trailing.py"]["line_count"] == 2
+    assert contracts["no_trailing.py"]["line_count"] == 2
+    assert contracts["empty.py"]["line_count"] == 0
 
 
 def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

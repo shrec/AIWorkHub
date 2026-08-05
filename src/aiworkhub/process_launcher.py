@@ -198,7 +198,9 @@ SUPERVISOR_GRACE_SECONDS = 90
 TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
 TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
-FINALIZATION_PENDING_STATES = {"release_pending", "review_pending", "reconcile_pending"}
+FINALIZATION_PENDING_STATES = {
+    "finalizing", "release_pending", "review_pending", "reconcile_pending",
+}
 TERMINAL_PROCESS_STATES = {
     "review_ready",
     "exited",
@@ -4467,6 +4469,24 @@ class ProcessManager:
         ``finalize_failed`` terminal outcome and enqueue its manager callback.
         The isolated workspace remains retained for diagnosis.
         """
+        finalization_started = time.monotonic()
+        with self._request_lock(request_id):
+            events = self._request_events(request_id)
+            if not events:
+                return None
+            latest = events[-1]
+            if latest.get("state") in TERMINAL_PROCESS_STATES:
+                return latest
+            if latest.get("state") not in {"finalizing", "cancel_requested"}:
+                self._append_event({
+                    **self._event_identity(events),
+                    "request_id": request_id,
+                    "state": "finalizing",
+                    "provider_process_alive": False,
+                    "finalization_started_at": _utcnow(),
+                    "worker_terminal_state": latest.get("worker_terminal_state"),
+                })
+
         errors: list[str] = []
         for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
             if delay:
@@ -4519,6 +4539,9 @@ class ProcessManager:
             "workspace_retained": True,
             "release_transition_ok": bool(release_result.get("ok")),
             "callback_enqueued": bool(release_result.get("callback_enqueued")),
+            "finalization_duration_ms": round(
+                (time.monotonic() - finalization_started) * 1000.0, 3
+            ),
             "error": (
                 error
                 if release_result.get("ok")
@@ -4725,6 +4748,7 @@ class ProcessManager:
         request_id: str,
         supervisor_returncode: int | None = None,
     ) -> dict[str, Any] | None:
+        finalization_started = time.monotonic()
         with self._request_lock(request_id):
             events = self._request_events(request_id)
             if not events:
@@ -4827,6 +4851,15 @@ class ProcessManager:
                     + str(budget.get("observed_bytes") or "unknown")
                 )
             elif supervisor_state == "cancelled":
+                terminal_state = "cancelled"
+                error = error or "worker_cancelled"
+            elif latest.get("state") == "cancel_requested":
+                # A durable manager cancellation intent outranks the exit
+                # shape produced while terminating the exact supervisor or
+                # child process.  In particular, SIGTERM/SIGKILL commonly
+                # surfaces as ``exited`` with a non-zero code after a manager
+                # restart; classifying that as worker_failed loses the user's
+                # explicit terminal decision.
                 terminal_state = "cancelled"
                 error = error or "worker_cancelled"
             elif supervisor_state == "exited" and exit_code == 0:
@@ -5246,6 +5279,13 @@ class ProcessManager:
             semantic_edit_evidence = _semantic_edit_evidence_from_output(
                 stdout_path, worker_mcp_gate=worker_mcp_gate,
             )
+            validation_duration_ms = round(
+                sum(
+                    max(0.0, float(row.get("duration_seconds") or 0.0))
+                    for row in validations
+                ) * 1000.0,
+                3,
+            )
             event = self._append_event({
                 "request_id": request_id,
                 "task_id": metadata["task_id"],
@@ -5301,6 +5341,12 @@ class ProcessManager:
                 "quality_gate": quality_gate,
                 "research_result": research_result,
                 "residual_contract": residual_contract_result,
+                "finalization_duration_ms": round(
+                    (time.monotonic() - finalization_started) * 1000.0, 3
+                ),
+                "finalization_phase_durations_ms": {
+                    "validation": validation_duration_ms,
+                },
             })
             if cleanup:
                 try:

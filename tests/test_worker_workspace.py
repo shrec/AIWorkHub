@@ -128,7 +128,19 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
         successor_output = successor.path / "out" / "result.txt"
         assert successor_output.read_text(encoding="utf-8") == "reviewed candidate\n"
         assert successor.workspace_baseline["out/result.txt"].endswith(candidate_hash)
-        assert worker_workspace.enforce_scope(successor) == []
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+        assert worker_workspace.enforce_scope(successor) == ["out/result.txt"]
+
+        records = worker_workspace.validate_required_outputs(
+            successor, ["out/result.txt"]
+        )
+        assert records[0]["unchanged_allowed"] is False
+        assert worker_workspace.promote(successor, ["out/result.txt"]) == [
+            "out/result.txt"
+        ]
+        assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == (
+            "reviewed candidate\n"
+        )
 
         successor_output.write_text("reworked candidate\n", encoding="utf-8")
         assert worker_workspace.enforce_scope(successor) == ["out/result.txt"]

@@ -132,10 +132,21 @@ def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_
         show_task=_show(lambda: _card(state="processing")),
         argv=[sys.executable, "-c", "pass"],
     )
+    request_id = "a" * 32
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "state": "running",
+        "metadata_path": str(tmp_path / "metadata.json"),
+    })
     attempts = []
 
     def flaky_finalize(request_id, supervisor_returncode=None):
         attempts.append((request_id, supervisor_returncode))
+        assert manager._request_events(request_id)[-1]["state"] == "finalizing"
+        assert manager._request_events(request_id)[-1]["provider_process_alive"] is False
         if len(attempts) < 3:
             raise OSError("transient windows finalizer race")
         return {"request_id": request_id, "state": "review_ready"}
@@ -143,9 +154,9 @@ def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_
     monkeypatch.setattr(manager, "_finalize_isolated_request", flaky_finalize)
     monkeypatch.setattr(process_launcher.time, "sleep", lambda _seconds: None)
 
-    event = manager._finalize_after_process_exit("a" * 32, 0)
+    event = manager._finalize_after_process_exit(request_id, 0)
 
-    assert event == {"request_id": "a" * 32, "state": "review_ready"}
+    assert event == {"request_id": request_id, "state": "review_ready"}
     assert len(attempts) == 3
 
 
@@ -187,6 +198,7 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     event = manager._finalize_after_process_exit(request_id, 0)
 
     assert event["state"] == "finalize_failed"
+    assert event["finalization_duration_ms"] >= 0
     assert event["release_transition_ok"] is True
     assert event["callback_enqueued"] is True
     assert "finalizer_retries_exhausted" in event["error"]
@@ -891,6 +903,8 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     assert event["state"] == "review_ready"
     assert event["workspace_retained"] is True
     assert event["promoted_paths"] == []
+    assert event["finalization_duration_ms"] >= 0
+    assert event["finalization_phase_durations_ms"] == {"validation": 0.0}
     assert "out/result.json" in event["changed_paths"]
 
     # No promotion or direct mark_review call ever happened.

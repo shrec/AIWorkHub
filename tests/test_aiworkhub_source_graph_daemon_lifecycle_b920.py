@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -315,7 +316,10 @@ def test_periodic_and_refresh_now_never_overlap(tmp_path, monkeypatch, cleanup_d
     finally:
         daemon.stop()
 
-    assert call_count["n"] == 1
+    # The armed follow-up may lose a race with stop(); non-overlap is the
+    # invariant this test owns, while the dedicated coalescing test below
+    # proves that a live daemon consumes the follow-up.
+    assert 1 <= call_count["n"] <= 2
 
 
 def test_core_refresh_queues_without_blocking_mcp_caller(
@@ -545,3 +549,72 @@ def test_stop_unregisters_and_thread_exits(tmp_path, cleanup_daemons):
     assert source_graph_daemon.get_daemon(root) is None
     # Idempotent: stopping again (already unregistered) is a clean no-op.
     assert source_graph_daemon.stop_daemon(root) is False
+
+
+def test_refresh_now_coalescing_arms_event_and_runs_one_follow_up_build(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    """A refresh request during a build schedules one later generation."""
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+
+    build_started = threading.Event()
+    release_build = threading.Event()
+    follow_up_started = threading.Event()
+    call_count = {"n": 0}
+
+    def fake_build_index(repo_root, *, incremental=True, db_path=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            build_started.set()
+            release_build.wait(timeout=5)
+        else:
+            follow_up_started.set()
+        return source_graph.BuildReport(
+            repo_root=str(repo_root),
+            db_path="fake.sqlite",
+            incremental=incremental,
+            files_seen=3,
+            files_changed=3,
+            files_unchanged=0,
+            files_removed=0,
+            entities_written=3,
+            edges_written=0,
+            errors=[],
+            build_revision="test-rev",
+            finished_at="2026-08-05T18:00:00+00:00",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", fake_build_index)
+    daemon = source_graph_daemon.SourceGraphDaemon(
+        root,
+        refresh_interval_seconds=source_graph_daemon.MIN_REFRESH_INTERVAL_SECONDS,
+    )
+    daemon.start()
+    try:
+        assert build_started.wait(timeout=5), "background build never started"
+        result = daemon.refresh_now()
+        assert result["triggered"] is False
+        assert result["reason"] == "build_in_progress"
+        assert daemon._refresh_event.is_set()
+
+        release_build.set()
+        assert follow_up_started.wait(timeout=5), "follow-up build never started"
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            health = daemon.health()
+            if health["status"] == source_graph_daemon.STATUS_READY and call_count["n"] == 2:
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    "daemon did not reach ready after follow-up build: "
+                    f"status={health['status']} calls={call_count['n']}"
+                )
+            time.sleep(0.01)
+
+        assert health["last_success_at"]
+        assert health["build_revision"] == "test-rev"
+        assert health["files_seen"] == 3
+    finally:
+        daemon.stop()
