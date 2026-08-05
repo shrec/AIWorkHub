@@ -884,6 +884,14 @@ def verify_audit_ledger(
         "bounded_bytes_by_tool": {},
         "cache_hits": 0,
         "cache_hits_by_tool": {},
+        "compact_replay": {
+            "receipt_count": 0,
+            "original_bytes": 0,
+            "returned_bytes": 0,
+            "bytes_avoided": 0,
+            "provider_tokens_saved": None,
+            "provider_token_savings_measured": False,
+        },
         "policy_violations": 0,
         "fresh_source_graph_calls": 0,
         "live_source_graph_calls": 0,
@@ -892,6 +900,7 @@ def verify_audit_ledger(
         "source_graph_failed_calls": 0,
         "source_graph_mode_counts": {},
         "source_graph_mode_sequence": [],
+        "source_graph_query_sequence": [],
         "source_graph_stage_counts": {},
         "source_graph_stage_sequence": [],
         "source_graph_mode_stage_counts": {},
@@ -976,6 +985,16 @@ def verify_audit_ledger(
                 mode_counts[mode] = int(mode_counts.get(mode) or 0) + 1
                 if len(result["source_graph_mode_sequence"]) < 64:
                     result["source_graph_mode_sequence"].append(mode)
+            query_sha256 = (
+                str(payload.get("query_sha256") or "")
+                if isinstance(payload, dict) else ""
+            )
+            if (
+                len(query_sha256) == 64
+                and all(char in "0123456789abcdef" for char in query_sha256)
+                and len(result["source_graph_query_sequence"]) < 64
+            ):
+                result["source_graph_query_sequence"].append(query_sha256)
             stage = (
                 str(payload.get("workflow_stage") or "unspecified")
                 if isinstance(payload, dict) else "unspecified"
@@ -1029,6 +1048,15 @@ def verify_audit_ledger(
         if entry.get("cache_hit"):
             result["cache_hits"] += 1
             cache_hits_by_tool[tool] = cache_hits_by_tool.get(tool, 0) + 1
+            if isinstance(payload, dict) and payload.get("compact_replay") is True:
+                replay = result["compact_replay"]
+                original = max(0, int(payload.get("replay_original_bytes") or 0))
+                returned = max(0, int(payload.get("replay_returned_bytes") or 0))
+                avoided = max(0, int(payload.get("replay_bytes_avoided") or 0))
+                replay["receipt_count"] += 1
+                replay["original_bytes"] += original
+                replay["returned_bytes"] += returned
+                replay["bytes_avoided"] += avoided
         if entry.get("violation"):
             result["policy_violations"] += 1
         authority_source = str(entry.get("authority_source") or "")
@@ -1174,7 +1202,118 @@ def verify_audit_ledger(
             "samples_truncated": len(gaps) > 64,
         }
     result["ok"] = True
+    result["receipt_conformance"] = receipt_conformance_report(result)
+    result["tool_discipline"] = tool_discipline_report(result)
     return result
+
+
+def receipt_conformance_report(verification: Mapping[str, Any]) -> dict[str, Any]:
+    """Check internally verifiable receipt invariants without trusting prose.
+
+    This is deliberately structural.  It does not reinterpret a provider's
+    answer or claim code quality; it checks that authenticated observations
+    are arithmetically and causally coherent.
+    """
+
+    blockers: list[str] = []
+    calls = verification.get("call_count_by_tool") or {}
+    successful = verification.get("successful_call_count_by_tool") or {}
+    for tool, count in successful.items():
+        if int(count or 0) > int(calls.get(tool) or 0):
+            blockers.append(f"successful_calls_exceed_calls:{tool}")
+
+    replay = verification.get("compact_replay") or {}
+    original = max(0, int(replay.get("original_bytes") or 0))
+    returned = max(0, int(replay.get("returned_bytes") or 0))
+    avoided = max(0, int(replay.get("bytes_avoided") or 0))
+    if int(replay.get("receipt_count") or 0) and original - returned != avoided:
+        blockers.append("compact_replay_arithmetic_mismatch")
+    if replay.get("provider_token_savings_measured") is not False:
+        blockers.append("compact_replay_token_claim_not_explicitly_unmeasured")
+
+    mode_sequence = verification.get("source_graph_mode_sequence") or []
+    stage_sequence = verification.get("source_graph_stage_sequence") or []
+    if len(mode_sequence) != len(stage_sequence):
+        blockers.append("source_graph_mode_stage_sequence_mismatch")
+    fresh = max(0, int(verification.get("fresh_source_graph_calls") or 0))
+    revisions = verification.get("source_graph_index_revision_counts") or {}
+    if fresh and not revisions:
+        blockers.append("fresh_source_graph_revision_missing")
+    if int(verification.get("entries_tampered") or 0):
+        blockers.append("tampered_receipts_observed")
+
+    checks = {
+        "authenticated_entries": int(verification.get("entries_verified") or 0),
+        "tampered_entries": int(verification.get("entries_tampered") or 0),
+        "call_accounting_coherent": not any(
+            item.startswith("successful_calls_exceed_calls:") for item in blockers
+        ),
+        "source_graph_stage_sequence_coherent": (
+            "source_graph_mode_stage_sequence_mismatch" not in blockers
+        ),
+        "fresh_source_graph_revision_present": (
+            "fresh_source_graph_revision_missing" not in blockers
+        ),
+        "compact_replay_arithmetic_coherent": (
+            "compact_replay_arithmetic_mismatch" not in blockers
+        ),
+        "provider_token_claim_boundary_preserved": (
+            "compact_replay_token_claim_not_explicitly_unmeasured" not in blockers
+        ),
+    }
+    return {
+        "schema_id": "aiworkhub.receipt_conformance.v1",
+        "status": "pass" if not blockers else "fail",
+        "blocking": bool(blockers),
+        "blockers": blockers,
+        "checks": checks,
+    }
+
+
+def tool_discipline_report(verification: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe observed Source Graph use without inventing task intent.
+
+    Scores are observational and normalized only over evidence that exists.
+    They are suitable for telemetry and ranking calibration, never an
+    independent completion gate.
+    """
+
+    calls = max(0, int((verification.get("call_count_by_tool") or {}).get("source_graph") or 0))
+    failed = max(0, int(verification.get("source_graph_failed_calls") or 0))
+    zero_hits = max(0, int(verification.get("source_graph_zero_hit_calls") or 0))
+    queries = [str(item) for item in verification.get("source_graph_query_sequence") or []]
+    repeated = max(0, len(queries) - len(set(queries)))
+    modes = [str(item) for item in verification.get("source_graph_mode_sequence") or []]
+    trace_index = next((index for index, mode in enumerate(modes) if mode == "trace"), None)
+    deps_after_trace = bool(
+        trace_index is not None and any(mode == "deps" for mode in modes[trace_index + 1:])
+    )
+    checks_observed = 0
+    penalty = 0.0
+    if calls:
+        checks_observed += 3
+        penalty += min(1.0, failed / calls) * 40.0
+        penalty += min(1.0, zero_hits / calls) * 25.0
+        penalty += min(1.0, repeated / calls) * 25.0
+        if trace_index is not None:
+            checks_observed += 1
+            penalty += 10.0 if deps_after_trace else 0.0
+    score = None if checks_observed == 0 else round(max(0.0, 100.0 - penalty), 2)
+    return {
+        "schema_id": "aiworkhub.tool_discipline.v1",
+        "status": "not_observed" if score is None else "observed",
+        "observation_only": True,
+        "score": score,
+        "source_graph_calls": calls,
+        "failed_calls": failed,
+        "zero_hit_calls": zero_hits,
+        "repeated_query_calls": repeated,
+        "deps_after_trace": deps_after_trace,
+        "query_identity_coverage": {
+            "observed": len(queries),
+            "expected": calls,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1368,6 +1507,7 @@ def source_graph_query(
     bounded_query = _bounded_query(query)
     if bounded_query is None:
         return _violation(ctx, tool, "invalid_query")
+    query_sha256 = hashlib.sha256(bounded_query.encode("utf-8")).hexdigest()
     try:
         budget = max(MIN_BUDGET, min(int(budget), MAX_BUDGET))
     except (TypeError, ValueError):
@@ -1416,6 +1556,7 @@ def source_graph_query(
         use_receipt = receipt_bytes < int(cached["bytes"])
         returned_content = receipt_content if use_receipt else str(cached_result["content"])
         returned_bytes = receipt_bytes if use_receipt else int(cached["bytes"])
+        replay_bytes_avoided = max(0, int(cached["bytes"]) - returned_bytes)
         _append_audit(
             ctx, tool=tool, ok=True, cache_hit=True,
             hit_count=cached["hit_count"], bytes_returned=returned_bytes,
@@ -1423,12 +1564,19 @@ def source_graph_query(
             authority_repo=query_repo,
             payload={
                 "mode": mode,
+                "query_sha256": query_sha256,
                 "workflow_stage": workflow_stage,
                 "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
                 "index_revision": index_identity["build_revision"],
                 "index_finished_at": index_identity["finished_at"],
                 "evidence_counts": cached["evidence_counts"],
                 "output_cap_bytes": cached["result"].get("output_cap_bytes"),
+                "compact_replay": use_receipt,
+                "replay_original_bytes": int(cached["bytes"]),
+                "replay_returned_bytes": returned_bytes,
+                "replay_bytes_avoided": replay_bytes_avoided,
+                "provider_tokens_saved": None,
+                "provider_token_savings_measured": False,
             },
         )
         return {
@@ -1439,6 +1587,10 @@ def source_graph_query(
             "cache_hit": True,
             "cache_receipt": use_receipt,
             "content_sha256": cached["content_sha256"],
+            "replay_original_bytes": int(cached["bytes"]),
+            "replay_bytes_avoided": replay_bytes_avoided,
+            "provider_tokens_saved": None,
+            "provider_token_savings_measured": False,
         }
 
     try:
@@ -1599,6 +1751,7 @@ def source_graph_query(
         authority_repo=query_repo,
         payload={
             "mode": mode,
+            "query_sha256": query_sha256,
             "workflow_stage": workflow_stage,
             "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "index_revision": index_identity["build_revision"],

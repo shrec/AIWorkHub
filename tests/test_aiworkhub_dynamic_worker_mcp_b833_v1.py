@@ -359,6 +359,9 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     assert receipt["reuse_previous_result"] is True
     assert receipt["content_sha256"] == first["content_sha256"]
     assert second["bytes"] < first["bytes"]
+    assert second["replay_bytes_avoided"] == first["bytes"] - second["bytes"]
+    assert second["provider_tokens_saved"] is None
+    assert second["provider_token_savings_measured"] is False
 
     verification = w.verify_audit_ledger(
         ctx.audit_ledger_path, ctx.audit_hmac_key_path,
@@ -366,6 +369,14 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     )
     assert verification["call_count_by_tool"]["source_graph"] == 2
     assert verification["cache_hits"] == 1
+    assert verification["compact_replay"] == {
+        "receipt_count": 1,
+        "original_bytes": first["bytes"],
+        "returned_bytes": second["bytes"],
+        "bytes_avoided": first["bytes"] - second["bytes"],
+        "provider_tokens_saved": None,
+        "provider_token_savings_measured": False,
+    }
     # B834: a cache hit must NOT count toward the live-call gate -- only the
     # first, genuinely fresh call does.
     assert verification["live_source_graph_calls"] == 1
@@ -387,6 +398,21 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
         source_graph_mod.BUILD_REVISION: 2,
     }
     assert len(verification["source_graph_index_sequence"]) == 2
+    assert len(verification["source_graph_query_sequence"]) == 2
+    assert verification["source_graph_query_sequence"][0] == verification["source_graph_query_sequence"][1]
+    assert verification["receipt_conformance"]["status"] == "pass"
+    assert verification["tool_discipline"] == {
+        "schema_id": "aiworkhub.tool_discipline.v1",
+        "status": "observed",
+        "observation_only": True,
+        "score": 87.5,
+        "source_graph_calls": 2,
+        "failed_calls": 0,
+        "zero_hit_calls": 0,
+        "repeated_query_calls": 1,
+        "deps_after_trace": False,
+        "query_identity_coverage": {"observed": 2, "expected": 2},
+    }
 
 
 def test_source_graph_orientation_truncation_preserves_full_evidence_counts(

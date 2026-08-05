@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "aggregates": [
+        {
+          "operation": "sum",
+          "row_field": "before_bundle_bytes",
+          "summary_field": "before_bundle_bytes"
+        },
+        {
+          "operation": "sum",
+          "row_field": "after_bundle_bytes",
+          "summary_field": "after_bundle_bytes"
+        }
+      ],
+      "assertion_tests": [
+        "tests/test_aiworkhub_context_optimization_b829_v1.py::test_project_context_caps_zero_hit_suppression_and_fail_closed",
+        "tests/test_aiworkhub_context_optimization_b829_v1.py::test_context_economics_reports_tokens_only_when_telemetry_exists",
+        "tests/test_aiworkhub_context_optimization_b829_v1.py::test_real_process_context_optimization_evidence_written"
+      ],
+      "count_fields": [
+        "record_count",
+        "real_process_records_used"
+      ],
+      "id": "context-optimization-b829",
+      "minimum_rows": 1,
+      "pass_values": [
+        "PASS"
+      ],
+      "required_row_fields": [
+        "request_id",
+        "task_id",
+        "before_bundle_bytes",
+        "after_bundle_bytes"
+      ],
+      "row_format": "jsonl",
+      "rows_path": "eval/aiworkhub_context_optimization_rows_b829_v1.jsonl",
+      "summary_path": "eval/aiworkhub_context_optimization_b829_v1.json",
+      "verdict_field": "verdict"
+    }
+  ],
+  "schema_id": "aiworkhub.eval_artifact_registry.v1"
+}

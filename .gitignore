@@ -23,6 +23,9 @@ node_modules/
 *.db
 .aiworkhub/*
 !.aiworkhub/quality.json
+!.aiworkhub/eval-artifacts.json
+!.aiworkhub/source-graph-retrieval-eval.json
+!.aiworkhub/quality-ratchet.json
 
 # Local coordinator handoffs, dated audits, and review scratch reports.
 /AUTONOMOUS_SESSION_SUMMARY.md

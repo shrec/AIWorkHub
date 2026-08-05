@@ -1,0 +1,9 @@
+{
+  "schema_id": "aiworkhub.quality_gate_ratchet.baseline.v1",
+  "violation_ids": [],
+  "max_lines": {
+    "src/aiworkhub/core.py": 5767,
+    "src/aiworkhub/process_launcher.py": 7077,
+    "vscode-extension/extension.js": 7204
+  }
+}

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from . import known_bug_scanner
+from . import eval_artifact_gate, known_bug_scanner
 
 # ---------------------------------------------------------------------------
 # 0.6.30 Quality Evidence Engine foundation.
@@ -1125,6 +1125,29 @@ def run_builtin_static_checks(
         provenance="builtin:diff_scoped_known_bug_registry.v1",
         error="" if bug_report["passed"] else "high_confidence_known_bug_pattern",
     ))
+    eval_report = eval_artifact_gate.evaluate(root, changed_paths=list(paths))
+    if eval_report["configured"]:
+        eval_status = (
+            STATUS_SKIPPED
+            if int(eval_report.get("evaluated_count") or 0) == 0
+            else STATUS_PASSED if eval_report["passed"] else STATUS_FAILED
+        )
+        checks.append(EvidenceCheck(
+            check_id="builtin:eval_artifact_truth",
+            kind="requirements",
+            status=eval_status,
+            affected_paths=tuple(
+                sorted({
+                    str(row.get(key) or "")
+                    for row in eval_report.get("artifacts") or []
+                    for key in ("summary_path", "rows_path")
+                    if row.get(key)
+                })
+            ),
+            summary=json.dumps(eval_report, sort_keys=True)[:MAX_SUMMARY_CHARS],
+            provenance="builtin:registry_driven_eval_artifact_gate.v1",
+            error="" if eval_status != STATUS_FAILED else "eval_artifact_evidence_diverged",
+        ))
     return checks
 
 
@@ -1586,4 +1609,10 @@ def build_evidence_packet(
         "optional_gates": optional_gates,
         "quality_reviewer_contract": quality_reviewer_contract(),
         "quality_verdict_contract": quality_verdict_contract(),
+        "eval_artifact_contract": {
+            "schema_id": eval_artifact_gate.SCHEMA_ID,
+            "registry_path": eval_artifact_gate.REGISTRY_RELATIVE_PATH.as_posix(),
+            "zero_eligible_rows": "inconclusive_never_pass",
+            "summary_authority": "recomputed_from_registered_rows",
+        },
     }

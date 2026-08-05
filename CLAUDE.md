@@ -32,7 +32,8 @@ Source Graph gate:
 - Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.
 - Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.
 - After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.
-- Final receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
+- For edits prefer aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified range.
+- Final HMAC-authenticated MCP audit ledger receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.
 - Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.

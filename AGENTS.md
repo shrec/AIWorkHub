@@ -40,6 +40,13 @@ Source Graph gate:
 - When source_graph_required is true, stop if its bundle is unavailable, empty, stale or unacknowledged.
 - Never use grep, rg, find, tree, broad cat/sed or recursive listing while Source Graph can index/process the target.
 - A bounded exact-target fallback is allowed only after Source Graph reports that target unsupported or unindexed; record that reason.
+- Re-query whenever the active symbol, dependency boundary, failure hypothesis, edit scope or validation target materially changes.
+- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review or rework; never relabel old calls after the fact.
+- Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.
+- Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.
+- After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.
+- For edits prefer aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified range.
+- Final HMAC-authenticated MCP audit ledger receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.
 Exact-command exception:
 - Exact validation/build/test commands named by the card are allowed.
 - Exact known-path reads from the card or Source Graph are allowed; they are not broad discovery.

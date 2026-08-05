@@ -152,6 +152,7 @@ def _history_rows(
 
 def _test_map(
     conn: sqlite3.Connection,
+    repo_root: Path,
     files: list[str],
     matches: list[dict[str, Any]],
     *,
@@ -161,6 +162,8 @@ def _test_map(
         conn, files, matches, limit=max(1, min(budget, 40)),
     )
     mapped_files = {str(row["file_path"]) for row in candidates}
+    from . import evidence_instruments
+
     return {
         "source_files": files[: max(1, budget)],
         "related_tests": candidates,
@@ -170,12 +173,9 @@ def _test_map(
             "candidate_test_files": len(mapped_files),
             "claim": "test_relationship_only_not_execution_coverage",
         },
-        "runtime_coverage": {
-            "status": "not_available",
-            "line_coverage": None,
-            "branch_coverage": None,
-            "reason": "no_runtime_coverage_evidence_imported",
-        },
+        "runtime_coverage": evidence_instruments.runtime_coverage_for_paths(
+            repo_root, files
+        ),
     }
 
 
@@ -394,7 +394,7 @@ def query(
         return {**base, "score_contract": score_contract, "ranked_symbols": ranked[:budget]}
 
     if mode in {"coverage", "testmap", "auditmap"}:
-        test_map = _test_map(conn, files, matches or scoped_matches, budget=budget)
+        test_map = _test_map(conn, repo_root, files, matches or scoped_matches, budget=budget)
         payload: dict[str, Any] = {**base, **test_map}
         if mode == "auditmap":
             mapped = bool(test_map["related_tests"])
@@ -402,7 +402,7 @@ def query(
                 {
                     "file_path": path,
                     "structural_test_mapping": "present" if mapped else "missing",
-                    "runtime_coverage": "not_available",
+                    "runtime_coverage": test_map["runtime_coverage"].get("status"),
                     "review_reason": "runtime_evidence_required",
                 }
                 for path in files[:budget]
@@ -444,6 +444,11 @@ def query(
 
     if mode == "reviewqueue":
         tests = insights.test_candidates(conn, files, matches or scoped_matches, limit=min(budget, 40))
+        from . import evidence_instruments
+
+        runtime_coverage = evidence_instruments.runtime_coverage_for_paths(
+            repo_root, files
+        )
         test_files = {str(row["file_path"]) for row in tests}
         queue: list[dict[str, Any]] = []
         for row in symbol_metrics:
@@ -460,7 +465,7 @@ def query(
         return {
             **base,
             "queue": queue[:budget],
-            "runtime_coverage": {"status": "not_available", "reason": "no_runtime_coverage_evidence_imported"},
+            "runtime_coverage": runtime_coverage,
         }
 
     if mode == "todo":
@@ -478,7 +483,7 @@ def query(
         }
 
     if mode == "gaps":
-        tests = _test_map(conn, files, matches or scoped_matches, budget=min(budget, 40))
+        tests = _test_map(conn, repo_root, files, matches or scoped_matches, budget=min(budget, 40))
         low_confidence = [
             dict(row) for row in conn.execute(
                 "SELECT file_path, kind, src_qualname, dst_name, dst_qualname, line, "
@@ -492,16 +497,20 @@ def query(
             "todos": insights.todos(repo_root, files, limit=min(budget, 40)),
             "structural_test_mapping": tests,
             "low_confidence_edges": low_confidence,
-            "runtime_coverage": {"status": "not_available", "reason": "no_runtime_coverage_evidence_imported"},
+            "runtime_coverage": tests["runtime_coverage"],
         }
 
     if mode == "stats":
         history_available, history, reason = _history_rows(conn, [], budget=min(budget, 10))
+        from . import evidence_instruments
+
         return {
             **base,
             **_summary(conn),
             "history": {"available": history_available, "reason": reason, "top_churn": history},
-            "runtime_coverage": {"status": "not_available", "reason": "no_runtime_coverage_evidence_imported"},
+            "runtime_coverage": evidence_instruments.runtime_coverage_for_paths(
+                repo_root, []
+            ),
             "capabilities": list(ANALYTIC_MODES),
         }
 
@@ -517,7 +526,7 @@ def query(
 
     # pipeline: one compact planning packet, still backed by the same DB.
     outgoing, incoming = insights.call_edges(conn, files, limit=min(budget, 40))
-    test_map = _test_map(conn, files, matches or scoped_matches, budget=min(budget, 24))
+    test_map = _test_map(conn, repo_root, files, matches or scoped_matches, budget=min(budget, 24))
     return {
         **base,
         "focus": {"ranked_symbols": symbol_metrics[: min(budget, 20)]},

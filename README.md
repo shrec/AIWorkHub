@@ -338,9 +338,15 @@ never inherit the manager launch capability.
 The KPI view separates explicit manager decisions from worker terminal
 outcomes and plots only bounded repository evidence. Its larger aggregate-only
 history shows Source Graph modes, workflow stages, latency, inter-call gaps,
-returned structural evidence, index generations, tool-use cohorts and
-deterministic raw-path-versus-delivered-bundle byte economics. Focused semantic
-edits additionally report authenticated source-file, selected-region and
+returned structural evidence, index generations, tool-use cohorts,
+deterministic raw-path-versus-delivered-bundle byte economics, authenticated
+receipt conformance, repeated-query discipline, compact-replay bytes and
+imported runtime coverage. The repository also ships registry-driven
+retrieval precision, eval-artifact truth, per-test suite profiling, risk
+precision, no-net-growth and matched A/B instruments. Missing populations are
+shown as `not_configured`, `inconclusive` or `unknown`; they never become zero
+or a synthetic savings multiplier.
+Focused semantic edits additionally report authenticated source-file, selected-region and
 replacement byte totals, including how many whole-file bytes the model did not
 re-emit. This is structural evidence, not a token multiplier. Every rate
 carries its sample window or denominator; token savings and causal quality

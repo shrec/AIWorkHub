@@ -6,6 +6,43 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.96] - 2026-08-05
+
+### Added
+
+- The evidence-instrumentation matrix now has executable gates for eval
+  artifacts, receipt conformance, review references, Source Graph retrieval,
+  provider-instruction consistency, worker tool discipline, session usage,
+  test-suite resources, runtime coverage, risk-mode precision, quality
+  ratcheting and paired prompt/bundle experiments.
+- Provider-usage receipts can be backfilled from retained raw streams without
+  estimating missing usage. Terminal-log retention protects a run until an
+  exact observed-or-unavailable capture receipt exists.
+- Operations → Tool Use now shows compact-replay bytes, conformance failures
+  and observational tool-discipline evidence while keeping byte ratios and
+  provider-token claims separate.
+- Runtime coverage can be previewed and write-gated into Source Graph, where
+  coverage and test-oriented modes expose it with explicit missing-evidence
+  semantics.
+
+### Changed
+
+- Review acceptance independently recomputes candidate hashes, sizes and
+  required-output references before promotion; retained legacy receipts that
+  stored the path set in `changed_path_hashes` remain verifiable.
+- Provider instruction files and worker runtime guidance now derive from one
+  canonical contract, including focused semantic edits and authenticated
+  receipts.
+- Workforce ranking uses observed tool discipline only as a non-causal
+  tie-breaker after outcome and cost evidence.
+
+### Fixed
+
+- Storage telemetry remains available before the repository task store has
+  been initialized, even with usage-aware terminal-log retention enabled.
+- Evaluation PASS claims with zero eligible rows or inconsistent aggregates
+  now fail closed through the registered artifact contract.
+
 ## [0.8.95] - 2026-08-05
 
 ### Added

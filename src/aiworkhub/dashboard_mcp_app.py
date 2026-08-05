@@ -781,6 +781,21 @@ def terminal_log_quarantine_view(preview_digest: str, confirm: bool = False) -> 
     return response
 
 
+def terminal_log_usage_backfill_view(confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: recover canonical usage receipts before log retention."""
+
+    try:
+        root = core.repo_root()
+        response = terminal_log_retention.backfill_usage_capture(
+            root, confirm=confirm is True
+        )
+    except terminal_log_retention.TerminalLogRetentionError as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    response["server_tool"] = "aiworkhub_dashboard_terminal_log_usage_backfill"
+    response["authority_flags"] = _storage_write_authority_flags()
+    return response
+
+
 def terminal_log_restore_view(batch_id: str, confirm: bool = False) -> dict[str, Any]:
     """USER WRITE: restore one terminal-log quarantine batch without overwrite."""
     try:
@@ -1187,6 +1202,7 @@ TERMINAL_LOG_RETENTION_READ_TOOLS: dict[str, Any] = {
     TERMINAL_LOG_RETENTION_PREVIEW_TOOL_NAME: terminal_log_retention_preview_view,
 }
 TERMINAL_LOG_RETENTION_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_terminal_log_usage_backfill": terminal_log_usage_backfill_view,
     "aiworkhub_dashboard_terminal_log_quarantine": terminal_log_quarantine_view,
     "aiworkhub_dashboard_terminal_log_restore": terminal_log_restore_view,
     "aiworkhub_dashboard_terminal_log_purge": terminal_log_purge_view,

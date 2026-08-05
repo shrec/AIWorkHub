@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import core
+from . import agent_tool_instructions
 from . import claude_auth
 from . import context_write_intents
 from . import context_writes
@@ -2545,52 +2546,7 @@ def build_worker_prompt(
     # unrelated tasks; the task contract, context receipt, and owner text stay
     # after the stable boundary. This is a structural optimization only --
     # cache savings remain unclaimed until provider telemetry observes them.
-    stable_prefix = """You are the sole worker for one exact AIWorkHub task in an isolated worktree.
-
-The coordinator already claimed the task. Do not run taskctl lifecycle commands,
-do not commit, and do not modify .git. Work only on the task contract. The
-coordinator will independently enforce allowed_writes, rerun validation, promote
-accepted files, and request review after your process exits successfully.
-
-Read every read_first path before editing. Create the required evidence and run
-the listed validation commands when their executables are already available.
-Never install, download, unpack, vendor, or bootstrap validation dependencies
-inside the worker sandbox. If a declared validator is unavailable, name the
-exact missing executable/module in the final message and continue no further
-than an already-available targeted check; the coordinator-side supervisor will
-still run the canonical validation after exit. Never use git add -A or git add
-. and never touch paths outside allowed_writes.
-
-MANDATORY_AIWORKHUB_TOOLS:
-- For code discovery call aiworkhub_worker_source_graph_query first and call it
-  again whenever you need a new symbol, dependency, call path, control-flow,
-  configuration, or file target. Initial injected context is startup material,
-  not a substitute for live Source Graph use. Raw Grep, Glob, grep, rg, find
-  and tree discovery are provider-blocked.
-- Source Graph `target` is an optional exact path filter, never a copy of the
-  semantic `query`. Omit `target` unless the task contract or worker MCP
-  receipt explicitly declares that exact path as an allowed source target.
-- Prefer Source Graph body/file previews after discovery. If an exact provider
-  file read is still necessary, request one bounded range and reuse it instead
-  of rereading an unchanged identical range.
-- For existing-file changes, prefer aiworkhub_worker_semantic_edit_prepare on
-  the smallest Source Graph line range, then aiworkhub_worker_semantic_edit_apply
-  with replacement code only. Do not read or emit a complete file when that
-  deterministic path is available. The local applier verifies the full-file
-  preimage and fragment hash before mutating the isolated worktree.
-- Executed, non-degraded Session Manager, AI Memory and KB sections in the
-  trusted injected bundle are already canonical queries. Acknowledge and reuse
-  them; call the corresponding live tool only when its section is absent or
-  degraded, or when a new unresolved fact makes another query relevant.
-  Never repeat an unchanged zero-hit query as ceremony.
-- The coordinator verifies an HMAC-authenticated MCP audit ledger and rejects
-  completion when a fresh live Source Graph call is missing. An injected
-  receipt or text claim cannot satisfy this execution-time requirement.
-- If Source Graph reports an exact target unsupported/unindexed, stop and
-  report that target. Only a new coordinator-authorized fallback card may use
-  raw discovery for it.
-
-Your final message must be at most 12 lines and name tests plus changed paths."""
+    stable_prefix = agent_tool_instructions.render_worker_runtime_policy()
     prompt = (
         stable_prefix
         + "\n\nTASK_CONTRACT_JSON:\n"
@@ -6284,6 +6240,29 @@ class ProcessManager:
                     "request_id": request_id,
                     "task_id": task_id,
                 }
+
+            if not readonly_no_change:
+                # Referential evidence is independently recomputed before the
+                # write gate opens and before a single candidate byte is
+                # promoted.  Stored prose cannot satisfy this gate.
+                from . import evidence_instruments
+
+                evidence_audit = evidence_instruments.review_evidence_audit(
+                    self.repo,
+                    workspace.path,
+                    changed_paths=list(evidence.get("changed_paths") or []),
+                    stored_hashes=stored_hashes,
+                    required_outputs=list(evidence.get("required_outputs") or []),
+                )
+                if evidence_audit.get("blocking"):
+                    return {
+                        "ok": False,
+                        "error": "review_evidence_audit_failed:"
+                        + ",".join(evidence_audit.get("blockers") or [])[:420],
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "review_evidence_audit": evidence_audit,
+                    }
 
             # B919: fail closed before copying any output whenever a declared
             # immutable/dependency input has drifted since the claim-time

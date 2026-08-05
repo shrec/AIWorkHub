@@ -173,6 +173,7 @@ class OutcomeEvidence:
     p95_latency_seconds: float | None = None
     cost_usd_per_1k_tokens: float | None = None
     estimated_tokens: int | None = None
+    tool_discipline_score: float | None = None
     sample_count: int = 0
 
     def normalized(self) -> tuple[dict[str, float | None], dict[str, str]]:
@@ -204,6 +205,11 @@ class OutcomeEvidence:
                 float(self.estimated_tokens) if self.estimated_tokens is not None else None,
                 CONSERVATIVE_PRIORS["estimated_tokens"],
             ),
+            "tool_discipline_score": (
+                max(0.0, min(100.0, float(self.tool_discipline_score)))
+                if self.tool_discipline_score is not None
+                else None
+            ),
         }
         sources = {
             key: (
@@ -226,6 +232,7 @@ class OutcomeEvidence:
             "p95_latency_seconds": self.p95_latency_seconds,
             "cost_usd_per_1k_tokens": self.cost_usd_per_1k_tokens,
             "estimated_tokens": self.estimated_tokens,
+            "tool_discipline_score": self.tool_discipline_score,
             "sample_count": self.sample_count,
         }
 
@@ -423,6 +430,7 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         "p95_latency_seconds": values["p95_latency_seconds"],
         "cost_usd_per_1k_tokens": values["cost_usd_per_1k_tokens"],
         "estimated_tokens": int(estimated_tokens),
+        "tool_discipline_score": values["tool_discipline_score"],
         "estimated_cost_usd": estimated_cost,
         "cost_known": cost_rate is not None,
         "quality_floor": task.quality_floor,
@@ -442,6 +450,11 @@ def _candidate_sort_key(candidate: CandidateRecord) -> tuple[Any, ...]:
         int(estimated_cost is None),
         float(estimated_cost) if estimated_cost is not None else float("inf"),
         -components.get("manager_adjusted_success_rate", 0.0),
+        -(
+            components.get("tool_discipline_score")
+            if components.get("tool_discipline_score") is not None
+            else -1.0
+        ),
         components.get("validation_failure_rate", 1.0),
         components.get("p50_latency_seconds", CONSERVATIVE_PRIORS["p50_latency_seconds"]),
         components.get("p95_latency_seconds", CONSERVATIVE_PRIORS["p95_latency_seconds"]),

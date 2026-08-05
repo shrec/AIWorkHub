@@ -873,6 +873,12 @@ function renderToolUse(snapshot) {
     ["Raw discovery denied", formatCount(telemetry.raw_discovery_denials)],
     ["Denial evidence", `${formatCount(telemetry.provider_denial_evidence_tasks)}/${formatCount(telemetry.gated_tasks)} tasks`],
     ["Tampered", formatCount(telemetry.tampered_ledger_tasks)],
+    ["Receipt failures", formatCount(telemetry.receipt_conformance_failures)],
+    ["Tool discipline", telemetry.tool_discipline_score_average == null
+      ? "Unmeasured"
+      : `${Number(telemetry.tool_discipline_score_average).toFixed(1)}/100`],
+    ["Repeated queries", formatCount(telemetry.repeated_source_graph_queries)],
+    ["Compact replay", `${formatCount(telemetry.compact_replay_receipts)} · ${formatBytes(telemetry.compact_replay_bytes_avoided)} avoided`],
     ["Guidance resolves", Number.isFinite(Number(recommendation.resolvability_ratio))
       ? `${(Number(recommendation.resolvability_ratio) * 100).toFixed(1)}%`
       : "Unmeasured"],

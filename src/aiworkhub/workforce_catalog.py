@@ -417,6 +417,22 @@ def build_catalog(
         review_rate = review_ready / sample_count if sample_count else None
         failure_rate = failed / sample_count if sample_count else None
         retry_rate = retries / attempts if attempts else None
+        discipline_scores = []
+        for process in matched:
+            infra = process.get("ai_infra_context")
+            tool_use = infra.get("tool_use") if isinstance(infra, Mapping) else None
+            discipline = (
+                tool_use.get("tool_discipline")
+                if isinstance(tool_use, Mapping)
+                else None
+            )
+            score = discipline.get("score") if isinstance(discipline, Mapping) else None
+            if isinstance(score, (int, float)):
+                discipline_scores.append(max(0.0, min(100.0, float(score))))
+        tool_discipline_score = (
+            round(sum(discipline_scores) / len(discipline_scores), 2)
+            if discipline_scores else None
+        )
         effective = (
             max(0.0, min(accepted_rate or 0.0, review_rate or 0.0) - (failure_rate or 0.0))
             if sample_count else None
@@ -450,6 +466,9 @@ def build_catalog(
                 "estimated_tokens_per_attempt": (
                     round(tokens / attempts) if tokens and attempts else None
                 ),
+                "tool_discipline_score": tool_discipline_score,
+                "tool_discipline_samples": len(discipline_scores),
+                "tool_discipline_role": "observational_tiebreaker_only",
                 "cost_usd": round(cost, 6) if cost else None,
                 "cost_known_records": len(known_cost_rows),
                 "cost_unknown_records": len(usage_source) - len(known_cost_rows),
@@ -511,6 +530,7 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
                 validation_failure_rate=outcomes.get("validation_failure_rate"), p50_latency_seconds=outcomes.get("p50_latency_seconds"),
                 p95_latency_seconds=outcomes.get("p95_latency_seconds"), cost_usd_per_1k_tokens=outcomes.get("cost_usd_per_1k_tokens"),
                 estimated_tokens=outcomes.get("estimated_tokens_per_attempt"),
+                tool_discipline_score=outcomes.get("tool_discipline_score"),
                 sample_count=int(outcomes.get("sample_count") or 0),
             ),
         ))

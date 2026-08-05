@@ -14,7 +14,7 @@ never substituted for another.
 | **Pilot A/B** | Matched variants exist, but the sample or controls are insufficient for a general product claim |
 | **Unmeasured** | The required counterfactual does not exist; AIWorkHub reports no multiplier |
 
-## Current 0.8.82 optimization evidence
+## Current optimization evidence
 
 | Surface | Population | Measured result | Evidence grade | What it means |
 | --- | ---: | --- | --- | --- |
@@ -24,6 +24,31 @@ The machine-readable fixture is
 [`benchmarks/context-envelope-encoding-v2.json`](../benchmarks/context-envelope-encoding-v2.json),
 and CI recomputes its arithmetic and claim boundaries with
 [`scripts/check_context_envelope_benchmark.py`](../scripts/check_context_envelope_benchmark.py).
+
+## Evidence-instrument coverage
+
+The measurement layer is implemented as a set of independent truth checks.
+An instrument being available does not mean its population is already large
+enough for a public claim.
+
+| Instrument | Current contract | Empty-evidence behavior |
+| --- | --- | --- |
+| Recommendation roundtrip | Replays Source Graph recommendations through the full wrapper and attributes wrapper-versus-engine failure | `unmeasured`, never green |
+| Eval artifact gate | Recomputes summary counts/aggregates from registered rows and blocks review on divergence | zero eligible rows is `inconclusive`, never `PASS` |
+| Provider usage capture | Persists attempt-bound input/output/reasoning/cache/cost receipts and protects uncaptured logs from retention | absent provider usage is `unknown`, never zero |
+| Index quality | Measures edge resolution, cross-language edges, artifact share and SQLite storage health per generation | missing index metadata is degraded/unmeasured |
+| Compact replay | Authenticates original, returned and avoided bytes for repeated results | provider-token savings stays `null` |
+| Receipt conformance | Checks HMAC, call arithmetic, stage/mode alignment, generation identity and replay arithmetic | tampering or structural drift fails |
+| Review evidence audit | Rehashes candidate paths and rechecks required-output sizes before promotion | missing/mismatched reference blocks acceptance |
+| Retrieval evaluation | Runs registered golden queries through the wrapper and computes precision@k/MRR | missing corpus is `not_configured` |
+| Contract consistency | Compares generated provider projections and worker runtime policy clauses | drift fails |
+| Tool discipline | Reports zero hits, failures, repeated query identities and ordering anomalies | observational only; no completion claim |
+| Session token profile | Reconciles provider-observed token/cache fields with separately labelled prompt byte sections | no byte-to-token conversion |
+| Suite profile | Repeats repo-declared argv-only checks and records per-test duration/CPU/RSS/disk evidence where pytest exposes it | missing portable metrics remain `null` |
+| Runtime coverage import | Hash-binds repo-local coverage JSON and projects file coverage into Source Graph | no imported artifact remains `not_available` |
+| Risk precision | Computes per-mode/per-language precision from adjudicated rows | missing adjudication is `not_configured` |
+| Quality ratchet | Blocks new violation identities and configured no-net-growth overflow while grandfathering the baseline | missing baseline is non-green `not_configured` |
+| Prompt/bundle A/B | Accepts only matched model/adapter/task-family pairs with observed usage and preregistered metrics | incomplete/unobserved pairs are excluded |
 
 ## Source Graph exact-symbol slice precision
 

@@ -274,6 +274,24 @@ Release gate: a fixed task suite demonstrates lower context bytes without lower
 acceptance quality; dashboard numbers reconcile exactly with signed ledgers and
 model usage records.
 
+### Evidence instrumentation closure
+
+The 16-item evidence/tool-economics instrument set is implemented. It includes
+Source Graph recommendation roundtrips and retrieval precision, registry-driven
+eval truth, attempt-bound provider usage with retention protection, generation
+quality, compact replay, authenticated receipt conformance, pre-promotion review
+evidence revalidation, generated instruction consistency, tool discipline,
+session token decomposition, per-test suite profiling, runtime coverage import,
+risk-mode precision, a quality no-net-growth ratchet and preregistered paired
+prompt/bundle A/B evaluation.
+
+Implementation closure is not evidence-population closure. Risk precision and
+paired A/B stay `not_configured`/`inconclusive` until real adjudicated or matched
+rows exist. Tool discipline is only an observational workforce tie-breaker, and
+compact replay never converts bytes into provider tokens. The next economic
+work is to collect unbiased populations through these shipped contracts rather
+than add another measurement framework.
+
 ## P1 — Orchestration and evidence (0.8.x)
 
 ### Proven donor capability consolidation

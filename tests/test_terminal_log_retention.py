@@ -49,9 +49,24 @@ def _run(repo: Path, request_id: str, task_id: str, *, age_days: int = 20) -> No
         handle.write(json.dumps({
             "request_id": request_id,
             "task_id": task_id,
+            "runner": "runner",
+            "topic": "topic",
+            "adapter_id": "codex_cli",
             "state": "exited",
             "finished_at": "2026-01-01T00:00:00+00:00",
         }) + "\n")
+    ok, reason = task_store.append_usage_capture_event(
+        repo,
+        task_id,
+        "runner",
+        {
+            "source": "task_mcp_launcher",
+            "note": f"task_mcp_request:{request_id}",
+            "usage_observed": False,
+            "telemetry_reason": "provider_usage_report_not_observed",
+        },
+    )
+    assert ok, reason
 
 
 def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp_path: Path) -> None:
@@ -142,14 +157,12 @@ def test_preview_expires_aged_orphan_files_without_touching_recent_orphans(tmp_p
 
     result = terminal_log_retention.preview(repo)
 
-    assert result["candidate_count"] == 1
-    assert result["candidates"][0]["request_id"] == old_id
-    assert result["candidates"][0]["state"] == "orphaned"
+    assert result["candidate_count"] == 0
+    assert result["protected_count"] == 2
     assert recent_id not in {row["request_id"] for row in result["candidates"]}
-    assert result["protected_count"] == 1
 
 
-def test_aged_legacy_store_quarantine_and_restore_roundtrip(tmp_path: Path) -> None:
+def test_aged_legacy_store_is_protected_without_usage_receipts(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     legacy = repo / "logs" / "processes"
     legacy.mkdir(parents=True)
@@ -159,23 +172,52 @@ def test_aged_legacy_store_quarantine_and_restore_roundtrip(tmp_path: Path) -> N
     os.utime(payload, (old, old))
 
     preview = terminal_log_retention.preview(repo)
-    assert preview["legacy_candidate"]["size_bytes"] == payload.stat().st_size
-    moved = terminal_log_retention.quarantine(
-        repo,
-        preview_digest=preview["preview_digest"],
-        confirm=True,
-    )
-
-    assert moved["no_op"] is False
-    assert moved["bytes"] == len(b"legacy" * 1024)
-    assert not (repo / "logs").exists()
-    restored = terminal_log_retention.restore(
-        repo,
-        batch_id=moved["batch_id"],
-        confirm=True,
-    )
-    assert restored["restored"] == 1
+    assert preview["legacy_candidate"] is None
+    assert preview["candidate_count"] == 0
+    assert preview["protected_count"] == 1
     assert payload.read_bytes() == b"legacy" * 1024
+
+
+def test_usage_capture_backfill_is_idempotent_and_unblocks_retention(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    request_id = "d" * 32
+    process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
+    process_root.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 20 * 86400
+    for suffix in terminal_log_retention._OWNED_SUFFIXES:
+        path = process_root / f"{request_id}{suffix}"
+        path.write_text(
+            '{"type":"result","usage":{"input_tokens":7,"output_tokens":3}}\n'
+            if suffix == ".stdout.log" else "run\n",
+            encoding="utf-8",
+        )
+        os.utime(path, (old, old))
+    ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({
+        "request_id": request_id,
+        "task_id": "TASK_DONE",
+        "runner": "runner",
+        "topic": "topic",
+        "adapter_id": "codex_cli",
+        "model": "codex",
+        "state": "exited",
+    }) + "\n", encoding="utf-8")
+
+    before = terminal_log_retention.preview(repo)
+    assert before["candidate_count"] == 0
+    assert before["protected_count"] == 1
+
+    first = terminal_log_retention.backfill_usage_capture(repo, confirm=True)
+    second = terminal_log_retention.backfill_usage_capture(repo, confirm=True)
+    assert first["recorded"] == 1
+    assert second["recorded"] == 0
+    assert second["already_recorded"] == 1
+
+    after = terminal_log_retention.preview(repo)
+    assert after["candidate_count"] == 1
+    usage = task_store.list_usage_events(repo)
+    assert usage[0]["total_tokens"] == 10
 
 
 def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path) -> None:

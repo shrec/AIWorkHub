@@ -1309,6 +1309,62 @@ def list_usage_events(root: str | Path, *, limit: int = 10_000) -> list[dict[str
     return result
 
 
+def append_usage_capture_event(
+    root: str | Path,
+    task_id: str,
+    runner: str,
+    payload: dict[str, Any],
+) -> tuple[bool, str]:
+    """Append one idempotent internal provider-usage capture receipt.
+
+    This is deliberately narrower than the public manager write surface.  It
+    exists for terminal-log reconciliation after a process exited but before
+    its provider usage reached the canonical task event ledger.  Exact task,
+    runner and ``task_mcp_request:<request_id>`` identity are mandatory.
+    """
+
+    _readiness, db_path = _require_ready(root)
+    request_note = str(payload.get("note") or "")
+    if not request_note.startswith("task_mcp_request:") or len(request_note) != 49:
+        return False, "usage_capture_request_identity_invalid"
+    if str(payload.get("source") or "") not in {
+        "task_mcp_launcher",
+        "terminal_log_backfill",
+    }:
+        return False, "usage_capture_source_invalid"
+    conn = _connect(db_path)
+    try:
+        task = conn.execute(
+            "SELECT runner FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False, "task_not_found"
+        if str(task["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND event='usage_record' "
+            "AND json_extract(payload_json, '$.note')=? LIMIT 1",
+            (task_id, request_note),
+        ).fetchone()
+        if existing is not None:
+            return True, "already_recorded"
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO task_events(task_id,event,runner,payload_json,created_at) "
+            "VALUES (?, 'usage_record', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "recorded"
+    finally:
+        conn.close()
+
+
 def manager_decision_counts(root: str | Path) -> dict[str, Any]:
     """Return exact review decisions plus bounded review-to-decision latency."""
 

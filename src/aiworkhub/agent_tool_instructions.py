@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-CANONICAL_MAX_BYTES = 3800
+CANONICAL_MAX_BYTES = 4100
 PROJECTION_MAX_BYTES = 5200
 START = "<!-- AIWORKHUB_TOOL_USE_POLICY_START -->"
 END = "<!-- AIWORKHUB_TOOL_USE_POLICY_END -->"
@@ -74,7 +74,8 @@ POLICY = ToolPolicy(
         "Start with focus/slice; escalate from returned evidence to context/calls/trace, impact, testmap/coverage and then a typed bundle only when needed.",
         "Use body for an exact symbol and bodygrep for indexed literal/body text; refresh once before any recorded bounded fallback.",
         "After Source Graph finds an exact target, prefer body/file preview; otherwise use a bounded read and never reread an unchanged range.",
-        "Final receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.",
+        "For edits prefer aiworkhub_worker_semantic_edit_prepare/apply with the smallest verified range.",
+        "Final HMAC-authenticated MCP audit ledger receipts distinguish injected, live, zero-hit and cache-hit calls plus modes and fallbacks; one preflight query is not continuous use.",
     ),
     validation=(
         "Exact validation/build/test commands named by the card are allowed.",
@@ -131,6 +132,72 @@ MANAGER_CONTEXT_GRAPH_TOOL_NAMES: tuple[str, ...] = (
     "aiworkhub_manager_context_graph_range",
     "aiworkhub_manager_context_graph_related",
 )
+
+
+WORKER_RUNTIME_POLICY = """You are the sole worker for one exact AIWorkHub task in an isolated worktree.
+
+The coordinator already claimed the task. Do not run taskctl lifecycle commands,
+do not commit, and do not modify .git. Work only on the task contract. The
+coordinator will independently enforce allowed_writes, rerun validation, promote
+accepted files, and request review after your process exits successfully.
+
+Read every read_first path before editing. Create the required evidence and run
+the listed validation commands when their executables are already available.
+Never install, download, unpack, vendor, or bootstrap validation dependencies
+inside the worker sandbox. If a declared validator is unavailable, name the
+exact missing executable/module in the final message and continue no further
+than an already-available targeted check; the coordinator-side supervisor will
+still run the canonical validation after exit. Never use git add -A or git add
+. and never touch paths outside allowed_writes.
+
+MANDATORY_AIWORKHUB_TOOLS:
+- For code discovery call aiworkhub_worker_source_graph_query first and call it
+  again whenever you need a new symbol, dependency, call path, control-flow,
+  configuration, or file target. Initial injected context is startup material,
+  not a substitute for live Source Graph use. Raw Grep, Glob, grep, rg, find
+  and tree discovery are provider-blocked.
+- Source Graph `target` is an optional exact path filter, never a copy of the
+  semantic `query`. Omit `target` unless the task contract or worker MCP
+  receipt explicitly declares that exact path as an allowed source target.
+- Prefer Source Graph body/file previews after discovery. If an exact provider
+  file read is still necessary, request one bounded range and reuse it instead
+  of rereading an unchanged identical range.
+- For existing-file changes, prefer aiworkhub_worker_semantic_edit_prepare on
+  the smallest Source Graph line range, then aiworkhub_worker_semantic_edit_apply
+  with replacement code only. Do not read or emit a complete file when that
+  deterministic path is available. The local applier verifies the full-file
+  preimage and fragment hash before mutating the isolated worktree.
+- Executed, non-degraded Session Manager, AI Memory and KB sections in the
+  trusted injected bundle are already canonical queries. Acknowledge and reuse
+  them; call the corresponding live tool only when its section is absent or
+  degraded, or when a new unresolved fact makes another query relevant.
+  Never repeat an unchanged zero-hit query as ceremony.
+- The coordinator verifies an HMAC-authenticated MCP audit ledger and rejects
+  completion when a fresh live Source Graph call is missing. An injected
+  receipt or text claim cannot satisfy this execution-time requirement.
+- If Source Graph reports an exact target unsupported/unindexed, stop and
+  report that target. Only a new coordinator-authorized fallback card may use
+  raw discovery for it.
+
+Your final message must be at most 12 lines and name tests plus changed paths."""
+
+
+def render_worker_runtime_policy() -> str:
+    """Return the canonical stable worker prefix from the policy module."""
+
+    return WORKER_RUNTIME_POLICY
+
+
+CONTRACT_CLAUSES: dict[str, tuple[str, ...]] = {
+    "source_graph_first": (
+        "aiworkhub_manager_source_graph_query",
+        "aiworkhub_worker_source_graph_query",
+    ),
+    "continuous_source_graph": ("Re-query", "again whenever"),
+    "bounded_fallback": ("bounded exact-target fallback", "bounded range"),
+    "semantic_edit": ("aiworkhub_worker_semantic_edit_prepare",),
+    "evidence_review": ("HMAC-authenticated MCP audit ledger",),
+}
 
 
 def _lines(policy: ToolPolicy = POLICY) -> list[str]:

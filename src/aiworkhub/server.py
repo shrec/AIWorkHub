@@ -330,6 +330,7 @@ from . import cost_ledger
 from . import core
 from . import dashboard_mcp_app
 from . import deepseek_credentials
+from . import evidence_instruments
 from . import launch_queue_contract
 from . import launch_queue_persist
 from . import manager_ai_tools
@@ -1939,6 +1940,112 @@ def aiworkhub_quality_profile() -> dict[str, Any]:
     """READ-ONLY: zero-config detected languages/declared/installed tools."""
 
     return quality_evidence.build_zero_config_profile(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_eval_artifact_gate(
+    changed_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """READ-ONLY: recompute registered eval verdicts from retained rows.
+
+    A PASS over zero eligible rows or a summary/count/aggregate divergence is
+    returned as blocking evidence. The tool never rewrites an artifact.
+    """
+
+    return quality_evidence.eval_artifact_gate.evaluate(
+        core.repo_root(), changed_paths=changed_paths
+    )
+
+
+@mcp.tool()
+def aiworkhub_contract_consistency_check() -> dict[str, Any]:
+    """READ-ONLY: detect managed provider/worker instruction drift."""
+
+    return evidence_instruments.contract_consistency_check(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_source_graph_retrieval_eval() -> dict[str, Any]:
+    """READ-ONLY: run registered precision@k/MRR cases through manager MCP wrapper."""
+
+    return evidence_instruments.source_graph_retrieval_eval(
+        core.repo_root(), query_fn=manager_ai_tools.source_graph_query
+    )
+
+
+@mcp.tool()
+def aiworkhub_session_token_profile(task_id: str | None = None) -> dict[str, Any]:
+    """READ-ONLY: observed provider tokens plus separately-labelled prompt bytes."""
+
+    return evidence_instruments.session_token_profile(core.repo_root(), task_id=task_id)
+
+
+@mcp.tool()
+def aiworkhub_risk_mode_precision_bench() -> dict[str, Any]:
+    """READ-ONLY: per-mode/language precision from adjudicated registered rows."""
+
+    return evidence_instruments.risk_mode_precision_bench(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_quality_gate_ratchet(
+    violations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """READ-ONLY: report new quality identities and no-net-growth overflow."""
+
+    return evidence_instruments.quality_gate_ratchet(
+        core.repo_root(), violations=violations or []
+    )
+
+
+@mcp.tool()
+def aiworkhub_prompt_bundle_ab_report() -> dict[str, Any]:
+    """READ-ONLY: evaluate preregistered matched A/B provider-usage rows."""
+
+    return evidence_instruments.prompt_bundle_ab_report(core.repo_root())
+
+
+@mcp.tool()
+def aiworkhub_suite_profile(
+    check_id: str,
+    repeats: int = 2,
+) -> dict[str, Any]:
+    """Execute one repo-declared quality check repeatedly; shell is never used."""
+
+    descriptors = quality_evidence.declared_check_descriptors(core.repo_root())
+    selected = next((row for row in descriptors if row.check_id == check_id), None)
+    if selected is None:
+        return {"ok": False, "error": "declared_check_not_found", "check_id": check_id}
+    argv = [sys.executable if part == "{python}" else part for part in selected.command]
+    return evidence_instruments.suite_profile(
+        core.repo_root(), argv=argv, repeats=repeats
+    )
+
+
+@mcp.tool()
+def aiworkhub_runtime_coverage_preview(artifact_path: str) -> dict[str, Any]:
+    """READ-ONLY: parse a repo-local coverage.py JSON artifact."""
+
+    try:
+        return evidence_instruments.coverage_import_preview(
+            core.repo_root(), artifact_path=artifact_path
+        )
+    except evidence_instruments.EvidenceInstrumentError as exc:
+        return {"ok": False, "error": str(exc)[:240]}
+
+
+@mcp.tool()
+def aiworkhub_runtime_coverage_import(artifact_path: str) -> dict[str, Any]:
+    """WRITE-GATED: atomically project repo-local coverage into Source Graph."""
+
+    if not core.writes_allowed():
+        return {"ok": False, "error": "write_gate_closed"}
+    try:
+        return evidence_instruments.coverage_import_apply(
+            core.repo_root(), artifact_path=artifact_path
+        )
+    except evidence_instruments.EvidenceInstrumentError as exc:
+        return {"ok": False, "error": str(exc)[:240]}
 
 
 @mcp.tool()

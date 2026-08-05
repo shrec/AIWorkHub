@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import process_event_ledger, repo_policy, task_store
+from . import process_event_ledger, provider_usage, repo_policy, task_store
 
 
 SCHEMA_ID = "aiworkhub.terminal_log_retention.v1"
@@ -146,6 +146,119 @@ def _latest_rows(root: Path) -> dict[str, dict[str, Any]]:
     return latest
 
 
+def _usage_capture_request_ids(root: Path) -> set[str]:
+    result: set[str] = set()
+    try:
+        events = task_store.list_usage_events(root, limit=50_000)
+    except task_store.TaskStoreError:
+        # Storage telemetry is also used before a repository has been
+        # initialized.  No task store means no durable capture receipts; it is
+        # not a dashboard scan failure.
+        return result
+    for event in events:
+        note = str(event.get("note") or "")
+        if note.startswith("task_mcp_request:"):
+            request_id = note.removeprefix("task_mcp_request:")
+            if _REQUEST_RE.fullmatch(request_id):
+                result.add(request_id)
+    return result
+
+
+def _ledger_token_counts(usage: Mapping[str, Any], adapter_id: str) -> tuple[int, int]:
+    input_tokens = int(usage.get("input_tokens") or 0)
+    if adapter_id == "claude_cli":
+        input_tokens += int(usage.get("cached_input_tokens") or 0)
+        input_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0) + int(
+        usage.get("reasoning_output_tokens") or 0
+    )
+    return input_tokens, output_tokens
+
+
+def backfill_usage_capture(repo_root: Path | str, *, confirm: bool) -> dict[str, Any]:
+    """Idempotently recover usage receipts from retained provider output.
+
+    No token or cost is estimated. A structured provider report is normalized;
+    otherwise an explicit ``provider_usage_report_not_observed`` receipt is
+    retained so cleanup can proceed without pretending the run was free.
+    """
+
+    if confirm is not True:
+        raise TerminalLogRetentionError("explicit_confirmation_required")
+    root = Path(repo_root).resolve()
+    captured = _usage_capture_request_ids(root)
+    latest = _latest_rows(root)
+    recorded = 0
+    already_recorded = 0
+    protected = 0
+    errors: list[dict[str, str]] = []
+    process_root = root / PROCESS_FILES_RELATIVE_PATH
+    for request_id, row in sorted(latest.items()):
+        if request_id in captured:
+            already_recorded += 1
+            continue
+        task_id = str(row.get("task_id") or "")
+        runner = str(row.get("runner") or "")
+        if not task_id or not runner or str(row.get("state") or "") not in _TERMINAL_STATES:
+            protected += 1
+            continue
+        stdout_path = process_root / f"{request_id}.stdout.log"
+        info = _owned_regular_file(stdout_path, process_root)
+        if info is None:
+            protected += 1
+            errors.append({"request_id": request_id, "reason": "stdout_unavailable"})
+            continue
+        usage = provider_usage.read_provider_usage(stdout_path, include_samples=True)
+        adapter_id = str(row.get("adapter_id") or "")
+        input_tokens, output_tokens = _ledger_token_counts(usage, adapter_id)
+        observed_model = str(usage.get("observed_model") or "")
+        payload = {
+            "runner": runner,
+            "topic": str(row.get("topic") or ""),
+            "model": observed_model or str(row.get("model") or adapter_id),
+            "requested_model": str(row.get("model") or adapter_id),
+            "observed_model": observed_model,
+            "model_observed": bool(usage.get("model_observed")),
+            "role": "worker",
+            "provider": adapter_id.removesuffix("_cli"),
+            "source": "terminal_log_backfill",
+            "note": f"task_mcp_request:{request_id}",
+            "records": 1,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "visible_output_tokens": int(usage.get("output_tokens") or 0),
+            "reasoning_output_tokens": int(usage.get("reasoning_output_tokens") or 0),
+            "total_tokens": input_tokens + output_tokens,
+            "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
+            "usage_observed": bool(usage.get("usage_observed")),
+            "telemetry_reason": (
+                "" if usage.get("usage_observed") else "provider_usage_report_not_observed"
+            ),
+            "cost_usd": float(usage.get("cost_usd") or 0.0),
+            "cost_observed": bool(usage.get("cost_observed")),
+        }
+        ok, reason = task_store.append_usage_capture_event(
+            root, task_id, runner, payload
+        )
+        if ok:
+            recorded += int(reason == "recorded")
+            already_recorded += int(reason == "already_recorded")
+        else:
+            protected += 1
+            errors.append({"request_id": request_id, "reason": reason})
+    return {
+        "ok": not errors,
+        "schema_id": "aiworkhub.provider_usage_backfill.v1",
+        "recorded": recorded,
+        "already_recorded": already_recorded,
+        "protected": protected,
+        "errors": errors[:100],
+        "tokens_estimated": False,
+    }
+
+
 def _candidate_payload(root: Path) -> dict[str, Any]:
     process_root = root / PROCESS_FILES_RELATIVE_PATH
     if process_root.exists():
@@ -187,6 +300,7 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         for path in process_event_ledger.ledger_paths(ledger_path)
     )
     latest_rows = _latest_rows(root)
+    usage_capture_ids = _usage_capture_request_ids(root)
     for request_id, row in latest_rows.items():
         task_id = str(row.get("task_id") or "")
         files = sorted(inventory.pop(request_id, []), key=lambda item: item["name"])
@@ -210,6 +324,9 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         if state not in _TERMINAL_STATES or task_status not in {"finished", "archived"}:
             protected.append({**item, "reason": "active_or_unverified_authority"})
             continue
+        if request_id not in usage_capture_ids:
+            protected.append({**item, "reason": "usage_capture_receipt_missing"})
+            continue
         eligible_by_task.setdefault(task_id, []).append(item)
 
     orphan_file_bytes = 0
@@ -232,10 +349,14 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
             "files": files,
         }
         orphan_modified = datetime.fromisoformat(orphan_item["modified_at"])
-        if orphan_modified <= cutoff:
-            orphan_candidates.append(orphan_item)
-        else:
-            protected.append({**orphan_item, "reason": "orphan_retention_age_not_met"})
+        protected.append({
+            **orphan_item,
+            "reason": (
+                "usage_capture_receipt_missing"
+                if orphan_modified <= cutoff
+                else "orphan_retention_age_not_met"
+            ),
+        })
 
     candidates: list[dict[str, Any]] = []
     for rows in eligible_by_task.values():
@@ -274,11 +395,17 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
     )
     legacy_candidate = None
     if legacy_current_bytes and legacy_modified is not None and legacy_modified <= cutoff:
-        legacy_candidate = {
-            "store": "legacy_logs",
-            **legacy_identity,
+        protected.append({
+            "request_id": "legacy_logs",
+            "task_id": "",
+            "state": "legacy",
+            "task_status": "unknown",
             "modified_at": legacy_modified.isoformat(),
-        }
+            "modified_at_ns": int(legacy_identity["newest_mtime_ns"]),
+            "size_bytes": legacy_current_bytes,
+            "files": [],
+            "reason": "usage_capture_receipt_missing",
+        })
     elif legacy_current_bytes:
         protected.append({
             "request_id": "legacy_logs",

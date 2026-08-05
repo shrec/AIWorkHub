@@ -321,6 +321,40 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "policy_violations": int(verification.get("policy_violations") or 0),
             "entries_verified": int(verification.get("entries_verified") or 0),
             "entries_tampered": int(verification.get("entries_tampered") or 0),
+            "receipt_conformance": {
+                "status": str(
+                    (verification.get("receipt_conformance") or {}).get("status") or ""
+                )[:32],
+                "blocking": bool(
+                    (verification.get("receipt_conformance") or {}).get("blocking")
+                ),
+                "blocker_count": len(
+                    (verification.get("receipt_conformance") or {}).get("blockers") or []
+                ),
+            },
+            "tool_discipline": {
+                "status": str(
+                    (verification.get("tool_discipline") or {}).get("status") or ""
+                )[:32],
+                "observation_only": True,
+                "score": (verification.get("tool_discipline") or {}).get("score"),
+                "repeated_query_calls": int(
+                    (verification.get("tool_discipline") or {}).get("repeated_query_calls") or 0
+                ),
+                "deps_after_trace": bool(
+                    (verification.get("tool_discipline") or {}).get("deps_after_trace")
+                ),
+            },
+            "compact_replay": {
+                "receipt_count": int(
+                    (verification.get("compact_replay") or {}).get("receipt_count") or 0
+                ),
+                "bytes_avoided": int(
+                    (verification.get("compact_replay") or {}).get("bytes_avoided") or 0
+                ),
+                "provider_tokens_saved": None,
+                "provider_token_savings_measured": False,
+            },
         }
 
     return {
@@ -535,6 +569,14 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
         "raw_discovery_denial_tasks": 0,
         "provider_denial_evidence_tasks": 0,
         "tampered_ledger_tasks": 0,
+        "receipt_conformance_failures": 0,
+        "tool_discipline_observed_tasks": 0,
+        "tool_discipline_score_sum": 0.0,
+        "tool_discipline_score_average": None,
+        "repeated_source_graph_queries": 0,
+        "deps_after_trace_tasks": 0,
+        "compact_replay_receipts": 0,
+        "compact_replay_bytes_avoided": 0,
         "blocked_reason_counts": {},
         "measurement_label": "authenticated_calls_and_returned_bytes_only_no_token_or_cost_claim",
         "live_rate": 0.0,
@@ -751,6 +793,28 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             totals["policy_violation_tasks"] += 1
         if int(tool_use.get("entries_tampered") or 0):
             totals["tampered_ledger_tasks"] += 1
+        conformance = tool_use.get("receipt_conformance")
+        if isinstance(conformance, Mapping) and conformance.get("blocking"):
+            totals["receipt_conformance_failures"] += 1
+        discipline = tool_use.get("tool_discipline")
+        if isinstance(discipline, Mapping) and discipline.get("status") == "observed":
+            score = discipline.get("score")
+            if isinstance(score, (int, float)):
+                totals["tool_discipline_observed_tasks"] += 1
+                totals["tool_discipline_score_sum"] += float(score)
+            totals["repeated_source_graph_queries"] += max(
+                0, int(discipline.get("repeated_query_calls") or 0)
+            )
+            if discipline.get("deps_after_trace"):
+                totals["deps_after_trace_tasks"] += 1
+        replay = tool_use.get("compact_replay")
+        if isinstance(replay, Mapping):
+            totals["compact_replay_receipts"] += max(
+                0, int(replay.get("receipt_count") or 0)
+            )
+            totals["compact_replay_bytes_avoided"] += max(
+                0, int(replay.get("bytes_avoided") or 0)
+            )
         if not tool_use.get("satisfied"):
             reason = str(tool_use.get("reason") or "unspecified")[:240]
             reason_counts = totals["blocked_reason_counts"]
@@ -773,6 +837,12 @@ def _source_graph_telemetry(process_report: Mapping[str, Any]) -> dict[str, Any]
             bucket["missing_or_stale_tasks"] += 1
 
     denominator = totals["gated_tasks"]
+    if totals["tool_discipline_observed_tasks"]:
+        totals["tool_discipline_score_average"] = round(
+            totals["tool_discipline_score_sum"]
+            / totals["tool_discipline_observed_tasks"],
+            2,
+        )
     attributed_calls = sum(
         max(0, int(count or 0))
         for count in totals["source_graph_mode_counts"].values()
