@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.90] - 2026-08-05
+
+### Changed
+
+- Read-only research and quality-review acceptance uses a request-scoped lock
+  instead of waiting behind unrelated canonical file promotions.
+- VS Code LM Source Graph calls carry an explicit workflow stage from the
+  initial request through private tool calls, cache identity and receipts.
+- `worker_failed` remains distinct from `launch_failed` in callback and UI
+  state, preserving whether a provider failed before or after worker start.
+
+### Fixed
+
+- Semantic edit can fill a declared zero-byte required-output placeholder at
+  its single hash-bound virtual `1:1` insertion point without relaxing any
+  other line-range, path, scope or stale-hash gate.
+- Exact worker Source Graph body lookup can recover a symbol from another
+  coordinator-declared target and handles Windows path casing without
+  broadening access beyond the immutable task scope.
+- `task_mark_done` is idempotent after `agent_accept_review` already promoted
+  and finished the exact candidate.
+- Windows reconciliation watches a live supervisor even when the OS cannot
+  provide start ticks, rather than prematurely emitting a finalizer failure;
+  destructive PID actions remain start-time verified.
+- Dashboard task liveness uses the newest request attempt and no longer lets
+  an older failed retry overwrite a current successful or running attempt.
+
 ## [0.8.89] - 2026-08-05
 
 ### Changed

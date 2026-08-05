@@ -118,8 +118,14 @@ def _line_slice(text: str, start_line: int, end_line: int) -> tuple[list[str], s
     ):
         raise SemanticEditError("semantic_edit_line_range_invalid")
     lines = text.splitlines(keepends=True)
-    # Empty files have no replaceable line. New files use the existing create
-    # protocol rather than inventing a line-range insertion authority.
+    # An existing zero-byte file has one deterministic virtual insertion
+    # point.  VS Code LM workers receive such files as trusted placeholders
+    # for declared required outputs; treating ``1:1`` as a zero-byte region
+    # lets the model emit only the new content while preserving the normal
+    # path, full-file-hash, fragment-hash and idempotency gates.  No other
+    # out-of-bounds range is relaxed.
+    if not lines and start_line == 1 and end_line == 1:
+        return lines, ""
     if not lines or end_line > len(lines):
         raise SemanticEditError(
             f"semantic_edit_line_range_out_of_bounds:{start_line}:{end_line}:{len(lines)}"

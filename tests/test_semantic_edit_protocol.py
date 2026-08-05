@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import semantic_edit
 from aiworkhub import process_launcher
 from aiworkhub import worker_ai_tools_mcp as worker_tools
@@ -29,6 +31,50 @@ def test_prepare_returns_only_fragment_and_truthful_byte_accounting(tmp_path: Pa
         receipt["file_bytes"] - receipt["fragment_bytes"]
     )
     assert receipt["token_savings_claimed"] is False
+
+
+def test_empty_file_has_one_hash_bound_virtual_line(tmp_path: Path) -> None:
+    target = tmp_path / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"")
+
+    prepared = semantic_edit.prepare_line_target(
+        tmp_path,
+        path="out/result.txt",
+        start_line=1,
+        end_line=1,
+        allowed_writes=("out/*.txt",),
+    )
+    assert prepared.fragment == ""
+    assert prepared.file_bytes == 0
+    assert prepared.fragment_bytes == 0
+
+    next_text, metrics = semantic_edit.apply_line_ranges(
+        "",
+        [{
+            "start_line": 1,
+            "end_line": 1,
+            "new": "created\n",
+            "fragment_sha256": hashlib.sha256(b"").hexdigest(),
+        }],
+    )
+    assert next_text == "created\n"
+    assert metrics["old_region_bytes"] == 0
+    assert metrics["replacement_bytes"] == len(b"created\n")
+
+
+def test_empty_file_rejects_every_nonvirtual_line_range(tmp_path: Path) -> None:
+    target = tmp_path / "out.txt"
+    target.write_bytes(b"")
+
+    with pytest.raises(semantic_edit.SemanticEditError, match="out_of_bounds:1:2:0"):
+        semantic_edit.prepare_line_target(
+            tmp_path,
+            path="out.txt",
+            start_line=1,
+            end_line=2,
+            allowed_writes=("out.txt",),
+        )
 
 
 def test_worker_semantic_edit_is_hash_bound_atomic_and_idempotent(tmp_path: Path) -> None:

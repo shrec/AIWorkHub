@@ -162,6 +162,7 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
         "mode": "focus",
         "query": "bounded output",
         "budget": 32,
+        "workflow_stage": "orientation",
     }
     response = {
         "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,

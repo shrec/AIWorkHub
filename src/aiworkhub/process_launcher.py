@@ -4486,7 +4486,6 @@ class ProcessManager:
             ticks = event.get("pid_start_ticks")
             if (
                 event.get("state") in ACTIVE_PROCESS_STATES
-                and ticks not in (None, "")
                 and _pid_matches(pid, ticks)
             ):
                 with self._lock:
@@ -5918,7 +5917,33 @@ class ProcessManager:
         and fail closed without the required read-only reviewer reports.
         High/critical profiles additionally require ``confirm_high_risk``.
         """
-        with self._promotion_lock():
+        # A no-change research/reviewer task never promotes repository bytes.
+        # A bounded pre-read selects a per-request lock for that case so it
+        # does not wait behind an unrelated writable promotion. Every identity
+        # and evidence check is repeated below while the selected lock is held.
+        readonly_lock_path = False
+        try:
+            pre_events = self._request_events(request_id)
+            pre_latest = pre_events[-1] if pre_events else {}
+            pre_card = _parse_card(self._show_task(task_id), task_id)
+            pre_evidence = (pre_card.get("terminal_review") or {}).get("evidence") or {}
+            readonly_lock_path = bool(
+                str(pre_latest.get("task_id") or "") == task_id
+                and _canonical_task_status(pre_card) == "review"
+                and (
+                    _card_is_readonly_quality_review(pre_card)
+                    or _card_is_readonly_research(pre_card)
+                )
+                and pre_evidence.get("changed_paths") in ([], None)
+            )
+        except (LaunchRejected, AttributeError, TypeError):
+            readonly_lock_path = False
+        acceptance_lock = (
+            self._request_lock(request_id)
+            if readonly_lock_path
+            else self._promotion_lock()
+        )
+        with acceptance_lock:
             if reviewer_reports:
                 return {
                     "ok": False,
@@ -6129,6 +6154,13 @@ class ProcessManager:
                 _card_is_readonly_research(card) and not readonly_quality_review
             )
             readonly_no_change = readonly_research or readonly_quality_review
+            if readonly_lock_path and not readonly_no_change:
+                return {
+                    "ok": False,
+                    "error": "review_lock_class_changed_retry",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
             stored_hashes = evidence.get("changed_path_hashes")
             if stored_hashes is None and readonly_no_change:
                 stored_hashes = {}
@@ -6316,6 +6348,7 @@ class ProcessManager:
                     "cleanup_error": cleanup_error,
                     "quality_review_receipt": verified_receipt,
                     "reviewer_finalization": [],
+                    "acceptance_lock_scope": "request",
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -6326,6 +6359,7 @@ class ProcessManager:
                     "cleanup_error": cleanup_error,
                     "quality_review_receipt": verified_receipt,
                     "reviewer_finalization": [],
+                    "acceptance_lock_scope": "request",
                 }
 
             if readonly_research:
@@ -6465,6 +6499,7 @@ class ProcessManager:
                     "cleanup_error": cleanup_error,
                     "research_result": current_result,
                     "reviewer_finalization": [],
+                    "acceptance_lock_scope": "request",
                 }
 
             try:

@@ -197,6 +197,48 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     )
 
 
+def test_reconcile_watches_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "c" * 32
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "state": "running",
+        "pid": 4242,
+        "pid_start_ticks": None,
+        "metadata_path": str(tmp_path / "metadata.json"),
+    })
+    monkeypatch.setattr(process_launcher, "_pid_matches", lambda pid, ticks: pid == 4242 and ticks is None)
+    watched = []
+    monkeypatch.setattr(manager, "_watch_persisted_request", lambda *args: watched.append(args))
+    monkeypatch.setattr(
+        manager,
+        "_finalize_after_process_exit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live pid finalized")),
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(process_launcher.threading, "Thread", ImmediateThread)
+
+    result = manager._reconcile_persisted_requests()
+
+    assert result == {"watched": 1, "finalized": 0}
+    assert watched == [(request_id, 4242, None)]
+
+
 @pytest.mark.parametrize(
     ("runner", "topic", "reason"),
     [

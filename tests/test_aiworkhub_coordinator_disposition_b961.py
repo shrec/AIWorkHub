@@ -432,6 +432,31 @@ def test_mark_done_requires_accept_review_for_isolated_candidate(coord):
     assert _row(coord, "T_REVIEW_FIRST")["status"] == "review"
 
 
+def test_mark_done_is_idempotent_after_accept_review_finished_candidate(coord):
+    _insert(
+        coord,
+        "T_ALREADY_ACCEPTED",
+        status="finished",
+        worker_status="done",
+        card={
+            "accepted_request_id": "request-123",
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "request-123"},
+                },
+            },
+        },
+    )
+
+    res = core.mark_done("T_ALREADY_ACCEPTED")
+
+    assert res["ok"] is True
+    assert res["already_done"] is True
+    assert res["reconciled"] is True
+    assert _row(coord, "T_ALREADY_ACCEPTED")["status"] == "finished"
+
+
 # --- issue 7: terminal substatus -> callback transition map ----------------
 
 def test_callback_transition_map_is_exhaustive_for_blocked_substatuses():
@@ -440,5 +465,6 @@ def test_callback_transition_map_is_exhaustive_for_blocked_substatuses():
     assert callback_store.resolve_callback_transition("required_output_unchanged") == "validation_failed"
     # unchanged mappings still hold
     assert callback_store.resolve_callback_transition("validation_failed") == "validation_failed"
+    assert callback_store.resolve_callback_transition("worker_failed") == "worker_failed"
     assert callback_store.resolve_callback_transition("review_ready") == "review_ready"
     assert callback_store.resolve_callback_transition("blocked") == "blocked"

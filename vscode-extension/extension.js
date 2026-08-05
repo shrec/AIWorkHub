@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.89";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.90";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2401,11 +2401,12 @@ function validateVscodeLmRequest(payload, repoInfo) {
     if (!initialSourceGraphRequest || typeof initialSourceGraphRequest !== "object" || Array.isArray(initialSourceGraphRequest)) {
       throw new Error("vscode_lm_initial_source_graph_request_invalid");
     }
-    const permittedKeys = new Set(["mode", "query", "budget", "target", "bundle_type"]);
+    const permittedKeys = new Set(["mode", "query", "budget", "target", "bundle_type", "workflow_stage"]);
     if (Object.keys(initialSourceGraphRequest).some((key) => !permittedKeys.has(key)) ||
         !["focus", "slice", "context", "file", "function", "class", "body", "bodygrep", "impact", "trace", "deps", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"].includes(initialSourceGraphRequest.mode) ||
         typeof initialSourceGraphRequest.query !== "string" || !initialSourceGraphRequest.query.trim() ||
-        initialSourceGraphRequest.query.length > 512) {
+        initialSourceGraphRequest.query.length > 512 ||
+        !["orientation", "implementation", "validation", "review", "rework", "unspecified"].includes(initialSourceGraphRequest.workflow_stage || "orientation")) {
       throw new Error("vscode_lm_initial_source_graph_request_invalid");
     }
   }
@@ -2428,6 +2429,7 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
         budget: { type: "integer", minimum: 8, maximum: 160 },
         target: { type: ["string", "null"], maxLength: 256 },
         bundle_type: { type: "string", enum: ["bugfix", "feature", "refactor", "audit", "optimize", "explore"] },
+        workflow_stage: { type: "string", enum: ["orientation", "implementation", "validation", "review", "rework", "unspecified"] },
       },
     },
   },
@@ -2582,6 +2584,7 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     : "output.json";
   return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
     `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
+    `- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review, or rework.\n` +
     `- Source Graph file lookup: mode=file with query and target both equal to one declared repo-relative path returns source_hash for that file.\n` +
     `- Source Graph body lookup: mode=body with query equal to the exact indexed symbol name and target equal to that file path returns bounded source.\n` +
     `- Use the supplied AIWorkHub Session Manager, AI Memory and KB tools when relevant.\n` +
@@ -2684,7 +2687,7 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
       : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
-    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"aiworkhub_manager_source_graph_query","input":{"mode":"focus","query":"..."}}\n` +
+    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"aiworkhub_manager_source_graph_query","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
     `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
     `- Never wrap JSON in Markdown or add prose.`;

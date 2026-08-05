@@ -78,6 +78,7 @@ CALLBACK_ELIGIBLE_STATES: frozenset[str] = frozenset({
     "review_ready",
     "blocked",
     "launch_failed",
+    "worker_failed",
     "validation_failed",
     "scope_rejected",
     "timed_out",

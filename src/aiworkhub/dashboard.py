@@ -1130,10 +1130,19 @@ def _merge_process_liveness_into_tasks(
         for row in rows
         if row.get("task_id")
     }
+    # The process report is newest-first and may contain several retry
+    # request IDs for one task.  Only the newest attempt is canonical for the
+    # task row.  Letting older rows overwrite it made a live/successful retry
+    # appear as its predecessor's ``launch_failed``/``finalize_failed``.
+    seen_task_ids: set[str] = set()
     for process_row in process_report.get("processes") or []:
         if not isinstance(process_row, Mapping):
             continue
-        target = rows_by_id.get(str(process_row.get("task_id") or ""))
+        task_id = str(process_row.get("task_id") or "")
+        if not task_id or task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task_id)
+        target = rows_by_id.get(task_id)
         if target is None:
             continue
         if not target.get("last_activity_at") and process_row.get("last_activity_at"):

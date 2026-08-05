@@ -102,6 +102,30 @@ def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Pat
     assert metric["token_savings_claimed"] is False
 
 
+def test_v3_can_fill_declared_empty_placeholder_with_virtual_line(tmp_path: Path) -> None:
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[{
+            "path": "out/result.txt",
+            "current_sha256": empty_sha256,
+            "ranges": [{"start_line": 1, "end_line": 1, "new": "created\n"}],
+        }]),
+        create_paths=["out/result.txt"],
+    )
+    target = workspace / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"")
+
+    result = vscode_lm_worker.run(spec)
+
+    assert target.read_text(encoding="utf-8") == "created\n"
+    metric = result["semantic_edit_metrics"][0]
+    assert metric["old_region_bytes"] == 0
+    assert metric["replacement_bytes"] == len(b"created\n")
+    assert metric["whole_file_output_required"] is False
+
+
 def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> None:
     current = "one\ntwo\nthree\n"
     overlap, workspace = _request(

@@ -45,6 +45,9 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 6 * 1024 * 1024
 _REQUEST_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _CONTEXT_RECEIPT_PREFIX = "PROJECT_CONTEXT_RECEIPT:"
+SOURCE_GRAPH_WORKFLOW_STAGES: tuple[str, ...] = (
+    "orientation", "implementation", "validation", "review", "rework", "unspecified",
+)
 EDITOR_MODEL_ALIASES: dict[str, tuple[str, ...]] = {
     "deepseek-v4-pro": (
         "deepseek-v4-pro",
@@ -337,7 +340,16 @@ def create_request(
             or len(query) > 512
         ):
             raise BridgeError("bridge_source_graph_request_invalid")
-        initial_source_graph_request = {"mode": mode, "query": query}
+        workflow_stage = str(
+            source_graph_request.get("workflow_stage") or "orientation"
+        )
+        if workflow_stage not in SOURCE_GRAPH_WORKFLOW_STAGES:
+            raise BridgeError("bridge_source_graph_workflow_stage_invalid")
+        initial_source_graph_request = {
+            "mode": mode,
+            "query": query,
+            "workflow_stage": workflow_stage,
+        }
         for key in ("budget", "target", "bundle_type"):
             value = source_graph_request.get(key)
             if value is not None:

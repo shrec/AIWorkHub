@@ -41,6 +41,7 @@ CALLBACK_ELIGIBLE_TRANSITIONS: frozenset[str] = frozenset({
     "review_ready",
     "blocked",
     "launch_failed",
+    "worker_failed",
     "validation_failed",
     "scope_rejected",
     "timed_out",
@@ -388,6 +389,7 @@ def _task_still_in_matching_terminal_state(
     if current_status == "blocked":
         return transition in {
             "launch_failed",
+            "worker_failed",
             "timed_out",
             "token_budget_exceeded",
             "output_budget_exceeded",
@@ -416,7 +418,10 @@ _CALLBACK_TRANSITION_MAP: dict[str, str] = {
     "dependency_blocked": "blocked",
     "liveness_lost": "blocked",
     "launch_failed": "launch_failed",
-    "worker_failed": "launch_failed",
+    # A provider/adapter that never starts is launch_failed.  A started worker
+    # whose supervisor exits unsuccessfully is a distinct worker_failed
+    # outcome and must remain distinct in callbacks/UI diagnostics.
+    "worker_failed": "worker_failed",
     "exited_without_review": "launch_failed",
     "validation_failed": "validation_failed",
     "required_output_unchanged": "validation_failed",

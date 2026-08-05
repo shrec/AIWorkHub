@@ -301,10 +301,16 @@ def test_accept_revalidates_exact_readonly_research_stdout(
         lambda *_args, **kwargs: accepted.append(kwargs) or {"ok": True},
     )
     monkeypatch.setattr(process_launcher, "cleanup_workspace", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        manager,
+        "_promotion_lock",
+        lambda: (_ for _ in ()).throw(AssertionError("read-only accept took promotion lock")),
+    )
 
     result = manager.accept_review(REQUEST_ID, TASK_ID)
 
     assert result["ok"] is True
+    assert result["acceptance_lock_scope"] == "request"
     assert result["promoted_paths"] == []
     assert result["research_result"] == result_evidence
     assert accepted[0]["evidence"]["quality_gate"]["applicable"] is False

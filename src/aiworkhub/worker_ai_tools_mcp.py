@@ -1204,10 +1204,13 @@ def _filter_by_scope(value: Any, scope: str) -> Any:
     through untouched.
     """
 
-    normalized_scope = scope.rstrip("/")
+    normalized_scope = scope.replace("\\", "/").rstrip("/")
 
     def in_scope(candidate: str) -> bool:
-        return candidate == normalized_scope or candidate.startswith(f"{normalized_scope}/")
+        normalized_candidate = candidate.replace("\\", "/")
+        candidate_cmp = normalized_candidate.casefold() if os.name == "nt" else normalized_candidate
+        scope_cmp = normalized_scope.casefold() if os.name == "nt" else normalized_scope
+        return candidate_cmp == scope_cmp or candidate_cmp.startswith(f"{scope_cmp}/")
 
     if isinstance(value, list):
         kept: list[Any] = []
@@ -1402,7 +1405,11 @@ def source_graph_query(
                 "output_cap_bytes": cached["result"].get("output_cap_bytes"),
             },
         )
-        return {**cached["result"], "cache_hit": True}
+        return {
+            **cached["result"],
+            "workflow_stage": workflow_stage,
+            "cache_hit": True,
+        }
 
     try:
         with _with_source_graph_db(_source_graph_mod, binding.db_path):
@@ -1458,9 +1465,46 @@ def source_graph_query(
         if exact_payload is not None:
             payload = exact_payload
     if scope is not None:
+        unscoped_payload = payload
         payload = _filter_by_scope(payload, scope) or {}
+        # An exact body symbol can legitimately live in a second coordinator-
+        # declared target even when the model carried forward a narrower
+        # orientation target.  Preserve the security boundary: broaden only
+        # to an exact result whose file is still covered by the immutable
+        # task-scoped target allowlist, never to arbitrary repository files.
+        if mode == "body" and _json_hit_count(payload) == 0:
+            matches = (
+                unscoped_payload.get("matches")
+                if isinstance(unscoped_payload, dict)
+                else None
+            )
+            permitted_matches = []
+            for match in matches if isinstance(matches, list) else []:
+                if not isinstance(match, dict):
+                    continue
+                file_path = str(match.get("file_path") or match.get("file") or "")
+                if file_path and semantic_edit.path_is_allowed(
+                    file_path, ctx.source_graph_targets
+                ):
+                    permitted_matches.append(match)
+            if permitted_matches:
+                bounded_matches = permitted_matches[:budget]
+                payload = {
+                    "mode": "body",
+                    "query": bounded_query,
+                    "budget": budget,
+                    "matches": bounded_matches,
+                    "candidate_files": sorted({
+                        str(match.get("file_path") or match.get("file") or "")
+                        for match in bounded_matches
+                        if str(match.get("file_path") or match.get("file") or "")
+                    }),
+                    "truncated": bool(unscoped_payload.get("truncated")),
+                    "scope": "declared_target_fallback",
+                    "requested_target": scope,
+                }
         if isinstance(payload, dict) and payload:
-            payload["scope"] = "target"
+            payload.setdefault("scope", "target")
     hit_count = _json_hit_count(payload)
     evidence_counts = _source_graph_evidence_counts(payload)
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1480,6 +1524,7 @@ def source_graph_query(
         "ok": True,
         "tool": tool,
         "mode": mode,
+        "workflow_stage": workflow_stage,
         "query": bounded_query,
         "target": scope,
         "budget": budget,

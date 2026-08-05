@@ -1465,6 +1465,35 @@ def test_worker_mcp_source_graph_query_is_canonical_and_repo_bound(tmp_path):
     assert "worker_probe" in result["content"]
 
 
+def test_worker_exact_body_can_recover_within_declared_target_set(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "orientation.py", "def orientation_probe():\n    return 1\n")
+    _write(repo / "pkg" / "status.py", "def DBAccountStatus():\n    return 'ok'\n")
+    sg.build_index(repo, incremental=True)
+    ctx = w.WorkerToolContext(
+        task_id="t-body", runner="r", topic="topic", request_id="req-body",
+        repo=repo, authority_repo=repo,
+        source_graph_targets=("pkg/orientation.py", "pkg/status.py"),
+        session_topic="topic", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+    result = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="DBAccountStatus",
+        target="pkg/orientation.py",
+        budget=10,
+        workflow_stage="review",
+    )
+
+    assert result["ok"] is True
+    assert result["workflow_stage"] == "review"
+    payload = json.loads(result["content"])
+    assert payload["scope"] == "declared_target_fallback"
+    assert payload["requested_target"] == "pkg/orientation.py"
+    assert any(row["file_path"] == "pkg/status.py" for row in payload["matches"])
+
+
 def test_worker_mcp_source_graph_query_fails_closed_when_unindexed(tmp_path):
     repo = _new_repo(tmp_path, "repo")  # bootstrapped but never built
     ctx = w.WorkerToolContext(

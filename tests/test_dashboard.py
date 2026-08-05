@@ -925,6 +925,36 @@ def test_task_rows_receive_last_activity_and_liveness_from_process_report(monkey
     assert processing_row["last_activity_at"] == "2026-07-09T02:00:00+00:00"
 
 
+def test_task_row_uses_newest_retry_instead_of_older_launch_failure():
+    groups = {
+        "processing": [{"task_id": "TASK_RETRY", "status": "processing"}],
+    }
+    dashboard._merge_process_liveness_into_tasks(
+        groups,
+        {
+            "processes": [
+                {
+                    "request_id": "new-request",
+                    "task_id": "TASK_RETRY",
+                    "state": "running",
+                    "liveness_state": "alive",
+                    "supervisor_alive": True,
+                },
+                {
+                    "request_id": "old-request",
+                    "task_id": "TASK_RETRY",
+                    "state": "launch_failed",
+                    "liveness_state": "lost",
+                    "supervisor_alive": False,
+                },
+            ],
+        },
+    )
+
+    assert groups["processing"][0]["liveness_state"] == "alive"
+    assert groups["processing"][0]["supervisor_alive"] is True
+
+
 def test_task_row_exposes_structured_provider_root_error_without_secrets():
     class FailedProvider(FakeProvider):
         def get_agent_processes(self):

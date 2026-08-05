@@ -194,7 +194,7 @@ def test_mark_terminal_review_hardcoded_review_ready_regression_guard(tmp_path):
         ("timed_out", "timed_out"),
         ("token_budget_exceeded", "token_budget_exceeded"),
         ("output_budget_exceeded", "output_budget_exceeded"),
-        ("worker_failed", "launch_failed"),
+        ("worker_failed", "worker_failed"),
         ("finalize_failed", "blocked"),
         ("cancelled", "cancelled"),
         ("liveness_lost", "blocked"),

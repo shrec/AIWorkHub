@@ -3647,6 +3647,23 @@ def mark_done(task_id: str, runner: str | None = None, topic: str | None = None)
         return _lifecycle_error("task has no exact topic identity")
     if topic is not None and topic != live_topic:
         return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+    if _lifecycle_state(card) == "finished":
+        # ``agent_accept_review`` is the authoritative promotion + finish
+        # operation for isolated candidates.  Clients commonly reconcile a
+        # lost/late acknowledgement by issuing the generic done operation
+        # afterwards.  Finished is an idempotent success, not another attempt
+        # to bypass promotion, and must be recognized before the retained
+        # terminal-review receipt triggers the candidate gate below.
+        command = ["done", task_id, "--runner", CODEX_RUNNER, "--topic", str(live_topic)]
+        result = _canonical_result(
+            ok=True,
+            returncode=0,
+            stdout=json.dumps(card, ensure_ascii=False, default=str),
+            command=command,
+        )
+        result["already_done"] = True
+        result["reconciled"] = True
+        return result
     terminal_review = card.get("terminal_review")
     if isinstance(terminal_review, dict) and terminal_review:
         terminal_substatus = str(terminal_review.get("substatus") or "")
