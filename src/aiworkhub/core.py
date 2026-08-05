@@ -1868,6 +1868,7 @@ def run_taskctl(
                 cached_input_tokens=_int_value("--cached-input-tokens", 0),
                 cache_creation_input_tokens=_int_value("--cache-creation-input-tokens", 0),
                 usage_observed=True if "--usage-observed" in args else None,
+                telemetry_reason=_value("--telemetry-reason", ""),
                 cache_metrics_observed="--cache-metrics-observed" in args,
                 cost_usd=float(_value("--cost-usd", "0") or 0),
                 cost_observed="--cost-observed" in args,
@@ -4577,6 +4578,7 @@ def record_usage(
     cached_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
     usage_observed: bool | None = None,
+    telemetry_reason: str | None = None,
     cache_metrics_observed: bool = False,
     cost_usd: float = 0.0,
     cost_observed: bool = False,
@@ -4645,6 +4647,7 @@ def record_usage(
         "cached_input_tokens": int(cached_input_tokens or 0),
         "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),
         "usage_observed": measured_usage,
+        "telemetry_reason": str(telemetry_reason or "")[:160],
         "cache_metrics_observed": bool(cache_metrics_observed),
         "cost_usd": float(cost_usd or 0.0),
         "cost_observed": bool(cost_observed),
@@ -4734,7 +4737,8 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
             f"records={int(rec.get('records') or 1)} | tokens={tokens} | "
             f"in={input_tokens} out={output_tokens} | cost={cost} | "
             f"usage_observed={str(usage_is_observed).lower()} "
-            f"cost_observed={str(cost_is_observed).lower()}"
+            f"cost_observed={str(cost_is_observed).lower()} "
+            f"telemetry_reason={rec.get('telemetry_reason') or '-'}"
         )
     stdout = "\n".join(lines)
     result = _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)

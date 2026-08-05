@@ -260,6 +260,32 @@ async function textProtocolChecks() {
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes('"action":"create"'));
   assert.ok(String(prefetchedOptions[0].messages[0].content).includes("e3b0c44298fc1c149"));
 
+  const coordinatorPrefetchCalls = [];
+  const coordinatorPrefetchedResult = await internals.runVscodeLmTextProtocol(
+    prefetchedModel,
+    {
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      allowed_writes: ["out/result.json"],
+      path_contracts: {},
+      initial_source_graph_request: { mode: "focus", query: "model", budget: 48 },
+      initial_source_graph_result: {
+        ok: true,
+        tool: "source_graph",
+        mode: "focus",
+        workflow_stage: "orientation",
+        content: "prefetched graph",
+      },
+    },
+    undefined,
+    async (call) => {
+      coordinatorPrefetchCalls.push(call);
+      throw new Error("coordinator_prefetch_must_not_requery_transport");
+    },
+  );
+  assert.strictEqual(coordinatorPrefetchedResult, finalResponse);
+  assert.strictEqual(coordinatorPrefetchCalls.length, 0);
+
   await assert.rejects(
     internals.runVscodeLmTextProtocol(
       prefetchedModel,
@@ -522,6 +548,40 @@ async function nativeProtocolChecks() {
   );
   assert.strictEqual(result, finalResponse);
   assert.ok(originalInvoke.length > 0);
+
+  const nativePrefetchCalls = [];
+  const nativePrefetchMessages = [];
+  const nativePrefetchOptions = [];
+  const nativePrefetchModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages, options) => {
+      nativePrefetchMessages.push(messages);
+      nativePrefetchOptions.push(options);
+      return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+    },
+  };
+  const nativePrefetched = await internals.runVscodeLmAgent(
+    nativePrefetchModel,
+    {
+      requestId: "9".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      initial_source_graph_request: { mode: "focus", query: "model" },
+      initial_source_graph_result: {
+        ok: true,
+        tool: "source_graph",
+        mode: "focus",
+        workflow_stage: "orientation",
+        content: "prefetched native graph",
+      },
+    },
+    undefined,
+    async (call) => { nativePrefetchCalls.push(call); return { ok: true }; },
+  );
+  assert.strictEqual(nativePrefetched, finalResponse);
+  assert.strictEqual(nativePrefetchCalls.length, 0);
+  assert.ok(String(nativePrefetchMessages[0][0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
+  assert.strictEqual(nativePrefetchOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
 
   let boundedTurns = 0;
   const boundedOptions = [];

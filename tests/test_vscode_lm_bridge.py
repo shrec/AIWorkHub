@@ -164,6 +164,7 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
         "budget": 32,
         "workflow_stage": "orientation",
     }
+    assert published["initial_source_graph_result"] is None
     response = {
         "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
         "request_id": request_id,
@@ -192,6 +193,73 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
     assert (workspace / "out" / "result.txt").read_text(encoding="utf-8") == "ok\n"
     if os.name != "nt":
         assert (workspace / "out" / "result.txt").stat().st_mode & 0o077 == 0
+
+
+def test_request_carries_verified_initial_source_graph_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "9" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    result = {
+        "ok": True,
+        "tool": "source_graph",
+        "mode": "focus",
+        "workflow_stage": "orientation",
+        "content": "{\"matches\":[]}",
+        "hit_count": 0,
+    }
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Use the verified graph receipt.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+        source_graph_request={"mode": "focus", "query": "bootstrap"},
+        source_graph_result=result,
+    )
+
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert published["initial_source_graph_result"] == result
+
+
+def test_request_rejects_unverified_initial_source_graph_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "8" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_source_graph_result_invalid",
+    ):
+        vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id=request_id,
+            workspace_path=workspace,
+            workspace_home=home,
+            prompt="Do not trust failed graph evidence.",
+            model="glm-5.2",
+            allowed_writes=[],
+            timeout_seconds=30,
+            source_graph_request={"mode": "focus", "query": "bootstrap"},
+            source_graph_result={"ok": False, "reason": "database is locked"},
+        )
 
 
 def test_request_publishes_hash_pinned_edit_and_create_path_contracts(

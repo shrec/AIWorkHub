@@ -1033,6 +1033,8 @@ def test_run_taskctl_usage_preserves_unobserved_attempt_without_fake_zero(writab
             "task_mcp_launcher",
             "--note",
             "task_mcp_request:req-unknown",
+            "--telemetry-reason",
+            "provider_api_usage_unavailable",
         ],
         allow_write=True,
         runner="glm_worker",
@@ -1051,6 +1053,7 @@ def test_run_taskctl_usage_preserves_unobserved_attempt_without_fake_zero(writab
     [event] = task_store.list_usage_events(writable_repo)
     assert event["usage_observed"] is False
     assert event["cost_observed"] is False
+    assert event["telemetry_reason"] == "provider_api_usage_unavailable"
 
 
 # ---------------------------------------------------------------------------

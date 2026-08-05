@@ -1570,6 +1570,38 @@ def test_worker_exact_body_can_recover_within_declared_target_set(tmp_path):
     assert any(row["file_path"] == "pkg/status.py" for row in payload["matches"])
 
 
+def test_worker_cpp_body_matches_manager_exact_symbol_query(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "LoginServer" / "LoginQueue.cpp",
+        "void DBAccountStatus(int account_id) {\n"
+        "  update(account_id);\n"
+        "}\n",
+    )
+    sg.build_index(repo, incremental=True)
+    manager = sg.body_query(repo, "DBAccountStatus", 16)
+    ctx = w.WorkerToolContext(
+        task_id="t-cpp-body", runner="r", topic="topic", request_id="req-cpp-body",
+        repo=repo, authority_repo=repo,
+        source_graph_targets=("LoginServer/LoginQueue.cpp",),
+        session_topic="topic", audit_ledger_path=None, audit_hmac_key_path=None,
+    )
+
+    worker = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="DBAccountStatus",
+        target="LoginServer/LoginQueue.cpp",
+        budget=16,
+        workflow_stage="review",
+    )
+
+    assert manager["matches"]
+    assert worker["ok"] is True
+    payload = json.loads(worker["content"])
+    assert payload["matches"] == manager["matches"]
+
+
 def test_worker_mcp_source_graph_query_fails_closed_when_unindexed(tmp_path):
     repo = _new_repo(tmp_path, "repo")  # bootstrapped but never built
     ctx = w.WorkerToolContext(

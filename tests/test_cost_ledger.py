@@ -184,6 +184,7 @@ def test_repo_bound_unobserved_attempt_is_counted_but_not_measured(monkeypatch, 
             "model": "glm-5.2",
             "provider": "vscode_lm",
             "usage_observed": False,
+            "telemetry_reason": "provider_api_usage_unavailable",
             "cost_observed": False,
             "source": "task_mcp_launcher",
             "note": "task_mcp_request:req-unknown",
@@ -197,6 +198,7 @@ def test_repo_bound_unobserved_attempt_is_counted_but_not_measured(monkeypatch, 
     [row] = result["tasks"]
     assert row["attempt_id"] == "req-unknown"
     assert row["usage_observed"] is False
+    assert row["telemetry_reason"] == "provider_api_usage_unavailable"
     assert row["cost_known"] is False
     aggregate = result["aggregates"]["by_provider"]["vscode_lm"]
     assert aggregate["records"] == 1

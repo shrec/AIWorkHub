@@ -285,6 +285,7 @@ def create_request(
     timeout_seconds: int,
     workspace_parent_baseline: dict[str, str | None] | None = None,
     source_graph_request: dict[str, Any] | None = None,
+    source_graph_result: dict[str, Any] | None = None,
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -354,6 +355,21 @@ def create_request(
             value = source_graph_request.get(key)
             if value is not None:
                 initial_source_graph_request[key] = value
+    initial_source_graph_result: dict[str, Any] | None = None
+    if source_graph_result is not None:
+        if initial_source_graph_request is None:
+            raise BridgeError("bridge_source_graph_result_without_request")
+        if not isinstance(source_graph_result, dict) or source_graph_result.get("ok") is not True:
+            raise BridgeError("bridge_source_graph_result_invalid")
+        encoded_result = json.dumps(
+            source_graph_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_result) > MAX_REQUEST_BYTES // 2:
+            raise BridgeError("bridge_source_graph_result_too_large")
+        initial_source_graph_result = dict(source_graph_result)
     shared = {
         "schema_id": REQUEST_SCHEMA_ID,
         "request_id": request_id,
@@ -367,6 +383,7 @@ def create_request(
         "allowed_writes": allowed,
         "path_contracts": path_contracts,
         "initial_source_graph_request": initial_source_graph_request,
+        "initial_source_graph_result": initial_source_graph_result,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deadline": deadline.isoformat(),
         "response_contract": {

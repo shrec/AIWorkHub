@@ -5,8 +5,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from aiworkhub import core
-from aiworkhub.process_launcher import ProcessManager
+from aiworkhub.process_launcher import LaunchRejected, ProcessManager
 
 
 def _manager(tmp_path: Path) -> ProcessManager:
@@ -42,6 +44,48 @@ def test_long_review_promotion_does_not_block_launch_registry(tmp_path: Path) ->
         elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
+
+
+def test_launch_reservation_releases_registry_before_expensive_setup(
+    tmp_path: Path,
+) -> None:
+    provisioner = _manager(tmp_path)
+    concurrent_launcher = _manager(tmp_path)
+    event = {
+        "request_id": "a" * 32,
+        "task_id": "TASK_A",
+        "runner": "worker_a",
+        "topic": "code",
+        "adapter_id": "glm_vscode_lm",
+    }
+
+    with provisioner._launch_reservation(event):
+        assert provisioner._active_count() == 1
+        started = time.monotonic()
+        with concurrent_launcher._registry_lock():
+            pass
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+
+
+def test_launch_reservation_blocks_duplicate_task_before_pid_exists(
+    tmp_path: Path,
+) -> None:
+    first = _manager(tmp_path)
+    second = _manager(tmp_path)
+    event = {
+        "request_id": "b" * 32,
+        "task_id": "TASK_DUPLICATE",
+        "runner": "worker_a",
+        "topic": "code",
+        "adapter_id": "deepseek_vscode_lm",
+    }
+
+    with first._launch_reservation(event):
+        with pytest.raises(LaunchRejected, match="duplicate_reserved_task"):
+            with second._launch_reservation({**event, "request_id": "c" * 32}):
+                pass
 
 
 def test_same_request_finalizers_remain_serialized(tmp_path: Path) -> None:

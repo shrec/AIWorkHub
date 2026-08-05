@@ -128,6 +128,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "cache_creation_input_tokens": int(entry.get("cache_creation_input_tokens") or 0),
             "cache_metrics_observed": bool(entry.get("cache_metrics_observed")),
             "usage_observed": bool(usage_observed),
+            "telemetry_reason": str(entry.get("telemetry_reason") or ""),
             "cost_usd": cost_usd,
             "cost_observed": bool(cost_observed),
             "cost_known": (

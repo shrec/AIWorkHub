@@ -2794,6 +2794,30 @@ class ProcessManager:
                 unlock_fd(fh.fileno())
 
     @contextmanager
+    def _launch_reservation(self, event: dict[str, Any]):
+        """Reserve a cross-process launch slot without serializing setup.
+
+        Worktree creation, runtime provisioning, Source Graph orientation and
+        prompt construction can be expensive on large repositories. Holding
+        the global registry lock across those operations serialized otherwise
+        independent launches and produced 60--90 second queueing. A bounded
+        ``starting`` event is the durable reservation observed by every
+        ProcessManager; the lock is released before the body runs.
+        """
+
+        reservation = {
+            **event,
+            "state": "starting",
+            "reservation_expires_at_epoch": time.time() + 120.0,
+        }
+        with self._lock, self._registry_lock():
+            if self._active_count() >= _configured_limit():
+                raise LaunchRejected("concurrency_limit_reached")
+            self._assert_no_duplicate_task(str(event.get("task_id") or ""))
+            self._append_event(reservation)
+        yield
+
+    @contextmanager
     def _request_lock(self, request_id: str):
         """Serialize one request's reconciliation without blocking launches.
 
@@ -3049,6 +3073,14 @@ class ProcessManager:
                 continue
             pid = int(event.get("pid") or 0)
             ticks = event.get("pid_start_ticks")
+            if (
+                event.get("state") == "starting"
+                and not pid
+                and float(event.get("reservation_expires_at_epoch") or 0.0)
+                > time.time()
+            ):
+                active.add(request_id)
+                continue
             if pid and (
                 (not event.get("metadata_path") and _pid_matches(pid, ticks))
                 or (ticks not in (None, "") and _pid_matches(pid, ticks))
@@ -3268,12 +3300,21 @@ class ProcessManager:
             provider_env, model = self._resolve_provider_env(adapter_id, model)
             sandbox_backend = _sandbox_backend_for_adapter(adapter_id)
             launch_phase = "workspace_and_runtime_provision"
-            with self._lock, self._registry_lock():
-                if self._active_count() >= _configured_limit():
-                    raise LaunchRejected("concurrency_limit_reached")
-                self._assert_no_duplicate_task(task_id)
-
-                request_id = uuid.uuid4().hex
+            request_id = uuid.uuid4().hex
+            with self._launch_reservation({
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": adapter_id,
+                "model": model,
+                "timeout_seconds": timeout_seconds,
+                "authority": f"coordinator_claim_isolated_worktree_{sandbox_backend}",
+                "sandbox_backend": sandbox_backend,
+                "project_context": (
+                    context_result.metadata if context_result is not None else None
+                ),
+            }):
                 self.process_dir.mkdir(parents=True, exist_ok=True)
                 os.chmod(self.process_dir, 0o700)
                 stdout_path = self.process_dir / f"{request_id}.stdout.log"
@@ -3284,25 +3325,6 @@ class ProcessManager:
                 spec_path = self.process_dir / f"{request_id}.supervisor-spec.json"
                 _touch_0600(stdout_path)
                 _touch_0600(stderr_path)
-
-                self._append_event({
-                    "request_id": request_id,
-                    "task_id": task_id,
-                    "runner": runner,
-                    "topic": topic,
-                    "adapter_id": adapter_id,
-                    "model": model,
-                    "state": "starting",
-                    "timeout_seconds": timeout_seconds,
-                    "stdout_path": str(stdout_path),
-                    "stderr_path": str(stderr_path),
-                    "metadata_path": str(metadata_path),
-                    "authority": f"coordinator_claim_isolated_worktree_{sandbox_backend}",
-                    "sandbox_backend": sandbox_backend,
-                    "project_context": (
-                        context_result.metadata if context_result is not None else None
-                    ),
-                })
 
                 review_packet_path: Path | None = None
                 review_workspace_evidence: dict[str, Any] | None = None
@@ -3345,6 +3367,67 @@ class ProcessManager:
                     session_topic=worker_session_topic,
                     quality_review_packet_path=review_packet_path,
                 )
+                vscode_source_graph_request = (
+                    (card.get("project_context") or {}).get("source_graph")
+                    if isinstance(card.get("project_context"), dict)
+                    else None
+                )
+                vscode_source_graph_result: dict[str, Any] | None = None
+                if (
+                    adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS
+                    and isinstance(vscode_source_graph_request, dict)
+                    and vscode_source_graph_request.get("query")
+                ):
+                    # Execute the mandatory orientation query before the
+                    # request enters the editor-host spool.  Calling back over
+                    # the coordinator's single MCP stdio connection from four
+                    # concurrent VS Code LM workers caused head-of-line
+                    # blocking and 90-second bootstrap timeouts.  This uses
+                    # the exact same immutable worker identity, target scope,
+                    # HMAC ledger and canonical authority as later live tool
+                    # calls, so the receipt remains genuine worker-scoped
+                    # evidence.  Only the first query is prefetched; every
+                    # implementation/review re-query still uses live MCP.
+                    source_graph_input = {
+                        key: vscode_source_graph_request[key]
+                        for key in (
+                            "mode", "query", "budget", "target",
+                            "bundle_type", "workflow_stage",
+                        )
+                        if vscode_source_graph_request.get(key) is not None
+                    }
+                    source_graph_input.setdefault("mode", "focus")
+                    source_graph_input.setdefault("workflow_stage", "orientation")
+                    prefetch_ctx = worker_ai_tools_mcp.WorkerToolContext(
+                        task_id=task_id,
+                        runner=runner,
+                        topic=topic,
+                        request_id=request_id,
+                        repo=workspace.path,
+                        authority_repo=authority_repo,
+                        source_graph_targets=tuple(worker_source_graph_targets),
+                        allowed_writes=tuple(
+                            str(value) for value in card.get("allowed_writes") or []
+                        ),
+                        session_topic=worker_session_topic,
+                        audit_ledger_path=worker_mcp_runtime.audit_ledger_path,
+                        audit_hmac_key_path=worker_mcp_runtime.audit_hmac_key_path,
+                        quality_review_packet_path=review_packet_path,
+                    )
+                    vscode_source_graph_result = worker_ai_tools_mcp.source_graph_query(
+                        prefetch_ctx,
+                        **source_graph_input,
+                    )
+                    if vscode_source_graph_result.get("ok") is not True:
+                        reason = str(
+                            vscode_source_graph_result.get("reason")
+                            or vscode_source_graph_result.get("error")
+                            or "source_graph_result_not_ok"
+                        )
+                        raise LaunchRejected(
+                            "vscode_lm_initial_source_graph_prefetch_failed:"
+                            + reason[:300]
+                        )
                 launch_phase = "prompt_and_adapter_plan"
                 if quality_review_binding is not None:
                     private_tool_name = (
@@ -3392,11 +3475,8 @@ class ProcessManager:
                         allowed_writes=workspace.allowed_writes,
                         workspace_parent_baseline=workspace.parent_baseline,
                         timeout_seconds=timeout_seconds,
-                        source_graph_request=(
-                            (card.get("project_context") or {}).get("source_graph")
-                            if isinstance(card.get("project_context"), dict)
-                            else None
-                        ),
+                        source_graph_request=vscode_source_graph_request,
+                        source_graph_result=vscode_source_graph_result,
                     )
                     plan = runtime_adapters.RuntimeAdapterPlan(
                         adapter_id=adapter_id,
@@ -3640,7 +3720,8 @@ class ProcessManager:
                     supervisor_status_path=status_path,
                     pid_start_ticks=start_ticks,
                 )
-                self._live[request_id] = live
+                with self._lock:
+                    self._live[request_id] = live
                 event = self._append_event({
                     "request_id": request_id,
                     "task_id": task_id,
@@ -3781,6 +3862,15 @@ class ProcessManager:
                 continue
             pid = int(event.get("pid") or 0)
             ticks = event.get("pid_start_ticks")
+            if (
+                event.get("state") == "starting"
+                and not pid
+                and float(event.get("reservation_expires_at_epoch") or 0.0)
+                > time.time()
+            ):
+                raise LaunchRejected(
+                    f"duplicate_reserved_task:{event.get('request_id')}"
+                )
             if pid and _pid_matches(pid, ticks):
                 raise LaunchRejected(f"duplicate_persisted_task:{event.get('request_id')}")
 
@@ -4120,6 +4210,15 @@ class ProcessManager:
         total_output = _ledger_output_tokens(usage)
         usage["recorded_input_tokens"] = total_input
         usage["recorded_output_tokens"] = total_output
+        if usage.get("usage_observed"):
+            usage["telemetry_reason"] = ""
+        elif adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+            # vscode.lm currently exposes the model response stream but no
+            # provider-authoritative token/cost usage object. Keep this
+            # distinct from a parser miss and never fabricate zero-cost work.
+            usage["telemetry_reason"] = "provider_api_usage_unavailable"
+        else:
+            usage["telemetry_reason"] = "provider_usage_report_not_observed"
         usage_role = "worker"
         note = f"task_mcp_request:{request_id}"
         try:
@@ -4155,6 +4254,7 @@ class ProcessManager:
             "--total-tokens", str(total_input + total_output),
             "--cached-input-tokens", str(usage["cached_input_tokens"]),
             "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
+            "--telemetry-reason", str(usage["telemetry_reason"]),
             "--cost-usd", str(
                 float(usage["cost_usd"] or 0.0)
                 if usage.get("cost_observed")

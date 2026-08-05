@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.8.92";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.8.93";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2410,6 +2410,14 @@ function validateVscodeLmRequest(payload, repoInfo) {
       throw new Error("vscode_lm_initial_source_graph_request_invalid");
     }
   }
+  const initialSourceGraphResult = payload.initial_source_graph_result;
+  if (initialSourceGraphResult !== null && initialSourceGraphResult !== undefined) {
+    if (!initialSourceGraphRequest || !initialSourceGraphResult ||
+        typeof initialSourceGraphResult !== "object" || Array.isArray(initialSourceGraphResult) ||
+        initialSourceGraphResult.ok !== true) {
+      throw new Error("vscode_lm_initial_source_graph_result_invalid");
+    }
+  }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
   return { ...payload, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
@@ -2882,25 +2890,28 @@ async function runVscodeLmTextProtocol(
   let sourceGraphAcknowledged = false;
   let initialSourceGraphResult = null;
   if (request.initial_source_graph_request) {
-    try {
-      initialSourceGraphResult = await invokeTool({
-        name: "aiworkhub_manager_source_graph_query",
-        input: request.initial_source_graph_request,
-      }, request.requestId);
-    } catch (cause) {
-      const error = vscodeLmProtocolFailure(
-        "vscode_lm_initial_source_graph_failed",
-        [{
-          turn: 0,
-          phase: "initial_source_graph",
-          outcome: sanitizeErrorMessage(cause),
-        }],
-        String((cause && cause.protocolPreview) || ""),
-      );
-      error.protocolPhase = "initial_source_graph";
-      error.protocolCause = sanitizeErrorMessage(cause);
-      error.protocolRequest = request.initial_source_graph_request;
-      throw error;
+    initialSourceGraphResult = request.initial_source_graph_result || null;
+    if (!initialSourceGraphResult) {
+      try {
+        initialSourceGraphResult = await invokeTool({
+          name: "aiworkhub_manager_source_graph_query",
+          input: request.initial_source_graph_request,
+        }, request.requestId);
+      } catch (cause) {
+        const error = vscodeLmProtocolFailure(
+          "vscode_lm_initial_source_graph_failed",
+          [{
+            turn: 0,
+            phase: "initial_source_graph",
+            outcome: sanitizeErrorMessage(cause),
+          }],
+          String((cause && cause.protocolPreview) || ""),
+        );
+        error.protocolPhase = "initial_source_graph";
+        error.protocolCause = sanitizeErrorMessage(cause);
+        error.protocolRequest = request.initial_source_graph_request;
+        throw error;
+      }
     }
     if (!initialSourceGraphResult || initialSourceGraphResult.ok !== true) {
       const reason = sanitizeErrorMessage(
@@ -3054,8 +3065,14 @@ async function runVscodeLmAgent(
   if (!model.capabilities || !model.capabilities.toolCalling) {
     return runVscodeLmTextProtocol(model, request, cancellationToken);
   }
-  const messages = [vscode.LanguageModelChatMessage.User(glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts))];
-  let sourceGraphAcknowledged = false;
+  const initialSourceGraphResult = request.initial_source_graph_result || null;
+  const messages = [vscode.LanguageModelChatMessage.User(
+    glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts) +
+    (initialSourceGraphResult
+      ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
+      : ""),
+  )];
+  let sourceGraphAcknowledged = Boolean(initialSourceGraphResult);
   let toolTurns = 0;
   let postSourceTurns = 0;
   let finalizationTurns = 0;

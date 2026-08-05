@@ -967,6 +967,51 @@ def test_usage_parser_keeps_unreported_cost_unknown(tmp_path):
     assert usage["cost_usd"] is None
 
 
+def test_vscode_lm_usage_records_explicit_provider_api_unavailability(
+    tmp_path, monkeypatch,
+):
+    output = tmp_path / "vscode-lm-result.jsonl"
+    output.write_text(
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "model": {"id": "glm-5.2"},
+            "result": "completed without provider usage metadata",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    captured: list[str] = []
+
+    def record(args, **_kwargs):
+        captured.extend(args)
+        return process_launcher.core.TaskCtlResult(args, 0, "ok", "")
+
+    monkeypatch.setattr(process_launcher.core, "run_taskctl", record)
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        isolation_enabled=False,
+    )
+
+    usage, recorded, error = manager._record_usage(
+        "a" * 32,
+        "TASK_USAGE",
+        "glm_worker",
+        "glm_vscode_lm",
+        "glm-5.2",
+        output,
+        topic="code",
+    )
+
+    assert recorded is True
+    assert error == ""
+    assert usage["usage_observed"] is False
+    assert usage["telemetry_reason"] == "provider_api_usage_unavailable"
+    reason_index = captured.index("--telemetry-reason")
+    assert captured[reason_index + 1] == "provider_api_usage_unavailable"
+
+
 def test_usage_parser_preserves_nested_per_turn_cache_and_model_evidence(tmp_path):
     output = tmp_path / "provider-stream.jsonl"
     output.write_text(

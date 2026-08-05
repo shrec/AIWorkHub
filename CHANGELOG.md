@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.8.93] - 2026-08-05
+
+### Changed
+
+- VS Code-hosted workers receive their mandatory initial Source Graph result
+  from a launcher-side, worker-scoped HMAC/audit call. This removes the shared
+  coordinator MCP round-trip from concurrent bootstrap while preserving live
+  MCP re-queries for implementation, validation and review.
+- Cross-process launch locking now reserves only the exact task and capacity
+  slot. Worktree creation, runtime provisioning, context construction and
+  provider startup proceed independently instead of serializing unrelated
+  workers behind one global lock.
+- Unmeasured VS Code Language Model usage is persisted with
+  `provider_api_usage_unavailable`, distinguishing an API limitation from a
+  parser failure or fabricated zero token/cost usage.
+
+### Fixed
+
+- Concurrent Claude, DeepSeek and GLM editor-model workers no longer queue
+  their initial Source Graph bootstrap on the coordinator's single MCP stdio
+  transport.
+- A bounded launch reservation prevents duplicate task starts before a PID
+  exists and expires after a crashed provisioner, preserving concurrency and
+  lifecycle truth.
+- C++ exact-symbol body lookup now has an explicit manager/worker parity
+  regression for `DBAccountStatus`-shaped source.
+
 ## [0.8.92] - 2026-08-05
 
 ### Fixed
