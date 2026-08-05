@@ -158,5 +158,6 @@ records structural bytes, file reads, provider tokens, cost availability and
 outcomes separately. A preliminary n=2 focused-edit pilot observed lower total
 tokens (27.5%) and elapsed time (21.5%), but it is not randomized and its cache
 mix differs; uncached input increased 20.3%. Separately, the 156-task context
-snapshot exposed a 20.0% envelope expansion that remains an optimization
-target. The raw ledgers, negative results and deterministic checkers are public.
+snapshot exposed a 20.0% legacy-v1 envelope expansion. The nested compact v2
+structural fix shipped in 0.8.82; an equivalent live fleet remeasurement remains
+a target. The raw ledgers, negative results and deterministic checkers are public.

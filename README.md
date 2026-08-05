@@ -143,7 +143,7 @@ negative and still-unmeasured results.
 | Authenticated edit shape | 531 replacement bytes for 31,998 existing-file bytes (1.66%; 60.26× structural ratio), with zero old bytes re-emitted | Verified reduction in emitted code payload when a full-file baseline applies; not a 60.26× claim for the complete provider bill |
 | Current Source Graph gate | 7/7 gated tasks used live graph evidence; 13 calls, 0 failures; p50 15.024 ms | Verified runtime snapshot |
 | Tool-use cohorts | Review-ready rate was 7.2% with missing graph use, 26.7% with live single-stage use and 33.3% with continuous use | Observational association; not causality |
-| Context packaging | 156-task payload expanded 20.0% after envelope overhead | Verified negative result and optimization target |
+| Legacy context packaging | The 0.8.81 v1 envelope expanded a 156-task payload by 20.0%; v2 later reduced the same-evidence representative fixture from 849 to 600 bytes (29.329%) | Historical negative baseline; structural fix shipped, live fleet remeasurement pending |
 | Callback durability | 271 events, zero dead letters and zero backlog | Verified runtime snapshot |
 
 See [Benchmarks](docs/BENCHMARKS.md) for the full evidence matrix, denominators,
