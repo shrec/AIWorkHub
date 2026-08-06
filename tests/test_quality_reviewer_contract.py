@@ -23,6 +23,15 @@ def _packet() -> dict[str, object]:
         acceptance=["acceptance contract only"],
         required_outputs=["src/aiworkhub/core.py"],
         validation=[["python", "-m", "pytest", "-q"]],
+        terminal_validation=[
+            {
+                "declared_command": "python -m pytest -q",
+                "executed_argv": ["python3", "-m", "pytest", "-q"],
+                "returncode": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+        ],
         mechanical_checks=[
             {
                 "check_id": "pytest",
@@ -113,6 +122,15 @@ def test_packet_is_deterministic_and_anti_anchored() -> None:
     assert "result" not in first
     assert "verdict" not in first
     assert "rationale" not in first
+    assert first["terminal_validation"] == [
+        {
+            "declared_command": "python -m pytest -q",
+            "executed_argv": ["python3", "-m", "pytest", "-q"],
+            "returncode": 0,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+    ]
 
 
 def test_receipt_is_bound_to_process_observed_identity() -> None:

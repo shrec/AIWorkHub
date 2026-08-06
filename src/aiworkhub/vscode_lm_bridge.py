@@ -38,6 +38,15 @@ RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.response.v1"
 EDIT_RESPONSE_SCHEMA_ID_V1 = "aiworkhub.vscode_lm.edit_response.v1"
 EDIT_RESPONSE_SCHEMA_ID_V2 = "aiworkhub.vscode_lm.edit_response.v2"
 EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.semantic_edit_response.v3"
+PROGRESS_RECEIPT_SCHEMA_ID = "aiworkhub.vscode_lm.progress_receipt.v1"
+PROGRESS_PHASES: tuple[str, ...] = (
+    "request_accepted",
+    "provider_response",
+    "tool_turn",
+    "final_edit",
+    "terminal_error",
+)
+MAX_PROGRESS_BYTES = 4096
 BRIDGE_ROOT_ENV = "AIWORKHUB_VSCODE_LM_BRIDGE_ROOT"
 DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
@@ -309,6 +318,7 @@ def create_request(
         raise BridgeError("bridge_workspace_request_mismatch")
     repo_id = _repo_id(repo)
     response_path = workspace_home / ".aiworkhub_vscode_lm_response.json"
+    progress_path = workspace_home / ".aiworkhub_vscode_lm_progress.json"
     worker_spec_path = workspace_home / ".aiworkhub_vscode_lm_worker.json"
     request_path = bridge_root() / "requests" / repo_id / f"{request_id}.json"
     allowed = [str(value) for value in allowed_writes]
@@ -448,6 +458,7 @@ def create_request(
         "repo_id": repo_id,
         "workspace_path": str(workspace_path),
         "response_path": str(response_path),
+        "progress_path": str(progress_path),
         "allowed_writes": allowed,
         "create_paths": sorted(create_paths),
         "path_contracts": path_contracts,
@@ -464,3 +475,74 @@ def cancel_request(request: BridgeRequest) -> None:
         request.request_path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _validate_progress_receipt(
+    path: Path,
+    request_id: str,
+    repo_id: str,
+    *,
+    owner_uid: int | None = None,
+    previous_sequence: int | None = None,
+) -> dict[str, Any]:
+    """Validate one bounded progress snapshot without treating it as completion."""
+    if not _REQUEST_ID_RE.fullmatch(request_id):
+        raise BridgeError("bridge_progress_request_id_invalid")
+    if path.is_symlink():
+        raise BridgeError("bridge_progress_symlink")
+    if not path.is_file():
+        raise BridgeError("bridge_progress_not_file")
+    metadata = path.stat()
+    if metadata.st_size > MAX_PROGRESS_BYTES:
+        raise BridgeError("bridge_progress_too_large")
+    if owner_uid is not None and metadata.st_uid != owner_uid:
+        raise BridgeError("bridge_progress_foreign_owner")
+    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise BridgeError("bridge_progress_insecure_mode")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise BridgeError("bridge_progress_invalid_json") from None
+    if not isinstance(payload, dict):
+        raise BridgeError("bridge_progress_not_object")
+    if payload.get("schema_id") != PROGRESS_RECEIPT_SCHEMA_ID:
+        raise BridgeError("bridge_progress_schema_mismatch")
+    if payload.get("request_id") != request_id:
+        raise BridgeError("bridge_progress_identity_mismatch")
+    if payload.get("repo_id") != repo_id:
+        raise BridgeError("bridge_progress_repo_mismatch")
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        raise BridgeError("bridge_progress_sequence_invalid")
+    if previous_sequence is not None and sequence <= previous_sequence:
+        raise BridgeError("bridge_progress_non_monotonic")
+    if payload.get("phase") not in PROGRESS_PHASES:
+        raise BridgeError("bridge_progress_phase_invalid")
+    updated_at = payload.get("updated_at")
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        raise BridgeError("bridge_progress_timestamp_missing")
+    try:
+        datetime.fromisoformat(updated_at)
+    except (TypeError, ValueError):
+        raise BridgeError("bridge_progress_timestamp_invalid") from None
+    return payload
+
+
+def read_progress_receipt(
+    path: Path,
+    request_id: str,
+    repo_id: str,
+    *,
+    owner_uid: int | None = None,
+    previous_sequence: int | None = None,
+) -> dict[str, Any]:
+    """Return no-progress for an absent sidecar; fail closed for an unsafe one."""
+    if not path.exists() and not path.is_symlink():
+        return {}
+    return _validate_progress_receipt(
+        path,
+        request_id,
+        repo_id,
+        owner_uid=owner_uid,
+        previous_sequence=previous_sequence,
+    )

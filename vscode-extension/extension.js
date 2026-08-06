@@ -204,6 +204,10 @@ const VSCODE_LM_EDIT_RESPONSE_SCHEMA = "aiworkhub.vscode_lm.semantic_edit_respon
 const VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 = "aiworkhub.vscode_lm.edit_response.v2";
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
+const VSCODE_LM_PROGRESS_SCHEMA = "aiworkhub.vscode_lm.progress_receipt.v1";
+const VSCODE_LM_PROGRESS_PHASES = Object.freeze([
+  "request_accepted", "provider_response", "tool_turn", "final_edit", "terminal_error",
+]);
 const VSCODE_LM_MODEL = "glm-5.2";
 const VSCODE_LM_SUPPORTED_MODELS = Object.freeze(["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "claude-sonnet-4.6"]);
 const VSCODE_LM_MODEL_ALIASES = Object.freeze({
@@ -2383,6 +2387,9 @@ function validateVscodeLmRequest(payload, repoInfo) {
   const workspacePath = path.resolve(String(payload.workspace_path || ""));
   const workspaceHome = path.resolve(String(payload.workspace_home || ""));
   const responsePath = path.resolve(String(payload.response_path || ""));
+  const progressPath = payload.progress_path
+    ? path.resolve(String(payload.progress_path))
+    : path.join(workspaceHome, ".aiworkhub_vscode_lm_progress.json");
   if (path.basename(workspacePath) !== "worktree" || path.basename(workspaceHome) !== "home") {
     throw new Error("vscode_lm_workspace_shape_invalid");
   }
@@ -2391,6 +2398,9 @@ function validateVscodeLmRequest(payload, repoInfo) {
   }
   if (responsePath !== path.join(workspaceHome, ".aiworkhub_vscode_lm_response.json")) {
     throw new Error("vscode_lm_response_path_invalid");
+  }
+  if (progressPath !== path.join(workspaceHome, ".aiworkhub_vscode_lm_progress.json")) {
+    throw new Error("vscode_lm_progress_path_invalid");
   }
   const allowedWrites = payload.allowed_writes;
   if (!Array.isArray(allowedWrites) || allowedWrites.some((value) => typeof value !== "string" || value.length > 512)) {
@@ -2420,7 +2430,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
   }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
-  return { ...payload, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, allowedWrites };
+  return { ...payload, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, progressPath, allowedWrites };
 }
 
 const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
@@ -2717,7 +2727,7 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     `- Never wrap JSON in Markdown or add prose.`;
 }
 
-async function collectVscodeLmResponseText(response) {
+async function collectVscodeLmResponseText(response, onProviderPart = null) {
   const textParts = [];
   const observations = { text: [], stream: [] };
   // VS Code documents `response.text` as a filtered view of `response.stream`,
@@ -2728,6 +2738,9 @@ async function collectVscodeLmResponseText(response) {
   const collectParts = async (iterable, channel) => {
     if (!iterable || typeof iterable[Symbol.asyncIterator] !== "function") return;
     for await (const part of iterable) {
+      if (typeof onProviderPart === "function") {
+        try { onProviderPart(); } catch (_err) { /* liveness only */ }
+      }
       if (part && typeof part.value === "string") textParts.push(part.value);
       else if (typeof part === "string") textParts.push(part);
       else if (observations[channel].length < 4) {
@@ -2902,6 +2915,8 @@ async function runVscodeLmTextProtocol(
   request,
   cancellationToken,
   invokeTool = invokeVscodeLmPrivateTool,
+  onToolTurn = null,
+  onProviderPart = null,
 ) {
   let sourceGraphAcknowledged = false;
   let initialSourceGraphResult = null;
@@ -2979,7 +2994,7 @@ async function runVscodeLmTextProtocol(
     }, cancellationToken);
     let text;
     try {
-      text = await collectVscodeLmResponseText(response);
+      text = await collectVscodeLmResponseText(response, onProviderPart);
     } catch (err) {
       if (String(err && err.message || err) !== "vscode_lm_empty_response") throw err;
       messages.push(vscode.LanguageModelChatMessage.User(
@@ -3059,6 +3074,9 @@ async function runVscodeLmTextProtocol(
     if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
+    if (typeof onToolTurn === "function") {
+      try { onToolTurn(envelope.name); } catch (_err) { /* liveness only */ }
+    }
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
@@ -3076,10 +3094,14 @@ async function runVscodeLmAgent(
   request,
   cancellationToken,
   invokeTool = invokeVscodeLmPrivateTool,
+  onToolTurn = null,
+  onProviderPart = null,
 ) {
   if (!model) throw new Error("vscode_lm_model_not_visible");
   if (!model.capabilities || !model.capabilities.toolCalling) {
-    return runVscodeLmTextProtocol(model, request, cancellationToken);
+    return runVscodeLmTextProtocol(
+      model, request, cancellationToken, invokeTool, onToolTurn, onProviderPart,
+    );
   }
   const initialSourceGraphResult = request.initial_source_graph_result || null;
   const messages = [vscode.LanguageModelChatMessage.User(
@@ -3126,6 +3148,9 @@ async function runVscodeLmAgent(
     const textParts = [];
     const calls = [];
     for await (const part of response.stream) {
+      if (typeof onProviderPart === "function") {
+        try { onProviderPart(); } catch (_err) { /* liveness only */ }
+      }
       assistantParts.push(part);
       if (isLanguageModelToolCallPart(part)) calls.push(part);
       else if (part && typeof part.value === "string") textParts.push(part.value);
@@ -3199,6 +3224,9 @@ async function runVscodeLmAgent(
       }
       if (call.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
         sourceGraphAcknowledged = true;
+      }
+      if (typeof onToolTurn === "function") {
+        try { onToolTurn(call.name); } catch (_err) { /* liveness only */ }
       }
       results.push(languageModelToolResultPart(call.callId, result));
     }
@@ -3385,6 +3413,8 @@ class VscodeLmBridgeHost {
 
   async processClaim(claimPath, repoInfo) {
     let source = null;
+    let progressSequence = 0;
+    let lastProviderProgressAt = 0;
     try {
       if (!ownerOnlyRegularFile(claimPath)) throw new Error("vscode_lm_request_not_owner_only");
       const payload = JSON.parse(fs.readFileSync(claimPath, "utf8"));
@@ -3393,6 +3423,26 @@ class VscodeLmBridgeHost {
       const model = selectVscodeLanguageModel(models, request.model);
       if (!model) throw new Error("vscode_lm_model_not_visible");
       if (!(await this.ensurePermission(model))) throw new Error("vscode_lm_permission_denied");
+      const writeProgress = (phase, extra = {}, minimumIntervalMs = 0) => {
+        const now = Date.now();
+        if (minimumIntervalMs && now - lastProviderProgressAt < minimumIntervalMs) return;
+        progressSequence += 1;
+        if (phase === "provider_response") lastProviderProgressAt = now;
+        try {
+          atomicWriteOwnerJson(request.progressPath, {
+            schema_id: VSCODE_LM_PROGRESS_SCHEMA,
+            request_id: request.requestId,
+            repo_id: repoInfo.repoId,
+            sequence: progressSequence,
+            phase,
+            updated_at: new Date(now).toISOString(),
+            ...extra,
+          });
+        } catch (_err) { /* progress is advisory, never completion */ }
+      };
+      writeProgress("request_accepted");
+      const onToolTurn = (toolName) => writeProgress("tool_turn", { tool_name: String(toolName || "").slice(0, 200) });
+      const onProviderPart = () => writeProgress("provider_response", {}, 2000);
       source = new vscode.CancellationTokenSource();
       this.activeSources.add(source);
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
@@ -3401,10 +3451,14 @@ class VscodeLmBridgeHost {
       let error = "";
       let diagnostics = null;
       try {
-        text = await runVscodeLmAgent(model, request, source.token);
+        text = await runVscodeLmAgent(
+          model, request, source.token, invokeVscodeLmPrivateTool, onToolTurn, onProviderPart,
+        );
+        writeProgress("final_edit");
       }
       catch (err) {
         error = sanitizeErrorMessage(err);
+        writeProgress("terminal_error", { error: error.slice(0, 256) });
         diagnostics = {
           phase: String((err && err.protocolPhase) || "provider_request"),
           error_code: error,
@@ -7191,6 +7245,8 @@ module.exports = {
     validateVscodeLmFinalEnvelope,
     vscodeLmPathMatchesPattern,
     glmTextToolProtocolPrompt,
+    atomicWriteOwnerJson,
+    ownerOnlyRegularFile,
     VSCODE_LM_PRIVATE_TOOLS,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
@@ -7215,6 +7271,8 @@ module.exports = {
       VSCODE_LM_EDIT_RESPONSE_SCHEMA,
       VSCODE_LM_TOOL_REQUEST_SCHEMA,
       VSCODE_LM_TOOL_RESULT_SCHEMA,
+      VSCODE_LM_PROGRESS_SCHEMA,
+      VSCODE_LM_PROGRESS_PHASES,
     },
   },
 };

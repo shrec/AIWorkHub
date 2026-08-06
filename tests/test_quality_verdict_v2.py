@@ -12,8 +12,14 @@ def _check(
     *,
     kind: str = "test",
     status: str = qe.STATUS_PASSED,
+    summary: str = "",
 ) -> qe.EvidenceCheck:
-    return qe.EvidenceCheck(check_id=check_id, kind=kind, status=status)
+    return qe.EvidenceCheck(
+        check_id=check_id,
+        kind=kind,
+        status=status,
+        summary=summary,
+    )
 
 
 def _report(
@@ -235,7 +241,7 @@ def test_malformed_or_mutating_reviewer_report_fails_closed() -> None:
     assert verdict["blocking_evidence"] == ["reviewer_schema:0:not_read_only"]
 
 
-def test_required_combined_tree_skipped_or_failed_is_blocking() -> None:
+def test_required_combined_tree_generic_skipped_is_blocking() -> None:
     profile = qe.resolve_risk_profile("medium")
     verdict = qe.fold_quality_verdict(
         [_check()],
@@ -246,6 +252,25 @@ def test_required_combined_tree_skipped_or_failed_is_blocking() -> None:
 
     assert verdict["passed"] is False
     assert verdict["blocking_evidence"] == ["combined_tree:union"]
+
+
+def test_required_combined_tree_changed_paths_not_applicable_is_nonblocking() -> None:
+    profile = qe.resolve_risk_profile("medium")
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        risk_profile=profile,
+        reviewer_reports=[_report(qe.LENS_CORRECTNESS)],
+        combined_tree_checks=[
+            _check(
+                "union",
+                status=qe.STATUS_SKIPPED,
+                summary="changed_paths_not_applicable",
+            )
+        ],
+    )
+
+    assert verdict["passed"] is True
+    assert verdict["blocking_evidence"] == []
 
 
 def test_completion_gate_exposes_same_pure_verdict_without_breaking_low_risk(tmp_path) -> None:

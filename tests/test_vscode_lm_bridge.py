@@ -643,3 +643,50 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
         "idempotency_key": "session:bridge:0001",
         "provenance": "bridge test",
     }
+
+
+def _progress_payload(*, sequence: int = 1) -> dict[str, object]:
+    return {
+        "schema_id": vscode_lm_bridge.PROGRESS_RECEIPT_SCHEMA_ID,
+        "request_id": "a" * 32,
+        "repo_id": "repo_test",
+        "sequence": sequence,
+        "phase": "tool_turn",
+        "updated_at": "2026-08-06T08:00:00+00:00",
+    }
+
+
+def test_progress_receipt_missing_is_backward_compatible_no_progress(tmp_path: Path) -> None:
+    assert vscode_lm_bridge.read_progress_receipt(
+        tmp_path / "missing.json", "a" * 32, "repo_test",
+    ) == {}
+
+
+def test_progress_receipt_is_owner_private_identity_bound_and_monotonic(tmp_path: Path) -> None:
+    progress = tmp_path / "progress.json"
+    vscode_lm_bridge._atomic_json(progress, _progress_payload(sequence=2))
+    receipt = vscode_lm_bridge.read_progress_receipt(
+        progress,
+        "a" * 32,
+        "repo_test",
+        owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+        previous_sequence=1,
+    )
+    assert receipt["sequence"] == 2
+    with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_non_monotonic"):
+        vscode_lm_bridge.read_progress_receipt(
+            progress, "a" * 32, "repo_test", previous_sequence=2,
+        )
+
+
+def test_progress_receipt_present_unsafe_sidecars_fail_closed(tmp_path: Path) -> None:
+    progress = tmp_path / "progress.json"
+    vscode_lm_bridge._atomic_json(progress, _progress_payload())
+    if os.name != "nt":
+        os.chmod(progress, 0o644)
+        with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_insecure_mode"):
+            vscode_lm_bridge.read_progress_receipt(progress, "a" * 32, "repo_test")
+    progress.unlink()
+    progress.symlink_to(tmp_path / "absent-target.json")
+    with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_symlink"):
+        vscode_lm_bridge.read_progress_receipt(progress, "a" * 32, "repo_test")

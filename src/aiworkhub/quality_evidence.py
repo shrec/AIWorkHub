@@ -360,6 +360,7 @@ def _check_payload(check: EvidenceCheck | Mapping[str, Any]) -> dict[str, Any]:
         "check_id": check_id,
         "kind": kind,
         "status": status,
+        "summary": str(check.get("summary") or "")[:MAX_SUMMARY_CHARS],
         "provenance": str(check.get("provenance") or "")[:MAX_SUMMARY_CHARS],
     }
 
@@ -542,12 +543,16 @@ def fold_quality_verdict(
     if profile.get("combined_tree_required"):
         if not combined_rows:
             blockers.append("combined_tree_evidence_missing")
-        elif any(row["status"] != STATUS_PASSED for row in combined_rows):
-            blockers.extend(
-                f"combined_tree:{row['check_id']}"
-                for row in combined_rows
-                if row["status"] != STATUS_PASSED
-            )
+        else:
+            for row in combined_rows:
+                if row["status"] == STATUS_PASSED:
+                    continue
+                if (
+                    row["status"] == STATUS_SKIPPED
+                    and row.get("summary") == "changed_paths_not_applicable"
+                ):
+                    continue
+                blockers.append(f"combined_tree:{row['check_id']}")
 
     if profile.get("explicit_human_approval_required") and not human_approval:
         blockers.append("explicit_human_approval_missing")

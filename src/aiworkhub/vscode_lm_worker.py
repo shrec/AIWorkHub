@@ -18,6 +18,7 @@ from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID_V1,
     EDIT_RESPONSE_SCHEMA_ID_V2,
     RESPONSE_SCHEMA_ID,
+    read_progress_receipt,
 )
 
 
@@ -363,6 +364,8 @@ def run(spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("bridge_worker_spec_schema_mismatch")
     workspace = Path(str(spec.get("workspace_path") or "")).resolve(strict=True)
     response_path = Path(str(spec.get("response_path") or ""))
+    progress_path_raw = str(spec.get("progress_path") or "")
+    progress_path = Path(progress_path_raw) if progress_path_raw else None
     timeout_seconds = max(30, min(int(spec.get("timeout_seconds") or 7200), 86_400))
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -377,6 +380,13 @@ def run(spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("vscode_lm_response_schema_mismatch")
     if response.get("request_id") != spec.get("request_id"):
         raise RuntimeError("vscode_lm_response_identity_mismatch")
+    if progress_path is not None:
+        read_progress_receipt(
+            progress_path,
+            str(spec.get("request_id") or ""),
+            str(spec.get("repo_id") or ""),
+            owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+        )
     if response.get("error"):
         diagnostics = response.get("diagnostics")
         detail = ""

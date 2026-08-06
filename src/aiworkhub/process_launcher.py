@@ -3163,6 +3163,7 @@ class ProcessManager:
                 acceptance=card.get("acceptance") or [],
                 required_outputs=card.get("required_outputs") or [],
                 validation=card.get("validation") or [],
+                terminal_validation=evidence.get("validation") or [],
                 mechanical_checks=initial_gate.get("checks") or [],
             )
         except (

@@ -57,6 +57,7 @@ def build_review_packet(
     acceptance: Iterable[object] = (),
     required_outputs: Iterable[object] = (),
     validation: Iterable[object] = (),
+    terminal_validation: Iterable[object] = (),
     mechanical_checks: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -110,6 +111,36 @@ def build_review_packet(
             )
         return result
 
+    def terminal_validations(values: Iterable[object]) -> list[dict[str, Any]]:
+        rows = list(values)
+        if len(rows) > MAX_PACKET_COMMANDS:
+            raise ReviewerEvidenceError("review_packet_overflow")
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ReviewerEvidenceError("invalid_terminal_validation")
+            executed = row.get("executed_argv") or row.get("argv") or []
+            if not isinstance(executed, (list, tuple)):
+                raise ReviewerEvidenceError("invalid_terminal_validation")
+            returncode = row.get("returncode")
+            if not isinstance(returncode, int) or isinstance(returncode, bool):
+                raise ReviewerEvidenceError("invalid_terminal_validation")
+            result.append(
+                {
+                    "declared_command": str(
+                        row.get("declared_command") or row.get("command") or ""
+                    )[:MAX_TEXT_CHARS],
+                    "executed_argv": [
+                        str(item)[:MAX_TEXT_CHARS]
+                        for item in list(executed)[:MAX_PACKET_COMMANDS]
+                    ],
+                    "returncode": returncode,
+                    "stdout_truncated": bool(row.get("stdout_truncated")),
+                    "stderr_truncated": bool(row.get("stderr_truncated")),
+                }
+            )
+        return result
+
     body = {
         "schema_id": PACKET_SCHEMA_ID,
         "target": {
@@ -124,6 +155,7 @@ def build_review_packet(
             "required_outputs": _bounded_strings(required_outputs, limit=MAX_PACKET_COMMANDS),
             "validation": _bounded_strings(validation, limit=MAX_PACKET_COMMANDS),
         },
+        "terminal_validation": terminal_validations(terminal_validation),
         "candidate": {"changed_paths": path_rows},
         "mechanical_checks": checks(mechanical_checks),
         "combined_tree_checks": checks(combined_tree_checks),

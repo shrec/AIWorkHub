@@ -714,6 +714,33 @@ async function main() {
   await malformedCatalogChecks();
   await permissionPersistenceChecks();
   await boundedParallelBridgeChecks();
+  await progressReceiptChecks();
+}
+
+async function progressReceiptChecks() {
+  assert.strictEqual(
+    internals.constants.VSCODE_LM_PROGRESS_SCHEMA,
+    "aiworkhub.vscode_lm.progress_receipt.v1",
+  );
+  assert.deepStrictEqual(internals.constants.VSCODE_LM_PROGRESS_PHASES, [
+    "request_accepted", "provider_response", "tool_turn", "final_edit", "terminal_error",
+  ]);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-progress-"));
+  try {
+    const target = path.join(root, ".aiworkhub_vscode_lm_progress.json");
+    internals.atomicWriteOwnerJson(target, {
+      schema_id: internals.constants.VSCODE_LM_PROGRESS_SCHEMA,
+      request_id: "a".repeat(32),
+      repo_id: "repo_test",
+      sequence: 1,
+      phase: "request_accepted",
+      updated_at: new Date().toISOString(),
+    });
+    assert.strictEqual(JSON.parse(fs.readFileSync(target, "utf8")).sequence, 1);
+    assert.strictEqual(internals.ownerOnlyRegularFile(target), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 main().then(() => {
