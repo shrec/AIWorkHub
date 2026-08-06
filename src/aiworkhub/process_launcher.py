@@ -3564,6 +3564,11 @@ class ProcessManager:
                         timeout_seconds=timeout_seconds,
                         source_graph_request=vscode_source_graph_request,
                         source_graph_result=vscode_source_graph_result,
+                        request_kind=(
+                            "quality_review"
+                            if quality_review_binding is not None
+                            else "worker"
+                        ),
                     )
                     plan = runtime_adapters.RuntimeAdapterPlan(
                         adapter_id=adapter_id,

@@ -143,6 +143,36 @@ async function textProtocolChecks() {
   assert.strictEqual(calls[0].name, "aiworkhub_manager_source_graph_query");
   assert.ok(options.every((entry) => !Object.prototype.hasOwnProperty.call(entry, "tools")));
 
+  const reviewSubmit = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_manager_quality_review_submit",
+    input: { packet_sha256: "a".repeat(64), lens: "correctness", findings: [] },
+  });
+  const readonlyFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "review submitted",
+    edits: [],
+    creates: [],
+  });
+  const reviewQueued = [reviewSubmit, readonlyFinal];
+  const reviewCalls = [];
+  const reviewModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: reviewQueued.shift() }; }()),
+    }),
+  };
+  const reviewResult = await internals.runVscodeLmTextProtocol(
+    reviewModel,
+    { prompt: "bounded review", request_kind: "quality_review", allowedWrites: [] },
+    undefined,
+    async (call) => { reviewCalls.push(call); return { ok: true }; },
+  );
+  assert.strictEqual(reviewResult, readonlyFinal);
+  assert.deepStrictEqual(reviewCalls.map((call) => call.name), [
+    "aiworkhub_manager_quality_review_submit",
+  ]);
+
   const premature = {
     capabilities: { toolCalling: false },
     sendRequest: async () => ({ stream: (async function* stream() { yield { value: finalResponse }; }()) }),
@@ -583,6 +613,50 @@ async function nativeProtocolChecks() {
   assert.ok(String(nativePrefetchMessages[0][0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
   assert.strictEqual(nativePrefetchOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
 
+  let reviewTurn = 0;
+  const readOnlyNativeFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "review submitted",
+    edits: [],
+    creates: [],
+  });
+  const nativeReviewCalls = [];
+  const nativeReviewOptions = [];
+  const nativeReviewModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeReviewOptions.push(options);
+      reviewTurn += 1;
+      if (reviewTurn === 1) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "review-submit-1",
+              name: "aiworkhub_manager_quality_review_submit",
+              input: { packet_sha256: "a".repeat(64), lens: "security", findings: [] },
+            };
+          }()),
+        };
+      }
+      return { stream: (async function* stream() { yield { value: readOnlyNativeFinal }; }()) };
+    },
+  };
+  const nativeReview = await internals.runVscodeLmAgent(
+    nativeReviewModel,
+    {
+      requestId: "8".repeat(32),
+      request_kind: "quality_review",
+      prompt: "bounded review",
+      allowedWrites: [],
+      path_contracts: {},
+    },
+    undefined,
+    async (call) => { nativeReviewCalls.push(call); return { ok: true }; },
+  );
+  assert.strictEqual(nativeReview, readOnlyNativeFinal);
+  assert.strictEqual(nativeReviewCalls[0].name, "aiworkhub_manager_quality_review_submit");
+  assert.strictEqual(nativeReviewOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
+
   let boundedTurns = 0;
   const boundedOptions = [];
   const loopingModel = {
@@ -669,6 +743,17 @@ try {
     deadline: new Date(Date.now() + 60000).toISOString(),
   }, repoInfo);
   assert.strictEqual(validated.requestId, requestId);
+  assert.strictEqual(validated.request_kind, "worker");
+  assert.strictEqual(
+    internals.validateVscodeLmRequest(
+      { ...validated, request_kind: "quality_review" }, repoInfo,
+    ).request_kind,
+    "quality_review",
+  );
+  assert.throws(
+    () => internals.validateVscodeLmRequest({ ...validated, request_kind: "other" }, repoInfo),
+    /request_kind_invalid/,
+  );
   assert.strictEqual(internals.validateVscodeLmRequest({ ...validated, model: "deepseek-v4-pro" }, repoInfo).model, "deepseek-v4-pro");
   assert.throws(() => internals.validateVscodeLmRequest({ ...validated, repo_id: `repo_${"b".repeat(32)}` }, repoInfo), /repo_id_mismatch/);
   assert.throws(() => internals.validateVscodeLmRequest({ ...validated, response_path: path.join(repo, "escape.json") }, repoInfo), /response_path_invalid/);

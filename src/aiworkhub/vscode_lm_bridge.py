@@ -301,6 +301,7 @@ def create_request(
     workspace_parent_baseline: dict[str, str | None] | None = None,
     source_graph_request: dict[str, Any] | None = None,
     source_graph_result: dict[str, Any] | None = None,
+    request_kind: str = "worker",
 ) -> BridgeRequest:
     """Publish one repo-scoped request and private worker-side contract."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
@@ -309,6 +310,8 @@ def create_request(
         raise BridgeError("bridge_prompt_missing")
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise BridgeError("bridge_prompt_too_large")
+    if request_kind not in {"worker", "quality_review"}:
+        raise BridgeError("bridge_request_kind_invalid")
     repo = repo.resolve()
     workspace_path = workspace_path.resolve()
     workspace_home = workspace_home.resolve()
@@ -412,6 +415,7 @@ def create_request(
         "path_contracts": path_contracts,
         "initial_source_graph_request": initial_source_graph_request,
         "initial_source_graph_result": initial_source_graph_result,
+        "request_kind": request_kind,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "deadline": deadline.isoformat(),
         "response_contract": {

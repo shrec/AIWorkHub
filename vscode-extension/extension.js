@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.3";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.4";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2384,6 +2384,10 @@ function validateVscodeLmRequest(payload, repoInfo) {
     throw new Error("vscode_lm_model_mismatch");
   }
   if (typeof payload.prompt !== "string" || !payload.prompt.trim()) throw new Error("vscode_lm_prompt_missing");
+  const requestKind = String(payload.request_kind || "worker");
+  if (!["worker", "quality_review"].includes(requestKind)) {
+    throw new Error("vscode_lm_request_kind_invalid");
+  }
   const workspacePath = path.resolve(String(payload.workspace_path || ""));
   const workspaceHome = path.resolve(String(payload.workspace_home || ""));
   const responsePath = path.resolve(String(payload.response_path || ""));
@@ -2430,7 +2434,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
   }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
-  return { ...payload, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, progressPath, allowedWrites };
+  return { ...payload, request_kind: requestKind, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, progressPath, allowedWrites };
 }
 
 const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
@@ -2918,7 +2922,7 @@ async function runVscodeLmTextProtocol(
   onToolTurn = null,
   onProviderPart = null,
 ) {
-  let sourceGraphAcknowledged = false;
+  let sourceGraphAcknowledged = request.request_kind === "quality_review";
   let initialSourceGraphResult = null;
   if (request.initial_source_graph_request) {
     initialSourceGraphResult = request.initial_source_graph_result || null;
@@ -3110,7 +3114,7 @@ async function runVscodeLmAgent(
       ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
       : ""),
   )];
-  let sourceGraphAcknowledged = Boolean(initialSourceGraphResult);
+  let sourceGraphAcknowledged = request.request_kind === "quality_review" || Boolean(initialSourceGraphResult);
   let toolTurns = 0;
   let postSourceTurns = 0;
   let finalizationTurns = 0;

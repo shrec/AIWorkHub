@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-08-06
+
+### Fixed
+
+- VS Code LM bridge requests now carry an explicit `quality_review` kind, so
+  packet-bound reviewers may submit their authenticated findings immediately
+  without an unrelated mandatory Source Graph pre-turn.
+- Both native tool-calling and text-envelope model protocols preserve the
+  ordinary worker Source Graph gate while allowing the reviewer-only submit
+  tool from the first turn.
+
 ## [0.9.3] - 2026-08-06
 
 ### Fixed

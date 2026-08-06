@@ -175,6 +175,7 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
         source_graph_request={"mode": "focus", "query": "bounded output", "budget": 32},
     )
     published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert published["request_kind"] == "worker"
     assert published["initial_source_graph_request"] == {
         "mode": "focus",
         "query": "bounded output",
@@ -210,6 +211,46 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
     assert (workspace / "out" / "result.txt").read_text(encoding="utf-8") == "ok\n"
     if os.name != "nt":
         assert (workspace / "out" / "result.txt").stat().st_mode & 0o077 == 0
+
+
+def test_quality_review_request_kind_is_explicit_and_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(tmp_path / "bridge"))
+    repo = _repo(tmp_path)
+    request_id = "f" * 32
+    request_root = tmp_path / request_id
+    workspace = request_root / "worktree"
+    home = request_root / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Review the bound packet.",
+        model="claude-sonnet-5",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+    )
+    published = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert published["request_kind"] == "quality_review"
+
+    with pytest.raises(vscode_lm_bridge.BridgeError, match="request_kind_invalid"):
+        vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id="e" * 32,
+            workspace_path=tmp_path / ("e" * 32) / "worktree",
+            workspace_home=tmp_path / ("e" * 32) / "home",
+            prompt="bad kind",
+            model="claude-sonnet-5",
+            allowed_writes=[],
+            timeout_seconds=30,
+            request_kind="other",
+        )
 
 
 def test_request_carries_verified_initial_source_graph_result(
