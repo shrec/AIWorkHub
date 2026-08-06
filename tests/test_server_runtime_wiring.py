@@ -147,6 +147,45 @@ def test_server_lifecycle_tools_preserve_public_schema(monkeypatch):
     ]
 
 
+def test_server_reject_review_passes_predecessor_request_id(monkeypatch):
+    """The server MCP tool forwards predecessor_request_id to core.reject_review
+    when provided, and omits it when None (safe default)."""
+    calls = []
+
+    def record(name):
+        def invoke(**kwargs):
+            calls.append((name, kwargs))
+            return {"ok": True, **kwargs}
+
+        return invoke
+
+    monkeypatch.setattr(core, "mark_review", record("review"))
+    monkeypatch.setattr(core, "mark_done", record("done"))
+    monkeypatch.setattr(core, "reject_review", record("reject"))
+
+    # With explicit predecessor
+    server.aiworkhub_task_reject_review(
+        "T_EXPL", "repair", to="pending", predecessor_request_id="req-A"
+    )
+    # Without predecessor (None, the default)
+    server.aiworkhub_task_reject_review("T_DEF", "repair")
+
+    assert ("reject", {
+        "task_id": "T_EXPL",
+        "reason": "repair",
+        "to": "pending",
+        "predecessor_request_id": "req-A",
+    }) in calls
+    assert ("reject", {
+        "task_id": "T_DEF",
+        "reason": "repair",
+        "to": "pending",
+    }) in calls
+    # None must not leak as a kwarg
+    for _, kwargs in calls:
+        if kwargs.get("task_id") == "T_DEF":
+            assert "predecessor_request_id" not in kwargs
+
 def test_real_core_lifecycle_calls_scope_identity_and_capability(monkeypatch, tmp_path):
     """B857: rebased to the canonical in-process engine (task_store) --
     these lifecycle calls resolve directly against the repo-local

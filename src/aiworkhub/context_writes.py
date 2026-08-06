@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import context_graph, feature_settings, storage_registry, transcript_store
+from .repository_state import RepositoryStateError
 
 
 SessionAction = Literal["start", "event", "checkpoint", "state", "handoff", "close"]
@@ -80,6 +81,43 @@ def _open(repo: Path, db_id: str) -> sqlite3.Connection:
     return con
 
 
+def _ensure_memories_fts(con: sqlite3.Connection) -> dict[str, Any]:
+    """Atomic repair: acquire BEGIN IMMEDIATE, re-check, backfill rowid=id.
+
+    Single source of truth for ``memories_fts`` DDL and backfill used by both
+    the write-path schema normalizer and the public search-path repair entry
+    point.  Returns a bounded outcome dict; callers decide interpretation.
+    """
+    try:
+        con.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        return {"ok": False, "error": "fts_lock_blocked", "detail": str(exc)[:120]}
+    try:
+        if con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+        ).fetchone() is not None:
+            con.rollback()
+            return {"ok": True, "created": False, "reason": "fts_already_exists"}
+        if con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
+        ).fetchone() is None:
+            con.rollback()
+            return {"ok": True, "created": False, "reason": "memories_table_absent"}
+        con.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope)")
+        con.execute(
+            "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
+            "SELECT id,key,value,tags,scope FROM memories"
+        )
+        con.commit()
+        return {"ok": True, "created": True, "reason": "fts_created"}
+    except sqlite3.Error as exc:
+        try:
+            con.rollback()
+        except sqlite3.OperationalError:
+            pass
+        return {"ok": False, "error": "fts_migration_failed", "detail": str(exc)[:160], "sqlite_errorname": str(getattr(exc, "sqlite_errorname", "UNKNOWN"))}
+
+
 def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     """Repair known legacy ``memories`` schema shapes without losing rows.
 
@@ -87,9 +125,8 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
     key.  Early databases declared ``key UNIQUE``; after an archived row was
     imported, ``remember`` therefore raised an opaque IntegrityError.  Rebuild
     only when an exact unique-key index is observed, preserve ids, and rebuild
-    the contentless FTS mirror deterministically.  Legacy databases that have
-    ``memories`` but no ``memories_fts`` are backfilled in place.  Both paths
-    are idempotent.
+    the contentless FTS mirror deterministically via the shared
+    ``_ensure_memories_fts`` primitive.  Both paths are idempotent.
     """
     if con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
@@ -116,22 +153,46 @@ def _normalize_memory_schema(con: sqlite3.Connection) -> None:
             "INSERT INTO memories(id,key,value,tags,scope) "
             "SELECT id,key,value,tags,scope FROM memories_legacy_unique;"
             "DROP TABLE memories_legacy_unique;"
-            "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
-            "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
-            "SELECT id,key,value,tags,scope FROM memories;"
         )
         con.commit()
-        return
-    if con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_fts'"
-    ).fetchone() is not None:
-        return
-    con.executescript(
-        "CREATE VIRTUAL TABLE memories_fts USING fts5(key,value,tags,scope);"
-        "INSERT INTO memories_fts(rowid,key,value,tags,scope) "
-        "SELECT id,key,value,tags,scope FROM memories;"
-    )
-    con.commit()
+    result = _ensure_memories_fts(con)
+    if not result.get("ok"):
+        raise ContextWriteError(f"fts_normalization_failed:{result.get('error', 'unknown')}")
+
+
+def ensure_memories_fts(repo: Path) -> dict[str, Any]:
+    """Public entry point for search-path FTS repair on the canonical memory DB.
+
+    Opens a fresh writable connection, acquires BEGIN IMMEDIATE, checks
+    whether ``memories_fts`` already exists, creates and backfills if absent,
+    and returns a bounded outcome dict.  Callers on the read-only search path
+    invoke this once before their MATCH query; exact get/related never call
+    it.
+    """
+    try:
+        registry = storage_registry.load_storage_registry(repo)
+        path = storage_registry.resolve_database_path(registry, "memory")
+    except (storage_registry.StorageRegistryError, RepositoryStateError, OSError) as exc:
+        return {"ok": False, "error": "fts_registry_unavailable", "detail": str(exc)[:160]}
+    if not path.is_file() or path.stat().st_size <= 0:
+        return {"ok": False, "error": "fts_db_absent_or_empty"}
+    con: sqlite3.Connection | None = None
+    try:
+        con = sqlite3.connect(str(path), timeout=5)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA busy_timeout=5000")
+        return _ensure_memories_fts(con)
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": "fts_migration_failed", "detail": str(exc)[:160], "sqlite_errorname": str(getattr(exc, "sqlite_errorname", "UNKNOWN"))}
+    except OSError as exc:
+        return {"ok": False, "error": "fts_io_failed", "detail": str(exc)[:160]}
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def _begin(con: sqlite3.Connection, *, idempotency_key: str) -> sqlite3.Row | None:
@@ -359,4 +420,4 @@ def kb_write(
         con.close()
 
 
-__all__ = ["ContextWriteError", "KbAction", "MemoryAction", "SessionAction", "kb_write", "memory_write", "session_write"]
+__all__ = ["ContextWriteError", "KbAction", "MemoryAction", "SessionAction", "ensure_memories_fts", "kb_write", "memory_write", "session_write"]

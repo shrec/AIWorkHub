@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-08-06
+
+### Fixed
+
+- Coordinator review rejection can explicitly select and durably pin an exact
+  same-repository, same-task retained predecessor after verifying workspace
+  containment and current changed-path hashes.
+- Omitting predecessor selection now defaults to the current reviewed request,
+  while empty, foreign, missing, garbage-collected and hash-mismatched
+  selections fail closed before state change or workspace cleanup.
+- Rework materialization no longer silently falls back to an older candidate
+  when a newer independently verified request ended with an unrelated
+  infrastructure validation failure.
+
+## [0.9.5] - 2026-08-06
+
+### Added
+
+- A strict SARIF 2.1.0 contract foundation normalizes deterministic findings
+  without weakening evidence or path authority.
+- Repository assessments are preserved as durable roadmap inputs instead of
+  remaining transient chat context.
+
+### Fixed
+
+- Bare `mypy` validation commands now resolve to the trusted canonical
+  repository virtual-environment executable while preserving distinct
+  declared and executed argv receipts and fail-closed root/symlink checks.
+- AI Memory FTS access now repairs legacy public-path schema state safely.
+- Source Graph recovery now survives interrupted generations without making
+  manager operations wait on a blocking rebuild.
+
 ## [0.9.4] - 2026-08-06
 
 ### Fixed

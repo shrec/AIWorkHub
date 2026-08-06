@@ -17,6 +17,42 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
+## Assessment intake and assurance roadmap (2026-08-06)
+
+Eight owner-supplied product and architecture reviews are preserved under
+[`docs/reviews/`](reviews/README.md). They are decision inputs, not shipped
+claims. The following checklist is the canonical follow-through so no review is
+lost:
+
+- [x] Preserve each review as a separately attributable repository document.
+- [x] Add the deterministic SARIF contract foundation and focused tests.
+- [ ] Complete and promote the common evidence-level contract.
+- [ ] Complete the durable attempt-artifact manifest and later wire it into
+  worker/reviewer finalization.
+- [ ] Finish same-path semantic-edit transactions and byte-fidelity regression
+  coverage; then run an uncapped, matched whole-file-versus-semantic A/B.
+- [ ] Add meaningful-output and task-type behavioral anti-collapse gates.
+- [ ] Build graph-scoped reviewer packets with risk-selected lenses and
+  evidence-bearing normalized findings.
+- [ ] Implement the manager-gated Learning Commit Protocol across Session,
+  Context Graph, AI Memory, KB, and accepted task outcomes.
+- [ ] Add assurance-as-code checks for claim-to-evidence, public tool surfaces,
+  policy projections, Source Graph freshness/retrieval goldens, and dormant
+  quality capabilities.
+- [ ] Normalize validation failure classes and measure diagnostic delta-rework
+  against blind retry before enabling automation.
+- [ ] Produce a replayable release evidence pack, residual-risk register, and
+  adapter/route parity matrix.
+- [ ] Publish an UltrafastSecp256k1 case study only after every public adoption,
+  benchmark, and assurance claim is pinned to a current public source.
+- [ ] Close route-local circuit isolation, atomic callback/terminal persistence,
+  and measured cost-per-accepted-outcome advisory routing.
+
+Evidence policy: ratings and estimated percentages in review records are expert
+judgment. Structural byte ratios are not provider-token savings; projected
+quality, speed, or cost gains remain hypotheses until a checked benchmark
+artifact establishes them.
+
 ## Current baseline (0.8.35)
 
 ### Shipped foundations
@@ -381,6 +417,14 @@ unknown-tool guidance and stable deterministic root-cause fingerprints for
 static findings. Agent graph, durable state, notes/todos, SARIF, usage ledgers,
 sandboxing and progressive context already map to existing canonical AIWorkHub
 authorities, so no parallel lifecycle or storage layer was added.
+
+**Open P1 — task-progress truth:** provider stream activity and meaningful task
+progress must be separate leases. Raw `provider_response` events prove only
+transport liveness; they must not indefinitely postpone stalled-worker
+reconciliation. A progress renewal requires a bounded semantic milestone,
+tool/edit receipt, target-hash change, validation transition, or submitted
+evidence. Regression coverage must preserve long-running provider liveness
+while truthfully surfacing no-op execution and retaining its diagnostics.
 
 - Add one pure deterministic verdict fold over six falsifiable lenses:
   correctness, does-it-run, test adequacy, security, code quality and

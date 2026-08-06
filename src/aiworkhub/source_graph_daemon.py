@@ -38,6 +38,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,12 @@ STATUS_EMPTY = "empty"
 STATUS_STANDBY = "standby"
 STATUS_DEGRADED = "degraded"
 STATUS_STALE = "stale"
+STATUS_RECOVERY = "recovery"
+
+_RECOVERY_PHASE_DETECT = "journal_detect"
+_RECOVERY_PHASE_OPEN = "writable_open_recover"
+_RECOVERY_PHASE_INTEGRITY = "integrity_check"
+_RECOVERY_PHASE_COMMIT = "commit"
 
 
 def _build_once_payload(repo_root: Path | str, *, incremental: bool) -> dict[str, Any]:
@@ -138,6 +145,14 @@ class SourceGraphDaemon:
         )
         self._process_lock = threading.Lock()
         self._build_process: subprocess.Popen[str] | None = None
+        # Power-loss recovery: single-flight writable recovery before any
+        # readonly probe when a non-empty SQLite journal/WAL exists.
+        self._recovery_lock = threading.Lock()
+        self._recovery_phase: str = ""
+        self._recovery_elapsed: float = 0.0
+        self._recovery_error: str = ""
+        self._last_known_good_generation: dict[str, Any] = {}
+        self._recovery_started_at: float = 0.0
 
     def _terminate_build_process(self) -> None:
         with self._process_lock:
@@ -150,6 +165,252 @@ class SourceGraphDaemon:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=2.0)
+
+    def _has_pending_journal(self) -> bool:
+        """True when a non-empty SQLite journal or WAL sidecar exists for the
+        canonical Source Graph database, signalling an interrupted write that
+        must be recovered before any readonly probe.
+
+        ``journal_mode=DELETE`` leaves ``<db>.sqlite-journal`` when a
+        transaction was mid-flight at process exit.  A pre-existing WAL
+        file (``-wal``) may also survive a crash.  A standalone ``-shm``
+        shared-memory index is not a hot journal and does not trigger
+        recovery.
+        """
+        try:
+            db_path = source_graph.resolve_db_path(self.repo_root)
+        except (source_graph.SourceGraphError, OSError):
+            return False
+        for suffix in ("-journal", "-wal"):
+            candidate = Path(str(db_path) + suffix)
+            try:
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _recover_database(self) -> dict[str, Any]:
+        """Single-flight writable recovery of a potentially interrupted SQLite
+        database.  Only one caller per daemon acquires the recovery lock;
+        subsequent callers receive the coalesced result immediately.
+
+        Returns a JSON-safe dict with ``recovered``: bool | None, ``error``: str,
+        and ``phase``: str describing the terminal recovery stage.
+        """
+        if not self._recovery_lock.acquire(blocking=False):
+            # Another thread already owns recovery -- coalesce.
+            return {
+                "recovered": None,
+                "phase": self._recovery_phase,
+                "error": self._recovery_error,
+                "coalesced": True,
+            }
+        try:
+            self._recovery_started_at = time.monotonic()
+            with self._state_lock:
+                self._status = STATUS_RECOVERY
+                self._recovery_phase = _RECOVERY_PHASE_DETECT
+                self._recovery_elapsed = 0.0
+                self._recovery_error = ""
+                # Snapshot the last-known-good canonical generation *before*
+                # recovery mutates the database, so failed recovery can
+                # preserve and re-expose this identity.
+                if self._last_report:
+                    self._last_known_good_generation = {
+                        "build_revision": str(self._last_report.get("build_revision") or ""),
+                        "finished_at": str(self._last_report.get("finished_at") or ""),
+                        "files_seen": int(self._last_report.get("files_seen") or 0),
+                    }
+            try:
+                db_path = source_graph.resolve_db_path(self.repo_root)
+            except (source_graph.SourceGraphError, OSError) as exc:
+                with self._state_lock:
+                    self._recovery_error = f"resolve_path:{type(exc).__name__}:{exc}"[:300]
+                    self._recovery_phase = _RECOVERY_PHASE_DETECT
+                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                    self._recovery_started_at = 0.0
+                return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
+
+            if not db_path.exists():
+                # No canonical database present.  A non-empty journal/WAL
+                # sidecar surviving alongside a missing canonical DB means
+                # the generation was removed mid-write: that is an explicit
+                # degraded failure, NOT a clean "nothing to recover"
+                # success.  Preserve the last-known-good generation and
+                # freeze the elapsed diagnostic; never auto-delete or
+                # fabricate readiness.
+                if self._has_pending_journal():
+                    with self._state_lock:
+                        self._recovery_error = "missing_database_with_pending_journal"
+                        self._recovery_phase = _RECOVERY_PHASE_DETECT
+                        self._recovery_elapsed = (
+                            time.monotonic() - self._recovery_started_at
+                        )
+                        self._recovery_started_at = 0.0
+                        self._status = STATUS_DEGRADED
+                    return {
+                        "recovered": False,
+                        "phase": self._recovery_phase,
+                        "error": self._recovery_error,
+                    }
+                # No database yet and no pending journal -- genuinely
+                # nothing to recover; this is a normal first-run state.
+                with self._state_lock:
+                    self._recovery_phase = ""
+                    self._recovery_elapsed = (
+                        time.monotonic() - self._recovery_started_at
+                    )
+                    self._recovery_started_at = 0.0
+                    self._recovery_error = ""
+                    self._status = STATUS_STOPPED
+                return {"recovered": True, "phase": "", "error": ""}
+
+            # Phase: writable open -- SQLite auto-recovers the journal/WAL on
+            # first connect in read_write mode.  This is the canonical
+            # recovery step prescribed by SQLite's hot-journal protocol.
+            self._recovery_phase = _RECOVERY_PHASE_OPEN
+            self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+            try:
+                conn = source_graph.connect(db_path, read_only=False)
+            except source_graph.SourceGraphBuildInProgressError:
+                # Another process holds WAL -- we cannot force recovery here.
+                with self._state_lock:
+                    self._recovery_error = "wal_held_by_other_process"
+                    self._recovery_phase = _RECOVERY_PHASE_OPEN
+                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                    self._recovery_started_at = 0.0
+                return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
+            except (OSError, sqlite3.Error) as exc:
+                with self._state_lock:
+                    self._recovery_error = f"connect:{type(exc).__name__}:{exc}"[:300]
+                    self._recovery_phase = _RECOVERY_PHASE_OPEN
+                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                    self._recovery_started_at = 0.0
+                return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
+
+            try:
+                # Phase: integrity check on the recovered database.
+                self._recovery_phase = _RECOVERY_PHASE_INTEGRITY
+                self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                try:
+                    integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                    if integrity and str(integrity[0]).lower() != "ok":
+                        raise sqlite3.DatabaseError(f"integrity_check:{integrity[0]}"[:300])
+                except sqlite3.Error as exc:
+                    # Integrity failure -- do NOT delete the database.
+                    # Preserve the canonical index so a human or later retry
+                    # can salvage what remains.
+                    with self._state_lock:
+                        self._recovery_error = f"integrity:{type(exc).__name__}:{exc}"[:300]
+                        self._recovery_phase = _RECOVERY_PHASE_INTEGRITY
+                        self._status = STATUS_DEGRADED
+                        self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                        self._recovery_started_at = 0.0
+                    return {"recovered": False, "phase": self._recovery_phase, "error": self._recovery_error}
+
+                # Phase: commit recovery by ensuring journal_mode=DELETE and
+                # persisting any recovered state.
+                self._recovery_phase = _RECOVERY_PHASE_COMMIT
+                self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                conn.commit()
+
+                # Re-read last_build from the recovered database to refresh
+                # the daemon's in-memory state so the health surface stays
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM meta WHERE key='last_build'"
+                    ).fetchone()
+                    if row is None:
+                        # A recovered canonical database must carry a
+                        # generation identity.  An absent row is not an
+                        # acceptable recovered state; fail bounded at commit,
+                        # preserve LKG, and never auto-delete.
+                        raise KeyError("last_build")
+                    payload = json.loads(str(row["value"]))
+                    if not isinstance(payload, dict):
+                        raise TypeError("last_build payload is not a JSON object")
+                    build_revision_raw = payload.get("build_revision")
+                    finished_at_raw = payload.get("finished_at")
+                    files_seen_raw = payload.get("files_seen")
+                    if (
+                        not isinstance(build_revision_raw, str)
+                        or not build_revision_raw
+                        or not isinstance(finished_at_raw, str)
+                        or not finished_at_raw
+                    ):
+                        raise ValueError("missing or empty generation metadata")
+                    if (
+                        not isinstance(files_seen_raw, int)
+                        or isinstance(files_seen_raw, bool)
+                        or files_seen_raw < 0
+                    ):
+                        raise ValueError("files_seen must be a nonnegative integer")
+                    build_revision = build_revision_raw
+                    finished_at = finished_at_raw
+                    files_seen = files_seen_raw
+                    with self._state_lock:
+                        if not self._last_report:
+                            self._last_report = {}
+                        self._last_report["build_revision"] = build_revision
+                        self._last_report["finished_at"] = finished_at
+                        self._last_report["files_seen"] = files_seen
+                        self._last_success_at = finished_at
+                except (
+                    json.JSONDecodeError,
+                    TypeError,
+                    KeyError,
+                    ValueError,
+                    AttributeError,
+                ) as exc:
+                    # Missing or malformed generation metadata is an explicit
+                    # bounded degraded failure at commit phase.  Preserve LKG
+                    # and frozen elapsed; never auto-delete the canonical DB.
+                    with self._state_lock:
+                        self._recovery_error = (
+                            f"generation_meta:{type(exc).__name__}:{exc}"[:300]
+                        )
+                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
+                        self._status = STATUS_DEGRADED
+                        self._recovery_elapsed = (
+                            time.monotonic() - self._recovery_started_at
+                        )
+                        self._recovery_started_at = 0.0
+                    return {
+                        "recovered": False,
+                        "phase": self._recovery_phase,
+                        "error": self._recovery_error,
+                    }
+                except sqlite3.Error as exc:
+                    # Meta query error after recovery; preserve LKG, flag
+                    # degraded, freeze elapsed, and return the diagnostic.
+                    with self._state_lock:
+                        self._recovery_error = (
+                            f"meta_query:{type(exc).__name__}:{exc}"[:300]
+                        )
+                        self._recovery_phase = _RECOVERY_PHASE_COMMIT
+                        self._status = STATUS_DEGRADED
+                        self._recovery_elapsed = (
+                            time.monotonic() - self._recovery_started_at
+                        )
+                        self._recovery_started_at = 0.0
+                    return {
+                        "recovered": False,
+                        "phase": self._recovery_phase,
+                        "error": self._recovery_error,
+                    }
+
+                with self._state_lock:
+                    self._recovery_phase = ""
+                    self._recovery_elapsed = time.monotonic() - self._recovery_started_at
+                    self._recovery_started_at = 0.0
+                    self._recovery_error = ""
+                    self._status = STATUS_STOPPED
+                return {"recovered": True, "phase": _RECOVERY_PHASE_COMMIT, "error": ""}
+            finally:
+                conn.close()
+        finally:
+            self._recovery_lock.release()
 
     def _run_build_subprocess(self, *, incremental: bool) -> dict[str, Any]:
         command = [
@@ -361,12 +622,42 @@ class SourceGraphDaemon:
             self._build_lock.release()
 
     def _loop(self) -> None:
-        self._run_one_build()
+        # Power-loss recovery: writable single-flight recovery must precede
+        # any readonly probe when a non-empty journal/WAL exists.
+        if self._has_pending_journal():
+            result = self._recover_database()
+            if not result.get("recovered"):
+                # Recovery failed or is still in-progress under another
+                # owner.  Retain degraded diagnostics and last-known-good
+                # generation; retry recovery on the next cycle before any
+                # readonly probe.
+                if result.get("recovered") is not None:
+                    # Explicit failure (not coalesced): ensure degraded.
+                    with self._state_lock:
+                        if self._status == STATUS_RECOVERY:
+                            self._status = STATUS_DEGRADED
+                        if not self._recovery_error:
+                            self._recovery_error = (
+                                result.get("error") or "recovery_failed"
+                            )[:300]
+                    # Signal lifecycle completion so callers do not block
+                    # indefinitely.  Health remains degraded and build_count
+                    # stays at zero; callers MUST inspect health after the wait.
+                    self._build_completed.set()
+            else:
+                self._run_one_build()
+        else:
+            self._run_one_build()
         while not self._stop_event.is_set():
             self._refresh_event.wait(self.refresh_interval_seconds)
             self._refresh_event.clear()
             if self._stop_event.is_set():
                 break
+            # Retry recovery before any probe when journal/WAL persists.
+            if self._has_pending_journal():
+                result = self._recover_database()
+                if not result.get("recovered"):
+                    continue
             self._run_one_build()
 
     def start(self) -> None:
@@ -471,14 +762,29 @@ class SourceGraphDaemon:
                     index_age_seconds = None
             stale = bool(
                 running
-                and status not in {STATUS_STOPPED, STATUS_DEGRADED}
+                and status not in {STATUS_STOPPED, STATUS_DEGRADED, STATUS_RECOVERY}
                 and index_age_seconds is not None
                 and index_age_seconds > self.stale_after_seconds
             )
             reported_status = STATUS_STALE if stale else status
             last_report = self._last_report or {}
+            # Recovery surface: always expose phase, elapsed_seconds, and
+            # error so callers receive a stable schema in every state
+            # (stopped, healthy, recovery, degraded).  Terminal phase/elapsed
+            # and actionable error are retained on failure instead of being
+            # dropped when status transitions away from RECOVERY.
+            recovery_info: dict[str, Any] = {
+                "error": self._recovery_error,
+                "phase": self._recovery_phase,
+                "elapsed_seconds": (
+                    round(time.monotonic() - self._recovery_started_at, 3)
+                    if self._recovery_started_at > 0
+                    else round(self._recovery_elapsed, 3)
+                ),
+            }
+            lkg = dict(self._last_known_good_generation) if self._last_known_good_generation else {}
             return {
-                "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE},
+                "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY},
                 "status": reported_status,
                 "running": running,
                 "repo_root": str(self.repo_root),
@@ -496,6 +802,8 @@ class SourceGraphDaemon:
                 "writer_state": "standby" if status == STATUS_STANDBY else "active",
                 "language_capabilities": dict(source_graph.LANGUAGE_CAPABILITIES),
                 "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
+                "recovery": recovery_info,
+                "last_known_good_generation": lkg,
             }
 
 
@@ -589,8 +897,18 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "recommendation_resolvability": None,
             "guidance_degraded": False,
             "registered": False,
+            "recovery": {"error": "", "phase": "", "elapsed_seconds": 0.0},
+            "last_known_good_generation": {},
         }
     out = daemon.health()
+    # Writable single-flight recovery MUST precede every readonly probe
+    # when the daemon is actively recovering or a non-empty journal/WAL
+    # sidecar still exists.  During recovery, return the bounded process
+    # diagnostics (phase/elapsed/error/LKG) without opening any readonly
+    # database connection.
+    if out.get("status") == STATUS_RECOVERY or daemon._has_pending_journal():
+        out["registered"] = True
+        return out
     # The canonical committed generation remains readable while another
     # process is INDEXING, while this daemon is STANDBY, and after a daemon
     # restart before its first successful refresh.  Health used to hydrate
@@ -716,6 +1034,7 @@ __all__ = [
     "STATUS_EMPTY",
     "STATUS_INDEXING",
     "STATUS_READY",
+    "STATUS_RECOVERY",
     "STATUS_STANDBY",
     "STATUS_STALE",
     "STATUS_STOPPED",

@@ -468,3 +468,515 @@ def test_callback_transition_map_is_exhaustive_for_blocked_substatuses():
     assert callback_store.resolve_callback_transition("worker_failed") == "worker_failed"
     assert callback_store.resolve_callback_transition("review_ready") == "review_ready"
     assert callback_store.resolve_callback_transition("blocked") == "blocked"
+
+
+# --- V2: predecessor_request_id selection ----------------------------------
+
+
+def test_reject_to_pending_explicit_predecessor_selects_retained_workspace(coord):
+    """Explicit predecessor_request_id selects a durably-pinned retained
+    workspace from a prior rework cycle rather than defaulting to the current
+    terminal_review."""
+    retained_request = "retained-request-A"
+    retained_workspace = {
+        "request_id": retained_request,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{retained_request}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{retained_request}/home",
+        "allowed_writes": ["src/a.py"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    retained_hashes = {"src/a.py": "a" * 64}
+    # Card has a durably-pinned rework_predecessor from cycle A plus a current
+    # terminal_review from cycle B (validation_failed).
+    _insert(
+        coord,
+        "T_V2_EXPLICIT",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": retained_request,
+                "workspace": retained_workspace,
+                "changed_path_hashes": retained_hashes,
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "validation_failed",
+                "evidence": {
+                    "request_identity": {"request_id": "newer-request-B"},
+                    "workspace": {
+                        "request_id": "newer-request-B",
+                        "repo": str(coord),
+                        "path": "/tmp/aiworkhub-worktrees/newer-request-B/worktree",
+                        "home": "/tmp/aiworkhub-worktrees/newer-request-B/home",
+                        "allowed_writes": ["src/b.py"],
+                        "parent_baseline": {},
+                        "workspace_baseline": {},
+                    },
+                    "changed_path_hashes": {"src/b.py": "b" * 64},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_EXPLICIT",
+        "rework from retained A",
+        to="pending",
+        predecessor_request_id=retained_request,
+    )
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_V2_EXPLICIT")["card_json"])
+    assert card["rework_predecessor"]["request_id"] == retained_request
+    assert card["rework_predecessor"]["changed_path_hashes"] == retained_hashes
+    assert card["rework_predecessor"]["workspace"]["request_id"] == retained_request
+    assert card["review_feedback"]["predecessor_request_id"] == retained_request
+    assert card["review_feedback"]["predecessor_changed_paths"] == ["src/a.py"]
+    assert "terminal_review" not in card
+
+
+def test_reject_to_blocked_explicit_predecessor_pins_selection(coord):
+    """Blocked disposition with an explicit predecessor_request_id must pin
+    the rework_predecessor identically to the pending case."""
+    retained_request = "retained-blocked-A"
+    retained_workspace = {
+        "request_id": retained_request,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{retained_request}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{retained_request}/home",
+        "allowed_writes": ["src/x.py"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    retained_hashes = {"src/x.py": "x" * 64}
+    _insert(
+        coord,
+        "T_V2_BLOCKED_PIN",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": retained_request,
+                "workspace": retained_workspace,
+                "changed_path_hashes": retained_hashes,
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "blocked-current-B"},
+                    "workspace": {
+                        "request_id": "blocked-current-B",
+                        "repo": str(coord),
+                        "path": "/tmp/aiworkhub-worktrees/blocked-current-B/worktree",
+                        "home": "/tmp/aiworkhub-worktrees/blocked-current-B/home",
+                        "allowed_writes": ["src/y.py"],
+                        "parent_baseline": {},
+                        "workspace_baseline": {},
+                    },
+                    "changed_path_hashes": {"src/y.py": "y" * 64},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_BLOCKED_PIN",
+        "blocked with explicit A",
+        to="blocked",
+        predecessor_request_id=retained_request,
+    )
+
+    assert res["ok"] is True, res
+    row = _row(coord, "T_V2_BLOCKED_PIN")
+    assert row["status"] == "blocked"
+    assert row["worker_status"] == "blocked"
+    card = json.loads(row["card_json"])
+    assert card["rework_predecessor"]["request_id"] == retained_request
+    assert card["rework_predecessor"]["changed_path_hashes"] == retained_hashes
+    assert "terminal_review" not in card
+
+
+def test_reject_default_predecessor_is_current_review(coord):
+    """When predecessor_request_id is omitted (None), the current terminal_review
+    request is the safe default -- identical to V1 behaviour."""
+    current_request = "current-review-default"
+    current_workspace = {
+        "request_id": current_request,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{current_request}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{current_request}/home",
+        "allowed_writes": ["out/default.txt"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    current_hashes = {"out/default.txt": "d" * 64}
+    _insert(
+        coord,
+        "T_V2_DEFAULT",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "older-stale-request",
+                "workspace": {
+                    "request_id": "older-stale-request",
+                    "repo": str(coord),
+                    "path": "/tmp/aiworkhub-worktrees/older-stale-request/worktree",
+                    "home": "/tmp/aiworkhub-worktrees/older-stale-request/home",
+                    "allowed_writes": ["src/stale.py"],
+                    "parent_baseline": {},
+                    "workspace_baseline": {},
+                },
+                "changed_path_hashes": {"src/stale.py": "s" * 64},
+                "residual_identities": [],
+                "pinned_at": "2026-07-18T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": current_request},
+                    "workspace": current_workspace,
+                    "changed_path_hashes": current_hashes,
+                },
+            },
+        },
+    )
+
+    # No explicit predecessor_request_id -- defaults to current review
+    res = core.reject_review("T_V2_DEFAULT", "rework", to="pending")
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_V2_DEFAULT")["card_json"])
+    # The freshly pinned rework_predecessor must be the CURRENT request,
+    # not the stale older one.
+    assert card["rework_predecessor"]["request_id"] == current_request
+    assert card["rework_predecessor"]["changed_path_hashes"] == current_hashes
+    assert card["review_feedback"]["predecessor_request_id"] == current_request
+
+
+def test_reject_empty_predecessor_fails_closed(coord):
+    """An empty predecessor_request_id string must fail closed before any
+    card state change."""
+    _insert(
+        coord,
+        "T_V2_EMPTY",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "some-request"},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_EMPTY", "x", to="pending", predecessor_request_id=""
+    )
+
+    assert res["ok"] is False
+    assert "predecessor_request_id" in (res.get("stderr") or "")
+    # Card must be unchanged -- still in review
+    row = _row(coord, "T_V2_EMPTY")
+    assert row["status"] == "review"
+
+
+def test_reject_foreign_predecessor_fails_closed(coord):
+    """A predecessor_request_id not in any durable evidence must fail closed."""
+    _insert(
+        coord,
+        "T_V2_FOREIGN",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "known-request",
+                "workspace": {
+                    "request_id": "known-request",
+                    "repo": str(coord),
+                    "path": "/tmp/aiworkhub-worktrees/known-request/worktree",
+                    "home": "/tmp/aiworkhub-worktrees/known-request/home",
+                    "allowed_writes": ["src/z.py"],
+                    "parent_baseline": {},
+                    "workspace_baseline": {},
+                },
+                "changed_path_hashes": {"src/z.py": "z" * 64},
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": "current-review"},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_FOREIGN",
+        "x",
+        to="pending",
+        predecessor_request_id="unknown-foreign-request",
+    )
+
+    assert res["ok"] is False
+    assert "not found" in (res.get("stderr") or "")
+    row = _row(coord, "T_V2_FOREIGN")
+    assert row["status"] == "review"
+
+
+def test_reject_adversarial_ab_preserves_green_a_when_b_rejected(coord):
+    """Adversarial A/B: A is a green (review_ready) predecessor, B is the
+    current validation_failed review.  Explicitly selecting A as predecessor
+    must preserve A's workspace while B is rejected."""
+    green_request = "green-candidate-A"
+    green_workspace = {
+        "request_id": green_request,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{green_request}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{green_request}/home",
+        "allowed_writes": ["src/green.py"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    green_hashes = {"src/green.py": "g" * 64}
+    # Previously green review cycle produced a rework_predecessor for A.
+    # The current (B) terminal_review is validation_failed with its own
+    # workspace evidence.
+    _insert(
+        coord,
+        "T_V2_AB",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": green_request,
+                "workspace": green_workspace,
+                "changed_path_hashes": green_hashes,
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "validation_failed",
+                "evidence": {
+                    "request_identity": {"request_id": "validation-failed-B"},
+                    "workspace": {
+                        "request_id": "validation-failed-B",
+                        "repo": str(coord),
+                        "path": "/tmp/aiworkhub-worktrees/validation-failed-B/worktree",
+                        "home": "/tmp/aiworkhub-worktrees/validation-failed-B/home",
+                        "allowed_writes": ["src/failed.py"],
+                        "parent_baseline": {},
+                        "workspace_baseline": {},
+                    },
+                    "changed_path_hashes": {"src/failed.py": "f" * 64},
+                },
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_AB",
+        "rework from green A",
+        to="pending",
+        predecessor_request_id=green_request,
+    )
+
+    assert res["ok"] is True, res
+    card = json.loads(_row(coord, "T_V2_AB")["card_json"])
+    # Green A's workspace must be durably pinned, not B's
+    assert card["rework_predecessor"]["request_id"] == green_request
+    assert card["rework_predecessor"]["changed_path_hashes"] == green_hashes
+    assert card["review_feedback"]["predecessor_request_id"] == green_request
+    assert card["review_feedback"]["predecessor_changed_paths"] == ["src/green.py"]
+    assert "terminal_review" not in card
+
+
+def test_reject_blocked_after_validation_failed_defaults_to_current(coord):
+    """When the current (B) review is valid but gets blocked for an unrelated
+    reason, and no explicit predecessor is selected, the current review (B)
+    is the safe default."""
+    current_request = "current-valid-B"
+    current_workspace = {
+        "request_id": current_request,
+        "repo": str(coord),
+        "path": f"/tmp/aiworkhub-worktrees/{current_request}/worktree",
+        "home": f"/tmp/aiworkhub-worktrees/{current_request}/home",
+        "allowed_writes": ["src/valid.py"],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+    }
+    current_hashes = {"src/valid.py": "v" * 64}
+    _insert(
+        coord,
+        "T_V2_BLOCKED_CURRENT",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "older-predecessor-X",
+                "workspace": {
+                    "request_id": "older-predecessor-X",
+                    "repo": str(coord),
+                    "path": "/tmp/aiworkhub-worktrees/older-predecessor-X/worktree",
+                    "home": "/tmp/aiworkhub-worktrees/older-predecessor-X/home",
+                    "allowed_writes": ["src/old.py"],
+                    "parent_baseline": {},
+                    "workspace_baseline": {},
+                },
+                "changed_path_hashes": {"src/old.py": "o" * 64},
+                "residual_identities": [],
+                "pinned_at": "2026-07-18T00:00:00+00:00",
+            },
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": current_request},
+                    "workspace": current_workspace,
+                    "changed_path_hashes": current_hashes,
+                },
+            },
+        },
+    )
+
+    # Blocked with no explicit predecessor -- defaults to current review (B)
+    res = core.reject_review(
+        "T_V2_BLOCKED_CURRENT", "needs external input", to="blocked"
+    )
+
+    assert res["ok"] is True, res
+    row = _row(coord, "T_V2_BLOCKED_CURRENT")
+    assert row["status"] == "blocked"
+    card = json.loads(row["card_json"])
+    # The pinned rework_predecessor must be the current (B), not the stale older one
+    assert card["rework_predecessor"]["request_id"] == current_request
+    assert card["rework_predecessor"]["changed_path_hashes"] == current_hashes
+    assert "terminal_review" not in card
+
+
+def test_reject_explicit_nonmatching_hash_fails_closed(coord):
+    """A predecessor_request_id that matches a stored request_id but whose
+    workspace request_id does not agree fails closed."""
+    _insert(
+        coord,
+        "T_V2_HASH_MISMATCH",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "hash-mismatch-req",
+                "workspace": {
+                    "request_id": "different-workspace-req",
+                    "repo": str(coord),
+                    "path": "/tmp/aiworkhub-worktrees/different-workspace-req/worktree",
+                    "home": "/tmp/aiworkhub-worktrees/different-workspace-req/home",
+                    "allowed_writes": ["src/m.py"],
+                    "parent_baseline": {},
+                    "workspace_baseline": {},
+                },
+                "changed_path_hashes": {},
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_HASH_MISMATCH",
+        "x",
+        to="pending",
+        predecessor_request_id="hash-mismatch-req",
+    )
+
+    assert res["ok"] is False
+    assert "not found" in (res.get("stderr") or "")
+
+
+def test_reject_workspace_missing_changed_hashes_not_selected(coord):
+    """A predecessor with empty changed_path_hashes is not selectable --
+    the coordinator must not guess at workspace identity."""
+    _insert(
+        coord,
+        "T_V2_EMPTY_HASHES",
+        card={
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "empty-hash-req",
+                "workspace": {
+                    "request_id": "empty-hash-req",
+                    "repo": str(coord),
+                    "path": "/tmp/aiworkhub-worktrees/empty-hash-req/worktree",
+                    "home": "/tmp/aiworkhub-worktrees/empty-hash-req/home",
+                    "allowed_writes": [],
+                    "parent_baseline": {},
+                    "workspace_baseline": {},
+                },
+                "changed_path_hashes": {},
+                "residual_identities": [],
+                "pinned_at": "2026-07-19T00:00:00+00:00",
+            },
+        },
+    )
+
+    res = core.reject_review(
+        "T_V2_EMPTY_HASHES",
+        "x",
+        to="pending",
+        predecessor_request_id="empty-hash-req",
+    )
+
+    assert res["ok"] is False
+    assert "not found" in (res.get("stderr") or "")
+
+
+def test_reject_none_predecessor_omission_is_not_empty_selection(coord):
+    """None (omitted) is distinct from "" (empty).  Omission defaults to
+    the current review; empty fails closed."""
+    current_request = "default-from-none"
+    _insert(
+        coord,
+        "T_V2_NONE_VS_EMPTY",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": current_request},
+                    "workspace": {
+                        "request_id": current_request,
+                        "repo": str(coord),
+                        "path": f"/tmp/aiworkhub-worktrees/{current_request}/worktree",
+                        "home": f"/tmp/aiworkhub-worktrees/{current_request}/home",
+                        "allowed_writes": ["out/result.txt"],
+                        "parent_baseline": {},
+                        "workspace_baseline": {},
+                    },
+                    "changed_path_hashes": {"out/result.txt": "r" * 64},
+                },
+            },
+        },
+    )
+
+    # None (omitted) must succeed
+    res_none = core.reject_review("T_V2_NONE_VS_EMPTY", "rework", to="pending")
+    assert res_none["ok"] is True, res_none
+    card_none = json.loads(_row(coord, "T_V2_NONE_VS_EMPTY")["card_json"])
+    assert card_none["rework_predecessor"]["request_id"] == current_request
+
+    # Now reset and try empty -- must fail
+    _insert(
+        coord,
+        "T_V2_NONE_VS_EMPTY_2",
+        card={
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {"request_id": current_request},
+                },
+            },
+        },
+    )
+    res_empty = core.reject_review(
+        "T_V2_NONE_VS_EMPTY_2", "x", to="pending", predecessor_request_id=""
+    )
+    assert res_empty["ok"] is False
+    assert "predecessor_request_id" in (res_empty.get("stderr") or "")

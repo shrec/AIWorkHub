@@ -123,12 +123,12 @@ def test_windows_runtime_path_uses_venv_scripts_exe(
 
 def test_unapproved_bare_executable_is_not_rewritten() -> None:
     assert worker_workspace._normalize_trusted_validation_executable_argv(
-        ["mypy", "src"]
-    ) == ["mypy", "src"]
+        ["pylint", "src"]
+    ) == ["pylint", "src"]
     with pytest.raises(
         worker_workspace.WorkspaceError, match="validation_executable_not_approved"
     ):
-        worker_workspace.resolve_trusted_validation_executable("mypy")
+        worker_workspace.resolve_trusted_validation_executable("pylint")
 
 
 def test_missing_approved_executable_fails_closed(
@@ -322,3 +322,87 @@ def test_pytest_console_script_normalization_is_preserved() -> None:
     ]
     explicit = ["python3", "-m", "pytest", "--version"]
     assert worker_workspace._normalize_pytest_validation_argv(explicit) == explicit
+
+
+def test_repo_venv_mypy_preferred_over_system(tmp_path, monkeypatch) -> None:
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    repo_mypy = venv_bin / "mypy"
+    _executable(repo_mypy)
+
+    sys_prefix = tmp_path / "sys"
+    sys_prefix_bin = sys_prefix / "bin"
+    sys_prefix_bin.mkdir(parents=True, exist_ok=True)
+    sys_mypy = sys_prefix_bin / "mypy"
+    _executable(sys_mypy)
+
+    fake_module = tmp_path / "src" / "aiworkhub" / "worker_workspace.py"
+    fake_module.parent.mkdir(parents=True, exist_ok=True)
+    fake_module.touch()
+    monkeypatch.setattr(worker_workspace, "__file__", str(fake_module))
+
+    approved = set(worker_workspace._TRUSTED_VALIDATION_BARE_EXECUTABLES)
+    with monkeypatch.context() as m:
+        m.setattr(
+            worker_workspace,
+            "_TRUSTED_VALIDATION_BARE_EXECUTABLES",
+            approved | {"mypy"},
+        )
+        m.setattr(worker_workspace.sys, "prefix", str(sys_prefix))
+        m.setattr(worker_workspace.sys, "base_prefix", "/something/else")
+        m.delenv("VIRTUAL_ENV", raising=False)
+
+        result = worker_workspace._resolve_trusted_validation_executable(
+            "mypy", repo=None
+        )
+
+    assert result.path == repo_mypy.resolve()
+    assert result.root == (tmp_path / ".venv").resolve(strict=False)
+
+
+def test_run_validations_mypy_declared_argv_bare_executed_is_repo_venv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = _workspace(tmp_path)
+    mypy = _executable(tmp_path / ".venv" / "bin" / "mypy")
+    captured: dict[str, object] = {}
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(
+        worker_workspace.sys, "prefix", worker_workspace.sys.base_prefix
+    )
+    monkeypatch.setattr(
+        worker_workspace, "select_sandbox_backend", lambda: "landlock"
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "provision_validation_exec_scratch",
+        lambda ws: tmp_path / "scratch",
+    )
+    monkeypatch.setattr(
+        worker_workspace, "cleanup_validation_exec_scratch", lambda path: None
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda ws, adapter_id, argv, **kw: list(argv),
+    )
+    monkeypatch.setattr(
+        worker_workspace, "sanitized_env", lambda *a, **kw: {"PATH": "/bin"}
+    )
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["shell"] = kwargs.get("shell")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", fake_run)
+
+    result = worker_workspace.run_validations(workspace, ["mypy check src"])
+
+    assert result[0]["declared_command"] == "mypy check src"
+    assert result[0]["declared_argv"] == ["mypy", "check", "src"]
+    assert result[0]["argv"] == [str(mypy.resolve()), "check", "src"]
+    assert result[0]["executed_argv"] == [str(mypy.resolve()), "check", "src"]
+    assert result[0]["argv_rewritten"] is True
+    assert captured["argv"] == [str(mypy.resolve()), "check", "src"]
+    assert captured["shell"] is False

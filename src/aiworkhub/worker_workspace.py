@@ -1891,7 +1891,7 @@ def select_sandbox_backend() -> str:
     raise WorkspaceError(f"secure_sandbox_unavailable:bubblewrap_unusable:{detail}")
 
 
-_TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"ruff"})
+_TRUSTED_VALIDATION_BARE_EXECUTABLES = frozenset({"ruff", "mypy"})
 SANDBOX_VALIDATION_EXECUTABLE_ROOT = "/validation-executable-root"
 
 
@@ -1903,8 +1903,13 @@ def _validation_executable_relative_path(name: str) -> PurePosixPath:
 
 def _trusted_validation_runtime_roots(repo: Path | None = None) -> tuple[Path, ...]:
     roots: list[Path] = []
-    if repo is not None:
-        roots.append(repo / ".venv")
+    if repo is None:
+        # Prefer the canonical repository .venv even when the caller does
+        # not supply an explicit repo, by deriving the repository root from
+        # the module's own location. The factory worker always places this
+        # module inside src/aiworkhub/.
+        repo = Path(__file__).resolve().parents[2]
+    roots.append(repo / ".venv")
     virtual_env = os.environ.get("VIRTUAL_ENV")
     if virtual_env:
         roots.append(Path(virtual_env))

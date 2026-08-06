@@ -1,0 +1,694 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from aiworkhub import task_store
+
+
+_TERMINAL_REVIEW_EVIDENCE = {
+    "validation": [
+        {"command": "pytest -q", "returncode": 1, "stdout": "1 failed", "stderr": ""}
+    ],
+    "required_outputs": [],
+    "changed_path_hashes": {
+        "src/aiworkhub/task_store.py": "abc123hash",
+    },
+}
+
+
+def _setup_repo(tmp_path: Path) -> Path:
+    """Create and initialize a minimal repo for task_store tests."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    return repo
+
+
+def _insert_blocked_task(
+    repo: Path,
+    task_id: str,
+    *,
+    runner: str = "codex_worker_test",
+    terminal_substatus: str = "validation_failed",
+    terminal_evidence: dict | None = None,
+    reject_review_reason: str = "",
+    extra_card: dict | None = None,
+    worker_status: str = "validation_failed",
+    claimed_by: str = "",
+) -> None:
+    """Insert a blocked task with terminal-review predecessor evidence."""
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-06T00:00:00+00:00"
+
+    evidence = dict(terminal_evidence or _TERMINAL_REVIEW_EVIDENCE)
+    card = {
+        "task_id": task_id,
+        "runner": runner,
+        "topic": "aiworkhub_blocked_rework_recovery",
+        "mode": "",
+        "allowed_writes": ["src/aiworkhub/task_store.py"],
+        "objective": "Implement blocked rework recovery",
+        "terminal_review": {
+            "substatus": terminal_substatus,
+            "evidence": evidence,
+            "deterministic_verification": {
+                "applicable": True,
+                "pass": False,
+                "substatus": terminal_substatus,
+                "reason": "evidence_verdict_failed",
+                "claim_epoch": 0,
+                "evidence_verdict": {
+                    "passed": False,
+                    "validation_count": 1,
+                    "failed_validation_count": 1,
+                    "required_output_count": 0,
+                    "missing_required_output_count": 0,
+                },
+            },
+            "recorded_at": now,
+            "runner": runner,
+            "claim_epoch": 0,
+        },
+        "terminal_substatus": terminal_substatus,
+        "deterministic_verification": {
+            "applicable": True,
+            "pass": False,
+            "substatus": terminal_substatus,
+            "reason": "evidence_verdict_failed",
+            "claim_epoch": 0,
+            "evidence_verdict": {"passed": False, "validation_count": 1, "failed_validation_count": 1},
+        },
+        "blocker_reason": f"{terminal_substatus}: tests failed",
+        "blocked_at": now,
+        "blocked_by": runner,
+        "claim_epoch": 0,
+    }
+    if reject_review_reason:
+        card["reject_review"] = {
+            "to": "pending",
+            "reason": reject_review_reason,
+            "recorded_at": now,
+        }
+    if extra_card:
+        card.update(extra_card)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
+            "objective, card_json, created_at, updated_at, claimed_by, claimed_at, started_at, "
+            "completed_at) "
+            "VALUES (?, ?, 'aiworkhub_blocked_rework_recovery', 'blocked', ?, '', '', "
+            "?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                worker_status,
+                json.dumps(card),
+                now,
+                now,
+                claimed_by,
+                now if claimed_by else "",
+                now if claimed_by else "",
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_review', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps({"substatus": terminal_substatus, "evidence": evidence}),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_card(repo: Path, task_id: str) -> dict:
+    task = task_store.get_task(repo, task_id)
+    assert task is not None, f"task {task_id} not found"
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Successful recovery
+# ---------------------------------------------------------------------------
+
+
+def test_recover_blocked_validation_failed_with_feedback_requeues_to_pending(
+    tmp_path: Path,
+) -> None:
+    """A blocked task with retained predecessor evidence and residual feedback
+    is safely requeued to pending, preserving history."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "BLOCKED_NEEDFIX_01",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: handle edge case when input is empty",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_NEEDFIX_01",
+        actor="coordinator",
+        feedback_reason="NeedFix: handle edge case when input is empty",
+    )
+    assert (ok, state) == (True, "recovered")
+
+    task = _get_card(repo, "BLOCKED_NEEDFIX_01")
+    assert task["status"] == "pending"
+    assert task["worker_status"] == "unclaimed"
+    assert task.get("claimed_by") in (None, "")
+    assert task.get("claimed_at") in (None, "")
+    assert task.get("claim_epoch") == 1
+    assert task.get("recovery_epoch") == 1
+    assert task.get("recovered_by") == "coordinator"
+    assert task.get("recovery_feedback") == "NeedFix: handle edge case when input is empty"
+
+    # Predecessor evidence is preserved.
+    pred = task.get("recovery_predecessor")
+    assert isinstance(pred, dict)
+    assert pred["terminal_substatus"] == "validation_failed"
+    assert pred["changed_path_hashes"] == {
+        "src/aiworkhub/task_store.py": "abc123hash",
+    }
+
+    # Audit event is recorded.
+    events = task_store.get_task_events(repo, "BLOCKED_NEEDFIX_01")
+    event_names = [e["event"] for e in events]
+    assert "blocked_rework_recovery" in event_names
+    # Terminal review event is preserved.
+    assert "terminal_review" in event_names
+
+
+def test_recover_blocked_worker_failed_with_feedback_requeues_to_pending(
+    tmp_path: Path,
+) -> None:
+    """A worker_failed blocked task with feedback is recoverable."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "BLOCKED_WORKER_FAIL",
+        terminal_substatus="worker_failed",
+        reject_review_reason="NeedFix: worker crashed due to OOM",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_WORKER_FAIL",
+        actor="coordinator",
+        feedback_reason="NeedFix: worker crashed due to OOM",
+    )
+    assert (ok, state) == (True, "recovered")
+    assert _get_card(repo, "BLOCKED_WORKER_FAIL")["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Idempotent retry
+# ---------------------------------------------------------------------------
+
+
+def test_recover_already_recovered_task_returns_idempotent_already_recovered(
+    tmp_path: Path,
+) -> None:
+    """Calling recover on an already-recovered (pending) task returns
+    already_recovered without duplicating audit history."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "IDEMPOTENT_01",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: rework needed",
+    )
+
+    # First recovery.
+    ok, state = task_store.recover_blocked_rework(
+        repo, "IDEMPOTENT_01", actor="coordinator",
+        feedback_reason="NeedFix: rework needed",
+    )
+    assert (ok, state) == (True, "recovered")
+    events_after_first = len(task_store.get_task_events(repo, "IDEMPOTENT_01"))
+
+    # Second call -- idempotent.
+    ok, state = task_store.recover_blocked_rework(
+        repo, "IDEMPOTENT_01", actor="coordinator",
+        feedback_reason="NeedFix: rework needed",
+    )
+    assert (ok, state) == (True, "already_recovered")
+
+    # No duplicate audit event.
+    events_after_second = len(task_store.get_task_events(repo, "IDEMPOTENT_01"))
+    assert events_after_second == events_after_first
+
+    # Task is still pending.
+    assert _get_card(repo, "IDEMPOTENT_01")["status"] == "pending"
+
+
+def test_recover_allows_second_cycle_after_reblock(
+    tmp_path: Path,
+) -> None:
+    """A task that was recovered, re-claimed, and blocked again can be
+    recovered a second time (new recovery cycle)."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "CYCLE_02",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: first attempt",
+    )
+
+    # First recovery.
+    ok, _ = task_store.recover_blocked_rework(
+        repo, "CYCLE_02", actor="coordinator",
+        feedback_reason="NeedFix: first attempt",
+    )
+    assert ok
+
+    # Simulate re-block (worker picked up, failed again).
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='validation_failed' "
+            "WHERE task_id='CYCLE_02'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Second recovery should succeed (new cycle).
+    ok, state = task_store.recover_blocked_rework(
+        repo, "CYCLE_02", actor="coordinator",
+        feedback_reason="NeedFix: second attempt",
+    )
+    assert (ok, state) == (True, "recovered")
+    assert _get_card(repo, "CYCLE_02")["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Fail closed: hard blockers
+# ---------------------------------------------------------------------------
+
+
+def test_recover_dependency_blocked_task_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A dependency-blocked task must not be silently recovered."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "DEP_BLOCKED_01",
+        terminal_substatus="dependency_blocked",
+        reject_review_reason="waiting for prerequisite",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "DEP_BLOCKED_01", actor="coordinator",
+        feedback_reason="waiting for prerequisite",
+    )
+    assert (ok, state) == (False, "hard_blocker:dependency_blocked")
+    assert _get_card(repo, "DEP_BLOCKED_01")["status"] == "blocked"
+
+
+def test_recover_scope_rejected_task_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A scope-rejected task must not be silently recovered."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "SCOPE_REJECTED_01",
+        terminal_substatus="scope_rejected",
+        reject_review_reason="out of scope",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "SCOPE_REJECTED_01", actor="coordinator",
+        feedback_reason="out of scope",
+    )
+    assert (ok, state) == (False, "hard_blocker:scope_rejected")
+    assert _get_card(repo, "SCOPE_REJECTED_01")["status"] == "blocked"
+
+
+def test_recover_generic_blocked_substatus_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A task with the generic 'blocked' terminal substatus fails closed
+    since its blocker nature is unknown."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "GENERIC_BLOCKED_01",
+        terminal_substatus="blocked",
+        reject_review_reason="unspecified blocker",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "GENERIC_BLOCKED_01", actor="coordinator",
+        feedback_reason="unspecified blocker",
+    )
+    assert (ok, state) == (False, "hard_blocker:blocked")
+    assert _get_card(repo, "GENERIC_BLOCKED_01")["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Fail closed: missing evidence
+# ---------------------------------------------------------------------------
+
+
+def test_recover_without_terminal_review_evidence_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A blocked task without retained terminal_review predecessor fails."""
+    repo = _setup_repo(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-06T00:00:00+00:00"
+    card = {"task_id": "NO_EVIDENCE_01", "runner": "test", "topic": "test"}
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at, completed_at) "
+            "VALUES ('NO_EVIDENCE_01', 'test', 'test', 'blocked', 'blocked', "
+            "?, ?, ?, ?)",
+            (json.dumps(card), now, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "NO_EVIDENCE_01", actor="coordinator",
+        feedback_reason="some feedback",
+    )
+    assert (ok, state) == (False, "no_retained_predecessor_evidence")
+    assert _get_card(repo, "NO_EVIDENCE_01")["status"] == "blocked"
+
+
+def test_recover_without_feedback_reason_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A blocked task with predecessor evidence but no residual feedback fails."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "NO_FEEDBACK_01",
+        terminal_substatus="validation_failed",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "NO_FEEDBACK_01", actor="coordinator",
+        feedback_reason="",
+    )
+    assert (ok, state) == (False, "no_residual_feedback")
+    assert _get_card(repo, "NO_FEEDBACK_01")["status"] == "blocked"
+
+
+def test_recover_with_reject_review_feedback_from_card_succeeds(
+    tmp_path: Path,
+) -> None:
+    """When feedback_reason is empty but card contains reject_review reason,
+    recovery succeeds using the card-level feedback."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "CARD_FEEDBACK_01",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: card-level feedback present",
+    )
+
+    # feedback_reason param is empty, but card has reject_review.reason.
+    ok, state = task_store.recover_blocked_rework(
+        repo, "CARD_FEEDBACK_01", actor="coordinator",
+        feedback_reason="",
+    )
+    assert (ok, state) == (True, "recovered")
+    assert _get_card(repo, "CARD_FEEDBACK_01")["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Fail closed: live claim
+# ---------------------------------------------------------------------------
+
+
+def test_recover_live_claimed_task_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A task with an active claim must not be silently recovered."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "LIVE_CLAIM_01",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: rework",
+        worker_status="claimed",
+        claimed_by="some_worker",
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "LIVE_CLAIM_01", actor="coordinator",
+        feedback_reason="NeedFix: rework",
+    )
+    assert (ok, state) == (False, "live_claim_detected")
+
+
+# ---------------------------------------------------------------------------
+# Fail closed: non-blocked
+# ---------------------------------------------------------------------------
+
+
+def test_recover_pending_task_fails_closed(tmp_path: Path) -> None:
+    """A pending (never-blocked) task must not be recovered."""
+    repo = _setup_repo(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-06T00:00:00+00:00"
+    card = {"task_id": "FRESH_TASK", "runner": "test", "topic": "test"}
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at) "
+            "VALUES ('FRESH_TASK', 'test', 'test', 'pending', 'unclaimed', ?, ?, ?)",
+            (json.dumps(card), now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "FRESH_TASK", actor="coordinator",
+        feedback_reason="some feedback",
+    )
+    assert (ok, state) == (False, "not_blocked:current=pending")
+
+
+def test_recover_processing_task_fails_closed(tmp_path: Path) -> None:
+    """A processing task must not be recovered."""
+    repo = _setup_repo(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-06T00:00:00+00:00"
+    card = {"task_id": "PROCESSING_TASK", "runner": "test", "topic": "test"}
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "card_json, created_at, updated_at, claimed_by, claimed_at) "
+            "VALUES ('PROCESSING_TASK', 'test', 'test', 'processing', 'claimed', "
+            "?, ?, ?, 'worker_1', ?)",
+            (json.dumps(card), now, now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ok, state = task_store.recover_blocked_rework(
+        repo, "PROCESSING_TASK", actor="coordinator",
+        feedback_reason="some feedback",
+    )
+    assert ok is False
+    assert "not_blocked" in state
+
+
+# ---------------------------------------------------------------------------
+# Fail closed: task not found
+# ---------------------------------------------------------------------------
+
+
+def test_recover_unknown_task_fails_closed(tmp_path: Path) -> None:
+    """Recovering a non-existent task returns task_not_found."""
+    repo = _setup_repo(tmp_path)
+    ok, state = task_store.recover_blocked_rework(
+        repo, "NONEXISTENT_TASK", actor="coordinator",
+        feedback_reason="some feedback",
+    )
+    assert (ok, state) == (False, "task_not_found")
+
+
+# ---------------------------------------------------------------------------
+# Regression: NeedFix foundation scenario
+# ---------------------------------------------------------------------------
+
+
+def test_regression_blocked_needfix_foundation_scenario_preserves_lineage(
+    tmp_path: Path,
+) -> None:
+    """Models the blocked NeedFix foundation scenario: a task undergoes
+    terminal_review -> reject_review with NeedFix disposition, then is
+    recovered for rework without creating a replacement task."""
+    repo = _setup_repo(tmp_path)
+    task_id = "NEEDFIX_FOUNDATION"
+
+    # Step 1: Insert a blocked task with full NeedFix evidence.
+    _insert_blocked_task(
+        repo,
+        task_id,
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: fix the edge case in validation logic",
+        extra_card={
+            "predecessor_task_id": task_id,  # same ID, rework cycle
+            "predecessor_sha256": "deadbeefcafe",
+            "residual_feedback": "The validation should handle empty string input",
+            "terminal_outcome": "validation_failed",
+        },
+    )
+
+    # Step 2: Recover.
+    ok, state = task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator",
+        feedback_reason="NeedFix: fix the edge case in validation logic",
+    )
+    assert (ok, state) == (True, "recovered")
+
+    task = _get_card(repo, task_id)
+
+    # Step 3: Task identity is preserved (no replacement).
+    assert task["task_id"] == task_id
+    assert task["runner"] == "codex_worker_test"
+    assert task["topic"] == "aiworkhub_blocked_rework_recovery"
+
+    # Step 4: Task is pending for rework.
+    assert task["status"] == "pending"
+    assert task["worker_status"] == "unclaimed"
+
+    # Step 5: Lineage is preserved.
+    assert task["claim_epoch"] == 1
+    assert task["recovery_epoch"] == 1
+
+    # Step 6: Predecessor evidence is pinned.
+    pred = task["recovery_predecessor"]
+    assert pred["terminal_substatus"] == "validation_failed"
+    assert pred["changed_path_hashes"] == {
+        "src/aiworkhub/task_store.py": "abc123hash",
+    }
+
+    # Step 7: Durable extra fields are preserved while current-episode truth
+    # is cleared from card_json.
+    assert task.get("predecessor_sha256") == "deadbeefcafe"
+    assert task.get("residual_feedback") == "The validation should handle empty string input"
+    assert task.get("terminal_outcome") in (None, "")
+
+    # Step 8: Episode fields are cleared.
+    assert task.get("terminal_substatus") in (None, "")
+    assert task.get("blocker_reason") in (None, "")
+    assert task.get("launch_error") in (None, "")
+    assert task.get("launch_failed") in (None, "")
+
+    # Step 9: Audit trail is intact.
+    events = task_store.get_task_events(repo, task_id)
+    event_names = [e["event"] for e in events]
+    assert "terminal_review" in event_names
+    assert "blocked_rework_recovery" in event_names
+
+    # Step 10: Idempotent retry.
+    ok2, state2 = task_store.recover_blocked_rework(
+        repo, task_id, actor="coordinator",
+        feedback_reason="NeedFix: fix the edge case in validation logic",
+    )
+    assert (ok2, state2) == (True, "already_recovered")
+
+
+# ---------------------------------------------------------------------------
+# History / evidence preservation
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_preserves_original_terminal_review_in_events(
+    tmp_path: Path,
+) -> None:
+    """Terminal evidence remains durable without contaminating a new episode."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "PRESERVE_EVIDENCE",
+        terminal_substatus="timed_out",
+        reject_review_reason="NeedFix: increase timeout",
+    )
+
+    task_store.recover_blocked_rework(
+        repo, "PRESERVE_EVIDENCE", actor="coordinator",
+        feedback_reason="NeedFix: increase timeout",
+    )
+
+    task = _get_card(repo, "PRESERVE_EVIDENCE")
+    assert task.get("terminal_review") is None
+    assert task.get("deterministic_verification") is None
+    assert task["recovery_predecessor"]["terminal_substatus"] == "timed_out"
+
+    events = task_store.get_task_events(repo, "PRESERVE_EVIDENCE")
+    terminal_events = [event for event in events if event["event"] == "terminal_review"]
+    assert len(terminal_events) == 1
+
+
+def test_recovery_bumps_claim_epoch_for_fresh_lineage(
+    tmp_path: Path,
+) -> None:
+    """Each recovery cycle produces a strictly increasing claim_epoch."""
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "EPOCH_BUMP",
+        terminal_substatus="validation_failed",
+        reject_review_reason="NeedFix: fix bug",
+        extra_card={"claim_epoch": 2},
+    )
+
+    task_store.recover_blocked_rework(
+        repo, "EPOCH_BUMP", actor="coordinator",
+        feedback_reason="NeedFix: fix bug",
+    )
+
+    task = _get_card(repo, "EPOCH_BUMP")
+    assert task["claim_epoch"] == 3
+    assert task["recovery_epoch"] == 3
+
+
+def test_recovery_accepts_launch_failed_and_timed_out_substatuses(
+    tmp_path: Path,
+) -> None:
+    """Launch failures and timeouts are rework-eligible."""
+    for substatus in ("launch_failed", "timed_out", "token_budget_exceeded"):
+        parent = tmp_path / substatus
+        parent.mkdir()
+        repo = _setup_repo(parent)
+        task_id = f"RECOVER_{substatus.upper()}"
+        _insert_blocked_task(
+            repo,
+            task_id,
+            terminal_substatus=substatus,
+            reject_review_reason=f"NeedFix: {substatus} recovery",
+        )
+        ok, state = task_store.recover_blocked_rework(
+            repo, task_id, actor="coordinator",
+            feedback_reason=f"NeedFix: {substatus} recovery",
+        )
+        assert (ok, state) == (True, "recovered"), f"failed for {substatus}"
+        assert _get_card(repo, task_id)["status"] == "pending"

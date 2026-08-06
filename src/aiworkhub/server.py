@@ -1029,11 +1029,17 @@ def aiworkhub_task_reject_review(
     reason: str,
     to: str = "pending",
     residual_identities: list[dict[str, str]] | None = None,
+    predecessor_request_id: str | None = None,
 ) -> dict[str, Any]:
     """Write-gated Codex action: reject a reviewed task with exact feedback and
     an explicit disposition. ``to`` = pending (rework, default) | blocked |
     archived | superseded -- so a task whose real next step is a dependency-
-    gated replacement is not silently requeued to pending."""
+    gated replacement is not silently requeued to pending.
+
+    ``predecessor_request_id`` selects an exact retained review request as
+    the rework workspace authority.  Omitted (None) defaults to the current
+    review request.  An empty string fails closed.
+    """
 
     kwargs: dict[str, Any] = {"task_id": task_id, "reason": reason, "to": to}
     # Preserve the established public call shape for callers that do not use
@@ -1041,6 +1047,8 @@ def aiworkhub_task_reject_review(
     # runtimes/mocks compatible while newer callers can opt into the field.
     if residual_identities is not None:
         kwargs["residual_identities"] = residual_identities
+    if predecessor_request_id is not None:
+        kwargs["predecessor_request_id"] = predecessor_request_id
     return core.reject_review(**kwargs)
 
 

@@ -70,7 +70,7 @@ CANONICAL_STATUSES: tuple[str, ...] = (
 # rejected back to ``pending`` may retain them in card_json for review/audit
 # display, but the next genuine claim must not inherit that stale terminal
 # truth.  Immutable history remains in task_events (including the original
-# terminal_review/reject_review rows); this list deliberately excludes task
+# terminal_review/reject_review rows).  This list deliberately excludes task
 # identity, requirements, validation commands and other durable card fields.
 CURRENT_EPISODE_CARD_FIELDS: tuple[str, ...] = (
     "terminal_review",
@@ -1219,6 +1219,250 @@ def mark_terminal_failure(
         conn.close()
 
 
+# Terminal substatuses that represent hard dependency/policy/scope blockers
+# and must never be silently recovered into pending.  These require external
+# resolution (dependency completed, scope redefined, policy changed) before
+# any rework transaction is legal.
+_HARD_BLOCKER_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "dependency_blocked",
+        "scope_rejected",
+        "blocked",
+    }
+)
+
+# Terminal substatuses that are eligible for rework recovery when retained
+# predecessor evidence and residual feedback are present.
+_REWORK_ELIGIBLE_SUBSTATUSES: frozenset[str] = frozenset(
+    {
+        "validation_failed",
+        "worker_failed",
+        "launch_failed",
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+        "cancelled",
+        "liveness_lost",
+        "finalize_failed",
+        "process_lost",
+        "stale",
+        "required_output_unchanged",
+        "exited",
+        "review_ready",
+        "promotion_conflict",
+    }
+)
+
+
+def recover_blocked_rework(
+    root: str | Path,
+    task_id: str,
+    *,
+    actor: str = "coordinator",
+    feedback_reason: str = "",
+) -> tuple[bool, str]:
+    """Recover the same blocked task ID for rework when retained predecessor
+    evidence and actionable residual feedback are present.
+
+    This is the canonical task-store transaction that requeues a blocked task
+    as ``pending`` for rework, preserving task identity, append-only history,
+    claim epoch lineage, predecessor hashes, and review feedback.  It clears
+    only the claim/worker fields required for a fresh pending launch.
+
+    Fails closed on:
+      - dependency, policy, or scope blockers (must be resolved first)
+      - blocked tasks without retained terminal-review predecessor evidence
+      - blocked tasks without residual feedback
+      - tasks with a live claim or in-process episode
+      - non-blocked tasks
+
+    Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
+    already re-queued the same task, without duplicating audit history.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT task_id, runner, status, worker_status, claimed_by, "
+            "claimed_at, card_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+
+        current_canonical = canonical_status(dict(row))
+
+        # --- Idempotency: already recovered ---
+        already = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id=? AND event='blocked_rework_recovery' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if already is not None:
+            if current_canonical == "pending":
+                return True, "already_recovered"
+            # Recovery event exists but task is no longer pending --
+            # e.g. it was recovered, re-claimed, and blocked again.
+            # Fall through to allow another recovery cycle.
+
+        # --- Fail on non-blocked tasks ---
+        if current_canonical != "blocked":
+            return False, f"not_blocked:current={current_canonical}"
+
+        # --- Parse card ---
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            return False, "card_json_invalid"
+        if not isinstance(card, dict):
+            return False, "card_json_not_dict"
+
+        # --- Fail on live claim ---
+        worker_status = str(row["worker_status"] or "").strip()
+        claimed_by = str(row["claimed_by"] or "").strip()
+        if worker_status in {"claimed", "in_progress"} or (
+            claimed_by and worker_status not in {
+                "launch_failed", "timed_out", "token_budget_exceeded",
+                "output_budget_exceeded", "worker_failed", "finalize_failed",
+                "cancelled", "liveness_lost", "process_lost", "stale",
+                "validation_failed", "required_output_unchanged",
+                "exited", "review_ready", "review", "promotion_conflict",
+                "scope_rejected", "dependency_blocked", "blocked",
+            }
+        ):
+            return False, "live_claim_detected"
+
+        # --- Retained predecessor evidence ---
+        # Current-episode terminal fields are intentionally cleared whenever
+        # a review is rejected or a new claim starts.  Durable predecessor
+        # truth lives in the append-only terminal_review event and, when a
+        # retained workspace exists, in rework_predecessor.  Never require a
+        # stale terminal_review copy to remain embedded in card_json.
+        terminal_row = conn.execute(
+            "SELECT runner, payload_json, created_at FROM task_events "
+            "WHERE task_id=? AND event='terminal_review' "
+            "ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if terminal_row is None:
+            return False, "no_retained_predecessor_evidence"
+
+        try:
+            terminal_review = json.loads(str(terminal_row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            return False, "retained_predecessor_evidence_invalid"
+        if not isinstance(terminal_review, dict) or not terminal_review:
+            return False, "retained_predecessor_evidence_invalid"
+
+        retained_predecessor = card.get("rework_predecessor")
+        if not isinstance(retained_predecessor, dict):
+            retained_predecessor = {}
+
+        terminal_substatus = str(
+            terminal_review.get("substatus") or ""
+        ).strip()
+
+        # --- Fail on hard dependency/policy/scope blockers ---
+        if terminal_substatus in _HARD_BLOCKER_SUBSTATUSES:
+            return False, f"hard_blocker:{terminal_substatus}"
+
+        # --- Validate rework eligibility ---
+        if terminal_substatus and terminal_substatus not in _REWORK_ELIGIBLE_SUBSTATUSES:
+            return False, f"unrecognized_terminal_substatus:{terminal_substatus}"
+
+        # --- Residual feedback required ---
+        bounded_feedback = str(feedback_reason or "").strip()
+        if not bounded_feedback:
+            # Also check card_json for residual feedback evidence
+            residual = card.get("reject_review")
+            if isinstance(residual, dict):
+                bounded_feedback = str(residual.get("reason") or "").strip()
+        if not bounded_feedback:
+            return False, "no_residual_feedback"
+
+        # --- Perform recovery ---
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Bump claim epoch so the next launch carries a fresh lineage marker.
+        try:
+            claim_epoch = max(0, int(card.get("claim_epoch") or 0)) + 1
+        except (TypeError, ValueError):
+            claim_epoch = 1
+
+        # Preserve predecessor provenance for audit.
+        predecessor_evidence = {
+            "terminal_substatus": terminal_substatus,
+            "terminal_runner": str(
+                terminal_review.get("runner") or terminal_row["runner"] or ""
+            ),
+            "terminal_recorded_at": str(
+                terminal_review.get("recorded_at") or terminal_row["created_at"] or ""
+            ),
+            "terminal_claim_epoch": (
+                terminal_review.get("claim_epoch")
+                if terminal_review.get("claim_epoch") is not None
+                else card.get("claim_epoch")
+            ),
+            "changed_path_hashes": (
+                retained_predecessor.get("changed_path_hashes")
+                or (
+                    terminal_review.get("evidence", {}).get("changed_path_hashes")
+                    if isinstance(terminal_review.get("evidence"), dict)
+                    else None
+                )
+            ),
+            "request_id": str(retained_predecessor.get("request_id") or ""),
+        }
+
+        # Clear only the current-episode claim/worker fields.
+        prior_episode_summary = begin_claim_episode(card)
+
+        # Apply recovery state.
+        card["claim_epoch"] = claim_epoch
+        card["recovery_epoch"] = claim_epoch
+        card["recovered_from_blocked_at"] = now
+        card["recovered_by"] = actor
+        card["recovery_predecessor"] = predecessor_evidence
+        card["recovery_feedback"] = bounded_feedback[:2000]
+
+        conn.execute(
+            "UPDATE tasks SET status='pending', worker_status='unclaimed', "
+            "claimed_by=NULL, claimed_at=NULL, started_at=NULL, "
+            "completed_at=NULL, updated_at=?, card_json=? "
+            "WHERE task_id=?",
+            (
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+            ),
+        )
+
+        recovery_payload = {
+            "transition": "blocked->pending",
+            "terminal_substatus": terminal_substatus,
+            "predecessor": predecessor_evidence,
+            "feedback": bounded_feedback[:2000],
+            "prior_episode": prior_episode_summary,
+            "claim_epoch": claim_epoch,
+            "recorded_at": now,
+            "actor": actor[:120],
+        }
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'blocked_rework_recovery', ?, ?, ?)",
+            (
+                task_id,
+                actor[:120],
+                json.dumps(recovery_payload, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "recovered"
+    finally:
+        conn.close()
+
+
 def restore_task(
     root: str | Path,
     task_id: str,
@@ -1626,6 +1870,7 @@ __all__ = [
     "mark_launch_failed",
     "mark_terminal_review",
     "quick_check",
+    "recover_blocked_rework",
     "restore_task",
     "sha256_file",
     "storage_readiness",

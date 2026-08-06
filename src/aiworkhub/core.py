@@ -3810,6 +3810,7 @@ def reject_review(
     topic: str | None = None,
     to: str = "pending",
     residual_identities: list[dict[str, str]] | None = None,
+    predecessor_request_id: str | None = None,
 ) -> dict[str, Any]:
     card, error = _live_card(task_id)
     if error:
@@ -3874,6 +3875,77 @@ def reject_review(
                 continue
             seen_residuals.add(key)
             normalized_residuals.append({"path": path, "pointer": pointer})
+
+    # V2 predecessor selection: resolve the explicit predecessor_request_id
+    # or default to the current review request identity.  None (omitted)
+    # defaults to the current terminal_review request.  "" (empty string)
+    # fails closed -- an explicit no-predecessor intent must be unambiguous.
+    # A non-empty value is validated against durable card evidence
+    # (rework_predecessor or terminal_review.evidence) and must pass
+    # same-repo, same-task workspace containment plus changed-path hash
+    # verification before any card state change or GC scheduling.
+    def _resolve_predecessor(
+        explicit: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if explicit is None:
+            return None, None  # default: current review
+        stripped = explicit.strip()
+        if not stripped:
+            return None, "predecessor_request_id must be a non-empty request id or omitted"
+        # Only card rework_predecessor (durably pinned from a prior cycle)
+        # and terminal_review.evidence (current cycle) are authoritative.
+        existing = card.get("rework_predecessor")
+        terminal_review = card.get("terminal_review")
+        evidence = (
+            terminal_review.get("evidence")
+            if isinstance(terminal_review, dict)
+            else None
+        )
+        identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+        t_workspace = evidence.get("workspace") if isinstance(evidence, dict) else None
+        t_hashes = (
+            evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
+        )
+        # Check existing rework_predecessor
+        if isinstance(existing, dict):
+            er = str(existing.get("request_id") or "").strip()
+            ew = existing.get("workspace")
+            eh = existing.get("changed_path_hashes")
+            if (
+                er == stripped
+                and isinstance(ew, dict)
+                and str(ew.get("request_id") or "").strip() == stripped
+                and isinstance(eh, dict)
+                and eh
+            ):
+                return {
+                    "request_id": stripped,
+                    "workspace": ew,
+                    "changed_path_hashes": eh,
+                }, None
+        # Check current terminal_review evidence
+        if (
+            isinstance(identity, dict)
+            and str(identity.get("request_id") or "").strip() == stripped
+            and isinstance(t_workspace, dict)
+            and str(t_workspace.get("request_id") or "").strip() == stripped
+            and isinstance(t_hashes, dict)
+            and t_hashes
+        ):
+            return {
+                "request_id": stripped,
+                "workspace": t_workspace,
+                "changed_path_hashes": t_hashes,
+            }, None
+        return (
+            None,
+            f"predecessor_request_id {stripped} not found in retained review evidence",
+        )
+
+    resolved_predecessor, pred_error = _resolve_predecessor(predecessor_request_id)
+    if pred_error:
+        return _lifecycle_error(pred_error)
+
     raw_reason = str(reason or "")
     reason_bytes = raw_reason.encode("utf-8")
     bounded_reason, reason_truncated = _bounded_utf8_prefix(
@@ -3928,7 +4000,7 @@ def reject_review(
     # initial baseline.  Legacy/malformed review evidence is left unpinned so
     # old cards remain rejectable; a new launch then follows the historical
     # clean-HEAD behavior rather than trusting incomplete evidence.
-    if disposition == "pending":
+    if disposition in ("pending", "blocked"):
         terminal_review = card.get("terminal_review")
         evidence = (
             terminal_review.get("evidence")
@@ -3940,28 +4012,38 @@ def reject_review(
         changed_hashes = (
             evidence.get("changed_path_hashes") if isinstance(evidence, dict) else None
         )
-        predecessor_request_id = (
-            str(identity.get("request_id") or "").strip()
-            if isinstance(identity, dict)
-            else ""
-        )
+        if resolved_predecessor is not None:
+            pred_request_id: str = resolved_predecessor["request_id"]
+            pred_workspace: dict[str, Any] = resolved_predecessor["workspace"]
+            pred_changed_hashes: dict[str, str] = resolved_predecessor["changed_path_hashes"]
+        else:
+            pred_request_id = (
+                str(identity.get("request_id") or "").strip()
+                if isinstance(identity, dict)
+                else ""
+            )
+            pred_workspace = workspace
+            pred_changed_hashes = changed_hashes
         if (
-            predecessor_request_id
-            and isinstance(workspace, dict)
-            and str(workspace.get("request_id") or "").strip() == predecessor_request_id
-            and isinstance(changed_hashes, dict)
-            and changed_hashes
+            pred_request_id
+            and isinstance(pred_workspace, dict)
+            and str(pred_workspace.get("request_id") or "").strip() == pred_request_id
+            and isinstance(pred_changed_hashes, dict)
+            and pred_changed_hashes
         ):
             card["rework_predecessor"] = {
                 "schema_id": "aiworkhub.rework_predecessor.v1",
-                "request_id": predecessor_request_id,
-                "workspace": workspace,
-                "changed_path_hashes": changed_hashes,
-                "residual_identities": normalized_residuals,
+                "request_id": pred_request_id,
+                "workspace": pred_workspace,
+                "changed_path_hashes": pred_changed_hashes,
+                "residual_identities": (
+                    normalized_residuals if disposition == "pending" else []
+                ),
                 "pinned_at": now,
             }
-        elif normalized_residuals:
+        elif disposition == "pending" and normalized_residuals:
             return residual_error("residual_contract_requires_review_predecessor")
+    if disposition == "pending":
         # Rework prompts carry one compact delta, never the previous terminal
         # envelope or raw worker transcript.  The retained workspace is the
         # content authority; this object only tells the successor what failed
@@ -3970,9 +4052,9 @@ def reject_review(
             "schema_id": "aiworkhub.rework_feedback_delta.v1",
             "instruction": bounded_reason,
             "reason_identity": reason_identity,
-            "predecessor_request_id": predecessor_request_id,
+            "predecessor_request_id": pred_request_id,
             "predecessor_changed_paths": sorted(
-                str(path) for path in (changed_hashes or {})
+                str(path) for path in (pred_changed_hashes or {})
             )[:256],
             "residual_identities": normalized_residuals,
         }
