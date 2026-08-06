@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-08-06
+
+### Fixed
+
+- Worker launch collision checks are now scoped to the exact candidate task:
+  unrelated planned collisions no longer freeze the whole queue,
+  dependency-blocked pending cards do not claim write authority early, and
+  ready overlapping launches select one deterministic winner.
+- New claim and rework episodes clear stale terminal card fields while
+  preserving predecessor evidence in append-only events and pinned rework
+  receipts.
+
 ## [0.9.6] - 2026-08-06
 
 ### Fixed

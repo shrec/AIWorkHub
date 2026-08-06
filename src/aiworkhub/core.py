@@ -4627,6 +4627,106 @@ def collision_guard(print_json: bool = True) -> dict[str, Any]:
     return _canonical_result(ok=ok, returncode=0 if ok else 1, stdout="\n".join(lines), command=command)
 
 
+def launch_collision_guard(
+    *, task_id: str, print_json: bool = True
+) -> dict[str, Any]:
+    """Check write-scope collisions that can block one exact launch.
+
+    The dashboard collision report intentionally includes every pending card
+    so managers can see future coordination needs.  A launcher must be more
+    precise: an unrelated planned collision cannot freeze the entire queue,
+    and a dependency-blocked pending card does not yet own write authority.
+    Processing/review cards always retain their scopes.  Among dependency-
+    ready pending contenders, a deterministic priority/task-id order admits
+    one winner so concurrent launch attempts cannot both pass preflight.
+    """
+    command = ["launch-collision-guard", task_id]
+    if print_json:
+        command.append("--print")
+    try:
+        cards = _active_cards_for_collision_guard()
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+
+    by_id = {str(card.get("task_id") or ""): card for card in cards}
+    candidate = by_id.get(task_id)
+    if candidate is None:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"collision_candidate_not_found:{task_id}",
+            command=command,
+        )
+
+    def dependencies_ready(card: dict[str, Any]) -> bool:
+        dependencies = card.get("depends_on") or []
+        if not isinstance(dependencies, list):
+            return False
+        for raw_dependency in dependencies:
+            dependency = by_id.get(str(raw_dependency or ""))
+            if dependency is None:
+                # Finished dependencies are absent from the active-card map;
+                # confirm them from canonical storage before declaring ready.
+                dependency = task_store.get_task(repo_root(), str(raw_dependency or ""))
+            if dependency is None or task_store.canonical_status(dependency) != "finished":
+                return False
+        return True
+
+    priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
+
+    def order_key(card: dict[str, Any]) -> tuple[int, str]:
+        priority = str(card.get("priority") or "").strip().lower()
+        return priority_rank.get(priority, 4), str(card.get("task_id") or "")
+
+    candidate_paths = [
+        normalized
+        for raw_path in candidate.get("allowed_writes") or []
+        if (normalized := _normalize_allowed_write_path(str(raw_path)))
+    ]
+    blockers: list[dict[str, Any]] = []
+    for other_id, other in by_id.items():
+        if other_id == task_id:
+            continue
+        other_paths = [
+            normalized
+            for raw_path in other.get("allowed_writes") or []
+            if (normalized := _normalize_allowed_write_path(str(raw_path)))
+        ]
+        overlaps = sorted(
+            {
+                left if left == right else f"{left} <-> {right}"
+                for left in candidate_paths
+                for right in other_paths
+                if _allowed_write_paths_overlap(left, right)
+            }
+        )
+        if not overlaps:
+            continue
+        lifecycle = task_store.canonical_status(other)
+        owns_scope = lifecycle in {"processing", "review"}
+        if lifecycle == "pending" and dependencies_ready(other):
+            owns_scope = order_key(other) < order_key(candidate)
+        if owns_scope:
+            blockers.append(
+                {"task_id": other_id, "lifecycle": lifecycle, "paths": overlaps}
+            )
+
+    result = {
+        "schema_id": "aiworkhub.task_launch_collision_report.v1",
+        "repo": str(repo_root()),
+        "task_id": task_id,
+        "collision_free": not blockers,
+        "blockers": blockers,
+    }
+    stdout = json.dumps(result, ensure_ascii=False, sort_keys=True) if print_json else ""
+    return _canonical_result(
+        ok=not blockers,
+        returncode=0 if not blockers else 1,
+        stdout=stdout,
+        command=command,
+    )
+
+
 def callback_outbox_status() -> dict[str, Any]:
     """Read-only, redacted-safe callback outbox health (bound/unbound task
     counts, pending/inflight/delivered/dead-letter counts). Sourced from

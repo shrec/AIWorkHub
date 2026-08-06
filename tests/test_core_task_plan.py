@@ -269,3 +269,69 @@ def test_archived_rework_does_not_block_pending_codex_runner_auto_pickup():
     result = core.auto_pickup_dryrun(runner="codex_a", topic="coding")
 
     assert result["would_claim_task_id"] == "codex_runner"
+
+
+def test_launch_collision_guard_ignores_unrelated_planned_collision():
+    repo = core.repo_root()
+    _insert_card(repo, "blocked_parent", allowed_writes=["shared.py"])
+    _insert_card(
+        repo,
+        "dependency_blocked_child",
+        allowed_writes=["shared.py"],
+        depends_on=["blocked_parent"],
+    )
+    _insert_card(repo, "independent", allowed_writes=["other.py"])
+
+    global_report = core.collision_guard(print_json=True)
+    launch_report = core.launch_collision_guard(
+        task_id="independent", print_json=True
+    )
+
+    assert global_report["ok"] is False
+    assert launch_report["ok"] is True
+
+
+def test_launch_collision_guard_ignores_dependency_blocked_pending_scope():
+    repo = core.repo_root()
+    _insert_card(repo, "unfinished", allowed_writes=["dependency.py"])
+    _insert_card(
+        repo,
+        "future",
+        allowed_writes=["shared.py"],
+        depends_on=["unfinished"],
+    )
+    _insert_card(repo, "candidate", allowed_writes=["shared.py"])
+
+    result = core.launch_collision_guard(task_id="candidate", print_json=True)
+
+    assert result["ok"] is True
+
+
+def test_launch_collision_guard_blocks_processing_owner():
+    repo = core.repo_root()
+    _insert_card(
+        repo,
+        "owner",
+        status="processing",
+        worker_status="claimed",
+        allowed_writes=["shared.py"],
+    )
+    _insert_card(repo, "candidate", allowed_writes=["shared.py"])
+
+    result = core.launch_collision_guard(task_id="candidate", print_json=True)
+
+    assert result["ok"] is False
+    payload = json.loads(result["stdout"])
+    assert payload["blockers"][0]["task_id"] == "owner"
+
+
+def test_launch_collision_guard_deterministically_selects_ready_pending_winner():
+    repo = core.repo_root()
+    _insert_card(repo, "a_first", allowed_writes=["shared.py"])
+    _insert_card(repo, "z_second", allowed_writes=["shared.py"])
+
+    first = core.launch_collision_guard(task_id="a_first", print_json=True)
+    second = core.launch_collision_guard(task_id="z_second", print_json=True)
+
+    assert first["ok"] is True
+    assert second["ok"] is False

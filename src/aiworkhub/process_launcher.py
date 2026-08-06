@@ -2692,7 +2692,7 @@ class ProcessManager:
             )
         )
         self._show_task = show_task or self._default_show_task
-        self._collision_guard = collision_guard or core.collision_guard
+        self._collision_guard = collision_guard or core.launch_collision_guard
         self._adapter_builder = adapter_builder
         self._popen = popen_factory or subprocess.Popen
         self.isolation_enabled = isolation_enabled
@@ -3072,7 +3072,7 @@ class ProcessManager:
         policy_result = repo_policy.validate_launch(self.repo, card, adapter_id)
         if not policy_result.get("ok"):
             raise LaunchRejected(str(policy_result.get("reason") or "repo_policy_rejected"))
-        collision = self._collision_guard(print_json=True)
+        collision = self._collision_guard(task_id=task_id, print_json=True)
         if collision.get("returncode") != 0:
             raise LaunchRejected("collision_guard_failed")
         return card
