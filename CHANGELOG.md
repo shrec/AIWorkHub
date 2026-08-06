@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-06
+
+### Added
+
+- VS Code LM requests now publish owner-private, request-bound monotonic
+  progress receipts and stream their validated phase into supervisor evidence.
+- Active workers now expose the last meaningful progress time and phase,
+  distinct from the supervisor-owned heartbeat lease.
+
+### Fixed
+
+- Heartbeat-only workers that exceed the configurable meaningful-activity
+  grace are finalized as `worker_stalled:no_meaningful_activity` instead of
+  remaining indefinitely active; exact PID and process start ticks are
+  reverified immediately before terminating the owned process tree.
+- Stall callbacks and terminal evidence preserve idle duration, phase,
+  progress sequence, output-byte counters and exact process identity.
+- Review evidence now combines terminal validation with candidate-tree truth,
+  and only the exact changed-paths-not-applicable skip is non-blocking.
+- VS Code LM progress validation remains fail-closed for unsafe or mismatched
+  sidecars while a missing receipt stays backward-compatible.
+
 ## [0.9.0] - 2026-08-05
 
 ### Fixed

@@ -67,6 +67,8 @@ def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> 
     assert status["token_budget"]["telemetry_authority"] == "telemetry_unavailable"
     assert status["token_budget"]["telemetry_observed"] is False
     assert status["token_budget"]["telemetry_reason"] == "no_provider_usage_report_observed"
+    assert status["last_meaningful_progress_epoch"] >= status["started_at_epoch"]
+    assert status["last_meaningful_phase"] == "provider_output"
     assert Path(spec["stdout_path"]).read_text(encoding="utf-8").strip() == "worker-ok"
     for key in ("status_path", "stdout_path", "stderr_path"):
         assert os.name == "nt" or stat.S_IMODE(Path(spec[key]).stat().st_mode) == 0o600
@@ -80,6 +82,42 @@ def test_supervisor_spawn_failure_is_never_reported_as_success(tmp_path: Path) -
     assert status["state"] == "spawn_failed"
     assert status["exit_code"] == 126
     assert "FileNotFoundError" in status["error"]
+
+
+def test_latest_progress_event_is_bounded_and_uses_newest_sequence(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text(
+        "not-json\n"
+        + json.dumps({"type": "aiworkhub_progress", "sequence": 1, "phase": "request_accepted"})
+        + "\n"
+        + json.dumps({"type": "aiworkhub_progress", "sequence": 2, "phase": "tool_turn"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert worker_supervisor._latest_progress_event(output) == {
+        "sequence": 2,
+        "phase": "tool_turn",
+    }
+
+
+def test_supervisor_persists_trusted_progress_phase(tmp_path: Path) -> None:
+    event = {"type": "aiworkhub_progress", "sequence": 3, "phase": "final_edit"}
+    script = (
+        "import json,time; "
+        f"print(json.dumps({event!r}), flush=True); "
+        "time.sleep(.2)"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(adapter_id="vscode_lm", heartbeat_interval_seconds=0.05)
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["last_progress_sequence"] == 3
+    assert status["last_meaningful_phase"] == "final_edit"
 
 
 def test_supervisor_bounds_verbose_output_and_keeps_tail(tmp_path: Path) -> None:

@@ -62,6 +62,8 @@ MAX_TOTAL_OUTPUT_BYTES = 1024 * 1024 * 1024
 _TRUNCATION_MARKER = b"\n[AIWorkHub: earlier worker output truncated; latest bytes retained]\n"
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 MAX_USAGE_SCAN_BYTES = 32 * 1024 * 1024
+MAX_PROGRESS_SCAN_BYTES = 128 * 1024
+TRUSTED_PROGRESS_ADAPTERS = {"vscode_lm", "deepseek_vscode_lm", "glm_vscode_lm"}
 
 
 class _IoCounters(ctypes.Structure):
@@ -293,6 +295,35 @@ def _usage_total_from_output(path: Path, adapter_id: str) -> int | None:
     return live_total_tokens(summary, adapter_id)
 
 
+def _latest_progress_event(path: Path) -> dict[str, Any]:
+    """Return the newest bounded worker progress event from a JSONL tail."""
+    try:
+        with path.open("rb") as handle:
+            size = path.stat().st_size
+            handle.seek(max(0, size - MAX_PROGRESS_SCAN_BYTES))
+            raw = handle.read(MAX_PROGRESS_SCAN_BYTES)
+    except OSError:
+        return {}
+    for raw_line in reversed(raw.splitlines()):
+        try:
+            payload = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "aiworkhub_progress":
+            continue
+        sequence = payload.get("sequence")
+        phase = payload.get("phase")
+        if (
+            isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+            and sequence > 0
+            and isinstance(phase, str)
+            and phase
+        ):
+            return {"sequence": sequence, "phase": phase[:80]}
+    return {}
+
+
 def _token_budget_config(spec: dict[str, Any]) -> tuple[int | None, str]:
     raw = spec.get("token_budget")
     if raw in (None, {}):
@@ -478,6 +509,9 @@ def supervise(spec: dict[str, Any]) -> int:
         last_stdout_bytes = _file_size(stdout_path)
         last_stderr_bytes = _file_size(stderr_path)
         last_output_change_epoch = started_epoch
+        last_meaningful_progress_epoch = started_epoch
+        last_meaningful_phase = "worker_started"
+        last_progress_sequence = 0
         next_heartbeat_monotonic = time.monotonic()
         _write_json_0600(status_path, {
             "state": "running",
@@ -493,6 +527,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "stdout_bytes": last_stdout_bytes,
             "stderr_bytes": last_stderr_bytes,
             "last_output_change_epoch": last_output_change_epoch,
+            "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+            "last_meaningful_phase": last_meaningful_phase,
+            "last_progress_sequence": last_progress_sequence,
         })
         final_state = "exited"
         while True:
@@ -517,10 +554,24 @@ def supervise(spec: dict[str, Any]) -> int:
                 stderr_bytes = _file_size(stderr_path)
                 if stdout_bytes != last_stdout_bytes or stderr_bytes != last_stderr_bytes:
                     last_output_change_epoch = time.time()
+                    last_meaningful_progress_epoch = last_output_change_epoch
+                    last_meaningful_phase = "provider_output"
                     last_stdout_bytes = stdout_bytes
                     last_stderr_bytes = stderr_bytes
+                progress = (
+                    _latest_progress_event(stdout_path)
+                    if adapter_id in TRUSTED_PROGRESS_ADAPTERS
+                    else {}
+                )
+                progress_sequence = int(progress.get("sequence") or 0)
+                if progress_sequence > last_progress_sequence:
+                    last_progress_sequence = progress_sequence
+                    last_meaningful_progress_epoch = time.time()
+                    last_meaningful_phase = str(progress["phase"])
                 observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
                 if observed_tokens is not None and observed_tokens != last_observed_tokens:
+                    last_meaningful_progress_epoch = time.time()
+                    last_meaningful_phase = "provider_usage"
                     decision = consume_sample(
                         token_state,
                         TokenSample(
@@ -553,6 +604,9 @@ def supervise(spec: dict[str, Any]) -> int:
                     "stdout_bytes": last_stdout_bytes,
                     "stderr_bytes": last_stderr_bytes,
                     "last_output_change_epoch": last_output_change_epoch,
+                    "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+                    "last_meaningful_phase": last_meaningful_phase,
+                    "last_progress_sequence": last_progress_sequence,
                     "token_budget": supervisor_evidence(
                         token_state,
                         token_decisions,
@@ -587,6 +641,18 @@ def supervise(spec: dict[str, Any]) -> int:
             or final_stderr_bytes != last_stderr_bytes
         ):
             last_output_change_epoch = time.time()
+            last_meaningful_progress_epoch = last_output_change_epoch
+            last_meaningful_phase = "provider_output"
+        final_progress = (
+            _latest_progress_event(stdout_path)
+            if adapter_id in TRUSTED_PROGRESS_ADAPTERS
+            else {}
+        )
+        final_progress_sequence = int(final_progress.get("sequence") or 0)
+        if final_progress_sequence > last_progress_sequence:
+            last_progress_sequence = final_progress_sequence
+            last_meaningful_progress_epoch = time.time()
+            last_meaningful_phase = str(final_progress["phase"])
         final_observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
         if (
             final_observed_tokens is not None
@@ -622,6 +688,9 @@ def supervise(spec: dict[str, Any]) -> int:
             "stderr_dropped_bytes": stderr_capture.dropped_bytes,
             "capture_errors": capture_errors,
             "last_output_change_epoch": last_output_change_epoch,
+            "last_meaningful_progress_epoch": last_meaningful_progress_epoch,
+            "last_meaningful_phase": last_meaningful_phase,
+            "last_progress_sequence": last_progress_sequence,
             "token_budget": supervisor_evidence(
                 token_state,
                 token_decisions,

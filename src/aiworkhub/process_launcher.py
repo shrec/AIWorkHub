@@ -306,6 +306,7 @@ GC_DISPOSED_CANONICAL_STATUSES = {"finished", "archived", "pending", "blocked"}
 HEARTBEAT_LEASE_ENV = "AIWORKHUB_HEARTBEAT_LEASE_SECONDS"
 QUIET_WARNING_ENV = "AIWORKHUB_QUIET_WARNING_SECONDS"
 LOST_RECOVERY_GRACE_ENV = "AIWORKHUB_LOST_RECOVERY_GRACE_SECONDS"
+STALL_GRACE_ENV = "AIWORKHUB_STALL_GRACE_SECONDS"
 # 4x the supervisor's default 15s heartbeat interval -- tolerant of scheduler
 # jitter/GC pauses without mistaking a merely-slow heartbeat for unresponsive.
 DEFAULT_HEARTBEAT_LEASE_SECONDS = 60.0
@@ -316,6 +317,7 @@ DEFAULT_QUIET_WARNING_SECONDS = 1800.0
 # still-existing supervisor is escalated to "lost" and its exact process
 # group is terminated by the reconciler.
 DEFAULT_LOST_RECOVERY_GRACE_SECONDS = 120.0
+DEFAULT_STALL_GRACE_SECONDS = 600.0
 LIVENESS_STATES = ("alive", "quiet", "unresponsive", "lost")
 
 
@@ -342,6 +344,12 @@ def quiet_warning_seconds() -> float:
 def lost_recovery_grace_seconds() -> float:
     return _bounded_float_env(
         LOST_RECOVERY_GRACE_ENV, DEFAULT_LOST_RECOVERY_GRACE_SECONDS, minimum=15.0, maximum=3600.0
+    )
+
+
+def stall_grace_seconds() -> float:
+    return _bounded_float_env(
+        STALL_GRACE_ENV, DEFAULT_STALL_GRACE_SECONDS, minimum=30.0, maximum=86_400.0
     )
 
 
@@ -4810,6 +4818,9 @@ class ProcessManager:
             if supervisor_alive and not supervisor_status:
                 return None
             liveness_lost = False
+            stall_detected = False
+            stall_idle_seconds: float | None = None
+            stall_error = ""
             if supervisor_status.get("state") in {"starting", "running"} and supervisor_alive:
                 liveness = derive_liveness_state(
                     now_epoch=time.time(),
@@ -4817,7 +4828,29 @@ class ProcessManager:
                     heartbeat_at_epoch=supervisor_status.get("heartbeat_at_epoch"),
                     last_output_change_epoch=supervisor_status.get("last_output_change_epoch"),
                 )
-                if liveness["liveness_state"] in {"alive", "quiet", "unresponsive"}:
+                meaningful_at = supervisor_status.get("last_meaningful_progress_epoch")
+                if (
+                    supervisor_status.get("state") == "running"
+                    and liveness["liveness_state"] in {"alive", "quiet"}
+                    and isinstance(meaningful_at, (int, float))
+                ):
+                    stall_idle_seconds = max(0.0, time.time() - float(meaningful_at))
+                    if stall_idle_seconds > stall_grace_seconds():
+                        # Reverify the exact process identity immediately before
+                        # termination. A bare or recycled PID is never killed.
+                        if _identity_verified_pid(supervisor_pid, supervisor_ticks):
+                            stall_detected = True
+                            liveness_lost = True
+                            _terminate_process_group(supervisor_pid, grace_seconds=5.0)
+                            supervisor_alive = False
+                            stall_error = (
+                                "worker_stalled:no_meaningful_activity:"
+                                f"idle_seconds={stall_idle_seconds:.3f}"
+                            )
+                if (
+                    not stall_detected
+                    and liveness["liveness_state"] in {"alive", "quiet", "unresponsive"}
+                ):
                     return None
                 # liveness_state == "lost": the heartbeat lease AND bounded
                 # recovery grace both elapsed while the exact supervisor PID
@@ -4827,10 +4860,11 @@ class ProcessManager:
                 # call's registry lock -- then terminate ONLY the exact
                 # matching supervisor/child process group(s). Never act on a
                 # bare "process exists" signal alone.
-                liveness_lost = True
-                if _identity_verified_pid(supervisor_pid, supervisor_ticks):
-                    _terminate_process_group(supervisor_pid, grace_seconds=5.0)
-                supervisor_alive = False
+                if not stall_detected:
+                    liveness_lost = True
+                    if _identity_verified_pid(supervisor_pid, supervisor_ticks):
+                        _terminate_process_group(supervisor_pid, grace_seconds=5.0)
+                    supervisor_alive = False
 
             # An abruptly lost (or heartbeat-lease-lost) supervisor may leave
             # its child running. Kill only when both PID and proc start time
@@ -4849,7 +4883,7 @@ class ProcessManager:
 
             exit_code = supervisor_status.get("exit_code")
             supervisor_state = str(supervisor_status.get("state") or "")
-            error = str(supervisor_status.get("error") or "")[:500]
+            error = stall_error or str(supervisor_status.get("error") or "")[:500]
             if liveness_lost and not error:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
             if supervisor_state == "timed_out":
@@ -4979,6 +5013,22 @@ class ProcessManager:
                             "supervisor_state": supervisor_state,
                             "exit_code": exit_code,
                             "liveness_lost": liveness_lost,
+                            "stall_detected": stall_detected,
+                            "stall_idle_seconds": stall_idle_seconds,
+                            "stall_last_meaningful_phase": supervisor_status.get(
+                                "last_meaningful_phase"
+                            ),
+                            "stall_last_meaningful_progress_epoch": supervisor_status.get(
+                                "last_meaningful_progress_epoch"
+                            ),
+                            "stall_last_progress_sequence": supervisor_status.get(
+                                "last_progress_sequence"
+                            ),
+                            "stall_heartbeat_seq": supervisor_status.get("heartbeat_seq"),
+                            "stall_stdout_bytes": supervisor_status.get("stdout_bytes"),
+                            "stall_stderr_bytes": supervisor_status.get("stderr_bytes"),
+                            "stall_supervisor_pid": supervisor_pid,
+                            "stall_supervisor_pid_start_ticks": supervisor_ticks,
                             "token_budget": supervisor_status.get("token_budget"),
                             "output_budget": supervisor_status.get("output_budget"),
                             **_declared_failure_denominators(metadata),
@@ -5352,6 +5402,20 @@ class ProcessManager:
                     (release_result or {}).get("canonical_lifecycle") or ""
                 )[:40],
                 "liveness_lost": liveness_lost,
+                "stall_detected": stall_detected,
+                "stall_idle_seconds": stall_idle_seconds,
+                "stall_last_meaningful_phase": supervisor_status.get("last_meaningful_phase"),
+                "stall_last_meaningful_progress_epoch": supervisor_status.get(
+                    "last_meaningful_progress_epoch"
+                ),
+                "stall_last_progress_sequence": supervisor_status.get(
+                    "last_progress_sequence"
+                ),
+                "stall_heartbeat_seq": supervisor_status.get("heartbeat_seq"),
+                "stall_stdout_bytes": supervisor_status.get("stdout_bytes"),
+                "stall_stderr_bytes": supervisor_status.get("stderr_bytes"),
+                "stall_supervisor_pid": supervisor_pid,
+                "stall_supervisor_pid_start_ticks": supervisor_ticks,
                 "error": error[:500],
                 "usage": usage,
                 "usage_recorded": usage_recorded,
@@ -5443,6 +5507,11 @@ class ProcessManager:
             "runtime_seconds": runtime_seconds,
             "stdout_bytes": supervisor_status.get("stdout_bytes"),
             "stderr_bytes": supervisor_status.get("stderr_bytes"),
+            "last_meaningful_progress_epoch": supervisor_status.get(
+                "last_meaningful_progress_epoch"
+            ),
+            "last_meaningful_phase": supervisor_status.get("last_meaningful_phase"),
+            "last_progress_sequence": supervisor_status.get("last_progress_sequence"),
         }
 
     def status(self, request_id: str) -> dict[str, Any]:

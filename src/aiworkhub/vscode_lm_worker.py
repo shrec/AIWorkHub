@@ -368,9 +368,43 @@ def run(spec_path: Path) -> dict[str, Any]:
     progress_path = Path(progress_path_raw) if progress_path_raw else None
     timeout_seconds = max(30, min(int(spec.get("timeout_seconds") or 7200), 86_400))
     deadline = time.monotonic() + timeout_seconds
+    last_progress_sequence = 0
+    last_progress_signature: tuple[int, int] | None = None
     while time.monotonic() < deadline:
         if response_path.is_file():
             break
+        if progress_path is not None and (
+            progress_path.exists() or progress_path.is_symlink()
+        ):
+            try:
+                progress_stat = progress_path.lstat()
+                progress_signature = (progress_stat.st_mtime_ns, progress_stat.st_size)
+            except OSError:
+                progress_signature = None
+            if progress_signature is not None and progress_signature != last_progress_signature:
+                progress = read_progress_receipt(
+                    progress_path,
+                    str(spec.get("request_id") or ""),
+                    str(spec.get("repo_id") or ""),
+                    owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+                    previous_sequence=(last_progress_sequence or None),
+                )
+                if progress:
+                    last_progress_sequence = int(progress["sequence"])
+                    print(
+                        json.dumps(
+                            {
+                                "type": "aiworkhub_progress",
+                                "sequence": last_progress_sequence,
+                                "phase": str(progress["phase"]),
+                                "updated_at": str(progress["updated_at"]),
+                            },
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                last_progress_signature = progress_signature
         time.sleep(0.1)
     else:
         raise RuntimeError("vscode_lm_response_timeout")

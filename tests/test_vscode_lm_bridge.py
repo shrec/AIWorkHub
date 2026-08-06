@@ -310,7 +310,6 @@ def test_request_publishes_hash_pinned_edit_and_create_path_contracts(
         },
         timeout_seconds=30,
     )
-
     published = json.loads(request.request_path.read_text(encoding="utf-8"))
     spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
     contracts = published["path_contracts"]
@@ -690,3 +689,77 @@ def test_progress_receipt_present_unsafe_sidecars_fail_closed(tmp_path: Path) ->
     progress.symlink_to(tmp_path / "absent-target.json")
     with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_symlink"):
         vscode_lm_bridge.read_progress_receipt(progress, "a" * 32, "repo_test")
+
+
+def test_worker_streams_monotonic_progress_before_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"])
+    request_id = "a" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Return one bounded edit.",
+        model="glm-5.2",
+        allowed_writes=["out.txt"],
+        timeout_seconds=30,
+    )
+    progress_path = Path(
+        json.loads(request.worker_spec_path.read_text(encoding="utf-8"))["progress_path"]
+    )
+    response = {
+        "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+        "request_id": request_id,
+        "repo_id": repo_id,
+        "model": {"id": "glm-5.2"},
+        "text": json.dumps({
+            "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+            "summary": "done",
+            "creates": [{"path": "out.txt", "content": "ok\n"}],
+            "edits": [],
+        }),
+        "error": "",
+    }
+    sleeps = 0
+
+    def advance(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            vscode_lm_bridge._atomic_json(
+                progress_path,
+                {
+                    "schema_id": vscode_lm_bridge.PROGRESS_RECEIPT_SCHEMA_ID,
+                    "request_id": request_id,
+                    "repo_id": repo_id,
+                    "sequence": 2,
+                    "phase": "tool_turn",
+                    "updated_at": "2026-08-06T08:00:00+00:00",
+                },
+            )
+        elif sleeps == 2:
+            vscode_lm_bridge._atomic_json(request.response_path, response)
+
+    monkeypatch.setattr(vscode_lm_worker.time, "sleep", advance)
+
+    result = vscode_lm_worker.run(request.worker_spec_path)
+
+    output = capsys.readouterr().out
+    progress = json.loads(output.strip())
+    assert progress == {
+        "phase": "tool_turn",
+        "sequence": 2,
+        "type": "aiworkhub_progress",
+        "updated_at": "2026-08-06T08:00:00+00:00",
+    }
+    assert result["is_error"] is False

@@ -508,6 +508,151 @@ def test_supervisor_unresponsive_beyond_grace_is_finalized_as_lost_and_kills_exa
         _kill_if_alive(fake_child)
 
 
+def test_fresh_heartbeat_without_meaningful_progress_is_truthfully_stalled(
+    tmp_path, monkeypatch,
+):
+    card = _card(task_id="TASK_STALL", runner="deepseek_worker_stall")
+    fake_supervisor = _spawn_sleeper()
+    terminated: list[tuple[int, float]] = []
+    release_evidence: list[dict] = []
+    try:
+        manager = _build_manager(tmp_path, card)
+
+        def fake_terminal_failure(
+            repo, task_id, runner, substatus, *, evidence=None, request_id=""
+        ):
+            release_evidence.append(dict(evidence or {}))
+            card.update({"status": "blocked", "worker_status": substatus})
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            process_launcher.task_engine, "mark_terminal_failure", fake_terminal_failure,
+        )
+        monkeypatch.setattr(
+            process_launcher,
+            "_terminate_process_group",
+            lambda pid, grace_seconds: terminated.append((pid, grace_seconds)),
+        )
+        monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "30")
+        now = time.time()
+        ticks = process_launcher._pid_start_ticks(fake_supervisor.pid)
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-meaningful-stall",
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=ticks,
+            supervisor_status={
+                "state": "running",
+                "heartbeat_at_epoch": now,
+                "heartbeat_seq": 42,
+                "last_output_change_epoch": now,
+                "last_meaningful_progress_epoch": now - 45,
+                "last_meaningful_phase": "tool_turn",
+                "last_progress_sequence": 7,
+                "stdout_bytes": 120,
+                "stderr_bytes": 0,
+                "child_pid": 0,
+            },
+        )
+
+        result = manager._finalize_isolated_request("req-meaningful-stall")
+
+        assert result is not None
+        assert result["state"] == "worker_failed"
+        assert result["stall_detected"] is True
+        assert result["stall_last_meaningful_phase"] == "tool_turn"
+        assert result["stall_last_progress_sequence"] == 7
+        assert result["error"].startswith("worker_stalled:no_meaningful_activity")
+        assert terminated == [(fake_supervisor.pid, 5.0)]
+        assert release_evidence[0]["stall_last_meaningful_phase"] == "tool_turn"
+        assert release_evidence[0]["stall_supervisor_pid_start_ticks"] == ticks
+    finally:
+        _kill_if_alive(fake_supervisor)
+
+
+def test_stall_detection_never_terminates_a_recycled_pid(tmp_path, monkeypatch):
+    card = _card(task_id="TASK_PID_REUSE", runner="deepseek_worker_pid")
+    fake_supervisor = _spawn_sleeper()
+    terminated: list[int] = []
+    try:
+        manager = _build_manager(tmp_path, card)
+        monkeypatch.setattr(
+            process_launcher.task_engine,
+            "mark_terminal_failure",
+            lambda *args, **kwargs: {"ok": True},
+        )
+        monkeypatch.setattr(
+            process_launcher,
+            "_terminate_process_group",
+            lambda pid, grace_seconds: terminated.append(pid),
+        )
+        now = time.time()
+        real_ticks = process_launcher._pid_start_ticks(fake_supervisor.pid)
+        assert real_ticks is not None
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-recycled-pid",
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=real_ticks + 1,
+            supervisor_status={
+                "state": "running",
+                "heartbeat_at_epoch": now,
+                "last_output_change_epoch": now,
+                "last_meaningful_progress_epoch": now - 3600,
+                "child_pid": 0,
+            },
+        )
+
+        manager._finalize_isolated_request("req-recycled-pid")
+
+        assert terminated == []
+        assert fake_supervisor.poll() is None
+    finally:
+        _kill_if_alive(fake_supervisor)
+
+
+def test_quiet_worker_below_stall_grace_remains_active(tmp_path, monkeypatch):
+    card = _card(task_id="TASK_QUIET", runner="deepseek_worker_quiet")
+    fake_supervisor = _spawn_sleeper()
+    terminated: list[int] = []
+    try:
+        manager = _build_manager(tmp_path, card)
+        monkeypatch.setattr(
+            process_launcher,
+            "_terminate_process_group",
+            lambda pid, grace_seconds: terminated.append(pid),
+        )
+        monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "30")
+        now = time.time()
+        _seed_request(
+            manager, tmp_path, card,
+            request_id="req-quiet-below-grace",
+            supervisor_pid=fake_supervisor.pid,
+            supervisor_ticks=process_launcher._pid_start_ticks(fake_supervisor.pid),
+            supervisor_status={
+                "state": "running",
+                "heartbeat_at_epoch": now,
+                "last_output_change_epoch": now,
+                "last_meaningful_progress_epoch": now - 10,
+                "last_meaningful_phase": "request_accepted",
+                "child_pid": 0,
+            },
+        )
+
+        assert manager._finalize_isolated_request("req-quiet-below-grace") is None
+        assert terminated == []
+        assert fake_supervisor.poll() is None
+    finally:
+        _kill_if_alive(fake_supervisor)
+
+
+def test_stall_grace_configuration_is_bounded(monkeypatch):
+    monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "1")
+    assert process_launcher.stall_grace_seconds() == 30.0
+    monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "999999")
+    assert process_launcher.stall_grace_seconds() == 86_400.0
+
+
 def test_live_supervisor_before_first_status_write_is_not_failed(tmp_path, monkeypatch):
     """A reconciler racing the supervisor's first status write must leave the
     exact live process and its processing task untouched."""
