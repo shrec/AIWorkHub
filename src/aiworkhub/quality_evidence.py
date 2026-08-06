@@ -1151,7 +1151,11 @@ def run_builtin_static_checks(
                     if row.get(key)
                 })
             ),
-            summary=json.dumps(eval_report, sort_keys=True)[:MAX_SUMMARY_CHARS],
+            summary=(
+                "changed_paths_not_applicable"
+                if eval_status == STATUS_SKIPPED
+                else json.dumps(eval_report, sort_keys=True)[:MAX_SUMMARY_CHARS]
+            ),
             provenance="builtin:registry_driven_eval_artifact_gate.v1",
             error="" if eval_status != STATUS_FAILED else "eval_artifact_evidence_diverged",
         ))

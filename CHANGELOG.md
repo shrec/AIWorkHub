@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-06
+
+### Fixed
+
+- Independent reviewer lenses now reuse one bounded, hash-bound candidate
+  packet instead of repeating target-event, task-card, hash and source-excerpt
+  preparation for every lens.
+- Exact candidate source excerpts are included in the packet delivered to the
+  reviewer prompt, with path/hash identity, truncation metadata and bounded
+  fail-closed reads.
+- Focused regression coverage now protects reviewer packet delivery, reuse,
+  identity/hash drift and truncation behavior.
+
 ## [0.9.1] - 2026-08-06
 
 ### Added

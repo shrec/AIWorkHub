@@ -60,6 +60,7 @@ def build_review_packet(
     terminal_validation: Iterable[object] = (),
     mechanical_checks: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[Mapping[str, Any]] = (),
+    source_evidence: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the only evidence packet an independent reviewer may receive.
 
@@ -141,6 +142,9 @@ def build_review_packet(
             )
         return result
 
+    candidate: dict[str, Any] = {"changed_paths": path_rows}
+    if source_evidence is not None:
+        candidate["source_evidence"] = _source_evidence_rows(source_evidence, path_rows)
     body = {
         "schema_id": PACKET_SCHEMA_ID,
         "target": {
@@ -156,7 +160,7 @@ def build_review_packet(
             "validation": _bounded_strings(validation, limit=MAX_PACKET_COMMANDS),
         },
         "terminal_validation": terminal_validations(terminal_validation),
-        "candidate": {"changed_paths": path_rows},
+        "candidate": candidate,
         "mechanical_checks": checks(mechanical_checks),
         "combined_tree_checks": checks(combined_tree_checks),
     }
@@ -260,9 +264,60 @@ def build_review_prompt(
     )
 
 
+MAX_SOURCE_EVIDENCE_CHARS = 8_000
+MAX_SOURCE_EVIDENCE_TOTAL_CHARS = 120_000
+
+
+def _source_evidence_rows(
+    source_evidence: Mapping[str, Mapping[str, Any]],
+    path_rows: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Validate bounded source evidence bound one-to-one to changed paths."""
+
+    if not isinstance(source_evidence, Mapping) or not source_evidence:
+        raise ReviewerEvidenceError("candidate_source_evidence_missing")
+    expected = {row["path"]: row["sha256"] for row in path_rows}
+    if set(source_evidence) != set(expected):
+        raise ReviewerEvidenceError("candidate_source_evidence_path_mismatch")
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for path in sorted(expected):
+        row = source_evidence[path]
+        if not isinstance(row, Mapping):
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        digest = str(row.get("candidate_sha256") or "")
+        if not _SHA256_RE.fullmatch(digest) or digest != expected[path]:
+            raise ReviewerEvidenceError("candidate_source_evidence_hash_mismatch")
+        excerpt = row.get("excerpt")
+        if not isinstance(excerpt, str):
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        if len(excerpt) > MAX_SOURCE_EVIDENCE_CHARS:
+            raise ReviewerEvidenceError("review_packet_overflow")
+        total += len(excerpt)
+        if total > MAX_SOURCE_EVIDENCE_TOTAL_CHARS:
+            raise ReviewerEvidenceError("review_packet_overflow")
+        source_bytes = int(row.get("source_bytes") or 0)
+        excerpt_bytes = int(row.get("excerpt_bytes") or 0)
+        if source_bytes < 0 or excerpt_bytes < 0 or excerpt_bytes > source_bytes:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        rows.append(
+            {
+                "path": path,
+                "candidate_sha256": digest,
+                "excerpt": excerpt,
+                "excerpt_bytes": excerpt_bytes,
+                "source_bytes": source_bytes,
+                "truncated": bool(row.get("truncated")),
+            }
+        )
+    return rows
+
+
 __all__ = [
     "PACKET_SCHEMA_ID",
     "RECEIPT_SCHEMA_ID",
+    "MAX_SOURCE_EVIDENCE_CHARS",
+    "MAX_SOURCE_EVIDENCE_TOTAL_CHARS",
     "ReviewerEvidenceError",
     "build_review_packet",
     "build_review_prompt",

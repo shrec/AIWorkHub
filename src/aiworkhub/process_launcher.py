@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from . import core
 from . import agent_tool_instructions
@@ -3114,22 +3114,51 @@ class ProcessManager:
             timeout_seconds=timeout_seconds,
         )
 
-    def launch_quality_reviewer(
-        self,
-        *,
-        target_request_id: str,
-        target_task_id: str,
-        reviewer_task_id: str,
-        runner: str,
-        adapter_id: str,
-        lens: str,
-        model: str | None = None,
-        timeout_seconds: int = 1800,
-    ) -> dict[str, Any]:
-        """Create and launch one independent packet-bound reviewer task."""
+    _QUALITY_REVIEW_PREP_LOCK = threading.Lock()
+    _QUALITY_REVIEW_PREP_MAX = 8
+    _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
+    _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
 
-        if lens not in quality_evidence.JUDGMENT_LENSES:
-            return {"ok": False, "error": "quality_review_lens_invalid"}
+    def _quality_review_source_evidence(
+        self, workspace: Any, changed_hashes: Mapping[str, str]
+    ) -> dict[str, dict[str, Any]]:
+        """Read bounded head bytes of each exact candidate path, fail closed."""
+
+        evidence: dict[str, dict[str, Any]] = {}
+        remaining = self._QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES
+        for path in sorted(changed_hashes):
+            candidate = Path(workspace.path) / path
+            limit = max(0, min(self._QUALITY_REVIEW_SOURCE_MAX_BYTES, remaining))
+            try:
+                source_bytes = int(candidate.stat().st_size)
+                with candidate.open("rb") as handle:
+                    head = handle.read(limit + 1)
+            except OSError as exc:
+                raise WorkspaceError(
+                    f"quality_review_candidate_unreadable:{path}"
+                ) from exc
+            body = head[:limit]
+            remaining -= len(body)
+            evidence[path] = {
+                "candidate_sha256": str(changed_hashes[path]),
+                "excerpt": body.decode("utf-8", errors="replace"),
+                "excerpt_bytes": len(body),
+                "source_bytes": max(source_bytes, len(body)),
+                "truncated": bool(source_bytes > len(body)),
+            }
+        return evidence
+
+    def _prepared_quality_review(
+        self, target_request_id: str, target_task_id: str
+    ) -> dict[str, Any]:
+        """Prepare the packet once per exact target and reuse it for all lenses."""
+
+        key = (target_request_id, target_task_id)
+        with self._QUALITY_REVIEW_PREP_LOCK:
+            cache = self.__dict__.setdefault("_quality_review_prepared", {})
+            prepared = cache.get(key)
+        if prepared is not None:
+            return {"ok": True, "prepared": prepared}
         events = self._request_events(target_request_id)
         if not events:
             return {"ok": False, "error": "quality_review_target_request_not_found"}
@@ -3142,8 +3171,6 @@ class ProcessManager:
                 "error": "quality_review_target_not_review_ready",
                 "state": latest.get("state"),
             }
-        if str(latest.get("adapter_id") or "") == adapter_id:
-            return {"ok": False, "error": "quality_review_provider_not_independent"}
         try:
             card = _parse_card(self._show_task(target_task_id), target_task_id)
             terminal = card.get("terminal_review") or {}
@@ -3160,19 +3187,23 @@ class ProcessManager:
             current_hashes = _changed_path_hashes(workspace, list(changed_hashes))
             if current_hashes != changed_hashes:
                 raise WorkspaceError("quality_review_target_hashes_drifted")
+            source_evidence = self._quality_review_source_evidence(
+                workspace, current_hashes
+            )
             initial_gate = evidence.get("quality_gate") or {}
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,
                 task_id=target_task_id,
                 claim_epoch=int(card.get("claim_epoch") or 0),
                 worker_provider=str(latest.get("adapter_id") or latest.get("runner") or ""),
-                changed_path_hashes=changed_hashes,
+                changed_path_hashes=current_hashes,
                 objective=str(card.get("objective") or ""),
                 acceptance=card.get("acceptance") or [],
                 required_outputs=card.get("required_outputs") or [],
                 validation=card.get("validation") or [],
                 terminal_validation=evidence.get("validation") or [],
                 mechanical_checks=initial_gate.get("checks") or [],
+                source_evidence=source_evidence,
             )
         except (
             KeyError,
@@ -3183,6 +3214,45 @@ class ProcessManager:
             quality_reviewer.ReviewerEvidenceError,
         ) as exc:
             return {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
+
+        prepared = {
+            "worker_adapter_id": str(latest.get("adapter_id") or ""),
+            "workspace": workspace,
+            "changed_hashes": dict(current_hashes),
+            "packet": packet,
+        }
+        with self._QUALITY_REVIEW_PREP_LOCK:
+            cache = self.__dict__.setdefault("_quality_review_prepared", {})
+            cache[key] = prepared
+            while len(cache) > self._QUALITY_REVIEW_PREP_MAX:
+                cache.pop(next(iter(cache)))
+        return {"ok": True, "prepared": prepared}
+
+    def launch_quality_reviewer(
+        self,
+        *,
+        target_request_id: str,
+        target_task_id: str,
+        reviewer_task_id: str,
+        runner: str,
+        adapter_id: str,
+        lens: str,
+        model: str | None = None,
+        timeout_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        """Create and launch one independent packet-bound reviewer task."""
+
+        if lens not in quality_evidence.JUDGMENT_LENSES:
+            return {"ok": False, "error": "quality_review_lens_invalid"}
+        prep = self._prepared_quality_review(target_request_id, target_task_id)
+        if not prep.get("ok"):
+            return {key: value for key, value in prep.items() if key != "prepared"}
+        prepared = prep["prepared"]
+        if prepared["worker_adapter_id"] == adapter_id:
+            return {"ok": False, "error": "quality_review_provider_not_independent"}
+        workspace = prepared["workspace"]
+        changed_hashes = prepared["changed_hashes"]
+        packet = prepared["packet"]
 
         created = core.create_task(
             task_id=reviewer_task_id,

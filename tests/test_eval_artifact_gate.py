@@ -88,9 +88,81 @@ def test_changed_path_scoping_and_quality_floor_integration(tmp_path: Path) -> N
         row for row in unrelated if row.check_id == "builtin:eval_artifact_truth"
     )
     assert unrelated_check.status == quality_evidence.STATUS_SKIPPED
+    assert unrelated_check.summary == "changed_paths_not_applicable"
 
     related = quality_evidence.run_builtin_static_checks(
         tmp_path, changed_paths=["eval/summary.json"]
     )
     check = next(row for row in related if row.check_id == "builtin:eval_artifact_truth")
     assert check.status == quality_evidence.STATUS_FAILED
+
+
+def _passing_check() -> quality_evidence.EvidenceCheck:
+    return quality_evidence.EvidenceCheck(
+        check_id="pass",
+        kind="static_analysis",
+        status=quality_evidence.STATUS_PASSED,
+    )
+
+
+def test_non_applicable_eval_artifact_does_not_block_combined_tree() -> None:
+    profile = quality_evidence.resolve_risk_profile("medium")
+    combined_checks = [
+        quality_evidence.EvidenceCheck(
+            check_id="builtin:eval_artifact_truth",
+            kind="requirements",
+            status=quality_evidence.STATUS_SKIPPED,
+            summary="changed_paths_not_applicable",
+        )
+    ]
+    verdict = quality_evidence.fold_quality_verdict(
+        [_passing_check()],
+        risk_profile=profile,
+        combined_tree_checks=combined_checks,
+    )
+    assert not any(
+        blocker.startswith("combined_tree:")
+        for blocker in verdict["blocking_evidence"]
+    )
+
+
+def test_generic_skipped_eval_artifact_still_blocks() -> None:
+    profile = quality_evidence.resolve_risk_profile("medium")
+    combined_checks = [
+        quality_evidence.EvidenceCheck(
+            check_id="builtin:eval_artifact_truth",
+            kind="requirements",
+            status=quality_evidence.STATUS_SKIPPED,
+            summary="some other reason",
+        )
+    ]
+    verdict = quality_evidence.fold_quality_verdict(
+        [_passing_check()],
+        risk_profile=profile,
+        combined_tree_checks=combined_checks,
+    )
+    assert (
+        "combined_tree:builtin:eval_artifact_truth"
+        in verdict["blocking_evidence"]
+    )
+
+
+def test_failed_eval_artifact_always_blocks() -> None:
+    profile = quality_evidence.resolve_risk_profile("medium")
+    combined_checks = [
+        quality_evidence.EvidenceCheck(
+            check_id="builtin:eval_artifact_truth",
+            kind="requirements",
+            status=quality_evidence.STATUS_FAILED,
+            summary="eval_artifact_evidence_diverged",
+        )
+    ]
+    verdict = quality_evidence.fold_quality_verdict(
+        [_passing_check()],
+        risk_profile=profile,
+        combined_tree_checks=combined_checks,
+    )
+    assert (
+        "combined_tree:builtin:eval_artifact_truth"
+        in verdict["blocking_evidence"]
+    )

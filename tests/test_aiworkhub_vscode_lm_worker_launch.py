@@ -1,0 +1,115 @@
+"""Three-lens tests: one packet preparation reused by every reviewer lens."""
+
+from __future__ import annotations
+
+import hashlib
+
+import pytest
+
+from aiworkhub import process_launcher as pl
+from aiworkhub import quality_reviewer
+
+
+class _Workspace:
+    def __init__(self, path, repo, request_id):
+        self.path = path
+        self.repo = repo
+        self.request_id = request_id
+        self.home = path
+
+    def as_metadata(self):
+        return {"path": str(self.path)}
+
+
+class _Manager(pl.ProcessManager):
+    def __init__(self, repo, events):
+        self.repo = repo
+        self._events = events
+        self.event_calls = 0
+        self.card_calls = 0
+
+    def _request_events(self, request_id):
+        self.event_calls += 1
+        return self._events
+
+    def _show_task(self, task_id):
+        self.card_calls += 1
+        return "{}"
+
+
+@pytest.fixture()
+def manager(tmp_path, monkeypatch):
+    workspace_dir = tmp_path / "ws"
+    (workspace_dir / "src").mkdir(parents=True)
+    candidate = workspace_dir / "src" / "mod.py"
+    candidate.write_text("print('candidate marker')\n", encoding="utf-8")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    workspace = _Workspace(workspace_dir, "repo-1", "req1")
+    card = {
+        "claim_epoch": 1,
+        "objective": "objective",
+        "acceptance": [],
+        "required_outputs": [],
+        "validation": [],
+        "terminal_review": {
+            "evidence": {
+                "workspace": {},
+                "changed_path_hashes": {"src/mod.py": digest},
+                "validation": [],
+                "quality_gate": {"checks": []},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        pl.WorkerWorkspace, "from_metadata", staticmethod(lambda meta: workspace)
+    )
+    monkeypatch.setattr(pl, "assert_gc_safe_workspace_shape", lambda *a, **k: None)
+    monkeypatch.setattr(pl, "_parse_card", lambda *a, **k: card)
+    monkeypatch.setattr(
+        pl, "_changed_path_hashes", lambda ws, paths: {"src/mod.py": digest}
+    )
+    events = [
+        {
+            "task_id": "task1",
+            "state": "review_ready",
+            "adapter_id": "adapter-a",
+            "runner": "vscode_lm",
+        }
+    ]
+    return _Manager("repo-1", events), candidate
+
+
+def test_three_lenses_reuse_one_preparation(manager):
+    mgr, _candidate = manager
+    packets = []
+    for _lens in ("correctness", "security", "code_quality"):
+        result = mgr._prepared_quality_review("req1", "task1")
+        assert result["ok"] is True
+        packets.append(result["prepared"]["packet"])
+    assert mgr.event_calls == 1
+    assert mgr.card_calls == 1
+    assert {packet["packet_sha256"] for packet in packets} == {
+        packets[0]["packet_sha256"]
+    }
+
+
+def test_prepared_packet_delivers_source_evidence_in_every_lens_prompt(manager):
+    mgr, _candidate = manager
+    packet = mgr._prepared_quality_review("req1", "task1")["prepared"]["packet"]
+    for lens in ("correctness", "security", "code_quality"):
+        prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
+        assert "candidate marker" in prompt
+
+
+def test_unreadable_candidate_fails_closed(manager):
+    mgr, candidate = manager
+    candidate.unlink()
+    result = mgr._prepared_quality_review("req1", "task1")
+    assert result["ok"] is False
+    assert result["error"].startswith("quality_review_target_invalid:")
+
+
+def test_identity_mismatch_fails_closed(manager):
+    mgr, _candidate = manager
+    result = mgr._prepared_quality_review("req1", "other-task")
+    assert result == {"ok": False, "error": "quality_review_target_identity_mismatch"}
