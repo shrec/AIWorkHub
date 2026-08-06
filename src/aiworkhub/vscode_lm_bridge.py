@@ -136,11 +136,21 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     # Avoid the redundant syscall, but still fail closed for a broader mode.
     if path.parent.stat().st_mode & 0o777 != 0o700:
         os.chmod(path.parent, 0o700)
+    parent_stat = os.stat(path.parent)
+    parent_dev, parent_ino = parent_stat.st_dev, parent_stat.st_ino
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     if len(encoded) > MAX_REQUEST_BYTES:
         raise BridgeError("bridge_document_too_large")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        # Fail closed if the parent directory identity changed between the
+        # mode check above and this descriptor's creation (swap/TOCTOU).
+        current_parent_stat = os.stat(path.parent)
+        if (
+            current_parent_stat.st_dev != parent_dev
+            or current_parent_stat.st_ino != parent_ino
+        ):
+            raise BridgeError("bridge_parent_identity_changed")
         if os.fstat(fd).st_mode & 0o777 != 0o600:
             chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as handle:
@@ -153,8 +163,24 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         os.close(fd)
         fd = -1
         os.replace(tmp_name, path)
-        if path.stat().st_mode & 0o777 != 0o600:
-            os.chmod(path, 0o600)
+        # Re-open the final path by descriptor (never by re-stat-ing the
+        # path) for handle-bound verification, eliminating a path-based
+        # chmod TOCTOU window after replacement. O_NOFOLLOW fails closed on
+        # a symlink swapped in during the race.
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        verify_fd = os.open(path, open_flags)
+        try:
+            final_stat = os.fstat(verify_fd)
+            if final_stat.st_mode & 0o777 != 0o600:
+                chmod_fd(verify_fd, 0o600)
+                final_stat = os.fstat(verify_fd)
+                if final_stat.st_mode & 0o777 != 0o600:
+                    raise BridgeError("bridge_final_mode_insecure")
+            getuid = getattr(os, "getuid", None)
+            if getuid is not None and final_stat.st_uid != getuid():
+                raise BridgeError("bridge_final_owner_mismatch")
+        finally:
+            os.close(verify_fd)
     finally:
         if fd >= 0:
             os.close(fd)
