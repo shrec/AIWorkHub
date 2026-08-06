@@ -6,6 +6,17 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-08-06
+
+### Fixed
+
+- Independent quality reviewers now skip the generic Session/Memory/KB
+  project-context envelope and duplicate VS Code Source Graph prefetch because
+  their exact hash-bound review packet is already the injected authority.
+- Live, on-demand reviewer Source Graph access remains available against the
+  candidate overlay while launch receipts no longer wait on unrelated context
+  bootstrap work.
+
 ## [0.9.2] - 2026-08-06
 
 ### Fixed

@@ -1330,6 +1330,30 @@ def _project_context_delivery(
     }
 
 
+def _launch_project_context(
+    repo: Path,
+    card: dict[str, Any],
+    quality_review_binding: dict[str, Any] | None,
+) -> project_context.ProjectContextResult | None:
+    """Skip the generic envelope when a reviewer already owns a bound packet."""
+
+    if quality_review_binding is not None:
+        return None
+    return project_context.collect_project_context(repo, card)
+
+
+def _launch_source_graph_request(
+    card: dict[str, Any],
+    quality_review_binding: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Reviewer Source Graph is live/on-demand, never a duplicate prefetch."""
+
+    if quality_review_binding is not None:
+        return None
+    request = (card.get("project_context") or {}).get("source_graph")
+    return request if isinstance(request, dict) else None
+
+
 def _receipt_text_candidates(raw_line: str) -> list[str]:
     """Return bounded text payloads used by the supported JSONL adapters."""
     candidates = [raw_line.strip()]
@@ -3356,7 +3380,9 @@ class ProcessManager:
             card = self._with_dependency_inputs(card)
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
-            context_result = project_context.collect_project_context(self.repo, card)
+            context_result = _launch_project_context(
+                self.repo, card, quality_review_binding
+            )
             # Load the BYOK credential (deepseek_copilot_cli) BEFORE claim-start.
             # A missing/invalid credential raises here, leaving the task
             # pending/unclaimed -- never claim on a missing credential.
@@ -3430,10 +3456,8 @@ class ProcessManager:
                     session_topic=worker_session_topic,
                     quality_review_packet_path=review_packet_path,
                 )
-                vscode_source_graph_request = (
-                    (card.get("project_context") or {}).get("source_graph")
-                    if isinstance(card.get("project_context"), dict)
-                    else None
+                vscode_source_graph_request = _launch_source_graph_request(
+                    card, quality_review_binding
                 )
                 vscode_source_graph_result: dict[str, Any] | None = None
                 if (

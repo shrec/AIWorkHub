@@ -113,3 +113,38 @@ def test_identity_mismatch_fails_closed(manager):
     mgr, _candidate = manager
     result = mgr._prepared_quality_review("req1", "other-task")
     assert result == {"ok": False, "error": "quality_review_target_identity_mismatch"}
+
+
+def test_quality_review_skips_generic_project_context_and_prefetch(
+    tmp_path, monkeypatch
+):
+    card = {
+        "project_context": {
+            "source_graph": {"mode": "focus", "query": "slow duplicate prefetch"}
+        }
+    }
+
+    def unexpected_collect(*_args, **_kwargs):
+        raise AssertionError("generic project context must not run for reviewers")
+
+    monkeypatch.setattr(pl.project_context, "collect_project_context", unexpected_collect)
+    binding = {"packet": {"packet_sha256": "a" * 64}}
+
+    assert pl._launch_project_context(tmp_path, card, binding) is None
+    assert pl._launch_source_graph_request(card, binding) is None
+
+
+def test_ordinary_worker_keeps_project_context_and_source_graph_prefetch(
+    tmp_path, monkeypatch
+):
+    request = {"mode": "focus", "query": "worker orientation"}
+    card = {"project_context": {"source_graph": request}}
+    sentinel = object()
+    monkeypatch.setattr(
+        pl.project_context,
+        "collect_project_context",
+        lambda repo, observed_card: sentinel,
+    )
+
+    assert pl._launch_project_context(tmp_path, card, None) is sentinel
+    assert pl._launch_source_graph_request(card, None) == request
