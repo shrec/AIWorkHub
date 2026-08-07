@@ -972,13 +972,6 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     baseline_hash = worker_workspace._hash_path(worked_file)
     raw_sha256 = hashlib.sha256(worked_file.read_bytes()).hexdigest()
 
-    # A second, unrelated allowed-writes path that this episode genuinely
-    # touches -- otherwise the whole finalize would trip the pre-existing
-    # "no_effect" gate regardless of the replay-authorization outcome for
-    # out/result.json, which is not what this test is exercising.
-    marker_file = workspace_dir / "out" / "marker.txt"
-    marker_file.write_text("marker-v1", encoding="utf-8")
-
     import subprocess
 
     def _git(*args):
@@ -989,10 +982,8 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     _git("init", "-q")
     _git("config", "user.email", "tests@example.invalid")
     _git("config", "user.name", "Task MCP Tests")
-    _git("add", "out/result.json", "out/marker.txt")
+    _git("add", "out/result.json")
     _git("commit", "-qm", "baseline")
-    marker_baseline_hash = worker_workspace._hash_path(marker_file)
-    marker_file.write_text("marker-v2", encoding="utf-8")
 
     home_dir = tmp_path / "home"
     home_dir.mkdir()
@@ -1002,15 +993,9 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
         repo=repo,
         path=workspace_dir,
         home=home_dir,
-        allowed_writes=("out/result.json", "out/marker.txt"),
-        parent_baseline={
-            "out/result.json": baseline_hash,
-            "out/marker.txt": marker_baseline_hash,
-        },
-        workspace_baseline={
-            "out/result.json": baseline_hash,
-            "out/marker.txt": marker_baseline_hash,
-        },
+        allowed_writes=("out/result.json",),
+        parent_baseline={"out/result.json": baseline_hash},
+        workspace_baseline={"out/result.json": baseline_hash},
         inherited_rework_paths=("out/result.json",),
     )
 
@@ -1135,6 +1120,7 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     authorization = {**stale_authorization, "next_claim_epoch": 3}
     authorized_event = _run("req-replay-authorized", authorization)
     assert authorized_event["state"] == "review_ready"
+    assert authorized_event["changed_paths"] == []
 
     call = next(c for c in review_calls if c["request_id"] == "req-replay-authorized")
     assert call["substatus"] == "review_ready"

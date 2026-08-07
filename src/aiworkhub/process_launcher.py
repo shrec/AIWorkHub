@@ -5277,20 +5277,33 @@ class ProcessManager:
                             for rec in required_output_records
                             if not rec.get("unchanged_allowed")
                         }
+                        validation_only_replay_records = [
+                            rec["replay_evidence"]
+                            for rec in required_output_records
+                            if rec.get("replay_evidence")
+                        ]
                         changed = sorted(set(changed) | validated_required_paths)
                         if not changed:
-                            if not _metadata_is_readonly_research(metadata, workspace):
+                            if validation_only_replay_records:
+                                # Exact, manager-authorized replay is itself the
+                                # intended effect: validations ran against the
+                                # hash-pinned inherited candidate, while no
+                                # repository delta may be fabricated merely to
+                                # satisfy the ordinary code-task no-effect gate.
+                                pass
+                            elif not _metadata_is_readonly_research(metadata, workspace):
                                 raise WorkspaceError("no_effect")
-                            research_result = _readonly_research_result_evidence(
-                                Path(str(metadata["stdout_path"]))
-                            )
-                            if not research_result.get("meaningful_output"):
-                                raise WorkspaceError(
-                                    str(
-                                        research_result.get("reason")
-                                        or "research_result_missing"
-                                    )
+                            else:
+                                research_result = _readonly_research_result_evidence(
+                                    Path(str(metadata["stdout_path"]))
                                 )
+                                if not research_result.get("meaningful_output"):
+                                    raise WorkspaceError(
+                                        str(
+                                            research_result.get("reason")
+                                            or "research_result_missing"
+                                        )
+                                    )
                             quality_gate = {
                                 "schema_id": "aiworkhub.completion_quality_gate.v1",
                                 "applicable": False,
@@ -5333,11 +5346,7 @@ class ProcessManager:
                                 "changed_paths": changed,
                                 "changed_path_hashes": changed_path_hashes,
                                 "required_outputs": required_output_records,
-                                "validation_only_replay": [
-                                    rec["replay_evidence"]
-                                    for rec in required_output_records
-                                    if rec.get("replay_evidence")
-                                ],
+                                "validation_only_replay": validation_only_replay_records,
                                 "validation": validations,
                                 "worker_mcp_gate": worker_mcp_gate,
                                 "quality_gate": quality_gate,
