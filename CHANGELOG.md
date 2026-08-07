@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.16] - 2026-08-07
+
+### Fixed
+
+- An exact, manager-authorized validation-only replay now reaches review when
+  the hash-pinned inherited output is byte- and mode-identical to canonical;
+  the ordinary `no_effect` gate remains fail-closed for every other code task.
+- Finalization regression coverage now exercises a truly zero-delta replay,
+  including stale/missing authorization failures and structured replay evidence.
+
 ## [0.9.15] - 2026-08-07
 
 ### Added
