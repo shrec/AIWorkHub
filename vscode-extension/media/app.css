@@ -2058,6 +2058,58 @@ tbody tr.is-selected td:first-child {
   margin: 12px 0;
 }
 
+.needfix-controls button,
+.needfix-toolbar button,
+.needfix-capture-form button,
+.needfix-conversion button {
+  min-height: 30px;
+  padding: 5px 11px;
+  border: 1px solid var(--vscode-button-secondaryForeground, var(--ink));
+  border-radius: 4px;
+  color: var(--vscode-button-secondaryForeground, #ffffff);
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  font-weight: 650;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+.needfix-controls button:hover,
+.needfix-toolbar button:hover,
+.needfix-capture-form button:hover,
+.needfix-conversion button:hover {
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--vscode-button-hoverBackground, #1177bb);
+  border-color: var(--vscode-focusBorder, #4daafc);
+}
+
+.needfix-controls button:focus-visible,
+.needfix-toolbar button:focus-visible,
+.needfix-capture-form button:focus-visible,
+.needfix-conversion button:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #4daafc);
+  outline-offset: 2px;
+}
+
+.needfix-controls .primary-button,
+.needfix-capture-form .primary-button,
+.needfix-conversion .primary-button {
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--vscode-button-background, #0e639c);
+  border-color: var(--vscode-button-border, var(--vscode-focusBorder, #4daafc));
+}
+
+.needfix-controls .danger-button {
+  color: #ffffff;
+  background: color-mix(in srgb, var(--blocked) 78%, #4b1111);
+  border-color: var(--blocked);
+}
+
+.needfix-controls .danger-button:hover {
+  color: #ffffff;
+  background: var(--blocked);
+  border-color: #ffffff;
+}
+
 .needfix-conversion {
   padding: 8px;
   border: 1px solid var(--line);
@@ -2065,18 +2117,118 @@ tbody tr.is-selected td:first-child {
   color: var(--muted);
 }
 
-.needfix-conversion pre,
-.needfix-object pre {
-  max-height: 220px;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
 .needfix-object {
   margin-top: 8px;
   border-top: 1px solid var(--line);
   padding-top: 8px;
+}
+
+.needfix-object > summary {
+  padding: 6px 2px;
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.json-visualizer {
+  display: grid;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--surface-subtle) 82%, var(--canvas));
+}
+
+.json-visualizer.compact {
+  padding: 5px;
+  border: 0;
+  background: transparent;
+}
+
+.json-field-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 32%) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 5px 7px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--canvas) 58%, transparent);
+}
+
+.json-field-key {
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.json-field-value {
+  color: var(--ink);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.json-boolean,
+.json-number {
+  color: var(--review);
+  font-weight: 700;
+}
+
+.json-tree-group {
+  padding: 4px 6px;
+  border-left: 2px solid var(--accent);
+}
+
+.json-tree-group > summary {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.json-tree-children {
+  display: grid;
+  gap: 4px;
+  padding: 5px 0 0 8px;
+}
+
+.json-empty {
+  padding: 6px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.needfix-event-timeline {
+  display: grid;
+  gap: 7px;
+  padding: 4px 0;
+}
+
+.needfix-event-card {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface-subtle);
+}
+
+.needfix-event-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.needfix-event-heading time {
+  color: var(--muted);
+  font-size: 9px;
+  text-align: right;
+}
+
+.needfix-conversion-preview {
+  margin-bottom: 8px;
+  color: var(--ink);
 }
 
 @media (max-width: 820px) {

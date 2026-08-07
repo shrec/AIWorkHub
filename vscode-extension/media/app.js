@@ -2104,11 +2104,112 @@ function renderNeedfix(payload) {
   renderNeedfixList();
 }
 
-function appendNeedfixObject(parent, title, value) {
+function humanizeJsonKey(value) {
+  return String(value || "value")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function parseJsonLike(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed || !["{", "["].includes(trimmed[0])) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+function jsonScalarText(value) {
+  if (value === null || value === undefined) return "Not set";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "number") return new Intl.NumberFormat().format(value);
+  const text = String(value);
+  if (/^\d{4}-\d{2}-\d{2}T/.test(text)) {
+    const date = new Date(text);
+    if (!Number.isNaN(date.getTime())) return date.toLocaleString();
+  }
+  return text || "Empty";
+}
+
+function appendJsonNode(parent, key, rawValue, depth = 0) {
+  const value = parseJsonLike(rawValue);
+  if (Array.isArray(value)) {
+    const group = createElement("details", "json-tree-group");
+    group.open = depth < 1;
+    group.appendChild(createElement("summary", "", `${humanizeJsonKey(key)} · ${value.length} item${value.length === 1 ? "" : "s"}`));
+    const body = createElement("div", "json-tree-children");
+    if (!value.length) body.appendChild(createElement("span", "json-empty", "No entries"));
+    value.forEach((item, index) => appendJsonNode(body, `Item ${index + 1}`, item, depth + 1));
+    group.appendChild(body);
+    parent.appendChild(group);
+    return;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value);
+    const group = createElement("details", "json-tree-group");
+    group.open = depth < 1;
+    group.appendChild(createElement("summary", "", `${humanizeJsonKey(key)} · ${entries.length} field${entries.length === 1 ? "" : "s"}`));
+    const body = createElement("div", "json-tree-children");
+    if (!entries.length) body.appendChild(createElement("span", "json-empty", "No fields"));
+    for (const [childKey, childValue] of entries) appendJsonNode(body, childKey, childValue, depth + 1);
+    group.appendChild(body);
+    parent.appendChild(group);
+    return;
+  }
+  const row = createElement("div", "json-field-row");
+  row.append(
+    createElement("span", "json-field-key", humanizeJsonKey(key)),
+    createElement("span", `json-field-value json-${typeof value}`, jsonScalarText(value)),
+  );
+  parent.appendChild(row);
+}
+
+function appendNeedfixObject(parent, title, value, open = false) {
   const section = createElement("details", "needfix-object");
+  section.open = open;
   section.appendChild(createElement("summary", "", title));
-  const pre = createElement("pre", "", JSON.stringify(value || {}, null, 2));
-  section.appendChild(pre);
+  const visualizer = createElement("div", "json-visualizer");
+  const parsed = parseJsonLike(value);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const entries = Object.entries(parsed);
+    if (!entries.length) visualizer.appendChild(createElement("span", "json-empty", "No structured data"));
+    for (const [key, childValue] of entries) appendJsonNode(visualizer, key, childValue);
+  } else if (Array.isArray(parsed)) {
+    if (!parsed.length) visualizer.appendChild(createElement("span", "json-empty", "No entries"));
+    parsed.forEach((item, index) => appendJsonNode(visualizer, `Item ${index + 1}`, item));
+  } else {
+    appendJsonNode(visualizer, "Value", parsed);
+  }
+  section.appendChild(visualizer);
+  parent.appendChild(section);
+}
+
+function appendNeedfixEvents(parent, events) {
+  const section = createElement("details", "needfix-object needfix-events");
+  section.appendChild(createElement("summary", "", `Audit events (${events.length})`));
+  const timeline = createElement("div", "needfix-event-timeline");
+  if (!events.length) timeline.appendChild(createElement("span", "json-empty", "No audit events"));
+  for (const event of events) {
+    const card = createElement("article", "needfix-event-card");
+    const heading = createElement("div", "needfix-event-heading");
+    heading.append(
+      createElement("strong", "", humanizeJsonKey(event.event || event.type || "event")),
+      createElement("time", "", jsonScalarText(event.created_at || event.timestamp || "")),
+    );
+    card.appendChild(heading);
+    const details = { ...event };
+    delete details.event;
+    delete details.type;
+    delete details.created_at;
+    delete details.timestamp;
+    const visualizer = createElement("div", "json-visualizer compact");
+    for (const [key, value] of Object.entries(details)) appendJsonNode(visualizer, key, value);
+    card.appendChild(visualizer);
+    timeline.appendChild(card);
+  }
+  section.appendChild(timeline);
   parent.appendChild(section);
 }
 
@@ -2159,9 +2260,9 @@ function renderNeedfixDetail(payload) {
   const conversion = createElement("div", "needfix-conversion", "Task conversion requires a preview before explicit confirmation.");
   conversion.id = "needfix-conversion";
   fragment.appendChild(conversion);
-  appendNeedfixObject(fragment, "Provenance", item.provenance);
-  appendNeedfixObject(fragment, "Evidence", item.evidence);
-  appendNeedfixObject(fragment, `Audit events (${asArray(payload.events).length})`, asArray(payload.events));
+  appendNeedfixObject(fragment, "Provenance", item.provenance, true);
+  appendNeedfixObject(fragment, "Evidence", item.evidence, true);
+  appendNeedfixEvents(fragment, asArray(payload.events));
   elements.needfixDetailPanel.replaceChildren(fragment);
 }
 
@@ -2175,10 +2276,9 @@ function renderNeedfixAction(payload) {
     state.needfixConversionPreview = payload;
     const box = document.querySelector("#needfix-conversion");
     if (box) {
-      box.replaceChildren(
-        createElement("pre", "", JSON.stringify(payload, null, 2)),
-        needfixActionButton("Confirm task creation", "convertCommit", "primary-button"),
-      );
+      const preview = createElement("div", "json-visualizer needfix-conversion-preview");
+      for (const [key, value] of Object.entries(payload)) appendJsonNode(preview, key, value);
+      box.replaceChildren(preview, needfixActionButton("Confirm task creation", "convertCommit", "primary-button"));
     }
     return;
   }

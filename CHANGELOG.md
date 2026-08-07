@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.11] - 2026-08-07
+
+### Added
+
+- NeedFix provenance, evidence, task-conversion previews and audit events now
+  render as expandable structured trees, typed key/value rows and timeline
+  cards instead of raw JSON text blocks.
+
+### Fixed
+
+- NeedFix primary, secondary and destructive actions now use explicit
+  high-contrast foregrounds, backgrounds, borders, hover states and keyboard
+  focus indicators across dark and light VS Code themes.
+
 ## [0.9.10] - 2026-08-07
 
 ### Fixed

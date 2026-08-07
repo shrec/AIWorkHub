@@ -38,6 +38,9 @@ for (const tool of [
 assert.ok(app.includes("snapshot.needfix"), "header must use canonical NeedFix snapshot");
 assert.ok(app.includes("function renderNeedfix(payload)"));
 assert.ok(app.includes("function renderNeedfixDetail(payload)"));
+assert.ok(app.includes("function appendJsonNode(parent, key, rawValue, depth = 0)"));
+assert.ok(app.includes("function appendNeedfixEvents(parent, events)"));
+assert.ok(app.includes("createElement(\"div\", \"json-visualizer\")"));
 assert.ok(app.includes('type: "requestNeedfix"'));
 assert.ok(app.includes('type: "needfixCapture"'));
 assert.ok(app.includes('type: "needfixConvertPreview"'));
@@ -48,6 +51,11 @@ assert.ok(!app.includes("needfix.sqlite"), "Webview must not access NeedFix stor
 assert.ok(!app.includes("agent_launch_task"), "NeedFix popup must never launch a worker");
 assert.ok(css.includes(".needfix-dialog"));
 assert.ok(css.includes(".needfix-workspace"));
+assert.ok(css.includes(".json-visualizer"));
+assert.ok(css.includes(".json-field-row"));
+assert.ok(css.includes(".needfix-event-timeline"));
+assert.ok(css.includes("var(--vscode-button-secondaryForeground, #ffffff)"));
+assert.ok(css.includes(".needfix-controls .danger-button"));
 
 const operationsStart = extension.indexOf('id="operations-dialog"');
 const operationsEnd = extension.indexOf("</dialog>", operationsStart);
