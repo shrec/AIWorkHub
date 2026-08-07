@@ -36,6 +36,73 @@ def test_atomic_json_skips_redundant_chmod_in_restricted_sandbox(
     assert target.stat().st_mode & 0o777 == 0o600
 
 
+def test_atomic_json_fails_closed_when_parent_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    target = parent / "note.json"
+    parent.mkdir(parents=True)
+    original_inode = parent.stat().st_ino
+    real_mkstemp = vscode_lm_bridge.tempfile.mkstemp
+
+    def rotating_mkstemp(*args, **kwargs):
+        moved = parent.with_name(parent.name + ".moved")
+        parent.rename(moved)
+        parent.mkdir()
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(vscode_lm_bridge.tempfile, "mkstemp", rotating_mkstemp)
+
+    with pytest.raises((OSError, RuntimeError)):
+        vscode_lm_bridge._atomic_json(target, {"rotation": "detected"})  # noqa: SLF001
+
+    assert not target.exists()
+    assert list(parent.iterdir()) == []
+    assert parent.stat().st_ino != original_inode
+
+
+def test_atomic_json_rejects_symlink_replacement_via_descriptor_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "private"
+    target = parent / "note.json"
+    parent.mkdir(parents=True)
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text("attacker", encoding="utf-8")
+    decoy_mode = decoy.stat().st_mode & 0o777
+    real_replace = os.replace
+
+    def racing_replace(src, dst):
+        real_replace(src, dst)
+        replaced = Path(dst)
+        replaced.unlink()
+        replaced.symlink_to(decoy)
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "replace", racing_replace)
+
+    with pytest.raises((OSError, RuntimeError)):
+        vscode_lm_bridge._atomic_json(target, {"safe": "no"})  # noqa: SLF001
+
+    assert decoy.read_text(encoding="utf-8") == "attacker"
+    assert decoy.stat().st_mode & 0o777 == decoy_mode
+
+
+def test_atomic_json_remains_portable_when_getuid_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "private" / "note.json"
+    monkeypatch.delattr(vscode_lm_bridge.os, "getuid", raising=False)
+    payload = {"portable": "über", "ok": True}
+
+    vscode_lm_bridge._atomic_json(target, payload)  # noqa: SLF001
+
+    raw = target.read_bytes()
+    assert "über".encode("utf-8") in raw
+    assert json.loads(raw.decode("utf-8")) == payload
+    assert target.is_file()
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
