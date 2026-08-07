@@ -2345,5 +2345,11 @@ def needfix_convert(needfix_id: str) -> dict:
     return core.needfix_convert(needfix_id)
 
 
+@mcp.tool()
+def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict:
+    """Manager-only: atomically link a NeedFix to an existing, finished, accepted task."""
+    return core.needfix_link_existing_task(needfix_id, existing_task_id)
+
+
 if __name__ == "__main__":
     main()

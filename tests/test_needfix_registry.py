@@ -386,6 +386,187 @@ class TestConvertAtomicIdempotent:
         assert c2.get("resolved") is True
 
 
+class TestLinkExistingTask:
+    """Explicit manager-only link of a NeedFix to an already-existing,
+    same-repository, manager-accepted, finished canonical task."""
+
+    def _tasks(self, **tasks):
+        store = dict(tasks)
+
+        def get_task_fn(task_id):
+            return store.get(task_id)
+
+        def canonical_status_fn(task):
+            return task["status"]
+
+        return get_task_fn, canonical_status_fn
+
+    def _accepted_needfix(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        return needfix_store.accept_needfix(init_store, r["id"])
+
+    def test_link_existing_task_success(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        result = needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", get_task_fn, status_fn
+        )
+        assert result["already_converted"] is False
+        assert result["converted_task_id"] == "task-1"
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "task_created"
+        assert nr["converted_task_id"] == "task-1"
+
+    def test_link_existing_task_idempotent_same_target(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        c1 = needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        assert c1["already_converted"] is False
+        c2 = needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        assert c2["already_converted"] is True
+        assert c2["converted_task_id"] == "task-1"
+
+    def test_link_existing_task_resolved_returns_existing(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        needfix_store.resolve_needfix(init_store, r["id"])
+        c2 = needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        assert c2["already_converted"] is True
+        assert c2.get("resolved") is True
+
+    def test_link_existing_task_conflicting_retry_different_target(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(
+            **{"task-1": {"status": "finished"}, "task-2": {"status": "finished"}}
+        )
+        needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-2", get_task_fn, status_fn)
+
+    def test_link_existing_task_missing_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks()
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "does-not-exist", get_task_fn, status_fn
+            )
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"  # compensated back
+        assert nr["converted_task_id"] is None
+
+    def test_link_existing_task_foreign_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        # ``task-in-other-repo`` never appears in this repo's task lookup,
+        # simulating an id that only exists in a different repository.
+        get_task_fn, status_fn = self._tasks(**{"other-repo-task-9": {"status": "finished"}})
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "task-in-other-repo", get_task_fn, status_fn
+            )
+
+    def test_link_existing_task_fabricated_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.link_existing_task(
+                init_store, r["id"], "totally-fabricated-id", get_task_fn, status_fn
+            )
+
+    def test_link_existing_task_unfinished_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "processing"}})
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"  # compensated back
+
+    def test_link_existing_task_unaccepted_review_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "review"}})
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+
+    def test_link_existing_task_archived_without_acceptance_fails_closed(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "archived"}})
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"  # compensated back
+
+    def test_link_existing_task_captured_cannot_link(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+
+    def test_link_existing_task_concurrency_guard(self, init_store: Path):
+        """Simulate race by directly manipulating the DB to look like it's being claimed."""
+        r = self._accepted_needfix(init_store)
+        conn = needfix_store._connect(init_store)
+        try:
+            conn.execute(
+                "UPDATE needfix SET status = 'converting' WHERE id = ?", (r["id"],)
+            )
+        finally:
+            conn.close()
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+
+    def test_link_existing_task_allows_normal_resolve_transition(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        get_task_fn, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(init_store, r["id"], "task-1", get_task_fn, status_fn)
+        resolved = needfix_store.resolve_needfix(init_store, r["id"])
+        assert resolved["status"] == "resolved"
+
+
+class TestExistingTaskLinkCanonicalDelegation:
+    """Core, server MCP, and dashboard MCP call the same canonical implementation."""
+
+    def test_server_delegates_to_core(self, monkeypatch):
+        from aiworkhub import core, server
+
+        calls = []
+
+        def fake(needfix_id, existing_task_id):
+            calls.append((needfix_id, existing_task_id))
+            return {"ok": True}
+
+        monkeypatch.setattr(core, "needfix_link_existing_task", fake)
+        server.needfix_link_existing_task("NF-2026-00001", "task-1")
+        assert calls == [("NF-2026-00001", "task-1")]
+
+    def test_dashboard_delegates_to_core(self, monkeypatch):
+        from aiworkhub import core, dashboard_mcp_app
+
+        calls = []
+
+        def fake(needfix_id, existing_task_id):
+            calls.append((needfix_id, existing_task_id))
+            return {
+                "needfix_id": needfix_id,
+                "converted_task_id": existing_task_id,
+                "already_converted": False,
+            }
+
+        monkeypatch.setattr(core, "needfix_link_existing_task", fake)
+        result = dashboard_mcp_app.needfix_link_existing_task_view(
+            "NF-2026-00001", "task-1", confirm=True
+        )
+        assert calls == [("NF-2026-00001", "task-1")]
+        assert result["ok"] is True
+
+    def test_dashboard_requires_confirmation(self):
+        from aiworkhub import dashboard_mcp_app
+
+        result = dashboard_mcp_app.needfix_link_existing_task_view("NF-2026-00001", "task-1")
+        assert result["ok"] is False
+
+
 class TestManagerVsWorkerAuthority:
     """Manager mutation vs worker proposal authority."""
 
@@ -459,6 +640,7 @@ class TestServerRegistration:
         "needfix_events",
         "needfix_preview_convert",
         "needfix_convert",
+        "needfix_link_existing_task",
     )
 
     def test_required_functions_callable(self):

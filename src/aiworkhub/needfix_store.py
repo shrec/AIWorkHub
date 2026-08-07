@@ -1099,3 +1099,146 @@ def convert_needfix(
         }
     finally:
         conn.close()
+
+
+def link_existing_task(
+    repo_root: str | Path,
+    needfix_id: str,
+    existing_task_id: str,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+) -> dict[str, Any]:
+    """Explicit, manager-only, atomic, idempotent link to an already-existing task.
+
+    ``get_task_fn`` and ``canonical_status_fn`` must be the existing
+    authoritative task-store ``get_task`` / ``canonical_status`` callables
+    (or adapters around them) bound to this repository; this module never
+    reads or mutates the task store itself.
+
+    Guards mirror ``convert_needfix``:
+    - captured/unverified cannot link (must be accepted or task_planned)
+    - Idempotent short-circuit: an identical retry (same ``needfix_id`` and
+      ``existing_task_id``) on an already ``task_created``/``resolved``
+      NeedFix returns the existing link without reclaiming (lost-ack-safe).
+      A retry with a *different* ``existing_task_id`` fails closed as a
+      conflict instead of silently repointing the link.
+    - Atomic claim via conditional UPDATE from a claimable status to
+      ``converting``; 0 rows updated means another caller already won the
+      race or the row is not claimable -- fails closed.
+    - The candidate task identity is verified only after the claim, against
+      a stable snapshot: missing/foreign/fabricated ids (``get_task_fn``
+      returns ``None``) and ids that are not manager-accepted-and-finished
+      (``canonical_status_fn`` result != ``"finished"``) both fail closed.
+    - On any verification failure the claim is compensated back to its
+      original status so the NeedFix is never stranded as ``task_created``
+      without a real linked task.
+    - On success, atomically records ``task_created`` + ``converted_task_id``
+      plus audited provenance of the link.
+    """
+
+    existing_task_id = str(existing_task_id or "").strip()
+    if not existing_task_id:
+        raise NeedFixValidationError("existing_task_id is required")
+
+    conn = _connect(repo_root)
+    try:
+        row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+        if row is None:
+            raise NeedFixNotFoundError(needfix_id)
+
+        if row["status"] == "task_created":
+            if row["converted_task_id"] == existing_task_id:
+                return {
+                    "needfix_id": needfix_id,
+                    "converted_task_id": row["converted_task_id"],
+                    "already_converted": True,
+                }
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} is already linked to "
+                f"{row['converted_task_id']!r}, not {existing_task_id!r}"
+            )
+
+        if row["status"] == "resolved":
+            if row["converted_task_id"] == existing_task_id:
+                return {
+                    "needfix_id": needfix_id,
+                    "converted_task_id": row["converted_task_id"],
+                    "already_converted": True,
+                    "resolved": True,
+                }
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} is already resolved and linked to "
+                f"{row['converted_task_id']!r}, not {existing_task_id!r}"
+            )
+
+        if row["status"] in ("captured", "triaged"):
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} is {row['status']!r} -- "
+                f"captured/unverified NeedFixes cannot be linked. "
+                f"A manager must first accept this NeedFix."
+            )
+
+        prior_status = row["status"]
+        cur = conn.execute(
+            "UPDATE needfix SET status = 'converting', updated_at = ? "
+            "WHERE id = ? AND status IN ('accepted', 'task_planned')",
+            (_utcnow_iso(), needfix_id),
+        )
+        if cur.rowcount != 1:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} could not be claimed for linking "
+                f"(current status is {prior_status!r}, must be accepted or task_planned)"
+            )
+        _record_event(
+            conn, needfix_id, "existing_task_link_claimed",
+            {"prior_status": prior_status, "existing_task_id": existing_task_id},
+        )
+    finally:
+        conn.close()
+
+    try:
+        task = get_task_fn(existing_task_id)
+        if task is None:
+            raise NeedFixValidationError(
+                f"existing task {existing_task_id!r} not found in this repository"
+            )
+        task_status = canonical_status_fn(task)
+        if task_status != "finished":
+            raise NeedFixConflictError(
+                f"existing task {existing_task_id!r} is not manager-accepted "
+                f"and finished (canonical status is {task_status!r})"
+            )
+    except Exception:
+        conn = _connect(repo_root)
+        try:
+            conn.execute(
+                "UPDATE needfix SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'converting'",
+                (prior_status, _utcnow_iso(), needfix_id),
+            )
+            _record_event(
+                conn, needfix_id, "existing_task_link_compensated",
+                {"restored_status": prior_status},
+            )
+        finally:
+            conn.close()
+        raise
+
+    conn = _connect(repo_root)
+    try:
+        conn.execute(
+            "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
+            "updated_at = ? WHERE id = ? AND status = 'converting'",
+            (existing_task_id, _utcnow_iso(), needfix_id),
+        )
+        _record_event(
+            conn, needfix_id, "existing_task_linked",
+            {"converted_task_id": existing_task_id},
+        )
+        return {
+            "needfix_id": needfix_id,
+            "converted_task_id": existing_task_id,
+            "already_converted": False,
+        }
+    finally:
+        conn.close()

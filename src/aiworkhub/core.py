@@ -6251,3 +6251,20 @@ def needfix_convert(needfix_id: str) -> dict[str, Any]:
         )
 
     return ns.convert_needfix(repo_root(), needfix_id, _create_task_fn)
+
+
+def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[str, Any]:
+    """Explicit manager-only link of a NeedFix to an already-existing,
+    same-repository canonical task that is manager-accepted and finished."""
+    ns = _needfix_store_module()
+
+    def _get_task_fn(task_id: str) -> dict[str, Any] | None:
+        return task_store.get_task(repo_root(), task_id)
+
+    return ns.link_existing_task(
+        repo_root(),
+        needfix_id,
+        existing_task_id,
+        _get_task_fn,
+        task_store.canonical_status,
+    )

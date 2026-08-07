@@ -1144,6 +1144,23 @@ def needfix_convert_commit_view(needfix_id: str, confirm: bool = False) -> dict[
     return _needfix_response(response, "aiworkhub_dashboard_needfix_convert_commit", write=True)
 
 
+def needfix_link_existing_task_view(
+    needfix_id: str, existing_task_id: str, confirm: bool = False
+) -> dict[str, Any]:
+    """USER WRITE: manager-only, explicitly link a NeedFix to an existing, finished, accepted task."""
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_link_existing_task_confirmation_required"}
+    else:
+        try:
+            response = dict(
+                core.needfix_link_existing_task(str(needfix_id or ""), str(existing_task_id or ""))
+            )
+            response.setdefault("ok", True)
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_link_existing_task", write=True)
+
+
 def task_quarantine_view(
     preview_digest: str,
     older_than_days: int | None = None,
@@ -1441,6 +1458,7 @@ NEEDFIX_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_needfix_restore": needfix_restore_view,
     "aiworkhub_dashboard_needfix_purge": needfix_purge_view,
     "aiworkhub_dashboard_needfix_convert_commit": needfix_convert_commit_view,
+    "aiworkhub_dashboard_needfix_link_existing_task": needfix_link_existing_task_view,
 }
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
