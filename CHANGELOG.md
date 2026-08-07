@@ -6,6 +6,18 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.10] - 2026-08-07
+
+### Fixed
+
+- Existing repositories now receive the additive NeedFix schema during MCP
+  startup, before the first read-only dashboard/list request; fresh repository
+  initialization creates the same store in its canonical initialization step.
+- The durable NeedFix store now accepts every intake kind exposed by the
+  dashboard, including ideas, technical debt, optimizations, benchmark gaps,
+  documentation drift, security risks, investigations and roadmap candidates,
+  while preserving the original compatibility values.
+
 ## [0.9.9] - 2026-08-07
 
 ### Added

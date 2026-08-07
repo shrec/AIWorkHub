@@ -1827,6 +1827,11 @@ def initialize_repository(
     except ProviderGuardError as exc:
         raise InitializationRefusedError(f"provider_guard_install_failed:{exc}") from exc
 
+    # NeedFix is an additive repo-local auxiliary store. Fresh initialization
+    # must create it in the same bounded operation so the dashboard's first
+    # read never reports a false missing-table error.
+    needfix_storage = ensure_needfix_storage(repo.root)
+
     readiness = storage_readiness(repo.root)
     return {
         "ok": readiness.ready,
@@ -1839,6 +1844,7 @@ def initialize_repository(
         "legacy_imported": bool(auxiliary["migrated"]),
         "legacy_deleted": False,
         "auxiliary_storage": auxiliary,
+        "needfix_storage": needfix_storage,
         "provider_guards": provider_guards,
         "storage": readiness.as_dict(),
         "timestamp": datetime.now(timezone.utc).isoformat(),

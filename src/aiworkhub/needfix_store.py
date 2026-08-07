@@ -103,7 +103,24 @@ VALID_TRANSITIONS: dict[str, tuple[str, ...]] = {
 
 SEVERITIES: tuple[str, ...] = ("critical", "high", "medium", "low", "info")
 
-KINDS: tuple[str, ...] = ("bug", "feature", "improvement", "refactor", "security", "docs", "other")
+KINDS: tuple[str, ...] = (
+    "bug",
+    "feature",
+    "improvement",
+    "idea",
+    "technical_debt",
+    "optimization",
+    "benchmark_gap",
+    "documentation_drift",
+    "security_risk",
+    "investigation",
+    "roadmap_candidate",
+    # Preserve the foundation's original public values for compatibility.
+    "refactor",
+    "security",
+    "docs",
+    "other",
+)
 
 NF_ID_RE = re.compile(r'^NF-\d{4}-\d{5}$')
 MAX_ID_SEQUENCE = 99999

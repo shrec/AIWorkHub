@@ -2156,6 +2156,16 @@ def _enforce_terminal_retention_safely(root: Path) -> None:
 
 
 def main() -> None:
+    root = core.repo_root()
+    # Additive schema migration for repositories created before NeedFix was
+    # introduced. This runs before any read-only dashboard/list call so those
+    # surfaces remain truthful and do not need hidden write side effects.
+    try:
+        task_store.ensure_needfix_storage(root)
+    except Exception:
+        # Keep MCP diagnostics alive if the auxiliary store cannot be opened;
+        # the bounded NeedFix APIs will then return the concrete store error.
+        pass
     # Every independently launched manager MCP child owns its repository's
     # in-process Source Graph daemon.  Dashboard activation already calls the
     # public ensure tool, but Codex/Claude/Copilot may start this stdio server
@@ -2168,7 +2178,6 @@ def main() -> None:
         # MCP must remain available so health/InitRepo can explain or repair
         # indexing; startup indexing failure must not kill the whole server.
         pass
-    root = core.repo_root()
     # Retention is repository policy, not a dashboard-only manual action.
     # Run it off the MCP stdio thread so startup remains responsive.
     threading.Thread(

@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import needfix_store
+from aiworkhub import needfix_store, task_store
 
 
 @pytest.fixture
@@ -70,6 +70,39 @@ class TestNeedFixIdGeneration:
                 init_store, title=f"T{i}", description=f"D{i}"
             )
             assert needfix_store.NF_ID_RE.match(r["id"])
+
+
+def test_task_store_initialization_creates_needfix_for_first_dashboard_read(
+    tmp_path: Path,
+):
+    """Fresh canonical initialization includes the additive NeedFix schema."""
+    result = task_store.initialize_repository(tmp_path)
+    assert result["needfix_storage"]["initialized"] is True
+    assert needfix_store.list_needfix(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "idea",
+        "technical_debt",
+        "optimization",
+        "benchmark_gap",
+        "documentation_drift",
+        "security_risk",
+        "investigation",
+        "roadmap_candidate",
+    ],
+)
+def test_dashboard_intake_kinds_round_trip(tmp_path: Path, kind: str):
+    needfix_store.initialize_repository(tmp_path)
+    row = needfix_store.capture_proposal(
+        tmp_path,
+        title=f"Kind {kind}",
+        description="Dashboard contract round-trip",
+        kind=kind,
+    )
+    assert row["kind"] == kind
 
 
 class TestLifecycleTransitions:
