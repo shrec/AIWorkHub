@@ -1410,11 +1410,66 @@ def _required_output_glob_matches(workspace_path: Path, pattern: str) -> list[st
     return sorted(set(matches))
 
 
+def _validation_only_replay_evidence(
+    authorization: dict[str, Any] | None,
+    relative: str,
+    raw_sha256: str | None,
+    *,
+    task_id: str,
+    actor: str,
+    predecessor_request_id: str,
+    claim_epoch: int | None,
+) -> dict[str, Any] | None:
+    """Return evidence only for an exact, single-episode replay authorization."""
+    if not isinstance(authorization, dict):
+        return None
+    if authorization.get("one_episode_binding") is not True:
+        return None
+    if not task_id or str(authorization.get("task_id") or "") != task_id:
+        return None
+    if not actor or str(authorization.get("actor") or "") != actor:
+        return None
+    if not predecessor_request_id or str(
+        authorization.get("predecessor_request_id") or ""
+    ) != predecessor_request_id:
+        return None
+    if claim_epoch is None:
+        return None
+    try:
+        authorized_epoch = int(authorization.get("next_claim_epoch"))
+    except (TypeError, ValueError):
+        return None
+    if authorized_epoch != int(claim_epoch):
+        return None
+    pinned_hashes = authorization.get("changed_path_hashes")
+    if not isinstance(pinned_hashes, dict):
+        return None
+    pinned_hash = pinned_hashes.get(relative)
+    if not pinned_hash or not raw_sha256 or pinned_hash != raw_sha256:
+        return None
+    return {
+        "schema_id": "aiworkhub.validation_only_replay_evidence.v1",
+        "path": relative,
+        "sha256": raw_sha256,
+        "task_id": task_id,
+        "actor": actor,
+        "predecessor_request_id": predecessor_request_id,
+        "claim_epoch": int(claim_epoch),
+        "authorized_at": authorization.get("authorized_at"),
+    }
+
+
 def validate_required_outputs(
     workspace: WorkerWorkspace,
     required_outputs: Iterable[str],
     allow_empty: tuple[str, ...] | None = None,
     allow_unchanged: tuple[str, ...] | None = None,
+    *,
+    replay_authorization: dict[str, Any] | None = None,
+    replay_task_id: str = "",
+    replay_actor: str = "",
+    replay_predecessor_request_id: str = "",
+    replay_claim_epoch: int | None = None,
 ) -> list[dict[str, Any]]:
     """Validate every declared required output exists, is non-empty, and changed.
 
@@ -1426,6 +1481,11 @@ def validate_required_outputs(
     ``allow_unchanged`` is an exact path allowlist for required outputs that may
     remain byte-equal to both launch baselines. These records are reported but
     must not be promoted by callers.
+
+    ``replay_authorization`` never widens that allowlist. It permits only an
+    unchanged inherited predecessor path whose raw SHA-256 and exact task,
+    actor, predecessor request, and claim epoch match a one-episode Phase A
+    authorization. Every mismatch preserves the ordinary fail-closed result.
     """
     required_patterns = [_relative_repo_path(raw) for raw in required_outputs]
     unchanged_allowed: set[str] = set()
@@ -1469,9 +1529,22 @@ def validate_required_outputs(
                 current_hash == workspace.workspace_baseline.get(relative)
                 and not inherited_change
             )
+            replay_evidence: dict[str, Any] | None = None
             if is_unchanged:
                 if relative not in unchanged_allowed:
-                    raise WorkspaceError(f"required_output_unchanged:{relative}")
+                    if relative in workspace.inherited_rework_paths:
+                        raw_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+                        replay_evidence = _validation_only_replay_evidence(
+                            replay_authorization,
+                            relative,
+                            raw_sha256,
+                            task_id=replay_task_id,
+                            actor=replay_actor,
+                            predecessor_request_id=replay_predecessor_request_id,
+                            claim_epoch=replay_claim_epoch,
+                        )
+                    if replay_evidence is None:
+                        raise WorkspaceError(f"required_output_unchanged:{relative}")
                 parent_hash = workspace.parent_baseline.get(relative)
                 if current_hash != parent_hash:
                     raise WorkspaceError(f"required_output_unchanged_parent_mismatch:{relative}")
@@ -1479,13 +1552,16 @@ def validate_required_outputs(
                     raise WorkspaceError(f"required_output_unchanged_invalid:{relative}")
             if is_unchanged is False and relative in unchanged_allowed:
                 raise WorkspaceError(f"allow_unchanged_required_output_changed:{relative}")
-            records.append({
+            record = {
                 "pattern": pattern,
                 "path": relative,
                 "bytes": size,
                 "sha256": current_hash,
                 "unchanged_allowed": is_unchanged,
-            })
+            }
+            if replay_evidence is not None:
+                record["replay_evidence"] = replay_evidence
+            records.append(record)
     return records
 
 

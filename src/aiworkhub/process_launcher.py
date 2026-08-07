@@ -3643,6 +3643,19 @@ class ProcessManager:
                     "task_id": task_id,
                     "runner": runner,
                     "topic": topic,
+                    "claim_epoch": int(card.get("claim_epoch") or 0),
+                    "rework_predecessor": (
+                        dict(card["rework_predecessor"])
+                        if isinstance(card.get("rework_predecessor"), dict)
+                        else None
+                    ),
+                    "validation_only_replay_authorization": (
+                        dict(card["validation_only_replay_authorization"])
+                        if isinstance(
+                            card.get("validation_only_replay_authorization"), dict
+                        )
+                        else None
+                    ),
                     "adapter_id": adapter_id,
                     "model": model,
                     "timeout_seconds": timeout_seconds,
@@ -5226,6 +5239,18 @@ class ProcessManager:
                             allow_unchanged=tuple(
                                 metadata.get("allow_unchanged_required_outputs") or []
                             ),
+                            replay_authorization=metadata.get(
+                                "validation_only_replay_authorization"
+                            ),
+                            replay_task_id=str(metadata.get("task_id") or ""),
+                            replay_actor=core.CODEX_RUNNER,
+                            replay_predecessor_request_id=str(
+                                (metadata.get("rework_predecessor") or {}).get(
+                                    "request_id"
+                                )
+                                or ""
+                            ),
+                            replay_claim_epoch=metadata.get("claim_epoch"),
                         )
                         worker_mcp_gate = _worker_mcp_live_call_gate(metadata, request_id)
                         # Always collect deterministic validation evidence
@@ -5308,6 +5333,11 @@ class ProcessManager:
                                 "changed_paths": changed,
                                 "changed_path_hashes": changed_path_hashes,
                                 "required_outputs": required_output_records,
+                                "validation_only_replay": [
+                                    rec["replay_evidence"]
+                                    for rec in required_output_records
+                                    if rec.get("replay_evidence")
+                                ],
                                 "validation": validations,
                                 "worker_mcp_gate": worker_mcp_gate,
                                 "quality_gate": quality_gate,

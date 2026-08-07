@@ -939,6 +939,212 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     assert evidence["workspace"]["path"] == str(workspace_dir)
 
 
+def test_finalize_isolated_request_validation_only_replay_authorization(
+    monkeypatch, tmp_path
+):
+    """NF50 Phase B regression at the real worker finalization callsite
+    (``_finalize_isolated_request``'s ``validate_required_outputs`` call):
+    an unchanged *inherited* predecessor required output only reaches
+    review when the immutable ``metadata`` snapshot carries a Phase A
+    ``validation_only_replay_authorization`` whose exact task, coordinator
+    actor, rework predecessor request, claim epoch, and pinned raw SHA-256
+    all match this exact episode. Without it, the ordinary
+    ``required_output_unchanged`` failure still applies.
+    """
+    if os.name == "nt":
+        pytest.skip("review finalization requires the POSIX secure sandbox backend")
+    _open_gates(monkeypatch)
+    from aiworkhub import worker_workspace
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "out").mkdir(parents=True)
+    canonical_file = repo / "out" / "result.json"
+    canonical_file.write_text("canonical-v1", encoding="utf-8")
+
+    workspace_dir = tmp_path / "workspace"
+    (workspace_dir / "out").mkdir(parents=True)
+    worked_file = workspace_dir / "out" / "result.json"
+    # Byte-identical to canonical: nothing changed within this episode, and
+    # the inherited predecessor content itself matches canonical too, so
+    # this is genuinely a validation-only replay, not a real delta.
+    worked_file.write_text("canonical-v1", encoding="utf-8")
+    baseline_hash = worker_workspace._hash_path(worked_file)
+    raw_sha256 = hashlib.sha256(worked_file.read_bytes()).hexdigest()
+
+    # A second, unrelated allowed-writes path that this episode genuinely
+    # touches -- otherwise the whole finalize would trip the pre-existing
+    # "no_effect" gate regardless of the replay-authorization outcome for
+    # out/result.json, which is not what this test is exercising.
+    marker_file = workspace_dir / "out" / "marker.txt"
+    marker_file.write_text("marker-v1", encoding="utf-8")
+
+    import subprocess
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=workspace_dir, text=True, capture_output=True, check=True
+        )
+
+    _git("init", "-q")
+    _git("config", "user.email", "tests@example.invalid")
+    _git("config", "user.name", "Task MCP Tests")
+    _git("add", "out/result.json", "out/marker.txt")
+    _git("commit", "-qm", "baseline")
+    marker_baseline_hash = worker_workspace._hash_path(marker_file)
+    marker_file.write_text("marker-v2", encoding="utf-8")
+
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id="req-replay-1",
+        repo=repo,
+        path=workspace_dir,
+        home=home_dir,
+        allowed_writes=("out/result.json", "out/marker.txt"),
+        parent_baseline={
+            "out/result.json": baseline_hash,
+            "out/marker.txt": marker_baseline_hash,
+        },
+        workspace_baseline={
+            "out/result.json": baseline_hash,
+            "out/marker.txt": marker_baseline_hash,
+        },
+        inherited_rework_paths=("out/result.json",),
+    )
+
+    def _processing_card():
+        card = _card()
+        card["status"] = "processing"
+        card["worker_status"] = "claimed"
+        card["claimed_by"] = "claude_worker_b1"
+        return card
+
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(_processing_card),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], repo),
+        isolation_enabled=False,
+    )
+    monkeypatch.setattr(
+        process_launcher, "promote", lambda *a, **k: [], raising=False
+    )
+    monkeypatch.setattr(
+        process_launcher.core, "mark_review", lambda *a, **k: {"ok": True}
+    )
+
+    review_calls = []
+
+    def fake_review_terminal_exact(metadata_arg, substatus, *, request_id, error="", evidence=None):
+        review_calls.append(
+            {
+                "request_id": request_id,
+                "task_id": metadata_arg["task_id"],
+                "substatus": substatus,
+                "evidence": evidence or {},
+            }
+        )
+        return {"ok": True, "returncode": 0, "stdout": "{}", "stderr": ""}
+
+    monkeypatch.setattr(manager, "_review_terminal_exact", fake_review_terminal_exact)
+
+    def _run(request_id: str, authorization: dict | None):
+        stdout_path = tmp_path / f"{request_id}.stdout.log"
+        stderr_path = tmp_path / f"{request_id}.stderr.log"
+        stdout_path.write_text("worker complete\n", encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        status_path = tmp_path / f"{request_id}.supervisor.json"
+        metadata_path = tmp_path / f"{request_id}.request.json"
+        worker_workspace.write_json_0600(
+            status_path, {"state": "exited", "exit_code": 0}
+        )
+        metadata = {
+            "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "claude_cli",
+            "model": "claude_cli",
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "supervisor_status_path": str(status_path),
+            "cancel_path": str(tmp_path / f"{request_id}.cancel.json"),
+            "prompt_sha256": "0" * 64,
+            "project_context": None,
+            "project_context_delivery": {"injected": False},
+            "sandbox_backend": "landlock",
+            "validation": [],
+            "required_outputs": ["out/result.json"],
+            "allow_empty_required_outputs": [],
+            "allow_unchanged_required_outputs": [],
+            "external_readonly_dirs": [],
+            "workspace": workspace.as_metadata(),
+            "claim_epoch": 3,
+            "rework_predecessor": {
+                "schema_id": "aiworkhub.rework_predecessor.v1",
+                "request_id": "predecessor-1",
+                "changed_path_hashes": {"out/result.json": raw_sha256},
+            },
+            "validation_only_replay_authorization": authorization,
+        }
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        manager._append_event({
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "claude_cli",
+            "model": "claude_cli",
+            "state": "running",
+            "pid": 999_999_999,
+            "pid_start_ticks": 1,
+            "metadata_path": str(metadata_path),
+            "supervisor_status_path": str(status_path),
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+        })
+        return manager._finalize_isolated_request(request_id, supervisor_returncode=0)
+
+    # Missing authorization: the ordinary required_output_unchanged failure
+    # still applies (this must never silently pass).
+    unauthorized_event = _run("req-replay-unauthorized", None)
+    assert unauthorized_event["state"] == "validation_failed"
+    assert "required_output_unchanged:out/result.json" in unauthorized_event["error"]
+
+    # A wrong claim epoch (stale/replayed episode) fails closed the same way.
+    stale_authorization = {
+        "task_id": "TASK_B1",
+        "actor": process_launcher.core.CODEX_RUNNER,
+        "predecessor_request_id": "predecessor-1",
+        "changed_path_hashes": {"out/result.json": raw_sha256},
+        "authorized_at": "2026-08-07T00:00:00+00:00",
+        "next_claim_epoch": 99,
+        "one_episode_binding": True,
+    }
+    stale_event = _run("req-replay-stale-epoch", stale_authorization)
+    assert stale_event["state"] == "validation_failed"
+    assert "required_output_unchanged:out/result.json" in stale_event["error"]
+
+    # Exact matching authorization: reaches review with structured replay
+    # evidence attached, and manager acceptance/promotion gates untouched.
+    authorization = {**stale_authorization, "next_claim_epoch": 3}
+    authorized_event = _run("req-replay-authorized", authorization)
+    assert authorized_event["state"] == "review_ready"
+
+    call = next(c for c in review_calls if c["request_id"] == "req-replay-authorized")
+    assert call["substatus"] == "review_ready"
+    evidence = call["evidence"]
+    record = evidence["required_outputs"][0]
+    assert record["unchanged_allowed"] is True
+    assert record["replay_evidence"]["sha256"] == raw_sha256
+    assert record["replay_evidence"]["claim_epoch"] == 3
+    assert evidence["validation_only_replay"] == [record["replay_evidence"]]
+
 def test_usage_parser_reads_claude_result_json(tmp_path):
     output = tmp_path / "claude.json"
     output.write_text(json.dumps({

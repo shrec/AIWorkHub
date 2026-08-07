@@ -150,6 +150,122 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
         worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
 
 
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
+
+def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unchanged_predecessor_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    predecessor = worker_workspace.create_workspace(
+        repo,
+        "replay-predecessor",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    successor = None
+    try:
+        candidate = predecessor.path / "out" / "result.txt"
+        # Byte-identical to the canonical repo: no real delta to promote, so
+        # the ordinary inherited-change carve-out (B561) never applies here.
+        candidate.write_text("result-v1\n", encoding="utf-8")
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        successor = worker_workspace.create_workspace(
+            repo,
+            "replay-successor",
+            {
+                "allowed_writes": ["out/result.txt"],
+                "rework_predecessor": {
+                    "schema_id": "aiworkhub.rework_predecessor.v1",
+                    "request_id": "replay-predecessor",
+                    "workspace": predecessor.as_metadata(),
+                    "changed_path_hashes": {"out/result.txt": candidate_hash},
+                },
+            },
+            "validation",
+        )
+        assert successor.inherited_rework_paths == ("out/result.txt",)
+
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="required_output_unchanged:"
+        ):
+            worker_workspace.validate_required_outputs(successor, ["out/result.txt"])
+
+        authorization = {
+            "task_id": "T-REPLAY",
+            "actor": "codex",
+            "predecessor_request_id": "replay-predecessor",
+            "changed_path_hashes": {"out/result.txt": candidate_hash},
+            "authorized_at": "2026-08-07T00:00:00+00:00",
+            "next_claim_epoch": 3,
+            "one_episode_binding": True,
+        }
+        current_identity = {
+            "replay_task_id": "T-REPLAY",
+            "replay_actor": "codex",
+            "replay_predecessor_request_id": "replay-predecessor",
+            "replay_claim_epoch": 3,
+        }
+
+        records = worker_workspace.validate_required_outputs(
+            successor,
+            ["out/result.txt"],
+            replay_authorization=authorization,
+            **current_identity,
+        )
+        assert records[0]["unchanged_allowed"] is True
+        assert records[0]["replay_evidence"]["sha256"] == candidate_hash
+        assert records[0]["replay_evidence"]["claim_epoch"] == 3
+        assert records[0]["replay_evidence"]["task_id"] == "T-REPLAY"
+
+        for bad_authorization in (
+            None,
+            {**authorization, "task_id": "WRONG"},
+            {**authorization, "actor": "someone-else"},
+            {**authorization, "predecessor_request_id": "other-request"},
+            {**authorization, "changed_path_hashes": {"out/result.txt": "0" * 64}},
+            {**authorization, "one_episode_binding": False},
+            {**authorization, "next_claim_epoch": 4},
+        ):
+            with pytest.raises(
+                worker_workspace.WorkspaceError, match="required_output_unchanged:"
+            ):
+                worker_workspace.validate_required_outputs(
+                    successor,
+                    ["out/result.txt"],
+                    replay_authorization=bad_authorization,
+                    **current_identity,
+                )
+
+        for bad_key, bad_value in (
+            ("replay_task_id", "WRONG"),
+            ("replay_actor", "someone-else"),
+            ("replay_predecessor_request_id", "other-request"),
+            ("replay_claim_epoch", 4),
+        ):
+            mismatched_identity = {**current_identity, bad_key: bad_value}
+            with pytest.raises(
+                worker_workspace.WorkspaceError, match="required_output_unchanged:"
+            ):
+                worker_workspace.validate_required_outputs(
+                    successor,
+                    ["out/result.txt"],
+                    replay_authorization=authorization,
+                    **mismatched_identity,
+                )
+
+        # Ordinary non-authorized rework still fails closed.
+        with pytest.raises(
+            worker_workspace.WorkspaceError, match="required_output_unchanged:"
+        ):
+            worker_workspace.validate_required_outputs(successor, ["out/result.txt"])
+    finally:
+        if successor is not None:
+            worker_workspace.cleanup_workspace(repo, successor.path, successor.home)
+        worker_workspace.cleanup_workspace(repo, predecessor.path, predecessor.home)
+
 def test_residual_contract_allows_only_declared_json_pointer_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
