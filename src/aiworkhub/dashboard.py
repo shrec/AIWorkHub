@@ -25,6 +25,7 @@ from aiworkhub import (
     cost_ledger,
     dashboard_kpis,
     deepseek_credentials,
+    needfix_store,
     process_launcher,
     repo_policy,
     source_graph_daemon,
@@ -46,6 +47,7 @@ MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
 # authenticated Source Graph calls, so the dashboard always exposes the
 # denominator and the interpretation label alongside the alert count.
 SOURCE_GRAPH_LONG_CALL_GAP_SECONDS = 15 * 60
+NEEDFIX_SNAPSHOT_LIMIT = 200
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
@@ -1800,6 +1802,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             ),
             "callback_bridge_health": {},
             "task_plan": {},
+            "needfix": _needfix_unavailable(),
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
         }
@@ -2070,6 +2073,10 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         ),
     )
 
+    needfix_snapshot = _build_needfix_snapshot(
+        provider_root or _default_repo_root()
+    )
+
     return {
         "schema_version": 1,
         "generated_at": _utc_now(),
@@ -2108,12 +2115,86 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "kpi_analytics": kpi_analytics,
         "callback_bridge_health": dict(callback_bridge_health),
         "task_plan": dict(task_plan_snapshot),
+        "needfix": needfix_snapshot,
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,
             "runner_mismatches": mismatch_warnings,
         },
         "errors": errors,
+    }
+
+
+# Closed/resolved statuses: not counted as "open" intake NeedFix items.
+_NEEDFIX_CLOSED_STATUSES: frozenset[str] = frozenset(
+    {"resolved", "archived", "rejected", "duplicate"}
+)
+
+
+def _needfix_unavailable() -> dict[str, Any]:
+    """Bounded unavailable state for uninitialized/degraded storage."""
+    return {
+        "schema_id": "aiworkhub.needfix_snapshot.v1",
+        "available": False,
+        "error": "needfix_store_unavailable",
+        "open": 0,
+        "total": 0,
+        "items": [],
+        "limit": 0,
+        "truncated": False,
+    }
+
+
+def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
+    """Build a bounded NeedFix snapshot from the canonical store.
+
+    Uses ``needfix_store.list_needfix`` with the correct signature and
+    canonical repository root. No direct SQLite duplication. Returns an
+    explicit loading/error state rather than a false zero on any failure.
+    The error is surfaced in the returned object itself, not in the main
+    errors list, so a NeedFix store failure never degrades the whole
+    dashboard snapshot.
+    """
+    try:
+        rows = needfix_store.list_needfix(
+            repo_root,
+            include_archived=False,
+            limit=NEEDFIX_SNAPSHOT_LIMIT,
+            order_by="created_at",
+            order_dir="DESC",
+        )
+    except Exception as exc:
+        result = _needfix_unavailable()
+        result["error"] = str(exc)[:500]
+        return result
+
+    total = len(rows)
+    truncated = total >= NEEDFIX_SNAPSHOT_LIMIT
+    open_count = sum(
+        1 for r in rows if r.get("status") not in _NEEDFIX_CLOSED_STATUSES
+    )
+
+    return {
+        "schema_id": "aiworkhub.needfix_snapshot.v1",
+        "available": True,
+        "error": None,
+        "open": open_count,
+        "total": total,
+        "items": [
+            {
+                "id": str(r.get("id") or ""),
+                "title": str(r.get("title") or "")[:200],
+                "status": str(r.get("status") or ""),
+                "kind": str(r.get("kind") or ""),
+                "severity": str(r.get("severity") or ""),
+                "created_at": str(r.get("created_at") or ""),
+                "updated_at": str(r.get("updated_at") or ""),
+                "converted_task_id": str(r.get("converted_task_id") or "") or None,
+            }
+            for r in rows
+        ],
+        "limit": NEEDFIX_SNAPSHOT_LIMIT,
+        "truncated": truncated,
     }
 
 
