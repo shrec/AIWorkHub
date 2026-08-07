@@ -2190,5 +2190,146 @@ def main() -> None:
         task_reconciler.stop_reconciler(root)
 
 
+# --- NeedFix MCP manager tools (additive; bounded, repo-scoped) ---
+
+
+@mcp.tool()
+def needfix_list(
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+    order_by: str = "created_at",
+    order_dir: str = "DESC",
+) -> list[dict]:
+    """List repo-scoped NeedFix entries (bounded)."""
+    return core.needfix_list(
+        status=status,
+        kind=kind,
+        severity=severity,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
+    )
+
+
+@mcp.tool()
+def needfix_show(needfix_id: str) -> dict:
+    """Show one NeedFix by id."""
+    return core.needfix_show(needfix_id)
+
+
+@mcp.tool()
+def needfix_add(
+    title: str,
+    description: str,
+    scope: str | None = None,
+    provenance: dict | None = None,
+    evidence: dict | None = None,
+    status: str = "captured",
+    kind: str = "other",
+    severity: str = "medium",
+    tags: list[str] | None = None,
+    scope_files: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+    evidence_refs: list[str] | None = None,
+    readiness_score: int = 0,
+) -> dict:
+    """Manager-authority add of a NeedFix (dedupe-aware)."""
+    return core.needfix_add(
+        title=title,
+        description=description,
+        scope=scope,
+        provenance=provenance,
+        evidence=evidence,
+        status=status,
+        kind=kind,
+        severity=severity,
+        tags=tags,
+        scope_files=scope_files,
+        scope_symbols=scope_symbols,
+        evidence_refs=evidence_refs,
+        readiness_score=readiness_score,
+    )
+
+
+@mcp.tool()
+def needfix_update(
+    needfix_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    tags: list[str] | None = None,
+    scope_files: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+    evidence: dict | None = None,
+    evidence_refs: list[str] | None = None,
+    readiness_score: int | None = None,
+) -> dict:
+    """Manager update of mutable NeedFix fields."""
+    return core.needfix_update(
+        needfix_id,
+        title=title,
+        description=description,
+        scope=scope,
+        kind=kind,
+        severity=severity,
+        tags=tags,
+        scope_files=scope_files,
+        scope_symbols=scope_symbols,
+        evidence=evidence,
+        evidence_refs=evidence_refs,
+        readiness_score=readiness_score,
+    )
+
+
+@mcp.tool()
+def needfix_archive(needfix_id: str, reason: str | None = None) -> dict:
+    """Explicitly archive (soft, audited, restorable) a NeedFix."""
+    return core.needfix_archive(needfix_id, reason=reason)
+
+
+@mcp.tool()
+def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict:
+    """Explicitly restore an archived NeedFix."""
+    return core.needfix_restore(needfix_id, target_status=target_status)
+
+
+@mcp.tool()
+def needfix_purge(needfix_id: str, audit_reason: str) -> dict:
+    """Audited hard delete of an already-archived NeedFix."""
+    return core.needfix_purge(needfix_id, audit_reason)
+
+
+@mcp.tool()
+def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
+    """Bounded count of NeedFix entries."""
+    return core.needfix_count(status=status, kind=kind, severity=severity)
+
+
+@mcp.tool()
+def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
+    """List events for a NeedFix entry."""
+    return core.needfix_events(needfix_id, limit=limit)
+
+
+@mcp.tool()
+def needfix_preview_convert(needfix_id: str) -> dict:
+    """Preview the task that would be created on conversion."""
+    return core.needfix_preview_convert(needfix_id)
+
+
+@mcp.tool()
+def needfix_convert(needfix_id: str) -> dict:
+    """Explicit conversion atomically claims and creates a task."""
+    return core.needfix_convert(needfix_id)
+
+
 if __name__ == "__main__":
     main()

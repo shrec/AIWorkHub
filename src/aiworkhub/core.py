@@ -6009,4 +6009,237 @@ def source_graph_stop() -> dict[str, Any]:
     deactivation."""
     root = repo_root()
     stopped = _source_graph_daemon_module().stop_daemon(root)
-    return {"ok": True, "stopped": stopped, "repo": str(root)}
+# --- NeedFix manager API (additive; NeedFix is separate from task state) ---
+
+
+def _needfix_store_module():
+    from . import needfix_store
+
+    return needfix_store
+
+
+def needfix_list(
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+    order_by: str = "created_at",
+    order_dir: str = "DESC",
+) -> list[dict[str, Any]]:
+    ns = _needfix_store_module()
+    return ns.list_needfix(
+        repo_root(),
+        status=status,
+        kind=kind,
+        severity=severity,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
+    )
+
+
+def needfix_show(needfix_id: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.get_needfix(repo_root(), needfix_id)
+
+
+def needfix_add(
+    title: str,
+    description: str,
+    scope: str | None = None,
+    provenance: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
+    status: str = "captured",
+    kind: str = "other",
+    severity: str = "medium",
+    tags: list[str] | None = None,
+    scope_files: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+    evidence_refs: list[str] | None = None,
+    readiness_score: int = 0,
+) -> dict[str, Any]:
+    """Manager mutation entry point. Distinct from worker capture authority."""
+    ns = _needfix_store_module()
+    return ns.add_needfix(
+        repo_root(),
+        title=title,
+        description=description,
+        scope=scope,
+        provenance=provenance,
+        evidence=evidence,
+        status=status,
+        kind=kind,
+        severity=severity,
+        tags=tags,
+        scope_files=scope_files,
+        scope_symbols=scope_symbols,
+        evidence_refs=evidence_refs,
+        readiness_score=readiness_score,
+    )
+
+
+def needfix_capture(
+    title: str,
+    description: str,
+    scope: str | None = None,
+    provenance: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
+    kind: str = "other",
+    severity: str = "medium",
+    tags: list[str] | None = None,
+    scope_files: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+    evidence_refs: list[str] | None = None,
+    readiness_score: int = 0,
+) -> dict[str, Any]:
+    """Worker/unverified proposal entry point. Always lands as captured."""
+    ns = _needfix_store_module()
+    return ns.capture_proposal(
+        repo_root(),
+        title=title,
+        description=description,
+        scope=scope,
+        provenance=provenance,
+        evidence=evidence,
+        kind=kind,
+        severity=severity,
+        tags=tags,
+        scope_files=scope_files,
+        scope_symbols=scope_symbols,
+        evidence_refs=evidence_refs,
+        readiness_score=readiness_score,
+    )
+
+
+def needfix_triage(needfix_id: str, *, readiness_score: int | None = None, triage_note: str | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.triage_needfix(repo_root(), needfix_id, readiness_score=readiness_score, triage_note=triage_note)
+
+
+def needfix_accept(needfix_id: str, *, readiness_score: int | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.accept_needfix(repo_root(), needfix_id, readiness_score=readiness_score)
+
+
+def needfix_reject(needfix_id: str, *, reason: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.reject_needfix(repo_root(), needfix_id, reason=reason)
+
+
+def needfix_mark_duplicate(needfix_id: str, duplicate_parent_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.mark_duplicate(repo_root(), needfix_id, duplicate_parent_id, reason=reason)
+
+
+def needfix_defer(needfix_id: str, *, reason: str | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.defer_needfix(repo_root(), needfix_id, reason=reason)
+
+
+def needfix_mark_task_planned(needfix_id: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.mark_task_planned(repo_root(), needfix_id)
+
+
+def needfix_resolve(needfix_id: str, *, resolution_note: str | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.resolve_needfix(repo_root(), needfix_id, resolution_note=resolution_note)
+
+
+def needfix_update(
+    needfix_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    tags: list[str] | None = None,
+    scope_files: list[str] | None = None,
+    scope_symbols: list[str] | None = None,
+    evidence: dict[str, Any] | None = None,
+    evidence_refs: list[str] | None = None,
+    readiness_score: int | None = None,
+) -> dict[str, Any]:
+    """Manager update of mutable NeedFix fields."""
+    ns = _needfix_store_module()
+    return ns.update_needfix(
+        repo_root(),
+        needfix_id,
+        title=title,
+        description=description,
+        scope=scope,
+        kind=kind,
+        severity=severity,
+        tags=tags,
+        scope_files=scope_files,
+        scope_symbols=scope_symbols,
+        evidence=evidence,
+        evidence_refs=evidence_refs,
+        readiness_score=readiness_score,
+    )
+
+
+def needfix_archive(needfix_id: str, reason: str | None = None) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.archive_needfix(repo_root(), needfix_id, reason=reason)
+
+
+def needfix_restore(needfix_id: str, target_status: str = "captured") -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.restore_needfix(repo_root(), needfix_id, target_status=target_status)
+
+
+def needfix_purge(needfix_id: str, audit_reason: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.purge_needfix(repo_root(), needfix_id, audit_reason=audit_reason)
+
+
+def needfix_count(status: str | None = None, kind: str | None = None, severity: str | None = None) -> int:
+    ns = _needfix_store_module()
+    return ns.count_needfix(repo_root(), status=status, kind=kind, severity=severity)
+
+
+def needfix_events(needfix_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    ns = _needfix_store_module()
+    return ns.list_events(repo_root(), needfix_id, limit=limit)
+
+
+def needfix_preview_convert(needfix_id: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.preview_convert(repo_root(), needfix_id)
+
+
+def needfix_convert(needfix_id: str) -> dict[str, Any]:
+    """Explicit conversion using the existing authoritative create_task."""
+    ns = _needfix_store_module()
+
+    def _create_task_fn(card: dict[str, Any]) -> dict[str, Any]:
+        return create_task(
+            task_id=card["task_id"],
+            title=card["title"],
+            runner=card.get("runner", "claude"),
+            topic=card.get("topic", "needfix_conversion"),
+            objective=card["objective"],
+            acceptance=card.get("acceptance", ["Resolve the reported NeedFix"]),
+            allowed_writes=card.get("allowed_writes", []),
+            forbidden=card.get("forbidden"),
+            required_outputs=card.get("required_outputs"),
+            allow_empty_required_outputs=card.get("allow_empty_required_outputs"),
+            allow_unchanged_required_outputs=card.get("allow_unchanged_required_outputs"),
+            validation=card.get("validation"),
+            priority=card.get("priority", "normal"),
+            callback_required=card.get("callback_required", True),
+            task_type=card.get("task_type", "code"),
+            depends_on=card.get("depends_on"),
+            read_first=card.get("read_first"),
+            immutable_inputs=card.get("immutable_inputs"),
+            read_only=card.get("read_only", False),
+            max_live_tokens=card.get("max_live_tokens"),
+        )
+
+    return ns.convert_needfix(repo_root(), needfix_id, _create_task_fn)

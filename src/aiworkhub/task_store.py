@@ -1854,6 +1854,7 @@ __all__ = [
     "SCHEMA_ID",
     "StorageNotReadyError",
     "StorageReadiness",
+    "storage_readiness",
     "TaskStoreError",
     "archive_task",
     "begin_claim_episode",
@@ -1873,5 +1874,14 @@ __all__ = [
     "recover_blocked_rework",
     "restore_task",
     "sha256_file",
-    "storage_readiness",
+    "ensure_needfix_storage",
 ]
+
+
+def ensure_needfix_storage(repo_root) -> dict[str, object]:
+    """Narrow, additive: idempotently ensure the repo-scoped NeedFix store
+    exists alongside canonical task storage. Never mutates task tables and
+    preserves any existing task-store authority/state."""
+    from . import needfix_store
+
+    return needfix_store.initialize_repository(repo_root)
