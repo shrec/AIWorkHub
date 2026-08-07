@@ -2481,24 +2481,42 @@ def validation_argv(command: str) -> list[str]:
     return parse_validation_command(command)[0]
 
 
+def _approved_pythonpath_site(component: str) -> Path:
+    try:
+        target = _require_beneath(Path("/"), Path(component))
+    except WorkspaceError as exc:
+        # Normalize the shared _require_beneath invariant's lexical-symlink /
+        # escape rejections at this public validation boundary so callers see
+        # the absolute-PYTHONPATH identity rather than the internal helper's,
+        # without accepting the path or broadening any trust root.
+        if str(exc).startswith(
+            ("symlink_path_component_forbidden", "path_escapes_workspace")
+        ):
+            raise WorkspaceError(
+                f"validation_pythonpath_absolute_component_forbidden:{component}"
+            ) from exc
+        raise
+    approved_site = Path(site.getusersitepackages()).resolve()
+    if target != approved_site or not target.is_dir():
+        raise WorkspaceError(
+            f"validation_pythonpath_absolute_component_forbidden:{component}"
+        )
+    return target
+
+
 def resolve_validation_pythonpath(
     workspace: WorkerWorkspace, backend: str, components: tuple[str, ...]
 ) -> str:
     """Resolve validated relative directories in the child-visible workspace."""
     base = SANDBOX_WORKSPACE if backend == "bubblewrap" else str(workspace.path)
     resolved: list[str] = []
-    approved_site = Path(site.getusersitepackages()).resolve()
     absolute_index = 0
     for component in components:
         if component == ".":
             resolved.append(base)
             continue
         if component.startswith("/"):
-            target = Path(component).resolve(strict=False)
-            if target != approved_site or target.is_symlink() or not target.is_dir():
-                raise WorkspaceError(
-                    f"validation_pythonpath_absolute_component_forbidden:{component}"
-                )
+            target = _approved_pythonpath_site(component)
             resolved.append(
                 f"/validation-pythonpath/{absolute_index}"
                 if backend == "bubblewrap"
@@ -2603,17 +2621,11 @@ def resolve_trusted_pytest_runtime_root() -> Path:
 
 
 def _validation_pythonpath_readonly_dirs(components: tuple[str, ...]) -> tuple[Path, ...]:
-    approved_site = Path(site.getusersitepackages()).resolve()
     rows: list[Path] = []
     for component in components:
         if not component.startswith("/"):
             continue
-        target = Path(component).resolve(strict=False)
-        if target != approved_site or target.is_symlink() or not target.is_dir():
-            raise WorkspaceError(
-                f"validation_pythonpath_absolute_component_forbidden:{component}"
-            )
-        rows.append(target)
+        rows.append(_approved_pythonpath_site(component))
     return tuple(rows)
 
 
