@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-08-07
+
+### Added
+
+- Blocked rework recovery now supports an explicit, one-episode
+  `validation_only_replay` authorization bound to retained predecessor request
+  identity, changed-path hashes and the next claim epoch.
+
+### Fixed
+
+- Linux Landlock validators now broker only verified `chmod`, `fchmod` and
+  `fchmodat`-family operations on stable, request-owned regular-file targets
+  beneath the exact validation scratch, without globally allowing metadata
+  syscalls or using seccomp notification continuation.
+- The metadata broker now rejects symlink scratch roots, requires libseccomp
+  notification API level 5, closes the fork/parent-death race, preserves child
+  exit status across listener teardown and bounds listener handshakes so a
+  failed setup cannot hang validation.
+- A live `run_validations` integration proves that unmodified `git init` works
+  inside the secured validation scratch while traversal, symlink, hardlink,
+  ownership, mode, identity and malformed-notification cases remain denied.
+
 ## [0.9.13] - 2026-08-07
 
 ### Fixed
