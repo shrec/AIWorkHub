@@ -4120,6 +4120,65 @@ def reject_review(
     )
 
 
+def recover_blocked_rework(
+    task_id: str,
+    *,
+    feedback_reason: str = "",
+    topic: str | None = None,
+) -> dict[str, Any]:
+    """Recover one exact blocked task through the canonical task-store transaction."""
+    card, error = _live_card(task_id)
+    if error:
+        return error
+    assert card is not None
+    live_topic = card.get("topic")
+    if not live_topic:
+        return _lifecycle_error("task has no exact topic identity")
+    if topic is not None and topic != live_topic:
+        return _lifecycle_error(f"topic mismatch expected={live_topic} got={topic}")
+
+    bounded_feedback, _truncated = _bounded_utf8_prefix(
+        str(feedback_reason or "").strip(), _MAX_REWORK_FEEDBACK_BYTES
+    )
+    command = [
+        "recover-blocked-rework",
+        task_id,
+        "--runner",
+        CODEX_RUNNER,
+        "--topic",
+        str(live_topic),
+    ]
+    blocked = _canonical_write_gate(
+        "recover-blocked-rework",
+        runner=CODEX_RUNNER,
+        topic=str(live_topic),
+        coordinator_capability=True,
+    )
+    if blocked is not None:
+        return blocked
+    try:
+        ok, state = task_store.recover_blocked_rework(
+            repo_root(),
+            task_id,
+            actor=CODEX_RUNNER,
+            feedback_reason=bounded_feedback,
+        )
+    except task_store.TaskStoreError as exc:
+        return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
+    if not ok:
+        return _canonical_result(
+            ok=False,
+            returncode=1,
+            stderr=f"recover_blocked_rework_failed:{state}",
+            command=command,
+        )
+    card2 = task_store.get_task(repo_root(), task_id)
+    stdout = json.dumps(card2, ensure_ascii=False, default=str) if card2 else ""
+    return _reconcile_retained_workspaces(
+        _canonical_result(ok=True, returncode=0, stdout=stdout, command=command)
+    )
+
+
 _RETRYABLE_OPERATIONAL_TERMINAL_SUBSTATUSES: frozenset[str] = frozenset(
     {
         "cancelled",

@@ -147,6 +147,75 @@ def test_server_lifecycle_tools_preserve_public_schema(monkeypatch):
     ]
 
 
+def test_server_recover_blocked_rework_forwards_public_schema(monkeypatch):
+    calls = []
+
+    def recover(task_id, *, feedback_reason=""):
+        calls.append((task_id, feedback_reason))
+        return {"ok": True, "task_id": task_id}
+
+    monkeypatch.setattr(core, "recover_blocked_rework", recover)
+
+    result = server.aiworkhub_task_recover_blocked_rework("T_BLOCKED", "focused repair")
+
+    assert result == {"ok": True, "task_id": "T_BLOCKED"}
+    assert calls == [("T_BLOCKED", "focused repair")]
+
+
+def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeypatch):
+    calls = []
+    card = {"task_id": "T_BLOCKED", "topic": "blocked_rework"}
+    monkeypatch.setattr(core, "_live_card", lambda task_id: (card, None))
+
+    def gate(action, **kwargs):
+        calls.append(("gate", action, kwargs))
+        return None
+
+    def recover(root, task_id, *, actor, feedback_reason):
+        calls.append(("recover", root, task_id, actor, feedback_reason))
+        return True, "recovered"
+
+    monkeypatch.setattr(core, "_canonical_write_gate", gate)
+    monkeypatch.setattr(task_store, "recover_blocked_rework", recover)
+    monkeypatch.setattr(task_store, "get_task", lambda root, task_id: card)
+    monkeypatch.setattr(core, "_reconcile_retained_workspaces", lambda result: result)
+
+    result = core.recover_blocked_rework(
+        "T_BLOCKED", feedback_reason=" focused repair ", topic="blocked_rework"
+    )
+
+    assert result["ok"] is True
+    assert calls[0] == (
+        "gate",
+        "recover-blocked-rework",
+        {
+            "runner": core.CODEX_RUNNER,
+            "topic": "blocked_rework",
+            "coordinator_capability": True,
+        },
+    )
+    assert calls[1][0:3] == ("recover", core.repo_root(), "T_BLOCKED")
+    assert calls[1][3:] == (core.CODEX_RUNNER, "focused repair")
+
+
+def test_core_recover_blocked_rework_topic_mismatch_fails_before_write(monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "_live_card",
+        lambda task_id: ({"task_id": task_id, "topic": "expected"}, None),
+    )
+    monkeypatch.setattr(
+        core,
+        "_canonical_write_gate",
+        lambda *args, **kwargs: pytest.fail("write gate must not run on topic mismatch"),
+    )
+
+    result = core.recover_blocked_rework("T_BLOCKED", topic="wrong")
+
+    assert result["ok"] is False
+    assert "topic mismatch" in result["stderr"]
+
+
 def test_server_reject_review_passes_predecessor_request_id(monkeypatch):
     """The server MCP tool forwards predecessor_request_id to core.reject_review
     when provided, and omits it when None (safe default)."""
