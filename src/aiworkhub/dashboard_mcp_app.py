@@ -26,6 +26,7 @@ from aiworkhub import (
     context_graph,
     dashboard,
     feature_settings,
+    needfix_store,
     process_launcher,
     repo_policy,
     repository_bootstrap,
@@ -895,6 +896,254 @@ def task_restore_view(task_id: str, reason: str = "", confirm: bool = False) -> 
     return response
 
 
+def _needfix_response(response: Mapping[str, Any], tool: str, *, write: bool = False) -> dict[str, Any]:
+    """Attach dashboard authority metadata to one bounded NeedFix response."""
+    result = dict(response)
+    result["server_tool"] = tool
+    result["authority_flags"] = (
+        _storage_write_authority_flags() if write else _readonly_authority_flags()
+    )
+    return result
+
+
+def _bounded_needfix_row(row: Mapping[str, Any], *, include_detail: bool = False) -> dict[str, Any]:
+    """Return only bounded fields safe for the native Webview."""
+    result: dict[str, Any] = {
+        "id": str(row.get("id") or "")[:32],
+        "title": str(row.get("title") or "")[:240],
+        "status": str(row.get("status") or "")[:40],
+        "kind": str(row.get("kind") or "")[:60],
+        "severity": str(row.get("severity") or "")[:24],
+        "readiness_score": max(0, min(100, int(row.get("readiness_score") or 0))),
+        "duplicate_parent_id": str(row.get("duplicate_parent_id") or "")[:32] or None,
+        "converted_task_id": str(row.get("converted_task_id") or "")[:200] or None,
+        "created_at": str(row.get("created_at") or "")[:64],
+        "updated_at": str(row.get("updated_at") or "")[:64],
+        "archived_at": str(row.get("archived_at") or "")[:64] or None,
+        "tags": [str(value)[:80] for value in list(row.get("tags") or [])[:24]],
+        "scope_files": [str(value)[:500] for value in list(row.get("scope_files") or [])[:48]],
+        "scope_symbols": [str(value)[:300] for value in list(row.get("scope_symbols") or [])[:48]],
+        "evidence_refs": [str(value)[:500] for value in list(row.get("evidence_refs") or [])[:48]],
+    }
+    if include_detail:
+        result.update({
+            "description": str(row.get("description") or "")[:8000],
+            "scope": str(row.get("scope") or "")[:4000] or None,
+            "provenance": dict(list((row.get("provenance") or {}).items())[:32])
+            if isinstance(row.get("provenance"), Mapping) else {},
+            "evidence": dict(list((row.get("evidence") or {}).items())[:32])
+            if isinstance(row.get("evidence"), Mapping) else {},
+        })
+    return result
+
+
+def needfix_list_view(
+    status: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """READ-ONLY: bounded canonical NeedFix inbox for the native Webview."""
+    bounded_limit = max(1, min(int(limit or 100), 200))
+    bounded_offset = max(0, int(offset or 0))
+    try:
+        rows = core.needfix_list(
+            status=str(status)[:40] if status else None,
+            kind=str(kind)[:60] if kind else None,
+            severity=str(severity)[:24] if severity else None,
+            include_archived=include_archived is True,
+            limit=bounded_limit,
+            offset=bounded_offset,
+        )
+        response = {
+            "ok": True,
+            "entries": [_bounded_needfix_row(row) for row in rows],
+            "count": len(rows),
+            "limit": bounded_limit,
+            "offset": bounded_offset,
+            "truncated": len(rows) >= bounded_limit,
+        }
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240], "entries": []}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_list")
+
+
+def needfix_detail_view(needfix_id: str, event_limit: int = 50) -> dict[str, Any]:
+    """READ-ONLY: one bounded NeedFix row plus its audit events."""
+    candidate = str(needfix_id or "")
+    if not needfix_store.NF_ID_RE.fullmatch(candidate):
+        return _needfix_response(
+            {"ok": False, "error": "invalid_needfix_id"},
+            "aiworkhub_dashboard_needfix_detail",
+        )
+    try:
+        row = core.needfix_show(candidate)
+        events = core.needfix_events(candidate, limit=max(1, min(int(event_limit or 50), 100)))
+        response = {
+            "ok": True,
+            "item": _bounded_needfix_row(row, include_detail=True),
+            "events": [dict(list(event.items())[:24]) for event in events[:100]],
+        }
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_detail")
+
+
+def needfix_capture_view(
+    title: str,
+    description: str,
+    kind: str = "other",
+    severity: str = "medium",
+    scope: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """USER WRITE: explicitly capture one dashboard-authored proposal."""
+    try:
+        row = core.needfix_capture(
+            title=str(title or "")[:240],
+            description=str(description or "")[:8000],
+            kind=str(kind or "other")[:60],
+            severity=str(severity or "medium")[:24],
+            scope=str(scope or "")[:4000] or None,
+            tags=[str(value)[:80] for value in list(tags or [])[:24]],
+            provenance={"source": "dashboard_user"},
+        )
+        response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_capture", write=True)
+
+
+def needfix_update_view(
+    needfix_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+    severity: str | None = None,
+    tags: list[str] | None = None,
+    readiness_score: int | None = None,
+) -> dict[str, Any]:
+    """USER WRITE: update bounded mutable NeedFix fields."""
+    candidate = str(needfix_id or "")
+    try:
+        row = core.needfix_update(
+            candidate,
+            title=str(title)[:240] if title is not None else None,
+            description=str(description)[:8000] if description is not None else None,
+            scope=str(scope)[:4000] if scope is not None else None,
+            kind=str(kind)[:60] if kind is not None else None,
+            severity=str(severity)[:24] if severity is not None else None,
+            tags=[str(value)[:80] for value in list(tags)[:24]] if tags is not None else None,
+            readiness_score=max(0, min(100, int(readiness_score))) if readiness_score is not None else None,
+        )
+        response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_update", write=True)
+
+
+def needfix_transition_view(
+    needfix_id: str,
+    action: str,
+    reason: str = "",
+    readiness_score: int | None = None,
+    duplicate_parent_id: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """USER WRITE: one explicit, confirmed NeedFix lifecycle transition."""
+    candidate = str(needfix_id or "")
+    selected = str(action or "").strip().lower()
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_transition_confirmation_required"}
+    else:
+        try:
+            if selected == "triage":
+                row = core.needfix_triage(candidate, readiness_score=readiness_score, triage_note=str(reason)[:1000] or None)
+            elif selected == "accept":
+                row = core.needfix_accept(candidate, readiness_score=readiness_score)
+            elif selected == "reject":
+                row = core.needfix_reject(candidate, reason=str(reason)[:1000])
+            elif selected == "duplicate":
+                row = core.needfix_mark_duplicate(candidate, str(duplicate_parent_id)[:32], reason=str(reason)[:1000] or None)
+            elif selected == "defer":
+                row = core.needfix_defer(candidate, reason=str(reason)[:1000] or None)
+            elif selected == "task_planned":
+                row = core.needfix_mark_task_planned(candidate)
+            elif selected == "resolve":
+                row = core.needfix_resolve(candidate, resolution_note=str(reason)[:1000] or None)
+            else:
+                return _needfix_response(
+                    {"ok": False, "error": "invalid_needfix_transition"},
+                    "aiworkhub_dashboard_needfix_transition",
+                    write=True,
+                )
+            response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_transition", write=True)
+
+
+def needfix_archive_view(needfix_id: str, reason: str = "", confirm: bool = False) -> dict[str, Any]:
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_archive_confirmation_required"}
+    else:
+        try:
+            row = core.needfix_archive(str(needfix_id or ""), reason=str(reason)[:1000] or None)
+            response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_archive", write=True)
+
+
+def needfix_restore_view(needfix_id: str, target_status: str = "captured", confirm: bool = False) -> dict[str, Any]:
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_restore_confirmation_required"}
+    else:
+        try:
+            row = core.needfix_restore(str(needfix_id or ""), target_status=str(target_status or "captured")[:40])
+            response = {"ok": True, "item": _bounded_needfix_row(row, include_detail=True)}
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_restore", write=True)
+
+
+def needfix_purge_view(needfix_id: str, audit_reason: str, confirm: bool = False) -> dict[str, Any]:
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_purge_confirmation_required"}
+    else:
+        try:
+            response = dict(core.needfix_purge(str(needfix_id or ""), str(audit_reason or "")[:1000]))
+            response.setdefault("ok", True)
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_purge", write=True)
+
+
+def needfix_convert_preview_view(needfix_id: str) -> dict[str, Any]:
+    try:
+        response = dict(core.needfix_preview_convert(str(needfix_id or "")))
+        response.setdefault("ok", True)
+    except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_convert_preview")
+
+
+def needfix_convert_commit_view(needfix_id: str, confirm: bool = False) -> dict[str, Any]:
+    """USER WRITE: explicitly create a task card; never launch a worker."""
+    if confirm is not True:
+        response = {"ok": False, "error": "needfix_conversion_confirmation_required"}
+    else:
+        try:
+            response = dict(core.needfix_convert(str(needfix_id or "")))
+            response.setdefault("ok", True)
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_needfix_convert_commit", write=True)
+
+
 def task_quarantine_view(
     preview_digest: str,
     older_than_days: int | None = None,
@@ -1179,6 +1428,20 @@ SESSION_TOOL_NAME = "aiworkhub_dashboard_sessions"
 SESSION_TOOLS: dict[str, Any] = {SESSION_TOOL_NAME: session_view}
 KB_TOOL_NAME = "aiworkhub_dashboard_kb"
 KB_TOOLS: dict[str, Any] = {KB_TOOL_NAME: kb_view}
+NEEDFIX_READ_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_needfix_list": needfix_list_view,
+    "aiworkhub_dashboard_needfix_detail": needfix_detail_view,
+    "aiworkhub_dashboard_needfix_convert_preview": needfix_convert_preview_view,
+}
+NEEDFIX_WRITE_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_needfix_capture": needfix_capture_view,
+    "aiworkhub_dashboard_needfix_update": needfix_update_view,
+    "aiworkhub_dashboard_needfix_transition": needfix_transition_view,
+    "aiworkhub_dashboard_needfix_archive": needfix_archive_view,
+    "aiworkhub_dashboard_needfix_restore": needfix_restore_view,
+    "aiworkhub_dashboard_needfix_purge": needfix_purge_view,
+    "aiworkhub_dashboard_needfix_convert_commit": needfix_convert_commit_view,
+}
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
 SETTINGS_UPDATE_TOOL_NAME = "aiworkhub_dashboard_settings_update"
@@ -1243,6 +1506,10 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in KB_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in NEEDFIX_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
+    for name, fn in NEEDFIX_WRITE_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
@@ -1276,6 +1543,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         tuple(STORAGE_RETENTION_WRITE_TOOLS)
         + tuple(TERMINAL_LOG_RETENTION_WRITE_TOOLS)
         + tuple(TASK_RETENTION_WRITE_TOOLS)
+        + tuple(NEEDFIX_READ_TOOLS)
+        + tuple(NEEDFIX_WRITE_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)
