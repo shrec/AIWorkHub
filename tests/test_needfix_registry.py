@@ -169,7 +169,7 @@ class TestCapturedUnverifiedGuard:
     """captured/unverified cannot convert -- must be accepted first."""
 
     def _dummy_create_task(self, card):
-        return {"task_id": "task-001", "id": "task-001"}
+        return {"ok": True, "returncode": 0, "command": [], "stdout": "", "stderr": "", "task_id": "task-001"}
 
     def test_captured_cannot_convert(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
@@ -334,10 +334,34 @@ class TestConvertAtomicIdempotent:
     """Atomic, idempotent, compensating convert."""
 
     def _create_task_ok(self, card):
-        return {"task_id": "task-ok", "id": "task-ok"}
+        return {"ok": True, "returncode": 0, "command": [], "stdout": "", "stderr": "", "task_id": "task-ok"}
 
     def _create_task_fail(self, card):
         raise RuntimeError("task creation failed")
+
+    def _create_task_ok_no_id_key(self, card):
+        """A fake exercising the real production shape: 'id' is never present."""
+        return {"ok": True, "task_id": "task-no-id-key", "created": True}
+
+    def _create_task_receipt_false(self, card):
+        """Mirrors the real create_task() validation-failure receipt shape."""
+        return {
+            "ok": False,
+            "returncode": 2,
+            "command": [],
+            "stdout": "",
+            "stderr": "read_only_declaration_required",
+        }
+
+    def _create_task_receipt_ok_missing_task_id(self, card):
+        return {"ok": True, "created": True}
+
+    def _create_task_receipt_not_a_mapping(self, card):
+        return "not-a-mapping"
+
+    def _create_task_capture(self, card):
+        self.captured_card = card
+        return {"ok": True, "task_id": "task-captured"}
 
     def test_convert_idempotent(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
@@ -384,6 +408,434 @@ class TestConvertAtomicIdempotent:
         c2 = needfix_store.convert_needfix(init_store, r["id"], self._create_task_ok)
         assert c2["already_converted"] is True
         assert c2.get("resolved") is True
+
+    def test_convert_extracts_task_id_without_guessing_id_fallback(self, init_store: Path):
+        """The canonical receipt never carries an 'id' key -- only 'task_id'."""
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        result = needfix_store.convert_needfix(
+            init_store, r["id"], self._create_task_ok_no_id_key
+        )
+        assert result["converted_task_id"] == "task-no-id-key"
+
+    def test_convert_rejects_ok_false_receipt_with_real_reason(self, init_store: Path):
+        """A canonical failure receipt (ok=False) surfaces its stderr reason and
+        fails closed without stranding the NeedFix as task_created."""
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        with pytest.raises(needfix_store.NeedFixError, match="read_only_declaration_required"):
+            needfix_store.convert_needfix(init_store, r["id"], self._create_task_receipt_false)
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+
+    def test_convert_rejects_ambiguous_ok_true_missing_task_id(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        with pytest.raises(needfix_store.NeedFixError, match="ambiguous"):
+            needfix_store.convert_needfix(
+                init_store, r["id"], self._create_task_receipt_ok_missing_task_id
+            )
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+
+    def test_convert_rejects_non_mapping_receipt(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        with pytest.raises(needfix_store.NeedFixError, match="malformed"):
+            needfix_store.convert_needfix(
+                init_store, r["id"], self._create_task_receipt_not_a_mapping
+            )
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+
+    def test_convert_retry_after_success_is_idempotent_no_duplicate(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        c1 = needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
+        c2 = needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
+        assert c2["already_converted"] is True
+        assert c2["converted_task_id"] == c1["converted_task_id"] == "task-captured"
+
+    # -- Typed required-field validation (mirrors core._create_task_fn) ----
+
+    def _validating_create_fn(self, card):
+        """Simulate core._create_task_fn's explicit required-field extraction:
+        missing/empty task_id, title, or objective must raise NeedFixError,
+        never a raw KeyError."""
+        for key in ("task_id", "title", "objective"):
+            value = card.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise needfix_store.NeedFixError(
+                    f"conversion card is missing required field {key!r}"
+                )
+        return {"ok": True, "task_id": card["task_id"]}
+
+    def _card_builder_missing(self, field):
+        """Return a task_card_builder that omits *field* from the card."""
+        def builder(snapshot):
+            card = {
+                "task_id": f"needfix-{snapshot['id']}",
+                "title": snapshot["title"],
+                "objective": snapshot["description"],
+            }
+            del card[field]
+            return card
+        return builder
+
+    @pytest.mark.parametrize("missing_field", ["task_id", "title", "objective"])
+    def test_convert_rejects_missing_required_card_field(self, init_store: Path, missing_field):
+        """A conversion card missing any required field must raise NeedFixError
+        and compensate the claim -- never a raw KeyError."""
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        with pytest.raises(needfix_store.NeedFixError, match="missing required field"):
+            needfix_store.convert_needfix(
+                init_store,
+                r["id"],
+                self._validating_create_fn,
+                task_card_builder=self._card_builder_missing(missing_field),
+            )
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"  # compensated back
+        assert nr["converted_task_id"] is None
+
+    @pytest.mark.parametrize("field", ["task_id", "title", "objective"])
+    def test_convert_rejects_empty_required_card_field(self, init_store: Path, field):
+        """A conversion card with an empty/whitespace required field must fail
+        closed with a typed error, just like a missing field."""
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+
+        def empty_field_builder(snapshot):
+            card = {
+                "task_id": f"needfix-{snapshot['id']}",
+                "title": snapshot["title"],
+                "objective": snapshot["description"],
+            }
+            card[field] = "   "  # whitespace-only → invalid
+            return card
+
+        with pytest.raises(needfix_store.NeedFixError, match="missing required field"):
+            needfix_store.convert_needfix(
+                init_store,
+                r["id"],
+                self._validating_create_fn,
+                task_card_builder=empty_field_builder,
+            )
+
+
+class TestDefaultTaskCard:
+    """Default conversion plan: executable, scoped, uncapped -- never an
+    empty writable code card."""
+
+    def _create_task_capture(self, card):
+        self.captured_card = card
+        return {"ok": True, "task_id": "task-captured"}
+
+    def test_default_card_is_scoped_and_executable_with_scope_files(self, init_store: Path):
+        r = needfix_store.capture_proposal(
+            init_store,
+            title="T",
+            description="D",
+            scope_files=["src/aiworkhub/foo.py"],
+        )
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
+        card = self.captured_card
+        assert card["read_only"] is False
+        assert card["allowed_writes"] == ["src/aiworkhub/foo.py"]
+        assert card["validation"]
+        assert card["task_type"] == "code"
+        assert card.get("max_live_tokens") is None
+
+    def test_default_card_does_not_infer_required_outputs_from_scope_files(self, init_store: Path):
+        """Scope files may include unchanged evidence/supporting context --
+        forcing all of them to be required would produce false
+        required_output_unchanged failures, so the default card leaves
+        required_outputs unset entirely."""
+        r = needfix_store.capture_proposal(
+            init_store,
+            title="T",
+            description="D",
+            scope_files=["src/aiworkhub/foo.py", "docs/evidence.md"],
+        )
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
+        card = self.captured_card
+        assert card["allowed_writes"] == ["src/aiworkhub/foo.py", "docs/evidence.md"]
+        assert not card.get("required_outputs")
+
+    def test_default_card_is_read_only_without_scope_files(self, init_store: Path):
+        r = needfix_store.capture_proposal(init_store, title="T", description="D")
+        needfix_store.triage_needfix(init_store, r["id"])
+        needfix_store.accept_needfix(init_store, r["id"])
+        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
+        card = self.captured_card
+        assert card["read_only"] is True
+        assert not card.get("allowed_writes")
+        assert not card.get("required_outputs")
+        assert card.get("max_live_tokens") is None
+
+
+class TestNeedFixConversionPublicPlanContract:
+    """Public task_plan contract: strict validation, preview digest binding,
+    default read/write vs required-output distinction, read_only intent,
+    and uncapped-unless-explicit max_live_tokens -- exercised through the
+    same ``needfix_store`` primitives ``core.needfix_preview_convert`` /
+    ``core.needfix_convert`` delegate to."""
+
+    def _create_task_capture(self, card):
+        self.captured_card = card
+        return {"ok": True, "task_id": "task-plan-committed"}
+
+    def _accepted_with_scope(self, init_store: Path, scope_files=None):
+        r = needfix_store.capture_proposal(
+            init_store, title="T", description="D", scope_files=scope_files
+        )
+        needfix_store.triage_needfix(init_store, r["id"])
+        return needfix_store.accept_needfix(init_store, r["id"])
+
+    def test_preview_returns_normalized_card_and_digest(self, init_store: Path):
+        r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
+        pv = needfix_store.preview_convert(init_store, r["id"])
+        assert pv["claimable"] is True
+        assert pv["task_plan"]["allowed_writes"] == ["src/aiworkhub/foo.py"]
+        assert not pv["task_plan"].get("required_outputs")
+        assert pv["plan_digest"] == needfix_store.plan_digest(pv["task_plan"])
+
+    def test_preview_reflects_caller_supplied_task_plan_overrides(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        plan = {"acceptance": ["Custom acceptance"], "priority": "high"}
+        pv = needfix_store.preview_convert(init_store, r["id"], plan)
+        assert pv["task_plan"]["acceptance"] == ["Custom acceptance"]
+        assert pv["task_plan"]["priority"] == "high"
+
+    def test_commit_forwards_full_task_plan_to_created_card(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        plan = {
+            "allowed_writes": ["src/a.py", "src/b.py"],
+            "required_outputs": ["src/a.py"],
+            "acceptance": ["Do the thing"],
+            "validation": ["python3 -m pytest -q tests/test_a.py"],
+            "depends_on": ["other-task"],
+            "runner": "codex",
+            "topic": "custom_topic",
+            "task_type": "code",
+            "read_only": False,
+        }
+        pv = needfix_store.preview_convert(init_store, r["id"], plan)
+        card = needfix_store.normalize_task_plan(
+            needfix_store.get_needfix(init_store, r["id"]), plan
+        )
+        assert card == pv["task_plan"]
+        needfix_store.convert_needfix(
+            init_store,
+            r["id"],
+            self._create_task_capture,
+            task_card_builder=lambda snapshot: needfix_store.normalize_task_plan(snapshot, plan),
+        )
+        committed = self.captured_card
+        for field, value in plan.items():
+            assert committed[field] == value
+        assert committed["task_id"] == f"needfix-{r['id']}"
+
+    def test_malformed_plan_unknown_field_fails_closed_without_mutation(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError, match="unsupported"):
+            needfix_store.preview_convert(init_store, r["id"], {"task_id": "guessed-id"})
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+
+    def test_malformed_plan_wrong_type_fails_closed(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.preview_convert(init_store, r["id"], {"allowed_writes": "not-a-list"})
+
+    def test_malformed_plan_not_a_mapping_fails_closed(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError):
+            needfix_store.preview_convert(init_store, r["id"], ["not", "a", "mapping"])
+
+    def test_ambiguous_read_only_contradiction_fails_closed(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError, match="contradictory"):
+            needfix_store.normalize_task_plan(
+                needfix_store.get_needfix(init_store, r["id"]),
+                {"read_only": True, "allowed_writes": ["src/a.py"]},
+            )
+
+    def test_read_only_intent_overrides_scope_derived_writes(self, init_store: Path):
+        r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
+        card = needfix_store.normalize_task_plan(
+            needfix_store.get_needfix(init_store, r["id"]), {"read_only": True}
+        )
+        assert card["read_only"] is True
+        assert not card.get("allowed_writes")
+        assert not card.get("required_outputs")
+        assert not card.get("validation")
+
+    def test_digest_drift_fails_closed_and_compensates(self, init_store: Path):
+        """A commit bound to a digest that no longer matches the freshly
+        normalized card (e.g. the NeedFix changed after preview) must fail
+        closed instead of silently committing a different plan, restoring
+        the NeedFix to its pre-claim status."""
+        r = self._accepted_with_scope(init_store)
+        pv = needfix_store.preview_convert(init_store, r["id"])
+        stale_digest = pv["plan_digest"]
+        needfix_store.update_needfix(init_store, r["id"], title="Changed after preview")
+
+        def _digest_bound_builder(snapshot):
+            card = needfix_store.normalize_task_plan(snapshot, None)
+            actual = needfix_store.plan_digest(card)
+            if actual != stale_digest:
+                raise needfix_store.NeedFixConflictError("task_plan digest mismatch")
+            return card
+
+        with pytest.raises(needfix_store.NeedFixConflictError, match="digest mismatch"):
+            needfix_store.convert_needfix(
+                init_store, r["id"], self._create_task_capture, task_card_builder=_digest_bound_builder
+            )
+        nr = needfix_store.get_needfix(init_store, r["id"])
+        assert nr["status"] == "accepted"
+        assert nr["converted_task_id"] is None
+
+    def test_plan_based_conversion_retry_is_idempotent_no_duplicate(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        plan = {"acceptance": ["Resolve it"]}
+        builder = lambda snapshot: needfix_store.normalize_task_plan(snapshot, plan)
+        c1 = needfix_store.convert_needfix(
+            init_store, r["id"], self._create_task_capture, task_card_builder=builder
+        )
+        c2 = needfix_store.convert_needfix(
+            init_store, r["id"], self._create_task_capture, task_card_builder=builder
+        )
+        assert c1["already_converted"] is False
+        assert c2["already_converted"] is True
+        assert c2["converted_task_id"] == c1["converted_task_id"] == "task-plan-committed"
+
+    def test_uncapped_unless_plan_explicitly_sets_max_live_tokens(self, init_store: Path):
+        r = self._accepted_with_scope(init_store)
+        default_card = needfix_store.normalize_task_plan(
+            needfix_store.get_needfix(init_store, r["id"]), None
+        )
+        assert default_card.get("max_live_tokens") is None
+        capped_card = needfix_store.normalize_task_plan(
+            needfix_store.get_needfix(init_store, r["id"]), {"max_live_tokens": 5000}
+        )
+        assert capped_card["max_live_tokens"] == 5000
+
+    def test_dashboard_preview_forwards_task_plan(self, monkeypatch):
+        from aiworkhub import core, dashboard_mcp_app
+
+        calls = []
+
+        def fake(needfix_id, *, task_plan=None):
+            calls.append((needfix_id, task_plan))
+            return {"needfix_id": needfix_id, "task_plan": {"title": "x"}, "plan_digest": "abc"}
+
+        monkeypatch.setattr(core, "needfix_preview_convert", fake)
+        plan = {"acceptance": ["Custom"]}
+        result = dashboard_mcp_app.needfix_convert_preview_view("NF-2026-00001", plan)
+        assert calls == [("NF-2026-00001", plan)]
+        assert result["ok"] is True
+        assert result["plan_digest"] == "abc"
+
+    def test_dashboard_commit_requires_plan_digest_when_plan_given(self):
+        from aiworkhub import dashboard_mcp_app
+
+        result = dashboard_mcp_app.needfix_convert_commit_view(
+            "NF-2026-00001", confirm=True, task_plan={"acceptance": ["Custom"]}
+        )
+        assert result["ok"] is False
+        assert result["error"] == "needfix_conversion_plan_digest_required"
+
+    def test_dashboard_commit_forwards_task_plan_and_digest(self, monkeypatch):
+        from aiworkhub import core, dashboard_mcp_app
+
+        calls = []
+
+        def fake(needfix_id, *, task_plan=None, plan_digest=None):
+            calls.append((needfix_id, task_plan, plan_digest))
+            return {"needfix_id": needfix_id, "converted_task_id": "task-x", "already_converted": False}
+
+        monkeypatch.setattr(core, "needfix_convert", fake)
+        plan = {"acceptance": ["Custom"]}
+        result = dashboard_mcp_app.needfix_convert_commit_view(
+            "NF-2026-00001", confirm=True, task_plan=plan, plan_digest="deadbeef"
+        )
+        assert calls == [("NF-2026-00001", plan, "deadbeef")]
+        assert result["ok"] is True
+        assert result["converted_task_id"] == "task-x"
+
+    def test_dashboard_commit_still_requires_confirmation(self, monkeypatch):
+        from aiworkhub import core, dashboard_mcp_app
+
+        monkeypatch.setattr(
+            core, "needfix_convert", lambda *a, **k: pytest.fail("must not be called")
+        )
+        result = dashboard_mcp_app.needfix_convert_commit_view("NF-2026-00001")
+        assert result["ok"] is False
+        assert result["error"] == "needfix_conversion_confirmation_required"
+
+    def test_dashboard_commit_default_plan_digest_required(self):
+        """Every confirmed non-idempotent conversion binds the commit to the
+        ``plan_digest`` the matching preview returned. The default-card path
+        (no explicit ``task_plan``) is held to that same digest discipline,
+        not exempted from it -- a confirmed commit without ``plan_digest``
+        fails closed instead of silently binding to an unconfirmed plan."""
+        from aiworkhub import dashboard_mcp_app
+
+        result = dashboard_mcp_app.needfix_convert_commit_view("NF-2026-00001", confirm=True)
+        assert result["ok"] is False
+        assert result["error"] == "needfix_conversion_plan_digest_required"
+
+    def test_dashboard_commit_bound_default_plan_succeeds_with_correct_digest(self, monkeypatch):
+        """A committed default card carries the matching ``plan_digest`` to
+        core; core's own hash check then binds the commit to the scope the
+        manager actually previewed."""
+        from aiworkhub import core, dashboard_mcp_app
+
+        calls = []
+
+        def fake(needfix_id, *, task_plan=None, plan_digest=None):
+            calls.append((needfix_id, task_plan, plan_digest))
+            return {"needfix_id": needfix_id, "converted_task_id": "task-y", "already_converted": False}
+
+        monkeypatch.setattr(core, "needfix_convert", fake)
+        result = dashboard_mcp_app.needfix_convert_commit_view(
+            "NF-2026-00001", confirm=True, plan_digest="deadbeef"
+        )
+        assert calls == [("NF-2026-00001", None, "deadbeef")]
+        assert result["ok"] is True
+
+    def test_dashboard_commit_needfix_drift_rejects_stale_digest(self, monkeypatch):
+        """When the NeedFix changed between preview and commit, core's
+        digest check raises a NeedFixConflictError; the dashboard surfaces
+        the rejection as a non-mutating failed response instead of creating
+        a task for a different plan."""
+        from aiworkhub import core, dashboard_mcp_app, needfix_store
+
+        def fake(needfix_id, *, task_plan=None, plan_digest=None):
+            raise needfix_store.NeedFixConflictError("task_plan digest mismatch")
+
+        monkeypatch.setattr(core, "needfix_convert", fake)
+        result = dashboard_mcp_app.needfix_convert_commit_view(
+            "NF-2026-00001", confirm=True, plan_digest="stale"
+        )
+        assert result["ok"] is False
+        assert "digest mismatch" in result["error"]
 
 
 class TestLinkExistingTask:

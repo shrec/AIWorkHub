@@ -90,6 +90,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 from typing import Any, Literal, Mapping
 
 try:
@@ -222,6 +224,7 @@ class WorkerToolContext:
     audit_hmac_key_path: Path | None
     quality_review_packet_path: Path | None = None
     allowed_writes: tuple[str, ...] = ()
+    rework_overlay_packet: dict[str, Any] | None = None
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -266,6 +269,20 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
     ledger_raw = source.get(ENV_AUDIT_LEDGER_PATH) or ""
     key_raw = source.get(ENV_AUDIT_HMAC_KEY_PATH) or ""
     review_packet_raw = source.get(ENV_QUALITY_REVIEW_PACKET_PATH) or ""
+    rework_overlay_raw = source.get(ENV_REWORK_OVERLAY_PATH) or ""
+    rework_packet: dict[str, Any] | None = None
+    if rework_overlay_raw:
+        overlay_path = Path(rework_overlay_raw).resolve()
+        if not overlay_path.is_file():
+            raise WorkerToolError(f"worker_mcp_rework_overlay_path_not_file:{overlay_path}")
+        rework_packet = json.loads(overlay_path.read_bytes().decode("utf-8"))
+        _verify_rework_overlay_packet(
+            rework_packet,
+            str(source[ENV_TASK_ID]),
+            str(source.get(ENV_REQUEST_ID) or ""),
+            str(source[ENV_RUNNER]),
+            authority_repo,
+        )
     return WorkerToolContext(
         task_id=str(source[ENV_TASK_ID]),
         runner=str(source[ENV_RUNNER]),
@@ -281,6 +298,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
         quality_review_packet_path=(
             Path(str(review_packet_raw)) if review_packet_raw else None
         ),
+        rework_overlay_packet=rework_packet,
     )
 
 
@@ -3053,3 +3071,112 @@ __all__ = [
     "source_graph_recommendation_roundtrip_gate",
     "verify_audit_ledger",
 ]
+
+
+ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
+
+
+def _verify_rework_overlay_packet(
+    packet: dict[str, Any],
+    successor_task_id: str,
+    successor_request_id: str,
+    runner: str,
+    authority_repo: Path,
+) -> None:
+    """Fail closed on identity mismatch, missing canonical digest, or foreign repo."""
+    required = ["successor_task_id", "successor_request_id",
+                "predecessor_task_id", "predecessor_request_id",
+                "authority_repo", "files", "canonical_digest"]
+    missing = [k for k in required if k not in packet]
+    if missing:
+        raise WorkerToolError(f"rework_packet_missing_keys:{','.join(missing)}")
+    if packet["successor_task_id"] != successor_task_id:
+        raise WorkerToolError(
+            f"rework_packet_successor_task_id_mismatch:"
+            f"{packet['successor_task_id']} vs {successor_task_id}"
+        )
+    if packet["successor_request_id"] != successor_request_id:
+        raise WorkerToolError(
+            f"rework_packet_successor_request_id_mismatch:"
+            f"{packet['successor_request_id']} vs {successor_request_id}"
+        )
+    if packet["successor_request_id"] == packet["predecessor_request_id"]:
+        raise WorkerToolError("rework_packet_identity_not_distinct")
+    if packet["successor_task_id"] == packet["predecessor_task_id"]:
+        raise WorkerToolError("rework_packet_identity_not_distinct")
+    if not _REQUEST_ID_RE.fullmatch(packet["successor_request_id"]):
+        raise WorkerToolError("rework_packet_invalid_successor_request_id")
+    if not _REQUEST_ID_RE.fullmatch(packet["predecessor_request_id"]):
+        raise WorkerToolError("rework_packet_invalid_predecessor_request_id")
+    packet_authority = Path(str(packet["authority_repo"])).resolve()
+    if packet_authority != authority_repo.resolve():
+        raise WorkerToolError(
+            f"rework_packet_authority_mismatch:{packet_authority} vs {authority_repo}"
+        )
+    payload = {k: packet[k] for k in required if k != "canonical_digest"}
+    expected_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    if packet["canonical_digest"] != expected_digest:
+        raise WorkerToolError(
+            f"rework_packet_digest_mismatch:"
+            f"{packet['canonical_digest']} vs {expected_digest}"
+        )
+    for entry in packet["files"]:
+        p = str(entry.get("path", ""))
+        if not p or ".." in p or p.startswith("/"):
+            raise WorkerToolError(f"rework_packet_invalid_file_path:{p}")
+        if "deleted" in entry and "sha256" in entry:
+            raise WorkerToolError(f"rework_packet_file_both_deleted_and_sha:{p}")
+
+
+def _build_rework_overlay_map(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return a dict mapping file path -> entry for fast overlay lookup."""
+    overlay: dict[str, dict[str, Any]] = {}
+    for entry in packet["files"]:
+        overlay[entry["path"]] = entry
+    return overlay
+
+
+def _apply_rework_overlay_query(
+    ctx: WorkerToolContext,
+    mode: str,
+    query: str,
+    target: str | None,
+    budget: int,
+) -> dict[str, Any] | None:
+    """Return overlay result dict if the target file is shadowed by the rework packet.
+
+    Returns None when the fallback to canonical is needed.
+    """
+    if not ctx.rework_overlay_packet:
+        return None
+    overlay = _build_rework_overlay_map(ctx.rework_overlay_packet)
+    if target and target in overlay:
+        entry = overlay[target]
+        if "deleted" in entry:
+            return {"ok": False, "reason": "file_deleted_by_rework_overlay"}
+        if "content_base64" in entry:
+            import base64
+            content = base64.b64decode(entry["content_base64"]).decode("utf-8")
+            return {
+                "ok": True,
+                "overlay": True,
+                "mode": mode,
+                "query": query,
+                "target": target,
+                "source_preview": content[:8192],
+                "source_preview_truncated": len(content) > 8192,
+                "source_hash": entry.get("sha256", ""),
+            }
+        return {
+            "ok": True,
+            "overlay": True,
+            "mode": mode,
+            "query": query,
+            "target": target,
+            "source_hash": entry.get("sha256", ""),
+            "matches": [],
+            "candidate_files": [],
+        }
+    return None

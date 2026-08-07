@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-08-07
+
+### Added
+
+- NeedFix conversion now produces a manager-confirmed, executable task card
+  with durable task linkage, strict preview binding and lost-ack-safe
+  idempotency instead of falling through to an unusable empty write scope.
+- Retained rework workspaces now expose a request-scoped Source Graph overlay
+  whose packet is bound to successor/predecessor identities, canonical digest,
+  repo-relative paths and file hashes while the canonical index remains the
+  immutable fallback for unshadowed files.
+
+### Fixed
+
+- Malformed NeedFix conversion cards now fail with typed contract errors for
+  missing `task_id`, `title` or `objective` fields instead of leaking raw
+  `KeyError`, and the conversion path is split into smaller auditable helpers.
+- Source Graph rework overlays now validate request identity, avoid mutating
+  frozen worker context, preserve thread isolation and clean request-private
+  artifacts deterministically.
+- The read-only Source Graph integration fixture now reports an explicit skip
+  when a validation sandbox forbids the required `chmod`; environments that
+  support the capability still execute the complete integration assertion.
+
 ## [0.9.16] - 2026-08-07
 
 ### Fixed

@@ -1122,22 +1122,51 @@ def needfix_purge_view(needfix_id: str, audit_reason: str, confirm: bool = False
     return _needfix_response(response, "aiworkhub_dashboard_needfix_purge", write=True)
 
 
-def needfix_convert_preview_view(needfix_id: str) -> dict[str, Any]:
+def needfix_convert_preview_view(
+    needfix_id: str, task_plan: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """READ-ONLY: normalized executable conversion card plus its plan_digest."""
     try:
-        response = dict(core.needfix_preview_convert(str(needfix_id or "")))
+        response = dict(
+            core.needfix_preview_convert(str(needfix_id or ""), task_plan=task_plan)
+        )
         response.setdefault("ok", True)
     except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
         response = {"ok": False, "error": str(exc)[:240]}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_convert_preview")
 
 
-def needfix_convert_commit_view(needfix_id: str, confirm: bool = False) -> dict[str, Any]:
-    """USER WRITE: explicitly create a task card; never launch a worker."""
+def needfix_convert_commit_view(
+    needfix_id: str,
+    confirm: bool = False,
+    task_plan: Mapping[str, Any] | None = None,
+    plan_digest: str | None = None,
+) -> dict[str, Any]:
+    """USER WRITE: explicitly create a task card; never launch a worker.
+
+    Every confirmed conversion must carry the exact ``plan_digest`` the
+    matching preview returned, binding the commit to what the manager
+    actually inspected. The rule is identical for an explicit
+    ``task_plan`` and for the default scope-derived card: a missing
+    digest, or a digest that no longer matches the freshly normalized
+    card, fails closed instead of silently converting a plan nobody
+    confirmed. Core's digest check runs only on the create path, so
+    already-task_created retries keep short-circuiting without forcing a
+    new create.
+    """
     if confirm is not True:
         response = {"ok": False, "error": "needfix_conversion_confirmation_required"}
+    elif not plan_digest:
+        response = {"ok": False, "error": "needfix_conversion_plan_digest_required"}
     else:
         try:
-            response = dict(core.needfix_convert(str(needfix_id or "")))
+            response = dict(
+                core.needfix_convert(
+                    str(needfix_id or ""),
+                    task_plan=task_plan,
+                    plan_digest=str(plan_digest) if plan_digest else None,
+                )
+            )
             response.setdefault("ok", True)
         except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)[:240]}

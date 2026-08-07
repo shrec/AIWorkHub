@@ -13,6 +13,7 @@ import argparse
 import copy
 import ctypes
 import errno
+import base64
 import fnmatch
 import hashlib
 import importlib.util
@@ -3828,4 +3829,71 @@ if __name__ == "__main__":
         raise SystemExit(_landlock_exec(sys.argv[1:]))
     except (OSError, WorkspaceError) as exc:
         print(f"secure sandbox setup failed: {exc}", file=sys.stderr)
-        raise SystemExit(126)
+
+
+@dataclass
+class ReworkOverlayPacket:
+    """Signed, digest-bound overlay for retained rework files."""
+    successor_request_id: str
+    successor_task_id: str
+    predecessor_request_id: str
+    predecessor_task_id: str
+    authority_repo: str
+    files: list[dict[str, Any]]
+    canonical_digest: str
+
+
+def materialize_rework_overlay(
+    successor_request_id: str,
+    successor_task_id: str,
+    predecessor_request_id: str,
+    predecessor_task_id: str,
+    authority_repo: Path,
+    file_entries: list[tuple[str, str | None, bytes | None]],
+) -> bytes:
+    """Emit canonical-digest-bound overlay packet with distinct successor/predecessor identities.
+
+    Each file entry is (repo_relative_path, sha256_or_None, content_bytes_or_None).
+    sha256=None means delete; content=None with sha256 indicates a hash-only reference.
+    Returns JSON bytes with a deterministic canonical_digest over the sorted files payload.
+    """
+    if not _REQUEST_ID_RE.fullmatch(successor_request_id):
+        raise ValueError(f"invalid successor_request_id: {successor_request_id!r}")
+    if not _REQUEST_ID_RE.fullmatch(predecessor_request_id):
+        raise ValueError(f"invalid predecessor_request_id: {predecessor_request_id!r}")
+    if successor_request_id == predecessor_request_id:
+        raise ValueError("successor and predecessor request_ids must be distinct")
+    if successor_task_id == predecessor_task_id:
+        raise ValueError("successor and predecessor task_ids must be distinct")
+    authority_repo = authority_repo.resolve()
+    if not authority_repo.is_dir():
+        raise FileNotFoundError(f"authority_repo not found: {authority_repo}")
+    normalized_files: list[dict[str, Any]] = []
+    for rel_path, file_sha, content in file_entries:
+        if not rel_path or ".." in rel_path or rel_path.startswith("/"):
+            raise ValueError(f"invalid repo-relative path: {rel_path!r}")
+        entry: dict[str, Any] = {"path": rel_path}
+        if file_sha is None:
+            entry["deleted"] = True
+        else:
+            entry["sha256"] = file_sha
+        if content is not None:
+            entry["content_base64"] = base64.b64encode(content).decode("ascii")
+        normalized_files.append(entry)
+    normalized_files.sort(key=lambda e: e["path"])
+    payload = {
+        "successor_request_id": successor_request_id,
+        "successor_task_id": successor_task_id,
+        "predecessor_request_id": predecessor_request_id,
+        "predecessor_task_id": predecessor_task_id,
+        "authority_repo": str(authority_repo),
+        "files": normalized_files,
+    }
+    payload_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    packet = {
+        **payload,
+        "canonical_digest": payload_digest,
+    }
+    return json.dumps(packet, indent=2, ensure_ascii=True).encode("utf-8")

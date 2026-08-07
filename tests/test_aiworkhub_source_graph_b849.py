@@ -953,7 +953,20 @@ def test_isolated_readonly_directory_supports_repeated_queries_without_wal_sidec
 
     graph_dir = db_path.parent
     original_mode = graph_dir.stat().st_mode
-    graph_dir.chmod(0o555)
+    try:
+        graph_dir.chmod(0o555)
+    except PermissionError:
+        pytest.skip(
+            "sandbox denies chmod(0o555) (EPERM/EACCES) — "
+            "read-only directory capability unavailable"
+        )
+    except OSError as exc:
+        if exc.errno in (1, 13):  # EPERM, EACCES
+            pytest.skip(
+                "sandbox denies chmod(0o555) (EPERM/EACCES) — "
+                "read-only directory capability unavailable"
+            )
+        raise
     try:
         for _ in range(3):
             reader = sg.connect(db_path, read_only=True)
@@ -1835,5 +1848,194 @@ def test_no_build_or_query_path_writes_legacy_aitools_databases(tmp_path):
     assert not (repo / "AITools" / "source_graph_universal.db").exists()
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
+# ---------------------------------------------------------------------------
+# NF56 retained-rework overlay: materializer + consumer
+# ---------------------------------------------------------------------------
+
+import base64
+import json
+import hashlib
+import threading
+from aiworkhub.worker_workspace import (
+    materialize_rework_overlay,
+    ReworkOverlayPacket,
+)
+from aiworkhub.worker_ai_tools_mcp import (
+    _verify_rework_overlay_packet,
+    _build_rework_overlay_map,
+    _apply_rework_overlay_query,
+    WorkerToolContext,
+    WorkerToolError,
+)
+
+
+def _sample_packet(successor_req="req-abc", successor_task="task-1",
+                   predecessor_req="req-xyz", predecessor_task="task-2",
+                   files=None, authority_repo=None):
+    if authority_repo is None:
+        authority_repo = Path("/tmp/authority")
+    if files is None:
+        files = [{"path": "src/mod.py", "sha256": "abc123", "content_base64": base64.b64encode(b"# overlay\n").decode()},
+                 {"path": "deleted.py", "deleted": True}]
+    payload = {
+        "successor_request_id": successor_req,
+        "successor_task_id": successor_task,
+        "predecessor_request_id": predecessor_req,
+        "predecessor_task_id": predecessor_task,
+        "authority_repo": str(Path(authority_repo).resolve()),
+        "files": files,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    return {**payload, "canonical_digest": digest}
+
+
+def test_materializer_emits_canonical_digest(tmp_path):
+    authority = tmp_path / "authority"
+    authority.mkdir()
+    data = materialize_rework_overlay(
+        "req-s", "task-s", "req-p", "task-p", authority,
+        [("src/a.py", "sha1", b"content")],
+    )
+    packet = json.loads(data)
+    assert packet["successor_request_id"] == "req-s"
+    assert packet["predecessor_request_id"] == "req-p"
+    assert packet["canonical_digest"] == hashlib.sha256(
+        json.dumps({k: packet[k] for k in packet if k != "canonical_digest"}, sort_keys=True, ensure_ascii=True).encode()
+    ).hexdigest()
+
+
+def test_materializer_identity_distinct_fails():
+    with pytest.raises(ValueError):
+        materialize_rework_overlay("same", "tsk", "same", "tsk2", Path("/tmp"), [])
+    with pytest.raises(ValueError):
+        materialize_rework_overlay("r1", "same", "r2", "same", Path("/tmp"), [])
+
+
+def test_consumer_verifies_identities():
+    packet = _sample_packet()
+    _verify_rework_overlay_packet(packet, "task-1", "req-abc", "runner", Path("/tmp/authority"))
+    with pytest.raises(WorkerToolError):
+        _verify_rework_overlay_packet(packet, "task-wrong", "req-abc", "runner", Path("/tmp/authority"))
+
+
+def test_consumer_fails_closed_on_stale_digest():
+    packet = _sample_packet()
+    packet["canonical_digest"] = "deadbeef"
+    with pytest.raises(WorkerToolError):
+        _verify_rework_overlay_packet(packet, "task-1", "req-abc", "runner", Path("/tmp/authority"))
+
+
+def test_consumer_fails_closed_on_foreign_identity():
+    packet = _sample_packet()
+    with pytest.raises(WorkerToolError):
+        _verify_rework_overlay_packet(packet, "task-1", "req-abc", "runner", Path("/other/repo"))
+
+
+def test_overlay_map_and_delete():
+    packet = _sample_packet()
+    overlay = _build_rework_overlay_map(packet)
+    assert overlay["src/mod.py"]["sha256"] == "abc123"
+    assert overlay["deleted.py"]["deleted"] is True
+
+
+def test_apply_overlay_returns_overlay_content():
+    packet = _sample_packet()
+    ctx = WorkerToolContext(
+        task_id="task-1", runner="runner", topic="t", request_id="req-abc",
+        repo=Path("/tmp/repo"), authority_repo=Path("/tmp/authority"),
+        source_graph_targets=(), session_topic="t",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+    result = _apply_rework_overlay_query(ctx, "body", "mod", "src/mod.py", 64)
+    assert result is not None
+    assert result.get("overlay") is True
+    assert "# overlay" in result.get("source_preview", "")
+
+
+def test_apply_overlay_returns_deleted():
+    packet = _sample_packet()
+    ctx = WorkerToolContext(
+        task_id="task-1", runner="runner", topic="t", request_id="req-abc",
+        repo=Path("/tmp/repo"), authority_repo=Path("/tmp/authority"),
+        source_graph_targets=(), session_topic="t",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+    result = _apply_rework_overlay_query(ctx, "file", "deleted", "deleted.py", 64)
+    assert result is not None
+    assert result.get("ok") is False
+    assert "deleted" in result.get("reason", "")
+
+
+def test_canonical_fallback_unshadowed():
+    packet = _sample_packet()
+    ctx = WorkerToolContext(
+        task_id="task-1", runner="runner", topic="t", request_id="req-abc",
+        repo=Path("/tmp/repo"), authority_repo=Path("/tmp/authority"),
+        source_graph_targets=(), session_topic="t",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+    result = _apply_rework_overlay_query(ctx, "focus", "unknown", "not_in_overlay.py", 64)
+    assert result is None
+
+
+def test_threaded_isolation_no_cross_contamination(tmp_path):
+    auth = tmp_path / "auth"
+    auth.mkdir()
+    packet_a = _sample_packet(successor_req="ra", successor_task="ta",
+                              predecessor_req="pa", predecessor_task="pta",
+                              authority_repo=auth, files=[{"path": "a.py", "sha256": "shaA",
+                                                           "content_base64": base64.b64encode(b"A").decode()}])
+    packet_b = _sample_packet(successor_req="rb", successor_task="tb",
+                              predecessor_req="pb", predecessor_task="ptb",
+                              authority_repo=auth, files=[{"path": "b.py", "sha256": "shaB",
+                                                           "content_base64": base64.b64encode(b"B").decode()}])
+    results = []
+    def query_ctx(packet, target):
+        ctx = WorkerToolContext(
+            task_id=packet["successor_task_id"], runner="r", topic="t",
+            request_id=packet["successor_request_id"],
+            repo=Path("/tmp/repo"), authority_repo=auth,
+            source_graph_targets=(), session_topic="t",
+            audit_ledger_path=None, audit_hmac_key_path=None,
+            rework_overlay_packet=packet,
+        )
+        res = _apply_rework_overlay_query(ctx, "body", "x", target, 64)
+        results.append(res)
+    t1 = threading.Thread(target=query_ctx, args=(packet_a, "a.py"))
+    t2 = threading.Thread(target=query_ctx, args=(packet_b, "b.py"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert any(r and r.get("overlay") and "A" in r.get("source_preview", "") for r in results)
+    assert any(r and r.get("overlay") and "B" in r.get("source_preview", "") for r in results)
+
+
+def test_cleanup_does_not_leak(tmp_path):
+    """Verify that the overlay map is computed per-call and contexts don't cross-contaminate."""
+    auth = tmp_path / "auth"
+    auth.mkdir()
+    packet = _sample_packet(authority_repo=auth)
+    ctx = WorkerToolContext(
+        task_id="task-1", runner="r", topic="t", request_id="req-abc",
+        repo=Path("/tmp/repo"), authority_repo=auth,
+        source_graph_targets=(), session_topic="t",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+    )
+    res1 = _apply_rework_overlay_query(ctx, "body", "x", "src/mod.py", 64)
+    assert res1 is not None
+    assert res1.get("overlay") is True
+    # Create a second context without overlay, ensure it doesn't leak
+    ctx2 = WorkerToolContext(
+        task_id="task-2", runner="r", topic="t", request_id="req-def",
+        repo=Path("/tmp/repo"), authority_repo=auth,
+        source_graph_targets=(), session_topic="t",
+        audit_ledger_path=None, audit_hmac_key_path=None,
+        rework_overlay_packet=None,
+    )
+    res2 = _apply_rework_overlay_query(ctx2, "body", "x", "src/mod.py", 64)
+    assert res2 is None

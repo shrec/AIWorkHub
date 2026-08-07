@@ -6217,22 +6217,57 @@ def needfix_events(needfix_id: str, limit: int = 100) -> list[dict[str, Any]]:
     return ns.list_events(repo_root(), needfix_id, limit=limit)
 
 
-def needfix_preview_convert(needfix_id: str) -> dict[str, Any]:
+def needfix_preview_convert(
+    needfix_id: str, *, task_plan: dict[str, Any] | None = None
+) -> dict[str, Any]:
     ns = _needfix_store_module()
-    return ns.preview_convert(repo_root(), needfix_id)
+    return ns.preview_convert(repo_root(), needfix_id, task_plan=task_plan)
 
 
-def needfix_convert(needfix_id: str) -> dict[str, Any]:
-    """Explicit conversion using the existing authoritative create_task."""
+def needfix_convert(
+    needfix_id: str,
+    *,
+    task_plan: dict[str, Any] | None = None,
+    plan_digest: str | None = None,
+) -> dict[str, Any]:
+    """Explicit conversion using the existing authoritative create_task.
+
+    With no ``task_plan``, the executable card is built entirely from the
+    NeedFix's own recorded scope (``needfix_store.default_task_card``). A
+    caller-supplied ``task_plan`` is strictly validated and overrides that
+    card field by field (``needfix_store.normalize_task_plan``); fields it
+    omits keep the scope-derived default. Never infers ``max_live_tokens``
+    on the caller's behalf -- the created task stays uncapped unless
+    ``task_plan`` explicitly sets it. Every confirmed non-idempotent
+    conversion must bind to a ``plan_digest`` the matching preview
+    returned -- the default card is held to the same digest discipline
+    as an explicit plan, so any NeedFix drift between preview and commit
+    fails closed instead of silently committing a different plan.
+    Idempotent already-task_created retries short-circuit before this
+    enforcement, preserving reconciliation without a new create.
+    """
     ns = _needfix_store_module()
 
     def _create_task_fn(card: dict[str, Any]) -> dict[str, Any]:
+        def _require_str(key: str) -> str:
+            """Extract a required non-empty string from the conversion card.
+
+            Raises the typed ``NeedFixError`` (never a raw ``KeyError``) when
+            the field is missing, not a string, or empty/whitespace-only.
+            """
+            value = card.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ns.NeedFixError(
+                    f"conversion card is missing required field {key!r}"
+                )
+            return value
+
         return create_task(
-            task_id=card["task_id"],
-            title=card["title"],
+            task_id=_require_str("task_id"),
+            title=_require_str("title"),
             runner=card.get("runner", "claude"),
             topic=card.get("topic", "needfix_conversion"),
-            objective=card["objective"],
+            objective=_require_str("objective"),
             acceptance=card.get("acceptance", ["Resolve the reported NeedFix"]),
             allowed_writes=card.get("allowed_writes", []),
             forbidden=card.get("forbidden"),
@@ -6250,7 +6285,24 @@ def needfix_convert(needfix_id: str) -> dict[str, Any]:
             max_live_tokens=card.get("max_live_tokens"),
         )
 
-    return ns.convert_needfix(repo_root(), needfix_id, _create_task_fn)
+    def _task_card_builder(needfix_snapshot: dict[str, Any]) -> dict[str, Any]:
+        if plan_digest is None:
+            raise ns.NeedFixError(
+                "plan_digest is required to bind a confirmed conversion to "
+                "the previewed plan; re-preview before committing"
+            )
+        card = ns.normalize_task_plan(needfix_snapshot, task_plan)
+        actual_digest = ns.plan_digest(card)
+        if actual_digest != plan_digest:
+            raise ns.NeedFixConflictError(
+                "task_plan digest mismatch -- the previewed plan no longer "
+                "matches the current NeedFix state; re-preview before committing"
+            )
+        return card
+
+    return ns.convert_needfix(
+        repo_root(), needfix_id, _create_task_fn, task_card_builder=_task_card_builder
+    )
 
 
 def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[str, Any]:

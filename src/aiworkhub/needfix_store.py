@@ -949,8 +949,16 @@ def list_events(
         conn.close()
 
 
-def preview_convert(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
-    """Read-only preview of what conversion would do. Never mutates state."""
+def preview_convert(
+    repo_root: str | Path, needfix_id: str, task_plan: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Read-only preview of what conversion would do. Never mutates state.
+
+    When claimable, returns the exact normalized executable card conversion
+    would submit (``task_plan``) plus its deterministic ``plan_digest`` so a
+    manager can bind a subsequent ``convert_needfix`` commit to precisely
+    what was previewed.
+    """
 
     row = get_needfix(repo_root, needfix_id)
     if row["status"] == "task_created":
@@ -967,6 +975,7 @@ def preview_convert(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
             "resolved": True,
         }
     claimable = row["status"] in CLAIMABLE_STATUSES
+    card = normalize_task_plan(row, task_plan)
     return {
         "needfix_id": needfix_id,
         "already_converted": False,
@@ -974,9 +983,319 @@ def preview_convert(repo_root: str | Path, needfix_id: str) -> dict[str, Any]:
         "current_status": row["status"],
         "unverified": row["status"] in ("captured",),
         "triaged": row["status"] == "triaged",
-        "proposed_task_title": row["title"],
-        "proposed_task_objective": row["description"],
+        "task_plan": card,
+        "plan_digest": plan_digest(card),
     }
+
+
+def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a structured, executable task-conversion plan from one NeedFix.
+
+    Used only when the caller does not supply an explicit
+    ``task_card_builder``. Scope (``allowed_writes``/``read_first``) comes
+    solely from the NeedFix's own recorded ``scope_files`` -- never
+    invented. A NeedFix with no recorded scope files converts to a
+    read-only investigation card instead of an unscoped, unlaunchable
+    "writable" card. ``required_outputs`` is deliberately left unset by
+    default: recorded scope files may include unchanged evidence/supporting
+    context rather than files every conversion must modify, and forcing all
+    of them to be required would produce false ``required_output_unchanged``
+    failures. A caller-supplied ``task_plan`` may still declare an explicit
+    ``required_outputs`` subset. Never sets ``max_live_tokens`` (uncapped
+    unless a caller-supplied plan says otherwise).
+    """
+    needfix_id = needfix_snapshot["id"]
+    scope_files = [
+        str(item) for item in (needfix_snapshot.get("scope_files") or []) if str(item).strip()
+    ]
+    card: dict[str, Any] = {
+        "task_id": f"needfix-{needfix_id}",
+        "title": needfix_snapshot["title"],
+        "objective": needfix_snapshot["description"],
+        "acceptance": [f"Resolve NeedFix {needfix_id}: {needfix_snapshot['title']}"],
+        "task_type": "code",
+    }
+    if scope_files:
+        card["read_only"] = False
+        card["allowed_writes"] = scope_files
+        card["read_first"] = scope_files
+        card["validation"] = ["git diff --check"]
+    else:
+        card["read_only"] = True
+    return card
+
+
+_TASK_PLAN_LIST_FIELDS: tuple[str, ...] = (
+    "acceptance",
+    "allowed_writes",
+    "required_outputs",
+    "forbidden",
+    "validation",
+    "read_first",
+    "immutable_inputs",
+    "depends_on",
+)
+_TASK_PLAN_STR_FIELDS: tuple[str, ...] = ("title", "objective", "runner", "topic", "task_type", "priority")
+_TASK_PLAN_BOOL_FIELDS: tuple[str, ...] = ("callback_required", "read_only")
+_TASK_PLAN_INT_FIELDS: tuple[str, ...] = ("max_live_tokens",)
+_TASK_PLAN_ALLOWED_FIELDS: frozenset[str] = frozenset(
+    _TASK_PLAN_LIST_FIELDS + _TASK_PLAN_STR_FIELDS + _TASK_PLAN_BOOL_FIELDS + _TASK_PLAN_INT_FIELDS
+)
+
+
+def validate_task_plan(task_plan: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Strictly validate a caller-supplied JSON-compatible conversion plan.
+
+    Fails closed on any unsupported field or wrong-typed value -- this is
+    the only path by which a manager-authored plan can influence the
+    executable card, so ambiguity here must never be guessed. ``task_id``
+    is never an accepted field: it always stays ``needfix-{needfix_id}`` so
+    retries and durable ``converted_task_id`` linkage stay stable.
+    """
+    if task_plan is None:
+        return {}
+    if not isinstance(task_plan, Mapping):
+        raise NeedFixValidationError("task_plan must be a JSON object")
+    unknown = set(task_plan.keys()) - _TASK_PLAN_ALLOWED_FIELDS
+    if unknown:
+        raise NeedFixValidationError(f"task_plan has unsupported fields: {sorted(unknown)}")
+    validated: dict[str, Any] = {}
+    for field in _TASK_PLAN_LIST_FIELDS:
+        if field not in task_plan:
+            continue
+        value = task_plan[field]
+        if not isinstance(value, list) or len(value) > 128:
+            raise NeedFixValidationError(f"task_plan.{field} must be a bounded list of strings")
+        items: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip() or len(item) > 1000:
+                raise NeedFixValidationError(
+                    f"task_plan.{field} entries must be non-empty bounded strings"
+                )
+            items.append(item)
+        validated[field] = items
+    for field in _TASK_PLAN_STR_FIELDS:
+        if field not in task_plan:
+            continue
+        value = task_plan[field]
+        if not isinstance(value, str) or not value.strip() or len(value) > 4000:
+            raise NeedFixValidationError(f"task_plan.{field} must be a non-empty bounded string")
+        validated[field] = value
+    for field in _TASK_PLAN_BOOL_FIELDS:
+        if field not in task_plan:
+            continue
+        value = task_plan[field]
+        if not isinstance(value, bool):
+            raise NeedFixValidationError(f"task_plan.{field} must be a boolean")
+        validated[field] = value
+    for field in _TASK_PLAN_INT_FIELDS:
+        if field not in task_plan:
+            continue
+        value = task_plan[field]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100_000_000:
+            raise NeedFixValidationError(
+                f"task_plan.{field} must be an int between 1 and 100000000"
+            )
+        validated[field] = value
+    return validated
+
+
+def normalize_task_plan(
+    needfix_snapshot: Mapping[str, Any], task_plan: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build the exact normalized, executable conversion card for one NeedFix.
+
+    ``task_plan`` (validated via ``validate_task_plan``) overrides the
+    scope-derived defaults from ``default_task_card`` field by field; any
+    field it omits keeps its scope-derived default. ``task_id`` is never
+    caller-controlled (always ``needfix-{needfix_id}``) and
+    ``max_live_tokens`` is never inferred -- only a caller-supplied plan may
+    set an explicit cap (uncapped otherwise).
+    """
+    validated = validate_task_plan(task_plan)
+    # Fail closed on an explicitly contradictory caller-supplied plan.
+    if validated.get("read_only") is True and (
+        validated.get("allowed_writes") or validated.get("required_outputs")
+    ):
+        raise NeedFixValidationError(
+            "task_plan cannot combine read_only=True with a non-empty "
+            "allowed_writes/required_outputs -- contradictory read/write intent"
+        )
+    card = default_task_card(needfix_snapshot)
+    for field, value in validated.items():
+        card[field] = value
+
+    # When the default card is read-only but the caller supplies
+    # write-bearing fields without explicitly overriding read_only,
+    # treat the write fields as an implicit read_only=False so the
+    # returned card is never contradictory.
+    user_set_read_only = "read_only" in validated
+    if not user_set_read_only and card.get("read_only") and (
+        card.get("allowed_writes") or card.get("required_outputs")
+    ):
+        card["read_only"] = False
+
+    # If the caller explicitly set read_only=True, strip any write
+    # fields that may have leaked from the default or the override
+    # (the override case is already rejected above).
+    if validated.get("read_only") is True:
+        card.pop("allowed_writes", None)
+        card.pop("required_outputs", None)
+        card.pop("validation", None)
+    return card
+
+def plan_digest(card: Mapping[str, Any]) -> str:
+    """Deterministic digest binding a preview to its exact confirmed card."""
+    canonical = json.dumps(card, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Typed helpers for convert_needfix -- each handles one concern so the public
+# conversion path is auditable and materially less branch-heavy without
+# changing its fail-closed or idempotent behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _check_already_converted(
+    row: sqlite3.Row, needfix_id: str
+) -> dict[str, Any] | None:
+    """Idempotent short-circuit: return existing result or None if not yet converted."""
+    if row["status"] == "task_created":
+        return {
+            "needfix_id": needfix_id,
+            "converted_task_id": row["converted_task_id"],
+            "already_converted": True,
+        }
+    if row["status"] == "resolved":
+        return {
+            "needfix_id": needfix_id,
+            "converted_task_id": row["converted_task_id"],
+            "already_converted": True,
+            "resolved": True,
+        }
+    return None
+
+
+def _validate_and_claim(
+    conn: sqlite3.Connection, needfix_id: str, row: sqlite3.Row
+) -> tuple[str, dict[str, Any]]:
+    """Status guard + atomic claim.
+
+    Raises NeedFixConflictError on captured/triaged or failed claim.
+    Returns ``(prior_status, needfix_snapshot)`` on success.
+    """
+    if row["status"] in ("captured", "triaged"):
+        raise NeedFixConflictError(
+            f"needfix {needfix_id} is {row['status']!r} -- "
+            f"captured/unverified NeedFixes cannot be converted. "
+            f"A manager must first accept this NeedFix."
+        )
+
+    prior_status: str = row["status"]
+    cur = conn.execute(
+        "UPDATE needfix SET status = 'converting', updated_at = ? "
+        "WHERE id = ? AND status IN ('accepted', 'task_planned')",
+        (_utcnow_iso(), needfix_id),
+    )
+    if cur.rowcount != 1:
+        raise NeedFixConflictError(
+            f"needfix {needfix_id} could not be claimed for conversion "
+            f"(current status is {prior_status!r}, must be accepted or task_planned)"
+        )
+    _record_event(conn, needfix_id, "conversion_claimed", {"prior_status": prior_status})
+    needfix_snapshot = _row_to_dict(
+        conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+    )
+    return prior_status, needfix_snapshot
+
+
+def _resolve_conversion_card(
+    needfix_snapshot: dict[str, Any],
+    task_card_builder: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the executable conversion card from the snapshot."""
+    if task_card_builder is not None:
+        return dict(task_card_builder(needfix_snapshot))
+    return default_task_card(needfix_snapshot)
+
+
+def _normalize_create_task_receipt(result: Any, needfix_id: str) -> str:
+    """Validate the canonical create_task_fn receipt and extract ``task_id``.
+
+    Raises NeedFixError on malformed (non-Mapping), ambiguous (ok=True
+    without a valid task_id), ok=False failure receipts, or receipts
+    missing the boolean ``ok`` field entirely.  Returns the verified
+    non-empty task_id string on success.
+    """
+    if not isinstance(result, Mapping):
+        raise NeedFixError(
+            "create_task_fn returned a malformed receipt "
+            f"(expected a mapping, got {type(result).__name__})"
+        )
+    ok = result.get("ok")
+    if ok is True:
+        task_id = result.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise NeedFixError(
+                "create_task_fn returned ok=True without a valid task_id "
+                "-- ambiguous receipt"
+            )
+        return task_id
+    if ok is False:
+        reason = str(result.get("stderr") or result.get("error") or "unknown_error")[:500]
+        raise NeedFixError(f"create_task_fn reported task creation failure: {reason}")
+    raise NeedFixError(
+        "create_task_fn returned a malformed receipt "
+        "(missing boolean 'ok' field)"
+    )
+
+
+def _compensate_conversion_claim(
+    repo_root: str | Path, needfix_id: str, prior_status: str
+) -> None:
+    """Restore the NeedFix to its pre-claim status after a failed conversion."""
+    conn = _connect(repo_root)
+    try:
+        conn.execute(
+            "UPDATE needfix SET status = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'converting'",
+            (prior_status, _utcnow_iso(), needfix_id),
+        )
+        _record_event(
+            conn,
+            needfix_id,
+            "conversion_compensated",
+            {"restored_status": prior_status},
+        )
+    finally:
+        conn.close()
+
+
+def _commit_conversion(
+    repo_root: str | Path, needfix_id: str, task_id: str
+) -> dict[str, Any]:
+    """Atomically record ``task_created`` + ``converted_task_id``."""
+    conn = _connect(repo_root)
+    try:
+        conn.execute(
+            "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
+            "updated_at = ? WHERE id = ? AND status = 'converting'",
+            (task_id, _utcnow_iso(), needfix_id),
+        )
+        _record_event(conn, needfix_id, "conversion_committed", {"converted_task_id": task_id})
+        return {
+            "needfix_id": needfix_id,
+            "converted_task_id": task_id,
+            "already_converted": False,
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Public conversion entry point -- thin orchestrator over the typed helpers.
+# ---------------------------------------------------------------------------
 
 
 def convert_needfix(
@@ -1005,100 +1324,33 @@ def convert_needfix(
     - On success, atomically record ``task_created`` + ``converted_task_id``.
     """
 
+    # -- Phase 1: load row, check idempotent short-circuit ---------------
     conn = _connect(repo_root)
     try:
         row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
         if row is None:
             raise NeedFixNotFoundError(needfix_id)
 
-        if row["status"] == "task_created":
-            return {
-                "needfix_id": needfix_id,
-                "converted_task_id": row["converted_task_id"],
-                "already_converted": True,
-            }
+        already = _check_already_converted(row, needfix_id)
+        if already is not None:
+            return already
 
-        if row["status"] == "resolved":
-            return {
-                "needfix_id": needfix_id,
-                "converted_task_id": row["converted_task_id"],
-                "already_converted": True,
-                "resolved": True,
-            }
-
-        if row["status"] in ("captured", "triaged"):
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} is {row['status']!r} -- "
-                f"captured/unverified NeedFixes cannot be converted. "
-                f"A manager must first accept this NeedFix."
-            )
-
-        prior_status = row["status"]
-        cur = conn.execute(
-            "UPDATE needfix SET status = 'converting', updated_at = ? "
-            "WHERE id = ? AND status IN ('accepted', 'task_planned')",
-            (_utcnow_iso(), needfix_id),
-        )
-        if cur.rowcount != 1:
-            raise NeedFixConflictError(
-                f"needfix {needfix_id} could not be claimed for conversion "
-                f"(current status is {prior_status!r}, must be accepted or task_planned)"
-            )
-        _record_event(conn, needfix_id, "conversion_claimed", {"prior_status": prior_status})
-        needfix_snapshot = _row_to_dict(
-            conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
-        )
+        # -- Phase 2: validate status and atomically claim --------------
+        prior_status, needfix_snapshot = _validate_and_claim(conn, needfix_id, row)
     finally:
         conn.close()
 
+    # -- Phase 3: build card, invoke create_task_fn, normalize receipt --
     try:
-        if task_card_builder is not None:
-            card = dict(task_card_builder(needfix_snapshot))
-        else:
-            card = {
-                "task_id": f"needfix-{needfix_id}",
-                "title": needfix_snapshot["title"],
-                "objective": needfix_snapshot["description"],
-            }
+        card = _resolve_conversion_card(needfix_snapshot, task_card_builder)
         result = create_task_fn(card)
-        task_id = None
-        if isinstance(result, Mapping):
-            task_id = result.get("task_id") or result.get("id")
-        if not task_id:
-            raise NeedFixError("create_task_fn did not return a task_id")
+        task_id = _normalize_create_task_receipt(result, needfix_id)
     except Exception:
-        conn = _connect(repo_root)
-        try:
-            conn.execute(
-                "UPDATE needfix SET status = ?, updated_at = ? "
-                "WHERE id = ? AND status = 'converting'",
-                (prior_status, _utcnow_iso(), needfix_id),
-            )
-            _record_event(
-                conn,
-                needfix_id,
-                "conversion_compensated",
-                {"restored_status": prior_status},
-            )
-        finally:
-            conn.close()
+        _compensate_conversion_claim(repo_root, needfix_id, prior_status)
         raise
 
-    conn = _connect(repo_root)
-    try:
-        conn.execute(
-            "UPDATE needfix SET status = 'task_created', converted_task_id = ?, "
-            "updated_at = ? WHERE id = ? AND status = 'converting'",
-            (task_id, _utcnow_iso(), needfix_id),
-        )
-        _record_event(conn, needfix_id, "conversion_committed", {"converted_task_id": task_id})
-        return {
-            "needfix_id": needfix_id,
-            "converted_task_id": task_id,
-            "already_converted": False,
-        }
-    finally:
-        conn.close()
+    # -- Phase 4: commit the successful conversion ----------------------
+    return _commit_conversion(repo_root, needfix_id, task_id)
 
 
 def link_existing_task(
