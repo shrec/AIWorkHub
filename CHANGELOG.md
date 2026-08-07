@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-08-07
+
+### Added
+
+- Worker finalization now consumes the exact one-episode validation-only
+  replay authorization snapshotted at launch and attaches structured replay
+  evidence to required-output and terminal review receipts.
+
+### Fixed
+
+- Hash-pinned, unchanged inherited predecessor outputs can be revalidated
+  without fabricating an edit, while task, actor, predecessor, path/hash and
+  claim-epoch mismatches continue to fail closed.
+
 ## [0.9.14] - 2026-08-07
 
 ### Added
