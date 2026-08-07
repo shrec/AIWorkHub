@@ -35,6 +35,59 @@ function initializeDebugTracing(context) {
   }
 }
 
+const TOOL_INPUT_DIAGNOSTIC_MAX_CHARS = 768;
+const TOOL_INPUT_TRACE_MAX_ENTRIES = 8;
+const TOOL_INPUT_SECRET_KEY_PATTERN = /(authorization|api[_-]?key|token|secret|password|credential|cookie)/i;
+
+function redactToolInputValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    const redacted = value
+      .replace(/bearer\s+[^\s"']+/gi, "Bearer [redacted]")
+      .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]");
+    return redacted.length > 200 ? `${redacted.slice(0, 200)}…[truncated]` : redacted;
+  }
+  if (Array.isArray(value)) return value.slice(0, 10).map(redactToolInputValue);
+  if (typeof value === "object") {
+    const output = {};
+    for (const key of Object.keys(value).slice(0, 20)) {
+      output[key] = TOOL_INPUT_SECRET_KEY_PATTERN.test(key)
+        ? "[redacted]"
+        : redactToolInputValue(value[key]);
+    }
+    return output;
+  }
+  return value;
+}
+
+function buildToolInputInvalidDiagnostic(toolName, parseError, rawInput, recentTurns) {
+  const safeToolName = typeof toolName === "string" && toolName.length > 0
+    ? toolName.slice(0, 120)
+    : "unknown";
+  const parserError = sanitizeStderrChunk(
+    String((parseError && parseError.message) || parseError || "unknown_parse_error"),
+  ).slice(0, 500);
+  let protocolPreview = "";
+  try {
+    protocolPreview = JSON.stringify(redactToolInputValue(rawInput));
+  } catch (_err) {
+    protocolPreview = "[unserializable_protocol_preview]";
+  }
+  if (protocolPreview.length > TOOL_INPUT_DIAGNOSTIC_MAX_CHARS) {
+    protocolPreview = `${protocolPreview.slice(0, TOOL_INPUT_DIAGNOSTIC_MAX_CHARS)}…[truncated]`;
+  }
+  const turnTrace = Array.isArray(recentTurns)
+    ? recentTurns.slice(-TOOL_INPUT_TRACE_MAX_ENTRIES).map(redactToolInputValue)
+    : [];
+  return {
+    schema_id: "aiworkhub.vscode_lm.tool_input_invalid_diagnostic.v1",
+    tool_name: safeToolName,
+    parser_error: parserError,
+    protocol_preview: protocolPreview,
+    turn_trace: turnTrace,
+  };
+}
+
 // Record HOW this extension host dies. Every extension in a window shares one
 // extension-host process, so a single fatal error here takes Codex, Copilot
 // and Claude down with the dashboard -- and the post-mortem is otherwise
@@ -3090,7 +3143,31 @@ async function runVscodeLmTextProtocol(
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
     if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
-      throw new Error("vscode_lm_tool_input_invalid");
+      const reason = Array.isArray(envelope.input)
+        ? "tool_input_is_array"
+        : (envelope.input === null || envelope.input === undefined)
+          ? "tool_input_missing"
+          : "tool_input_not_object";
+      const traceEntry = {
+        turn,
+        phase: "tool_input_validation",
+        outcome: "vscode_lm_tool_input_invalid",
+        tool_name: String(envelope.name || "unknown").slice(0, 120),
+        reason,
+      };
+      const diagnostic = buildToolInputInvalidDiagnostic(
+        envelope.name,
+        new Error(reason),
+        envelope.input,
+        [...protocolTrace, traceEntry],
+      );
+      const invalidInputError = new Error("vscode_lm_tool_input_invalid");
+      invalidInputError.protocolPhase = "tool_input_validation";
+      invalidInputError.protocolCause = diagnostic.parser_error;
+      invalidInputError.protocolPreview = diagnostic.protocol_preview;
+      invalidInputError.protocolTrace = diagnostic.turn_trace;
+      invalidInputError.responseDiagnostics = diagnostic;
+      throw invalidInputError;
     }
     if (Buffer.byteLength(JSON.stringify(envelope.input), "utf8") > VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES) {
       throw new Error("vscode_lm_tool_input_too_large");
@@ -3497,6 +3574,7 @@ class VscodeLmBridgeHost {
           mcp: (err && err.mcpDiagnostics) || null,
           protocol_preview: sanitizeStderrChunk(String((err && err.protocolPreview) || "")).slice(0, 768),
           turn_trace: Array.isArray(err && err.protocolTrace) ? err.protocolTrace.slice(-16) : [],
+          tool_input_invalid: (err && err.responseDiagnostics) || null,
         };
         if (err && err.protocolPreview) {
           recordSystemLog(`[vscode lm bridge] rejected response preview ${diagnostics.protocol_preview}`);

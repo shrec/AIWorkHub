@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,72 @@ def test_atomic_json_skips_redundant_chmod_in_restricted_sandbox(
     assert json.loads(target.read_text(encoding="utf-8"))["text"] == "ქართული → UTF-8"
     assert target.parent.stat().st_mode & 0o777 == 0o700
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_vscode_lm_tool_input_invalid_has_bounded_diagnostics() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "vscode-extension" / "extension.js"
+    ).read_text(encoding="utf-8")
+    invalid_branch_start = source.index(
+        'if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {'
+    )
+    invalid_branch = source[invalid_branch_start:invalid_branch_start + 1800]
+    assert "buildToolInputInvalidDiagnostic(" in invalid_branch
+    assert "responseDiagnostics = diagnostic" in invalid_branch
+    outer_catch_start = source.index("diagnostics = {", invalid_branch_start)
+    outer_catch = source[outer_catch_start:outer_catch_start + 1200]
+    assert "tool_input_invalid: (err && err.responseDiagnostics) || null" in outer_catch
+
+    helper_start = source.index("const TOOL_INPUT_DIAGNOSTIC_MAX_CHARS")
+    helper_end = source.index("// Record HOW this extension host dies", helper_start)
+    helper_source = source[helper_start:helper_end]
+    sanitize_start = source.index("function sanitizeStderrChunk(")
+    sanitize_open = source.index("{", sanitize_start)
+    depth = 0
+    sanitize_end = sanitize_open
+    while sanitize_end < len(source):
+        if source[sanitize_end] == "{":
+            depth += 1
+        elif source[sanitize_end] == "}":
+            depth -= 1
+            if depth == 0:
+                sanitize_end += 1
+                break
+        sanitize_end += 1
+    sanitize_source = source[sanitize_start:sanitize_end]
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node executable is required for the bounded diagnostic harness")
+    harness = f"""
+const MCP_MAX_STDERR_LOG_BYTES = 4096;
+{sanitize_source}
+{helper_source}
+const trace = Array.from({{length: 20}}, (_, index) => ({{index}}));
+const result = buildToolInputInvalidDiagnostic(
+  "aiworkhub_worker_source_graph_query",
+  new Error("schema mismatch"),
+  {{authorization: "Bearer secret-value", nested: {{api_key: "sk-secretvalue"}}, payload: "x".repeat(5000)}},
+  trace,
+);
+process.stdout.write(JSON.stringify(result));
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as stream:
+        stream.write(harness)
+        harness_path = Path(stream.name)
+    try:
+        completed = subprocess.run(
+            [node, str(harness_path)], check=True, capture_output=True, text=True, timeout=10,
+        )
+    finally:
+        harness_path.unlink(missing_ok=True)
+    diagnostic = json.loads(completed.stdout)
+    assert diagnostic["tool_name"] == "aiworkhub_worker_source_graph_query"
+    assert diagnostic["parser_error"] == "schema mismatch"
+    assert 0 < len(diagnostic["protocol_preview"]) <= 780
+    assert "secret-value" not in diagnostic["protocol_preview"]
+    assert "sk-secretvalue" not in diagnostic["protocol_preview"]
+    assert "[redacted]" in diagnostic["protocol_preview"]
+    assert len(diagnostic["turn_trace"]) == 8
 
 
 def test_atomic_json_fails_closed_when_parent_identity_changes(
