@@ -1058,11 +1058,15 @@ def aiworkhub_task_reject_review(
 def aiworkhub_task_recover_blocked_rework(
     task_id: str,
     feedback_reason: str = "",
+    validation_only_replay: bool = False,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical transaction."""
 
-    return core.recover_blocked_rework(task_id, feedback_reason=feedback_reason)
-
+    return core.recover_blocked_rework(
+        task_id,
+        feedback_reason=feedback_reason,
+        validation_only_replay=bool(validation_only_replay),
+    )
 
 @mcp.tool()
 @_serialize_task_lifecycle_write

@@ -1260,14 +1260,18 @@ def recover_blocked_rework(
     *,
     actor: str = "coordinator",
     feedback_reason: str = "",
+    validation_only_replay: bool = False,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
 
-    This is the canonical task-store transaction that requeues a blocked task
-    as ``pending`` for rework, preserving task identity, append-only history,
-    claim epoch lineage, predecessor hashes, and review feedback.  It clears
-    only the claim/worker fields required for a fresh pending launch.
+    ``validation_only_replay`` explicitly authorizes a validation-only
+    replay recovery.  When True this fails closed unless the retained
+    ``rework_predecessor`` carries a non-empty ``request_id`` and
+    ``changed_path_hashes``; on success the exact provenance and the newly
+    computed claim epoch are persisted on the recovered card as
+    ``validation_only_replay_authorization``, scoped to this one episode.
+    Default False preserves ordinary recovery behavior unchanged.
 
     Fails closed on:
       - dependency, policy, or scope blockers (must be resolved first)
@@ -1275,6 +1279,8 @@ def recover_blocked_rework(
       - blocked tasks without residual feedback
       - tasks with a live claim or in-process episode
       - non-blocked tasks
+      - explicit validation_only_replay authorization lacking retained
+        predecessor request_id or changed_path_hashes
 
     Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
     already re-queued the same task, without duplicating audit history.
@@ -1292,7 +1298,6 @@ def recover_blocked_rework(
 
         current_canonical = canonical_status(dict(row))
 
-        # --- Idempotency: already recovered ---
         already = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id=? AND event='blocked_rework_recovery' LIMIT 1",
@@ -1301,15 +1306,10 @@ def recover_blocked_rework(
         if already is not None:
             if current_canonical == "pending":
                 return True, "already_recovered"
-            # Recovery event exists but task is no longer pending --
-            # e.g. it was recovered, re-claimed, and blocked again.
-            # Fall through to allow another recovery cycle.
 
-        # --- Fail on non-blocked tasks ---
         if current_canonical != "blocked":
             return False, f"not_blocked:current={current_canonical}"
 
-        # --- Parse card ---
         try:
             card = json.loads(str(row["card_json"] or "{}"))
         except json.JSONDecodeError:
@@ -1317,7 +1317,6 @@ def recover_blocked_rework(
         if not isinstance(card, dict):
             return False, "card_json_not_dict"
 
-        # --- Fail on live claim ---
         worker_status = str(row["worker_status"] or "").strip()
         claimed_by = str(row["claimed_by"] or "").strip()
         if worker_status in {"claimed", "in_progress"} or (
@@ -1332,12 +1331,6 @@ def recover_blocked_rework(
         ):
             return False, "live_claim_detected"
 
-        # --- Retained predecessor evidence ---
-        # Current-episode terminal fields are intentionally cleared whenever
-        # a review is rejected or a new claim starts.  Durable predecessor
-        # truth lives in the append-only terminal_review event and, when a
-        # retained workspace exists, in rework_predecessor.  Never require a
-        # stale terminal_review copy to remain embedded in card_json.
         terminal_row = conn.execute(
             "SELECT runner, payload_json, created_at FROM task_events "
             "WHERE task_id=? AND event='terminal_review' "
@@ -1358,38 +1351,41 @@ def recover_blocked_rework(
         if not isinstance(retained_predecessor, dict):
             retained_predecessor = {}
 
+        predecessor_request_id = str(
+            retained_predecessor.get("request_id") or ""
+        ).strip()
+        predecessor_changed_path_hashes = retained_predecessor.get(
+            "changed_path_hashes"
+        )
+        if validation_only_replay:
+            if not predecessor_request_id or not predecessor_changed_path_hashes:
+                return False, "validation_only_replay_missing_evidence"
+
         terminal_substatus = str(
             terminal_review.get("substatus") or ""
         ).strip()
 
-        # --- Fail on hard dependency/policy/scope blockers ---
         if terminal_substatus in _HARD_BLOCKER_SUBSTATUSES:
             return False, f"hard_blocker:{terminal_substatus}"
 
-        # --- Validate rework eligibility ---
         if terminal_substatus and terminal_substatus not in _REWORK_ELIGIBLE_SUBSTATUSES:
             return False, f"unrecognized_terminal_substatus:{terminal_substatus}"
 
-        # --- Residual feedback required ---
         bounded_feedback = str(feedback_reason or "").strip()
         if not bounded_feedback:
-            # Also check card_json for residual feedback evidence
             residual = card.get("reject_review")
             if isinstance(residual, dict):
                 bounded_feedback = str(residual.get("reason") or "").strip()
         if not bounded_feedback:
             return False, "no_residual_feedback"
 
-        # --- Perform recovery ---
         now = datetime.now(timezone.utc).isoformat()
 
-        # Bump claim epoch so the next launch carries a fresh lineage marker.
         try:
             claim_epoch = max(0, int(card.get("claim_epoch") or 0)) + 1
         except (TypeError, ValueError):
             claim_epoch = 1
 
-        # Preserve predecessor provenance for audit.
         predecessor_evidence = {
             "terminal_substatus": terminal_substatus,
             "terminal_runner": str(
@@ -1414,16 +1410,27 @@ def recover_blocked_rework(
             "request_id": str(retained_predecessor.get("request_id") or ""),
         }
 
-        # Clear only the current-episode claim/worker fields.
         prior_episode_summary = begin_claim_episode(card)
 
-        # Apply recovery state.
         card["claim_epoch"] = claim_epoch
         card["recovery_epoch"] = claim_epoch
         card["recovered_from_blocked_at"] = now
         card["recovered_by"] = actor
         card["recovery_predecessor"] = predecessor_evidence
         card["recovery_feedback"] = bounded_feedback[:2000]
+
+        if validation_only_replay:
+            card["validation_only_replay_authorization"] = {
+                "task_id": task_id,
+                "actor": actor,
+                "predecessor_request_id": predecessor_request_id,
+                "changed_path_hashes": predecessor_changed_path_hashes,
+                "authorized_at": now,
+                "next_claim_epoch": claim_epoch,
+                "one_episode_binding": True,
+            }
+        else:
+            card.pop("validation_only_replay_authorization", None)
 
         conn.execute(
             "UPDATE tasks SET status='pending', worker_status='unclaimed', "
@@ -1446,6 +1453,7 @@ def recover_blocked_rework(
             "claim_epoch": claim_epoch,
             "recorded_at": now,
             "actor": actor[:120],
+            "validation_only_replay": bool(validation_only_replay),
         }
         conn.execute(
             "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "

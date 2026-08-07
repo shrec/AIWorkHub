@@ -4126,6 +4126,7 @@ def recover_blocked_rework(
     *,
     feedback_reason: str = "",
     topic: str | None = None,
+    validation_only_replay: bool = False,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical task-store transaction."""
     card, error = _live_card(task_id)
@@ -4164,6 +4165,7 @@ def recover_blocked_rework(
             task_id,
             actor=CODEX_RUNNER,
             feedback_reason=bounded_feedback,
+            validation_only_replay=bool(validation_only_replay),
         )
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)

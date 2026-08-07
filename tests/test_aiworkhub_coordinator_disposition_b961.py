@@ -980,3 +980,143 @@ def test_reject_none_predecessor_omission_is_not_empty_selection(coord):
     )
     assert res_empty["ok"] is False
     assert "predecessor_request_id" in (res_empty.get("stderr") or "")
+
+
+def _make_blocked_rework_task_with_terminal_review(
+    root,
+    task_id="nf50-validation-only-replay",
+    *,
+    request_id="req-abc123",
+    changed_path_hashes=None,
+    feedback_reason="fix the flaky assertion",
+    include_predecessor_identity=True,
+):
+    """Insert one blocked task card plus its append-only terminal_review event.
+
+    Single correct local helper for validation_only_replay tests: creates the
+    task row (status=blocked, with rework_predecessor and workspace) and
+    appends the matching terminal_review task_event row.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    if changed_path_hashes is None:
+        changed_path_hashes = {"src/example.py": "deadbeef"}
+
+    now = datetime.now(timezone.utc).isoformat()
+    rework_predecessor = {"workspace": "/tmp/nf50-workspace"}
+    if include_predecessor_identity:
+        rework_predecessor["request_id"] = request_id
+        rework_predecessor["changed_path_hashes"] = changed_path_hashes
+
+    card = {
+        "topic": "nf50",
+        "claim_epoch": 1,
+        "rework_predecessor": rework_predecessor,
+        "reject_review": {"reason": feedback_reason},
+    }
+    card_json = _json.dumps(card, ensure_ascii=False, sort_keys=True)
+
+    _readiness, db_path = task_store._require_ready(root)
+    conn = task_store._connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, status, worker_status, "
+            "claimed_by, claimed_at, card_json, created_at, updated_at) "
+            "VALUES (?, 'codex', 'blocked', 'blocked', NULL, NULL, ?, ?, ?)",
+            (task_id, card_json, now, now),
+        )
+        terminal_review_payload = {
+            "substatus": "validation_failed",
+            "runner": "codex",
+            "recorded_at": now,
+            "claim_epoch": 1,
+            "evidence": {"changed_path_hashes": changed_path_hashes},
+        }
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'terminal_review', 'codex', ?, ?)",
+            (
+                task_id,
+                _json.dumps(terminal_review_payload, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return task_id
+
+
+def test_recover_blocked_rework_validation_only_replay_default_false_unchanged(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(root)
+    ok, state = task_store.recover_blocked_rework(
+        root, task_id, actor="coordinator", feedback_reason="fix flaky test"
+    )
+    assert ok is True
+    assert state == "recovered"
+    card = task_store.get_task(root, task_id)
+    assert "validation_only_replay_authorization" not in card
+
+
+def test_recover_blocked_rework_validation_only_replay_missing_evidence_rejected(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root, include_predecessor_identity=False
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="fix flaky test",
+        validation_only_replay=True,
+    )
+    assert ok is False
+    assert state == "validation_only_replay_missing_evidence"
+    card = task_store.get_task(root, task_id)
+    assert "validation_only_replay_authorization" not in card
+    assert card.get("claim_epoch") == 1
+
+
+def test_recover_blocked_rework_validation_only_replay_persists_authorization(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(
+        root, request_id="req-xyz789", changed_path_hashes={"a.py": "aaaa"}
+    )
+    ok, state = task_store.recover_blocked_rework(
+        root,
+        task_id,
+        actor="coordinator",
+        feedback_reason="fix flaky test",
+        validation_only_replay=True,
+    )
+    assert ok is True
+    assert state == "recovered"
+    card = task_store.get_task(root, task_id)
+    auth = card.get("validation_only_replay_authorization")
+    assert auth is not None
+    assert auth["task_id"] == task_id
+    assert auth["actor"] == "coordinator"
+    assert auth["predecessor_request_id"] == "req-xyz789"
+    assert auth["changed_path_hashes"] == {"a.py": "aaaa"}
+    assert auth["next_claim_epoch"] == card["claim_epoch"] == 2
+    assert "authorized_at" in auth
+
+
+def test_recover_blocked_rework_ordinary_recovery_regression(tmp_path):
+    root = tmp_path
+    task_store.initialize_repository(root)
+    task_id = _make_blocked_rework_task_with_terminal_review(root)
+    ok, state = task_store.recover_blocked_rework(
+        root, task_id, actor="coordinator", feedback_reason="fix flaky test"
+    )
+    assert ok is True
+    assert state == "recovered"
+    card = task_store.get_task(root, task_id)
+    assert card.get("claim_epoch") == 2
+    assert card.get("recovered_by") == "coordinator"
+    assert "validation_only_replay_authorization" not in card
