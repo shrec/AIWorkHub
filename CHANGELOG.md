@@ -6,6 +6,19 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-08-07
+
+### Fixed
+
+- Validation scratch selection now rejects filesystems that execute files but
+  cannot preserve the chmod metadata semantics required by Git and audit
+  receipts, falling back to a compatible private scratch root.
+- Approved repository-relative virtualenv validators such as
+  `.venv/bin/ruff` now resolve to a trusted absolute canonical executable
+  while receipts retain both the declared and actually executed argv.
+- Focused integration coverage proves the portable scratch, Git initialization
+  and declared-versus-executed validation evidence contract end to end.
+
 ## [0.9.12] - 2026-08-07
 
 ### Added

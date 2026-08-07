@@ -96,7 +96,9 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # instead of trusting the ambient tmp mount. Admins may pin an exact root
 # (must itself be exec-capable, no silent fallback) via
 # AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT; otherwise a small fixed
-# candidate list is probed in order and the first exec-capable one wins.
+# candidate list is probed in order and the first root that is BOTH
+# exec-capable AND honours the chmod/metadata semantics git init needs wins
+# (a hardened /dev/shm that execs but rejects chmod is skipped, not forced).
 # Fails closed (raises WorkspaceError) if nothing usable is found -- never
 # chmods or remounts a shared filesystem to force it to work.
 VALIDATION_EXEC_SCRATCH_ROOT_ENV = "AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT"
@@ -1737,6 +1739,25 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
         probe_path.unlink(missing_ok=True)
 
 
+def _probe_metadata_capable_dir(directory: Path) -> bool:
+    """Best-effort, self-cleaning probe for git-required chmod semantics."""
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    probe_path = directory / f".metadata_probe_{uuid.uuid4().hex}"
+    try:
+        fd = os.open(probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError:
+        return False
+    try:
+        os.close(fd)
+        os.chmod(probe_path, 0o600)
+        return stat.S_IMODE(os.stat(probe_path).st_mode) == 0o600
+    except OSError:
+        return False
+    finally:
+        probe_path.unlink(missing_ok=True)
+
+
 def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     """Create and return a private, request-unique, exec-capable scratch
     directory for one ``run_validations`` call.
@@ -1778,10 +1799,15 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
             os.chmod(scratch_dir, 0o700)
         except OSError:
             pass
-        if _probe_exec_capable_dir(scratch_dir):
-            return scratch_dir
-        tried.append(f"{root}:noexec")
-        shutil.rmtree(scratch_dir, ignore_errors=True)
+        if not _probe_exec_capable_dir(scratch_dir):
+            tried.append(f"{root}:noexec")
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            continue
+        if not _probe_metadata_capable_dir(scratch_dir):
+            tried.append(f"{root}:no_metadata")
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+            continue
+        return scratch_dir
     raise WorkspaceError(
         "validation_exec_scratch_unavailable:" + ";".join(tried[:16])
     )
@@ -1980,6 +2006,60 @@ def resolve_trusted_validation_executable(name: str, repo: Path | None = None) -
     return _resolve_trusted_validation_executable(name, repo).path
 
 
+def _resolve_repo_relative_trusted_validation_executable(
+    head: str, repo: Path | None = None
+) -> TrustedValidationExecutable | None:
+    """Resolve an approved repository-relative virtualenv executable."""
+    if repo is None:
+        repo = Path(__file__).resolve().parents[2]
+    normalized = head.replace("\\", "/")
+    if not normalized or normalized.startswith("/") or "\x00" in normalized:
+        return None
+    parts = PurePosixPath(normalized).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    name = parts[-1]
+    stem = name[:-4] if os.name == "nt" and name.lower().endswith(".exe") else name
+    if stem not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
+        return None
+    tail_parts = _validation_executable_relative_path(stem).parts
+    if len(parts) <= len(tail_parts) or parts[-len(tail_parts) :] != tail_parts:
+        return None
+
+    repo_root = repo.resolve(strict=False)
+    root = (
+        repo_root / PurePosixPath(*parts[: -len(tail_parts)])
+    ).resolve(strict=False)
+    try:
+        root.relative_to(repo_root)
+    except ValueError:
+        return None
+    candidate = repo_root / PurePosixPath(*parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return None
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    try:
+        root_info = root.stat()
+    except OSError:
+        return None
+    if os.name != "nt" and root_info.st_uid != os.getuid():
+        raise WorkspaceError(
+            f"validation_executable_runtime_root_untrusted_owner:{root}"
+        )
+    if stat.S_IMODE(root_info.st_mode) & 0o002:
+        raise WorkspaceError(
+            f"validation_executable_runtime_root_world_writable:{root}"
+        )
+    return _trusted_validation_executable_from_resolved(stem, root, resolved)
+
+
 def _normalize_trusted_validation_executable_argv(
     argv: list[str], repo: Path | None = None
 ) -> list[str]:
@@ -2010,8 +2090,13 @@ def _normalize_trusted_validation_executable_argv_with_roots(
     ):
         executable = _resolve_trusted_validation_executable("ruff", repo)
         return [str(executable.path), *argv[3:]], (executable.root,)
-    if "/" in head or "\\" in head or Path(head).is_absolute():
+    if Path(head).is_absolute():
         return list(argv), ()
+    if "/" in head or "\\" in head:
+        repo_relative = _resolve_repo_relative_trusted_validation_executable(head, repo)
+        if repo_relative is None:
+            return list(argv), ()
+        return [str(repo_relative.path), *argv[1:]], (repo_relative.root,)
     if head not in _TRUSTED_VALIDATION_BARE_EXECUTABLES:
         return list(argv), ()
     executable = _resolve_trusted_validation_executable(head, repo)

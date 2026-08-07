@@ -1262,3 +1262,215 @@ def test_validation_batch_retains_each_failed_command_and_bounded_streams(
     assert len(rows[0]["stdout_head"]) == 4_096
     assert len(rows[0]["stdout_tail"]) == 4_096
     assert rows[1]["stderr_truncated"] is True
+
+
+# ── validation sandbox portability regression (request cfaa21da...) ──────────
+
+
+def _bare_workspace(tmp_path: Path, request_id: str) -> worker_workspace.WorkerWorkspace:
+    return worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_repo_relative_venv_ruff_resolves_against_candidate_repo(tmp_path: Path) -> None:
+    """Root cause B: a declared repo-relative ``.venv/bin/ruff`` must resolve to
+    the canonical candidate repository executable (absolute host path), not be
+    executed verbatim relative to the sandbox cwd (which yields rc=126)."""
+    repo = tmp_path / "candidate-repo"
+    bin_dir = repo / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    ruff = bin_dir / "ruff"
+    ruff.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(ruff, 0o755)
+
+    declared = [".venv/bin/ruff", "check", "src/aiworkhub/worker_workspace.py"]
+    executed, roots = (
+        worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+            list(declared), repo
+        )
+    )
+    assert executed == [
+        str(ruff.resolve()),
+        "check",
+        "src/aiworkhub/worker_workspace.py",
+    ]
+    assert roots == ((repo / ".venv").resolve(),)
+    # Declared vs executed argv remain distinct and truthful for the receipt.
+    assert executed[0] != declared[0]
+    assert executed[1:] == declared[1:]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+def test_repo_relative_executable_passes_through_unrelated_and_rejects_untrusted(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "candidate-repo"
+    (repo / ".venv" / "bin").mkdir(parents=True)
+
+    # An absolute path is never rewritten.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["/usr/bin/ruff", "check"], repo
+    ) == (["/usr/bin/ruff", "check"], ())
+    # A relative path that is not <venv>/bin/<approved-name> passes through.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["scripts/run.sh", "arg"], repo
+    ) == (["scripts/run.sh", "arg"], ())
+    # A relative path to a non-approved executable name passes through.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        [".venv/bin/python3", "-m", "pytest"], repo
+    ) == ([".venv/bin/python3", "-m", "pytest"], ())
+    # Traversal escapes never resolve to a trusted executable.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        ["../evil/.venv/bin/ruff", "check"], repo
+    ) == (["../evil/.venv/bin/ruff", "check"], ())
+    # A missing executable is not fabricated; the head passes through.
+    assert worker_workspace._normalize_trusted_validation_executable_argv_with_roots(
+        [".venv/bin/mypy", "src"], repo
+    ) == ([".venv/bin/mypy", "src"], ())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX venv layout")
+@pytest.mark.skipif(
+    worker_workspace.landlock_abi_version() < 1,
+    reason="Landlock is not supported by this kernel",
+)
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GitHub hosted runners cannot execute nested Landlock validations",
+)
+def test_run_validations_declared_vs_executed_relative_venv_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path
+) -> None:
+    """Keep declared and executed argv distinct after trusted-path rewriting."""
+    bin_dir = repo / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    ruff = bin_dir / "ruff"
+    ruff.write_text("#!/bin/sh\necho ran-canonical-ruff\nexit 0\n", encoding="utf-8")
+    os.chmod(ruff, 0o755)
+    expected_executable = ruff.resolve()
+
+    workspace = _workspace(monkeypatch, tmp_path, repo, "declared-vs-executed-ruff")
+    try:
+        (result,) = worker_workspace.run_validations(
+            workspace, [".venv/bin/ruff check read/input.txt"]
+        )
+        assert result["returncode"] == 0, result["stderr_tail"]
+        assert result["declared_argv"] == [
+            ".venv/bin/ruff",
+            "check",
+            "read/input.txt",
+        ]
+        assert result["executed_argv"] == [
+            str(expected_executable),
+            "check",
+            "read/input.txt",
+        ]
+        assert result["argv"] == result["executed_argv"]
+        assert result["argv_rewritten"] is True
+        assert "ran-canonical-ruff" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_probe_metadata_capable_dir_rejects_chmod_hostile_filesystem(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Root cause A: the metadata probe must reject a scratch root whose
+    filesystem cannot honour the chmod git init performs on .git/config.lock."""
+    good = tmp_path / "ok"
+    good.mkdir()
+    assert worker_workspace._probe_metadata_capable_dir(good) is True
+
+    def _deny_chmod(_path: object, _mode: int, *args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(worker_workspace.os, "chmod", _deny_chmod)
+    assert worker_workspace._probe_metadata_capable_dir(good) is False
+
+
+def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A /dev/shm-like root that execs but rejects chmod must be skipped in
+    favour of the next chmod-capable candidate, never handed back."""
+    hostile = tmp_path / "shm-like"
+    portable = tmp_path / "tmp-like"
+    hostile.mkdir()
+    portable.mkdir()
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(
+        worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (hostile, portable)
+    )
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda _d: True)
+    monkeypatch.setattr(
+        worker_workspace,
+        "_probe_metadata_capable_dir",
+        lambda directory: not worker_workspace._path_is_relative_to(
+            directory.resolve(), hostile.resolve()
+        ),
+    )
+    workspace = _bare_workspace(tmp_path, "scratch-meta")
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    try:
+        assert worker_workspace._path_is_relative_to(
+            scratch.resolve(), portable.resolve()
+        )
+        assert not worker_workspace._path_is_relative_to(
+            scratch.resolve(), hostile.resolve()
+        )
+        # The rejected candidate leaves no scratch directory behind.
+        assert list(hostile.iterdir()) == []
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
+def test_provision_validation_exec_scratch_fails_closed_without_metadata_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    only = tmp_path / "only"
+    only.mkdir()
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (only,))
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda _d: True)
+    monkeypatch.setattr(worker_workspace, "_probe_metadata_capable_dir", lambda _d: False)
+    workspace = _bare_workspace(tmp_path, "scratch-none")
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="validation_exec_scratch_unavailable"
+    ) as caught:
+        worker_workspace.provision_validation_exec_scratch(workspace)
+    assert "no_metadata" in str(caught.value)
+    # Fail-closed: no half-provisioned scratch directory is left behind.
+    assert list(only.iterdir()) == []
+
+
+def test_provisioned_scratch_supports_git_init(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end: the provisioned scratch (selected via the real metadata
+    probe) is git-init-capable in a pytest temp dir, without granting broader
+    repository write authority."""
+    root = tmp_path / "scratch-root"
+    root.mkdir()
+    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (root,))
+    # Exercise the real metadata probe; only the exec probe is stubbed so the
+    # test does not depend on the exec-capability of the test filesystem.
+    monkeypatch.setattr(worker_workspace, "_probe_exec_capable_dir", lambda _d: True)
+    workspace = _bare_workspace(tmp_path, "scratch-git")
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    try:
+        assert worker_workspace._path_is_relative_to(scratch.resolve(), root.resolve())
+        target = scratch / "repo"
+        result = _git(scratch, "init", "-q", str(target))
+        assert result.returncode == 0, result.stderr
+        assert (target / ".git").is_dir()
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
