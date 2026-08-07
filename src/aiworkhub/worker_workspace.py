@@ -2357,6 +2357,691 @@ def _apply_landlock(
         os.close(ruleset_fd)
 
 
+_SCMP_ACT_NOTIFY = 0x7FC00000
+_METADATA_BROKER_SYSCALLS = ("chmod", "fchmod", "fchmodat", "fchmodat2")
+_METADATA_BROKER_POLL_MS = 200
+_METADATA_BROKER_HANDSHAKE_SECONDS = 30.0
+_METADATA_BROKER_PATH_LIMIT = 4096
+_AT_FDCWD = -100
+# Defensive upper bound on the whole broker loop so a wedged poll/waitpid can
+# never hang the trusted parent; the outer subprocess timeout is the primary
+# bound, this is the belt-and-braces backstop that kills the validator group.
+_METADATA_BROKER_DEADLINE_SECONDS = MAX_VALIDATION_SECONDS
+# ``openat2(2)`` (Linux 5.6+) with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS is the
+# sole target-acquisition authority: the kernel re-resolves every component
+# against a stable scratch directory fd and refuses any symlink or any escape
+# beneath it, so authority is never a string-prefix comparison the caller
+# performs by hand. The syscall number is identical across the Linux
+# architectures this deployment runs on.
+_OPENAT2_SYSCALL = 437
+_RESOLVE_NO_SYMLINKS = 0x04
+_RESOLVE_BENEATH = 0x08
+_PR_SET_PDEATHSIG = 1
+# libseccomp API level 5 is the first that exposes SCMP_ACT_NOTIFY and the
+# notification APIs; ``seccomp_api_get``
+# probes the running kernel, so this is a real capability check rather than a
+# libseccomp symbol-presence guess.
+_SECCOMP_NOTIFY_MIN_API = 5
+
+
+class _OpenHow(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+def _openat2_beneath(dir_fd: int, relative: str, flags: int) -> int:
+    """Open ``relative`` strictly beneath ``dir_fd`` with no symlink traversal.
+
+    Returns a new file descriptor (the caller owns it) or raises
+    ``WorkspaceError``. RESOLVE_BENEATH rejects any ``..``/escape and
+    RESOLVE_NO_SYMLINKS rejects a symlinked component or final target, so a
+    swapped path or symlink root/target fails closed inside the kernel rather
+    than being validated by a fragile userspace string check.
+    """
+    if relative.startswith("/") or ".." in PurePosixPath(relative).parts:
+        raise WorkspaceError(f"metadata_broker_unsafe_relative:{relative}")
+    libc = ctypes.CDLL(None, use_errno=True)
+    how = _OpenHow(
+        flags=ctypes.c_uint64(flags),
+        mode=ctypes.c_uint64(0),
+        resolve=ctypes.c_uint64(_RESOLVE_BENEATH | _RESOLVE_NO_SYMLINKS),
+    )
+    ctypes.set_errno(0)
+    fd = libc.syscall(
+        _OPENAT2_SYSCALL,
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(relative.encode("utf-8")),
+        ctypes.byref(how),
+        ctypes.c_size_t(ctypes.sizeof(how)),
+    )
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise WorkspaceError(
+            f"metadata_broker_openat2_failed:{relative}:{os.strerror(error)}"
+        )
+    return int(fd)
+
+
+def _openat2_available() -> bool:
+    """Real kernel probe: can ``openat2(2)`` open the filesystem root?"""
+    if sys.platform != "linux":
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    how = _OpenHow(
+        flags=ctypes.c_uint64(os.O_RDONLY | os.O_DIRECTORY),
+        mode=ctypes.c_uint64(0),
+        resolve=ctypes.c_uint64(0),
+    )
+    try:
+        fd = libc.syscall(
+            _OPENAT2_SYSCALL,
+            ctypes.c_int(_AT_FDCWD),
+            ctypes.c_char_p(b"/"),
+            ctypes.byref(how),
+            ctypes.c_size_t(ctypes.sizeof(how)),
+        )
+    except OSError:
+        return False
+    if fd < 0:
+        return False
+    os.close(int(fd))
+    return True
+
+
+class _SeccompData(ctypes.Structure):
+    _fields_ = [
+        ("nr", ctypes.c_int32),
+        ("arch", ctypes.c_uint32),
+        ("instruction_pointer", ctypes.c_uint64),
+        ("args", ctypes.c_uint64 * 6),
+    ]
+
+
+class _SeccompNotif(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("data", _SeccompData),
+    ]
+
+
+class _SeccompNotifResp(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint64),
+        ("val", ctypes.c_int64),
+        ("error", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+def _seccomp_notify_library() -> Any | None:
+    """Return libseccomp bound for user-notification use, or ``None``.
+
+    ``None`` means this host genuinely lacks seccomp user notification (old
+    libseccomp or old kernel); it never means "skip the confinement" -- the
+    caller falls back to the strict deny-only metadata filter.
+    """
+    library = _seccomp_library()
+    if library is None:
+        return None
+    try:
+        library.seccomp_notify_alloc.argtypes = [
+            ctypes.POINTER(ctypes.POINTER(_SeccompNotif)),
+            ctypes.POINTER(ctypes.POINTER(_SeccompNotifResp)),
+        ]
+        library.seccomp_notify_alloc.restype = ctypes.c_int
+        library.seccomp_notify_free.argtypes = [
+            ctypes.POINTER(_SeccompNotif),
+            ctypes.POINTER(_SeccompNotifResp),
+        ]
+        library.seccomp_notify_free.restype = None
+        library.seccomp_notify_receive.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(_SeccompNotif),
+        ]
+        library.seccomp_notify_receive.restype = ctypes.c_int
+        library.seccomp_notify_respond.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(_SeccompNotifResp),
+        ]
+        library.seccomp_notify_respond.restype = ctypes.c_int
+        library.seccomp_notify_id_valid.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        library.seccomp_notify_id_valid.restype = ctypes.c_int
+        library.seccomp_notify_fd.argtypes = [ctypes.c_void_p]
+        library.seccomp_notify_fd.restype = ctypes.c_int
+    except AttributeError:
+        return None
+    return library
+
+
+def _seccomp_kernel_notify_api() -> bool:
+    """Query the running kernel's seccomp API level via libseccomp.
+
+    ``seccomp_api_get`` probes the live kernel (not just the library build),
+    so a level below the user-notification listener threshold means this host
+    genuinely cannot broker metadata syscalls -- a legitimate capability skip,
+    never a silent confinement bypass.
+    """
+    library = _seccomp_library()
+    if library is None:
+        return False
+    try:
+        library.seccomp_api_get.argtypes = []
+        library.seccomp_api_get.restype = ctypes.c_uint
+    except AttributeError:
+        return False
+    try:
+        level = int(library.seccomp_api_get())
+    except OSError:
+        return False
+    return level >= _SECCOMP_NOTIFY_MIN_API
+
+
+def _seccomp_notify_supported() -> bool:
+    """True only when the kernel really supports the broker's whole mechanism.
+
+    Requires the libseccomp notification symbols, a kernel API level that
+    negotiates the user-notification listener, and ``openat2`` for
+    stable-fd target resolution. Any missing piece returns ``False`` so the
+    caller falls back to the strict deny-only filter and the integration test
+    skips as a genuine host-capability gap.
+    """
+    if _seccomp_notify_library() is None:
+        return False
+    if not _seccomp_kernel_notify_api():
+        return False
+    return _openat2_available()
+
+
+def _metadata_broker_verify_mode(mode: int) -> int:
+    """Permit only ordinary permission bits; never setuid/setgid/sticky."""
+    if mode < 0 or mode & ~0o777:
+        raise WorkspaceError(f"metadata_broker_unsafe_mode:{mode:o}")
+    return mode
+
+
+def _metadata_broker_verify_flags(flags: int) -> int:
+    if flags != 0:
+        raise WorkspaceError(f"metadata_broker_unsupported_flags:{flags}")
+    return flags
+
+
+def _metadata_broker_verify_fd(fd: int, candidate: str) -> None:
+    """Fail closed unless ``fd`` is a scratch-owned, non-hardlinked regular file."""
+    info = os.fstat(fd)
+    if stat.S_ISDIR(info.st_mode):
+        raise WorkspaceError(f"metadata_broker_directory_target:{candidate}")
+    if not stat.S_ISREG(info.st_mode):
+        raise WorkspaceError(f"metadata_broker_not_regular_file:{candidate}")
+    if info.st_nlink != 1:
+        raise WorkspaceError(f"metadata_broker_hardlink_forbidden:{candidate}")
+    if info.st_uid != os.getuid():
+        raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
+
+
+def _metadata_broker_verify_target(
+    candidate: str, scratch_fd: int, scratch_root: PurePosixPath
+) -> int:
+    """Open and return a verified regular-file fd strictly beneath the scratch.
+
+    ``scratch_fd`` is a stable directory descriptor for the exact request-owned
+    validation exec scratch and ``scratch_root`` its resolved absolute path
+    (used only to derive the beneath-scratch relative component). The kernel is
+    the resolution authority: ``openat2`` with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS
+    fails closed on traversal, absolute/outside paths, symlinked roots and
+    symlink targets -- never a userspace string-prefix comparison. The returned
+    descriptor is inode-checked for a non-hardlinked regular file owned by this
+    process; the caller mutates that exact fd and closes it.
+    """
+    if not candidate or not candidate.startswith("/"):
+        raise WorkspaceError(f"metadata_broker_path_not_absolute:{candidate}")
+    target = PurePosixPath(candidate)
+    if ".." in target.parts:
+        raise WorkspaceError(f"metadata_broker_traversal_forbidden:{candidate}")
+    try:
+        relative = target.relative_to(scratch_root)
+    except ValueError as exc:
+        raise WorkspaceError(f"metadata_broker_outside_scratch:{candidate}") from exc
+    rel_str = relative.as_posix()
+    if rel_str in ("", "."):
+        raise WorkspaceError(f"metadata_broker_scratch_root_target:{candidate}")
+    fd = _openat2_beneath(scratch_fd, rel_str, os.O_RDONLY | os.O_NOCTTY)
+    try:
+        _metadata_broker_verify_fd(fd, candidate)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _metadata_broker_process_pgid(pid: int) -> int:
+    """Return ``pid``'s process-group id parsed from ``/proc/<pid>/stat``.
+
+    The ``comm`` field can contain spaces and parentheses, so the fields after
+    the final ``)`` are used: ``state ppid pgrp ...`` -- ``pgrp`` is the third.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_pid_unavailable:{pid}:{exc}") from exc
+    close_paren = data.rfind(b")")
+    if close_paren < 0:
+        raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}")
+    fields = data[close_paren + 1:].split()
+    if len(fields) < 3:
+        raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}")
+    try:
+        return int(fields[2])
+    except ValueError as exc:
+        raise WorkspaceError(f"metadata_broker_stat_malformed:{pid}") from exc
+
+
+def _metadata_broker_authenticate_pid(pid: int, child_pid: int) -> None:
+    """Accept only the broker child or a live descendant in its process group.
+
+    The disposable child calls ``setsid`` before ``exec``, so every legitimate
+    validator descendant shares ``pgid == child_pid`` and no unrelated process
+    can join that freshly created session. Re-read on every request so a dead,
+    reused or foreign pid is rejected fail-closed.
+    """
+    if pid <= 0:
+        raise WorkspaceError(f"metadata_broker_bad_pid:{pid}")
+    if pid == child_pid:
+        return
+    if _metadata_broker_process_pgid(pid) != child_pid:
+        raise WorkspaceError(f"metadata_broker_foreign_pid:{pid}")
+
+
+def _kill_validator_group(child_pid: int) -> None:
+    """Best-effort SIGKILL of the whole validator process group, then the leader."""
+    import signal
+
+    try:
+        os.killpg(child_pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _reap_validator(child_pid: int) -> None:
+    """Best-effort reap of the broker child so it can never become a zombie."""
+    try:
+        os.waitpid(child_pid, 0)
+    except OSError:
+        pass
+
+
+def _verify_broker_parent_identity(expected_parent_pid: int) -> None:
+    # If the parent exited after fork but before prctl, the kernel could not
+    # deliver the configured signal for that already-completed transition.
+    # Fail before exec when the identity no longer matches; after this check,
+    # the armed PDEATHSIG covers every subsequent parent exit.
+    if os.getppid() != expected_parent_pid:
+        raise WorkspaceError("metadata_broker_parent_identity_changed")
+
+
+def _set_pdeathsig_sigkill(expected_parent_pid: int) -> None:
+    """Arm parent-death SIGKILL and close the fork/prctl identity race."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    import signal
+
+    ctypes.set_errno(0)
+    result = libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise WorkspaceError(f"metadata_broker_pdeathsig_failed:{os.strerror(error)}")
+    _verify_broker_parent_identity(expected_parent_pid)
+
+
+def _read_child_cstring(pid: int, address: int) -> str:
+    if address <= 0:
+        raise WorkspaceError("metadata_broker_null_path_pointer")
+    try:
+        handle = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_child_memory_unavailable:{exc}") from exc
+    try:
+        chunk = os.pread(handle, _METADATA_BROKER_PATH_LIMIT, address)
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_child_memory_read_failed:{exc}") from exc
+    finally:
+        os.close(handle)
+    end = chunk.find(b"\x00")
+    if end < 0:
+        raise WorkspaceError("metadata_broker_path_unterminated")
+    try:
+        return chunk[:end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkspaceError("metadata_broker_path_not_utf8") from exc
+
+
+def _metadata_broker_child_link(pid: int, name: str) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/{name}")
+    except OSError as exc:
+        raise WorkspaceError(f"metadata_broker_child_link_unavailable:{exc}") from exc
+
+
+def _metadata_broker_abs_path(pid: int, dirfd: int, raw: str) -> str:
+    if raw.startswith("/"):
+        return raw
+    if not raw:
+        raise WorkspaceError("metadata_broker_empty_path")
+    if dirfd == _AT_FDCWD:
+        base = _metadata_broker_child_link(pid, "cwd")
+    elif dirfd >= 0:
+        base = _metadata_broker_child_link(pid, f"fd/{dirfd}")
+    else:
+        raise WorkspaceError(f"metadata_broker_bad_dirfd:{dirfd}")
+    if base.endswith(" (deleted)"):
+        raise WorkspaceError("metadata_broker_deleted_base")
+    return os.path.join(base, raw)
+
+
+def _metadata_broker_syscall_names(library: Any) -> dict[int, str]:
+    table: dict[int, str] = {}
+    for name in _METADATA_BROKER_SYSCALLS:
+        number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
+        if number >= 0:
+            table[int(number)] = name
+    return table
+
+
+def _install_metadata_notify_filter() -> int:
+    """Install the disposable child's user-notification metadata filter.
+
+    Metadata syscalls are never globally allowed and no continue flag is
+    used: the brokered family traps to the trusted parent, every other
+    denied metadata syscall still returns EPERM in-kernel.
+    """
+    library = _seccomp_notify_library()
+    if library is None:
+        raise WorkspaceError("seccomp_user_notification_unavailable")
+    context = library.seccomp_init(_SCMP_ACT_ALLOW)
+    if not context:
+        raise WorkspaceError("seccomp_init_failed")
+    listener = -1
+    try:
+        notified = 0
+        for name in _METADATA_BROKER_SYSCALLS:
+            number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
+            if number < 0:
+                continue
+            if library.seccomp_rule_add(context, _SCMP_ACT_NOTIFY, number, 0) == 0:
+                notified += 1
+        if notified == 0:
+            raise WorkspaceError("seccomp_notify_rules_unavailable")
+        action = _SCMP_ACT_ERRNO | errno.EPERM
+        for name in _SECCOMP_DENIED_SYSCALLS:
+            if name in _METADATA_BROKER_SYSCALLS:
+                continue
+            number = library.seccomp_syscall_resolve_name(name.encode("ascii"))
+            if number < 0:
+                continue
+            result = library.seccomp_rule_add(context, action, number, 0)
+            if result != 0:
+                raise WorkspaceError(f"seccomp_rule_failed:{name}:{-result}")
+        result = library.seccomp_load(context)
+        if result != 0:
+            raise WorkspaceError(f"seccomp_load_failed:{-result}")
+        raw_fd = library.seccomp_notify_fd(context)
+        if raw_fd < 0:
+            raise WorkspaceError("seccomp_notify_fd_failed")
+        listener = os.dup(raw_fd)
+        return listener
+    finally:
+        library.seccomp_release(context)
+
+
+def _metadata_broker_check_notification(
+    library: Any, listener_fd: int, notif_id: int
+) -> None:
+    if library.seccomp_notify_id_valid(listener_fd, notif_id) != 0:
+        raise WorkspaceError("metadata_broker_notification_stale")
+
+
+def _metadata_broker_apply(
+    library: Any,
+    listener_fd: int,
+    request: _SeccompNotif,
+    child_pid: int,
+    scratch_fd: int,
+    scratch_root: PurePosixPath,
+) -> None:
+    """Emulate exactly one verified brokered metadata syscall in the parent.
+
+    Authenticates the notifying pid as a live descendant in the broker child's
+    process group (validators legitimately fork -- e.g. ``git`` -- so the caller
+    is often not ``child_pid`` itself), re-checks the notification id both
+    before and after acquiring the target, resolves the target with the kernel
+    as authority (``openat2`` beneath the exact scratch fd) and mutates only a
+    stable, inode-verified regular file.
+    """
+    pid = int(request.pid)
+    _metadata_broker_authenticate_pid(pid, child_pid)
+    names = _metadata_broker_syscall_names(library)
+    name = names.get(int(request.data.nr))
+    if name is None:
+        raise WorkspaceError(f"metadata_broker_unsupported_syscall:{request.data.nr}")
+    args = request.data.args
+
+    if name == "fchmod":
+        mode = _metadata_broker_verify_mode(int(args[1]))
+        raw_fd = ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value
+        if raw_fd < 0:
+            raise WorkspaceError(f"metadata_broker_bad_fd:{raw_fd}")
+        _metadata_broker_check_notification(library, listener_fd, request.id)
+        link = _metadata_broker_child_link(pid, f"fd/{raw_fd}")
+        if link.endswith(" (deleted)"):
+            raise WorkspaceError("metadata_broker_deleted_fd")
+        verified_fd = _metadata_broker_verify_target(link, scratch_fd, scratch_root)
+        try:
+            try:
+                fd_target = os.open(
+                    f"/proc/{pid}/fd/{raw_fd}", os.O_RDONLY | os.O_NOCTTY
+                )
+            except OSError as exc:
+                raise WorkspaceError(
+                    f"metadata_broker_fd_reopen_failed:{exc}"
+                ) from exc
+            try:
+                verified_info = os.fstat(verified_fd)
+                target_info = os.fstat(fd_target)
+                if (target_info.st_dev, target_info.st_ino) != (
+                    verified_info.st_dev,
+                    verified_info.st_ino,
+                ):
+                    raise WorkspaceError("metadata_broker_fd_inode_drift")
+                _metadata_broker_verify_fd(fd_target, f"/proc/{pid}/fd/{raw_fd}")
+                _metadata_broker_check_notification(library, listener_fd, request.id)
+                # Mutate the exact descriptor the child blocked on, proven by
+                # inode identity to be the same beneath-scratch regular file --
+                # never a readlink+reopen-by-name that a swap could race.
+                os.fchmod(fd_target, mode)
+            finally:
+                os.close(fd_target)
+        finally:
+            os.close(verified_fd)
+        return
+
+    if name == "chmod":
+        mode = _metadata_broker_verify_mode(int(args[1]))
+        raw_target = _metadata_broker_abs_path(
+            pid, _AT_FDCWD, _read_child_cstring(pid, int(args[0]))
+        )
+    elif name == "fchmodat":
+        # The classic ``fchmodat`` syscall is (dirfd, path, mode) -- it has NO
+        # flags argument, so args[3] is undefined register content and must not
+        # be read or validated here.
+        mode = _metadata_broker_verify_mode(int(args[2]))
+        raw_target = _metadata_broker_abs_path(
+            pid,
+            ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value,
+            _read_child_cstring(pid, int(args[1])),
+        )
+    elif name == "fchmodat2":
+        # Only ``fchmodat2`` carries a flags argument (args[3]); require 0 so an
+        # AT_SYMLINK_NOFOLLOW / other variant is denied fail-closed.
+        mode = _metadata_broker_verify_mode(int(args[2]))
+        _metadata_broker_verify_flags(int(args[3]))
+        raw_target = _metadata_broker_abs_path(
+            pid,
+            ctypes.c_int32(int(args[0]) & 0xFFFFFFFF).value,
+            _read_child_cstring(pid, int(args[1])),
+        )
+    else:
+        raise WorkspaceError(f"metadata_broker_unsupported_syscall:{name}")
+
+    _metadata_broker_check_notification(library, listener_fd, request.id)
+    verified_fd = _metadata_broker_verify_target(raw_target, scratch_fd, scratch_root)
+    try:
+        _metadata_broker_check_notification(library, listener_fd, request.id)
+        os.fchmod(verified_fd, mode)
+    finally:
+        os.close(verified_fd)
+
+
+def _metadata_broker_exit_code(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def _run_metadata_broker(listener_fd: int, child_pid: int, scratch: Path) -> int:
+    """Trusted parent loop: emulate only verified brokered operations.
+
+    Opens one stable directory fd for the exact request scratch (the single
+    resolution root handed to every ``openat2`` acquisition), polls with a
+    bounded timeout, reaps the child non-blockingly, and enforces an overall
+    deadline. On any deadline or error the entire validator process group is
+    killed and the child reaped, so a wedged validator can never deadlock the
+    broker, orphan descendants, or leak descriptors; every allocated
+    notification pair is freed on every path.
+    """
+    import select
+
+    library = _seccomp_notify_library()
+    if library is None:
+        raise WorkspaceError("seccomp_user_notification_unavailable")
+    scratch_dir_fd = -1
+    try:
+        # Open the exact supplied root without following its final component.
+        # Resolving first would silently turn a symlink root into authority for
+        # its target. All later target resolution is anchored to this stable fd.
+        try:
+            scratch_dir_fd = os.open(
+                scratch,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError as exc:
+            raise WorkspaceError(
+                f"metadata_broker_scratch_unavailable:{exc}"
+            ) from exc
+        dir_info = os.fstat(scratch_dir_fd)
+        if not stat.S_ISDIR(dir_info.st_mode) or dir_info.st_uid != os.getuid():
+            raise WorkspaceError("metadata_broker_scratch_untrusted")
+        try:
+            scratch_root = Path(f"/proc/self/fd/{scratch_dir_fd}").resolve(strict=True)
+            resolved_info = os.stat(scratch_root, follow_symlinks=False)
+        except OSError as exc:
+            raise WorkspaceError(
+                f"metadata_broker_scratch_identity_unavailable:{exc}"
+            ) from exc
+        if (resolved_info.st_dev, resolved_info.st_ino) != (
+            dir_info.st_dev,
+            dir_info.st_ino,
+        ):
+            raise WorkspaceError("metadata_broker_scratch_identity_changed")
+        scratch_root_posix = PurePosixPath(str(scratch_root))
+        deadline = time.monotonic() + _METADATA_BROKER_DEADLINE_SECONDS
+        poller = select.poll()
+        poller.register(listener_fd, select.POLLIN)
+        while True:
+            reaped, status = os.waitpid(child_pid, os.WNOHANG)
+            if reaped == child_pid:
+                return _metadata_broker_exit_code(status)
+            if time.monotonic() > deadline:
+                raise WorkspaceError("metadata_broker_deadline_exceeded")
+            try:
+                events = poller.poll(_METADATA_BROKER_POLL_MS)
+            except InterruptedError:
+                continue
+            if not events:
+                continue
+            event_mask = 0
+            for _event_fd, mask in events:
+                event_mask |= mask
+            if event_mask & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                # Listener teardown and child exit are separate kernel events;
+                # allow the leader a short bounded grace to become waitable so
+                # its real exit status is not replaced by a broker error.
+                for _attempt in range(50):
+                    reaped, status = os.waitpid(child_pid, os.WNOHANG)
+                    if reaped == child_pid:
+                        return _metadata_broker_exit_code(status)
+                    time.sleep(0.01)
+                raise WorkspaceError("metadata_broker_listener_closed")
+            if not event_mask & select.POLLIN:
+                continue
+            request_ptr = ctypes.POINTER(_SeccompNotif)()
+            response_ptr = ctypes.POINTER(_SeccompNotifResp)()
+            if (
+                library.seccomp_notify_alloc(
+                    ctypes.byref(request_ptr), ctypes.byref(response_ptr)
+                )
+                != 0
+            ):
+                raise WorkspaceError("seccomp_notify_alloc_failed")
+            try:
+                if library.seccomp_notify_receive(listener_fd, request_ptr) != 0:
+                    continue
+                request = request_ptr.contents
+                response = response_ptr.contents
+                response.id = request.id
+                response.flags = 0
+                try:
+                    _metadata_broker_apply(
+                        library,
+                        listener_fd,
+                        request,
+                        child_pid,
+                        scratch_dir_fd,
+                        scratch_root_posix,
+                    )
+                    response.val = 0
+                    response.error = 0
+                except (WorkspaceError, OSError, ValueError):
+                    response.val = 0
+                    response.error = -errno.EPERM
+                if library.seccomp_notify_respond(listener_fd, response_ptr) != 0:
+                    # A respond failure for a no-longer-valid notification (the
+                    # caller died or was killed mid-request) is benign; a
+                    # failure while the id is still live is a real fault.
+                    if (
+                        library.seccomp_notify_id_valid(listener_fd, request.id)
+                        == 0
+                    ):
+                        raise WorkspaceError("metadata_broker_respond_failed")
+            finally:
+                library.seccomp_notify_free(request_ptr, response_ptr)
+    except BaseException:
+        _kill_validator_group(child_pid)
+        _reap_validator(child_pid)
+        raise
+    finally:
+        if scratch_dir_fd >= 0:
+            os.close(scratch_dir_fd)
+
+
 def _apply_metadata_seccomp() -> None:
     library = _seccomp_library()
     if library is None:
@@ -2381,6 +3066,9 @@ def _apply_metadata_seccomp() -> None:
 
 
 def _landlock_exec(argv: list[str]) -> int:
+    import select
+    import socket
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--landlock-exec", action="store_true", required=True)
     parser.add_argument("--workspace", required=True)
@@ -2399,7 +3087,6 @@ def _landlock_exec(argv: list[str]) -> int:
     home = Path(args.home).resolve()
     exec_scratch = Path(args.exec_scratch).resolve() if args.exec_scratch else None
     _apply_landlock(workspace, home, args.allow, exec_scratch)
-    _apply_metadata_seccomp()
     if args.cwd is not None:
         # Re-validate against this exec'd child's own view of the workspace
         # (fail closed rather than trusting the parent-provided flag) --
@@ -2411,6 +3098,80 @@ def _landlock_exec(argv: list[str]) -> int:
     else:
         chdir_target = workspace
     os.chdir(chdir_target)
+    if exec_scratch is not None and _seccomp_notify_supported():
+        # NF27: the validator child previously received EPERM for the whole
+        # chmod family, breaking unmodified tools (git init writing
+        # .git/config.lock). Install a user-notification filter in the
+        # disposable child and emulate ONLY verified chmod/fchmod/fchmodat
+        # operations on stable, request-owned regular files beneath this
+        # exact validation exec scratch from this trusted parent.
+        parent_sock, child_sock = socket.socketpair()
+        broker_parent_pid = os.getpid()
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                parent_sock.close()
+                # New session so the whole validator subtree shares
+                # ``pgid == child_pid``: this lets the trusted parent
+                # authenticate brokered requests as descendants and kill the
+                # entire group on error/timeout, and the parent-death signal
+                # makes the child die if the broker parent is killed first.
+                os.setsid()
+                _set_pdeathsig_sigkill(broker_parent_pid)
+                listener = _install_metadata_notify_filter()
+                socket.send_fds(child_sock, [b"1"], [listener])
+                os.close(listener)
+                child_sock.close()
+            except BaseException as exc:
+                try:
+                    diagnostic = (
+                        f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
+                    )
+                    child_sock.sendall(b"E" + diagnostic)
+                except BaseException:
+                    pass
+                os._exit(126)
+            try:
+                os.execvpe(command[0], command, os.environ.copy())
+            except BaseException as exc:
+                try:
+                    os.write(
+                        2,
+                        (
+                            f"metadata_broker_exec_failed:{type(exc).__name__}:{exc}\n"
+                        ).encode("utf-8", "replace")[:2048],
+                    )
+                except BaseException:
+                    pass
+            os._exit(126)
+        child_sock.close()
+        listener_fd = -1
+        listener_error = ""
+        try:
+            parent_sock.setblocking(False)
+            ready, _writable, _exceptional = select.select(
+                [parent_sock], [], [], _METADATA_BROKER_HANDSHAKE_SECONDS
+            )
+            if ready:
+                payload, fds, _flags, _addr = socket.recv_fds(parent_sock, 1025, 1)
+                if fds:
+                    listener_fd = fds[0]
+                elif payload.startswith(b"E"):
+                    listener_error = payload[1:].decode("utf-8", "replace")
+        except OSError:
+            listener_fd = -1
+        finally:
+            parent_sock.close()
+        if listener_fd < 0:
+            _kill_validator_group(child_pid)
+            _reap_validator(child_pid)
+            suffix = f":{listener_error}" if listener_error else ""
+            raise WorkspaceError(f"metadata_broker_listener_transfer_failed{suffix}")
+        try:
+            return _run_metadata_broker(listener_fd, child_pid, exec_scratch)
+        finally:
+            os.close(listener_fd)
+    _apply_metadata_seccomp()
     os.execvpe(command[0], command, os.environ.copy())
     return 126
 
