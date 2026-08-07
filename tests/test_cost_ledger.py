@@ -173,6 +173,43 @@ def test_cache_ratio_is_unknown_when_provider_did_not_report_cache_metrics() -> 
     assert aggregate["cache_observed_records"] == 0
 
 
+def test_cache_ratio_excludes_rows_without_observed_cache_metrics() -> None:
+    aggregate = cost_ledger._aggregate(
+        [
+            {
+                "runner": "codex",
+                "records": 1,
+                "input_tokens": 1000,
+                "output_tokens": 100,
+                "total_tokens": 1100,
+                "cached_input_tokens": 900,
+                "cache_creation_input_tokens": 0,
+                "cache_metrics_observed": True,
+                "cost_usd": 0.0,
+                "cost_known": False,
+            },
+            {
+                "runner": "codex",
+                "records": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cached_input_tokens": 500,
+                "cache_creation_input_tokens": 0,
+                "cache_metrics_observed": False,
+                "cost_usd": 0.0,
+                "cost_known": False,
+            },
+        ],
+        "runner",
+    )["codex"]
+
+    assert aggregate["cached_input_tokens"] == 1400
+    assert aggregate["cache_eligible_input_tokens"] == 1000
+    assert aggregate["cache_hit_ratio"] == 0.9
+    assert aggregate["cache_observed_records"] == 1
+
+
 def test_repo_bound_unobserved_attempt_is_counted_but_not_measured(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         cost_ledger.task_store,

@@ -159,6 +159,7 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         "usage_unknown_records": 0,
         "cache_observed_records": 0,
         "cache_eligible_input_tokens": 0,
+        "cache_hit_ratio_numerator": 0,
         "cost_usd": 0.0,
         "cost_known_records": 0,
         "cost_unknown_records": 0,
@@ -187,6 +188,7 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         if row.get("cache_metrics_observed"):
             out[bucket]["cache_observed_records"] += int(row.get("records") or 0)
             out[bucket]["cache_eligible_input_tokens"] += int(row.get("input_tokens") or 0)
+            out[bucket]["cache_hit_ratio_numerator"] += int(row.get("cached_input_tokens") or 0)
         out[bucket]["cost_usd"] = round(out[bucket]["cost_usd"] + float(row.get("cost_usd") or 0.0), 6)
         if row.get("cost_known"):
             out[bucket]["cost_known_records"] += int(row.get("records") or 0)
@@ -195,8 +197,9 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
             out[bucket]["tokens_with_unknown_cost"] += int(row.get("total_tokens") or 0)
     for aggregate in out.values():
         denominator = int(aggregate["cache_eligible_input_tokens"] or 0)
+        numerator = int(aggregate.pop("cache_hit_ratio_numerator", 0) or 0)
         aggregate["cache_hit_ratio"] = (
-            round(int(aggregate["cached_input_tokens"] or 0) / denominator, 6)
+            round(numerator / denominator, 6)
             if denominator > 0
             else None
         )
