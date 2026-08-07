@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-08-07
+
+### Added
+
+- Coordinators can recover an explicitly blocked rework card through the
+  public MCP surface while preserving its task identity, predecessor evidence,
+  topic authority and exact task-store transaction boundary.
+
+### Fixed
+
+- VS Code LM bridge JSON writes now pin and revalidate the parent directory,
+  reject symlink replacement, verify the final regular file through a bound
+  descriptor, and remain portable on platforms without `os.getuid`.
+- Atomic JSON regression coverage now protects parent-identity drift,
+  symlink-decoy replacement and portable UTF-8 `0600` writes.
+
 ## [0.9.7] - 2026-08-06
 
 ### Fixed
