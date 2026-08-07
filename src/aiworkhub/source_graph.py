@@ -435,7 +435,7 @@ def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
         )
     return SourceGraphIgnorePolicy(
         frozenset((*DEFAULT_EXCLUDE_DIR_NAMES, *extra_dirs)),
-        (*DEFAULT_CONFIG_EXCLUDE_GLOBS, *tuple(dict.fromkeys(extra_globs))),
+        tuple(dict.fromkeys(extra_globs)),
         frozenset(disabled_languages),
         revision,
         True,

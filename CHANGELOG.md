@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.12] - 2026-08-07
+
+### Added
+
+- Source Graph now exposes bounded single-file indexing and removal so newly
+  created, changed or deleted files can update the readable generation without
+  waiting for a full repository refresh.
+
+### Fixed
+
+- The MCP server now binds the canonical repository-scoped NeedFix store at
+  startup, keeping dashboard and direct MCP reads on the same durable registry.
+- Validation executable and temporary-path handling is now portable across
+  isolated worktrees and restricted temporary filesystems, preserving declared
+  versus executed command evidence without relying on an editable-worktree
+  `.venv` or `/dev/shm` metadata operations.
+
 ## [0.9.11] - 2026-08-07
 
 ### Added

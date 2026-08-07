@@ -6009,6 +6009,12 @@ def source_graph_stop() -> dict[str, Any]:
     deactivation."""
     root = repo_root()
     stopped = _source_graph_daemon_module().stop_daemon(root)
+    return {
+        "ok": True,
+        "stopped": stopped,
+        "status": "stopped" if stopped else "idle",
+        "repo": str(root),
+    }
 # --- NeedFix manager API (additive; NeedFix is separate from task state) ---
 
 
