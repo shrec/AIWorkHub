@@ -192,10 +192,19 @@ def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeyp
             "runner": core.CODEX_RUNNER,
             "topic": "blocked_rework",
             "coordinator_capability": True,
+            "task_id": "T_BLOCKED",
         },
     )
     assert calls[1][0:3] == ("recover", core.repo_root(), "T_BLOCKED")
     assert calls[1][3:] == (core.CODEX_RUNNER, "focused repair")
+
+
+def test_recover_blocked_rework_is_a_codex_coordinator_action():
+    assert core.check_runner_topic_allowlist(
+        core.CODEX_RUNNER,
+        "blocked_rework",
+        "recover-blocked-rework",
+    ) == {"allowed": True, "reason": "codex_wildcard_topic_allowed"}
 
 
 def test_core_recover_blocked_rework_topic_mismatch_fails_before_write(monkeypatch):

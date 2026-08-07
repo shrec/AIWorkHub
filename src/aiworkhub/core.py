@@ -1365,6 +1365,7 @@ CODEX_ALLOWED_ACTIONS: frozenset[str] = frozenset(
         "restore",
         "review",
         "reject-review",
+        "recover-blocked-rework",
         "release-launch",
         "retry-terminal",
         "usage",
@@ -4153,6 +4154,7 @@ def recover_blocked_rework(
         runner=CODEX_RUNNER,
         topic=str(live_topic),
         coordinator_capability=True,
+        task_id=task_id,
     )
     if blocked is not None:
         return blocked
