@@ -40,7 +40,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from . import source_graph_ast as sgast
@@ -396,7 +396,7 @@ def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
 
     path = ignore_config_path(repo_root)
     if not path.exists():
-        return SourceGraphIgnorePolicy(frozenset(DEFAULT_EXCLUDE_DIR_NAMES), ())
+        return SourceGraphIgnorePolicy(frozenset(DEFAULT_EXCLUDE_DIR_NAMES), DEFAULT_CONFIG_EXCLUDE_GLOBS)
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -435,7 +435,7 @@ def load_ignore_policy(repo_root: Path) -> SourceGraphIgnorePolicy:
         )
     return SourceGraphIgnorePolicy(
         frozenset((*DEFAULT_EXCLUDE_DIR_NAMES, *extra_dirs)),
-        tuple(dict.fromkeys(extra_globs)),
+        (*DEFAULT_CONFIG_EXCLUDE_GLOBS, *tuple(dict.fromkeys(extra_globs))),
         frozenset(disabled_languages),
         revision,
         True,
@@ -2311,8 +2311,226 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# NF15 single-file index / remove (transactional, fail-closed, generation-safe)
+# ---------------------------------------------------------------------------
+
+def _validate_single_file_path(repo_root: Path, path: str) -> Path:
+    """Validate and resolve a single relative file path for index/remove.
+
+    Rejects absolute, traversal (..), symlink (lexically before resolve),
+    out-of-repo, and excluded paths. Returns the resolved absolute path.
+    """
+    repo_root = repo_root.resolve()
+    if not isinstance(path, str):
+        raise SourceGraphError(
+            f"source_graph_single_file_path_not_string:{type(path).__name__}"
+        )
+    if "\x00" in path:
+        raise SourceGraphError("source_graph_single_file_path_null_byte")
+    rel = Path(path)
+    # --- Lexical checks before any filesystem access ---
+    if rel.is_absolute():
+        raise SourceGraphError(
+            f"source_graph_single_file_absolute:{path}"
+        )
+    # Windows drive/UNC absolute path: PurePosixPath.is_absolute
+    # ignores drive letters on POSIX; PureWindowsPath recognizes
+    # them so that "C:\\..." and "//server/share/..." are caught.
+    try:
+        win_abs = PureWindowsPath(path).is_absolute()
+    except Exception:
+        pass
+    else:
+        if win_abs:
+            raise SourceGraphError(
+                f"source_graph_single_file_absolute:{path}"
+            )
+    if ".." in rel.parts:
+        raise SourceGraphError(
+            f"source_graph_single_file_traversal:{path}"
+        )
+    # Check for symlink components lexically before resolve.
+    if _has_symlink_component(repo_root / rel):
+        raise SourceGraphError(
+            f"source_graph_single_file_symlink:{path}"
+        )
+    # Resolve and verify containment.
+    try:
+        candidate = (repo_root / rel).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unresolvable:{path}"
+        ) from exc
+    if repo_root not in candidate.parents and candidate != repo_root:
+        raise SourceGraphError(
+            f"source_graph_single_file_outside_repository:{path}"
+        )
+    # Check exclude dirs and globs.
+    policy = load_ignore_policy(repo_root)
+    rel_posix = rel.as_posix()
+    # Check if any parent directory is excluded.
+    for part in rel_posix.split("/")[:-1]:
+        if part in policy.exclude_dirs or part.endswith(".egg-info"):
+            raise SourceGraphError(
+                f"source_graph_single_file_excluded_dir:{part}"
+            )
+    if _glob_ignored(rel_posix, policy.exclude_globs):
+        raise SourceGraphError(
+            f"source_graph_single_file_excluded_glob:{rel_posix}"
+        )
+    return candidate
+
+
+def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]:
+    """Index exactly one file into the canonical Source Graph.
+
+    The file must already exist on disk, must pass the bounded path-safety
+    checks, must be an indexed extension, and its sha256 must match
+    ``expected_hash``. Everything else fails closed. Only the target file's
+    rows are mutated inside a single exclusive transaction; all other rows
+    and the generation authority are preserved unchanged.
+
+    Returns a summary dict with ``ok``, ``file_path``, ``source_hash``,
+    ``language``, ``status``, ``entities``, and ``edges``.
+    """
+    repo_root = repo_root.resolve()
+    resolved = _validate_single_file_path(repo_root, path)
+    rel = Path(path).as_posix()
+
+    # Reject unsupported extensions (no LanguageSpec entry).
+    suffix = resolved.suffix.casefold()
+    if suffix not in _INDEXED_EXTENSION_SET:
+        raise SourceGraphError(
+            f"source_graph_single_file_unsupported_extension:{suffix}"
+        )
+
+    # Compute the actual file hash.
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        raise SourceGraphError(
+            f"source_graph_single_file_unreadable:{path}"
+        ) from exc
+    source_hash = sgast.sha256_bytes(raw)
+
+    # Fail closed on hash mismatch.
+    if not isinstance(expected_hash, str) or not expected_hash:
+        raise SourceGraphError(
+            "source_graph_single_file_expected_hash_required"
+        )
+    if source_hash != expected_hash:
+        raise SourceGraphError(
+            f"source_graph_single_file_hash_mismatch:"
+            f"expected={expected_hash[:16]} actual={source_hash[:16]}"
+        )
+
+    # Extraction.
+    extraction = sgast.extract_file(repo_root, resolved, build_revision=BUILD_REVISION)
+    if extraction.file_path != rel:
+        raise SourceGraphError(
+            f"source_graph_single_file_path_mismatch:"
+            f"expected={rel} returned={extraction.file_path}"
+        )
+
+    # Acquire writer lease, open connection, mutate exactly one file.
+    with index_write_lease(repo_root) as acquired:
+        if not acquired:
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_build_in_progress:{repo_root}"
+            )
+        db_path = resolve_db_path(repo_root)
+        conn = connect(db_path)
+        try:
+            with conn:
+                _invalidate_file(conn, rel)
+                try:
+                    path_stat = resolved.stat()
+                    file_size = int(path_stat.st_size)
+                    mtime_ns = int(path_stat.st_mtime_ns)
+                except OSError:
+                    file_size = -1
+                    mtime_ns = -1
+                inserted_entities, inserted_edges = _write_extraction(
+                    conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
+                )
+            # Post-commit: cache buster so next index_quality snapshot
+            # reflects the generation, but preserve existing meta rows.
+            with conn:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('single_file_last_index', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (json.dumps({
+                        "finished_at": _now_iso(),
+                        "file_path": rel,
+                        "source_hash": source_hash,
+                        "build_revision": BUILD_REVISION,
+                    }),),
+                )
+        finally:
+            conn.close()
+    return {
+        "ok": True,
+        "file_path": rel,
+        "source_hash": source_hash,
+        "language": extraction.language,
+        "status": extraction.status,
+        "entities": inserted_entities,
+        "edges": inserted_edges,
+    }
+
+
+def remove_file(repo_root: Path, path: str) -> dict[str, Any]:
+    """Remove exactly one file from the canonical Source Graph.
+
+    The path must pass the same bounded path-safety checks as ``index_file``.
+    Removal is idempotent: when the file is not in the index, the call still
+    succeeds without error. Only the target file's rows are mutated inside a
+    single exclusive transaction.
+    """
+    repo_root = repo_root.resolve()
+    _validate_single_file_path(repo_root, path)
+    rel = Path(path).as_posix()
+
+    with index_write_lease(repo_root) as acquired:
+        if not acquired:
+            raise SourceGraphBuildInProgressError(
+                f"source_graph_build_in_progress:{repo_root}"
+            )
+        db_path = resolve_db_path(repo_root)
+        conn = connect(db_path)
+        try:
+            with conn:
+                # Count before we delete.
+                entity_count = conn.execute(
+                    "SELECT COUNT(*) FROM entities WHERE file_path=?", (rel,)
+                ).fetchone()[0]
+                _invalidate_file(conn, rel)
+        finally:
+            conn.close()
+    return {
+        "ok": True,
+        "file_path": rel,
+        "removed_entities": entity_count,
+    }
+
+
+def _has_symlink_component(path: Path) -> bool:
+    """Check for symlink components in path, lexically before resolve."""
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    for part in path.parts[len(current.parts):]:
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
 
 
 __all__ = [
@@ -2354,6 +2572,8 @@ __all__ = [
     "function_query",
     "func",
     "impact",
+    "index_file",
+    "remove_file",
     "slice_",
     "struct",
     "summary",
