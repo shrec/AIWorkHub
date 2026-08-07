@@ -46,6 +46,9 @@ const state = {
   memoryEntries: [],
   sessionEntries: [],
   kbEntries: [],
+  needfixEntries: [],
+  needfixDetail: null,
+  needfixConversionPreview: null,
   featureSettings: null,
   settingsTab: "features",
   returnPage: 0,
@@ -104,6 +107,9 @@ const elements = {
   headerKb: document.querySelector("#header-kb"),
   headerKbValue: document.querySelector("#header-kb-value"),
   headerKbDetail: document.querySelector("#header-kb-detail"),
+  headerNeedfix: document.querySelector("#header-needfix"),
+  headerNeedfixValue: document.querySelector("#header-needfix-value"),
+  headerNeedfixDetail: document.querySelector("#header-needfix-detail"),
   headerPreflight: document.querySelector("#header-preflight"),
   headerPreflightValue: document.querySelector("#header-preflight-value"),
   headerPreflightDetail: document.querySelector("#header-preflight-detail"),
@@ -173,6 +179,24 @@ const elements = {
   kbSummary: document.querySelector("#kb-summary"),
   kbSearch: document.querySelector("#kb-search"),
   kbList: document.querySelector("#kb-list"),
+  openNeedfix: document.querySelector("#open-needfix"),
+  needfixDialog: document.querySelector("#needfix-dialog"),
+  needfixSummary: document.querySelector("#needfix-summary"),
+  needfixCaptureForm: document.querySelector("#needfix-capture-form"),
+  needfixTitle: document.querySelector("#needfix-title"),
+  needfixKind: document.querySelector("#needfix-kind"),
+  needfixSeverity: document.querySelector("#needfix-severity"),
+  needfixDescription: document.querySelector("#needfix-description"),
+  needfixScope: document.querySelector("#needfix-scope"),
+  needfixTags: document.querySelector("#needfix-tags"),
+  needfixSearch: document.querySelector("#needfix-search"),
+  needfixStatusFilter: document.querySelector("#needfix-status-filter"),
+  needfixKindFilter: document.querySelector("#needfix-kind-filter"),
+  needfixSeverityFilter: document.querySelector("#needfix-severity-filter"),
+  needfixIncludeArchived: document.querySelector("#needfix-include-archived"),
+  needfixRefresh: document.querySelector("#needfix-refresh"),
+  needfixList: document.querySelector("#needfix-list"),
+  needfixDetailPanel: document.querySelector("#needfix-detail"),
   openSettings: document.querySelector("#open-settings"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsSummary: document.querySelector("#settings-summary"),
@@ -411,6 +435,23 @@ function renderSummary(snapshot) {
     if (card) card.title = telemetry
       ? `${formatCount(telemetry.requested_tasks)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} hits · ${degraded} degraded`
       : "Context telemetry unavailable";
+  }
+  const needfix = snapshot && snapshot.needfix && typeof snapshot.needfix === "object"
+    ? snapshot.needfix
+    : null;
+  if (elements.headerNeedfixValue && elements.headerNeedfixDetail) {
+    if (!needfix || needfix.available === false) {
+      elements.headerNeedfixValue.textContent = "Unavailable";
+      elements.headerNeedfixDetail.textContent = needfix && needfix.error ? String(needfix.error) : "No evidence";
+    } else {
+      elements.headerNeedfixValue.textContent = `${formatCount(needfix.open)} open`;
+      elements.headerNeedfixDetail.textContent = `${formatCount(needfix.total)} stored${needfix.truncated ? " · partial" : ""}`;
+    }
+    if (elements.headerNeedfix) {
+      elements.headerNeedfix.title = needfix && needfix.available !== false
+        ? `${numberValue(needfix.open)} open NeedFix entries · ${numberValue(needfix.total)} visible`
+        : `NeedFix unavailable: ${String((needfix && needfix.error) || "unknown")}`;
+    }
   }
   const preflight = snapshot && snapshot.environment_preflight
     && typeof snapshot.environment_preflight === "object"
@@ -2010,6 +2051,142 @@ function renderKb(payload) {
   renderKbEntries();
 }
 
+function needfixFilters() {
+  return {
+    status: String(elements.needfixStatusFilter.value || ""),
+    kind: String(elements.needfixKindFilter.value || ""),
+    severity: String(elements.needfixSeverityFilter.value || ""),
+    includeArchived: Boolean(elements.needfixIncludeArchived.checked),
+  };
+}
+
+function requestNeedfixList() {
+  vscode.postMessage({ type: "requestNeedfix", ...needfixFilters() });
+}
+
+function renderNeedfixList() {
+  const query = String(elements.needfixSearch.value || "").trim().toLocaleLowerCase();
+  const rows = state.needfixEntries.filter((entry) => !query || [
+    entry.id, entry.title, entry.status, entry.kind, entry.severity, asArray(entry.tags).join(" "),
+  ].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+  if (!rows.length) {
+    elements.needfixList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching NeedFix entries" : "NeedFix inbox is empty"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of rows) {
+    const button = createElement("button", "needfix-list-item");
+    button.type = "button";
+    button.dataset.needfixId = String(entry.id || "");
+    const heading = createElement("span", "needfix-list-heading");
+    heading.append(
+      createElement("strong", "", String(entry.title || entry.id || "Untitled")),
+      createElement("span", `status-badge status-${String(entry.status || "captured")}`, String(entry.status || "captured")),
+    );
+    button.append(
+      heading,
+      createElement("span", "needfix-list-meta", `${String(entry.id || "")} · ${String(entry.kind || "other")} · ${String(entry.severity || "medium")} · readiness ${numberValue(entry.readiness_score)}`),
+    );
+    fragment.appendChild(button);
+  }
+  elements.needfixList.replaceChildren(fragment);
+}
+
+function renderNeedfix(payload) {
+  if (!payload || payload.ok === false) {
+    state.needfixEntries = [];
+    elements.needfixSummary.textContent = (payload && payload.error) || "NeedFix unavailable";
+    renderNeedfixList();
+    return;
+  }
+  state.needfixEntries = asArray(payload.entries);
+  elements.needfixSummary.textContent = `${formatCount(payload.count)} shown${payload.truncated ? " · more available" : ""}`;
+  renderNeedfixList();
+}
+
+function appendNeedfixObject(parent, title, value) {
+  const section = createElement("details", "needfix-object");
+  section.appendChild(createElement("summary", "", title));
+  const pre = createElement("pre", "", JSON.stringify(value || {}, null, 2));
+  section.appendChild(pre);
+  parent.appendChild(section);
+}
+
+function needfixActionButton(label, action, className = "secondary-button") {
+  const button = createElement("button", className, label);
+  button.type = "button";
+  button.dataset.needfixAction = action;
+  return button;
+}
+
+function renderNeedfixDetail(payload) {
+  if (!payload || payload.ok === false || !payload.item) {
+    state.needfixDetail = null;
+    elements.needfixDetailPanel.replaceChildren(createElement("div", "panel-list-empty", (payload && payload.error) || "NeedFix detail unavailable"));
+    return;
+  }
+  const item = payload.item;
+  state.needfixDetail = item;
+  state.needfixConversionPreview = null;
+  const fragment = document.createDocumentFragment();
+  const heading = createElement("div", "needfix-detail-heading");
+  heading.append(
+    createElement("div", "", String(item.id || "")),
+    createElement("h3", "", String(item.title || "Untitled")),
+    createElement("span", `status-badge status-${String(item.status || "captured")}`, String(item.status || "captured")),
+  );
+  fragment.appendChild(heading);
+  fragment.appendChild(createElement("p", "needfix-description", String(item.description || "No description")));
+  const metadata = createElement("dl", "metadata-grid needfix-metadata");
+  for (const [label, value] of [
+    ["Kind", item.kind], ["Severity", item.severity], ["Readiness", numberValue(item.readiness_score)],
+    ["Scope", item.scope || asArray(item.scope_files).join(", ")], ["Tags", asArray(item.tags).join(", ")],
+    ["Task", item.converted_task_id || "Not converted"], ["Updated", item.updated_at],
+  ]) {
+    metadata.append(createElement("dt", "", label), createElement("dd", "", String(value || "—")));
+  }
+  fragment.appendChild(metadata);
+  const controls = createElement("div", "needfix-controls");
+  controls.append(
+    needfixActionButton("Triage", "triage"), needfixActionButton("Accept", "accept"),
+    needfixActionButton("Defer", "defer"), needfixActionButton("Reject", "reject", "danger-button"),
+    needfixActionButton("Duplicate", "duplicate"), needfixActionButton("Task planned", "task_planned"),
+    needfixActionButton("Resolve", "resolve"), needfixActionButton("Archive", "archive"),
+  );
+  if (item.archived_at) controls.appendChild(needfixActionButton("Restore", "restore"));
+  controls.append(needfixActionButton("Preview task", "convertPreview"), needfixActionButton("Purge", "purge", "danger-button"));
+  fragment.appendChild(controls);
+  const conversion = createElement("div", "needfix-conversion", "Task conversion requires a preview before explicit confirmation.");
+  conversion.id = "needfix-conversion";
+  fragment.appendChild(conversion);
+  appendNeedfixObject(fragment, "Provenance", item.provenance);
+  appendNeedfixObject(fragment, "Evidence", item.evidence);
+  appendNeedfixObject(fragment, `Audit events (${asArray(payload.events).length})`, asArray(payload.events));
+  elements.needfixDetailPanel.replaceChildren(fragment);
+}
+
+function renderNeedfixAction(payload) {
+  if (!payload || payload.ok === false) {
+    showToast((payload && payload.error) || "NeedFix action failed");
+    return;
+  }
+  const tool = String(payload.server_tool || "");
+  if (tool.endsWith("_convert_preview")) {
+    state.needfixConversionPreview = payload;
+    const box = document.querySelector("#needfix-conversion");
+    if (box) {
+      box.replaceChildren(
+        createElement("pre", "", JSON.stringify(payload, null, 2)),
+        needfixActionButton("Confirm task creation", "convertCommit", "primary-button"),
+      );
+    }
+    return;
+  }
+  showToast("NeedFix updated");
+  if (payload.item) renderNeedfixDetail({ ok: true, item: payload.item, events: [] });
+  requestNeedfixList();
+}
+
 function taskSignalRow(task, badgeText, badgeClass) {
   const row = createElement("div", "signal-row");
   const top = createElement("div", "signal-topline");
@@ -3506,6 +3683,15 @@ window.addEventListener("message", (event) => {
     case "kb":
       renderKb(message.payload);
       break;
+    case "needfix":
+      renderNeedfix(message.payload);
+      break;
+    case "needfixDetail":
+      renderNeedfixDetail(message.payload);
+      break;
+    case "needfixAction":
+      renderNeedfixAction(message.payload);
+      break;
     case "settings":
       renderSettings(message.payload);
       break;
@@ -3785,6 +3971,77 @@ elements.openKb.addEventListener("click", () => {
   elements.kbDialog.showModal();
   elements.kbSummary.textContent = "Loading repository knowledge";
   vscode.postMessage({ type: "requestKb" });
+});
+
+function openNeedfixDialog() {
+  if (!elements.needfixDialog.open) elements.needfixDialog.showModal();
+  elements.needfixSummary.textContent = "Loading NeedFix inbox";
+  requestNeedfixList();
+}
+
+elements.openNeedfix.addEventListener("click", openNeedfixDialog);
+elements.headerNeedfix.addEventListener("click", openNeedfixDialog);
+elements.needfixRefresh.addEventListener("click", requestNeedfixList);
+elements.needfixSearch.addEventListener("input", renderNeedfixList);
+for (const filter of [elements.needfixStatusFilter, elements.needfixKindFilter, elements.needfixSeverityFilter, elements.needfixIncludeArchived]) {
+  filter.addEventListener("change", requestNeedfixList);
+}
+
+elements.needfixCaptureForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const title = String(elements.needfixTitle.value || "").trim();
+  if (!title) return;
+  vscode.postMessage({
+    type: "needfixCapture",
+    title,
+    description: String(elements.needfixDescription.value || "").trim(),
+    kind: elements.needfixKind.value,
+    severity: elements.needfixSeverity.value,
+    scope: String(elements.needfixScope.value || "").trim(),
+    tags: String(elements.needfixTags.value || "").split(",").map((value) => value.trim()).filter(Boolean),
+  });
+  elements.needfixCaptureForm.reset();
+  elements.needfixSeverity.value = "medium";
+});
+
+elements.needfixList.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-needfix-id]");
+  if (target) vscode.postMessage({ type: "requestNeedfixDetail", needfixId: target.dataset.needfixId });
+});
+
+elements.needfixDetailPanel.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-needfix-action]");
+  const item = state.needfixDetail;
+  if (!target || !item) return;
+  const action = target.dataset.needfixAction;
+  const needfixId = String(item.id || "");
+  if (action === "convertPreview") {
+    vscode.postMessage({ type: "needfixConvertPreview", needfixId });
+    return;
+  }
+  if (action === "convertCommit") {
+    if (state.needfixConversionPreview && window.confirm(`Create a task from ${needfixId}? This does not launch a worker.`)) {
+      vscode.postMessage({ type: "needfixConvertCommit", needfixId, confirm: true });
+    }
+    return;
+  }
+  let reason = "";
+  let duplicateParentId = "";
+  if (["triage", "defer", "reject", "resolve", "archive", "purge"].includes(action)) {
+    reason = String(window.prompt(`${action} reason`, "") || "").trim();
+    if (["reject", "purge"].includes(action) && !reason) return;
+  }
+  if (action === "duplicate") {
+    duplicateParentId = String(window.prompt("Canonical NeedFix ID", "") || "").trim();
+    if (!duplicateParentId) return;
+  }
+  if (!window.confirm(`Confirm ${action} for ${needfixId}?`)) return;
+  if (["archive", "restore", "purge"].includes(action)) {
+    const type = { archive: "needfixArchive", restore: "needfixRestore", purge: "needfixPurge" }[action];
+    vscode.postMessage({ type, needfixId, reason, targetStatus: "captured", confirm: true });
+    return;
+  }
+  vscode.postMessage({ type: "needfixTransition", needfixId, action, reason, duplicateParentId, confirm: true });
 });
 
 elements.openOperations.addEventListener("click", () => {

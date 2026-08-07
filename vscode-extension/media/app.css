@@ -218,7 +218,7 @@ select:focus-visible,
 
 .header-insights {
   display: grid;
-  grid-template-columns: repeat(6, minmax(130px, 1fr));
+  grid-template-columns: repeat(7, minmax(120px, 1fr));
   gap: 8px;
   padding: 6px 14px;
   background: var(--surface-subtle);
@@ -313,13 +313,15 @@ select:focus-visible,
 }
 
 .header-storage,
-.header-tool-use {
+.header-tool-use,
+#header-needfix {
   cursor: pointer;
   font: inherit;
 }
 
 .header-storage:hover,
-.header-tool-use:hover {
+.header-tool-use:hover,
+#header-needfix:hover {
   border-color: var(--accent);
   background: var(--review-soft);
 }
@@ -1911,6 +1913,192 @@ tbody tr.is-selected td:first-child {
   height: calc(100% - 105px);
   overflow: auto;
   padding: 0 10px 10px;
+}
+
+.needfix-dialog {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: 1180px;
+  height: min(820px, calc(100vh - 40px));
+}
+
+.needfix-capture-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px 140px auto;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.needfix-capture-form label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.needfix-capture-form input,
+.needfix-capture-form select,
+.needfix-capture-form textarea,
+.needfix-toolbar input,
+.needfix-toolbar select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface-subtle);
+  color: var(--ink);
+  font: inherit;
+}
+
+.needfix-capture-form textarea {
+  resize: vertical;
+}
+
+.needfix-wide {
+  grid-column: span 2;
+}
+
+.needfix-toolbar {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) repeat(3, minmax(115px, auto)) auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.needfix-archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.needfix-workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 34%) minmax(0, 1fr);
+  height: calc(100% - 250px);
+  min-height: 260px;
+}
+
+.needfix-list,
+.needfix-detail {
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.needfix-list {
+  border-right: 1px solid var(--line);
+}
+
+.needfix-list-item {
+  display: grid;
+  width: 100%;
+  gap: 5px;
+  margin-bottom: 7px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-subtle);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.needfix-list-item:hover {
+  border-color: var(--accent);
+}
+
+.needfix-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.needfix-list-meta,
+.needfix-detail-heading > div {
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.needfix-detail-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  align-items: start;
+}
+
+.needfix-detail-heading > div,
+.needfix-detail-heading h3 {
+  grid-column: 1;
+}
+
+.needfix-detail-heading h3 {
+  margin: 0;
+}
+
+.needfix-detail-heading .status-badge {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.needfix-description {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.needfix-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.needfix-conversion {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.needfix-conversion pre,
+.needfix-object pre {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.needfix-object {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+@media (max-width: 820px) {
+  .needfix-capture-form,
+  .needfix-toolbar,
+  .needfix-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .needfix-wide {
+    grid-column: auto;
+  }
+
+  .needfix-workspace {
+    height: auto;
+  }
+
+  .needfix-list {
+    max-height: 240px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
 }
 
 .settings-list {

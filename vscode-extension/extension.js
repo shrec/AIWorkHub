@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.8";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.9";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -134,6 +134,16 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestMemory",
   "requestSessions",
   "requestKb",
+  "requestNeedfix",
+  "requestNeedfixDetail",
+  "needfixCapture",
+  "needfixUpdate",
+  "needfixTransition",
+  "needfixArchive",
+  "needfixRestore",
+  "needfixPurge",
+  "needfixConvertPreview",
+  "needfixConvertCommit",
   "requestSettings",
   "updateFeatureSetting",
   "updateSourceGraphLanguage",
@@ -169,6 +179,9 @@ const OUTBOUND_TYPES = Object.freeze({
   memory: "memory",
   sessions: "sessions",
   kb: "kb",
+  needfix: "needfix",
+  needfixDetail: "needfixDetail",
+  needfixAction: "needfixAction",
   settings: "settings",
 });
 
@@ -243,6 +256,19 @@ const DASHBOARD_TOOLS = Object.freeze({
   settings: "aiworkhub_dashboard_settings",
 });
 const SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_settings_update";
+const NEEDFIX_TOOLS = Object.freeze({
+  list: "aiworkhub_dashboard_needfix_list",
+  detail: "aiworkhub_dashboard_needfix_detail",
+  capture: "aiworkhub_dashboard_needfix_capture",
+  update: "aiworkhub_dashboard_needfix_update",
+  transition: "aiworkhub_dashboard_needfix_transition",
+  archive: "aiworkhub_dashboard_needfix_archive",
+  restore: "aiworkhub_dashboard_needfix_restore",
+  purge: "aiworkhub_dashboard_needfix_purge",
+  convertPreview: "aiworkhub_dashboard_needfix_convert_preview",
+  convertCommit: "aiworkhub_dashboard_needfix_convert_commit",
+});
+const NEEDFIX_ID_RE = /^NF-\d{4}-\d{5}$/;
 const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
 const FEATURE_SETTING_KEYS = new Set([
   "source_graph",
@@ -5357,6 +5383,82 @@ async function pushKb(view) {
   }
 }
 
+async function pushNeedfixList(view, filters = {}) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(NEEDFIX_TOOLS.list, {
+      status: String(filters.status || "").slice(0, 40) || null,
+      kind: String(filters.kind || "").slice(0, 60) || null,
+      severity: String(filters.severity || "").slice(0, 24) || null,
+      include_archived: Boolean(filters.includeArchived),
+      limit: 200,
+      offset: 0,
+    });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.needfix, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.needfix,
+      payload: { ok: false, error: sanitizeErrorMessage(err), entries: [] },
+    });
+  }
+}
+
+async function pushNeedfixDetail(view, needfixId) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(NEEDFIX_TOOLS.detail, {
+      needfix_id: needfixId,
+      event_limit: 50,
+    });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.needfixDetail, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.needfixDetail,
+      payload: { ok: false, error: sanitizeErrorMessage(err) },
+    });
+  }
+}
+
+async function runNeedfixAction(view, action, args) {
+  const tool = NEEDFIX_TOOLS[action];
+  if (!tool) return;
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(tool, args);
+    if (!view.stillBoundTo(client)) return;
+    view.postMessage({
+      type: OUTBOUND_TYPES.needfixAction,
+      action,
+      payload: sanitizeWebviewPayload(payload),
+    });
+    if (payload && payload.ok === true) {
+      // Preview is read-only and the Webview must retain its exact receipt
+      // until the user explicitly confirms task creation. A detail refresh
+      // here would erase that preview before the confirmation click.
+      if (action === "convertPreview") return;
+      await pushSnapshotNoRetry(view, { client, authoritative: true });
+      await pushNeedfixList(view, {});
+      const needfixId = String(args.needfix_id || (payload.item && payload.item.id) || "");
+      if (NEEDFIX_ID_RE.test(needfixId) && action !== "purge") {
+        await pushNeedfixDetail(view, needfixId);
+      }
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.needfixAction,
+      action,
+      payload: { ok: false, error: sanitizeErrorMessage(err) },
+    });
+  }
+}
+
 async function pushSettings(view) {
   try {
     const client = getMcpClient();
@@ -6044,6 +6146,79 @@ function handleInboundMessage(view, message) {
     case "requestKb":
       pushKb(view);
       break;
+    case "requestNeedfix":
+      pushNeedfixList(view, {
+        status: message.status,
+        kind: message.kind,
+        severity: message.severity,
+        includeArchived: message.includeArchived,
+      });
+      break;
+    case "requestNeedfixDetail": {
+      const needfixId = String(message.needfixId || "");
+      if (NEEDFIX_ID_RE.test(needfixId)) pushNeedfixDetail(view, needfixId);
+      break;
+    }
+    case "needfixCapture":
+      runNeedfixAction(view, "capture", {
+        title: String(message.title || "").slice(0, 240),
+        description: String(message.description || "").slice(0, 8000),
+        kind: String(message.kind || "other").slice(0, 60),
+        severity: String(message.severity || "medium").slice(0, 24),
+        scope: String(message.scope || "").slice(0, 4000) || null,
+        tags: Array.isArray(message.tags) ? message.tags.slice(0, 24).map((value) => String(value).slice(0, 80)) : [],
+      });
+      break;
+    case "needfixUpdate": {
+      const needfixId = String(message.needfixId || "");
+      if (!NEEDFIX_ID_RE.test(needfixId)) break;
+      runNeedfixAction(view, "update", {
+        needfix_id: needfixId,
+        title: message.title == null ? null : String(message.title).slice(0, 240),
+        description: message.description == null ? null : String(message.description).slice(0, 8000),
+        scope: message.scope == null ? null : String(message.scope).slice(0, 4000),
+        kind: message.kind == null ? null : String(message.kind).slice(0, 60),
+        severity: message.severity == null ? null : String(message.severity).slice(0, 24),
+        tags: Array.isArray(message.tags) ? message.tags.slice(0, 24).map((value) => String(value).slice(0, 80)) : null,
+        readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
+      });
+      break;
+    }
+    case "needfixTransition": {
+      const needfixId = String(message.needfixId || "");
+      if (!NEEDFIX_ID_RE.test(needfixId)) break;
+      runNeedfixAction(view, "transition", {
+        needfix_id: needfixId,
+        action: String(message.action || "").slice(0, 32),
+        reason: String(message.reason || "").slice(0, 1000),
+        readiness_score: Number.isFinite(Number(message.readinessScore)) ? Math.max(0, Math.min(100, Number(message.readinessScore))) : null,
+        duplicate_parent_id: String(message.duplicateParentId || "").slice(0, 32),
+        confirm: message.confirm === true,
+      });
+      break;
+    }
+    case "needfixArchive":
+    case "needfixRestore":
+    case "needfixPurge":
+    case "needfixConvertPreview":
+    case "needfixConvertCommit": {
+      const needfixId = String(message.needfixId || "");
+      if (!NEEDFIX_ID_RE.test(needfixId)) break;
+      const action = {
+        needfixArchive: "archive",
+        needfixRestore: "restore",
+        needfixPurge: "purge",
+        needfixConvertPreview: "convertPreview",
+        needfixConvertCommit: "convertCommit",
+      }[message.type];
+      const args = { needfix_id: needfixId };
+      if (action === "archive") Object.assign(args, { reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
+      if (action === "restore") Object.assign(args, { target_status: String(message.targetStatus || "captured").slice(0, 40), confirm: message.confirm === true });
+      if (action === "purge") Object.assign(args, { audit_reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
+      if (action === "convertCommit") args.confirm = message.confirm === true;
+      runNeedfixAction(view, action, args);
+      break;
+    }
     case "requestSettings":
       pushSettings(view);
       break;
@@ -6243,6 +6418,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-kb-detail">No evidence</span>
       </div>
 
+      <button class="header-insight-card" id="header-needfix" type="button" title="Open the durable NeedFix intake and triage registry">
+        <span class="header-storage-label">NeedFix</span>
+        <strong id="header-needfix-value">—</strong>
+        <span class="header-insight-detail" id="header-needfix-detail">No entries</span>
+      </button>
+
       <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
         <span class="header-storage-label">Preflight</span>
         <strong id="header-preflight-value">Checking</strong>
@@ -6337,6 +6518,9 @@ function getHtmlForWebview(webview, extensionUri) {
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-kb" title="Open Knowledge Base" aria-label="Open Knowledge Base">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/></svg><span>KB</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-needfix" title="Open NeedFix inbox" aria-label="Open NeedFix inbox">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 4v1M5 5h14v16H5zM8 8h8M8 12h8"/></svg><span>NeedFix</span>
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-operations" title="Open repository operations" aria-label="Open repository operations">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V11h3v8zm6 0V5h3v14zm6 0V8h3v11M2 21h20"/></svg><span>Operations</span>
@@ -6596,6 +6780,36 @@ function getHtmlForWebview(webview, extensionUri) {
     </div>
     <input class="dialog-search" id="kb-search" type="search" placeholder="Filter key, title, category, tags or body" aria-label="Filter Knowledge Base entries">
     <div class="memory-list" id="kb-list"></div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog needfix-dialog" id="needfix-dialog">
+    <div class="dialog-heading">
+      <div><h2>NeedFix</h2><span id="needfix-summary">Durable intake for bugs, ideas and deferred work</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="needfix-dialog">Close</button>
+    </div>
+    <form id="needfix-capture-form" class="needfix-capture-form">
+      <label>Title<input id="needfix-title" required maxlength="240" placeholder="What needs attention?"></label>
+      <label>Kind<select id="needfix-kind"><option value="bug">Bug</option><option value="improvement">Improvement</option><option value="idea">Idea</option><option value="technical_debt">Technical debt</option><option value="optimization">Optimization</option><option value="benchmark_gap">Benchmark gap</option><option value="documentation_drift">Documentation drift</option><option value="security_risk">Security risk</option><option value="investigation">Investigation</option><option value="roadmap_candidate">Roadmap candidate</option><option value="other">Other</option></select></label>
+      <label>Severity<select id="needfix-severity"><option value="medium">Medium</option><option value="critical">Critical</option><option value="high">High</option><option value="low">Low</option></select></label>
+      <label class="needfix-wide">Description<textarea id="needfix-description" maxlength="8000" rows="3" placeholder="Observed behavior and why it matters"></textarea></label>
+      <label class="needfix-wide">Scope<input id="needfix-scope" maxlength="4000" placeholder="Components, files or symbols"></label>
+      <label class="needfix-wide">Tags<input id="needfix-tags" maxlength="1000" placeholder="comma, separated"></label>
+      <button class="primary-button" type="submit">Capture</button>
+    </form>
+    <div class="needfix-toolbar">
+      <input id="needfix-search" type="search" placeholder="Filter NeedFix entries" aria-label="Filter NeedFix entries">
+      <select id="needfix-status-filter" aria-label="Filter NeedFix status"><option value="">All statuses</option><option value="captured">Captured</option><option value="triaged">Triaged</option><option value="accepted">Accepted</option><option value="deferred">Deferred</option><option value="rejected">Rejected</option><option value="duplicate">Duplicate</option><option value="task_planned">Task planned</option><option value="task_created">Task created</option><option value="resolved">Resolved</option></select>
+      <select id="needfix-kind-filter" aria-label="Filter NeedFix kind"><option value="">All kinds</option><option value="bug">Bug</option><option value="improvement">Improvement</option><option value="idea">Idea</option><option value="technical_debt">Technical debt</option><option value="optimization">Optimization</option><option value="benchmark_gap">Benchmark gap</option><option value="documentation_drift">Documentation drift</option><option value="security_risk">Security risk</option><option value="investigation">Investigation</option><option value="roadmap_candidate">Roadmap candidate</option></select>
+      <select id="needfix-severity-filter" aria-label="Filter NeedFix severity"><option value="">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+      <label class="needfix-archived-toggle"><input id="needfix-include-archived" type="checkbox"> Archived</label>
+      <button id="needfix-refresh" type="button">Refresh</button>
+    </div>
+    <div class="needfix-workspace">
+      <div class="needfix-list" id="needfix-list" aria-live="polite"></div>
+      <section class="needfix-detail" id="needfix-detail" aria-live="polite">
+        <div class="panel-list-empty">Select a NeedFix entry</div>
+      </section>
+    </div>
   </dialog>
 
   <dialog class="diagnostic-dialog settings-dialog" id="settings-dialog">

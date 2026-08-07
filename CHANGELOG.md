@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-08-07
+
+### Added
+
+- A durable repository-scoped NeedFix registry now captures bugs, improvements,
+  ideas, technical debt, optimization work, benchmark gaps, documentation
+  drift, security risks, investigations and roadmap candidates without
+  prematurely creating task cards.
+- The native dashboard exposes NeedFix as a top-level status card and dedicated
+  popup with bounded search, filters, detail, provenance, evidence, audit
+  events and explicit lifecycle actions.
+- NeedFix-to-task conversion is a two-step preview and confirmation flow. It
+  creates a task card but never launches a worker automatically.
+
+### Fixed
+
+- NeedFix dashboard reads and writes now use bounded MCP tools instead of
+  exposing storage paths or arbitrary tool execution to the Webview.
+- Destructive archive, purge and lifecycle transitions require explicit user
+  confirmation, while task conversion retains its preview until confirmed.
+
 ## [0.9.8] - 2026-08-07
 
 ### Added
