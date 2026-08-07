@@ -11,6 +11,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
+from . import task_store
 from .tool_recovery import unknown_tool_message
 
 try:
