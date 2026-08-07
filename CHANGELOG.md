@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-08-07
+
+### Fixed
+
+- Invalid emulated VS Code LM tool input now produces a bounded, redacted and
+  actionable terminal diagnostic containing the known tool name, parser
+  reason, protocol preview and recent turn trace instead of empty diagnostic
+  fields.
+- The structured invalid-input receipt is preserved through the outer bridge
+  response without weakening fail-closed tool-input validation or exposing
+  credential-shaped values.
+
+### Tests
+
+- Added a Node-backed regression that verifies real invalid-branch wiring,
+  preview and trace bounds, secret redaction, and outer response propagation.
+
 ## [0.9.17] - 2026-08-07
 
 ### Added
