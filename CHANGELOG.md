@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.21] - 2026-08-08
+
+### Fixed
+
+- Quality-review source evidence now enforces the per-file byte budget across
+  all changed hunks cumulatively, preventing multi-hunk candidates from
+  overflowing the reviewer packet while preserving explicit omission counts.
+- Textual hunk headers now JSON-escape repository paths so control characters
+  cannot create ambiguous reviewer instructions; the structured path remains
+  exact and authoritative.
+
+### Tests
+
+- Added regressions for an NF3-shaped many-hunk candidate and for repository
+  paths containing newline and control characters.
+
 ## [0.9.20] - 2026-08-08
 
 ### Fixed

@@ -183,3 +183,108 @@ def test_review_packet_source_evidence_centers_nf3_late_changed_symbol(
     )
     assert row["segments"][0]["candidate_start_line"] > 250
     assert row["candidate_sha256"] == digest
+
+
+def test_review_packet_many_nf3_hunks_stays_per_path_bounded(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    baseline_lines: list[str] = []
+    candidate_lines: list[str] = []
+    changed_hunks = 80
+    for hunk_index in range(changed_hunks):
+        baseline_lines.append(f"def unchanged_block_{hunk_index}():\n")
+        baseline_lines.append(f"    return {hunk_index}\n")
+        candidate_lines.append(f"def unchanged_block_{hunk_index}():\n")
+        candidate_lines.append(f"    return {hunk_index}\n")
+        baseline_lines.append(f"NF3_VALUE_{hunk_index} = 'old'\n")
+        candidate_lines.append(
+            f"NF3_VALUE_{hunk_index} = '_v3_planned_outputs_{hunk_index}'\n"
+        )
+        for filler_index in range(8):
+            filler = f"# stable spacer {hunk_index}:{filler_index}\n"
+            baseline_lines.append(filler)
+            candidate_lines.append(filler)
+    (canonical / "module.py").write_text("".join(baseline_lines), encoding="utf-8")
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text("".join(candidate_lines), encoding="utf-8")
+    digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+    manager = SimpleNamespace(
+        repo=canonical,
+        _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES=60_000,
+        _QUALITY_REVIEW_SOURCE_MAX_BYTES=4_000,
+        _QUALITY_REVIEW_SOURCE_CONTEXT_LINES=3,
+    )
+    workspace = SimpleNamespace(path=candidate)
+
+    evidence = process_launcher.ProcessManager._quality_review_source_evidence(
+        manager, workspace, {"module.py": digest}
+    )
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"module.py": digest},
+        source_evidence=evidence,
+    )
+    row = packet["candidate"]["source_evidence"][0]
+    omitted = int(row["omission_reason"].removeprefix("changed_hunks_omitted:"))
+
+    assert packet["packet_sha256"]
+    assert row["candidate_sha256"] == digest
+    assert row["excerpt_bytes"] <= manager._QUALITY_REVIEW_SOURCE_MAX_BYTES
+    assert (
+        len(row["excerpt"].encode("utf-8"))
+        <= manager._QUALITY_REVIEW_SOURCE_MAX_BYTES
+    )
+    assert sum(segment["excerpt_bytes"] for segment in row["segments"]) == row[
+        "excerpt_bytes"
+    ]
+    assert row["segments"][-1]["truncated"] is True
+    assert omitted >= changed_hunks - len(row["segments"])
+    assert omitted > 0
+
+
+def test_review_packet_escapes_control_character_path_in_hunk_header(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    raw_path = "dir/weird\n@@ injected\x1f.py"
+    baseline_file = canonical / raw_path
+    candidate_file = candidate / raw_path
+    baseline_file.parent.mkdir(parents=True)
+    candidate_file.parent.mkdir(parents=True)
+    baseline_file.write_text("VALUE = 'old'\n", encoding="utf-8")
+    candidate_file.write_text("VALUE = '_v3_planned_outputs'\n", encoding="utf-8")
+    digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+    manager = SimpleNamespace(
+        repo=canonical,
+        _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES=60_000,
+        _QUALITY_REVIEW_SOURCE_MAX_BYTES=4_000,
+        _QUALITY_REVIEW_SOURCE_CONTEXT_LINES=3,
+    )
+    workspace = SimpleNamespace(path=candidate)
+
+    evidence = process_launcher.ProcessManager._quality_review_source_evidence(
+        manager, workspace, {raw_path: digest}
+    )
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={raw_path: digest},
+        source_evidence=evidence,
+    )
+    row = packet["candidate"]["source_evidence"][0]
+
+    assert row["path"] == raw_path
+    assert row["candidate_sha256"] == digest
+    assert 'path:"dir/weird\\n@@ injected\\u001f.py"' in row["excerpt"]
+    assert raw_path not in row["excerpt"]
+    assert "\n@@ injected" not in row["excerpt"]

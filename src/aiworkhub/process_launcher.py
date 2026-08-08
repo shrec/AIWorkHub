@@ -3230,15 +3230,17 @@ class ProcessManager:
             matcher = difflib.SequenceMatcher(None, baseline_lines, candidate_lines)
             chunks: list[str] = []
             omitted_hunks = 0
+            path_remaining = self._QUALITY_REVIEW_SOURCE_MAX_BYTES
+            header_path = json.dumps(path, ensure_ascii=True)
             for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
                 if tag == "equal":
                     continue
                 start_line, end_line = line_span(
                     new_start, new_end, len(candidate_lines)
                 )
-                limit = max(0, min(self._QUALITY_REVIEW_SOURCE_MAX_BYTES, remaining))
+                limit = max(0, min(path_remaining, remaining))
                 header = (
-                    f"@@ {path} candidate:{start_line}-{end_line} "
+                    f"@@ path:{header_path} candidate:{start_line}-{end_line} "
                     f"change:{new_start + 1}-{max(new_start + 1, new_end)} "
                     f"baseline:{old_start + 1}-{max(old_start + 1, old_end)} {tag} @@\n"
                 )
@@ -3252,6 +3254,7 @@ class ProcessManager:
                 )
                 segment_bytes = header_bytes + excerpt_bytes
                 remaining -= segment_bytes
+                path_remaining -= segment_bytes
                 row["excerpt_bytes"] += segment_bytes
                 row["segments"].append(
                     {
@@ -3270,9 +3273,8 @@ class ProcessManager:
                 if truncated:
                     omitted_hunks += 1
                     row["truncated"] = True
-                if remaining <= 0:
+                if remaining <= 0 or path_remaining <= 0:
                     row["truncated"] = True
-                    break
             if omitted_hunks:
                 row["omission_reason"] = f"changed_hunks_omitted:{omitted_hunks}"
             if not chunks and "omission_reason" not in row:
