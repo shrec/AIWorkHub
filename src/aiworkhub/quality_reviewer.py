@@ -75,17 +75,19 @@ def build_review_packet(
         raise ReviewerEvidenceError("changed_path_hashes_missing")
     if len(changed_path_hashes) > MAX_PACKET_PATHS:
         raise ReviewerEvidenceError("review_packet_overflow")
-    path_rows: list[dict[str, str]] = []
+    path_rows: list[dict[str, Any]] = []
     for path, digest in sorted(changed_path_hashes.items()):
         normalized_path = str(path)
-        normalized_digest = str(digest)
+        normalized_digest = None if digest is None else str(digest)
         if (
             not normalized_path
             or normalized_path.startswith("/")
             or ".." in normalized_path.split("/")
         ):
             raise ReviewerEvidenceError("invalid_changed_path")
-        if not _SHA256_RE.fullmatch(normalized_digest):
+        if normalized_digest is not None and not _SHA256_RE.fullmatch(
+            normalized_digest
+        ):
             raise ReviewerEvidenceError("invalid_changed_path_hash")
         path_rows.append({"path": normalized_path, "sha256": normalized_digest})
 
@@ -266,13 +268,66 @@ def build_review_prompt(
 
 MAX_SOURCE_EVIDENCE_CHARS = 8_000
 MAX_SOURCE_EVIDENCE_TOTAL_CHARS = 120_000
+MAX_SOURCE_EVIDENCE_SEGMENTS = 200
 
 
 def _source_evidence_rows(
     source_evidence: Mapping[str, Mapping[str, Any]],
-    path_rows: list[dict[str, str]],
+    path_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Validate bounded source evidence bound one-to-one to changed paths."""
+
+    def bounded_int(value: object, field: str) -> int:
+        if isinstance(value, bool):
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        try:
+            normalized = int(value or 0)
+        except (TypeError, ValueError) as exc:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence") from exc
+        if normalized < 0:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        return normalized
+
+    def segment_rows(values: object) -> list[dict[str, Any]]:
+        if values is None:
+            return []
+        if not isinstance(values, list) or len(values) > MAX_SOURCE_EVIDENCE_SEGMENTS:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        result: list[dict[str, Any]] = []
+        for segment in values:
+            if not isinstance(segment, Mapping):
+                raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+            kind = str(segment.get("kind") or "")
+            if kind not in {"replace", "insert", "delete"}:
+                raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+            result.append(
+                {
+                    "kind": kind,
+                    "candidate_start_line": bounded_int(
+                        segment.get("candidate_start_line"), "candidate_start_line"
+                    ),
+                    "candidate_end_line": bounded_int(
+                        segment.get("candidate_end_line"), "candidate_end_line"
+                    ),
+                    "changed_start_line": bounded_int(
+                        segment.get("changed_start_line"), "changed_start_line"
+                    ),
+                    "changed_end_line": bounded_int(
+                        segment.get("changed_end_line"), "changed_end_line"
+                    ),
+                    "baseline_start_line": bounded_int(
+                        segment.get("baseline_start_line"), "baseline_start_line"
+                    ),
+                    "baseline_end_line": bounded_int(
+                        segment.get("baseline_end_line"), "baseline_end_line"
+                    ),
+                    "excerpt_bytes": bounded_int(
+                        segment.get("excerpt_bytes"), "excerpt_bytes"
+                    ),
+                    "truncated": bool(segment.get("truncated")),
+                }
+            )
+        return result
 
     if not isinstance(source_evidence, Mapping) or not source_evidence:
         raise ReviewerEvidenceError("candidate_source_evidence_missing")
@@ -285,9 +340,15 @@ def _source_evidence_rows(
         row = source_evidence[path]
         if not isinstance(row, Mapping):
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
-        digest = str(row.get("candidate_sha256") or "")
-        if not _SHA256_RE.fullmatch(digest) or digest != expected[path]:
-            raise ReviewerEvidenceError("candidate_source_evidence_hash_mismatch")
+        expected_digest = expected[path]
+        digest = row.get("candidate_sha256")
+        if expected_digest is None:
+            if digest is not None:
+                raise ReviewerEvidenceError("candidate_source_evidence_hash_mismatch")
+        else:
+            digest = str(digest or "")
+            if not _SHA256_RE.fullmatch(digest) or digest != expected_digest:
+                raise ReviewerEvidenceError("candidate_source_evidence_hash_mismatch")
         excerpt = row.get("excerpt")
         if not isinstance(excerpt, str):
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
@@ -296,20 +357,31 @@ def _source_evidence_rows(
         total += len(excerpt)
         if total > MAX_SOURCE_EVIDENCE_TOTAL_CHARS:
             raise ReviewerEvidenceError("review_packet_overflow")
-        source_bytes = int(row.get("source_bytes") or 0)
-        excerpt_bytes = int(row.get("excerpt_bytes") or 0)
-        if source_bytes < 0 or excerpt_bytes < 0 or excerpt_bytes > source_bytes:
+        source_bytes = bounded_int(row.get("source_bytes"), "source_bytes")
+        excerpt_bytes = bounded_int(row.get("excerpt_bytes"), "excerpt_bytes")
+        if excerpt_bytes > max(source_bytes, len(excerpt.encode("utf-8"))):
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
-        rows.append(
-            {
-                "path": path,
-                "candidate_sha256": digest,
-                "excerpt": excerpt,
-                "excerpt_bytes": excerpt_bytes,
-                "source_bytes": source_bytes,
-                "truncated": bool(row.get("truncated")),
-            }
-        )
+        segments = segment_rows(row.get("segments"))
+        omission_reason = str(row.get("omission_reason") or "")[:MAX_TEXT_CHARS]
+        if not excerpt and not omission_reason and not segments:
+            raise ReviewerEvidenceError("invalid_candidate_source_evidence")
+        result = {
+            "path": path,
+            "candidate_sha256": digest,
+            "excerpt": excerpt,
+            "excerpt_bytes": excerpt_bytes,
+            "source_bytes": source_bytes,
+            "truncated": bool(row.get("truncated")),
+            "segments": segments,
+        }
+        if omission_reason:
+            result["omission_reason"] = omission_reason
+        baseline_omission = str(
+            row.get("baseline_omission_reason") or ""
+        )[:MAX_TEXT_CHARS]
+        if baseline_omission:
+            result["baseline_omission_reason"] = baseline_omission
+        rows.append(result)
     return rows
 
 

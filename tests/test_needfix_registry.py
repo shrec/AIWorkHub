@@ -153,17 +153,34 @@ class TestLifecycleTransitions:
         needfix_store.triage_needfix(init_store, r["id"])
         with pytest.raises(needfix_store.NeedFixValidationError):
             needfix_store.reject_needfix(init_store, r["id"], reason="  ")
-
     def test_invalid_transition_rejected(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
-        with pytest.raises(needfix_store.NeedFixConflictError):
+        assert r["status"] == "captured"
+        with pytest.raises(needfix_store.NeedFixConflictError) as exc_info:
             needfix_store.accept_needfix(init_store, r["id"])
+        msg = str(exc_info.value)
+        assert "captured" in msg
+        for status in needfix_store.VALID_TRANSITIONS.get("captured", ()):
+            assert status in msg
 
     def test_cannot_skip_triage_for_accept(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
-        with pytest.raises(needfix_store.NeedFixConflictError):
-            needfix_store.mark_task_planned(init_store, r["id"])
+        with pytest.raises(needfix_store.NeedFixConflictError) as exc_info:
+            needfix_store.accept_needfix(init_store, r["id"])
+        msg = str(exc_info.value)
+        assert "captured" in msg
+        for status in needfix_store.VALID_TRANSITIONS.get("captured", ()):
+            assert status in msg
 
+    def test_invalid_create_status_guidance(self, init_store: Path):
+        with pytest.raises(needfix_store.NeedFixValidationError) as exc_info:
+            needfix_store.add_needfix(
+                init_store, title="T", description="D", status="open"
+            )
+        msg = str(exc_info.value)
+        assert "open" in msg
+        for status in needfix_store.STATUSES:
+            assert status in msg
 
 class TestCapturedUnverifiedGuard:
     """captured/unverified cannot convert -- must be accepted first."""

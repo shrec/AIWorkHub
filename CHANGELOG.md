@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-08-08
+
+### Fixed
+
+- Quality-review packets now center bounded source evidence on the candidate's
+  actual changed hunks instead of taking only each file's first 4,000 bytes,
+  so late-file implementation and test changes remain reviewable without
+  unbounded full-file payloads.
+- Reviewer source-evidence rows now preserve exact candidate hashes, bounded
+  segment metadata and explicit omission reasons for deleted, non-file and
+  non-UTF-8 candidates while failing closed on malformed evidence.
+- NeedFix status-validation errors now return the allowed lifecycle values and
+  actionable schema guidance instead of an opaque rejection.
+
+### Tests
+
+- Added a regression proving that a changed symbol after a 4,000-byte
+  unchanged prefix is visible with only the configured adjacent context.
+- Added reviewer-packet segment and deleted-candidate contract coverage plus
+  expanded NeedFix status-guidance tests.
+
 ## [0.9.19] - 2026-08-08
 
 ### Fixed

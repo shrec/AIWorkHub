@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+from aiworkhub import process_launcher
 from aiworkhub import quality_reviewer
 from aiworkhub import source_graph
 from aiworkhub import worker_ai_tools_mcp as worker_tools
@@ -131,3 +133,53 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     assert audit["authority_index_identity"] == [
         f"source_graph:candidate_overlay:quality_review_readonly:{candidate.resolve()}"
     ]
+
+
+def test_review_packet_source_evidence_centers_nf3_late_changed_symbol(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    candidate = tmp_path / "candidate"
+    canonical.mkdir()
+    candidate.mkdir()
+    prefix = "# unchanged filler\n" * 260
+    assert len(prefix.encode("utf-8")) > 4_000
+    original = prefix + "def unchanged_tail():\n    return None\n"
+    changed = (
+        prefix
+        + "def _v3_planned_outputs():\n"
+        + "    return ['tests/test_quality_reviewer_candidate_source_graph_b1461.py']\n"
+    )
+    (canonical / "module.py").write_text(original, encoding="utf-8")
+    candidate_file = candidate / "module.py"
+    candidate_file.write_text(changed, encoding="utf-8")
+    digest = hashlib.sha256(candidate_file.read_bytes()).hexdigest()
+    manager = SimpleNamespace(
+        repo=canonical,
+        _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES=60_000,
+        _QUALITY_REVIEW_SOURCE_MAX_BYTES=4_000,
+        _QUALITY_REVIEW_SOURCE_CONTEXT_LINES=3,
+    )
+    workspace = SimpleNamespace(path=candidate)
+
+    evidence = process_launcher.ProcessManager._quality_review_source_evidence(
+        manager, workspace, {"module.py": digest}
+    )
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"module.py": digest},
+        source_evidence=evidence,
+    )
+    row = packet["candidate"]["source_evidence"][0]
+
+    filler_count = row["excerpt"].count("# unchanged filler")
+    assert 0 < filler_count <= manager._QUALITY_REVIEW_SOURCE_CONTEXT_LINES
+    assert "_v3_planned_outputs" in row["excerpt"][:200]
+    assert (
+        "tests/test_quality_reviewer_candidate_source_graph_b1461.py" in row["excerpt"]
+    )
+    assert row["segments"][0]["candidate_start_line"] > 250
+    assert row["candidate_sha256"] == digest

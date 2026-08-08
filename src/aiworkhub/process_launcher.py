@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import ctypes
+import difflib
 import hashlib
 import hmac
 import html
@@ -3142,34 +3143,141 @@ class ProcessManager:
     _QUALITY_REVIEW_PREP_MAX = 8
     _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
     _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
+    _QUALITY_REVIEW_SOURCE_CONTEXT_LINES = 3
 
     def _quality_review_source_evidence(
-        self, workspace: Any, changed_hashes: Mapping[str, str]
+        self, workspace: Any, changed_hashes: Mapping[str, str | None]
     ) -> dict[str, dict[str, Any]]:
-        """Read bounded head bytes of each exact candidate path, fail closed."""
+        """Build bounded source evidence centered on candidate changed ranges."""
+
+        def decode_utf8(raw: bytes) -> str | None:
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+
+        def line_span(start: int, end: int, line_count: int) -> tuple[int, int]:
+            anchor_start = start + 1
+            anchor_end = max(start + 1, end)
+            context = self._QUALITY_REVIEW_SOURCE_CONTEXT_LINES
+            return (
+                max(1, anchor_start - context),
+                min(line_count, anchor_end + context),
+            )
+
+        def segment_excerpt(
+            lines: list[str], start_line: int, end_line: int, limit: int
+        ) -> tuple[str, int, bool]:
+            if limit <= 0 or start_line > end_line:
+                return "", 0, bool(start_line <= end_line)
+            excerpt = "".join(lines[start_line - 1 : end_line])
+            encoded = excerpt.encode("utf-8")
+            if len(encoded) <= limit:
+                return excerpt, len(encoded), False
+            body = encoded[:limit]
+            return body.decode("utf-8", errors="replace"), len(body), True
 
         evidence: dict[str, dict[str, Any]] = {}
         remaining = self._QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES
         for path in sorted(changed_hashes):
             candidate = Path(workspace.path) / path
-            limit = max(0, min(self._QUALITY_REVIEW_SOURCE_MAX_BYTES, remaining))
+            baseline = Path(self.repo) / path
+            row: dict[str, Any] = {
+                "candidate_sha256": changed_hashes[path],
+                "excerpt": "",
+                "excerpt_bytes": 0,
+                "source_bytes": 0,
+                "truncated": False,
+                "segments": [],
+            }
+            evidence[path] = row
+            if remaining <= 0:
+                row["omission_reason"] = "source_evidence_total_budget_exhausted"
+                row["truncated"] = True
+                continue
             try:
-                source_bytes = int(candidate.stat().st_size)
-                with candidate.open("rb") as handle:
-                    head = handle.read(limit + 1)
+                if candidate.is_symlink():
+                    raise WorkspaceError(
+                        f"quality_review_candidate_unreadable:{path}"
+                    )
+                if not candidate.is_file():
+                    if changed_hashes[path] is None:
+                        row["omission_reason"] = "candidate_deleted_or_non_file"
+                        continue
+                    raise WorkspaceError(
+                        f"quality_review_candidate_unreadable:{path}"
+                    )
+                candidate_bytes = candidate.read_bytes()
+                baseline_bytes = baseline.read_bytes() if baseline.is_file() else b""
             except OSError as exc:
                 raise WorkspaceError(
                     f"quality_review_candidate_unreadable:{path}"
                 ) from exc
-            body = head[:limit]
-            remaining -= len(body)
-            evidence[path] = {
-                "candidate_sha256": str(changed_hashes[path]),
-                "excerpt": body.decode("utf-8", errors="replace"),
-                "excerpt_bytes": len(body),
-                "source_bytes": max(source_bytes, len(body)),
-                "truncated": bool(source_bytes > len(body)),
-            }
+            row["source_bytes"] = len(candidate_bytes)
+            candidate_text = decode_utf8(candidate_bytes)
+            baseline_text = decode_utf8(baseline_bytes)
+            if candidate_text is None:
+                row["omission_reason"] = "candidate_non_utf8"
+                row["truncated"] = True
+                continue
+            if baseline_text is None:
+                baseline_text = ""
+                row["baseline_omission_reason"] = "baseline_non_utf8"
+            candidate_lines = candidate_text.splitlines(keepends=True)
+            baseline_lines = baseline_text.splitlines(keepends=True)
+            if not candidate_lines and candidate_text:
+                candidate_lines = [candidate_text]
+            matcher = difflib.SequenceMatcher(None, baseline_lines, candidate_lines)
+            chunks: list[str] = []
+            omitted_hunks = 0
+            for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+                if tag == "equal":
+                    continue
+                start_line, end_line = line_span(
+                    new_start, new_end, len(candidate_lines)
+                )
+                limit = max(0, min(self._QUALITY_REVIEW_SOURCE_MAX_BYTES, remaining))
+                header = (
+                    f"@@ {path} candidate:{start_line}-{end_line} "
+                    f"change:{new_start + 1}-{max(new_start + 1, new_end)} "
+                    f"baseline:{old_start + 1}-{max(old_start + 1, old_end)} {tag} @@\n"
+                )
+                header_bytes = len(header.encode("utf-8"))
+                if limit <= header_bytes:
+                    omitted_hunks += 1
+                    row["truncated"] = True
+                    continue
+                excerpt, excerpt_bytes, truncated = segment_excerpt(
+                    candidate_lines, start_line, end_line, limit - header_bytes
+                )
+                segment_bytes = header_bytes + excerpt_bytes
+                remaining -= segment_bytes
+                row["excerpt_bytes"] += segment_bytes
+                row["segments"].append(
+                    {
+                        "kind": tag,
+                        "candidate_start_line": start_line,
+                        "candidate_end_line": end_line,
+                        "changed_start_line": new_start + 1,
+                        "changed_end_line": max(new_start + 1, new_end),
+                        "baseline_start_line": old_start + 1,
+                        "baseline_end_line": max(old_start + 1, old_end),
+                        "excerpt_bytes": segment_bytes,
+                        "truncated": truncated,
+                    }
+                )
+                chunks.append(header + excerpt)
+                if truncated:
+                    omitted_hunks += 1
+                    row["truncated"] = True
+                if remaining <= 0:
+                    row["truncated"] = True
+                    break
+            if omitted_hunks:
+                row["omission_reason"] = f"changed_hunks_omitted:{omitted_hunks}"
+            if not chunks and "omission_reason" not in row:
+                row["omission_reason"] = "empty_diff"
+            row["excerpt"] = "".join(chunks)
         return evidence
 
     def _prepared_quality_review(

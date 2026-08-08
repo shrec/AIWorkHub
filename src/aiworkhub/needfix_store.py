@@ -348,14 +348,23 @@ def _check_duplicate_cycle(
 
 
 def _validate_transition(current_status: str, target_status: str) -> None:
-    """Lifecycle guard: fail closed on invalid transitions."""
+    """Lifecycle guard: fail closed on invalid transitions.
+
+    Raises with a bounded, canonical payload: the rejected target value,
+    the current status, the exact allowed next transitions from the
+    current status, and the full canonical status list -- so every
+    invalid-transition surface (store/dashboard/server) shares one source
+    of truth instead of drifting duplicate messages.
+    """
     if current_status == target_status:
         return  # idempotent no-op
     allowed = VALID_TRANSITIONS.get(current_status, ())
     if target_status not in allowed:
         raise NeedFixConflictError(
-            f"invalid transition: {current_status!r} -> {target_status!r}; "
-            f"allowed: {allowed}"
+            f"invalid transition: rejected={target_status!r} "
+            f"current_status={current_status!r} "
+            f"allowed_next_transitions={list(allowed)!r} "
+            f"allowed_statuses={list(STATUSES)!r}"
         )
 
 
@@ -507,7 +516,9 @@ def add_needfix(
     """
 
     if status not in STATUSES:
-        raise NeedFixValidationError(f"invalid status: {status!r}")
+        raise NeedFixValidationError(
+            f"invalid status: {status!r}; allowed_statuses={sorted(STATUSES)}"
+        )
     prov = dict(provenance or {})
     prov.setdefault("origin", "manager_add")
     prov["verified"] = True

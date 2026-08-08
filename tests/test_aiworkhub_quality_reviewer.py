@@ -79,3 +79,49 @@ def test_truncation_metadata_is_preserved():
     assert row["truncated"] is True
     assert row["excerpt_bytes"] == 2
     assert row["source_bytes"] == len(SOURCE.encode("utf-8"))
+
+
+def test_changed_hunk_segments_are_preserved_in_packet_and_prompt():
+    segment = {
+        "kind": "insert",
+        "candidate_start_line": 405,
+        "candidate_end_line": 412,
+        "changed_start_line": 408,
+        "changed_end_line": 409,
+        "baseline_start_line": 407,
+        "baseline_end_line": 407,
+        "excerpt_bytes": len(SOURCE.encode("utf-8")),
+        "truncated": False,
+    }
+    packet = _packet(source_evidence=_evidence(segments=[segment]))
+    row = packet["candidate"]["source_evidence"][0]
+
+    assert row["segments"] == [segment]
+    assert "candidate_start_line" in quality_reviewer.build_review_prompt(
+        packet, lens="correctness"
+    )
+
+
+def test_deleted_candidate_path_uses_explicit_omission_reason():
+    packet = quality_reviewer.build_review_packet(
+        request_id="req1",
+        task_id="task1",
+        claim_epoch=1,
+        worker_provider="adapter-a",
+        changed_path_hashes={"src/deleted.py": None},
+        source_evidence={
+            "src/deleted.py": {
+                "candidate_sha256": None,
+                "excerpt": "",
+                "excerpt_bytes": 0,
+                "source_bytes": 0,
+                "truncated": False,
+                "segments": [],
+                "omission_reason": "candidate_deleted_or_non_file",
+            }
+        },
+    )
+
+    row = packet["candidate"]["source_evidence"][0]
+    assert row["candidate_sha256"] is None
+    assert row["omission_reason"] == "candidate_deleted_or_non_file"
