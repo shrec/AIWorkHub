@@ -152,15 +152,19 @@ def test_fresh_install_task_context_callback_reload_and_repo_isolation(tmp_path,
     repo_b = tmp_path / "repo_b"
     repo_a.mkdir()
     repo_b.mkdir()
+    # A first index is useful only if it sees real language surfaces.  Keep a
+    # Python and PHP function in the portable gate (PHP was a real fresh-install
+    # zero-file regression, not optional coverage). Materialize the repository
+    # sources before InitRepo so this gate qualifies the first canonical
+    # generation rather than racing a background scan against test-fixture
+    # creation; post-init file convergence is covered by the single-file and
+    # daemon refresh suites.
+    (repo_a / "app.py").write_text("def python_probe():\n    return 1\n", encoding="utf-8")
+    (repo_a / "app.php").write_text("<?php function php_probe() { return 1; }\n", encoding="utf-8")
     init_a = repository_bootstrap.initialize_repository_full(repo_a)
     init_b = repository_bootstrap.initialize_repository_full(repo_b)
     assert init_a["ok"] is True and init_b["ok"] is True
 
-    # A first index is useful only if it sees real language surfaces.  Keep a
-    # Python and PHP function in the portable gate (PHP was a real fresh-install
-    # zero-file regression, not optional coverage).
-    (repo_a / "app.py").write_text("def python_probe():\n    return 1\n", encoding="utf-8")
-    (repo_a / "app.php").write_text("<?php function php_probe() { return 1; }\n", encoding="utf-8")
     # InitRepo owns automatic indexing.  Synchronize with that canonical
     # daemon instead of racing it with a second direct writer: on a fast host
     # the first build can already include both files, while on a slower host a
