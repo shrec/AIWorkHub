@@ -33,6 +33,7 @@ from aiworkhub import source_graph as sg
 from aiworkhub import source_graph_ast as sgast
 from aiworkhub import source_graph_migration as sgm
 from aiworkhub import worker_ai_tools_mcp as w
+import aiworkhub.source_graph_semantic as sgsemantic
 from aiworkhub.repository_state import HUB_DIRNAME, bootstrap_repository, inspect_repository
 from aiworkhub.storage_registry import load_storage_registry
 
@@ -47,6 +48,36 @@ def _new_repo(tmp_path: Path, name: str) -> Path:
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def test_javascript_fallback_masks_regex_literals_before_matching_braces(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "javascript_regex_fallback")
+    target = repo / "src" / "extension.js"
+    _write(
+        target,
+        "function redactToolInputValue(value) {\n"
+        "  return value.replace(/bearer\\s+[^\\s\"']+/gi, 'redacted');\n"
+        "}\n\n"
+        "function glmTextToolProtocolPrompt(prompt, pathContracts = {}) {\n"
+        "  return 'bounded';\n"
+        "}\n",
+    )
+    monkeypatch.setattr(sgsemantic, "extract_javascript_typescript", lambda **_kwargs: None)
+
+    extraction = sgast.extract_file(repo, target, build_revision="test")
+    functions = {
+        entity.name: entity
+        for entity in extraction.entities
+        if entity.kind == "function"
+    }
+
+    assert functions["redactToolInputValue"].line_end == 3
+    # The legacy fallback deliberately includes the immediately preceding
+    # blank line because its anchored pattern uses ``\s*``.
+    assert functions["glmTextToolProtocolPrompt"].line_start == 4
+    assert functions["glmTextToolProtocolPrompt"].line_end == 7
 
 
 # ---------------------------------------------------------------------------

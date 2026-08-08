@@ -502,13 +502,41 @@ _CPP_CONTROL_NAMES = frozenset({
 })
 
 
-def _mask_c_family_non_code(text: str) -> str:
+_JAVASCRIPT_REGEX_PREFIX_CHARS = frozenset("=(:,[!&|?{};+-*%^~<>")
+_JAVASCRIPT_REGEX_PREFIX_WORDS = frozenset({
+    "await", "case", "delete", "in", "instanceof", "new", "of", "return",
+    "throw", "typeof", "void", "yield",
+})
+
+
+def _javascript_regex_literal_starts(chars: list[str], index: int) -> bool:
+    """Conservatively distinguish a JS regex literal from division."""
+
+    previous = index - 1
+    while previous >= 0 and chars[previous].isspace():
+        previous -= 1
+    if previous < 0 or chars[previous] in _JAVASCRIPT_REGEX_PREFIX_CHARS:
+        return True
+    if chars[previous].isalnum() or chars[previous] in {"_", "$"}:
+        end = previous + 1
+        while previous >= 0 and (
+            chars[previous].isalnum() or chars[previous] in {"_", "$"}
+        ):
+            previous -= 1
+        return "".join(chars[previous + 1:end]) in _JAVASCRIPT_REGEX_PREFIX_WORDS
+    return False
+
+
+def _mask_c_family_non_code(
+    text: str, *, javascript_regex_literals: bool = False,
+) -> str:
     """Mask C-family strings/comments while preserving offsets and lines."""
 
     chars = list(text)
     i = 0
     state = "code"
     quote = ""
+    regex_character_class = False
     while i < len(chars):
         ch = chars[i]
         nxt = chars[i + 1] if i + 1 < len(chars) else ""
@@ -521,6 +549,14 @@ def _mask_c_family_non_code(text: str) -> str:
                 state = "block_comment"
                 chars[i] = chars[i + 1] = " "
                 i += 1
+            elif (
+                javascript_regex_literals
+                and ch == "/"
+                and _javascript_regex_literal_starts(chars, i)
+            ):
+                state = "regex"
+                regex_character_class = False
+                chars[i] = " "
             elif ch in {"'", '"', "`"}:
                 state, quote = "string", ch
                 chars[i] = " "
@@ -547,6 +583,29 @@ def _mask_c_family_non_code(text: str) -> str:
                 i += 1
                 state = "code"
             elif ch != "\n":
+                chars[i] = " "
+        elif state == "regex":
+            if ch == "\n":
+                state = "code"
+                regex_character_class = False
+            elif ch == "\\" and i + 1 < len(chars):
+                chars[i] = " "
+                if chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                i += 1
+            elif ch == "[":
+                regex_character_class = True
+                chars[i] = " "
+            elif ch == "]" and regex_character_class:
+                regex_character_class = False
+                chars[i] = " "
+            elif ch == "/" and not regex_character_class:
+                chars[i] = " "
+                state = "code"
+                while i + 1 < len(chars) and chars[i + 1].isalpha():
+                    i += 1
+                    chars[i] = " "
+            else:
                 chars[i] = " "
         i += 1
     return "".join(chars)
@@ -848,22 +907,25 @@ def _polyglot_function_patterns(language: str) -> tuple[re.Pattern[str], ...]:
         return (
             re.compile(
                 r"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+"
-                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*\([^;{}]*\)\s*"
+                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*"
+                r"\((?:[^;(){}]|\{[^;(){}]*\})*\)\s*"
                 r"(?:\:\s*[^={]+)?\{"
             ),
             re.compile(
                 r"(?m)^\s*(?:module\.exports|exports\.[$A-Za-z_]\w*|[$A-Za-z_]\w*(?:\.[$A-Za-z_]\w*)*)"
                 r"\s*=\s*(?:async\s+)?function\s+(?P<name>[$A-Za-z_]\w*)\s*"
-                r"\([^;{}]*\)\s*\{"
+                r"\((?:[^;(){}]|\{[^;(){}]*\})*\)\s*\{"
             ),
             re.compile(
                 r"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[$A-Za-z_]\w*)"
-                r"(?:\s*:\s*[^=]+)?\s*=\s*(?:async\s+)?(?:\([^;{}]*\)|[$A-Za-z_]\w*)"
+                r"(?:\s*:\s*[^=]+)?\s*=\s*(?:async\s+)?"
+                r"(?:\((?:[^;(){}]|\{[^;(){}]*\})*\)|[$A-Za-z_]\w*)"
                 r"\s*=>\s*\{"
             ),
             re.compile(
                 r"(?m)^\s*(?:(?:public|private|protected|static|async|abstract|override|readonly)\s+)*"
-                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*\([^;{}]*\)\s*"
+                r"(?P<name>[$A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*"
+                r"\((?:[^;(){}]|\{[^;(){}]*\})*\)\s*"
                 r"(?:\:\s*[^={]+)?\{"
             ),
         )
@@ -906,7 +968,9 @@ def _extract_polyglot_lexical(
 ) -> FileExtraction:
     """Extract donor-proven structural surfaces for six brace languages."""
 
-    masked = _mask_c_family_non_code(text)
+    masked = _mask_c_family_non_code(
+        text, javascript_regex_literals=language in {"javascript", "typescript"},
+    )
     line_count = max(1, text.count("\n") + 1)
     entities: list[Entity] = [Entity(
         kind="module", name=rel, qualname=rel, file_path=rel,
