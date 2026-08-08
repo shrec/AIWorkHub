@@ -123,6 +123,27 @@ def test_retrieval_eval_measures_wrapper_rank(tmp_path: Path) -> None:
     assert report["mrr"] == 0.5
 
 
+def test_retrieval_eval_distinguishes_missing_from_invalid_registry(tmp_path: Path) -> None:
+    missing = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {},
+    )
+    assert missing["status"] == "not_configured"
+    assert missing["configured"] is False
+    assert missing["reason"].startswith("retrieval_registry_missing:")
+
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text("{not-json}\n", encoding="utf-8")
+    invalid = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {},
+    )
+    assert invalid["status"] == "configuration_invalid"
+    assert invalid["configured"] is True
+    assert invalid["repair_hint"]
+
+
 def test_ab_report_excludes_unobserved_and_measures_complete_pair(tmp_path: Path) -> None:
     path = tmp_path / ".aiworkhub/prompt-ab-canary.jsonl"
     path.parent.mkdir()

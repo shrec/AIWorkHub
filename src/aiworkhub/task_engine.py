@@ -232,13 +232,20 @@ def record_launch_blocker(
     operational blocker instead of looping or reporting an empty blocker map.
     """
     command = ["launch-blocked", task_id, "--runner", runner]
+    # A launch blocker is a narrower card-scoped write than claim-start. It is
+    # authorized only for this exact pending/unclaimed card, including legacy
+    # cards incorrectly owned by the coordinator runner; it never grants that
+    # runner claim/review/usage authority and has no coordinator token-file
+    # dependency.
     blocked = core._canonical_write_gate(
-        "claim-start", runner=runner, topic=topic, task_id=task_id
+        "launch-blocked",
+        runner=runner,
+        topic=topic,
+        task_id=task_id,
     )
     if blocked is not None:
-        # The gate checks the same narrow claim-start authority, but callers
-        # are performing a distinct launch-blocker write. Preserve the exact
-        # denial while reporting the operation they actually requested.
+        # Preserve the card-gate denial while reporting the operation the
+        # launcher actually requested.
         return {**blocked, "command": command}
     now = datetime.now(timezone.utc).isoformat()
     try:

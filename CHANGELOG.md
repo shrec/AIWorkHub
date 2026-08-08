@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.23] - 2026-08-08
+
+### Fixed
+
+- Workforce ranking now returns one directly executable `launch_contract`
+  containing the exact worker runner, adapter and model, so managers no longer
+  reuse the reserved `codex` coordinator identity for worker cards.
+- Task creation rejects the exact coordinator runner before provider or
+  workspace work begins, and legacy misuse now fails with a focused launcher
+  diagnostic instead of the lower-level `card_scoped_codex_forbidden` error.
+- Pre-claim launch blockers are persisted through coordinator authority while
+  retaining exact card runner/topic checks; an invalid worker identity can no
+  longer suppress its own operational blocker receipt.
+- Source Graph retrieval evaluation now distinguishes a missing registry
+  (`not_configured`) from a present malformed registry
+  (`configuration_invalid`) and returns an actionable repair hint.
+
+### Tests
+
+- Added coordinator/worker identity, executable workforce receipt, legacy
+  blocker persistence and retrieval-registry diagnostics regressions. The full
+  Python suite passes with 2,523 tests and 28 environment-specific skips; the
+  VS Code extension suite also passes.
+
 ## [0.9.22] - 2026-08-08
 
 ### Fixed

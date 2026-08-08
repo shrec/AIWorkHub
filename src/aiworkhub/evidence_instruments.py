@@ -241,6 +241,16 @@ def source_graph_retrieval_eval(
     """Measure precision@k and reciprocal rank through a supplied wrapper."""
 
     root = Path(repo_root).resolve()
+    candidate = _regular(root, registry_path, must_exist=False)
+    if not candidate.exists() and not candidate.is_symlink():
+        return {
+            "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
+            "status": "not_configured",
+            "configured": False,
+            "measured": False,
+            "reason": f"retrieval_registry_missing:{registry_path}",
+            "cases": [],
+        }
     try:
         document = json.loads(_regular(root, registry_path).read_text(encoding="utf-8"))
         cases = document.get("cases") if isinstance(document, Mapping) else None
@@ -249,9 +259,14 @@ def source_graph_retrieval_eval(
     except (OSError, UnicodeError, json.JSONDecodeError, EvidenceInstrumentError) as exc:
         return {
             "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
-            "status": "not_configured",
+            "status": "configuration_invalid",
+            "configured": True,
             "measured": False,
             "reason": str(exc),
+            "repair_hint": (
+                "Replace the registry with a regular UTF-8 JSON file containing "
+                "a non-empty cases array, or remove it to declare evaluation unconfigured."
+            ),
             "cases": [],
         }
     rows: list[dict[str, Any]] = []
@@ -285,6 +300,7 @@ def source_graph_retrieval_eval(
     return {
         "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
         "status": "measured" if measured else "inconclusive",
+        "configured": True,
         "measured": measured,
         "case_count": len(rows),
         "precision_at_k": round(sum(row["precision_at_k"] for row in rows) / len(rows), 6) if rows else None,

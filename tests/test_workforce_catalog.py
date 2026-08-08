@@ -166,8 +166,25 @@ def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path
     )
     decision = workforce_catalog.rank_task(root, task, catalog={"workers": workers})
     assert decision["selected_worker_id"] == "b"
+    assert decision["selected_execution_runner"] == "codex_b"
+    assert decision["launch_contract"] == {
+        "runner": "codex_b",
+        "adapter_id": "codex_cli",
+        "model": "b",
+        "task_id": "T",
+        "identity_rule": "use_same_runner_for_task_create_and_agent_launch_task",
+    }
     by_id = {item["worker_id"]: item for item in decision["candidates"]}
+    assert by_id["a"]["execution_runner"] == "codex_a"
+    assert by_id["b"]["execution_runner"] == "codex_b"
     assert by_id["b"]["score_components"]["manager_adjusted_success_rate"] > by_id["a"]["score_components"]["manager_adjusted_success_rate"]
+
+
+def test_execution_runner_is_stable_and_never_uses_manager_identity() -> None:
+    assert workforce_catalog.execution_runner("glm-5.2", "glm_vscode_lm") == "glm_5.2"
+    assert workforce_catalog.execution_runner("deepseek-v4-pro", "deepseek_vscode_lm") == "deepseek_v4-pro"
+    assert workforce_catalog.execution_runner("gpt-5.5", "codex_cli") == "codex_gpt-5.5"
+    assert workforce_catalog.execution_runner("any", "vscode_lm") == "copilot_any"
 
 
 def test_deepseek_uses_launchable_copilot_fallback_without_identity_drift(

@@ -40,7 +40,7 @@ enough for a public claim.
 | Compact replay | Authenticates original, returned and avoided bytes for repeated results | provider-token savings stays `null` |
 | Receipt conformance | Checks HMAC, call arithmetic, stage/mode alignment, generation identity and replay arithmetic | tampering or structural drift fails |
 | Review evidence audit | Rehashes candidate paths and rechecks required-output sizes before promotion | missing/mismatched reference blocks acceptance |
-| Retrieval evaluation | Runs registered golden queries through the wrapper and computes precision@k/MRR | missing corpus is `not_configured` |
+| Retrieval evaluation | Runs registered golden queries through the wrapper and computes precision@k/MRR | missing registry is `not_configured`; a present malformed registry is `configuration_invalid` with a repair hint |
 | Contract consistency | Compares generated provider projections and worker runtime policy clauses | drift fails |
 | Tool discipline | Reports zero hits, failures, repeated query identities and ordering anomalies | observational only; no completion claim |
 | Session token profile | Reconciles provider-observed token/cache fields with separately labelled prompt byte sections | no byte-to-token conversion |

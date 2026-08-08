@@ -7,6 +7,7 @@ joined at read time, with missing observations labeled explicitly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,42 @@ AUDIT_RELATIVE_PATH = Path(".aiworkhub/config/workforce.audit.jsonl")
 MAX_CATALOG_BYTES = 256 * 1024
 MAX_WORKERS = 64
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def execution_runner(worker_id: str, adapter_id: str) -> str:
+    """Return the stable worker identity used by create+launch receipts.
+
+    Workforce selection used to return adapter/model without the third exact
+    identity required by task creation and launch.  Managers consequently
+    reused their own ``codex`` identity, which preflight accepted but the
+    card-scoped claim gate correctly rejected.  Keep the identity derived and
+    deterministic so the rank receipt is directly executable.
+    """
+
+    family = {
+        "claude_cli": "claude",
+        "codex_cli": "codex",
+        "deepseek_vscode_lm": "deepseek",
+        "deepseek_copilot_cli": "deepseek",
+        "deepseek_manual": "deepseek",
+        "glm_vscode_lm": "glm",
+        "glm_copilot_cli": "glm",
+        "vscode_lm": "copilot",
+    }.get(str(adapter_id).strip(), "worker")
+    slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(worker_id).strip()).strip("_.:-")
+    remainder = slug
+    for separator in ("_", "-", ".", ":"):
+        prefix = family + separator
+        if slug.casefold().startswith(prefix.casefold()):
+            remainder = slug[len(prefix) :]
+            break
+    candidate = f"{family}_{remainder or slug}"
+    if len(candidate) <= 128 and _TOKEN_RE.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(
+        f"{worker_id}\0{adapter_id}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{candidate[:115].rstrip('_.:-')}_{digest}"
 
 # Keep the declared worker/provider/model identity stable while allowing an
 # equivalent launch transport when the preferred VS Code LM surface is not
@@ -446,6 +483,9 @@ def build_catalog(
         effective_score = max(0.0, min(100.0, (observed_score if observed_score is not None else 50.0) + worker["manager_score_adjustment"]))
         access_observed = bool(adapter_ready.get("access_observed"))
         rows.append({
+            "execution_runner": execution_runner(
+                worker["worker_id"], effective_adapter
+            ),
             **worker,
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
@@ -536,7 +576,38 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
                 sample_count=int(outcomes.get("sample_count") or 0),
             ),
         ))
-    return workforce_router.rank_workforce(task, workers).as_dict()
+    decision = workforce_router.rank_workforce(task, workers).as_dict()
+    by_worker = {
+        str(item.get("worker_id") or ""): item
+        for item in snapshot.get("workers") or []
+        if isinstance(item, Mapping)
+    }
+    for candidate in decision.get("candidates") or []:
+        item = by_worker.get(str(candidate.get("worker_id") or ""), {})
+        candidate["execution_runner"] = execution_runner(
+            str(candidate.get("worker_id") or ""),
+            str(candidate.get("adapter_id") or item.get("effective_adapter_id") or item.get("adapter_id") or ""),
+        )
+    selected_worker_id = str(decision.get("selected_worker_id") or "")
+    selected_runner = ""
+    if selected_worker_id:
+        selected_runner = execution_runner(
+            selected_worker_id,
+            str(decision.get("selected_adapter_id") or ""),
+        )
+    decision["selected_execution_runner"] = selected_runner or None
+    decision["launch_contract"] = (
+        {
+            "runner": selected_runner,
+            "adapter_id": decision.get("selected_adapter_id"),
+            "model": decision.get("selected_model"),
+            "task_id": task.task_id,
+            "identity_rule": "use_same_runner_for_task_create_and_agent_launch_task",
+        }
+        if selected_runner
+        else None
+    )
+    return decision
 
 
-__all__ = ["AUDIT_RELATIVE_PATH", "CATALOG_RELATIVE_PATH", "DEFAULT_WORKERS", "SCHEMA_ID", "WorkforceCatalogError", "build_catalog", "catalog_path", "ensure_catalog", "load_catalog", "rank_task", "upsert_worker", "validate_catalog"]
+__all__ = ["AUDIT_RELATIVE_PATH", "CATALOG_RELATIVE_PATH", "DEFAULT_WORKERS", "SCHEMA_ID", "WorkforceCatalogError", "build_catalog", "catalog_path", "ensure_catalog", "execution_runner", "load_catalog", "rank_task", "upsert_worker", "validate_catalog"]

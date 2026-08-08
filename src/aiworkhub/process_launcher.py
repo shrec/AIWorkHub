@@ -2026,6 +2026,8 @@ def _external_readonly_dirs(
 
 
 def _validate_adapter_identity(runner: str, adapter_id: str) -> None:
+    if runner == core.CODEX_RUNNER:
+        raise LaunchRejected("coordinator_runner_cannot_launch_worker")
     if runner.startswith("claude_"):
         allowed: tuple[str, ...] = ("vscode_lm", "claude_cli")
     elif runner.startswith("codex_"):

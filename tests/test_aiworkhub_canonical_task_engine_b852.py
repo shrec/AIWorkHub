@@ -572,6 +572,82 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
     assert "title" in duplicate["conflict_fields"]
 
 
+def test_manager_create_rejects_coordinator_identity_as_worker_runner(
+    writable_repo, monkeypatch,
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+    result = core.create_task(
+        task_id="TASK_MANAGER_AS_WORKER_REJECTED",
+        title="Reject coordinator worker identity",
+        runner="codex",
+        topic="coding",
+        objective="Fail before a provider or workspace is started.",
+        acceptance=["clear runner guidance"],
+        allowed_writes=[],
+        read_only=True,
+        task_type="research",
+    )
+    assert result["ok"] is False
+    assert "worker_runner_required:coordinator_codex_forbidden" in result["stderr"]
+    assert "launch_contract.runner" in result["contract_hint"]
+
+
+def test_legacy_codex_card_identical_retry_still_reconciles(
+    writable_repo, monkeypatch,
+):
+    monkeypatch.setattr(
+        core,
+        "_claude_manager_identity",
+        lambda: {
+            "provider": "claude",
+            "session_id": "5be44029-03da-4683-aae3-c68ecb07b1a4",
+            "window_id": "claude_vscode_123",
+        },
+    )
+    kwargs = {
+        "task_id": "TASK_LEGACY_CODEX_RECONCILE",
+        "title": "Reconcile legacy coordinator-owned card",
+        "runner": "codex_worker",
+        "topic": "coding",
+        "objective": "Preserve lost-ack idempotency across the stricter create gate.",
+        "acceptance": ["identical retry reconciles"],
+        "allowed_writes": [],
+        "read_only": True,
+        "task_type": "research",
+    }
+    assert core.create_task(**kwargs)["ok"] is True
+    readiness = task_store.storage_readiness(writable_repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        raw = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?",
+            (kwargs["task_id"],),
+        ).fetchone()[0]
+        card = json.loads(raw)
+        card["runner"] = "codex"
+        conn.execute(
+            "UPDATE tasks SET runner=?, card_json=? WHERE task_id=?",
+            ("codex", json.dumps(card, ensure_ascii=False), kwargs["task_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    kwargs["runner"] = "codex"
+    reconciled = core.create_task(**kwargs)
+    assert reconciled["ok"] is True, reconciled
+    assert reconciled["created"] is False
+    assert reconciled["receipt_state"] == "existing_identical"
+
+
 def test_manager_create_exposes_required_output_exceptions_and_reconciles(
     writable_repo, monkeypatch
 ):

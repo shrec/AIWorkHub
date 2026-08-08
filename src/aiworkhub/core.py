@@ -1883,7 +1883,7 @@ def run_taskctl(
 
 
 def _task_id_from_write_args(args: list[str]) -> str | None:
-    if not args or args[0] not in {"claim-start", "review", "usage"}:
+    if not args or args[0] not in {"claim-start", "launch-blocked", "review", "usage"}:
         return None
     if len(args) < 2:
         return None
@@ -1898,9 +1898,9 @@ def _check_card_scoped_write_authority(
 ) -> dict[str, Any]:
     """Allow exact one-off card owners without widening the static matrix."""
     action = args[0] if args else ""
-    if action not in {"claim-start", "review", "usage"}:
+    if action not in {"claim-start", "launch-blocked", "review", "usage"}:
         return {"allowed": False, "reason": f"card_scoped_action_not_allowed:{action}"}
-    if runner == CODEX_RUNNER:
+    if runner == CODEX_RUNNER and action != "launch-blocked":
         return {"allowed": False, "reason": "card_scoped_codex_forbidden"}
     if runner is None or topic is None:
         return {"allowed": False, "reason": "runner_and_topic_required_for_card_scoped_authority"}
@@ -1924,6 +1924,14 @@ def _check_card_scoped_write_authority(
         return {"allowed": False, "reason": "card_scoped_identity_mismatch"}
     claimed_by = str(card.get("claimed_by") or "")
     lifecycle = _lifecycle_state(card)
+    if action == "launch-blocked":
+        worker_status = str(card.get("worker_status") or "unclaimed")
+        if lifecycle == "pending" and worker_status == "unclaimed" and not claimed_by:
+            return {"allowed": True, "reason": "card_scoped_launch_blocker_allowed"}
+        return {
+            "allowed": False,
+            "reason": f"card_scoped_launch_blocker_ineligible:{lifecycle}",
+        }
     if action == "claim-start":
         worker_status = str(card.get("worker_status") or "unclaimed")
         if lifecycle == "pending" and worker_status == "unclaimed" and not claimed_by:
@@ -3072,6 +3080,7 @@ def create_task(
         return _lifecycle_error("invalid_task_id", 2)
     if not _TASK_IDENTITY_RE.fullmatch(runner) or not _TASK_IDENTITY_RE.fullmatch(topic):
         return _lifecycle_error("invalid_runner_or_topic", 2)
+    coordinator_worker_runner = runner == CODEX_RUNNER
     if not title or len(title) > 300 or not objective or len(objective) > 4000:
         return _lifecycle_error("invalid_title_or_objective", 2)
     if priority not in ("low", "normal", "high", "critical"):
@@ -3495,6 +3504,20 @@ def create_task(
         if existing_row is not None:
             conn.rollback()
             return reconcile_existing(existing_row["card_json"])
+        if coordinator_worker_runner:
+            conn.rollback()
+            result = _lifecycle_error(
+                "worker_runner_required:coordinator_codex_forbidden", 2
+            )
+            result.update({
+                "received_runner": runner,
+                "contract_hint": (
+                    "Use the selected workforce decision's launch_contract.runner for both "
+                    "task_create and agent_launch_task. The exact runner 'codex' is the "
+                    "manager identity and cannot own or claim worker cards."
+                ),
+            })
+            return result
         if depends_on2:
             existing_cards: dict[str, dict[str, Any]] = {}
             for row in conn.execute("SELECT task_id, card_json FROM tasks"):

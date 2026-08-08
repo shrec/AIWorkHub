@@ -315,6 +315,53 @@ def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_pat
     assert "operational_blocker" not in retried_card
 
 
+def test_preclaim_blocker_uses_coordinator_authority_for_legacy_codex_card(
+    tmp_path, monkeypatch,
+):
+    repo = _repo(tmp_path, monkeypatch)
+    _insert(repo, "TASK_LEGACY_CODEX_BLOCKER")
+    readiness = task_store.storage_readiness(repo)
+    conn = sqlite3.connect(readiness.canonical_db)
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?",
+            ("TASK_LEGACY_CODEX_BLOCKER",),
+        ).fetchone()
+        card = json.loads(row[0])
+        card["runner"] = "codex"
+        conn.execute(
+            "UPDATE tasks SET runner=?, card_json=? WHERE task_id=?",
+            ("codex", json.dumps(card, ensure_ascii=False, sort_keys=True), "TASK_LEGACY_CODEX_BLOCKER"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    denied_claim = task_engine.claim_start_exact(
+        repo,
+        "TASK_LEGACY_CODEX_BLOCKER",
+        "codex",
+        TOPIC,
+        request_id="must-not-claim",
+    )
+    assert denied_claim["ok"] is False
+    assert "card_scoped_codex_forbidden" in denied_claim["stderr"]
+
+    recorded = task_engine.record_launch_blocker(
+        repo,
+        "TASK_LEGACY_CODEX_BLOCKER",
+        "codex",
+        TOPIC,
+        adapter_id="glm_vscode_lm",
+        reason="coordinator_runner_cannot_launch_worker",
+    )
+    assert recorded["ok"] is True, recorded
+    card = task_store.get_task(repo, "TASK_LEGACY_CODEX_BLOCKER") or {}
+    assert card["status"] == "pending"
+    assert card["worker_status"] == "unclaimed"
+    assert card["operational_blocker"]["reason"] == "coordinator_runner_cannot_launch_worker"
+
+
 def test_preclaim_launch_blocker_gate_denial_reports_exact_operation(tmp_path, monkeypatch):
     repo = _repo(tmp_path, monkeypatch)
     _insert(repo, "TASK_BLOCKER_GATE")

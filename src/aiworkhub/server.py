@@ -790,6 +790,10 @@ def aiworkhub_task_create(
     ``read_only=True`` is required for a task that intentionally declares
     both ``allowed_writes=[]`` and ``required_outputs=[]``. Read-only intent is
     never inferred from missing output authority.
+    ``runner`` is the worker execution identity returned by
+    ``aiworkhub_manager_workforce_rank.launch_contract.runner``. The exact
+    value ``codex`` is reserved for the verified manager and is rejected for
+    worker cards.
     """
 
     return core.create_task(
@@ -1735,6 +1739,8 @@ def aiworkhub_agent_launch_task(
     AIWORKHUB_ALLOW_WRITES=1. The task card, runner, topic, pending state,
     allowed-write scope, collision guard, adapter, and process limit are all
     validated before a shell-free child process can start.
+    Use the exact ``launch_contract`` returned by workforce ranking; the
+    manager identity ``codex`` is never a worker runner.
     """
 
     core.scrub_coordinator_capability_from_environment()

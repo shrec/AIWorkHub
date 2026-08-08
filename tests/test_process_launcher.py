@@ -293,6 +293,14 @@ def test_runner_adapter_family_must_match(monkeypatch, tmp_path):
     assert "runner_adapter_mismatch" in result["blocked_reason"]
 
 
+def test_coordinator_runner_is_never_accepted_as_worker_identity() -> None:
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="coordinator_runner_cannot_launch_worker",
+    ):
+        process_launcher._validate_adapter_identity("codex", "glm_vscode_lm")
+
+
 def test_real_shell_free_process_reaches_review_ready(monkeypatch, tmp_path):
     _open_gates(monkeypatch)
     marker = tmp_path / "review.marker"
