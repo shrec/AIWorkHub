@@ -226,6 +226,59 @@ def test_mark_terminal_review_allows_launch_failed_from_pending(tmp_path: Path) 
     assert card["terminal_substatus"] == "launch_failed"
 
 
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"status": "superseded", "worker_status": "unclaimed"}, "superseded"),
+        ({"status": "pending", "worker_status": "superseded"}, "superseded"),
+        (
+            {
+                "archived_at": "2026-08-08T00:00:00Z",
+                "status": "superseded",
+                "worker_status": "superseded",
+            },
+            "archived",
+        ),
+        ({"status": "finished", "worker_status": "superseded"}, "finished"),
+        ({"status": "superseded", "worker_status": "deferred"}, "blocked"),
+        ({"status": "superseded", "worker_status": "ready_for_review"}, "review"),
+        ({"status": "superseded", "worker_status": "claimed"}, "processing"),
+    ],
+)
+def test_canonical_status_preserves_superseded_and_existing_precedence(
+    row: dict[str, str], expected: str
+) -> None:
+    assert task_store.canonical_status(row) == expected
+
+
+def test_get_task_and_list_task_cards_preserve_superseded_status(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_id = "TASK_SUPERSEDED_REVIEWER"
+    _insert_task(repo, task_id, status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE tasks SET status = ?, worker_status = ? WHERE task_id = ?",
+            ("superseded", "superseded", task_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    detail = task_store.get_task(repo, task_id)
+    listed = {
+        card["task_id"]: card for card in task_store.list_task_cards(repo, limit=10)
+    }[task_id]
+
+    assert detail is not None
+    assert detail["status"] == "superseded"
+    assert listed["status"] == "superseded"
+
+
 def test_mark_terminal_review_rejects_illegal_regression_to_pending_from_review(
     tmp_path: Path,
 ) -> None:

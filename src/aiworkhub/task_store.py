@@ -561,7 +561,18 @@ def _upgrade_compatible_schema(path: Path) -> bool:
 
 def canonical_status(row: Mapping[str, Any]) -> str:
     """Compact lifecycle state, mirroring AITools/taskdb.py::canonical_status
-    but implemented independently -- this module never imports that one."""
+    but implemented independently -- this module never imports that one.
+
+    ``superseded`` is a durable reviewer lifecycle state: a reviewer has
+    declared this task displaced by another canonical task.  It must be
+    projected as its own public state rather than collapsed back onto
+    ``pending`` so reviewer-child disposition truth survives.
+
+    Precedence is intentionally unchanged for the existing public
+    archived/finished/blocked/review/processing states; ``superseded``
+    slots strictly between ``processing`` and the ``pending`` fallback so
+    those five keep their established ordering.
+    """
     if str(row.get("archived_at") or "").strip():
         return "archived"
     status = str(row.get("status") or "").strip().lower()
@@ -579,6 +590,8 @@ def canonical_status(row: Mapping[str, Any]) -> str:
         return "review"
     if status in {"processing", "in_progress"} or worker_status in {"claimed", "in_progress"}:
         return "processing"
+    if status == "superseded" or worker_status == "superseded":
+        return "superseded"
     return "pending"
 
 

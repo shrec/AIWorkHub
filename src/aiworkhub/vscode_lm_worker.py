@@ -39,10 +39,12 @@ def _load_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, An
 
 def _strip_fence(text: str) -> str:
     value = text.strip()
-    if value.startswith("```") and value.endswith("```"):
+    open_run = len(value) - len(value.lstrip("`"))
+    close_run = len(value) - len(value.rstrip("`"))
+    if open_run >= 3 and close_run >= 3 and open_run == close_run:
         first_newline = value.find("\n")
         if first_newline >= 0:
-            value = value[first_newline + 1 : -3].strip()
+            value = value[first_newline + 1 : len(value) - close_run].strip()
     return value
 
 
@@ -51,7 +53,12 @@ def _relative_path(raw: Any) -> str:
         raise RuntimeError("bridge_output_path_invalid")
     value = raw.strip().replace("\\", "/")
     path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git":
+    if (
+        path.is_absolute()
+        or not path.parts
+        or ".." in path.parts
+        or any(part.lower() == ".git" for part in path.parts)
+    ):
         raise RuntimeError(f"bridge_output_path_escape:{value}")
     return path.as_posix()
 
@@ -61,6 +68,7 @@ def _matches(path: str, patterns: list[str]) -> bool:
 
 
 def _write_atomic(workspace: Path, relative: str, content: str) -> None:
+    relative = _relative_path(relative)
     workspace = workspace.resolve()
     lexical_target = workspace / relative
     cursor = workspace
@@ -73,38 +81,29 @@ def _write_atomic(workspace: Path, relative: str, content: str) -> None:
         raise RuntimeError(f"bridge_output_path_escape:{relative}")
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    # Root outputs use a no-follow file descriptor instead of creating a
-    # sibling temporary file, which would also require repository-root
-    # directory mutation rights next to the detached worktree's .git metadata.
-    # Nested outputs keep the atomic replacement path because their bounded
-    # parent directory is writable.
-    if target.parent == workspace:
-        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= os.O_TRUNC if target.exists() else os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(target, flags, 0o600)
+    existing_mode = None
+    if target.exists():
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        finally:
-            os.close(fd)
-        return
+            existing_mode = target.stat().st_mode & 0o777
+        except OSError:
+            existing_mode = None
 
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
-        # ``mkstemp`` creates the file with owner-only permissions (0600).
-        # Do not call fchmod here: isolated workers deliberately run under a
-        # seccomp profile that rejects metadata-changing syscalls, including
-        # fchmod.  The redundant chmod therefore made a valid GLM response
-        # fail with EPERM before its first allowed output could be written.
         with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.close(fd)
+        closing_fd = fd
         fd = -1
+        os.close(closing_fd)
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp_name, existing_mode)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"bridge_output_chmod_failed:{relative}"
+                ) from exc
         os.replace(tmp_name, target)
     finally:
         if fd >= 0:
@@ -287,25 +286,81 @@ def _v3_planned_outputs(
 
     edits = edit.get("edits", [])
     creates = edit.get("creates", [])
+    for key in ("deletes", "files", "replacements"):
+        if key in edit and edit.get(key) is not None:
+            raise RuntimeError(f"vscode_lm_edit_response_unsupported_top_level:{key}")
     _validate_v2_counts(edits, creates)
     planned: list[tuple[str, str]] = []
     metrics: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for item in edits:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for idx, item in enumerate(edits):
         if not isinstance(item, dict):
             raise RuntimeError("vscode_lm_semantic_edit_invalid")
         relative = _validate_allowed_path(item.get("path"), allowed)
-        if relative in seen:
-            raise RuntimeError(f"vscode_lm_edit_response_duplicate_path:{relative}")
-        seen.add(relative)
         expected_hash = _require_sha256(item.get("current_sha256"), relative)
         ranges = item.get("ranges")
-        if not isinstance(ranges, list):
+        if not isinstance(ranges, list) or not ranges:
             raise RuntimeError(f"vscode_lm_semantic_edit_ranges_invalid:{relative}")
+        range_sources = []
+        for range_idx, range_item in enumerate(ranges):
+            if not isinstance(range_item, dict):
+                raise RuntimeError(f"vscode_lm_semantic_edit_ranges_invalid:{relative}")
+            start = range_item.get("start_line")
+            end = range_item.get("end_line")
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+            ):
+                raise RuntimeError(f"vscode_lm_semantic_edit_ranges_invalid:{relative}")
+            range_sources.append((start, end, idx, range_idx))
+        if relative not in groups:
+            groups[relative] = {
+                "hash": expected_hash,
+                "ranges": [],
+                "range_sources": [],
+                "first_idx": idx,
+                "entry_count": 0,
+            }
+            order.append(relative)
+            seen.add(relative)
+        else:
+            group = groups[relative]
+            if group["hash"] != expected_hash:
+                raise RuntimeError(
+                    f"vscode_lm_edit_response_hash_conflict:{relative}:"
+                    f"entry_index1={group['first_idx']}:entry_index2={idx}"
+                )
+        groups[relative]["ranges"].extend(ranges)
+        groups[relative]["range_sources"].extend(range_sources)
+        groups[relative]["entry_count"] += 1
+
+    for relative in order:
+        group = groups[relative]
+        expected_hash = group["hash"]
+        ranges = group["ranges"]
+        ordered_sources = sorted(
+            group["range_sources"],
+            key=lambda value: (value[0], value[1], value[2], value[3]),
+        )
+        for previous, current in zip(ordered_sources, ordered_sources[1:]):
+            if current[0] <= previous[1]:
+                raise RuntimeError(
+                    f"vscode_lm_semantic_edit_rejected:{relative}:"
+                    f"entry_index1={previous[2]}:range_index1={previous[3]}:"
+                    f"entry_index2={current[2]}:range_index2={current[3]}:"
+                    f"semantic_edit_ranges_overlap:{previous[0]}-{previous[1]}:"
+                    f"{current[0]}-{current[1]}"
+        )
         target = _target_path(workspace, relative)
         if target.is_symlink() or not target.is_file():
-            raise RuntimeError(f"vscode_lm_edit_response_edit_target_invalid:{relative}")
+            raise RuntimeError(
+                f"vscode_lm_edit_response_edit_target_invalid:{relative}"
+            )
         current_bytes = target.read_bytes()
         if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
             raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
@@ -316,18 +371,27 @@ def _v3_planned_outputs(
                 f"vscode_lm_edit_response_current_utf8_invalid:{relative}"
             ) from exc
         try:
-            next_text, edit_metrics = semantic_edit.apply_line_ranges(current_text, ranges)
+            next_text, edit_metrics = semantic_edit.apply_line_ranges(
+                current_text, ranges
+            )
         except semantic_edit.SemanticEditError as exc:
-            raise RuntimeError(f"vscode_lm_semantic_edit_rejected:{relative}:{exc}") from exc
+            first_idx = group["first_idx"]
+            raise RuntimeError(
+                f"vscode_lm_semantic_edit_rejected:{relative}:"
+                f"entry_index1={first_idx}:{exc}"
+            ) from exc
+        next_bytes = next_text.encode("utf-8")
+        if len(next_bytes) > MAX_V2_FILE_BYTES:
+            raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
         planned.append((relative, next_text))
         metrics.append({
             "path": relative,
             "file_bytes": len(current_bytes),
+            "entry_index1": group["first_idx"],
+            "entry_count": group["entry_count"],
             **edit_metrics,
         })
 
-    # File creation necessarily needs complete content; it is not counted as
-    # a full-file rewrite of an existing source file.
     for item in creates:
         if not isinstance(item, dict) or not isinstance(item.get("content"), str):
             raise RuntimeError("vscode_lm_edit_response_create_invalid")
@@ -467,10 +531,42 @@ def run(spec_path: Path) -> dict[str, Any]:
         ) from exc
     # Scope-validate the complete response before the first mutation.  This
     # prevents a mixed valid/invalid model response from partially applying.
+    # Compute expected hash/bytes for every planned content *before* any
+    # write so that read-back verification never emits false evidence.
+    expected_content: dict[str, tuple[bytes, str, int]] = {}
+    for relative, content in planned:
+        content_bytes = content.encode("utf-8")
+        expected_content[relative] = (
+            content_bytes,
+            hashlib.sha256(content_bytes).hexdigest(),
+            len(content_bytes),
+        )
     written: list[str] = []
+    final_hashes: dict[str, str] = {}
+    final_sizes: dict[str, int] = {}
     for relative, content in planned:
         _write_atomic(workspace, relative, content)
+        readback_bytes = _target_path(workspace, relative).read_bytes()
+        exp_bytes, exp_hash, exp_size = expected_content[relative]
+        if readback_bytes != exp_bytes:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_write_readback_mismatch:"
+                f"{relative}:expected_sha256={exp_hash}:"
+                f"expected_bytes={exp_size}:"
+                f"actual_sha256="
+                f"{hashlib.sha256(readback_bytes).hexdigest()}:"
+                f"actual_bytes={len(readback_bytes)}"
+            )
         written.append(relative)
+        final_hashes[relative] = exp_hash
+        final_sizes[relative] = exp_size
+    for metric in semantic_metrics:
+        metric_path = metric.get("path")
+        if metric_path in final_hashes:
+            metric["final_sha256"] = final_hashes[metric_path]
+            metric["final_bytes"] = final_sizes[metric_path]
+        metric["apply_surface"] = "vscode_lm_worker_provider_side"
+        metric["mcp_receipt"] = None
     return {
         "type": "result",
         "subtype": "success",
