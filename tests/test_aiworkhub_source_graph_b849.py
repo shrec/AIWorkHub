@@ -78,6 +78,7 @@ def test_javascript_fallback_masks_regex_literals_before_matching_braces(
     # blank line because its anchored pattern uses ``\s*``.
     assert functions["glmTextToolProtocolPrompt"].line_start == 4
     assert functions["glmTextToolProtocolPrompt"].line_end == 7
+    assert "pathContracts = {}" in functions["glmTextToolProtocolPrompt"].signature
 
 
 # ---------------------------------------------------------------------------
