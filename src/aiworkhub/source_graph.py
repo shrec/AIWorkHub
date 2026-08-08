@@ -2454,16 +2454,14 @@ def index_file(repo_root: Path, path: str, expected_hash: str) -> dict[str, Any]
                 inserted_entities, inserted_edges = _write_extraction(
                     conn, extraction, file_size=file_size, mtime_ns=mtime_ns,
                 )
-            # Post-commit: cache buster so next index_quality snapshot
-            # reflects the generation, but preserve existing meta rows.
-            with conn:
                 conn.execute(
-                    "INSERT INTO meta(key, value) VALUES('single_file_last_index', ?) "
+                    "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (json.dumps({
                         "finished_at": _now_iso(),
                         "file_path": rel,
                         "source_hash": source_hash,
+                        "operation": "index",
                         "build_revision": BUILD_REVISION,
                     }),),
                 )
@@ -2506,6 +2504,16 @@ def remove_file(repo_root: Path, path: str) -> dict[str, Any]:
                     "SELECT COUNT(*) FROM entities WHERE file_path=?", (rel,)
                 ).fetchone()[0]
                 _invalidate_file(conn, rel)
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (json.dumps({
+                        "finished_at": _now_iso(),
+                        "file_path": rel,
+                        "operation": "remove",
+                        "build_revision": BUILD_REVISION,
+                    }),),
+                )
         finally:
             conn.close()
     return {

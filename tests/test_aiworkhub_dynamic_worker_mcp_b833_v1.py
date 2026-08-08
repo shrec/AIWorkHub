@@ -480,6 +480,62 @@ def test_source_graph_cache_is_invalidated_by_index_generation(
     assert len(calls) == 2
 
 
+def test_source_graph_identity_prefers_newest_single_file_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "source_graph.sqlite"
+    conn = source_graph_mod.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('last_build', ?)",
+                (json.dumps({
+                    "build_revision": "full.v1",
+                    "finished_at": "2026-08-01T00:00:00+00:00",
+                }),),
+            )
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('single_file_last_mutation', ?)",
+                (json.dumps({
+                    "build_revision": "single.v2",
+                    "finished_at": "2026-08-01T00:01:00+00:00",
+                    "file_path": "src/new.py",
+                    "operation": "index",
+                }),),
+            )
+    finally:
+        conn.close()
+
+    assert w._source_graph_index_identity(
+        db_path, default_revision="default",
+    ) == {
+        "build_revision": "single.v2",
+        "finished_at": "2026-08-01T00:01:00+00:00",
+    }
+
+
+def test_source_graph_identity_reads_legacy_single_file_index_marker(tmp_path: Path) -> None:
+    db_path = tmp_path / "source_graph.sqlite"
+    conn = source_graph_mod.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('single_file_last_index', ?)",
+                (json.dumps({
+                    "build_revision": "legacy.v1",
+                    "finished_at": "2026-07-31T23:59:00+00:00",
+                    "file_path": "src/legacy.py",
+                }),),
+            )
+    finally:
+        conn.close()
+
+    assert w._source_graph_index_identity(
+        db_path, default_revision="default",
+    ) == {
+        "build_revision": "legacy.v1",
+        "finished_at": "2026-07-31T23:59:00+00:00",
+    }
+
+
 def test_source_graph_evidence_counts_are_unique_and_structural() -> None:
     payload = {
         "matches": [

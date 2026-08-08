@@ -1,4 +1,4 @@
-"""NF15 single-file Source Graph maintenance API (26-case focused regression).
+"""NF15 single-file Source Graph maintenance API focused regression.
 
 Covers: index_file(repo_root, path, expected_hash),
 remove_file(repo_root, path), lexical symlink rejection before resolve,
@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from aiworkhub import source_graph as sg
+from aiworkhub import worker_ai_tools_mcp as worker_tools
 from aiworkhub.repository_state import bootstrap_repository
 
 
@@ -512,6 +513,126 @@ def test_index_file_and_remove_file_exported_exactly_once():
     assert sg.__all__.count("remove_file") == 1, (
         f"remove_file appears {sg.__all__.count('remove_file')} times in __all__"
     )
+
+
+def test_single_file_mutations_advance_query_cache_identity(tmp_path):
+    repo = _new_repo(tmp_path, "cache_identity")
+    db_path = sg.resolve_db_path(repo)
+    conn = sg.connect(db_path)
+    conn.close()
+    before = worker_tools._source_graph_index_identity(
+        db_path, default_revision=sg.BUILD_REVISION,
+    )
+
+    source = "def cache_visible():\n    return True\n"
+    _write(repo / "cache_visible.py", source)
+    sg.index_file(repo, "cache_visible.py", _sha256(source))
+    after_index = worker_tools._source_graph_index_identity(
+        db_path, default_revision=sg.BUILD_REVISION,
+    )
+    assert after_index["finished_at"] > before["finished_at"]
+
+    conn = sg.connect(db_path)
+    try:
+        payload = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert payload["operation"] == "index"
+    assert payload["file_path"] == "cache_visible.py"
+
+    with pytest.raises(sg.SourceGraphError, match="hash_mismatch"):
+        sg.index_file(repo, "cache_visible.py", "bad-hash")
+    after_rejection = worker_tools._source_graph_index_identity(
+        db_path, default_revision=sg.BUILD_REVISION,
+    )
+    assert after_rejection == after_index
+
+    sg.remove_file(repo, "cache_visible.py")
+    after_remove = worker_tools._source_graph_index_identity(
+        db_path, default_revision=sg.BUILD_REVISION,
+    )
+    assert after_remove["finished_at"] > after_index["finished_at"]
+
+    conn = sg.connect(db_path)
+    try:
+        payload = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    assert payload["operation"] == "remove"
+    assert payload["file_path"] == "cache_visible.py"
+
+
+def test_single_file_mutation_identity_is_repository_scoped(tmp_path):
+    repo_a = _new_repo(tmp_path, "cache_repo_a")
+    repo_b = _new_repo(tmp_path, "cache_repo_b")
+    db_a = sg.resolve_db_path(repo_a)
+    db_b = sg.resolve_db_path(repo_b)
+    for db_path in (db_a, db_b):
+        conn = sg.connect(db_path)
+        conn.close()
+
+    source_b = "def only_b():\n    return 'b'\n"
+    _write(repo_b / "only_b.py", source_b)
+    sg.index_file(repo_b, "only_b.py", _sha256(source_b))
+    identity_b = worker_tools._source_graph_index_identity(
+        db_b, default_revision=sg.BUILD_REVISION,
+    )
+
+    source_a = "def only_a():\n    return 'a'\n"
+    _write(repo_a / "only_a.py", source_a)
+    sg.index_file(repo_a, "only_a.py", _sha256(source_a))
+
+    assert worker_tools._source_graph_index_identity(
+        db_b, default_revision=sg.BUILD_REVISION,
+    ) == identity_b
+    assert worker_tools._source_graph_index_identity(
+        db_a, default_revision=sg.BUILD_REVISION,
+    )["finished_at"]
+
+
+def test_index_file_failure_rolls_back_rows_and_mutation_marker(tmp_path, monkeypatch):
+    repo = _new_repo(tmp_path, "cache_rollback")
+    original = "def stable():\n    return 1\n"
+    _write(repo / "stable.py", original)
+    sg.index_file(repo, "stable.py", _sha256(original))
+    db_path = sg.resolve_db_path(repo)
+
+    conn = sg.connect(db_path)
+    try:
+        original_file_hash = conn.execute(
+            "SELECT source_hash FROM files WHERE file_path='stable.py'"
+        ).fetchone()[0]
+        original_marker = conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    updated = "def stable():\n    return 2\n"
+    _write(repo / "stable.py", updated)
+
+    def fail_write(*args, **kwargs):
+        raise RuntimeError("synthetic_extraction_write_failure")
+
+    monkeypatch.setattr(sg, "_write_extraction", fail_write)
+    with pytest.raises(RuntimeError, match="synthetic_extraction_write_failure"):
+        sg.index_file(repo, "stable.py", _sha256(updated))
+
+    conn = sg.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT source_hash FROM files WHERE file_path='stable.py'"
+        ).fetchone()[0] == original_file_hash
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='single_file_last_mutation'"
+        ).fetchone()[0] == original_marker
+        assert _entity_count_for_file(conn, "stable.py") >= 1
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

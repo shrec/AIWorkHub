@@ -684,32 +684,45 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
 def _source_graph_index_identity(db_path: Path, *, default_revision: str) -> dict[str, str]:
     """Return bounded canonical index identity without exposing its path.
 
-    ``last_build.finished_at`` changes after every successful incremental
-    refresh, so it is also the cache-generation boundary.  A database created
-    by an older runtime may not have the row yet; that remains a truthful empty
-    timestamp rather than turning a supported query into a false failure.
+    Full refreshes advance ``last_build`` while successful exact-file
+    mutations advance ``single_file_last_mutation``.  Older runtimes used
+    ``single_file_last_index`` for the latter, so retain it as a read-only
+    compatibility source.  The newest valid timestamp is the repository-local
+    cache-generation boundary.  Missing or malformed rows remain a truthful
+    empty timestamp rather than turning a supported query into a false failure.
     """
 
     identity = {"build_revision": default_revision[:96], "finished_at": ""}
     try:
         conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            row = conn.execute("SELECT value FROM meta WHERE key='last_build'").fetchone()
+            rows = conn.execute(
+                "SELECT key, value FROM meta WHERE key IN "
+                "('last_build', 'single_file_last_mutation', 'single_file_last_index')"
+            ).fetchall()
         finally:
             conn.close()
     except (OSError, sqlite3.Error):
         return identity
-    if not row or not isinstance(row[0], str):
-        return identity
-    try:
-        payload = json.loads(row[0])
-    except json.JSONDecodeError:
-        return identity
-    if not isinstance(payload, dict):
-        return identity
-    revision = str(payload.get("build_revision") or default_revision)[:96]
-    finished_at = str(payload.get("finished_at") or "")[:64]
-    return {"build_revision": revision, "finished_at": finished_at}
+    for _key, value in rows:
+        if not isinstance(value, str):
+            continue
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        finished_at = str(payload.get("finished_at") or "")[:64]
+        if not finished_at or finished_at <= identity["finished_at"]:
+            continue
+        identity = {
+            "build_revision": str(
+                payload.get("build_revision") or default_revision
+            )[:96],
+            "finished_at": finished_at,
+        }
+    return identity
 
 
 def _source_graph_evidence_counts(value: Any) -> dict[str, int]:
