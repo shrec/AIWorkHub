@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.22] - 2026-08-08
+
+### Fixed
+
+- Quality-review child cards now leave actionable Review when their parent is
+  accepted: authenticated successful receipts finalize, redundant sibling
+  attempts become durably superseded, and immutable task/event history remains
+  available for audit.
+- Reviewer-child disposition now binds both the exact target task and target
+  request, preventing a receipt for an older candidate from being finalized by
+  a later parent decision.
+- Canonical task status preserves the durable `superseded` lifecycle instead of
+  projecting it back to `pending`.
+- VS Code LM multi-range semantic edits retain exact range fidelity and no
+  longer corrupt unrelated file regions during a focused replacement.
+- Dashboard telemetry separates actionable implementation reviews from
+  quality-review receipt rows while retaining the total review-ready count.
+
+### Tests
+
+- Added focused lifecycle, idempotence, request-binding, dashboard KPI, and
+  multi-range semantic-edit regressions; the full suite passes with 2,518 tests
+  and 28 environment-specific skips.
+
 ## [0.9.21] - 2026-08-08
 
 ### Fixed
