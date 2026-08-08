@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.24] - 2026-08-08
+
+### Fixed
+
+- Windows VS Code LM launches no longer apply POSIX `chmod` operations to
+  ACL-governed runtime paths, removing the pre-claim `WinError 5` failure
+  boundary while preserving owner-only POSIX modes on Linux and macOS.
+- The outer supervisor and inner worker now launch from the verified isolated
+  worktree on Windows instead of the drive root; POSIX sandbox cwd behavior is
+  unchanged.
+- Supervisor spawn failures now identify `child_spawn` versus
+  `job_assignment` without weakening mandatory Windows Job Object assignment.
+- VS Code LM bridge and worker runtime JSON writers use the same platform-aware
+  filesystem contract, including Unicode payloads.
+
+### Tests
+
+- Added deterministic Windows ACL/cwd/spawn-phase regressions. The focused
+  launcher suite passes with 71 tests, Ruff passes, and the full Python suite
+  passes with 2,535 tests and 28 environment-specific skips.
+
 ## [0.9.23] - 2026-08-08
 
 ### Fixed

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 try:
-    from .platform_io import atomic_replace, chmod_fd
+    from .platform_io import atomic_replace, chmod_fd, chmod_path
     from .provider_usage import live_total_tokens, read_provider_usage
     from .token_budget import (
         SampleKind,
@@ -29,7 +29,7 @@ try:
         supervisor_evidence,
     )
 except ImportError:  # direct-script entrypoint
-    from platform_io import atomic_replace
+    from platform_io import atomic_replace, chmod_path
     from provider_usage import live_total_tokens, read_provider_usage
     from token_budget import (  # type: ignore[no-redef]
         SampleKind,
@@ -145,7 +145,7 @@ class _WindowsKillOnCloseJob:
 
 def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    chmod_path(path.parent, 0o700)
     data = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(temp_name)
@@ -158,7 +158,7 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
         os.close(fd)
         fd = -1
         atomic_replace(temp, path)
-        os.chmod(path, 0o600)
+        chmod_path(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -167,7 +167,7 @@ def _write_json_0600(path: Path, payload: dict[str, Any]) -> None:
 
 def _open_0600(path: Path) -> BinaryIO:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    chmod_path(path.parent, 0o700)
     flags = os.O_CREAT | os.O_APPEND | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -460,6 +460,7 @@ def supervise(spec: dict[str, Any]) -> int:
     })
 
     try:
+        spawn_phase = "child_spawn"
         try:
             popen_kwargs: dict[str, Any] = {
                 "cwd": cwd,
@@ -476,6 +477,7 @@ def supervise(spec: dict[str, Any]) -> int:
                 popen_kwargs.update(_posix_worker_spawn_kwargs())
             child = subprocess.Popen(argv, **popen_kwargs)
             if windows_job is not None:
+                spawn_phase = "job_assignment"
                 windows_job.assign(child)
         except Exception as exc:
             if child is not None and child.poll() is None:
@@ -487,6 +489,7 @@ def supervise(spec: dict[str, Any]) -> int:
                 "state": "spawn_failed",
                 "supervisor_pid": supervisor_pid,
                 "exit_code": 126,
+                "spawn_phase": spawn_phase,
                 "error": f"{type(exc).__name__}:{exc}"[:500],
                 "started_at_epoch": started_epoch,
                 "finished_at_epoch": time.time(),

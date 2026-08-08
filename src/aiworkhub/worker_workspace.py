@@ -35,12 +35,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 try:
-    from .platform_io import chmod_fd
+    from .platform_io import chmod_fd, chmod_path
 except ImportError:  # direct-script Landlock entrypoint
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             fchmod(fd, mode)
+
+    def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
+        if os.name != "nt":
+            os.chmod(path, mode)
 
 
 def bubblewrap_home_env_value() -> str:
@@ -785,10 +789,10 @@ def validate_residual_contract(
 
 def _credential_home(home: Path, adapter_id: str, project_root: Path | None = None) -> None:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(home, 0o700)
+    chmod_path(home, 0o700)
     temp_home = home / "tmp"
     temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(temp_home, 0o700)
+    chmod_path(temp_home, 0o700)
     source_home = Path.home()
     if adapter_id == "claude_cli":
         source = source_home / ".claude" / ".credentials.json"
@@ -796,7 +800,7 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
             destination = home / ".claude" / ".credentials.json"
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             shutil.copyfile(source, destination)
-            os.chmod(destination, 0o600)
+            chmod_path(destination, 0o600)
         # Claude Code ignores the repository's permissions allowlist until the
         # project trust dialog has been accepted. Isolated workers have no TTY,
         # so a fresh minimal HOME would otherwise wait forever before the first
@@ -820,14 +824,14 @@ def _credential_home(home: Path, adapter_id: str, project_root: Path | None = No
                 + "\n",
                 encoding="utf-8",
             )
-            os.chmod(trust_config, 0o600)
+            chmod_path(trust_config, 0o600)
     elif adapter_id == "codex_cli":
         source = source_home / ".codex" / "auth.json"
         if source.is_file():
             destination = home / ".codex" / "auth.json"
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             shutil.copyfile(source, destination)
-            os.chmod(destination, 0o600)
+            chmod_path(destination, 0o600)
 
 
 def _load_repo_taskdb_module(repo: Path) -> Any:
@@ -883,7 +887,7 @@ def provision_isolated_task_queue_db(repo: Path, home: Path) -> Path:
     """
     destination = (home / TASK_QUEUE_ISOLATED_RELATIVE).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(destination.parent, 0o700)
+    chmod_path(destination.parent, 0o700)
     cards: list[dict[str, Any]] = []
     taskdb: Any = None
     try:
@@ -1072,7 +1076,7 @@ def create_workspace(
     if root == repo or repo in root.parents:
         raise WorkspaceError(f"worktree_root_inside_parent_repo:{root}")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(root, 0o700)
+    chmod_path(root, 0o700)
     path = root / request_id / "worktree"
     home = root / request_id / "home"
     if path == repo or repo in path.parents:
@@ -1631,7 +1635,7 @@ def promote(workspace: WorkerWorkspace, changed: Iterable[str]) -> list[str]:
         try:
             shutil.copyfile(source, temp)
             mode = stat.S_IMODE(source.stat().st_mode) & 0o777
-            os.chmod(temp, mode or 0o644)
+            chmod_path(temp, mode or 0o644)
             os.replace(temp, parent)
         finally:
             temp.unlink(missing_ok=True)
@@ -1675,10 +1679,10 @@ def sanitized_env(
         if os.name == "nt" or not verify_preprovisioned_home:
             selected_home = Path(home).resolve()
             selected_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(selected_home, 0o700)
+            chmod_path(selected_home, 0o700)
             temp_home = selected_home / "tmp"
             temp_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(temp_home, 0o700)
+            chmod_path(temp_home, 0o700)
         else:
             selected_home = _verify_owner_private_directory(
                 Path(home), "sanitized_home"
@@ -3819,7 +3823,7 @@ def unlink_if_regular(path: Path) -> None:
 
 def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    chmod_path(path.parent, 0o700)
     data = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp = Path(temp_name)
@@ -3832,7 +3836,7 @@ def write_json_0600(path: Path, payload: dict[str, Any]) -> None:
         os.close(fd)
         fd = -1
         os.replace(temp, path)
-        os.chmod(path, 0o600)
+        chmod_path(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)

@@ -24,12 +24,19 @@ from typing import Any, Iterable
 from . import repository_state
 from .source_graph import SOURCE_GRAPH_MODES
 try:
-    from .platform_io import chmod_fd
+    from .platform_io import chmod_fd, chmod_path, posix_path_modes_supported
 except ImportError:  # pragma: no cover - standalone compatibility
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             fchmod(fd, mode)
+
+    def posix_path_modes_supported() -> bool:
+        return os.name != "nt"
+
+    def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
+        if posix_path_modes_supported():
+            os.chmod(path, mode)
 
 
 REQUEST_SCHEMA_ID = "aiworkhub.vscode_lm.request.v1"
@@ -134,8 +141,11 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     # Some secure validation sandboxes deny chmod/fchmod syscalls even when
     # the freshly-created object already has the required owner-only mode.
     # Avoid the redundant syscall, but still fail closed for a broader mode.
-    if path.parent.stat().st_mode & 0o777 != 0o700:
-        os.chmod(path.parent, 0o700)
+    if (
+        posix_path_modes_supported()
+        and path.parent.stat().st_mode & 0o777 != 0o700
+    ):
+        chmod_path(path.parent, 0o700)
     parent_stat = os.stat(path.parent)
     parent_dev, parent_ino = parent_stat.st_dev, parent_stat.st_ino
     encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
@@ -171,7 +181,10 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         verify_fd = os.open(path, open_flags)
         try:
             final_stat = os.fstat(verify_fd)
-            if final_stat.st_mode & 0o777 != 0o600:
+            if (
+                posix_path_modes_supported()
+                and final_stat.st_mode & 0o777 != 0o600
+            ):
                 chmod_fd(verify_fd, 0o600)
                 final_stat = os.fstat(verify_fd)
                 if final_stat.st_mode & 0o777 != 0o600:

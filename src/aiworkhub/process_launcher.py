@@ -39,7 +39,7 @@ from . import agent_tool_instructions
 from . import claude_auth
 from . import context_write_intents
 from . import context_writes
-from .platform_io import chmod_fd, lock_fd, unlock_fd
+from .platform_io import chmod_fd, chmod_path, lock_fd, unlock_fd
 from . import quality_evidence
 from . import process_event_ledger
 from . import provider_usage
@@ -792,7 +792,7 @@ def read_live_output_for_task(
 
 def _touch_0600(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    chmod_path(path.parent, 0o700)
     flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -801,6 +801,17 @@ def _touch_0600(path: Path) -> None:
         chmod_fd(fd, 0o600)
     finally:
         os.close(fd)
+
+
+def _worker_launch_cwd(workspace_path: Path) -> str:
+    """Return a real task directory on Windows while preserving POSIX root."""
+
+    if os.name != "nt":
+        return "/"
+    resolved = workspace_path.resolve()
+    if not resolved.is_dir():
+        raise LaunchRejected(f"windows_launch_cwd_unavailable:{resolved}")
+    return str(resolved)
 
 
 def _usage_from_output(
@@ -3517,7 +3528,7 @@ class ProcessManager:
                 ),
             }):
                 self.process_dir.mkdir(parents=True, exist_ok=True)
-                os.chmod(self.process_dir, 0o700)
+                chmod_path(self.process_dir, 0o700)
                 stdout_path = self.process_dir / f"{request_id}.stdout.log"
                 stderr_path = self.process_dir / f"{request_id}.stderr.log"
                 status_path = self.process_dir / f"{request_id}.supervisor.json"
@@ -3871,9 +3882,10 @@ class ProcessManager:
                     request_id=request_id,
                 )
                 launch_phase = "supervisor_spec"
+                launch_cwd = _worker_launch_cwd(workspace.path)
                 write_json_0600(spec_path, {
                     "argv": worker_argv,
-                    "cwd": "/",
+                    "cwd": launch_cwd,
                     "timeout_seconds": timeout_seconds,
                     "status_path": str(status_path),
                     "cancel_path": str(cancel_path),
@@ -3897,7 +3909,7 @@ class ProcessManager:
                 launch_phase = "supervisor_spawn"
                 process = self._popen(
                     [sys.executable, str(supervisor), "--spec", str(spec_path)],
-                    cwd="/",
+                    cwd=launch_cwd,
                     env=sanitized_env(
                         adapter_id,
                         home=(
@@ -4160,7 +4172,7 @@ class ProcessManager:
 
                 request_id = uuid.uuid4().hex
                 self.process_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                os.chmod(self.process_dir, 0o700)
+                chmod_path(self.process_dir, 0o700)
                 stdout_path = self.process_dir / f"{request_id}.stdout.log"
                 stderr_path = self.process_dir / f"{request_id}.stderr.log"
                 _touch_0600(stdout_path)

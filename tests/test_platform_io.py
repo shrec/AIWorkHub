@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -38,6 +39,28 @@ def test_posix_lock_round_trip(tmp_path):
         platform_io.unlock_fd(fd)
     finally:
         os.close(fd)
+
+
+def test_chmod_path_skips_posix_mode_on_windows(monkeypatch, tmp_path):
+    target = tmp_path / "owner-acl-file"
+    target.write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+
+    def denied(_path, _mode):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(platform_io.os, "chmod", denied)
+    platform_io.chmod_path(target, 0o600)
+
+
+def test_chmod_path_applies_posix_mode(monkeypatch, tmp_path):
+    target = tmp_path / "private-file"
+    target.write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(platform_io.os, "name", "posix")
+
+    platform_io.chmod_path(target, 0o600)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
 def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
