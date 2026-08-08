@@ -2648,10 +2648,18 @@ def _metadata_broker_verify_flags(flags: int) -> int:
 
 
 def _metadata_broker_verify_fd(fd: int, candidate: str) -> None:
-    """Fail closed unless ``fd`` is a scratch-owned, non-hardlinked regular file."""
+    """Fail closed unless ``fd`` is a scratch-owned target beneath the request scratch.
+
+    Owned directories are permitted so validators can manage scratch-directory
+    metadata (e.g. ``os.chmod(parent, 0o700)`` after ``path.parent.mkdir``).
+    Regular files still require ``st_nlink == 1`` (no hardlinks). Special files
+    (devices, sockets, FIFOs) remain denied.
+    """
     info = os.fstat(fd)
     if stat.S_ISDIR(info.st_mode):
-        raise WorkspaceError(f"metadata_broker_directory_target:{candidate}")
+        if info.st_uid != os.getuid():
+            raise WorkspaceError(f"metadata_broker_foreign_owner:{candidate}")
+        return
     if not stat.S_ISREG(info.st_mode):
         raise WorkspaceError(f"metadata_broker_not_regular_file:{candidate}")
     if info.st_nlink != 1:
@@ -2663,7 +2671,7 @@ def _metadata_broker_verify_fd(fd: int, candidate: str) -> None:
 def _metadata_broker_verify_target(
     candidate: str, scratch_fd: int, scratch_root: PurePosixPath
 ) -> int:
-    """Open and return a verified regular-file fd strictly beneath the scratch.
+    """Open and return a verified, mutable fd strictly beneath the scratch.
 
     ``scratch_fd`` is a stable directory descriptor for the exact request-owned
     validation exec scratch and ``scratch_root`` its resolved absolute path
@@ -2671,8 +2679,14 @@ def _metadata_broker_verify_target(
     the resolution authority: ``openat2`` with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS
     fails closed on traversal, absolute/outside paths, symlinked roots and
     symlink targets -- never a userspace string-prefix comparison. The returned
-    descriptor is inode-checked for a non-hardlinked regular file owned by this
-    process; the caller mutates that exact fd and closes it.
+    descriptor passes ``_metadata_broker_verify_fd`` (owned directories are
+    permitted; regular files require ``st_nlink == 1``); the caller mutates
+    that exact fd and closes it.
+
+    For directories the first ``openat2`` with ``O_RDONLY|O_NOCTTY`` yields an
+    O_PATH descriptor that cannot be ``fchmod``'d.  A second ``openat2`` with
+    ``O_DIRECTORY`` opens the same already-validated relative path; inode
+    comparison defeats any TOCTOU swap between the two kernel resolutions.
     """
     if not candidate or not candidate.startswith("/"):
         raise WorkspaceError(f"metadata_broker_path_not_absolute:{candidate}")
@@ -2688,9 +2702,32 @@ def _metadata_broker_verify_target(
         raise WorkspaceError(f"metadata_broker_scratch_root_target:{candidate}")
     fd = _openat2_beneath(scratch_fd, rel_str, os.O_RDONLY | os.O_NOCTTY)
     try:
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            # fd is O_PATH for directories -- reopen the validated relative
+            # path with O_DIRECTORY so the returned descriptor is mutable.
+            # Drop the closed descriptor first so no failure branch ever
+            # closes the same fd twice (a double close raises EBADF and
+            # would mask the real denial error).
+            os.close(fd)
+            fd = -1
+            fd = _openat2_beneath(
+                scratch_fd, rel_str, os.O_RDONLY | os.O_NOCTTY | os.O_DIRECTORY
+            )
+            reopen_info = os.fstat(fd)
+            if (reopen_info.st_dev, reopen_info.st_ino) != (
+                info.st_dev,
+                info.st_ino,
+            ):
+                raise WorkspaceError(
+                    f"metadata_broker_directory_inode_drift:{candidate}"
+                )
+            _metadata_broker_verify_fd(fd, candidate)
+            return fd
         _metadata_broker_verify_fd(fd, candidate)
     except BaseException:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         raise
     return fd
 
@@ -2899,7 +2936,7 @@ def _metadata_broker_apply(
     is often not ``child_pid`` itself), re-checks the notification id both
     before and after acquiring the target, resolves the target with the kernel
     as authority (``openat2`` beneath the exact scratch fd) and mutates only a
-    stable, inode-verified regular file.
+    stable, inode-verified file or directory.
     """
     pid = int(request.pid)
     _metadata_broker_authenticate_pid(pid, child_pid)
@@ -2920,16 +2957,24 @@ def _metadata_broker_apply(
             raise WorkspaceError("metadata_broker_deleted_fd")
         verified_fd = _metadata_broker_verify_target(link, scratch_fd, scratch_root)
         try:
+            verified_info = os.fstat(verified_fd)
+            # verified_fd is kernel-resolved via openat2; for directories it
+            # may be an O_PATH descriptor that cannot be fchmod'd directly.
+            # Stat it first so the proc reopen can include O_DIRECTORY for
+            # directory targets -- open() on a directory symlink target
+            # without O_DIRECTORY returns EISDIR.
+            open_flags = os.O_RDONLY | os.O_NOCTTY
+            if stat.S_ISDIR(verified_info.st_mode):
+                open_flags |= os.O_DIRECTORY
             try:
                 fd_target = os.open(
-                    f"/proc/{pid}/fd/{raw_fd}", os.O_RDONLY | os.O_NOCTTY
+                    f"/proc/{pid}/fd/{raw_fd}", open_flags
                 )
             except OSError as exc:
                 raise WorkspaceError(
                     f"metadata_broker_fd_reopen_failed:{exc}"
                 ) from exc
             try:
-                verified_info = os.fstat(verified_fd)
                 target_info = os.fstat(fd_target)
                 if (target_info.st_dev, target_info.st_ino) != (
                     verified_info.st_dev,
@@ -2939,7 +2984,7 @@ def _metadata_broker_apply(
                 _metadata_broker_verify_fd(fd_target, f"/proc/{pid}/fd/{raw_fd}")
                 _metadata_broker_check_notification(library, listener_fd, request.id)
                 # Mutate the exact descriptor the child blocked on, proven by
-                # inode identity to be the same beneath-scratch regular file --
+                # inode identity to be the same beneath-scratch file --
                 # never a readlink+reopen-by-name that a swap could race.
                 os.fchmod(fd_target, mode)
             finally:
@@ -3180,8 +3225,9 @@ def _landlock_exec(argv: list[str]) -> int:
         # chmod family, breaking unmodified tools (git init writing
         # .git/config.lock). Install a user-notification filter in the
         # disposable child and emulate ONLY verified chmod/fchmod/fchmodat
-        # operations on stable, request-owned regular files beneath this
-        # exact validation exec scratch from this trusted parent.
+        # operations on stable, request-owned regular files and owned
+        # directories beneath this exact validation exec scratch from
+        # this trusted parent.
         parent_sock, child_sock = socket.socketpair()
         broker_parent_pid = os.getpid()
         child_pid = os.fork()
