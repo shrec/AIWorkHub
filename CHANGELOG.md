@@ -20,12 +20,16 @@ noted by package/extension version and release tag.
   `job_assignment` without weakening mandatory Windows Job Object assignment.
 - VS Code LM bridge and worker runtime JSON writers use the same platform-aware
   filesystem contract, including Unicode payloads.
+- Source Graph first-build completion now hands control to waiters only after
+  releasing the build guard, so an immediate refresh cannot return a stale
+  generation while a newly created file is still awaiting extraction.
 
 ### Tests
 
-- Added deterministic Windows ACL/cwd/spawn-phase regressions. The focused
-  launcher suite passes with 71 tests, Ruff passes, and the full Python suite
-  passes with 2,535 tests and 28 environment-specific skips.
+- Added deterministic Windows ACL/cwd/spawn-phase and Source Graph build-handoff
+  regressions. The focused launcher suite passes with 71 tests, Ruff passes,
+  and the full Python suite passes with 2,536 tests and 28 environment-specific
+  skips.
 
 ## [0.9.23] - 2026-08-08
 

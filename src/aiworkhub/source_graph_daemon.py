@@ -618,8 +618,13 @@ class SourceGraphDaemon:
                     self._last_run_at = _utcnow()
             return True
         finally:
-            self._build_completed.set()
             self._build_lock.release()
+            # Completion is an acquire-ready handoff, not merely a report
+            # that parsing stopped.  Wake waiters only after releasing the
+            # non-overlap guard so an immediate refresh_now() can perform the
+            # requested follow-up build instead of observing a false
+            # build_in_progress result and returning the previous generation.
+            self._build_completed.set()
 
     def _loop(self) -> None:
         # Power-loss recovery: writable single-flight recovery must precede

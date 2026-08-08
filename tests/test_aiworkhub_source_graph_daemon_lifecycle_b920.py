@@ -100,6 +100,31 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
     assert ".php" in health["indexed_extensions"]
 
 
+def test_first_build_completion_hands_off_after_build_lock_release(
+    tmp_path, cleanup_daemons,
+):
+    root = _init_repo(tmp_path)
+    cleanup_daemons.append(root)
+    daemon = source_graph_daemon.SourceGraphDaemon(root)
+    completion = daemon._build_completed
+    lock_state_at_completion: list[bool] = []
+
+    class CompletionProbe:
+        def set(self) -> None:
+            lock_state_at_completion.append(daemon._build_lock.locked())
+            completion.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return completion.wait(timeout)
+
+    daemon._build_completed = CompletionProbe()  # type: ignore[assignment]
+    daemon.start()
+
+    assert daemon.wait_for_first_build(timeout=10)
+    assert lock_state_at_completion == [False]
+    assert daemon.refresh_now()["triggered"] is True
+
+
 def test_initialized_repo_indexes_instruction_documents_without_source_files(tmp_path):
     root = _init_repo(tmp_path)
     daemon = source_graph_daemon.SourceGraphDaemon(root)
