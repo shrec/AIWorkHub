@@ -85,13 +85,18 @@ def chmod_fd(fd: int, mode: int) -> None:
         fchmod(fd, mode)
 
 
-def posix_path_modes_supported() -> bool:
+def posix_path_modes_supported(platform_name: str | None = None) -> bool:
     """Return whether POSIX path mode bits are an enforceable authority."""
 
-    return os.name != "nt"
+    return (platform_name or os.name) != "nt"
 
 
-def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
+def chmod_path(
+    path: str | os.PathLike[str],
+    mode: int,
+    *,
+    platform_name: str | None = None,
+) -> None:
     """Apply a POSIX path mode only on hosts where it is meaningful.
 
     Windows secures these runtime files through creation semantics and the
@@ -99,7 +104,7 @@ def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
     fail with ``WinError 5`` on otherwise valid user-owned paths.
     """
 
-    if posix_path_modes_supported():
+    if posix_path_modes_supported(platform_name):
         os.chmod(path, mode)
 
 

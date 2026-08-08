@@ -44,21 +44,19 @@ def test_posix_lock_round_trip(tmp_path):
 def test_chmod_path_skips_posix_mode_on_windows(monkeypatch, tmp_path):
     target = tmp_path / "owner-acl-file"
     target.write_text("ok", encoding="utf-8")
-    monkeypatch.setattr(platform_io.os, "name", "nt")
 
     def denied(_path, _mode):
         raise PermissionError(5, "Access is denied")
 
     monkeypatch.setattr(platform_io.os, "chmod", denied)
-    platform_io.chmod_path(target, 0o600)
+    platform_io.chmod_path(target, 0o600, platform_name="nt")
 
 
-def test_chmod_path_applies_posix_mode(monkeypatch, tmp_path):
+def test_chmod_path_applies_posix_mode(tmp_path):
     target = tmp_path / "private-file"
     target.write_text("ok", encoding="utf-8")
-    monkeypatch.setattr(platform_io.os, "name", "posix")
 
-    platform_io.chmod_path(target, 0o600)
+    platform_io.chmod_path(target, 0o600, platform_name="posix")
 
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 

@@ -42,14 +42,15 @@ def test_launch_critical_writers_do_not_call_raw_chmod(
 def test_worker_launch_cwd_uses_workspace_on_windows(monkeypatch, tmp_path: Path) -> None:
     workspace = tmp_path / "worktree"
     workspace.mkdir()
-    monkeypatch.setattr(process_launcher.os, "name", "nt")
 
-    assert process_launcher._worker_launch_cwd(workspace) == str(workspace.resolve())
+    assert process_launcher._worker_launch_cwd(
+        workspace,
+        platform_name="nt",
+    ) == str(workspace.resolve())
 
 
-def test_worker_launch_cwd_preserves_posix_root(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(process_launcher.os, "name", "posix")
-    assert process_launcher._worker_launch_cwd(tmp_path) == "/"
+def test_worker_launch_cwd_preserves_posix_root(tmp_path: Path) -> None:
+    assert process_launcher._worker_launch_cwd(tmp_path, platform_name="posix") == "/"
 
 
 def test_bridge_atomic_json_uses_windows_acl_authority(monkeypatch, tmp_path: Path) -> None:

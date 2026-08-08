@@ -803,10 +803,14 @@ def _touch_0600(path: Path) -> None:
         os.close(fd)
 
 
-def _worker_launch_cwd(workspace_path: Path) -> str:
+def _worker_launch_cwd(
+    workspace_path: Path,
+    *,
+    platform_name: str | None = None,
+) -> str:
     """Return a real task directory on Windows while preserving POSIX root."""
 
-    if os.name != "nt":
+    if (platform_name or os.name) != "nt":
         return "/"
     resolved = workspace_path.resolve()
     if not resolved.is_dir():
