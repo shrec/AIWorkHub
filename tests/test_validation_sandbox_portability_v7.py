@@ -719,6 +719,12 @@ class TestRunValidationsGitInitIntegration:
     def test_git_init_succeeds_beneath_validation_scratch(
         self, tmp_path: Path
     ) -> None:
+        if _SELF_HOSTED_VALIDATION_EXEC:
+            pytest.skip(
+                "self-hosted validation bootstrap: loaded canonical broker "
+                "still denies directory mutation before the candidate "
+                "broker proves its behavior in a real run_validations"
+            )
         if sys.platform != "linux":
             pytest.skip("seccomp user notification is Linux-only")
         try:

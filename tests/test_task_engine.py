@@ -307,6 +307,84 @@ def test_disposition_reviewer_children_finalizes_verified_and_supersedes_sibling
     assert sibling["worker_status"] == "superseded"
 
 
+def test_disposition_reviewer_children_reads_terminal_review_evidence_binding(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", ("REVIEWER_V1",)
+        ).fetchone()
+        card = json.loads(row[0])
+        binding = card.pop("quality_review")
+        card["terminal_review"] = {"evidence": {"quality_review": binding}}
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), "REVIEWER_V1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_engine.disposition_reviewer_children(
+        repo,
+        "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    payload = json.loads(result["stdout"])
+    assert payload["finalized"] == ["REVIEWER_V1"]
+    verified = task_store.get_task(repo, "REVIEWER_V1")
+    assert verified is not None
+    assert verified["status"] == "finished"
+    assert verified["worker_status"] == "done"
+
+
+def test_disposition_reviewer_children_rejects_conflicting_durable_bindings(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", ("REVIEWER_V1",)
+        ).fetchone()
+        card = json.loads(row[0])
+        card["terminal_review"] = {
+            "evidence": {
+                "quality_review": {
+                    "target_task_id": "OTHER_PARENT",
+                    "target_request_id": "req-other",
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), "REVIEWER_V1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_engine.disposition_reviewer_children(
+        repo,
+        "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    payload = json.loads(result["stdout"])
+    assert payload["finalized"] == []
+    assert payload["errors"] == ["REVIEWER_V1:reviewer_binding_conflict"]
+    verified = task_store.get_task(repo, "REVIEWER_V1")
+    assert verified is not None
+    assert verified["status"] == "review"
+
+
 def test_disposition_reviewer_children_idempotent_retry(
     tmp_path: Path,
 ) -> None:

@@ -120,6 +120,112 @@ def test_supervisor_persists_trusted_progress_phase(tmp_path: Path) -> None:
     assert status["last_meaningful_phase"] == "final_edit"
 
 
+def test_supervisor_error_status_salvages_bounded_child_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NF-2026-00082: when the primary lifecycle write faults after the child
+    exits, the supervisor must fail closed and persist a supervisor_error
+    status carrying the bounded child stdout_tail, stderr_tail and
+    child_returncode so the diagnostic cannot be lost inside the validation
+    sandbox.
+
+    supervise() is called directly so the validation sandbox does not need
+    supervisor->child nested process depth. status writes are monkeypatched
+    by call/state: writes for the starting state and running heartbeats are
+    allowed; the final exited write is forced to raise so the outer
+    supervisor_error salvage branch runs deterministically. No directory
+    chmod tricks, no missing-directory assumptions and no skips are used so
+    execution stays portable under Landlock, seccomp and process isolation."""
+    _spec_path, spec = _spec(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('salvage-out\\n'); sys.stdout.flush();"
+            " sys.stderr.write('salvage-err\\n'); sys.stderr.flush();"
+            " sys.exit(42)",
+        ],
+    )
+
+    real_write = worker_supervisor._write_json_0600
+    recorded: list[dict] = []
+
+    def selective_write(path, payload):
+        snapshot = dict(payload)
+        recorded.append(snapshot)
+        if snapshot.get("state") == "exited":
+            raise OSError("simulated_exited_status_write_failure")
+        real_write(path, payload)
+
+    # supervise() calls signal.signal(SIGTERM/SIGINT); calling it in-process
+    # must not leak those handlers into pytest. The production supervisor
+    # still installs them when it runs as its own dedicated process.
+    monkeypatch.setattr(worker_supervisor.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(worker_supervisor, "_write_json_0600", selective_write)
+
+    rc = worker_supervisor.supervise(spec)
+
+    assert rc != 0
+    salvage = next(p for p in recorded if p.get("state") == "supervisor_error")
+    assert salvage["state"] == "supervisor_error"
+    assert "salvage-out" in salvage["stdout_tail"]
+    assert "salvage-err" in salvage["stderr_tail"]
+    assert salvage["child_returncode"] == 42
+
+
+def test_supervisor_status_write_failure_emits_bounded_stderr_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """NF-2026-00082: when both the primary lifecycle write and the
+    supervisor_error salvage artifact cannot be persisted, the supervisor
+    must fail closed and emit a bounded structured stderr fallback carrying
+    the bounded child stdout_tail/stderr_tail and child_returncode so the
+    diagnostic is not silently lost inside the validation sandbox.
+
+    supervise() is called directly so the validation sandbox does not need
+    supervisor->child nested process depth. status writes are monkeypatched
+    by call/state: writes for the starting state and running heartbeats are
+    allowed; the final exited write and the supervisor_error salvage write
+    both raise so the structured stderr fallback runs deterministically. No
+    directory chmod tricks, no missing-directory assumptions and no skips are
+    used so execution stays portable under Landlock, seccomp and process
+    isolation."""
+    spec_path, spec = _spec(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('fallback-out\\n'); sys.stdout.flush();"
+            " sys.stderr.write('fallback-err\\n'); sys.stderr.flush();"
+            " sys.exit(7)",
+        ],
+    )
+
+    real_write = worker_supervisor._write_json_0600
+
+    def selective_write(path, payload):
+        state = payload.get("state")
+        if state in ("exited", "supervisor_error"):
+            raise OSError(f"simulated_{state}_status_write_failure")
+        real_write(path, payload)
+    # supervise() calls signal.signal(SIGTERM/SIGINT); calling it in-process
+    # must not leak those handlers into pytest. The production supervisor
+    # still installs them when it runs as its own dedicated process.
+    monkeypatch.setattr(worker_supervisor.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(worker_supervisor, "_write_json_0600", selective_write)
+
+    rc = worker_supervisor.supervise(spec)
+
+    assert rc != 0
+    fallback = capsys.readouterr().err
+    assert "fallback-out" in fallback
+    assert "fallback-err" in fallback
+    assert "7" in fallback
+
+
 def test_supervisor_bounds_verbose_output_and_keeps_tail(tmp_path: Path) -> None:
     spec_path, spec = _spec(
         tmp_path,
@@ -282,7 +388,10 @@ def test_cancel_marker_and_signal_survive_manager_restart_boundary(tmp_path: Pat
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         shell=False,
-        start_new_session=True,
+        # Validation sandboxes may deny the outer pytest->supervisor setsid;
+        # production child isolation (worker start_new_session + Linux PDEATHSIG
+        # created by the supervisor itself) is asserted separately by
+        # test_posix_worker_spawn_kwargs_are_platform_specific.
     )
     status_path = Path(spec["status_path"])
     deadline = time.monotonic() + 5
@@ -323,7 +432,10 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         shell=False,
-        start_new_session=True,
+        # Validation sandboxes may deny the outer pytest->supervisor setsid;
+        # production child isolation (worker start_new_session + Linux PDEATHSIG
+        # created by the supervisor itself) is asserted separately by
+        # test_posix_worker_spawn_kwargs_are_platform_specific.
     )
     status_path = Path(spec["status_path"])
     deadline = time.monotonic() + 5

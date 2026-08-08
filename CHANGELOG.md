@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.26] - 2026-08-08
+
+### Fixed
+
+- Reviewer-child disposition now resolves the authenticated target binding
+  from current `terminal_review.evidence.quality_review` receipts while
+  retaining legacy root-card compatibility; conflicting durable bindings fail
+  closed instead of leaving accepted reviewers silently stranded in Review.
+- VS Code LM strict-JSON prompts explicitly distinguish missing native tool
+  calling from the callable AIWorkHub bridge, preventing workers from falsely
+  reporting that Source Graph and edit tools are unavailable.
+- Supervisor failures retain bounded child return-code/stdout/stderr evidence,
+  including a structured stderr fallback when the status artifact itself
+  cannot be persisted inside a validation sandbox.
+
+### Tests
+
+- Added current/legacy/conflicting reviewer-binding regressions, supervisor
+  diagnostic salvage coverage, and strict-JSON tool-availability prompt checks.
+
 ## [0.9.25] - 2026-08-08
 
 ### Fixed

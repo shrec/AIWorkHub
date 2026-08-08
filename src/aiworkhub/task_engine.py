@@ -734,7 +734,29 @@ def disposition_reviewer_children(
             card = {}
         if not isinstance(card, dict):
             card = {}
-        binding = card.get("quality_review") or {}
+        root_binding = card.get("quality_review") or {}
+        terminal_review = card.get("terminal_review") or {}
+        terminal_evidence = (
+            terminal_review.get("evidence") or {}
+            if isinstance(terminal_review, dict)
+            else {}
+        )
+        terminal_binding = (
+            terminal_evidence.get("quality_review") or {}
+            if isinstance(terminal_evidence, dict)
+            else {}
+        )
+        if not isinstance(root_binding, dict):
+            root_binding = {}
+        if not isinstance(terminal_binding, dict):
+            terminal_binding = {}
+        if root_binding and terminal_binding and root_binding != terminal_binding:
+            errors.append(f"{child_task_id}:reviewer_binding_conflict")
+            continue
+        # Current terminal-review cards persist the authenticated target binding
+        # with the terminal evidence.  Keep the root lookup for older cards, but
+        # never guess when both durable representations disagree.
+        binding = terminal_binding or root_binding
         target = str(binding.get("target_task_id") or "")
         target_request = str(binding.get("target_request_id") or "")
         if target != parent_task_id or target_request != parent_request_id:

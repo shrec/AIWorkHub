@@ -715,17 +715,65 @@ def supervise(spec: dict[str, Any]) -> int:
     except Exception as exc:
         if child is not None and child.poll() is None:
             _terminate_child(child)
-        _write_json_0600(status_path, {
-            "state": "supervisor_error",
-            "supervisor_pid": supervisor_pid,
-            "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
-            "child_pid": child.pid if child is not None else None,
-            "exit_code": 126,
-            "error": f"{type(exc).__name__}:{exc}"[:500],
-            "started_at_epoch": started_epoch,
-            "finished_at_epoch": time.time(),
-            "timeout_seconds": timeout,
-        })
+        # NF-2026-00082: preserve bounded child stdout/stderr/return-code
+        # diagnostics so a missing/partial status artifact never hides what
+        # the nested child actually produced. The supervisor owns
+        # stdout_path/stderr_path independently of the sandboxed child, so
+        # re-reading them here is a fail-closed review of already-captured
+        # evidence (never a new privileged op against the sandbox).
+        _salvage_cap = max(
+            MIN_MAX_OUTPUT_BYTES, min(max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES)
+        )
+
+        def _salvage_tail(source: Path) -> str:
+            try:
+                total = source.stat().st_size
+                with source.open("rb") as handle:
+                    if total > _salvage_cap:
+                        handle.seek(-_salvage_cap, os.SEEK_END)
+                    return handle.read().decode("utf-8", errors="replace")
+            except OSError:
+                return ""
+
+        _child_rc = child.poll() if child is not None else None
+        _stdout_tail = _salvage_tail(stdout_path)
+        _stderr_tail = _salvage_tail(stderr_path)
+        try:
+            _write_json_0600(status_path, {
+                "state": "supervisor_error",
+                "supervisor_pid": supervisor_pid,
+                "supervisor_pid_start_ticks": supervisor_pid_start_ticks,
+                "child_pid": child.pid if child is not None else None,
+                "exit_code": 126,
+                "child_returncode": _child_rc,
+                "stdout_tail": _stdout_tail,
+                "stderr_tail": _stderr_tail,
+                "error": f"{type(exc).__name__}:{exc}"[:500],
+                "started_at_epoch": started_epoch,
+                "finished_at_epoch": time.time(),
+                "timeout_seconds": timeout,
+            })
+        except Exception:
+            # Status artifact itself is unwritable (e.g. a nested read-only
+            # validation exec scratch). Stay fail-closed on the artifact but
+            # still surface bounded child diagnostics on the supervisor's own
+            # stderr so the orchestrator/run_validations can report them
+            # instead of an opaque missing-status failure.
+            sys.stderr.write(
+                "aiworkhub_supervisor_error:"
+                + json.dumps(
+                    {
+                        "state": "supervisor_error",
+                        "exit_code": 126,
+                        "child_returncode": _child_rc,
+                        "stdout_tail": _stdout_tail[-1000:],
+                        "stderr_tail": _stderr_tail[-1000:],
+                        "error": f"{type(exc).__name__}:{exc}"[:500],
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
         return 126
     finally:
         if windows_job is not None:

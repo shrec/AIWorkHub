@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.25";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.26";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2821,6 +2821,7 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
   const toolNames = VSCODE_LM_PRIVATE_TOOLS.map((tool) => tool.name);
   return `${glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts)}\n` +
     `This provider does not expose native tool calling. Use the strict JSON transport below.\n` +
+    `The absence of native toolCalling does not mean tools are unavailable: the AIWorkHub tools listed below remain callable through this strict JSON bridge, so never report that MCP/callable tools are missing while that list is present.\n` +
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
       : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
