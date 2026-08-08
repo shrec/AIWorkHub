@@ -101,6 +101,49 @@ def test_latest_progress_event_is_bounded_and_uses_newest_sequence(tmp_path: Pat
     }
 
 
+def test_progress_tail_preserves_meaningful_event_before_newer_liveness(tmp_path: Path) -> None:
+    output = tmp_path / "stdout.log"
+    events = [
+        {"type": "aiworkhub_progress", "sequence": 1, "phase": "request_accepted"},
+        {"type": "aiworkhub_progress", "sequence": 2, "phase": "tool_turn"},
+        {"type": "aiworkhub_progress", "sequence": 3, "phase": "provider_response"},
+    ]
+    output.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    latest, meaningful = worker_supervisor._latest_progress_events(output)
+
+    assert latest == {"sequence": 3, "phase": "provider_response"}
+    assert meaningful == {"sequence": 2, "phase": "tool_turn"}
+
+
+def test_short_trusted_worker_persists_preterminal_meaningful_event(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {"type": "aiworkhub_progress", "sequence": 1, "phase": "request_accepted"},
+        {"type": "aiworkhub_progress", "sequence": 2, "phase": "tool_turn"},
+        {"type": "aiworkhub_progress", "sequence": 3, "phase": "provider_response"},
+    ]
+    script = (
+        "import json; events=" + repr(events) + "; "
+        "[print(json.dumps(event), flush=True) for event in events]"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(adapter_id="vscode_lm", heartbeat_interval_seconds=60)
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["last_progress_sequence"] == 3
+    assert status["last_meaningful_progress_sequence"] == 2
+    assert status["last_meaningful_phase"] == "tool_turn"
+
+
 def test_supervisor_persists_trusted_progress_phase(tmp_path: Path) -> None:
     event = {"type": "aiworkhub_progress", "sequence": 3, "phase": "final_edit"}
     script = (

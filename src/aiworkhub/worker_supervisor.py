@@ -301,15 +301,19 @@ def _usage_total_from_output(path: Path, adapter_id: str) -> int | None:
     return live_total_tokens(summary, adapter_id)
 
 
-def _latest_progress_event(path: Path) -> dict[str, Any]:
-    """Return the newest bounded worker progress event from a JSONL tail."""
+def _latest_progress_events(
+    path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the newest observed and meaningful events from one bounded tail."""
     try:
         with path.open("rb") as handle:
             size = path.stat().st_size
             handle.seek(max(0, size - MAX_PROGRESS_SCAN_BYTES))
             raw = handle.read(MAX_PROGRESS_SCAN_BYTES)
     except OSError:
-        return {}
+        return {}, {}
+    latest: dict[str, Any] = {}
+    meaningful: dict[str, Any] = {}
     for raw_line in reversed(raw.splitlines()):
         try:
             payload = json.loads(raw_line.decode("utf-8"))
@@ -326,8 +330,20 @@ def _latest_progress_event(path: Path) -> dict[str, Any]:
             and isinstance(phase, str)
             and phase
         ):
-            return {"sequence": sequence, "phase": phase[:80]}
-    return {}
+            event = {"sequence": sequence, "phase": phase[:80]}
+            if not latest:
+                latest = event
+            if phase in MEANINGFUL_PROGRESS_PHASES:
+                meaningful = event
+                break
+    return latest, meaningful
+
+
+def _latest_progress_event(path: Path) -> dict[str, Any]:
+    """Backward-compatible newest-event view used by focused callers/tests."""
+
+    latest, _meaningful = _latest_progress_events(path)
+    return latest
 
 
 def _token_budget_config(spec: dict[str, Any]) -> tuple[int | None, str]:
@@ -570,19 +586,19 @@ def supervise(spec: dict[str, Any]) -> int:
                         last_meaningful_phase = "provider_output"
                     last_stdout_bytes = stdout_bytes
                     last_stderr_bytes = stderr_bytes
-                progress = (
-                    _latest_progress_event(stdout_path)
+                progress, meaningful_progress = (
+                    _latest_progress_events(stdout_path)
                     if adapter_id in TRUSTED_PROGRESS_ADAPTERS
-                    else {}
+                    else ({}, {})
                 )
                 progress_sequence = int(progress.get("sequence") or 0)
                 if progress_sequence > last_progress_sequence:
                     last_progress_sequence = progress_sequence
-                    progress_phase = str(progress["phase"])
-                    if progress_phase in MEANINGFUL_PROGRESS_PHASES:
-                        last_meaningful_progress_epoch = time.time()
-                        last_meaningful_phase = progress_phase
-                        last_meaningful_progress_sequence = progress_sequence
+                meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
+                if meaningful_sequence > last_meaningful_progress_sequence:
+                    last_meaningful_progress_epoch = time.time()
+                    last_meaningful_phase = str(meaningful_progress["phase"])
+                    last_meaningful_progress_sequence = meaningful_sequence
                 observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
                 if observed_tokens is not None and observed_tokens != last_observed_tokens:
                     last_meaningful_progress_epoch = time.time()
@@ -662,19 +678,21 @@ def supervise(spec: dict[str, Any]) -> int:
             if adapter_id not in TRUSTED_PROGRESS_ADAPTERS:
                 last_meaningful_progress_epoch = last_output_change_epoch
                 last_meaningful_phase = "provider_output"
-        final_progress = (
-            _latest_progress_event(stdout_path)
+        final_progress, final_meaningful_progress = (
+            _latest_progress_events(stdout_path)
             if adapter_id in TRUSTED_PROGRESS_ADAPTERS
-            else {}
+            else ({}, {})
         )
         final_progress_sequence = int(final_progress.get("sequence") or 0)
         if final_progress_sequence > last_progress_sequence:
             last_progress_sequence = final_progress_sequence
-            final_progress_phase = str(final_progress["phase"])
-            if final_progress_phase in MEANINGFUL_PROGRESS_PHASES:
-                last_meaningful_progress_epoch = time.time()
-                last_meaningful_phase = final_progress_phase
-                last_meaningful_progress_sequence = final_progress_sequence
+        final_meaningful_sequence = int(
+            final_meaningful_progress.get("sequence") or 0
+        )
+        if final_meaningful_sequence > last_meaningful_progress_sequence:
+            last_meaningful_progress_epoch = time.time()
+            last_meaningful_phase = str(final_meaningful_progress["phase"])
+            last_meaningful_progress_sequence = final_meaningful_sequence
         final_observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
         if (
             final_observed_tokens is not None

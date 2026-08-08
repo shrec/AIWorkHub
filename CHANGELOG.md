@@ -17,15 +17,17 @@ noted by package/extension version and release tag.
   they no longer reset the meaningful-progress stall clock without a tool turn,
   final edit, terminal error, usage advance, or other auditable work.
 - Supervisor receipts preserve both the latest observed progress sequence and
-  the latest meaningful sequence, with backward-compatible reading of older
-  status artifacts.
+  the latest meaningful sequence even when a short worker exits after newer
+  liveness-only events, with backward-compatible reading of older status
+  artifacts.
 
 ### Tests
 
 - Added atomic rollback, cross-repository isolation, legacy-marker and
   index/remove cache-generation regressions for Source Graph.
 - Added all-adapter provider-response loop and old-status compatibility
-  regressions; the focused worker liveness suite passes with 49 tests.
+  regressions, including a terminal-tail race fixture; the focused worker
+  liveness suite passes with 51 tests.
 
 ## [0.9.26] - 2026-08-08
 
