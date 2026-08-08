@@ -7206,23 +7206,38 @@ class ProcessManager:
                     "promoted_paths": promoted,
                 }
 
+            verified_reviewer_ids = [
+                tid for tid, _ws in verified_reviewer_tasks
+            ]
+            disposition_result = task_engine.disposition_reviewer_children(
+                self.repo,
+                task_id,
+                verified_reviewer_task_ids=verified_reviewer_ids,
+                parent_request_id=request_id,
+                disposition="accepted",
+            )
+            try:
+                disposition_payload = json.loads(
+                    str(disposition_result.get("stdout") or "{}")
+                )
+            except (TypeError, json.JSONDecodeError):
+                disposition_payload = {}
+            finalized_set = set(disposition_payload.get("finalized") or [])
             reviewer_finalization: list[dict[str, Any]] = []
             for reviewer_task_id, reviewer_workspace in verified_reviewer_tasks:
-                done = core.mark_done(reviewer_task_id)
                 row = {
                     "task_id": reviewer_task_id,
-                    "finished": bool(done.get("ok")),
+                    "finished": reviewer_task_id in finalized_set,
                     "cleanup_error": "",
                 }
-                if done.get("ok"):
-                    try:
-                        cleanup_workspace(
-                            reviewer_workspace.repo,
-                            reviewer_workspace.path,
-                            reviewer_workspace.home,
-                        )
-                    except WorkspaceError as exc:
-                        row["cleanup_error"] = str(exc)[:300]
+                try:
+                    cleanup_workspace(
+                        reviewer_workspace.repo,
+                        reviewer_workspace.path,
+                        reviewer_workspace.home,
+                    )
+                except WorkspaceError as exc:
+                    row["cleanup_error"] = str(exc)[:300]
                 reviewer_finalization.append(row)
 
             try:

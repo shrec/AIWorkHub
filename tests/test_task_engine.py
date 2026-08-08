@@ -206,3 +206,214 @@ def test_accept_review_rejects_non_review_ready_substatus(tmp_path: Path) -> Non
     card = task_store.get_task(repo, "TASK_B891")
     assert card is not None
     assert card["status"] == "review"
+
+
+def _repo_with_reviewer_children(
+    tmp_path: Path, *, parent_task_id: str = "PARENT_T1",
+    child_verified: str = "REVIEWER_V1", child_sibling: str = "REVIEWER_S1",
+) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-08T00:00:00+00:00"
+    conn = sqlite3.connect(db_path)
+    try:
+        # Parent task in review_ready
+        parent_card = {
+            "task_id": parent_task_id,
+            "runner": "worker_p1",
+            "topic": "task_mcp",
+            "terminal_review": {
+                "substatus": "review_ready",
+                "evidence": {
+                    "request_identity": {
+                        "request_id": "req-parent-1",
+                        "task_id": parent_task_id,
+                        "runner": "worker_p1",
+                        "topic": "task_mcp",
+                    },
+                },
+            },
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, claimed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (parent_task_id, "worker_p1", "task_mcp", "review", "review",
+             "", "", json.dumps(parent_card), now, now, "worker_p1", now),
+        )
+        # Verified reviewer child
+        verified_card = {
+            "task_id": child_verified,
+            "runner": "reviewer_v1",
+            "topic": "quality_review",
+            "quality_review": {
+                "target_task_id": parent_task_id,
+                "target_request_id": "req-parent-1",
+            },
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, claimed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (child_verified, "reviewer_v1", "quality_review", "review", "review",
+             "", "", json.dumps(verified_card), now, now, "reviewer_v1", now),
+        )
+        # Sibling (redundant) reviewer child
+        sibling_card = {
+            "task_id": child_sibling,
+            "runner": "reviewer_s1",
+            "topic": "quality_review",
+            "quality_review": {
+                "target_task_id": parent_task_id,
+                "target_request_id": "req-parent-1",
+            },
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at, claimed_by, claimed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (child_sibling, "reviewer_s1", "quality_review", "review", "review",
+             "", "", json.dumps(sibling_card), now, now, "reviewer_s1", now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return repo
+
+
+def test_disposition_reviewer_children_finalizes_verified_and_supersedes_siblings(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    result = task_engine.disposition_reviewer_children(
+        repo,
+        "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+
+    verified = task_store.get_task(repo, "REVIEWER_V1")
+    assert verified is not None
+    assert verified["status"] == "finished"
+    assert verified["worker_status"] == "done"
+
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "superseded"
+    assert sibling["worker_status"] == "superseded"
+
+
+def test_disposition_reviewer_children_idempotent_retry(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    first = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert first["ok"] is True
+    second = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert second["ok"] is True
+    payload = json.loads(second["stdout"])
+    assert "REVIEWER_V1" in payload["skipped"]
+    assert "REVIEWER_S1" in payload["skipped"]
+
+
+def test_disposition_reviewer_children_preserves_receipt_evidence(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    verified = task_store.get_task(repo, "REVIEWER_V1")
+    assert verified is not None
+    assert verified.get("topic") == "quality_review"
+    qr = verified.get("quality_review") or {}
+    assert qr.get("target_task_id") == "PARENT_T1"
+    disposition_meta = verified.get("reviewer_disposition") or {}
+    assert disposition_meta.get("parent_task_id") == "PARENT_T1"
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    qr_sib = sibling.get("quality_review") or {}
+    assert qr_sib.get("target_task_id") == "PARENT_T1"
+
+
+def test_disposition_reviewer_children_ignores_non_quality_review_tasks(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    # Add a task with topic task_mcp that is NOT quality_review
+    _readiness, db_path = task_store._require_ready(repo)
+    now = "2026-08-08T00:00:00+00:00"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tasks(task_id, runner, topic, status, worker_status, "
+            "priority, objective, card_json, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("IMPL_T1", "worker_i1", "task_mcp", "review", "review",
+             "", "", json.dumps({"task_id": "IMPL_T1"}), now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_engine.disposition_reviewer_children(
+        repo, "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    impl = task_store.get_task(repo, "IMPL_T1")
+    assert impl is not None
+    assert impl["status"] == "review"  # unchanged
+
+
+def test_disposition_reviewer_children_ignores_request_mismatched_sibling(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_reviewer_children(tmp_path)
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT card_json FROM tasks WHERE task_id=?", ("REVIEWER_S1",)
+        ).fetchone()
+        card = json.loads(row[0])
+        card["quality_review"]["target_request_id"] = "req-other-candidate"
+        conn.execute(
+            "UPDATE tasks SET card_json=? WHERE task_id=?",
+            (json.dumps(card), "REVIEWER_S1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_engine.disposition_reviewer_children(
+        repo,
+        "PARENT_T1",
+        verified_reviewer_task_ids=["REVIEWER_V1"],
+        parent_request_id="req-parent-1",
+        disposition="accepted",
+    )
+    assert result["ok"] is True
+    sibling = task_store.get_task(repo, "REVIEWER_S1")
+    assert sibling is not None
+    assert sibling["status"] == "review"
+    assert sibling["worker_status"] == "review"

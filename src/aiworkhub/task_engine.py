@@ -673,7 +673,142 @@ def archive_task(
     }
 
 
+def disposition_reviewer_children(
+    repo: Path,
+    parent_task_id: str,
+    *,
+    verified_reviewer_task_ids: list[str],
+    parent_request_id: str,
+    disposition: str = "accepted",
+) -> dict[str, Any]:
+    """Atomically disposition exact reviewer child cards for one parent.
+
+    When a parent candidate is accepted or rejected, every bound quality-review
+    child card is disposed without deleting its immutable receipt/audit history:
+    * verified (successful) reviewer tasks are finalized, preserving their
+      receipts and leaving an actionable Review event.
+    * redundant/failed sibling reviewer attempts are superseded so they are
+      not counted in future dashboard KPIs yet remain in history.
+
+    Idempotent: a repeat call with the same verified set updates nothing already
+    finalized or superseded.  Fail-closed: any child whose target binding does
+    not match this parent is left untouched and reported.
+    """
+    verified_set = frozenset(str(tid) for tid in (verified_reviewer_task_ids or []))
+    command = [
+        "disposition-reviewer-children", parent_task_id,
+        "--request-id", parent_request_id, "--disposition", disposition,
+    ]
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        _readiness, db_path = task_store._require_ready(repo)
+        conn = task_store._connect(db_path)
+    except task_store.TaskStoreError as exc:
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
+    try:
+        rows = conn.execute(
+            "SELECT task_id, runner, topic, status, worker_status, card_json "
+            "FROM tasks WHERE topic='quality_review' AND (status NOT IN ('archived'))"
+        ).fetchall()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return {"ok": False, "returncode": 1, "command": command, "stdout": "",
+                "stderr": "reviewer_children_query_failed"}
+    finalized: list[str] = []
+    superseded: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    for row in rows:
+        child_task_id = str(row["task_id"] or "")
+        try:
+            card = json.loads(row["card_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            card = {}
+        if not isinstance(card, dict):
+            card = {}
+        binding = card.get("quality_review") or {}
+        target = str(binding.get("target_task_id") or "")
+        target_request = str(binding.get("target_request_id") or "")
+        if target != parent_task_id or target_request != parent_request_id:
+            continue
+        child_status = str(row["status"] or "")
+        if child_status in ("finished", "done", "archived", "superseded"):
+            skipped.append(child_task_id)
+            continue
+        child_runner = str(row["runner"] or "")
+        if child_task_id in verified_set:
+            card["reviewer_disposition"] = {
+                "parent_task_id": parent_task_id,
+                "parent_request_id": parent_request_id,
+                "disposition": disposition,
+                "disposed_at": now,
+            }
+            conn.execute(
+                "UPDATE tasks SET status='finished', worker_status='done', "
+                "completed_at=COALESCE(NULLIF(completed_at, ''), ?), updated_at=?, card_json=? "
+                "WHERE task_id=?",
+                (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), child_task_id),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    child_task_id, "reviewer_child_finalized", child_runner,
+                    json.dumps({
+                        "parent_task_id": parent_task_id,
+                        "parent_request_id": parent_request_id,
+                        "disposition": disposition,
+                    }, ensure_ascii=False, default=str, sort_keys=True),
+                    now,
+                ),
+            )
+            finalized.append(child_task_id)
+        else:
+            card["reviewer_disposition"] = {
+                "parent_task_id": parent_task_id,
+                "parent_request_id": parent_request_id,
+                "disposition": "superseded",
+                "disposed_at": now,
+            }
+            # Durable superseded status must remain visible through task_store.canonical_status.
+            conn.execute(
+                "UPDATE tasks SET status='superseded', worker_status='superseded', "
+                "updated_at=?, card_json=? WHERE task_id=?",
+                (now, json.dumps(card, ensure_ascii=False, sort_keys=True), child_task_id),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, event, runner, payload_json, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    child_task_id, "reviewer_child_superseded", child_runner,
+                    json.dumps({
+                        "parent_task_id": parent_task_id,
+                        "parent_request_id": parent_request_id,
+                        "disposition": "superseded",
+                    }, ensure_ascii=False, default=str, sort_keys=True),
+                    now,
+                ),
+            )
+            superseded.append(child_task_id)
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "returncode": 0,
+        "command": command,
+        "stdout": json.dumps({
+            "parent_task_id": parent_task_id,
+            "finalized": finalized,
+            "superseded": superseded,
+            "skipped": skipped,
+            "errors": errors,
+        }, ensure_ascii=False),
+        "stderr": "",
+    }
+
+
 __all__ = [
     "show_task", "claim_start_exact", "mark_terminal_review", "mark_launch_failed", "accept_review",
-    "archive_task",
+    "archive_task", "disposition_reviewer_children",
 ]

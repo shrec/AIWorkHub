@@ -1387,3 +1387,34 @@ def test_worker_context_section_count_supports_v1_and_v2_bundles():
         {"evidence": {"source_graph": {}, "session_current_state": {}}}
     ) == 2
     assert process_launcher._worker_context_section_count({}) == 0
+
+
+def test_quality_review_card_is_readonly_and_quality_review_topic():
+    quality_card = {
+        "topic": "quality_review",
+        "project_context": {"task_type": "research"},
+        "read_only": True,
+        "allowed_writes": [],
+        "required_outputs": [],
+    }
+    assert process_launcher._card_is_readonly_quality_review(quality_card) is True
+
+    impl_card = {
+        "topic": "task_mcp",
+        "project_context": {"task_type": "code"},
+        "read_only": False,
+        "allowed_writes": ["out.txt"],
+        "required_outputs": ["out.txt"],
+    }
+    assert process_launcher._card_is_readonly_quality_review(impl_card) is False
+
+
+def test_quality_review_card_identification_rejects_mutation():
+    card = {
+        "topic": "quality_review",
+        "project_context": {"task_type": "research"},
+        "read_only": False,
+        "allowed_writes": ["some_file"],
+        "required_outputs": [],
+    }
+    assert process_launcher._card_is_readonly_quality_review(card) is False

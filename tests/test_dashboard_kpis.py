@@ -454,3 +454,68 @@ def test_compact_context_marks_optimized_section_measurement_observed() -> None:
     assert compact["estimate"]["pre_optimization_section_bytes"] == 2_000
     assert compact["estimate"]["optimized_section_bytes"] == 1_200
     assert compact["estimate"]["optimized_section_bytes_observed"] is True
+
+
+def test_kpis_separate_actionable_review_from_reviewer_receipts():
+    impl = _run("IMPL_A", "review_ready", "2026-08-01T12:00:00Z")
+    impl["topic"] = "task_mcp"
+    reviewer = _run("REV_A", "review_ready", "2026-08-01T12:01:00Z")
+    reviewer["topic"] = "quality_review"
+    validation = _run("VAL_A", "validation_failed", "2026-08-01T12:02:00Z")
+    validation["topic"] = "task_mcp"
+
+    result = _build([impl, reviewer, validation])
+
+    assert result["headline"]["terminal_runs"] == 3
+    assert result["headline"]["review_ready_runs"] == 2
+    assert result["headline"]["actionable_review_ready_runs"] == 1
+    assert result["headline"]["reviewer_receipt_runs"] == 1
+    assert result["headline"]["actionable_review_ready_rate"] == 33.3
+    assert result["headline"]["reviewer_receipt_rate"] == 33.3
+
+
+def test_kpis_reviewer_receipts_do_not_inflate_actionable_review():
+    reviewer1 = _run("REV_B1", "review_ready", "2026-08-01T12:00:00Z")
+    reviewer1["topic"] = "quality_review"
+    reviewer2 = _run("REV_B2", "review_ready", "2026-08-01T12:01:00Z")
+    reviewer2["topic"] = "quality_review"
+    reviewer3 = _run("REV_B3", "review_ready", "2026-08-01T12:02:00Z")
+    reviewer3["topic"] = "quality_review"
+
+    result = _build([reviewer1, reviewer2, reviewer3])
+
+    assert result["headline"]["review_ready_runs"] == 3
+    assert result["headline"]["actionable_review_ready_runs"] == 0
+    assert result["headline"]["reviewer_receipt_runs"] == 3
+    assert result["headline"]["actionable_review_ready_rate"] == 0.0
+
+
+def test_kpis_reviewer_receipt_in_daily_buckets():
+    impl = _run("IMPL_C", "review_ready", "2026-08-01T12:00:00Z")
+    impl["topic"] = "task_mcp"
+    reviewer = _run("REV_C", "review_ready", "2026-08-01T12:01:00Z")
+    reviewer["topic"] = "quality_review"
+
+    result = _build([impl, reviewer])
+
+    daily = {row["date"]: row for row in result["daily"]}
+    aug1 = daily.get("2026-08-01")
+    assert aug1 is not None
+    assert aug1["review_ready"] == 2
+    assert aug1["actionable_review_ready"] == 1
+    assert aug1["reviewer_receipt"] == 1
+
+
+def test_kpis_no_false_reviewer_receipts_from_implementation_tasks():
+    impl1 = _run("IMPL_D1", "review_ready", "2026-08-01T12:00:00Z")
+    impl1["topic"] = "task_mcp"
+    impl2 = _run("IMPL_D2", "review_ready", "2026-08-01T12:01:00Z")
+    impl2["topic"] = "task_mcp"
+
+    result = _build([impl1, impl2])
+
+    assert result["headline"]["review_ready_runs"] == 2
+    assert result["headline"]["actionable_review_ready_runs"] == 2
+    assert result["headline"]["reviewer_receipt_runs"] == 0
+    assert result["headline"]["actionable_review_ready_rate"] == 100.0
+    assert result["headline"]["reviewer_receipt_rate"] == 0.0

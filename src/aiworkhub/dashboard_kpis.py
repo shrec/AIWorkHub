@@ -28,6 +28,7 @@ TERMINAL_STATES = frozenset(
     }
 )
 NON_GREEN_STATES = TERMINAL_STATES - {"review_ready"}
+QUALITY_REVIEW_TOPIC = "quality_review"
 MAX_DAILY_BUCKETS = 30
 
 
@@ -155,11 +156,20 @@ def build_kpi_snapshot(
     validation_failed = outcome_counts["validation_failed"]
     non_green = sum(outcome_counts[state] for state in NON_GREEN_STATES)
 
+    reviewer_receipt = sum(
+        1 for row in runs
+        if str(row.get("state") or "") == "review_ready"
+        and str(row.get("topic") or "") == QUALITY_REVIEW_TOPIC
+    )
+    actionable_review_ready = max(0, review_ready - reviewer_receipt)
+
     daily: dict[str, dict[str, int]] = defaultdict(
         lambda: {
             "runs": 0,
             "terminal": 0,
             "review_ready": 0,
+            "actionable_review_ready": 0,
+            "reviewer_receipt": 0,
             "validation_failed": 0,
             "other_non_green": 0,
             "source_graph_live_tasks": 0,
@@ -387,6 +397,10 @@ def build_kpi_snapshot(
             bucket["terminal"] += 1
         if state == "review_ready":
             bucket["review_ready"] += 1
+            if topic == QUALITY_REVIEW_TOPIC:
+                bucket["reviewer_receipt"] += 1
+            else:
+                bucket["actionable_review_ready"] += 1
         elif state == "validation_failed":
             bucket["validation_failed"] += 1
         elif state in NON_GREEN_STATES:
@@ -614,6 +628,10 @@ def build_kpi_snapshot(
             "terminal_runs": terminal_runs,
             "review_ready_runs": review_ready,
             "review_ready_rate": _rate(review_ready, terminal_runs),
+            "actionable_review_ready_runs": actionable_review_ready,
+            "actionable_review_ready_rate": _rate(actionable_review_ready, terminal_runs),
+            "reviewer_receipt_runs": reviewer_receipt,
+            "reviewer_receipt_rate": _rate(reviewer_receipt, terminal_runs),
             "validation_failed_runs": validation_failed,
             "validation_failed_rate": _rate(validation_failed, terminal_runs),
             "other_non_green_runs": max(0, non_green - validation_failed),
