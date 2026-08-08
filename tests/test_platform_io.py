@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -52,13 +51,20 @@ def test_chmod_path_skips_posix_mode_on_windows(monkeypatch, tmp_path):
     platform_io.chmod_path(target, 0o600, platform_name="nt")
 
 
-def test_chmod_path_applies_posix_mode(tmp_path):
+def test_chmod_path_applies_posix_mode(monkeypatch, tmp_path):
     target = tmp_path / "private-file"
     target.write_text("ok", encoding="utf-8")
+    calls: list[tuple[object, int]] = []
+
+    monkeypatch.setattr(
+        platform_io.os,
+        "chmod",
+        lambda path, mode: calls.append((path, mode)),
+    )
 
     platform_io.chmod_path(target, 0o600, platform_name="posix")
 
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert calls == [(target, 0o600)]
 
 
 def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
