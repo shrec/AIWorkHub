@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.24";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.25";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2313,10 +2313,30 @@ function vscodeLmBridgeRoot() {
 }
 
 function atomicWriteOwnerJson(filePath, payload) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(path.dirname(filePath), 0o700); } catch (_err) { /* Windows/filesystem */ }
-  atomicWriteJson(filePath, payload);
-  try { fs.chmodSync(filePath, 0o600); } catch (_err) { /* Windows/filesystem */ }
+  const parent = path.dirname(filePath);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(parent, 0o700); } catch (_err) { /* Windows/filesystem */ }
+  const nonce = crypto.randomBytes(6).toString("hex");
+  const tmp = path.join(parent, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${nonce}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    // The temp file must already be owner-private when rename publishes it.
+    // A chmod only after rename leaves a real read-side TOCTOU window.
+    try { fs.chmodSync(tmp, 0o600); } catch (_err) { /* Windows/filesystem */ }
+    fs.renameSync(tmp, filePath);
+    try { fs.chmodSync(filePath, 0o600); } catch (_err) { /* Windows/filesystem */ }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {
+      // Best-effort cleanup; preserve the original filesystem failure.
+    }
+    throw err;
+  }
 }
 
 function vscodeLmModelFields(model) {

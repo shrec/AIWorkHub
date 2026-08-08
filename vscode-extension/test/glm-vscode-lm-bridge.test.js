@@ -813,16 +813,31 @@ async function progressReceiptChecks() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-progress-"));
   try {
     const target = path.join(root, ".aiworkhub_vscode_lm_progress.json");
-    internals.atomicWriteOwnerJson(target, {
-      schema_id: internals.constants.VSCODE_LM_PROGRESS_SCHEMA,
-      request_id: "a".repeat(32),
-      repo_id: "repo_test",
-      sequence: 1,
-      phase: "request_accepted",
-      updated_at: new Date().toISOString(),
-    });
+    const originalRenameSync = fs.renameSync;
+    let publishedTempMode = null;
+    fs.renameSync = (source, destination) => {
+      if (destination === target && process.platform !== "win32") {
+        publishedTempMode = fs.statSync(source).mode & 0o777;
+      }
+      return originalRenameSync(source, destination);
+    };
+    try {
+      internals.atomicWriteOwnerJson(target, {
+        schema_id: internals.constants.VSCODE_LM_PROGRESS_SCHEMA,
+        request_id: "a".repeat(32),
+        repo_id: "repo_test",
+        sequence: 1,
+        phase: "request_accepted",
+        updated_at: new Date().toISOString(),
+      });
+    } finally {
+      fs.renameSync = originalRenameSync;
+    }
     assert.strictEqual(JSON.parse(fs.readFileSync(target, "utf8")).sequence, 1);
     assert.strictEqual(internals.ownerOnlyRegularFile(target), true);
+    if (process.platform !== "win32") {
+      assert.strictEqual(publishedTempMode, 0o600);
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

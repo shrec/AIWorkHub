@@ -981,3 +981,20 @@ class TestV3UnsupportedTopLevel:
 def test_relative_path_rejects_mixed_case_git_component(raw: str) -> None:
     with pytest.raises(RuntimeError, match="bridge_output_path_escape:"):
         vscode_lm_worker._relative_path(raw)
+
+def test_write_atomic_preserves_exact_bytes_no_newline_translation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path
+    relative = "test_file.txt"
+    content = "line1\nline2\nline3\r\nline4\r\n"
+    expected_bytes = content.encode("utf-8")
+    expected_hash = hashlib.sha256(expected_bytes).hexdigest()
+    vscode_lm_worker._write_atomic(workspace, relative, content)
+    target = workspace / relative
+    assert target.exists()
+    actual_bytes = target.read_bytes()
+    assert actual_bytes == expected_bytes
+    actual_hash = hashlib.sha256(actual_bytes).hexdigest()
+    assert actual_hash == expected_hash
+    assert actual_bytes.decode('utf-8') == content

@@ -56,6 +56,10 @@ def test_default_catalog_contains_current_declared_workforce_and_is_idempotent(t
     models = {item["model"] for item in catalog["workers"]}
     assert {"haiku", "sonnet", "opus", "gpt-5.5", "gpt-5.3-codex-spark", "deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2"}.issubset(models)
     assert "opus-4.8" not in models
+    expected_tools = ["filesystem", "source-graph", "session-manager", "ai-memory", "kb", "semantic-edit"]
+    for worker_id in ("deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2"):
+        worker = next(item for item in catalog["workers"] if item["worker_id"] == worker_id)
+        assert worker["tools"] == expected_tools
     deepseek = next(item for item in catalog["workers"] if item["worker_id"] == "deepseek-v4-pro")
     assert deepseek["adapter_id"] == "deepseek_vscode_lm"
     same, created_again = workforce_catalog.ensure_catalog(root)

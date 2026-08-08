@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.25] - 2026-08-08
+
+### Fixed
+
+- VS Code LM semantic edits preserve exact output bytes on Windows instead of
+  allowing newline translation to invalidate the provider-side SHA-256 check.
+- DeepSeek and GLM workforce entries truthfully advertise the callable
+  repository tools exposed by their strict JSON bridge.
+- Owner-private VS Code LM progress receipts are created with mode `0600`
+  before atomic rename on POSIX, removing the rename-before-chmod observation
+  window while retaining Windows portability.
+- Repeated, byte-equivalent authenticated quality-review submissions are
+  treated as one logical receipt after an ambiguous acknowledgement; any
+  conflicting retry still fails closed.
+
+### Tests
+
+- Added deterministic CRLF/LF byte-identity, workforce capability,
+  pre-rename owner-mode, and duplicate/conflicting reviewer-receipt
+  regressions.
+
 ## [0.9.24] - 2026-08-08
 
 ### Fixed

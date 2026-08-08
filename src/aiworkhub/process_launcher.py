@@ -2491,15 +2491,23 @@ def _verified_quality_review_receipt(
         request_id=request_id,
     )
     payloads = verification.get("verified_payloads") or []
-    if len(payloads) != 1:
-        raise WorkspaceError(f"quality_review_submission_count:{len(payloads)}")
+    if not payloads:
+        raise WorkspaceError("quality_review_submission_count:0")
+    # A model may retry the tool after a lost/ambiguous acknowledgement. The
+    # HMAC ledger remains append-only, but identical authenticated retries are
+    # one logical receipt. Conflicting retries still fail closed.
+    receipt_payload = payloads[0]
+    if any(payload != receipt_payload for payload in payloads[1:]):
+        raise WorkspaceError(
+            f"quality_review_submission_conflict:{len(payloads)}"
+        )
     observed_provider = str(metadata.get("adapter_id") or "")
     target = packet.get("target") if isinstance(packet, dict) else None
     if not isinstance(target, dict):
         raise WorkspaceError("quality_review_packet_target_missing")
     if observed_provider == str(target.get("worker_provider") or ""):
         raise WorkspaceError("quality_review_provider_not_independent")
-    receipt = json.loads(json.dumps(payloads[0], ensure_ascii=False))
+    receipt = json.loads(json.dumps(receipt_payload, ensure_ascii=False))
     reviewer = receipt.get("reviewer")
     report = receipt.get("report")
     if not isinstance(reviewer, dict) or not isinstance(report, dict):

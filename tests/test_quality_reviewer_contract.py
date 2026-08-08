@@ -276,6 +276,108 @@ def test_worker_submission_is_packet_bound_and_hmac_audited(tmp_path: Path) -> N
     assert verified["report"]["provider"] == "claude_cli"
 
 
+def test_identical_quality_review_retries_are_one_logical_receipt(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    for _attempt in range(2):
+        result = worker_tools.quality_review_submit(
+            ctx,
+            packet_sha256=str(packet["packet_sha256"]),
+            lens="correctness",
+            findings=[],
+        )
+        assert result["ok"] is True
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=ctx.request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    verified = process_launcher._verified_quality_review_receipt(
+        {
+            "task_id": ctx.task_id,
+            "runner": ctx.runner,
+            "topic": ctx.topic,
+            "adapter_id": "claude_cli",
+            "worker_mcp": {
+                "audit_ledger_path": str(ctx.audit_ledger_path),
+                "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+            },
+            "quality_review": {
+                "packet_path": str(packet_path),
+                "lens": "correctness",
+            },
+        },
+        workspace,
+        ctx.request_id,
+    )
+    assert verified["report"]["findings"] == []
+
+
+def test_conflicting_quality_review_retries_fail_closed(tmp_path: Path) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    assert worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )["ok"] is True
+    assert worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "conflicting-retry",
+            "severity": "low",
+            "summary": "conflicting retry",
+            "evidence": "source.py:1",
+        }],
+    )["ok"] is True
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=ctx.request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="quality_review_submission_conflict:2",
+    ):
+        process_launcher._verified_quality_review_receipt(
+            {
+                "task_id": ctx.task_id,
+                "runner": ctx.runner,
+                "topic": ctx.topic,
+                "adapter_id": "claude_cli",
+                "worker_mcp": {
+                    "audit_ledger_path": str(ctx.audit_ledger_path),
+                    "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+                },
+                "quality_review": {
+                    "packet_path": str(packet_path),
+                    "lens": "correctness",
+                },
+            },
+            workspace,
+            ctx.request_id,
+        )
+
+
 def test_ordinary_worker_cannot_submit_unbound_review(tmp_path: Path) -> None:
     ctx = _worker_context(tmp_path, None)
     result = worker_tools.quality_review_submit(
