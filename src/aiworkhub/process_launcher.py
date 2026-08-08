@@ -354,6 +354,15 @@ def stall_grace_seconds() -> float:
     )
 
 
+def _meaningful_progress_sequence(status: dict[str, Any]) -> Any:
+    """Read the new semantic sequence with an old-status fallback."""
+
+    return status.get(
+        "last_meaningful_progress_sequence",
+        status.get("last_progress_sequence"),
+    )
+
+
 def derive_liveness_state(
     *,
     now_epoch: float,
@@ -5269,8 +5278,8 @@ class ProcessManager:
                             "stall_last_meaningful_progress_epoch": supervisor_status.get(
                                 "last_meaningful_progress_epoch"
                             ),
-                            "stall_last_progress_sequence": supervisor_status.get(
-                                "last_progress_sequence"
+                            "stall_last_progress_sequence": (
+                                _meaningful_progress_sequence(supervisor_status)
                             ),
                             "stall_heartbeat_seq": supervisor_status.get("heartbeat_seq"),
                             "stall_stdout_bytes": supervisor_status.get("stdout_bytes"),
@@ -5682,8 +5691,8 @@ class ProcessManager:
                 "stall_last_meaningful_progress_epoch": supervisor_status.get(
                     "last_meaningful_progress_epoch"
                 ),
-                "stall_last_progress_sequence": supervisor_status.get(
-                    "last_progress_sequence"
+                "stall_last_progress_sequence": _meaningful_progress_sequence(
+                    supervisor_status
                 ),
                 "stall_heartbeat_seq": supervisor_status.get("heartbeat_seq"),
                 "stall_stdout_bytes": supervisor_status.get("stdout_bytes"),
@@ -5786,6 +5795,9 @@ class ProcessManager:
             ),
             "last_meaningful_phase": supervisor_status.get("last_meaningful_phase"),
             "last_progress_sequence": supervisor_status.get("last_progress_sequence"),
+            "last_meaningful_progress_sequence": _meaningful_progress_sequence(
+                supervisor_status
+            ),
         }
 
     def status(self, request_id: str) -> dict[str, Any]:

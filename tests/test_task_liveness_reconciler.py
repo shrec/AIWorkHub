@@ -548,7 +548,8 @@ def test_fresh_heartbeat_without_meaningful_progress_is_truthfully_stalled(
                 "last_output_change_epoch": now,
                 "last_meaningful_progress_epoch": now - 45,
                 "last_meaningful_phase": "tool_turn",
-                "last_progress_sequence": 7,
+                "last_progress_sequence": 99,
+                "last_meaningful_progress_sequence": 7,
                 "stdout_bytes": 120,
                 "stderr_bytes": 0,
                 "child_pid": 0,
@@ -651,6 +652,16 @@ def test_stall_grace_configuration_is_bounded(monkeypatch):
     assert process_launcher.stall_grace_seconds() == 30.0
     monkeypatch.setenv(process_launcher.STALL_GRACE_ENV, "999999")
     assert process_launcher.stall_grace_seconds() == 86_400.0
+
+
+def test_meaningful_progress_sequence_is_backward_compatible():
+    assert process_launcher._meaningful_progress_sequence({
+        "last_progress_sequence": 7,
+    }) == 7
+    assert process_launcher._meaningful_progress_sequence({
+        "last_progress_sequence": 99,
+        "last_meaningful_progress_sequence": 7,
+    }) == 7
 
 
 def test_live_supervisor_before_first_status_write_is_not_failed(tmp_path, monkeypatch):

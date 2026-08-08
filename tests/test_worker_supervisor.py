@@ -117,7 +117,36 @@ def test_supervisor_persists_trusted_progress_phase(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr.decode()
     status = _read_status(Path(spec["status_path"]))
     assert status["last_progress_sequence"] == 3
+    assert status["last_meaningful_progress_sequence"] == 3
     assert status["last_meaningful_phase"] == "final_edit"
+
+
+@pytest.mark.parametrize("adapter_id", sorted(worker_supervisor.TRUSTED_PROGRESS_ADAPTERS))
+def test_provider_response_progress_is_liveness_only(
+    tmp_path: Path, adapter_id: str,
+) -> None:
+    events = [
+        {"type": "aiworkhub_progress", "sequence": 1, "phase": "request_accepted"},
+        {"type": "aiworkhub_progress", "sequence": 2, "phase": "tool_turn"},
+        {"type": "aiworkhub_progress", "sequence": 3, "phase": "provider_response"},
+        {"type": "aiworkhub_progress", "sequence": 4, "phase": "provider_response"},
+    ]
+    script = (
+        "import json,time; events=" + repr(events) + "; "
+        "[(print(json.dumps(event), flush=True), time.sleep(.08)) for event in events]"
+    )
+    spec_path, spec = _spec(tmp_path, [sys.executable, "-c", script])
+    spec.update(adapter_id=adapter_id, heartbeat_interval_seconds=0.03)
+    write_json_0600(spec_path, spec)
+
+    result = _run_supervisor(spec_path)
+
+    assert result.returncode == 0, result.stderr.decode()
+    status = _read_status(Path(spec["status_path"]))
+    assert status["last_progress_sequence"] == 4
+    assert status["last_meaningful_progress_sequence"] == 2
+    assert status["last_meaningful_phase"] == "tool_turn"
+    assert status["last_output_change_epoch"] >= status["last_meaningful_progress_epoch"]
 
 
 def test_supervisor_error_status_salvages_bounded_child_outputs(
