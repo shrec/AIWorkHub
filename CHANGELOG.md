@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.19] - 2026-08-08
+
+### Fixed
+
+- Linux validation sandboxes now permit `chmod`/`fchmod` on process-owned
+  directories strictly beneath the exact request scratch while retaining
+  kernel-resolved path confinement, inode revalidation, ownership checks and
+  fail-closed denial for the scratch root, symlinks, foreign targets and
+  special files.
+- Cost-ledger cache-hit ratios now use only cache-observed rows in both the
+  numerator and denominator, preventing legacy or unobserved cache-token rows
+  from inflating the ratio above its measurable population.
+- The worker MCP module now finishes defining its rework-overlay constants and
+  validators before entering the standalone server, preventing a startup
+  `NameError` and closed stdio connection during real module launch.
+
+### Tests
+
+- Added focused directory metadata broker coverage for path and descriptor
+  operations plus a live JSON-writer validation integration.
+- Added a mixed observed/unobserved cache-metrics regression for cost-ledger
+  aggregation.
+
 ## [0.9.18] - 2026-08-07
 
 ### Fixed

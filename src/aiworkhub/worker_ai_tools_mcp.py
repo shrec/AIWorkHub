@@ -3022,10 +3022,6 @@ def main() -> None:
     server.run()
 
 
-if __name__ == "__main__":
-    main()
-
-
 __all__ = [
     "AUDIT_ENTRY_SCHEMA_ID",
     "AUDIT_LEDGER_VERIFICATION_SCHEMA_ID",
@@ -3180,3 +3176,7 @@ def _apply_rework_overlay_query(
             "candidate_files": [],
         }
     return None
+
+
+if __name__ == "__main__":
+    main()

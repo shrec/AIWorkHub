@@ -51,7 +51,11 @@ class TestBuildNeedfixSnapshot:
         needfix_store.initialize_repository(tmp_path)
 
         def _dummy_create_task(card):
-            return {"task_id": f"task-{card['title']}", "id": f"task-{card['title']}"}
+            return {
+                "ok": True,
+                "task_id": f"task-{card['title']}",
+                "id": f"task-{card['title']}",
+            }
 
         captured = needfix_store.capture_proposal(
             tmp_path, title="Captured", description="D1"

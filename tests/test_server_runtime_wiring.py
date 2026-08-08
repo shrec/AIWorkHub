@@ -150,8 +150,8 @@ def test_server_lifecycle_tools_preserve_public_schema(monkeypatch):
 def test_server_recover_blocked_rework_forwards_public_schema(monkeypatch):
     calls = []
 
-    def recover(task_id, *, feedback_reason=""):
-        calls.append((task_id, feedback_reason))
+    def recover(task_id, *, feedback_reason="", validation_only_replay=False):
+        calls.append((task_id, feedback_reason, validation_only_replay))
         return {"ok": True, "task_id": task_id}
 
     monkeypatch.setattr(core, "recover_blocked_rework", recover)
@@ -159,7 +159,7 @@ def test_server_recover_blocked_rework_forwards_public_schema(monkeypatch):
     result = server.aiworkhub_task_recover_blocked_rework("T_BLOCKED", "focused repair")
 
     assert result == {"ok": True, "task_id": "T_BLOCKED"}
-    assert calls == [("T_BLOCKED", "focused repair")]
+    assert calls == [("T_BLOCKED", "focused repair", False)]
 
 
 def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeypatch):
@@ -171,8 +171,24 @@ def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeyp
         calls.append(("gate", action, kwargs))
         return None
 
-    def recover(root, task_id, *, actor, feedback_reason):
-        calls.append(("recover", root, task_id, actor, feedback_reason))
+    def recover(
+        root,
+        task_id,
+        *,
+        actor,
+        feedback_reason,
+        validation_only_replay=False,
+    ):
+        calls.append(
+            (
+                "recover",
+                root,
+                task_id,
+                actor,
+                feedback_reason,
+                validation_only_replay,
+            )
+        )
         return True, "recovered"
 
     monkeypatch.setattr(core, "_canonical_write_gate", gate)
@@ -196,7 +212,7 @@ def test_core_recover_blocked_rework_uses_canonical_gate_and_transaction(monkeyp
         },
     )
     assert calls[1][0:3] == ("recover", core.repo_root(), "T_BLOCKED")
-    assert calls[1][3:] == (core.CODEX_RUNNER, "focused repair")
+    assert calls[1][3:] == (core.CODEX_RUNNER, "focused repair", False)
 
 
 def test_recover_blocked_rework_is_a_codex_coordinator_action():
