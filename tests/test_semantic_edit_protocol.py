@@ -14,7 +14,7 @@ from aiworkhub import worker_ai_tools_mcp as worker_tools
 def test_prepare_returns_only_fragment_and_truthful_byte_accounting(tmp_path: Path) -> None:
     target = tmp_path / "src" / "module.py"
     target.parent.mkdir()
-    target.write_text("before\ndef target():\n    return 1\nafter\n", encoding="utf-8")
+    target.write_bytes(b"before\ndef target():\n    return 1\nafter\n")
 
     prepared = semantic_edit.prepare_line_target(
         tmp_path,
@@ -81,7 +81,7 @@ def test_worker_semantic_edit_is_hash_bound_atomic_and_idempotent(tmp_path: Path
     repo = tmp_path / "worktree"
     target = repo / "src" / "module.py"
     target.parent.mkdir(parents=True)
-    target.write_text("before\ndef target():\n    return 1\nafter\n", encoding="utf-8")
+    target.write_bytes(b"before\ndef target():\n    return 1\nafter\n")
     ctx = worker_tools.WorkerToolContext(
         task_id="TASK",
         runner="runner",
@@ -122,7 +122,7 @@ def test_worker_semantic_edit_rejects_stale_and_out_of_scope(tmp_path: Path) -> 
     repo = tmp_path / "worktree"
     target = repo / "src" / "module.py"
     target.parent.mkdir(parents=True)
-    target.write_text("one\ntwo\n", encoding="utf-8")
+    target.write_bytes(b"one\ntwo\n")
     ctx = worker_tools.WorkerToolContext(
         task_id="TASK",
         runner="runner",
@@ -145,7 +145,7 @@ def test_worker_semantic_edit_rejects_stale_and_out_of_scope(tmp_path: Path) -> 
     }
 
     prepared = session.prepare(file_path="src/module.py", start_line=1, end_line=1)
-    target.write_text("changed\ntwo\n", encoding="utf-8")
+    target.write_bytes(b"changed\ntwo\n")
     stale = session.apply(
         target_id=prepared["target_id"], new="new", idempotency_key="edit-2"
     )
@@ -223,7 +223,7 @@ def test_verified_audit_exposes_only_semantic_edit_byte_receipt(
     target = repo / "src" / "module.py"
     target.parent.mkdir(parents=True)
     original = "before\ndef target():\n    return 1\nafter\n"
-    target.write_text(original, encoding="utf-8")
+    target.write_bytes(original.encode("utf-8"))
     ledger = tmp_path / "audit.jsonl"
     key_path = tmp_path / "audit.key"
     key_path.write_bytes(b"k" * 32)

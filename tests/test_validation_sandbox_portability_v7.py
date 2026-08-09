@@ -28,6 +28,12 @@ from aiworkhub import worker_workspace
 from aiworkhub.worker_workspace import WorkspaceError
 
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires Linux seccomp user-notification and Landlock",
+)
+
+
 def _self_hosted_validation_exec() -> bool:
     """True when this pytest runs inside an AIWorkHub validation exec sandbox.
 

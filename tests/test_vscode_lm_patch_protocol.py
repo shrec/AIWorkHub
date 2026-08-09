@@ -90,7 +90,7 @@ def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Pat
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text(current, encoding="utf-8")
+    target.write_bytes(current.encode("utf-8"))
 
     result = vscode_lm_worker.run(spec)
 
@@ -141,7 +141,7 @@ def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> N
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text(current, encoding="utf-8")
+    target.write_bytes(current.encode("utf-8"))
     with pytest.raises(RuntimeError, match="ranges_overlap"):
         vscode_lm_worker.run(overlap)
     assert target.read_text(encoding="utf-8") == current
@@ -156,7 +156,7 @@ def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> N
     )
     stale_target = stale_workspace / "src" / "app.py"
     stale_target.parent.mkdir()
-    stale_target.write_text(current, encoding="utf-8")
+    stale_target.write_bytes(current.encode("utf-8"))
     with pytest.raises(RuntimeError, match="stale_hash"):
         vscode_lm_worker.run(stale)
     assert stale_target.read_text(encoding="utf-8") == current
@@ -189,7 +189,7 @@ def test_v2_rejects_stale_hash_before_writing(tmp_path: Path) -> None:
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text("old\n", encoding="utf-8")
+    target.write_bytes(b"old\n")
 
     with pytest.raises(RuntimeError, match="stale_hash"):
         vscode_lm_worker.run(spec)
@@ -221,7 +221,7 @@ def test_v2_rejects_ambiguous_or_noninteger_replacement_count(
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text(current, encoding="utf-8")
+    target.write_bytes(current.encode("utf-8"))
 
     with pytest.raises(RuntimeError, match="replacement_(count|invalid)") as raised:
         vscode_lm_worker.run(spec)
@@ -263,7 +263,7 @@ def test_v2_create_fails_when_target_exists(tmp_path: Path) -> None:
     )
     target = workspace / "docs" / "new.md"
     target.parent.mkdir()
-    target.write_text("existing\n", encoding="utf-8")
+    target.write_bytes(b"existing\n")
 
     with pytest.raises(RuntimeError, match="create_exists"):
         vscode_lm_worker.run(spec)
@@ -296,7 +296,7 @@ def test_v2_create_rejects_nonempty_declared_placeholder(tmp_path: Path) -> None
     )
     target = workspace / "docs" / "new.md"
     target.parent.mkdir()
-    target.write_text("unexpected\n", encoding="utf-8")
+    target.write_bytes(b"unexpected\n")
 
     with pytest.raises(RuntimeError, match="create_exists"):
         vscode_lm_worker.run(spec)
@@ -317,10 +317,10 @@ def test_v2_validates_every_output_before_first_write(tmp_path: Path) -> None:
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text(current, encoding="utf-8")
+    target.write_bytes(current.encode("utf-8"))
     existing = workspace / "docs" / "existing.md"
     existing.parent.mkdir()
-    existing.write_text("keep\n", encoding="utf-8")
+    existing.write_bytes(b"keep\n")
 
     with pytest.raises(RuntimeError, match="create_exists"):
         vscode_lm_worker.run(spec)
@@ -341,7 +341,7 @@ def test_v2_replaces_large_file_and_creates_root_file(tmp_path: Path) -> None:
     )
     target = workspace / "src" / "app.py"
     target.parent.mkdir()
-    target.write_text(content, encoding="utf-8")
+    target.write_bytes(content.encode("utf-8"))
 
     result = vscode_lm_worker.run(spec)
 

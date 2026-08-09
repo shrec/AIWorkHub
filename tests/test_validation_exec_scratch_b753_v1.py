@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("GITHUB_ACTIONS") == "true",
-    reason="GitHub hosted runners cannot execute nested Landlock validation sandboxes",
+    os.name == "nt" or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="requires a POSIX Landlock/seccomp validation sandbox",
 )
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -49,7 +49,7 @@ def _tolerate_nested_seccomp_chmod_denial(monkeypatch: pytest.MonkeyPatch) -> No
     so a denied follow-up chmod never changes the resulting permissions.
     """
     real_chmod = os.chmod
-    real_fchmod = os.fchmod
+    real_fchmod = getattr(os, "fchmod", None)
 
     def _chmod(path, mode, *a, **kw):
         try:
@@ -59,12 +59,14 @@ def _tolerate_nested_seccomp_chmod_denial(monkeypatch: pytest.MonkeyPatch) -> No
 
     def _fchmod(fd, mode):
         try:
+            assert real_fchmod is not None
             return real_fchmod(fd, mode)
         except PermissionError:
             return None
 
     monkeypatch.setattr(os, "chmod", _chmod)
-    monkeypatch.setattr(os, "fchmod", _fchmod)
+    if real_fchmod is not None:
+        monkeypatch.setattr(os, "fchmod", _fchmod)
 
 
 def _manual_workspace(

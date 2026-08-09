@@ -104,6 +104,7 @@ def test_unified_preflight_is_portable_and_truthful_about_unobserved_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _initialized_root(tmp_path)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
     monkeypatch.setattr(
         repo_policy.task_store,
         "storage_readiness",

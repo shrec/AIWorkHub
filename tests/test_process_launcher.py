@@ -725,6 +725,9 @@ def test_external_readonly_sources_fail_closed_on_escape(monkeypatch, tmp_path):
 
 
 def test_deepseek_adapter_adds_only_declared_read_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        process_launcher.runtime_adapters, "_is_windows_host", lambda: False
+    )
     repo = tmp_path / "repo"
     repo.mkdir()
     external = tmp_path / "external"

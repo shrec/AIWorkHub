@@ -416,6 +416,7 @@ def test_workspace_creation_does_not_copy_live_context_databases(monkeypatch: py
 
 
 def test_codex_inner_sandbox_switches_only_under_outer_confinement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
     repo = tmp_path / "repo"
     repo.mkdir()
     exe = tmp_path / "codex"

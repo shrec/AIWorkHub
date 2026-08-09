@@ -29,7 +29,7 @@ def test_validation_failed_candidate_carries_pin_capable_request_identity(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path, "failed-request-1")
-    (workspace.path / "candidate.py").write_text("value = 2\n", encoding="utf-8")
+    (workspace.path / "candidate.py").write_bytes(b"value = 2\n")
 
     evidence = process_launcher._retained_candidate_identity_evidence(
         workspace,

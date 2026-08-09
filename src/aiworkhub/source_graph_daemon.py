@@ -875,12 +875,16 @@ def stop_all_daemons() -> int:
 
 
 def daemon_health(repo_root: Path | str) -> dict[str, Any]:
-    """Read-only health for the repo's daemon, or a not-registered shape
-    if none exists yet (never an error -- an unregistered daemon on an
-    otherwise-healthy repository is a normal, not-degraded state)."""
+    """Read-only daemon and canonical-generation health for a repository.
+
+    An unregistered daemon is a normal, not-degraded process state.  It does
+    not mean that a generation produced by a one-shot or external builder is
+    unavailable, so the canonical database is still probed below.
+    """
     daemon = get_daemon(repo_root)
+    registered = daemon is not None
     if daemon is None:
-        return {
+        out = {
             "ok": True,
             "status": STATUS_STOPPED,
             "running": False,
@@ -905,13 +909,16 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
             "recovery": {"error": "", "phase": "", "elapsed_seconds": 0.0},
             "last_known_good_generation": {},
         }
-    out = daemon.health()
+    else:
+        out = daemon.health()
     # Writable single-flight recovery MUST precede every readonly probe
     # when the daemon is actively recovering or a non-empty journal/WAL
     # sidecar still exists.  During recovery, return the bounded process
     # diagnostics (phase/elapsed/error/LKG) without opening any readonly
     # database connection.
-    if out.get("status") == STATUS_RECOVERY or daemon._has_pending_journal():
+    if daemon is not None and (
+        out.get("status") == STATUS_RECOVERY or daemon._has_pending_journal()
+    ):
         out["registered"] = True
         return out
     # The canonical committed generation remains readable while another
@@ -1009,7 +1016,7 @@ def daemon_health(repo_root: Path | str) -> dict[str, Any]:
         # probe failure must not erase valid local identity or contradict a
         # live query; expose the bounded diagnostic separately.
         out["generation_read_error"] = f"{type(exc).__name__}:{exc}"[:300]
-    out["registered"] = True
+    out["registered"] = registered
     return out
 
 

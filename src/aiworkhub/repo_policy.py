@@ -272,12 +272,23 @@ def _provider_status(
     sandbox_error: str,
 ) -> dict[str, Any]:
     resolution = runtime_adapters.resolve_executable(adapter_id)
+    policy_allowed = adapter_id in policy["providers"]["allowed_adapters"]
     native_windows_cli_without_broker = (
-        _is_windows_host() and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
+        _is_windows_host()
+        and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
+        and sandbox_backend != "windows_appcontainer"
     )
     result: dict[str, Any] = {
         "adapter_id": adapter_id,
-        "policy_allowed": adapter_id in policy["providers"]["allowed_adapters"],
+        "policy_allowed": policy_allowed,
+        # Coverage describes routes this host and repository can actually
+        # support. Windows native CLI routes remain fail-closed until an
+        # AppContainer-grade broker exists, but they must not make healthy
+        # editor-hosted routes look degraded merely by being in the portable
+        # adapter catalog. Explicitly policy-denied routes are likewise not a
+        # required coverage target.
+        "coverage_required": bool(policy_allowed and not native_windows_cli_without_broker),
+        "platform_excluded": bool(native_windows_cli_without_broker),
         "installed": bool(resolution.ok),
         "launchable": bool(resolution.ok),
         "access_observed": False,
@@ -431,8 +442,10 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         errors.append("selected_adapter_unsupported")
     elif selected is not None and not selected["launchable"]:
         errors.append("selected_adapter_not_launchable")
-    launchable_routes = [item for item in providers if item.get("launchable")]
-    unavailable_routes = [item for item in providers if not item.get("launchable")]
+    eligible_routes = [item for item in providers if item.get("coverage_required", True)]
+    excluded_routes = [item for item in providers if not item.get("coverage_required", True)]
+    launchable_routes = [item for item in eligible_routes if item.get("launchable")]
+    unavailable_routes = [item for item in eligible_routes if not item.get("launchable")]
     if not launchable_routes:
         errors.append("no_launchable_provider_routes")
     route_coverage_status = (
@@ -555,11 +568,15 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         "providers": providers,
         "provider_summary": {
             "route_count": len(providers),
+            "eligible_route_count": len(eligible_routes),
             "launchable_route_count": len(launchable_routes),
             "unavailable_route_count": len(unavailable_routes),
+            "excluded_route_count": len(excluded_routes),
             "coverage_status": route_coverage_status,
             "coverage_ratio": (
-                round(len(launchable_routes) / len(providers), 6) if providers else 0.0
+                round(len(launchable_routes) / len(eligible_routes), 6)
+                if eligible_routes
+                else 0.0
             ),
             "unavailable_routes": [
                 {
@@ -569,6 +586,19 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
                     "sandbox_backend": str(item.get("sandbox_backend") or "")[:128],
                 }
                 for item in unavailable_routes
+            ],
+            "excluded_routes": [
+                {
+                    "adapter_id": str(item.get("adapter_id") or "")[:128],
+                    "status": str(item.get("status") or "excluded")[:128],
+                    "reason": str(item.get("reason") or "excluded")[:200],
+                    "exclusion": (
+                        "platform"
+                        if item.get("platform_excluded")
+                        else "policy"
+                    ),
+                }
+                for item in excluded_routes
             ],
         },
         "selected_adapter": selected,

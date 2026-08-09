@@ -153,7 +153,10 @@ def _spawn_sleeper(seconds: float = 30.0) -> subprocess.Popen:
 def _kill_if_alive(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            if os.name == "nt":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
 

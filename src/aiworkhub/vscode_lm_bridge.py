@@ -211,7 +211,10 @@ def _atomic_json_once(
             or current_parent_stat.st_ino != parent_ino
         ):
             raise BridgeError("bridge_parent_identity_changed")
-        if os.fstat(fd).st_mode & 0o777 != 0o600:
+        if (
+            posix_path_modes_supported()
+            and os.fstat(fd).st_mode & 0o777 != 0o600
+        ):
             chmod_fd(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(encoded)
@@ -239,8 +242,16 @@ def _atomic_json_once(
         # path) for handle-bound verification, eliminating a path-based
         # chmod TOCTOU window after replacement. O_NOFOLLOW fails closed on
         # a symlink swapped in during the race.
-        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+        open_flags = os.O_RDONLY | nofollow_flag
         try:
+            if not nofollow_flag:
+                preopen_stat = os.lstat(path)
+                reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                if stat.S_ISLNK(preopen_stat.st_mode) or (
+                    getattr(preopen_stat, "st_file_attributes", 0) & reparse_flag
+                ):
+                    raise BridgeError("bridge_final_path_reparse_point")
             verify_fd = os.open(path, open_flags)
         except FileNotFoundError:
             # Request files are published by rename and may be claimed by the
@@ -252,6 +263,16 @@ def _atomic_json_once(
             raise
         try:
             final_stat = os.fstat(verify_fd)
+            if not nofollow_flag:
+                final_path_stat = os.lstat(path)
+                reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                if (
+                    stat.S_ISLNK(final_path_stat.st_mode)
+                    or getattr(final_path_stat, "st_file_attributes", 0) & reparse_flag
+                    or (final_path_stat.st_dev, final_path_stat.st_ino)
+                    != (final_stat.st_dev, final_stat.st_ino)
+                ):
+                    raise BridgeError("bridge_final_path_identity_changed")
             if (
                 posix_path_modes_supported()
                 and final_stat.st_mode & 0o777 != 0o600

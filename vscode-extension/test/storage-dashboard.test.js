@@ -50,6 +50,8 @@ for (const token of [
   '"Degraded"',
   "secure routes",
   "unavailable",
+  "platform/policy excluded",
+  "eligible_route_count",
   "provider_summary",
   "Repository components",
   "Retention dry run",

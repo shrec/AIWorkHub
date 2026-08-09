@@ -41,8 +41,10 @@ def _ready_preflight_deps(monkeypatch: pytest.MonkeyPatch) -> None:
             "status": "ready",
             "running": True,
             "registered": True,
+            "readable_generation": True,
             "last_success_at": "2026-08-03T00:00:00+00:00",
             "build_revision": "aiworkhub.source_graph.semantic.v5",
+            "files_seen": 1,
         },
     )
     monkeypatch.setattr(repo_policy.task_store, "callback_bridge_health", lambda _root: {"ok": True})
@@ -186,8 +188,10 @@ def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    executable = tmp_path / "claude.exe"
+    executable.write_bytes(b"MZ")
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
-    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: "/bin/true")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: str(executable))
 
     plan = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
 
@@ -195,7 +199,7 @@ def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
     assert plan.validation_reason == runtime_adapters.WINDOWS_NATIVE_CLI_REQUIRES_APPCONTAINER
 
 
-def test_windows_preflight_degrades_native_cli_but_keeps_editor_bridge_ready(
+def test_windows_preflight_excludes_native_cli_but_keeps_editor_bridge_ready(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = _initialized_root(tmp_path)
@@ -228,6 +232,10 @@ def test_windows_preflight_degrades_native_cli_but_keeps_editor_bridge_ready(
     assert by_adapter["claude_cli"]["sandbox_backend"] == ""
     assert by_adapter["glm_vscode_lm"]["launchable"] is True
     assert by_adapter["glm_vscode_lm"]["sandbox_backend"] == "vscode_lm_in_process"
+    assert report["status"] == "ready"
+    assert report["provider_summary"]["coverage_status"] == "full"
+    assert report["provider_summary"]["unavailable_route_count"] == 0
+    assert report["provider_summary"]["excluded_route_count"] == 4
 
 
 def test_editor_model_aliases_resolve_only_to_observed_same_provider_models() -> None:

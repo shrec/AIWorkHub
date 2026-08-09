@@ -26,9 +26,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import select
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -426,10 +428,25 @@ class _StdioSession:
 
     def recv(self, timeout: float = 20.0) -> dict:
         assert self.proc.stdout is not None
-        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
-        if not ready:
-            raise TimeoutError("bundled MCP fallback runtime did not respond in time")
-        line = self.proc.stdout.readline()
+        if os.name == "nt":
+            # Windows ``select`` accepts sockets only, not subprocess pipes.
+            # A daemon reader preserves the same bounded protocol timeout.
+            received: queue.Queue[str] = queue.Queue(maxsize=1)
+            threading.Thread(
+                target=lambda: received.put(self.proc.stdout.readline()),
+                daemon=True,
+            ).start()
+            try:
+                line = received.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    "bundled MCP fallback runtime did not respond in time"
+                ) from exc
+        else:
+            ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+            if not ready:
+                raise TimeoutError("bundled MCP fallback runtime did not respond in time")
+            line = self.proc.stdout.readline()
         if line == "":
             stderr = self.proc.stderr.read() if self.proc.stderr else ""
             raise EOFError(f"bundled MCP fallback runtime exited unexpectedly: {stderr[-2000:]}")

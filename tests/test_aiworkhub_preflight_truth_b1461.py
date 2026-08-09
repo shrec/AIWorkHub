@@ -65,6 +65,7 @@ def test_cli_adapter_is_not_launchable_without_enforceable_sandbox(monkeypatch, 
 def test_ready_vscode_lm_route_does_not_require_subprocess_sandbox(monkeypatch, tmp_path):
     root = _root(tmp_path)
     _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: False)
     monkeypatch.setattr(
         repo_policy.worker_workspace,
         "select_sandbox_backend",
@@ -103,6 +104,50 @@ def test_ready_vscode_lm_route_does_not_require_subprocess_sandbox(monkeypatch, 
         item["adapter_id"] and item["status"] and item["reason"]
         for item in report["provider_summary"]["unavailable_routes"]
     )
+
+
+def test_windows_platform_exclusions_do_not_degrade_ready_editor_routes(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError("windows_appcontainer_sandbox_unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "/bin/x", True, ""
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "access_observed": True,
+            "consent_required": False,
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+    summary = report["provider_summary"]
+
+    assert report["ok"] is True
+    assert report["status"] == "ready"
+    assert report["warnings"] == []
+    assert summary["coverage_status"] == "full"
+    assert summary["eligible_route_count"] == 3
+    assert summary["launchable_route_count"] == 3
+    assert summary["unavailable_route_count"] == 0
+    assert summary["excluded_route_count"] == 4
+    assert summary["coverage_ratio"] == 1.0
+    assert all(item["exclusion"] == "platform" for item in summary["excluded_routes"])
 
 
 def test_zero_launchable_routes_is_a_global_preflight_blocker(monkeypatch, tmp_path):

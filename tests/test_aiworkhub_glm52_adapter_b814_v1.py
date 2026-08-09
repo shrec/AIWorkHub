@@ -24,6 +24,11 @@ FAKE_KEY = "sk-glm-B814-FAKE-not-a-real-key"
 ADAPTER = "glm_copilot_cli"
 
 
+@pytest.fixture(autouse=True)
+def _exercise_portable_adapter_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
+
+
 def _copilot(tmp_path: Path) -> Path:
     exe = tmp_path / "copilot"
     fd = os.open(exe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o755)

@@ -431,6 +431,7 @@ def test_acceptance_5c_copy_one_symlink_source_fails(
         worker_workspace._copy_one(sym, tmp_path / "dst")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode semantics")
 def test_acceptance_5d_copy_one_executable_mode(
     tmp_path: Path,
 ) -> None:

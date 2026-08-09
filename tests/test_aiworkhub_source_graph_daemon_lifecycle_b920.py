@@ -412,6 +412,21 @@ def test_daemon_health_hydrates_fresh_canonical_generation_for_standby(
     assert health["files_seen"] == report.files_seen
 
 
+def test_daemon_health_hydrates_generation_without_registered_daemon(tmp_path):
+    root = _init_repo(tmp_path, "one_shot_reader")
+    report = source_graph.build_index(root, incremental=False)
+    assert source_graph_daemon.get_daemon(root) is None
+
+    health = source_graph_daemon.daemon_health(root)
+
+    assert health["status"] == source_graph_daemon.STATUS_STOPPED
+    assert health["registered"] is False
+    assert health["readable_generation"] is True
+    assert health["last_success_at"] == report.finished_at
+    assert health["build_revision"] == report.build_revision
+    assert health["files_seen"] == report.files_seen
+
+
 def test_daemon_health_hydrates_canonical_generation_while_indexing(
     tmp_path, monkeypatch,
 ):

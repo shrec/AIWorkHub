@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ast
 import fnmatch
+import os
 import shutil
 import subprocess
 import sys
@@ -803,6 +804,11 @@ def _run_command_array(
     """Run one exact argv array, shell=False. Returns (status, stdout, stderr, duration)."""
 
     argv = [sys.executable if part == "{python}" else part for part in command]
+    if os.name == "nt" and argv and argv[0] in {"python", "python3"}:
+        # Repository quality manifests are shared across hosts. Windows does
+        # not consistently install the POSIX ``python3`` launcher alias, so
+        # bind that interpreter token to the already-running trusted runtime.
+        argv[0] = sys.executable
     start = time.monotonic()
     try:
         completed = subprocess.run(

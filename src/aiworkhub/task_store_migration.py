@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -171,7 +172,10 @@ def schema_fingerprint(conn: sqlite3.Connection) -> str:
 
 def parity_snapshot(path: str | Path, *, repo_id: str = "") -> dict[str, Any]:
     path = Path(path)
-    with _connect(path, readonly=True) as conn:
+    # ``sqlite3.Connection.__exit__`` commits/rolls back but does not close the
+    # handle. An explicit closing context is required before Windows can
+    # atomically replace a parity-checked database during cutover.
+    with closing(_connect(path, readonly=True)) as conn:
         counts = {
             table: int(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"])
             if _table_exists(conn, table)

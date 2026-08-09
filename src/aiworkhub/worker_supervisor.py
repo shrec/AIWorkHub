@@ -266,6 +266,32 @@ def _posix_worker_spawn_kwargs(platform: str | None = None) -> dict[str, Any]:
 
 
 def _pid_start_ticks(pid: int) -> int | None:
+    if os.name == "nt":
+        class _FileTime(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        creation = _FileTime()
+        exit_time = _FileTime()
+        kernel = _FileTime()
+        user = _FileTime()
+        try:
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (int(creation.high) << 32) | int(creation.low)
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         _head, separator, tail = raw.rpartition(")")

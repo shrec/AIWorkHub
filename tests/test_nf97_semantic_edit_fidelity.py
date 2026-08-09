@@ -79,7 +79,7 @@ def test_large_punctuation_only_shrink_rejected_but_v3_delete_allowed() -> None:
 def test_v1_and_create_payloads_use_the_same_gate(tmp_path: Path) -> None:
     existing = tmp_path / "src" / "app.py"
     existing.parent.mkdir()
-    existing.write_text("x" * 2048, encoding="utf-8")
+    existing.write_bytes(("x" * 2048).encode("utf-8"))
     with pytest.raises(RuntimeError, match="explicit_non_substantive_marker"):
         worker._v1_planned_outputs(
             tmp_path,
@@ -97,8 +97,8 @@ def test_v1_and_create_payloads_use_the_same_gate(tmp_path: Path) -> None:
 def test_v2_rejected_late_edit_cannot_partially_mutate(tmp_path: Path) -> None:
     first = tmp_path / "first.py"
     second = tmp_path / "second.py"
-    first.write_text("needle\n", encoding="utf-8")
-    second.write_text("needle\n", encoding="utf-8")
+    first.write_bytes(b"needle\n")
+    second.write_bytes(b"needle\n")
     edit = {
         "edits": [
             {
@@ -127,7 +127,7 @@ def test_v2_rejected_late_edit_cannot_partially_mutate(tmp_path: Path) -> None:
 def test_v3_ranges_and_creates_are_gated_and_delete_remains_valid(tmp_path: Path) -> None:
     target = tmp_path / "app.py"
     old = "x" * 2048 + "\n"
-    target.write_text(old, encoding="utf-8")
+    target.write_bytes(old.encode("utf-8"))
     base = {"path": "app.py", "current_sha256": _sha(old)}
     with pytest.raises(RuntimeError, match="explicit_non_substantive_marker"):
         worker._v3_planned_outputs(

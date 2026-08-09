@@ -36,11 +36,12 @@ import re
 import sqlite3
 import stat
 import sys
+import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from . import source_graph_ast as sgast
@@ -285,7 +286,21 @@ def index_write_lease(repo_root: Path):
             if os.name == "nt":
                 import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                # Windows may retain a byte-range lock for a very short window
+                # while another build handle is closing. Avoid surfacing that
+                # release race as a false permanent build-in-progress state,
+                # while remaining bounded when another writer is genuinely
+                # active.
+                deadline = time.monotonic() + 1.0
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.01)
+                        handle.seek(0)
             else:
                 import fcntl
 
@@ -2330,7 +2345,10 @@ def _validate_single_file_path(repo_root: Path, path: str) -> Path:
         raise SourceGraphError("source_graph_single_file_path_null_byte")
     rel = Path(path)
     # --- Lexical checks before any filesystem access ---
-    if rel.is_absolute():
+    # ``WindowsPath('/etc/passwd')`` is rooted but not considered absolute
+    # because it has no drive. Treat both path dialects as untrusted input so
+    # a POSIX absolute path is rejected consistently on Windows too.
+    if rel.is_absolute() or PurePosixPath(path).is_absolute():
         raise SourceGraphError(
             f"source_graph_single_file_absolute:{path}"
         )

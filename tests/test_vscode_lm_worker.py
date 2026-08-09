@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
 import stat
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
@@ -13,6 +16,38 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import vscode_lm_worker  # noqa: E402
+
+
+def test_main_stdout_is_safe_for_legacy_windows_code_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        vscode_lm_worker,
+        "run",
+        lambda _path: {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "Move → 測試",
+            "project_context_receipt": "",
+        },
+    )
+    raw = io.BytesIO()
+    legacy_stdout = io.TextIOWrapper(
+        raw,
+        encoding="cp1251",
+        errors="strict",
+        newline="",
+    )
+
+    with redirect_stdout(legacy_stdout):
+        assert vscode_lm_worker.main(["--spec", str(tmp_path / "unused.json")]) == 0
+        legacy_stdout.flush()
+
+    output = raw.getvalue().decode("cp1251")
+    assert "\\u2192" in output
+    assert json.loads(output)["result"] == "Move → 測試"
 
 
 def test_root_and_nested_existing_files_preserve_mode_bits(
@@ -184,7 +219,10 @@ def _make_v3_edit(
     """Create a minimal V3 edit payload for testing."""
     target = workspace / file_path
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    # Hash the same bytes that exist on disk. Path.write_text() performs
+    # platform newline translation on Windows and would make the fixture's
+    # LF-based digest stale before the worker sees it.
+    target.write_bytes(content.encode("utf-8"))
     file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     edits = []
@@ -378,7 +416,7 @@ class TestV3SamePathMultiRange:
         original = "line1\nline2\n"
         target = tmp_path / "src" / "module.py"
         target.parent.mkdir(parents=True)
-        target.write_text(original, encoding="utf-8")
+        target.write_bytes(original.encode("utf-8"))
         file_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
 
         edit_payload: dict[str, object] = {
@@ -572,7 +610,7 @@ class TestV3SamePathMultiRange:
         original = "line1\nline2\nline3\n"
         target = tmp_path / "src" / "module.py"
         target.parent.mkdir(parents=True)
-        target.write_text(original, encoding="utf-8")
+        target.write_bytes(original.encode("utf-8"))
 
         # Use a hash that doesn't match the actual file
         stale_hash = hashlib.sha256(b"something else\n").hexdigest()
@@ -719,7 +757,7 @@ class TestRunSpecPathIntegration:
         workspace.mkdir()
         target = workspace / file_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(original, encoding="utf-8")
+        target.write_bytes(original.encode("utf-8"))
         file_hash = hashlib.sha256(
             original.encode("utf-8")
         ).hexdigest()

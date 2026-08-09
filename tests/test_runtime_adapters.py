@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -13,6 +14,13 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import runtime_adapters  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _exercise_portable_adapter_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep command-shape tests independent of the executing host OS."""
+
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
 
 
 def _executable(tmp_path: Path, name: str) -> Path:
@@ -318,6 +326,8 @@ def test_absolute_executable_override_bypasses_which(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("kind", ["relative", "missing", "directory", "not_executable"])
 def test_unsafe_executable_overrides_are_rejected(kind, tmp_path):
+    if kind == "not_executable" and os.name == "nt":
+        pytest.skip("Windows has no POSIX executable mode bit")
     repo = tmp_path / "repo"
     repo.mkdir()
 

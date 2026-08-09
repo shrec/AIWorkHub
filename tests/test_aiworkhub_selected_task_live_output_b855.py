@@ -47,8 +47,8 @@ def _seed_task(
     stdout_path = tmp_path / f"{request_id}.stdout.log"
     stderr_path = tmp_path / f"{request_id}.stderr.log"
     if include_paths:
-        stdout_path.write_text(stdout_text, encoding="utf-8")
-        stderr_path.write_text(stderr_text, encoding="utf-8")
+        stdout_path.write_bytes(stdout_text.encode("utf-8"))
+        stderr_path.write_bytes(stderr_text.encode("utf-8"))
     event = {
         "request_id": request_id,
         "task_id": task_id,
@@ -86,8 +86,8 @@ def test_cursor_incremental_refresh(repo) -> None:
 
     # Append more bytes to the same stdout log, as a live worker would.
     stdout_path = repo / "req-1.stdout.log"
-    with stdout_path.open("a", encoding="utf-8") as fh:
-        fh.write("second-chunk\n")
+    with stdout_path.open("ab") as fh:
+        fh.write(b"second-chunk\n")
 
     second = process_launcher.read_live_output_for_task("TASK_B855_INCR", repo=repo, cursor=cursor)
     assert second["ok"] is True

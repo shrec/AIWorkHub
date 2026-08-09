@@ -468,7 +468,11 @@ function renderSummary(snapshot) {
       : {};
     const unavailableRoutes = asArray(providerSummary.unavailable_routes).length
       ? asArray(providerSummary.unavailable_routes)
-      : providers.filter((item) => item && !item.launchable);
+      : providers.filter((item) => item && item.coverage_required !== false && !item.launchable);
+    const excludedRoutes = asArray(providerSummary.excluded_routes);
+    const eligibleRouteCount = Number.isFinite(Number(providerSummary.eligible_route_count))
+      ? Number(providerSummary.eligible_route_count)
+      : Math.max(0, providers.length - excludedRoutes.length);
     const coverageStatus = String(providerSummary.coverage_status || (
       readyProviders === 0 ? "blocked" : (readyProviders < providers.length ? "degraded" : "full")
     ));
@@ -479,12 +483,15 @@ function renderSummary(snapshot) {
       : "Unavailable";
     elements.headerPreflightDetail.textContent = preflight
       ? (brokerModels.length
-        ? `${brokerModels.length} editor models · ${readyProviders}/${providers.length} secure routes · ${unavailableRoutes.length} unavailable`
-        : `${readyProviders}/${providers.length} secure routes · ${unavailableRoutes.length} unavailable`)
+        ? `${brokerModels.length} editor models · ${readyProviders}/${eligibleRouteCount} secure routes · ${unavailableRoutes.length} unavailable${excludedRoutes.length ? ` · ${excludedRoutes.length} platform/policy excluded` : ""}`
+        : `${readyProviders}/${eligibleRouteCount} secure routes · ${unavailableRoutes.length} unavailable${excludedRoutes.length ? ` · ${excludedRoutes.length} platform/policy excluded` : ""}`)
       : "No evidence";
     if (elements.headerPreflight) {
       const unavailableDetail = unavailableRoutes
         .map((item) => `${String((item && item.adapter_id) || "unknown")}: ${String((item && item.reason) || "unavailable")}`)
+        .join(" · ");
+      const excludedDetail = excludedRoutes
+        .map((item) => `${String((item && item.adapter_id) || "unknown")}: ${String((item && item.reason) || "excluded")}`)
         .join(" · ");
       elements.headerPreflight.title = preflight
         ? (errors.length
@@ -493,7 +500,7 @@ function renderSummary(snapshot) {
             ? `Usable with reduced route coverage · ${unavailableDetail}`
             : (broker && !broker.launchable
             ? `Core preflight passed; editor model broker ${broker.reason || "unavailable"}`
-            : "Repository, policy, runtime and editor model broker preflight passed")))
+            : `Repository, policy, runtime and editor model broker preflight passed${excludedDetail ? ` · Optional routes excluded: ${excludedDetail}` : ""}`)))
         : "Unified preflight unavailable";
     }
   }
