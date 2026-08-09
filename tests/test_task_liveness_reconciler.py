@@ -810,15 +810,17 @@ def test_successful_exit_reconciled_after_launcher_disappearance_runs_each_step_
     assert latest["state"] == "review_ready"
     assert card["status"] == "review"
     # enforce_scope runs twice by design (re-checked after validations, in
-    # case a validation command itself changed files). Validation and the
-    # review transition each run exactly once; canonical promotion is deferred
-    # to the coordinator's accept_review operation.
-    assert calls == {"enforce_scope": 2, "run_validations": 1, "promote": 0, "mark_review": 1}
+    # case a validation command itself changed files). This card declares an
+    # empty validation contract, so route resolution, scratch provisioning and
+    # the validation executor are skipped entirely. The review transition runs
+    # exactly once; canonical promotion is deferred to the coordinator's
+    # accept_review operation.
+    assert calls == {"enforce_scope": 2, "run_validations": 0, "promote": 0, "mark_review": 1}
 
     # --- idempotent double scan: a second scan must be a total no-op ---
     result2 = task_reconciler.run_scan(manager)
     assert result2["ok"] is True
-    assert calls == {"enforce_scope": 2, "run_validations": 1, "promote": 0, "mark_review": 1}
+    assert calls == {"enforce_scope": 2, "run_validations": 0, "promote": 0, "mark_review": 1}
     events_after = manager._request_events("req-exited-orphaned")
     assert len(events_after) == len(events)
 

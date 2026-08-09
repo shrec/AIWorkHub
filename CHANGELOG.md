@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.35] - 2026-08-09
+
+### Fixed
+
+- Empty validation contracts now short-circuit in the finalizer before route
+  resolution, executable-scratch provisioning, or child-process dispatch.
+  This makes `validation=[]` authoritative for ordinary workers, retained
+  finalization retries and provider-free validation-only replay on Windows.
+- Retryable `validation_exec_scratch_unavailable` infrastructure failures now
+  use the canonical operational-failure transition instead of masquerading as
+  quality-review work. Task review queue, completion inbox and reviewer
+  eligibility therefore agree on the exact request state while the retained
+  workspace remains available for provider-free retry.
+- Blank or non-list validation contracts fail explicitly instead of reaching
+  sandbox setup with ambiguous execution intent.
+
+### Tests
+
+- Added finalizer-level empty-validation route/scratch denial and operational
+  scratch classification regressions; the focused lifecycle matrix passes 69
+  tests.
+
 ## [0.9.34] - 2026-08-09
 
 ### Fixed

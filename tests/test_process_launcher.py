@@ -1023,6 +1023,13 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
         "mark_review",
         lambda *a, **k: mark_review_calls.append((a, k)) or {"ok": True},
     )
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty validation must not resolve a sandbox route")
+        ),
+    )
 
     manager._append_event({
         "request_id": "req-review-first-1",
@@ -1079,6 +1086,41 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     }
     assert evidence["workspace"]["request_id"] == "req-review-first-1"
     assert evidence["workspace"]["path"] == str(workspace_dir)
+
+
+def test_empty_declared_validation_skips_route_and_scratch(monkeypatch, tmp_path):
+    workspace = SimpleNamespace(path=tmp_path, home=tmp_path)
+    monkeypatch.setattr(
+        process_launcher,
+        "_validation_route_kwargs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty validation must not resolve a route")
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "run_validations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("empty validation must not enter the executor")
+        ),
+    )
+
+    assert process_launcher._run_declared_validations(
+        workspace,
+        {"validation": []},
+        {"adapter_id": "vscode_lm", "sandbox_backend": "deterministic_validation"},
+    ) == []
+
+
+def test_operational_scratch_failure_is_not_quality_review_eligible():
+    error = "validation_exec_scratch_unavailable:request-home:noexec"
+
+    assert process_launcher._is_operational_validation_failure(
+        "validation_failed", error
+    ) is True
+    assert process_launcher._is_operational_validation_failure(
+        "validation_failed", "validation_failed:pytest:rc=1"
+    ) is False
 
 
 def test_finalize_isolated_request_validation_only_replay_authorization(

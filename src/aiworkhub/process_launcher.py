@@ -314,6 +314,53 @@ def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, str]:
         )
     return {"backend": expected_backend, "adapter_id": adapter_id}
 
+
+def _declared_validation_commands(authority: Mapping[str, Any]) -> list[str]:
+    """Return the exact non-empty validation contract from card/metadata.
+
+    An empty contract is authoritative: it must not resolve a route, provision
+    executable scratch, or run a child process.  Keeping this decision above
+    keyword-argument evaluation prevents downstream route setup from turning
+    ``validation=[]`` into an operational failure before ``run_validations``
+    can apply its own empty fast path.
+    """
+    raw = authority.get("validation")
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise WorkspaceError("validation_commands_invalid")
+    commands: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise WorkspaceError("validation_command_invalid")
+        commands.append(value)
+    return commands
+
+
+def _run_declared_validations(
+    workspace: WorkerWorkspace,
+    authority: Mapping[str, Any],
+    route_metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    commands = _declared_validation_commands(authority)
+    if not commands:
+        return []
+    return run_validations(
+        workspace,
+        commands,
+        **_validation_route_kwargs(route_metadata),
+    )
+
+
+def _is_operational_validation_failure(terminal_state: str, error: str) -> bool:
+    """Classify retryable infrastructure validation failures consistently."""
+    return terminal_state == "validation_failed" and (
+        error.startswith("validation_exec_scratch_unavailable:")
+        or error.startswith(
+            "validation_failed:validation_exec_scratch_unavailable:"
+        )
+    )
+
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
 # to pending, or moved it to blocked), the retained workspace is no longer the
@@ -5748,10 +5795,8 @@ class ProcessManager:
                         # must not erase the otherwise useful test evidence or
                         # force the coordinator to rerun the worker merely to
                         # learn whether its candidate builds.
-                        validations = run_validations(
-                            workspace,
-                            metadata.get("validation") or [],
-                            **_validation_route_kwargs(metadata),
+                        validations = _run_declared_validations(
+                            workspace, metadata, metadata
                         )
                         if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
                             raise WorkspaceError(
@@ -5937,7 +5982,9 @@ class ProcessManager:
                         },
                         **retained_candidate,
                     }
-                    if terminal_state == "finalize_failed":
+                    if terminal_state == "finalize_failed" or (
+                        _is_operational_validation_failure(terminal_state, error)
+                    ):
                         terminal_evidence["error"] = error[:500]
                         release_result = self._terminal_failure_exact(
                             metadata,
@@ -7366,10 +7413,8 @@ class ProcessManager:
                         or report.get("can_mutate_repo") is not False
                     ):
                         raise WorkspaceError("quality_review_receipt_not_readonly")
-                    validations = run_validations(
-                        workspace,
-                        card.get("validation") or [],
-                        **_validation_route_kwargs(latest),
+                    validations = _run_declared_validations(
+                        workspace, card, latest
                     )
                 except WorkspaceError as exc:
                     return {
@@ -7509,10 +7554,8 @@ class ProcessManager:
                             "validation_required_aiworkhub_mcp_call_missing:"
                             + str(worker_mcp_gate.get("reason") or "")
                         )
-                    validations = run_validations(
-                        workspace,
-                        card.get("validation") or [],
-                        **_validation_route_kwargs(latest),
+                    validations = _run_declared_validations(
+                        workspace, card, latest
                     )
                 except WorkspaceError as exc:
                     return {
@@ -7653,10 +7696,8 @@ class ProcessManager:
                         changed,
                     )
                     try:
-                        union_validations = run_validations(
-                            union_workspace,
-                            card.get("validation") or [],
-                            **_validation_route_kwargs(latest),
+                        union_validations = _run_declared_validations(
+                            union_workspace, card, latest
                         )
                         union_quality = quality_evidence.run_completion_quality_gate(
                             union_workspace.path,
@@ -7785,10 +7826,8 @@ class ProcessManager:
                 quality_gate["destructive_change_confirmed"] = bool(
                     confirm_destructive_change and destructive_blockers
                 )
-                validations = run_validations(
-                    workspace,
-                    card.get("validation") or [],
-                    **_validation_route_kwargs(latest),
+                validations = _run_declared_validations(
+                    workspace, card, latest
                 )
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(
