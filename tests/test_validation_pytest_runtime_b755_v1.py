@@ -426,6 +426,7 @@ class WindowsPytestRuntimeModeBitsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._prepare_root(tmp)
             real_stat = os.stat
+            native_path_type = type(Path())
 
             def fake_stat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
                 info = real_stat(path, *args, **kwargs)
@@ -434,6 +435,7 @@ class WindowsPytestRuntimeModeBitsTest(unittest.TestCase):
                 )
 
             with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(worker_workspace, "Path", native_path_type), \
                     mock.patch.object(
                         worker_workspace.site,
                         "getusersitepackages",
@@ -451,7 +453,9 @@ class WindowsPytestRuntimeModeBitsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "site-packages")
             os.makedirs(root, exist_ok=True)
+            native_path_type = type(Path())
             with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(worker_workspace, "Path", native_path_type), \
                     mock.patch.object(
                         worker_workspace.site,
                         "getusersitepackages",
@@ -466,7 +470,9 @@ class WindowsPytestRuntimeModeBitsTest(unittest.TestCase):
     def test_windows_missing_directory_still_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, "absent-site-packages")
+            native_path_type = type(Path())
             with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(worker_workspace, "Path", native_path_type), \
                     mock.patch.object(
                         worker_workspace.site,
                         "getusersitepackages",
