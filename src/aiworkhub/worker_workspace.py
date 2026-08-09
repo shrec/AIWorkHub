@@ -1857,7 +1857,19 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
     """
     if directory.is_symlink() or not directory.is_dir():
         return False
-    probe_path = directory / f".exec_probe_{uuid.uuid4().hex}"
+    windows = sys.platform == "win32"
+    suffix = ".exe" if windows else ""
+    probe_path = directory / f".exec_probe_{uuid.uuid4().hex}{suffix}"
+    if windows:
+        comspec = os.environ.get("COMSPEC", "").strip()
+        if not comspec:
+            return False
+        try:
+            probe_payload = Path(comspec).read_bytes()
+        except OSError:
+            return False
+    else:
+        probe_payload = _EXEC_PROBE_SCRIPT
     try:
         # The executable bit is requested directly on the atomic O_CREAT --
         # never via a separate chmod(2)/fchmod(2) follow-up call. This keeps
@@ -1872,13 +1884,27 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
         return False
     try:
         try:
-            os.write(fd, _EXEC_PROBE_SCRIPT)
+            os.write(fd, probe_payload)
         finally:
             os.close(fd)
+        if windows:
+            # Execute a private copy from the candidate itself. Invoking the
+            # original COMSPEC on a .cmd file would only prove that cmd.exe
+            # can *read* the directory, not that Windows policy permits a
+            # native validation artifact located there to execute.
+            argv = [str(probe_path), "/d", "/c", "exit 0"]
+            probe_env = {
+                "COMSPEC": comspec,
+                "PATH": os.environ.get("PATH", ""),
+                "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
+            }
+        else:
+            argv = [str(probe_path)]
+            probe_env = {"PATH": "/usr/bin:/bin"}
         result = subprocess.run(
-            [str(probe_path)],
+            argv,
             cwd=str(directory),
-            env={"PATH": "/usr/bin:/bin"},
+            env=probe_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -1893,7 +1919,7 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
 
 
 def _probe_metadata_capable_dir(directory: Path) -> bool:
-    """Best-effort, self-cleaning probe for git-required chmod semantics."""
+    """Best-effort, self-cleaning probe for platform metadata semantics."""
     if directory.is_symlink() or not directory.is_dir():
         return False
     probe_path = directory / f".metadata_probe_{uuid.uuid4().hex}"
@@ -1901,14 +1927,22 @@ def _probe_metadata_capable_dir(directory: Path) -> bool:
         fd = os.open(probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except OSError:
         return False
+    replacement_path: Path | None = None
     try:
         os.close(fd)
+        if sys.platform == "win32":
+            replacement_path = directory / f".metadata_replace_{uuid.uuid4().hex}"
+            replacement_path.write_bytes(b"aiworkhub")
+            os.replace(replacement_path, probe_path)
+            return probe_path.read_bytes() == b"aiworkhub"
         os.chmod(probe_path, 0o600)
         return stat.S_IMODE(os.stat(probe_path).st_mode) == 0o600
     except OSError:
         return False
     finally:
         probe_path.unlink(missing_ok=True)
+        if replacement_path is not None:
+            replacement_path.unlink(missing_ok=True)
 
 
 def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
@@ -1923,7 +1957,18 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     """
     name = f"{_EXEC_SCRATCH_NAME_PREFIX}{workspace.request_id}"
     tried: list[str] = []
-    for raw_root in _exec_scratch_candidate_roots():
+    candidate_roots = list(_exec_scratch_candidate_roots())
+    if (
+        sys.platform == "win32"
+        and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
+    ):
+        # The request-private HOME is already inside AIWorkHub's retained
+        # workspace boundary. Prefer it on Windows: unlike POSIX, Windows has
+        # no mount-level executable bit to gain from /dev/shm, and global
+        # TEMP may be denied by enterprise policy even when the repo-owned
+        # runtime is usable.
+        candidate_roots.insert(0, workspace.home)
+    for raw_root in candidate_roots:
         root = raw_root.expanduser()
         try:
             resolved_root = root.resolve(strict=True)

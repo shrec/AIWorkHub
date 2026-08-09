@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.32] - 2026-08-09
+
+### Fixed
+
+- Windows validation scratch probing is now platform-aware. Editor-hosted
+  worker finalization prefers the request-private retained workspace, executes
+  a native probe copy from the candidate directory, and verifies Windows
+  metadata with atomic replace instead of requiring POSIX shebang/chmod
+  semantics. Enterprise-denied global `%TEMP%` no longer masks a usable
+  repository-owned runtime boundary as `noexec`.
+- Tasks with no validation commands are regression-protected from provisioning
+  executable scratch, so a successful no-validation worker can proceed to
+  canonical review without an unrelated scratch capability gate.
+
+### Tests
+
+- Added Windows-simulated native execution, atomic metadata, private scratch
+  priority and empty-validation regressions. The focused finalization and
+  validation matrix passes with 167 tests; the full repository suite passes
+  with 2,615 tests and 28 platform skips.
+
 ## [0.9.31] - 2026-08-09
 
 ### Fixed

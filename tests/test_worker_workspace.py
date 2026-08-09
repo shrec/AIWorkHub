@@ -1580,6 +1580,87 @@ def test_probe_metadata_capable_dir_rejects_chmod_hostile_filesystem(
     assert worker_workspace._probe_metadata_capable_dir(good) is False
 
 
+def test_windows_exec_probe_executes_private_native_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    comspec = tmp_path / "cmd.exe"
+    comspec.write_bytes(b"fake portable executable")
+
+    def _run(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs["env"])))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", str(comspec))
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _run)
+
+    assert worker_workspace._probe_exec_capable_dir(tmp_path) is True
+    argv, env = calls[0]
+    assert argv[0].endswith(".exe")
+    assert argv[1:] == ["/d", "/c", "exit 0"]
+    assert env["COMSPEC"] == str(comspec)
+    assert list(tmp_path.iterdir()) == [comspec]
+
+
+def test_windows_metadata_probe_uses_atomic_replace_not_posix_chmod(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.setattr(
+        worker_workspace.os,
+        "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Windows metadata probe must not require chmod")
+        ),
+    )
+
+    assert worker_workspace._probe_metadata_capable_dir(tmp_path) is True
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_windows_scratch_prefers_request_private_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = _bare_workspace(tmp_path, "windows-private-home")
+    fallback = tmp_path / "global-temp"
+    fallback.mkdir()
+    monkeypatch.setattr(worker_workspace.sys, "platform", "win32")
+    monkeypatch.delenv(
+        worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (fallback,)
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_exec_capable_dir", lambda _directory: True
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_metadata_capable_dir", lambda _directory: True
+    )
+
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    try:
+        assert scratch.parent == workspace.home.resolve()
+    finally:
+        worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
+def test_empty_validation_never_provisions_exec_scratch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = _bare_workspace(tmp_path, "empty-validation-no-scratch")
+    monkeypatch.setattr(
+        worker_workspace,
+        "provision_validation_exec_scratch",
+        lambda _workspace: (_ for _ in ()).throw(
+            AssertionError("empty validation must not provision scratch")
+        ),
+    )
+
+    assert worker_workspace.run_validations(workspace, []) == []
+
+
 def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
