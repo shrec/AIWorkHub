@@ -1816,11 +1816,14 @@ def aiworkhub_agent_retry_finalization(
     request_id: str,
     task_id: str,
 ) -> dict[str, Any]:
-    """COORDINATOR/WRITE-GATED: retry one retained ``finalize_failed`` request.
+    """COORDINATOR/WRITE-GATED: retry one retained finalization request.
 
     The provider/model is never launched again. The exact successful worker
     request, retained workspace, task identity and supervisor exit receipt are
     revalidated before deterministic validation/finalization is re-entered.
+    A validation failure is eligible only when its durable reason is the
+    operational ``validation_exec_scratch_unavailable`` condition; ordinary
+    product/test failures remain non-retryable.
     """
 
     return process_launcher.default_manager().retry_finalization(

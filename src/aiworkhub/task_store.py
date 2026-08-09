@@ -1279,9 +1279,11 @@ def retry_finalize_failed(
 
     This is deliberately narrower than rework recovery: it never increments
     the claim epoch, creates a new provider attempt, or changes task identity.
-    The exact blocked ``finalize_failed`` request is restored solely so the
-    trusted coordinator can re-run deterministic finalization against its
-    retained workspace.
+    The exact blocked request is restored solely so the trusted coordinator
+    can re-run deterministic finalization against its retained workspace.
+    Besides ``finalize_failed``, only the explicitly operational
+    ``validation_exec_scratch_unavailable`` validation failure is eligible;
+    ordinary product/test failures remain terminal and require rework.
     """
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
@@ -1308,17 +1310,28 @@ def retry_finalize_failed(
         if str(card.get("launch_request_id") or "") != request_id:
             return False, "launch_request_mismatch"
         terminal_record = (
-            card.get("terminal_failure")
+            card.get("terminal_failure") or card.get("terminal_review")
             if current_status == "blocked"
             else card.get("terminal_review")
         )
         if not isinstance(terminal_record, dict):
             return False, "finalize_failed_terminal_record_missing"
-        if str(terminal_record.get("substatus") or "") != "finalize_failed":
-            return False, "terminal_substatus_not_finalize_failed"
+        terminal_substatus = str(terminal_record.get("substatus") or "")
         evidence = terminal_record.get("evidence")
         if not isinstance(evidence, dict):
             return False, "terminal_failure_evidence_missing"
+        evidence_error = str(evidence.get("error") or "")
+        retryable_validation_failure = (
+            terminal_substatus == "validation_failed"
+            and (
+                evidence_error.startswith("validation_exec_scratch_unavailable:")
+                or evidence_error.startswith(
+                    "validation_failed:validation_exec_scratch_unavailable:"
+                )
+            )
+        )
+        if terminal_substatus != "finalize_failed" and not retryable_validation_failure:
+            return False, "terminal_substatus_not_retryable_finalization_failure"
         evidence_request_id = str(
             evidence.get("request_id")
             or (evidence.get("request_identity") or {}).get("request_id")
@@ -1336,6 +1349,7 @@ def retry_finalize_failed(
             "actor": actor,
             "authorized_at": now,
             "provider_relaunch": False,
+            "source_substatus": terminal_substatus,
         }
         card.pop("blocker_reason", None)
         source_worker_status = str(row["worker_status"] or "")

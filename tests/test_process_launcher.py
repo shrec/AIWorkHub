@@ -209,8 +209,18 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    ("terminal_state", "terminal_error"),
+    [
+        ("finalize_failed", ""),
+        (
+            "validation_failed",
+            "validation_exec_scratch_unavailable:C:\\Temp:noexec",
+        ),
+    ],
+)
 def test_retry_finalization_reuses_retained_workspace_without_provider(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, terminal_state, terminal_error
 ):
     _open_gates(monkeypatch)
     from aiworkhub import worker_workspace
@@ -261,7 +271,8 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
         "runner": "claude_worker_b1",
         "topic": "task_mcp",
         "adapter_id": "vscode_lm",
-        "state": "finalize_failed",
+        "state": terminal_state,
+        "error": terminal_error,
         "metadata_path": str(metadata_path),
         "supervisor_status_path": str(status_path),
         "workspace_retained": True,
@@ -301,6 +312,34 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
         "TASK_B1",
         "claude_worker_b1",
         request_id,
+    )
+
+
+def test_retry_finalization_rejects_product_validation_failure(monkeypatch, tmp_path):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="blocked")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "e" * 32
+    manager._append_event(
+        {
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "state": "validation_failed",
+            "error": "validation_failed:python3 -m pytest:rc=1",
+            "workspace_retained": True,
+        }
+    )
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "request_not_retryable_finalization_failure:validation_failed"
     )
 
 

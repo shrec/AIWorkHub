@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.33] - 2026-08-09
+
+### Fixed
+
+- Retained finalization retry now recovers the narrowly operational
+  `validation_exec_scratch_unavailable` failure after a successful worker exit,
+  without relaunching or charging the provider. Ordinary failing tests and
+  product validation errors remain non-retryable and require normal rework.
+- Completion inbox classification keeps retryable validation-scratch failures
+  out of the ordinary quality-review queue and exposes them as operational
+  failures, eliminating the transient `review` /
+  `quality_review_target_not_review_ready` split-brain.
+
+### Tests
+
+- Added positive provider-free scratch-recovery tests and negative product-test
+  retry denial at both process and durable task-store boundaries, plus inbox
+  classification coverage.
+
 ## [0.9.32] - 2026-08-09
 
 ### Fixed

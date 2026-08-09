@@ -274,6 +274,86 @@ def test_finalize_failed_retry_reenters_same_claim_without_new_attempt(tmp_path)
     assert after["finalization_retry"]["provider_relaunch"] is False
 
 
+def test_operational_validation_scratch_failure_retries_without_new_attempt(tmp_path):
+    repo = _init_repo(tmp_path)
+    task_id = "TASK_VALIDATION_SCRATCH_RETRY"
+    runner = "claude_worker_b921"
+    request_id = f"request-{task_id.lower()}"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id="thread-validation-scratch-retry",
+        runner=runner,
+    )
+    failed = task_engine.mark_terminal_review(
+        repo,
+        task_id,
+        runner,
+        "validation_failed",
+        evidence={
+            "request_id": request_id,
+            "error": "validation_exec_scratch_unavailable:C:\\Temp:noexec",
+        },
+    )
+    assert failed["ok"] is True
+    before = task_store.get_task(repo, task_id)
+    claim_epoch = before["claim_epoch"]
+
+    ok, state = task_store.retry_finalize_failed(
+        repo,
+        task_id,
+        runner=runner,
+        request_id=request_id,
+        actor="codex",
+    )
+
+    assert (ok, state) == (True, "processing")
+    after = task_store.get_task(repo, task_id)
+    assert after["claim_epoch"] == claim_epoch
+    assert after["finalization_retry"] == {
+        "request_id": request_id,
+        "actor": "codex",
+        "authorized_at": after["finalization_retry"]["authorized_at"],
+        "provider_relaunch": False,
+        "source_substatus": "validation_failed",
+    }
+
+
+def test_product_validation_failure_cannot_use_finalization_retry(tmp_path):
+    repo = _init_repo(tmp_path)
+    task_id = "TASK_PRODUCT_VALIDATION_FAILURE"
+    runner = "claude_worker_b921"
+    request_id = f"request-{task_id.lower()}"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id="thread-product-validation-failure",
+        runner=runner,
+    )
+    failed = task_engine.mark_terminal_review(
+        repo,
+        task_id,
+        runner,
+        "validation_failed",
+        evidence={
+            "request_id": request_id,
+            "error": "validation_failed:python3 -m pytest:rc=1",
+        },
+    )
+    assert failed["ok"] is True
+
+    ok, state = task_store.retry_finalize_failed(
+        repo,
+        task_id,
+        runner=runner,
+        request_id=request_id,
+        actor="codex",
+    )
+
+    assert ok is False
+    assert state == "terminal_substatus_not_retryable_finalization_failure"
+
+
 def test_legacy_review_finalize_failed_is_retryable_but_not_other_review(tmp_path):
     repo = _init_repo(tmp_path)
     task_id = "TASK_LEGACY_FINALIZE_RETRY"

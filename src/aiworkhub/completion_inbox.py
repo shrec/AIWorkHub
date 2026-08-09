@@ -304,6 +304,15 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         )
         or ""
     )
+    terminal_evidence = (
+        terminal_review.get("evidence")
+        if isinstance(terminal_review, dict)
+        and isinstance(terminal_review.get("evidence"), dict)
+        else {}
+    )
+    operational_error = str(
+        terminal_evidence.get("error") or card.get("validation_error") or ""
+    )
     return {
         "task_id": card.get("task_id"),
         "runner": card.get("runner"),
@@ -316,9 +325,23 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         "review_at": card.get("review_at", ""),
         "validation_status": card.get("validation_status", "unreported"),
         "terminal_substatus": terminal_substatus,
+        "operational_error": operational_error[:300] or None,
         "quality_reviewer_eligible": terminal_substatus == "review_ready",
         "runner_task_batch_mismatch": mismatch or None,
     }
+
+
+def _is_operational_finalization_failure(entry: dict[str, Any]) -> bool:
+    substatus = str(entry.get("terminal_substatus") or "")
+    if substatus == "finalize_failed":
+        return True
+    error = str(entry.get("operational_error") or "")
+    return substatus == "validation_failed" and (
+        error.startswith("validation_exec_scratch_unavailable:")
+        or error.startswith(
+            "validation_failed:validation_exec_scratch_unavailable:"
+        )
+    )
 
 
 def _stale_processing_entry(
@@ -377,8 +400,9 @@ def build_completion_inbox(
       * ``review_queue``: cards in canonical state "review" (awaiting Codex),
         excluding non-reviewable finalizer failures, newest ``updated_at``
         first.
-      * ``operational_failures``: legacy ``review/finalize_failed`` cards that
-        require retained finalization retry rather than quality review.
+      * ``operational_failures``: legacy ``review/finalize_failed`` cards and
+        narrowly retryable validation-scratch failures that require retained
+        finalization retry rather than quality review.
       * ``stale_processing``: cards in canonical state "processing" whose
         last recorded activity timestamp (``updated_at``, falling back to
         ``started_at`` then ``claimed_at``) is older than
@@ -430,12 +454,12 @@ def build_completion_inbox(
     operational_failures = [
         entry
         for entry in review_entries
-        if entry.get("terminal_substatus") == "finalize_failed"
+        if _is_operational_finalization_failure(entry)
     ]
     review_queue = [
         entry
         for entry in review_entries
-        if entry.get("terminal_substatus") != "finalize_failed"
+        if not _is_operational_finalization_failure(entry)
     ]
     review_queue.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     operational_failures.sort(

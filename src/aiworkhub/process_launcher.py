@@ -6787,14 +6787,25 @@ class ProcessManager:
                     "task_id": task_id,
                     "error": "request_task_identity_mismatch",
                 }
-            if str(latest.get("state") or "") != "finalize_failed":
+            latest_state = str(latest.get("state") or "")
+            latest_error = str(latest.get("error") or "")
+            retryable_validation_failure = (
+                latest_state == "validation_failed"
+                and (
+                    latest_error.startswith("validation_exec_scratch_unavailable:")
+                    or latest_error.startswith(
+                        "validation_failed:validation_exec_scratch_unavailable:"
+                    )
+                )
+            )
+            if latest_state != "finalize_failed" and not retryable_validation_failure:
                 return {
                     "ok": False,
                     "request_id": request_id,
                     "task_id": task_id,
                     "error": (
-                        "request_not_finalize_failed:"
-                        + str(latest.get("state") or "missing")
+                        "request_not_retryable_finalization_failure:"
+                        + (latest_state or "missing")
                     ),
                 }
             metadata_path = self._metadata_from_events(events)

@@ -122,7 +122,7 @@ def test_scenario_completion():
     )
 
 
-def test_finalize_failed_is_operational_not_ordinary_review_queue():
+def test_finalization_failures_are_operational_not_ordinary_review_queue():
     cards = {
         "TASK_REVIEW_READY": {
             "task_id": "TASK_REVIEW_READY",
@@ -137,6 +137,19 @@ def test_finalize_failed_is_operational_not_ordinary_review_queue():
             "topic": "task_mcp",
             "terminal_substatus": "finalize_failed",
             "updated_at": "2026-08-09T00:00:01+00:00",
+        },
+        "TASK_VALIDATION_SCRATCH_FAILED": {
+            "task_id": "TASK_VALIDATION_SCRATCH_FAILED",
+            "runner": "worker_scratch",
+            "topic": "task_mcp",
+            "terminal_substatus": "validation_failed",
+            "terminal_review": {
+                "substatus": "validation_failed",
+                "evidence": {
+                    "error": "validation_exec_scratch_unavailable:C:\\Temp:noexec"
+                },
+            },
+            "updated_at": "2026-08-09T00:00:02+00:00",
         },
     }
 
@@ -165,10 +178,11 @@ def test_finalize_failed_is_operational_not_ordinary_review_queue():
     ]
     assert result["review_queue"][0]["quality_reviewer_eligible"] is True
     assert [row["task_id"] for row in result["operational_failures"]] == [
+        "TASK_VALIDATION_SCRATCH_FAILED",
         "TASK_FINALIZE_FAILED"
     ]
     assert result["counts"]["review_queue"] == 1
-    assert result["counts"]["operational_failures"] == 1
+    assert result["counts"]["operational_failures"] == 2
 
 
 # ===========================================================================
