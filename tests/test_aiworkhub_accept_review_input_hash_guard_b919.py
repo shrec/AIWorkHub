@@ -373,7 +373,11 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "validate_required_outputs",
         lambda _ws, _req, allow_empty=(), allow_unchanged=(): [],
     )
-    monkeypatch.setattr(process_launcher, "run_validations", lambda _ws, _validation: [])
+    monkeypatch.setattr(
+        process_launcher,
+        "run_validations",
+        lambda _ws, _validation, **_kwargs: [],
+    )
     monkeypatch.setattr(process_launcher, "cleanup_workspace", lambda *_a, **_k: None)
     monkeypatch.setattr(process_launcher.core, "writes_allowed", lambda: True)
 

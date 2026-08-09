@@ -1267,6 +1267,117 @@ _REWORK_ELIGIBLE_SUBSTATUSES: frozenset[str] = frozenset(
 )
 
 
+def retry_finalize_failed(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    request_id: str,
+    actor: str = "codex",
+) -> tuple[bool, str]:
+    """Re-enter processing for the same retained finalization attempt only.
+
+    This is deliberately narrower than rework recovery: it never increments
+    the claim epoch, creates a new provider attempt, or changes task identity.
+    The exact blocked ``finalize_failed`` request is restored solely so the
+    trusted coordinator can re-run deterministic finalization against its
+    retained workspace.
+    """
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        current_status = canonical_status(dict(row))
+        if current_status not in {"blocked", "review"}:
+            return False, f"not_finalize_failed_terminal:current={current_status}"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            return False, "card_json_invalid"
+        if not isinstance(card, dict):
+            return False, "card_json_not_dict"
+        if str(card.get("launch_request_id") or "") != request_id:
+            return False, "launch_request_mismatch"
+        terminal_record = (
+            card.get("terminal_failure")
+            if current_status == "blocked"
+            else card.get("terminal_review")
+        )
+        if not isinstance(terminal_record, dict):
+            return False, "finalize_failed_terminal_record_missing"
+        if str(terminal_record.get("substatus") or "") != "finalize_failed":
+            return False, "terminal_substatus_not_finalize_failed"
+        evidence = terminal_record.get("evidence")
+        if not isinstance(evidence, dict):
+            return False, "terminal_failure_evidence_missing"
+        evidence_request_id = str(
+            evidence.get("request_id")
+            or (evidence.get("request_identity") or {}).get("request_id")
+            or ""
+        )
+        if evidence_request_id and evidence_request_id != request_id:
+            return False, "terminal_failure_request_mismatch"
+
+        now = datetime.now(timezone.utc).isoformat()
+        card["status"] = "processing"
+        card["worker_status"] = "claimed"
+        card["claimed_by"] = runner
+        card["finalization_retry"] = {
+            "request_id": request_id,
+            "actor": actor,
+            "authorized_at": now,
+            "provider_relaunch": False,
+        }
+        card.pop("blocker_reason", None)
+        source_worker_status = str(row["worker_status"] or "")
+        cur = conn.execute(
+            "UPDATE tasks SET status='processing', worker_status='claimed', "
+            "claimed_by=?, completed_at=NULL, updated_at=?, card_json=? "
+            "WHERE task_id=? AND status=? AND worker_status=? AND card_json=?",
+            (
+                runner,
+                now,
+                json.dumps(card, ensure_ascii=False, sort_keys=True),
+                task_id,
+                str(row["status"] or ""),
+                source_worker_status,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "finalization_retry_transition_conflict"
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'finalization_retry_started', ?, ?, ?)",
+            (
+                task_id,
+                actor,
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "provider_relaunch": False,
+                    },
+                    sort_keys=True,
+                ),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "processing"
+    finally:
+        conn.close()
+
+
 def recover_blocked_rework(
     root: str | Path,
     task_id: str,

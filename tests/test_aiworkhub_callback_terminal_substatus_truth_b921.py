@@ -234,6 +234,77 @@ def test_blocked_terminal_failure_remains_callback_eligible(
     )
 
 
+def test_finalize_failed_retry_reenters_same_claim_without_new_attempt(tmp_path):
+    repo = _init_repo(tmp_path)
+    task_id = "TASK_FINALIZE_RETRY"
+    runner = "claude_worker_b921"
+    request_id = f"request-{task_id.lower()}"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id="thread-finalize-retry",
+        runner=runner,
+    )
+    failed = task_engine.mark_terminal_failure(
+        repo,
+        task_id,
+        runner,
+        "finalize_failed",
+        evidence={"request_id": request_id, "error": "transient-finalizer"},
+        request_id=request_id,
+    )
+    assert failed["ok"] is True
+    before = task_store.get_task(repo, task_id)
+    claim_epoch = before["claim_epoch"]
+
+    ok, state = task_store.retry_finalize_failed(
+        repo,
+        task_id,
+        runner=runner,
+        request_id=request_id,
+        actor="codex",
+    )
+
+    assert (ok, state) == (True, "processing")
+    after = task_store.get_task(repo, task_id)
+    assert after["status"] == "processing"
+    assert after["worker_status"] == "claimed"
+    assert after["claimed_by"] == runner
+    assert after["claim_epoch"] == claim_epoch
+    assert after["finalization_retry"]["provider_relaunch"] is False
+
+
+def test_legacy_review_finalize_failed_is_retryable_but_not_other_review(tmp_path):
+    repo = _init_repo(tmp_path)
+    task_id = "TASK_LEGACY_FINALIZE_RETRY"
+    runner = "claude_worker_b921"
+    request_id = f"request-{task_id.lower()}"
+    _seed_processing_task(
+        repo,
+        task_id,
+        origin_thread_id="thread-legacy-finalize-retry",
+        runner=runner,
+    )
+    reviewed = task_engine.mark_terminal_review(
+        repo,
+        task_id,
+        runner,
+        "finalize_failed",
+        evidence={"error": "windows_appcontainer_sandbox_unavailable"},
+    )
+    assert reviewed["ok"] is True
+
+    ok, state = task_store.retry_finalize_failed(
+        repo,
+        task_id,
+        runner=runner,
+        request_id=request_id,
+        actor="codex",
+    )
+
+    assert (ok, state) == (True, "processing")
+
+
 def test_normalize_callback_transition_public_wrapper_matches_private_map():
     assert callback_store.normalize_callback_transition("validation_failed") == "validation_failed"
     assert callback_store.normalize_callback_transition("review") == "review_ready"

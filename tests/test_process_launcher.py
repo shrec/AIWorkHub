@@ -209,6 +209,101 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     )
 
 
+def test_retry_finalization_reuses_retained_workspace_without_provider(
+    monkeypatch, tmp_path
+):
+    _open_gates(monkeypatch)
+    from aiworkhub import worker_workspace
+
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="review")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "d" * 32
+    worktree_root = tmp_path / "worktrees"
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(worktree_root))
+    workspace_path = worktree_root / request_id / "worktree"
+    home_path = worktree_root / request_id / "home"
+    workspace_path.parent.mkdir(parents=True)
+    workspace_path.mkdir()
+    home_path.mkdir()
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=manager.repo,
+        path=workspace_path,
+        home=home_path,
+        allowed_writes=("out/result.json",),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    status_path = manager.process_dir / f"{request_id}.supervisor.json"
+    metadata_path = manager.process_dir / f"{request_id}.request.json"
+    worker_workspace.write_json_0600(
+        status_path, {"state": "exited", "exit_code": 0}
+    )
+    worker_workspace.write_json_0600(
+        metadata_path,
+        {
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "vscode_lm",
+            "sandbox_backend": "vscode_lm_in_process",
+            "supervisor_status_path": str(status_path),
+            "workspace": workspace.as_metadata(),
+        },
+    )
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "vscode_lm",
+        "state": "finalize_failed",
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+        "workspace_retained": True,
+    })
+    transitions = []
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "retry_finalize_failed",
+        lambda *args, **kwargs: transitions.append((args, kwargs)) or {
+            "ok": True,
+            "stderr": "",
+        },
+    )
+
+    def finalize(request_id_arg, supervisor_returncode=None):
+        latest = manager._request_events(request_id_arg)[-1]
+        assert latest["state"] == "finalizing"
+        assert latest["finalization_retry"] is True
+        assert latest["finalization_retry_provider_launched"] is False
+        assert supervisor_returncode == 0
+        return {
+            "request_id": request_id_arg,
+            "task_id": "TASK_B1",
+            "state": "review_ready",
+            "workspace_retained": True,
+            "error": "",
+        }
+
+    monkeypatch.setattr(manager, "_finalize_isolated_request", finalize)
+
+    result = manager.retry_finalization(request_id, "TASK_B1")
+
+    assert result["ok"] is True, result
+    assert result["state"] == "review_ready"
+    assert result["provider_relaunched"] is False
+    assert transitions and transitions[0][0][1:4] == (
+        "TASK_B1",
+        "claude_worker_b1",
+        request_id,
+    )
+
+
 def test_reconcile_watches_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,

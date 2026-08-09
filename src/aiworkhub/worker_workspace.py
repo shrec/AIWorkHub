@@ -3679,6 +3679,8 @@ def run_validations(
     commands: Iterable[str],
     *,
     timeout_seconds: int = MAX_VALIDATION_SECONDS,
+    backend: str | None = None,
+    adapter_id: str = "",
 ) -> list[dict[str, Any]]:
     rows = list(commands)
     if len(rows) > MAX_VALIDATION_COMMANDS:
@@ -3691,8 +3693,25 @@ def run_validations(
     if not rows:
         return []
     results: list[dict[str, Any]] = []
-    backend = select_sandbox_backend()
-    validation_home = workspace.home if backend == "landlock" else None
+    selected_backend = backend or select_sandbox_backend()
+    if selected_backend not in {
+        "landlock",
+        "bubblewrap",
+        VSCODE_LM_IN_PROCESS_BACKEND,
+    }:
+        raise WorkspaceError(f"unsupported_sandbox_backend:{selected_backend}")
+    if (
+        selected_backend == VSCODE_LM_IN_PROCESS_BACKEND
+        and adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS
+    ):
+        raise WorkspaceError(
+            f"vscode_lm_in_process_validation_adapter_forbidden:{adapter_id}"
+        )
+    validation_home = (
+        workspace.home
+        if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+        else None
+    )
     bounded_timeout = max(1, min(timeout_seconds, MAX_VALIDATION_SECONDS))
     # B753: one private, exec-probed scratch directory for this whole
     # validation run -- provisioned before any command executes, and always
@@ -3701,7 +3720,9 @@ def run_validations(
     # or any other exception propagating out of this function).
     scratch_dir = provision_validation_exec_scratch(workspace)
     scratch_env_value = (
-        str(scratch_dir) if backend == "landlock" else SANDBOX_VALIDATION_EXEC_SCRATCH
+        str(scratch_dir)
+        if selected_backend in {"landlock", VSCODE_LM_IN_PROCESS_BACKEND}
+        else SANDBOX_VALIDATION_EXEC_SCRATCH
     )
     try:
         for command in rows:
@@ -3728,23 +3749,45 @@ def run_validations(
                     tokens, workspace.repo
                 )
             )
-            wrapped = sandbox_argv(
-                workspace,
-                "validation",
-                tokens,
-                backend=backend,
-                validation_readonly_dirs=_validation_pythonpath_readonly_dirs(
-                    effective_components
-                ),
-                validation_exec_scratch=scratch_dir,
-                validation_cwd=cd_relative,
-                validation_executable_roots=validation_executable_roots,
-            )
+            if selected_backend == VSCODE_LM_IN_PROCESS_BACKEND:
+                # The editor-hosted provider has already stopped.  This is a
+                # trusted-manager finalization step, not a second model or a
+                # native CLI worker launch: execute only the card's exact,
+                # shell-free argv inside the retained isolated worktree.  The
+                # adapter allowlist above prevents native routes from using
+                # this boundary to bypass their AppContainer requirement.
+                wrapped = list(tokens)
+                resolved_cwd = (
+                    _resolve_validation_cwd(workspace, cd_relative)
+                    if cd_relative is not None
+                    else ""
+                )
+                subprocess_cwd: str | Path = (
+                    workspace.path / Path(*PurePosixPath(resolved_cwd).parts)
+                    if resolved_cwd
+                    else workspace.path
+                )
+                execution_boundary = "trusted_manager_shell_free_validation"
+            else:
+                wrapped = sandbox_argv(
+                    workspace,
+                    "validation",
+                    tokens,
+                    backend=selected_backend,
+                    validation_readonly_dirs=_validation_pythonpath_readonly_dirs(
+                        effective_components
+                    ),
+                    validation_exec_scratch=scratch_dir,
+                    validation_cwd=cd_relative,
+                    validation_executable_roots=validation_executable_roots,
+                )
+                subprocess_cwd = "/"
+                execution_boundary = "os_sandbox"
             env = sanitized_env(
                 "validation",
                 home=validation_home,
                 isolated_task_queue_db=True,
-                verify_preprovisioned_home=backend == "landlock",
+                verify_preprovisioned_home=selected_backend == "landlock",
             )
             env["TMPDIR"] = scratch_env_value
             env["TMP"] = scratch_env_value
@@ -3769,7 +3812,7 @@ def run_validations(
             env_override_evidence: dict[str, Any] | None = None
             if effective_components:
                 env["PYTHONPATH"] = resolve_validation_pythonpath(
-                    workspace, backend, effective_components
+                    workspace, selected_backend, effective_components
                 )
                 env_override_evidence = {
                     "variable": "PYTHONPATH",
@@ -3784,7 +3827,7 @@ def run_validations(
             try:
                 result = subprocess.run(
                     wrapped,
-                    cwd="/",
+                    cwd=subprocess_cwd,
                     env=env,
                     text=True,
                     stdout=subprocess.PIPE,
@@ -3814,6 +3857,8 @@ def run_validations(
                         "argv_rewritten": declared_argv != tokens,
                         "cwd": cd_relative,
                         "env_override": env_override_evidence,
+                        "sandbox_backend": selected_backend,
+                        "execution_boundary": execution_boundary,
                         "returncode": None,
                         "timed_out": True,
                         "duration_seconds": round(time.monotonic() - started, 6),
@@ -3837,6 +3882,8 @@ def run_validations(
                 "argv_rewritten": declared_argv != tokens,
                 "cwd": cd_relative,
                 "env_override": env_override_evidence,
+                "sandbox_backend": selected_backend,
+                "execution_boundary": execution_boundary,
                 "returncode": result.returncode,
                 "duration_seconds": round(time.monotonic() - started, 6),
                 "stdout_head": stdout[:4_096],

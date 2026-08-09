@@ -1231,6 +1231,61 @@ def test_empty_validation_list_never_resolves_host_sandbox(monkeypatch, tmp_path
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+def test_editor_route_validation_uses_retained_workspace_without_host_sandbox(
+    monkeypatch, tmp_path, repo
+):
+    workspace = _workspace(monkeypatch, tmp_path, repo, "editor-route-validation")
+    (workspace.path / "verify_route.py").write_text(
+        "from pathlib import Path\n"
+        "assert Path.cwd() == Path(__file__).resolve().parent\n"
+        "print('route-aware-validation-ok')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable"
+            )
+        ),
+    )
+    try:
+        result, = worker_workspace.run_validations(
+            workspace,
+            [f"{sys.executable} verify_route.py"],
+            backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+            adapter_id="vscode_lm",
+        )
+        assert result["returncode"] == 0
+        assert result["sandbox_backend"] == "vscode_lm_in_process"
+        assert result["execution_boundary"] == (
+            "trusted_manager_shell_free_validation"
+        )
+        assert "route-aware-validation-ok" in result["stdout_tail"]
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_native_adapter_cannot_borrow_editor_validation_boundary(
+    monkeypatch, tmp_path, repo
+):
+    workspace = _workspace(monkeypatch, tmp_path, repo, "native-route-denied")
+    try:
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="vscode_lm_in_process_validation_adapter_forbidden:claude_cli",
+        ):
+            worker_workspace.run_validations(
+                workspace,
+                [f"{sys.executable} -c pass"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="claude_cli",
+            )
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
 def test_validation_cd_prefix_is_removed_from_executable_argv() -> None:
     argv, components, tmpdir_override, cwd = worker_workspace._parse_validation_command_detailed(
         "cd read && python3 x.py"

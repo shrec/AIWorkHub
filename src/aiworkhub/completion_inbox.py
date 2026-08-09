@@ -294,6 +294,16 @@ def _fetch_full_cards(
 
 
 def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]:
+    terminal_review = card.get("terminal_review")
+    terminal_substatus = str(
+        card.get("terminal_substatus")
+        or (
+            terminal_review.get("substatus")
+            if isinstance(terminal_review, dict)
+            else ""
+        )
+        or ""
+    )
     return {
         "task_id": card.get("task_id"),
         "runner": card.get("runner"),
@@ -305,6 +315,8 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         "updated_at": card.get("updated_at", ""),
         "review_at": card.get("review_at", ""),
         "validation_status": card.get("validation_status", "unreported"),
+        "terminal_substatus": terminal_substatus,
+        "quality_reviewer_eligible": terminal_substatus == "review_ready",
         "runner_task_batch_mismatch": mismatch or None,
     }
 
@@ -363,7 +375,10 @@ def build_completion_inbox(
 
     Facets:
       * ``review_queue``: cards in canonical state "review" (awaiting Codex),
-        newest ``updated_at`` first.
+        excluding non-reviewable finalizer failures, newest ``updated_at``
+        first.
+      * ``operational_failures``: legacy ``review/finalize_failed`` cards that
+        require retained finalization retry rather than quality review.
       * ``stale_processing``: cards in canonical state "processing" whose
         last recorded activity timestamp (``updated_at``, falling back to
         ``started_at`` then ``claimed_at``) is older than
@@ -408,11 +423,24 @@ def build_completion_inbox(
 
     cards_by_status = dict(buckets)
 
-    review_queue = [
+    review_entries = [
         _compact_review_entry(card, _runner_task_batch_mismatch(card))
         for card in cards_by_status["review"]
     ]
+    operational_failures = [
+        entry
+        for entry in review_entries
+        if entry.get("terminal_substatus") == "finalize_failed"
+    ]
+    review_queue = [
+        entry
+        for entry in review_entries
+        if entry.get("terminal_substatus") != "finalize_failed"
+    ]
     review_queue.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    operational_failures.sort(
+        key=lambda x: x.get("updated_at", ""), reverse=True
+    )
 
     stale_processing = []
     for card in cards_by_status["processing"]:
@@ -455,6 +483,7 @@ def build_completion_inbox(
             "stale_processing_hours": stale_processing_hours,
         },
         "review_queue": review_queue,
+        "operational_failures": operational_failures,
         "stale_processing": stale_processing,
         "runner_mismatch_warnings": runner_mismatch_warnings,
         "latest_validation_facts": latest_validation_facts,
@@ -463,6 +492,7 @@ def build_completion_inbox(
             "processing_scanned": len(cards_by_status["processing"]),
             "review_scanned": len(cards_by_status["review"]),
             "review_queue": len(review_queue),
+            "operational_failures": len(operational_failures),
             "stale_processing": len(stale_processing),
             "runner_mismatch_warnings": len(runner_mismatch_warnings),
             "latest_validation_facts": len(latest_validation_facts),

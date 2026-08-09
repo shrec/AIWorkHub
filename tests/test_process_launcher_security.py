@@ -157,6 +157,11 @@ def _open_gates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "auth_status",
+        lambda: {"launchable": True, "blocker_reason": ""},
+    )
 
 
 def _lifecycle_fakes(monkeypatch: pytest.MonkeyPatch, card: dict) -> list[tuple]:

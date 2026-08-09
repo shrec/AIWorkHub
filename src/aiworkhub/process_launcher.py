@@ -284,6 +284,26 @@ def _sandbox_backend_for_adapter(adapter_id: str) -> str:
         return VSCODE_LM_IN_PROCESS_BACKEND
     return select_sandbox_backend()
 
+
+def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Return the exact launch-bound validation route, failing on drift.
+
+    Finalization must not rediscover a host-native sandbox for an editor-hosted
+    worker.  Conversely, a forged/stale metadata backend must never let a
+    native CLI route borrow the in-process boundary.
+    """
+    adapter_id = str(metadata.get("adapter_id") or "").strip()
+    if not adapter_id:
+        raise WorkspaceError("validation_route_adapter_missing")
+    expected_backend = _sandbox_backend_for_adapter(adapter_id)
+    recorded_backend = str(metadata.get("sandbox_backend") or "").strip()
+    if recorded_backend and recorded_backend != expected_backend:
+        raise WorkspaceError(
+            "validation_route_backend_mismatch:"
+            f"expected={expected_backend}:recorded={recorded_backend}"
+        )
+    return {"backend": expected_backend, "adapter_id": adapter_id}
+
 # Failure workspaces remain available through coordinator review.  Once a
 # coordinator has disposed that exact attempt (finished/archived, returned it
 # to pending, or moved it to blocked), the retained workspace is no longer the
@@ -5359,6 +5379,7 @@ class ProcessManager:
             if not events:
                 return None
             latest = events[-1]
+            finalization_retry = bool(latest.get("finalization_retry"))
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
             metadata_path = self._metadata_from_events(events)
@@ -5718,7 +5739,9 @@ class ProcessManager:
                         # force the coordinator to rerun the worker merely to
                         # learn whether its candidate builds.
                         validations = run_validations(
-                            workspace, metadata.get("validation") or []
+                            workspace,
+                            metadata.get("validation") or [],
+                            **_validation_route_kwargs(metadata),
                         )
                         if worker_mcp_gate.get("gated") and not worker_mcp_gate.get("satisfied", True):
                             raise WorkspaceError(
@@ -5886,22 +5909,40 @@ class ProcessManager:
                             # Keep the truthful failure even when these bytes
                             # cannot be safely bound for residual rework.
                             retained_candidate = {}
-                    release_result = self._review_terminal_exact(
-                        metadata,
-                        terminal_state,
-                        request_id=request_id,
-                        error=error,
-                        evidence={
-                            "changed_paths": changed,
-                            "promoted_paths": promoted,
-                            "required_outputs": required_output_records,
-                            "validation": validations,
-                            "worker_mcp_gate": worker_mcp_gate,
-                            "quality_gate": quality_gate,
-                            "residual_contract": residual_contract_result,
-                            **retained_candidate,
+                    terminal_evidence = {
+                        "request_id": request_id,
+                        "changed_paths": changed,
+                        "promoted_paths": promoted,
+                        "required_outputs": required_output_records,
+                        "validation": validations,
+                        "worker_mcp_gate": worker_mcp_gate,
+                        "quality_gate": quality_gate,
+                        "residual_contract": residual_contract_result,
+                        "workspace": workspace.as_metadata(),
+                        "request_identity": {
+                            "request_id": request_id,
+                            "task_id": str(metadata["task_id"]),
+                            "runner": str(metadata["runner"]),
+                            "topic": str(metadata["topic"]),
                         },
-                    )
+                        **retained_candidate,
+                    }
+                    if terminal_state == "finalize_failed":
+                        terminal_evidence["error"] = error[:500]
+                        release_result = self._terminal_failure_exact(
+                            metadata,
+                            terminal_state,
+                            request_id=request_id,
+                            evidence=terminal_evidence,
+                        )
+                    else:
+                        release_result = self._review_terminal_exact(
+                            metadata,
+                            terminal_state,
+                            request_id=request_id,
+                            error=error,
+                            evidence=terminal_evidence,
+                        )
                     if not release_result.get("ok"):
                         cleanup = False
                         terminal_state = "release_pending"
@@ -5913,14 +5954,22 @@ class ProcessManager:
                 else:
                     terminal_state = "finalize_failed"
                     cleanup = False
-                    release_result = self._review_terminal_exact(
+                    release_result = self._terminal_failure_exact(
                         metadata,
                         terminal_state,
                         request_id=request_id,
-                        error=error,
                         evidence={
+                            "request_id": request_id,
+                            "error": error[:500],
                             "changed_paths": changed,
                             "promoted_paths": promoted,
+                            "workspace": workspace.as_metadata(),
+                            "request_identity": {
+                                "request_id": request_id,
+                                "task_id": str(metadata["task_id"]),
+                                "runner": str(metadata["runner"]),
+                                "topic": str(metadata["topic"]),
+                            },
                         },
                     )
                     if not release_result.get("ok"):
@@ -5931,7 +5980,19 @@ class ProcessManager:
             usage: dict[str, Any] = {}
             usage_recorded = False
             usage_error = ""
-            if terminal_state not in FINALIZATION_PENDING_STATES:
+            if finalization_retry:
+                prior_usage_event = next(
+                    (
+                        row
+                        for row in reversed(events[:-1])
+                        if isinstance(row.get("usage"), dict) and row.get("usage")
+                    ),
+                    {},
+                )
+                usage = dict(prior_usage_event.get("usage") or {})
+                usage_recorded = bool(prior_usage_event.get("usage_recorded"))
+                usage_error = "finalization_retry_reused_prior_usage"
+            elif terminal_state not in FINALIZATION_PENDING_STATES:
                 usage, usage_recorded, usage_error = self._record_usage(
                     request_id,
                     str(metadata["task_id"]),
@@ -5988,6 +6049,8 @@ class ProcessManager:
                 "sandbox_backend": metadata.get("sandbox_backend"),
                 "execution_mode": metadata.get("execution_mode") or "provider_worker",
                 "provider_launched": metadata.get("provider_launched") is not False,
+                "finalization_retry": finalization_retry,
+                "finalization_retry_provider_launched": False if finalization_retry else None,
                 "changed_paths": changed,
                 "promoted_paths": promoted,
                 "required_outputs": required_output_records,
@@ -6542,6 +6605,17 @@ class ProcessManager:
             truncated_fields.append("latest_event")
         stdout_tail = _safe_tail(stdout_path, stdout_limit) if stdout_limit else ""
         stderr_tail = _safe_tail(stderr_path, stderr_limit) if stderr_limit else ""
+        terminal_review = card.get("terminal_review")
+        terminal_substatus = (
+            str(terminal_review.get("substatus") or "")
+            if isinstance(terminal_review, dict)
+            else ""
+        )
+        review_ready = bool(
+            status.get("task_state") == "review"
+            and terminal_substatus in {"", "review_ready"}
+            and str(status.get("state") or "") == "review_ready"
+        )
         return {
             "ok": True,
             "request_id": status.get("request_id"),
@@ -6566,7 +6640,8 @@ class ProcessManager:
             "max_log_bytes": total_log_limit,
             "truncated_fields": truncated_fields,
             "detail_cursor": {"request_id": request_id},
-            "review_ready": status.get("task_state") == "review",
+            "review_ready": review_ready,
+            "terminal_substatus": terminal_substatus,
             "terminal": status.get("state") in {
                 *TERMINAL_PROCESS_STATES,
             },
@@ -6685,6 +6760,172 @@ class ProcessManager:
                 "blocked_reason": "supervisor_not_alive",
             }
         return {"ok": True, "request_id": request_id, "state": event["state"]}
+
+    def retry_finalization(self, request_id: str, task_id: str) -> dict[str, Any]:
+        """Retry retained deterministic finalization without a provider call."""
+        if not core.writes_allowed():
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "task_id": task_id,
+                "error": "write_gate_closed",
+            }
+        with self._request_lock(request_id):
+            events = self._request_events(request_id)
+            if not events:
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "request_not_found",
+                }
+            latest = events[-1]
+            if str(latest.get("task_id") or "") != task_id:
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "request_task_identity_mismatch",
+                }
+            if str(latest.get("state") or "") != "finalize_failed":
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": (
+                        "request_not_finalize_failed:"
+                        + str(latest.get("state") or "missing")
+                    ),
+                }
+            metadata_path = self._metadata_from_events(events)
+            if (
+                metadata_path is None
+                or metadata_path.parent.resolve() != self.process_dir.resolve()
+                or metadata_path.is_symlink()
+                or not metadata_path.is_file()
+                or metadata_path.stat().st_size > 2 * 1024 * 1024
+            ):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "finalization_retry_metadata_invalid",
+                }
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                workspace = WorkerWorkspace.from_metadata(dict(metadata["workspace"]))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": f"finalization_retry_metadata_unreadable:{exc}"[:500],
+                }
+            runner = str(metadata.get("runner") or "")
+            topic = str(metadata.get("topic") or "")
+            if (
+                str(metadata.get("request_id") or "") != request_id
+                or str(metadata.get("task_id") or "") != task_id
+                or workspace.repo != self.repo
+                or workspace.request_id != request_id
+            ):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "finalization_retry_identity_mismatch",
+                }
+            try:
+                assert_gc_safe_workspace_shape(request_id, workspace.path, workspace.home)
+            except WorkspaceError as exc:
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": f"finalization_retry_workspace_unsafe:{exc}"[:500],
+                }
+            if workspace.path.is_symlink() or not workspace.path.is_dir():
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "finalization_retry_workspace_missing",
+                }
+            status_path = Path(str(metadata.get("supervisor_status_path") or ""))
+            if (
+                status_path.parent.resolve() != self.process_dir.resolve()
+                or status_path.is_symlink()
+                or not status_path.is_file()
+            ):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "finalization_retry_supervisor_status_invalid",
+                }
+            supervisor_status = self._read_supervisor_status(status_path)
+            if (
+                str(supervisor_status.get("state") or "") != "exited"
+                or supervisor_status.get("exit_code") != 0
+            ):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": "finalization_retry_worker_not_successful",
+                }
+            transition = task_engine.retry_finalize_failed(
+                self.repo,
+                task_id,
+                runner,
+                request_id,
+                actor=core.CODEX_RUNNER,
+            )
+            if not transition.get("ok"):
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "error": (
+                        "finalization_retry_transition_failed:"
+                        + str(transition.get("stderr") or transition.get("stdout") or "")
+                    )[:500],
+                }
+            self._append_event({
+                **self._event_identity(events),
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": metadata.get("adapter_id"),
+                "state": "finalizing",
+                "metadata_path": str(metadata_path),
+                "supervisor_status_path": metadata.get("supervisor_status_path"),
+                "pid": latest.get("pid"),
+                "pid_start_ticks": latest.get("pid_start_ticks"),
+                "provider_process_alive": False,
+                "finalization_retry": True,
+                "finalization_retry_provider_launched": False,
+                "finalization_started_at": _utcnow(),
+            })
+
+        event = self._finalize_isolated_request(request_id, 0)
+        if event is None:
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "task_id": task_id,
+                "error": "finalization_retry_no_terminal_event",
+            }
+        return {
+            "ok": str(event.get("state") or "") == "review_ready",
+            "request_id": request_id,
+            "task_id": task_id,
+            "state": event.get("state"),
+            "provider_relaunched": False,
+            "workspace_retained": event.get("workspace_retained"),
+            "error": event.get("error") or "",
+        }
 
     def accept_review(
         self,
@@ -7105,7 +7346,9 @@ class ProcessManager:
                     ):
                         raise WorkspaceError("quality_review_receipt_not_readonly")
                     validations = run_validations(
-                        workspace, card.get("validation") or []
+                        workspace,
+                        card.get("validation") or [],
+                        **_validation_route_kwargs(latest),
                     )
                 except WorkspaceError as exc:
                     return {
@@ -7246,7 +7489,9 @@ class ProcessManager:
                             + str(worker_mcp_gate.get("reason") or "")
                         )
                     validations = run_validations(
-                        workspace, card.get("validation") or []
+                        workspace,
+                        card.get("validation") or [],
+                        **_validation_route_kwargs(latest),
                     )
                 except WorkspaceError as exc:
                     return {
@@ -7390,6 +7635,7 @@ class ProcessManager:
                         union_validations = run_validations(
                             union_workspace,
                             card.get("validation") or [],
+                            **_validation_route_kwargs(latest),
                         )
                         union_quality = quality_evidence.run_completion_quality_gate(
                             union_workspace.path,
@@ -7518,7 +7764,11 @@ class ProcessManager:
                 quality_gate["destructive_change_confirmed"] = bool(
                     confirm_destructive_change and destructive_blockers
                 )
-                validations = run_validations(workspace, card.get("validation") or [])
+                validations = run_validations(
+                    workspace,
+                    card.get("validation") or [],
+                    **_validation_route_kwargs(latest),
+                )
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(
                     current_hashes[relative] != stored_hashes.get(relative)

@@ -1597,9 +1597,10 @@ def aiworkhub_completion_inbox(
 ) -> dict[str, Any]:
     """READ-ONLY: combined completion-inbox facts for Codex orchestration.
 
-    Returns four facets in one call: ``review_queue`` (tasks awaiting Codex
-    review), ``stale_processing`` (claimed tasks with no recent artifact/
-    validation activity, default threshold 24h), ``runner_mismatch_warnings``
+    Returns five facets in one call: ``review_queue`` (tasks awaiting Codex
+    review), ``operational_failures`` (legacy finalizer failures eligible for
+    retained retry), ``stale_processing`` (claimed tasks with no recent
+    artifact/validation activity, default threshold 24h), ``runner_mismatch_warnings``
     (batch-token mismatches between a runner name and the task_id it
     claimed -- a local pure replica of
     ``AITools/taskctl.py::_runner_task_batch_mismatch``), and
@@ -1807,6 +1808,25 @@ def aiworkhub_agent_cancel_task(
     """DUAL-GATED: terminate one exact process group recorded by this server."""
 
     return process_launcher.default_manager().cancel(request_id, reason=reason)
+
+
+@mcp.tool()
+@_serialize_task_lifecycle_write
+def aiworkhub_agent_retry_finalization(
+    request_id: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """COORDINATOR/WRITE-GATED: retry one retained ``finalize_failed`` request.
+
+    The provider/model is never launched again. The exact successful worker
+    request, retained workspace, task identity and supervisor exit receipt are
+    revalidated before deterministic validation/finalization is re-entered.
+    """
+
+    return process_launcher.default_manager().retry_finalization(
+        request_id,
+        task_id,
+    )
 
 
 @mcp.tool()

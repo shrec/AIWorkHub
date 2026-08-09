@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.31] - 2026-08-09
+
+### Fixed
+
+- VS Code LM in-process workers now carry their exact launch backend through
+  worker-exit validation and manager acceptance. Windows finalization no longer
+  rediscovers the native CLI/AppContainer backend after an editor-hosted worker
+  has exited successfully; native CLI routes remain fail-closed without their
+  required OS sandbox.
+- Finalizer implementation failures now enter the canonical blocked
+  `finalize_failed` state instead of fabricating an ordinary review candidate.
+  Completion surfaces separate legacy finalization failures from actionable
+  review entries, and `review_ready` is derived from the exact terminal
+  substatus and request state.
+- Added manager-authorized retained-workspace finalization retry. It verifies
+  the exact request, successful supervisor receipt and workspace identity, then
+  re-runs deterministic finalization without launching or charging the provider
+  again; legacy 0.9.30 `review/finalize_failed` rows are also recoverable.
+
+### Tests
+
+- Added editor-route validation and backend-drift regressions, native-adapter
+  bypass denial, retained finalization retry/legacy recovery coverage, MCP
+  wiring checks and review-inbox split-brain fixtures. Focused regression tests
+  pass with 252 tests; the full repository suite passes with 2,611 tests and 28
+  platform skips.
+
 ## [0.9.30] - 2026-08-09
 
 ### Fixed

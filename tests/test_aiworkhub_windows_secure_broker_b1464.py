@@ -108,6 +108,41 @@ def test_editor_response_applier_is_only_unsandboxed_for_editor_adapters(tmp_pat
         )
 
 
+def test_finalizer_reuses_exact_editor_route_instead_of_windows_appcontainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        process_launcher,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable"
+            )
+        ),
+    )
+
+    route = process_launcher._validation_route_kwargs({
+        "adapter_id": "vscode_lm",
+        "sandbox_backend": "vscode_lm_in_process",
+    })
+
+    assert route == {
+        "backend": "vscode_lm_in_process",
+        "adapter_id": "vscode_lm",
+    }
+
+
+def test_finalizer_rejects_recorded_backend_drift() -> None:
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_route_backend_mismatch",
+    ):
+        process_launcher._validation_route_kwargs({
+            "adapter_id": "vscode_lm",
+            "sandbox_backend": "landlock",
+        })
+
+
 def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

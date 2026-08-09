@@ -370,6 +370,11 @@ def git_task_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("AIWORKHUB_REPO", str(root))
     monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
+    monkeypatch.setattr(
+        process_launcher.claude_auth,
+        "auth_status",
+        lambda: {"launchable": True, "blocker_reason": ""},
+    )
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "landlock")
     monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "worktrees"))
     return root

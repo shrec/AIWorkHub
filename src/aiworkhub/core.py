@@ -16,7 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 from . import (
@@ -1982,8 +1982,21 @@ def health() -> dict[str, Any]:
 
 def review_queue() -> dict[str, Any]:
     command = ["review-queue"]
+    def _review_substatus(row: Mapping[str, Any]) -> str:
+        terminal = row.get("terminal_review")
+        return str(
+            row.get("terminal_substatus")
+            or (terminal.get("substatus") if isinstance(terminal, Mapping) else "")
+            or ""
+        )
+
     try:
-        rows = task_store.list_tasks(repo_root(), status="review", limit=500)
+        rows = [
+            row
+            for row in task_store.list_task_cards(repo_root(), limit=5000)
+            if row.get("status") == "review"
+            and _review_substatus(row) != "finalize_failed"
+        ][:500]
     except task_store.TaskStoreError as exc:
         return _canonical_result(ok=False, returncode=1, stderr=str(exc), command=command)
     lines = [f"=== Codex Review Queue ({len(rows)}) ==="]

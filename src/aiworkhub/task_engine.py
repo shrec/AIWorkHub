@@ -521,6 +521,41 @@ def mark_terminal_failure(
     }
 
 
+def retry_finalize_failed(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    request_id: str,
+    *,
+    actor: str = "codex",
+) -> dict[str, Any]:
+    """Authorize deterministic finalization retry for one retained request."""
+    command = ["retry-finalization", task_id, "--request-id", request_id]
+    try:
+        ok, state = task_store.retry_finalize_failed(
+            repo,
+            task_id,
+            runner=runner,
+            request_id=request_id,
+            actor=actor,
+        )
+    except task_store.TaskStoreError as exc:
+        return {
+            "ok": False,
+            "returncode": 1,
+            "command": command,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+    }
+
+
 def accept_review(
     repo: Path,
     task_id: str,

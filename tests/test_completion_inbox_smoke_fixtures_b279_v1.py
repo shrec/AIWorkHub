@@ -122,6 +122,55 @@ def test_scenario_completion():
     )
 
 
+def test_finalize_failed_is_operational_not_ordinary_review_queue():
+    cards = {
+        "TASK_REVIEW_READY": {
+            "task_id": "TASK_REVIEW_READY",
+            "runner": "worker_ready",
+            "topic": "task_mcp",
+            "terminal_substatus": "review_ready",
+            "updated_at": "2026-08-09T00:00:00+00:00",
+        },
+        "TASK_FINALIZE_FAILED": {
+            "task_id": "TASK_FINALIZE_FAILED",
+            "runner": "worker_failed",
+            "topic": "task_mcp",
+            "terminal_substatus": "finalize_failed",
+            "updated_at": "2026-08-09T00:00:01+00:00",
+        },
+    }
+
+    def stub_list_tasks(status="pending", topic=None, limit=80):
+        if status != "review":
+            return {"stdout": "", "returncode": 0}
+        return {
+            "stdout": "\n".join(
+                f"[review] [task_mcp] [{card['runner']}] {task_id}"
+                for task_id, card in cards.items()
+            ),
+            "returncode": 0,
+        }
+
+    def stub_show_task(task_id):
+        return {"stdout": json.dumps(cards[task_id]), "returncode": 0}
+
+    result = completion_inbox.build_completion_inbox(
+        topic="task_mcp",
+        _list_tasks=stub_list_tasks,
+        _show_task=stub_show_task,
+    )
+
+    assert [row["task_id"] for row in result["review_queue"]] == [
+        "TASK_REVIEW_READY"
+    ]
+    assert result["review_queue"][0]["quality_reviewer_eligible"] is True
+    assert [row["task_id"] for row in result["operational_failures"]] == [
+        "TASK_FINALIZE_FAILED"
+    ]
+    assert result["counts"]["review_queue"] == 1
+    assert result["counts"]["operational_failures"] == 1
+
+
 # ===========================================================================
 # scenario_blocked -> canonical event_kind "failure" (B278 section_0 mapping)
 # ===========================================================================

@@ -78,6 +78,19 @@ class _FakeManager:
         self.calls.append(("cancel", {"request_id": request_id, "reason": reason}))
         return {"ok": True, "request_id": request_id, "state": "cancelled"}
 
+    def retry_finalization(self, request_id, task_id):
+        self.calls.append(("retry_finalization", {
+            "request_id": request_id,
+            "task_id": task_id,
+        }))
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "task_id": task_id,
+            "state": "review_ready",
+            "provider_relaunched": False,
+        }
+
     def list_processes(self, limit):
         self.calls.append(("list", {"limit": limit}))
         return {"ok": True, "processes": []}
@@ -94,9 +107,19 @@ def test_runtime_tools_delegate_to_single_manager(monkeypatch):
     assert server.aiworkhub_agent_task_status("r1")["state"] == "running"
     assert server.aiworkhub_agent_collect_result("r1", 4096)["review_ready"] is True
     assert server.aiworkhub_agent_cancel_task("r1", "test")["state"] == "cancelled"
+    assert server.aiworkhub_agent_retry_finalization("r1", "T1")[
+        "provider_relaunched"
+    ] is False
     assert server.aiworkhub_agent_list_processes(20)["processes"] == []
 
-    assert [name for name, _ in fake.calls] == ["launch", "status", "collect", "cancel", "list"]
+    assert [name for name, _ in fake.calls] == [
+        "launch",
+        "status",
+        "collect",
+        "cancel",
+        "retry_finalization",
+        "list",
+    ]
 
 
 def test_launch_scrubs_coordinator_capability_before_manager_call(monkeypatch, tmp_path):
