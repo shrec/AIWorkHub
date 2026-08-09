@@ -304,12 +304,11 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         )
         or ""
     )
-    terminal_evidence = (
-        terminal_review.get("evidence")
-        if isinstance(terminal_review, dict)
-        and isinstance(terminal_review.get("evidence"), dict)
-        else {}
-    )
+    terminal_evidence: dict[str, Any] = {}
+    if isinstance(terminal_review, dict):
+        review_evidence = terminal_review.get("evidence")
+        if isinstance(review_evidence, dict):
+            terminal_evidence = review_evidence
     operational_error = str(
         terminal_evidence.get("error") or card.get("validation_error") or ""
     )
@@ -329,6 +328,71 @@ def _compact_review_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]
         "quality_reviewer_eligible": terminal_substatus == "review_ready",
         "runner_task_batch_mismatch": mismatch or None,
     }
+
+
+def _compact_blocked_entry(card: dict[str, Any], mismatch: str) -> dict[str, Any]:
+    terminal_review = card.get("terminal_review")
+    terminal_failure = card.get("terminal_failure")
+    terminal_substatus = str(
+        card.get("terminal_substatus")
+        or (
+            terminal_review.get("substatus")
+            if isinstance(terminal_review, dict)
+            else ""
+        )
+        or (
+            terminal_failure.get("substatus")
+            if isinstance(terminal_failure, dict)
+            else ""
+        )
+        or ""
+    )
+    terminal_review_evidence: dict[str, Any] = {}
+    if isinstance(terminal_review, dict):
+        review_evidence = terminal_review.get("evidence")
+        if isinstance(review_evidence, dict):
+            terminal_review_evidence = review_evidence
+    terminal_failure_evidence: dict[str, Any] = {}
+    if isinstance(terminal_failure, dict):
+        failure_evidence = terminal_failure.get("evidence")
+        if isinstance(failure_evidence, dict):
+            terminal_failure_evidence = failure_evidence
+    request_id = (
+        terminal_review_evidence.get("request_id")
+        or terminal_failure_evidence.get("request_id")
+        or card.get("launch_request_id")
+    )
+    operational_error = str(
+        terminal_review_evidence.get("error")
+        or terminal_failure_evidence.get("error")
+        or card.get("blocker_reason")
+        or card.get("validation_error")
+        or ""
+    )
+    entry: dict[str, Any] = {
+        "task_id": card.get("task_id"),
+        "runner": card.get("runner"),
+        "claimed_by": card.get("claimed_by"),
+        "topic": card.get("topic"),
+        "priority": card.get("priority"),
+        "objective": str(card.get("objective", ""))[:160],
+        "allowed_writes": list(card.get("allowed_writes") or [])[:10],
+        "updated_at": card.get("updated_at", ""),
+        "review_at": card.get("review_at", ""),
+        "validation_status": card.get("validation_status", "unreported"),
+        "terminal_substatus": terminal_substatus,
+        "operational_error": operational_error[:300] or None,
+        "quality_reviewer_eligible": False,
+        "runner_task_batch_mismatch": mismatch or None,
+    }
+    if request_id is not None:
+        entry["request_id"] = request_id
+    launch_request_id = card.get("launch_request_id")
+    if launch_request_id is not None:
+        entry["launch_request_id"] = launch_request_id
+    if "workspace_retained" in card:
+        entry["workspace_retained"] = card["workspace_retained"]
+    return entry
 
 
 def _is_operational_finalization_failure(entry: dict[str, Any]) -> bool:
@@ -437,7 +501,7 @@ def build_completion_inbox(
     read_errors: list[dict[str, Any]] = []
 
     buckets: list[tuple[str, list[dict[str, Any]]]] = []
-    for cstatus in ("pending", "processing", "review"):
+    for cstatus in ("pending", "processing", "review", "blocked"):
         cards, errs, r_errs = _fetch_full_cards(
             cstatus, topic, safe_limit, _list_tasks=_list_tasks, _show_task=_show_task
         )
@@ -466,13 +530,26 @@ def build_completion_inbox(
         key=lambda x: x.get("updated_at", ""), reverse=True
     )
 
+    _blocked_failure_keys = {
+        (e.get("task_id"), e.get("request_id")) for e in operational_failures
+    }
+    for card in cards_by_status.get("blocked", []):
+        entry = _compact_blocked_entry(card, _runner_task_batch_mismatch(card))
+        if entry.get("terminal_substatus") != "finalize_failed":
+            continue
+        key = (entry.get("task_id"), entry.get("request_id"))
+        if key in _blocked_failure_keys:
+            continue
+        _blocked_failure_keys.add(key)
+        operational_failures.append(entry)
+
     stale_processing = []
     for card in cards_by_status["processing"]:
-        entry = _stale_processing_entry(
+        stale_entry = _stale_processing_entry(
             card, _runner_task_batch_mismatch(card), now_dt, stale_processing_hours
         )
-        if entry:
-            stale_processing.append(entry)
+        if stale_entry:
+            stale_processing.append(stale_entry)
     stale_processing.sort(key=lambda x: x["stale_hours"], reverse=True)
 
     runner_mismatch_warnings = []
@@ -515,6 +592,7 @@ def build_completion_inbox(
             "pending_scanned": len(cards_by_status["pending"]),
             "processing_scanned": len(cards_by_status["processing"]),
             "review_scanned": len(cards_by_status["review"]),
+            "blocked_scanned": len(cards_by_status.get("blocked", [])),
             "review_queue": len(review_queue),
             "operational_failures": len(operational_failures),
             "stale_processing": len(stale_processing),

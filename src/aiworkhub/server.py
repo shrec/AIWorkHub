@@ -1594,6 +1594,53 @@ def aiworkhub_task_cost_ledger(
 # read-path/invariant note. Additive wiring only; no existing tool touched.
 # ---------------------------------------------------------------------------
 
+
+def _enrich_operational_failures_from_processes(
+    operational_failures: Any, compact_processes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return enriched copies of ``operational_failures`` from process rows.
+
+    Index ``compact_processes`` by exact non-empty ``request_id`` and, when a
+    failure row carries that exact ``request_id``, copy the process ``error``
+    when the failure has no ``operational_error`` and copy
+    ``workspace_retained`` whenever the process row exposes it (including
+    ``False``). Duplicate exact request rows resolve latest-wins by the last
+    ``compact_processes`` occurrence. Resolution uses only the failure's
+    ``request_id`` field -- never ``task_id`` and never ``launch_request_id``.
+    """
+    if not isinstance(operational_failures, list) or not operational_failures:
+        return operational_failures
+    latest_by_request: dict[str, dict[str, Any]] = {}
+    for row in compact_processes:
+        if not isinstance(row, Mapping):
+            continue
+        request_id = row.get("request_id")
+        if isinstance(request_id, str) and request_id:
+            latest_by_request[request_id] = row
+    enriched: list[dict[str, Any]] = []
+    for failure in operational_failures:
+        if not isinstance(failure, Mapping):
+            enriched.append(failure)
+            continue
+        failure_dict: dict[str, Any] = dict(failure)
+        request_id = failure.get("request_id")
+        match = (
+            latest_by_request.get(request_id)
+            if isinstance(request_id, str) and request_id
+            else None
+        )
+        if match is None:
+            enriched.append(failure_dict)
+            continue
+        enriched_failure = failure_dict
+        if not enriched_failure.get("operational_error") and match.get("error"):
+            enriched_failure["operational_error"] = match["error"]
+        if "workspace_retained" in match:
+            enriched_failure["workspace_retained"] = match["workspace_retained"]
+        enriched.append(enriched_failure)
+    return enriched
+
+
 @mcp.tool()
 def aiworkhub_completion_inbox(
     topic: str | None = None,
@@ -1725,6 +1772,9 @@ def aiworkhub_completion_inbox(
         adapter["launchability_authority"] = repo_policy.PREFLIGHT_SCHEMA_ID
     readiness["preflight_schema_id"] = preflight.get("schema_id")
     result["adapter_readiness"] = readiness
+    result["operational_failures"] = _enrich_operational_failures_from_processes(
+        result.get("operational_failures"), compact_processes
+    )
     return result
 
 

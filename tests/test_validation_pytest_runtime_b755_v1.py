@@ -408,6 +408,76 @@ class TestRunValidationsPytestRepair(_TolerateNestedSeccompChmodDenial):
         finally:
             worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
+class WindowsPytestRuntimeModeBitsTest(unittest.TestCase):
+    """On Windows POSIX st_mode world-writable bits must not reject the
+    trusted pytest runtime root, while every other fail-closed check
+    (symlink, missing directory, missing pytest package) still applies."""
+
+    def _prepare_root(self, tmp: str) -> str:
+        root = os.path.join(tmp, "site-packages")
+        os.makedirs(os.path.join(root, "pytest"), exist_ok=True)
+        with open(
+            os.path.join(root, "pytest", "__init__.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("")
+        return root
+
+    def test_windows_world_writable_mode_bits_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._prepare_root(tmp)
+            real_stat = os.stat
+
+            def fake_stat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+                info = real_stat(path, *args, **kwargs)
+                return os.stat_result(
+                    (info.st_mode | 0o002,) + tuple(info)[1:]
+                )
+
+            with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(
+                        worker_workspace.site,
+                        "getusersitepackages",
+                        return_value=root,
+                    ), \
+                    mock.patch.object(Path, "stat", autospec=True) as patched:
+                patched.side_effect = lambda self, *a, **k: fake_stat(str(self))
+                resolved = worker_workspace.resolve_trusted_pytest_runtime_root()
+            self.assertEqual(
+                Path(root).resolve(strict=False),
+                resolved,
+            )
+
+    def test_windows_missing_pytest_package_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "site-packages")
+            os.makedirs(root, exist_ok=True)
+            with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(
+                        worker_workspace.site,
+                        "getusersitepackages",
+                        return_value=root,
+                    ):
+                with self.assertRaises(worker_workspace.WorkspaceError) as ctx:
+                    worker_workspace.resolve_trusted_pytest_runtime_root()
+            self.assertIn(
+                "validation_pytest_runtime_missing_pytest", str(ctx.exception)
+            )
+
+    def test_windows_missing_directory_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "absent-site-packages")
+            with mock.patch.object(worker_workspace.os, "name", "nt"), \
+                    mock.patch.object(
+                        worker_workspace.site,
+                        "getusersitepackages",
+                        return_value=root,
+                    ):
+                with self.assertRaises(worker_workspace.WorkspaceError) as ctx:
+                    worker_workspace.resolve_trusted_pytest_runtime_root()
+            self.assertIn(
+                "validation_pytest_runtime_unavailable", str(ctx.exception)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
