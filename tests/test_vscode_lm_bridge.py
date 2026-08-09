@@ -307,6 +307,403 @@ def test_readiness_reports_durable_model_consent(tmp_path: Path, monkeypatch: py
     assert ready["access_state"] == "granted_remembered"
 
 
+def _bridge_request_for_cancel_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    request_id: str,
+) -> vscode_lm_bridge.BridgeRequest:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = tmp_path / "repo"
+    if not repo.exists():
+        repo.mkdir()
+        task_store.initialize_repository(repo)
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    return vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Bounded cancellation test.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+    )
+
+
+def _response_decision(
+    request: vscode_lm_bridge.BridgeRequest,
+) -> dict[str, object]:
+    return {
+        "repo_id": request.repo_id,
+        "decision": {
+            "action": "response",
+            "cancel_token": request.cancel_token,
+        },
+    }
+
+
+def test_cancel_before_claim_removes_request_without_stale_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="1" * 32,
+    )
+
+    assert vscode_lm_bridge.cancel_request(request) == "removed"
+
+    assert not request.request_path.exists()
+    assert not request.cancel_path.exists()
+
+
+def test_cancel_after_claim_publishes_private_identity_bound_decision_in_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="2" * 32,
+    )
+    isolated = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="3" * 32,
+    )
+    claim_path = Path(f"{cancelled.request_path}.claim-window_test")
+    cancelled.request_path.rename(claim_path)
+
+    assert vscode_lm_bridge.cancel_request(cancelled) == "cancelled"
+    assert vscode_lm_bridge.cancel_request(cancelled) == "cancelled"
+
+    decision = json.loads(cancelled.cancel_path.read_text(encoding="utf-8"))
+    assert decision["schema_id"] == vscode_lm_bridge.RESPONSE_SCHEMA_ID
+    assert decision["request_id"] == cancelled.request_id
+    assert decision["repo_id"] == cancelled.repo_id
+    assert decision["error"] == "vscode_lm_request_cancelled"
+    assert decision["diagnostics"] == {
+        "action": "cancel",
+        "cancel_token": cancelled.cancel_token,
+        "phase": "cancelled",
+    }
+    assert isolated.request_path.is_file()
+    assert not isolated.cancel_path.exists()
+    if vscode_lm_bridge.posix_path_modes_supported():
+        assert cancelled.cancel_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_cancel_after_claim_does_not_reclassify_private_completed_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="4" * 32,
+    )
+    claim_path = Path(f"{request.request_path}.claim-window_test")
+    request.request_path.rename(claim_path)
+    vscode_lm_bridge._atomic_json(  # noqa: SLF001 - exact bridge response contract
+        request.response_path,
+        {
+            "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+            "request_id": request.request_id,
+            "repo_id": request.repo_id,
+            "decision": {
+                "action": "response",
+                "cancel_token": request.cancel_token,
+            },
+        },
+    )
+
+    assert vscode_lm_bridge.cancel_request(request) == "completed"
+    assert request.cancel_path.exists()
+    assert json.loads(request.cancel_path.read_text(encoding="utf-8"))["decision"] == {
+        "action": "response",
+        "cancel_token": request.cancel_token,
+    }
+
+
+def test_cancel_claim_rename_race_publishes_terminal_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="8" * 32,
+    )
+    claim_path = Path(f"{request.request_path}.claim-window_race")
+    real_rename = vscode_lm_bridge.os.rename
+
+    def claim_before_cancel(source, destination):
+        if Path(source) == request.request_path:
+            real_rename(source, claim_path)
+            raise FileNotFoundError(source)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "rename", claim_before_cancel)
+
+    assert vscode_lm_bridge.cancel_request(request) == "cancelled"
+    assert claim_path.is_file()
+    payload = json.loads(request.response_path.read_text(encoding="utf-8"))
+    assert payload["decision"] == {
+        "action": "cancel",
+        "cancel_token": request.cancel_token,
+    }
+
+
+def test_cancel_never_unlinks_request_replaced_by_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="9" * 32,
+    )
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text("do-not-touch", encoding="utf-8")
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(decoy)
+    except OSError:
+        pytest.skip("file symlinks are unavailable on this Windows host")
+    probe.unlink()
+    real_rename = vscode_lm_bridge.os.rename
+
+    def replace_before_move(source, destination):
+        if Path(source) == request.request_path:
+            request.request_path.unlink()
+            request.request_path.symlink_to(decoy)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "rename", replace_before_move)
+
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="quarantined_identity_changed",
+    ):
+        vscode_lm_bridge.cancel_request(request)
+
+    assert decoy.read_text(encoding="utf-8") == "do-not-touch"
+    quarantined = list(request.request_path.parent.glob(".*.cancel-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].is_symlink()
+
+
+def test_cancel_retries_then_reports_persistent_partial_decision_without_deleting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="c" * 32,
+    )
+    request.request_path.rename(Path(f"{request.request_path}.claim-window_test"))
+    request.response_path.write_bytes(b"{")
+    if vscode_lm_bridge.posix_path_modes_supported():
+        request.response_path.chmod(0o600)
+    monkeypatch.setattr(vscode_lm_bridge.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_terminal_decision_persistent_invalid",
+    ):
+        vscode_lm_bridge.cancel_request(request)
+
+    assert request.response_path.read_bytes() == b"{"
+
+
+def test_cancel_rejects_forged_response_token_and_preserves_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="d" * 32,
+    )
+    request.request_path.rename(Path(f"{request.request_path}.claim-window_test"))
+    forged = {
+        "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+        "request_id": request.request_id,
+        "repo_id": request.repo_id,
+        "error": "",
+        "decision": {"action": "response", "cancel_token": "0" * 64},
+    }
+    vscode_lm_bridge._atomic_json(request.response_path, forged)  # noqa: SLF001
+
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="bridge_terminal_decision_contract_mismatch",
+    ):
+        vscode_lm_bridge.cancel_request(request)
+
+    assert json.loads(request.response_path.read_text(encoding="utf-8")) == forged
+
+
+def test_persisted_bridge_metadata_round_trips_and_rejects_path_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="e" * 32,
+    )
+    metadata = vscode_lm_bridge.bridge_request_metadata(request)
+
+    restored = vscode_lm_bridge.bridge_request_from_metadata(
+        metadata, expected_request_id=request.request_id,
+    )
+    assert restored == request
+
+    tampered = {**metadata, "cancel_path": str(tmp_path / "foreign.json")}
+    with pytest.raises(
+        vscode_lm_bridge.BridgeError,
+        match="decision_path_mismatch",
+    ):
+        vscode_lm_bridge.bridge_request_from_metadata(
+            tampered, expected_request_id=request.request_id,
+        )
+
+
+def test_isolated_process_exit_publishes_claimed_bridge_cancellation_before_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="5" * 32,
+    )
+    claim_path = Path(f"{request.request_path}.claim-window_test")
+    request.request_path.rename(claim_path)
+    finalized: list[tuple[str, int | None]] = []
+
+    class ExitedProcess:
+        pid = 12345
+
+        @staticmethod
+        def wait(*, timeout: float) -> int:
+            assert timeout > 0
+            return 1
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path / "repo",
+        process_log_path=tmp_path / "processes.jsonl",
+        process_dir=tmp_path / "processes",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_finalize_after_process_exit",
+        lambda request_id, returncode: finalized.append((request_id, returncode)),
+    )
+    live = process_launcher._LiveProcess(  # noqa: SLF001 - monitor contract test
+        request_id=request.request_id,
+        task_id="CANCEL_MONITOR_TEST",
+        runner="codex",
+        topic="cancel-monitor",
+        adapter_id="vscode_lm",
+        model="glm-5.2",
+        process=ExitedProcess(),  # type: ignore[arg-type]
+        stdout_path=tmp_path / "stdout.log",
+        stderr_path=tmp_path / "stderr.log",
+        started_at="2026-08-10T00:00:00+00:00",
+        timeout_seconds=30,
+        isolated=True,
+        bridge_request=request,
+    )
+    manager._live[request.request_id] = live  # noqa: SLF001
+
+    manager._monitor(live)  # noqa: SLF001
+
+    assert finalized == [(request.request_id, 1)]
+    assert json.loads(request.cancel_path.read_text(encoding="utf-8"))["diagnostics"]["action"] == "cancel"
+
+
+def test_prompt_process_cancel_publishes_bridge_terminal_before_process_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _bridge_request_for_cancel_test(
+        tmp_path, monkeypatch, request_id="6" * 32,
+    )
+    request.request_path.rename(Path(f"{request.request_path}.claim-window_test"))
+    order: list[str] = []
+    real_cancel = vscode_lm_bridge.cancel_request
+
+    def publish_cancel(bound_request: vscode_lm_bridge.BridgeRequest) -> str:
+        order.append("bridge")
+        return real_cancel(bound_request)
+
+    monkeypatch.setattr(vscode_lm_bridge, "cancel_request", publish_cancel)
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminate_process_group",
+        lambda _pid, *, grace_seconds: order.append(f"terminate:{grace_seconds}"),
+    )
+
+    class RunningProcess:
+        pid = 23456
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    manager = process_launcher.ProcessManager(
+        repo=tmp_path / "repo",
+        process_log_path=tmp_path / "cancel-processes.jsonl",
+        process_dir=tmp_path / "cancel-processes",
+    )
+    live = process_launcher._LiveProcess(  # noqa: SLF001 - cancellation contract
+        request_id=request.request_id,
+        task_id="PROMPT_CANCEL_TEST",
+        runner="codex",
+        topic="prompt-cancel",
+        adapter_id="vscode_lm",
+        model="glm-5.2",
+        process=RunningProcess(),  # type: ignore[arg-type]
+        stdout_path=tmp_path / "stdout.log",
+        stderr_path=tmp_path / "stderr.log",
+        started_at="2026-08-10T00:00:00+00:00",
+        timeout_seconds=30,
+        bridge_request=request,
+    )
+    manager._live[request.request_id] = live  # noqa: SLF001
+    manager._append_event({  # noqa: SLF001
+        "request_id": request.request_id,
+        "task_id": live.task_id,
+        "runner": live.runner,
+        "topic": live.topic,
+        "adapter_id": live.adapter_id,
+        "state": "running",
+        "pid": live.process.pid,
+    })
+
+    result = manager.cancel(request.request_id, "test cancellation")
+
+    assert result["ok"] is True
+    assert result["state"] == "cancelled"
+    assert order == ["bridge", "terminate:5.0"]
+    assert json.loads(request.response_path.read_text(encoding="utf-8"))["error"] == (
+        "vscode_lm_request_cancelled"
+    )
+
+
+def test_worker_bridge_tool_authorization_denies_cancel_requested_state(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_store.initialize_repository(repo)
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "auth-processes.jsonl",
+        process_dir=tmp_path / "auth-processes",
+    )
+    request_id = "7" * 32
+    manager._append_event({  # noqa: SLF001 - exact authorization-state setup
+        "request_id": request_id,
+        "task_id": "CANCEL_AUTH_TEST",
+        "runner": "codex",
+        "topic": "cancel-auth",
+        "adapter_id": "vscode_lm",
+        "state": "cancel_requested",
+    })
+
+    result = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_session_write_intent",
+        {"action": "append", "content": "must not run"},
+    )
+
+    assert result == {"ok": False, "reason": "worker_bridge_request_not_active"}
+
+
 def test_readiness_distinguishes_stale_host_from_missing_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -381,6 +778,7 @@ def test_worker_applies_only_fully_validated_allowed_outputs(tmp_path: Path, mon
             }
         ),
         "error": "",
+        **_response_decision(request),
     }
     vscode_lm_bridge._atomic_json(request.response_path, response)  # noqa: SLF001
     # The production Landlock/seccomp worker denies fchmod.  The writer must
@@ -654,6 +1052,7 @@ def test_worker_rejects_whole_mixed_scope_response_before_writing(tmp_path: Path
         {
             "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
             "request_id": request_id,
+            **_response_decision(request),
             "error": "",
             "text": json.dumps(
                 {
@@ -694,6 +1093,7 @@ def test_worker_surfaces_bounded_bridge_diagnostics_on_provider_failure(tmp_path
         {
             "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
             "request_id": request_id,
+            **_response_decision(request),
             "error": "vscode_lm_finalization_limit",
             "text": "",
             "diagnostics": {
@@ -881,9 +1281,16 @@ def _progress_payload(*, sequence: int = 1) -> dict[str, object]:
 
 
 def test_progress_receipt_missing_is_backward_compatible_no_progress(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
     assert vscode_lm_bridge.read_progress_receipt(
-        tmp_path / "missing.json", "a" * 32, "repo_test",
+        missing, "a" * 32, "repo_test",
     ) == {}
+    assert vscode_lm_worker._read_progress_with_retry(
+        missing,
+        "a" * 32,
+        "repo_test",
+        defer_transient=False,
+    ) == ({}, None)
 
 
 def test_progress_receipt_is_owner_private_identity_bound_and_monotonic(tmp_path: Path) -> None:
@@ -903,6 +1310,21 @@ def test_progress_receipt_is_owner_private_identity_bound_and_monotonic(tmp_path
         )
 
 
+def test_progress_receipt_persistent_malformed_json_fails_closed(tmp_path: Path) -> None:
+    progress = tmp_path / "progress.json"
+    progress.write_text("{", encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(progress, 0o600)
+
+    with pytest.raises(vscode_lm_bridge.BridgeError) as captured:
+        vscode_lm_bridge.read_progress_receipt(progress, "a" * 32, "repo_test")
+
+    diagnostic = str(captured.value)
+    assert diagnostic.startswith("bridge_progress_invalid_json:line=1:column=2:")
+    assert "bytes=1" in diagnostic
+    assert f"sha256={hashlib.sha256(b'{').hexdigest()}" in diagnostic
+
+
 def test_progress_receipt_present_unsafe_sidecars_fail_closed(tmp_path: Path) -> None:
     progress = tmp_path / "progress.json"
     vscode_lm_bridge._atomic_json(progress, _progress_payload())
@@ -914,6 +1336,50 @@ def test_progress_receipt_present_unsafe_sidecars_fail_closed(tmp_path: Path) ->
     progress.symlink_to(tmp_path / "absent-target.json")
     with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_symlink"):
         vscode_lm_bridge.read_progress_receipt(progress, "a" * 32, "repo_test")
+
+
+def test_progress_receipt_open_handle_rejects_aba_swapped_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress = tmp_path / "progress.json"
+    saved = tmp_path / "saved.json"
+    forged = tmp_path / "forged.json"
+    vscode_lm_bridge._atomic_json(progress, _progress_payload(sequence=1))
+    forged_payload = _progress_payload(sequence=99)
+    forged_payload["phase"] = "final_edit"
+    vscode_lm_bridge._atomic_json(forged, forged_payload)
+
+    real_read_bytes = Path.read_bytes
+    real_open = vscode_lm_bridge.os.open
+
+    def path_read_aba(path: Path) -> bytes:
+        if path != progress:
+            return real_read_bytes(path)
+        progress.rename(saved)
+        try:
+            return real_read_bytes(forged)
+        finally:
+            saved.rename(progress)
+
+    def redirected_open(path: str | os.PathLike[str], flags: int) -> int:
+        if Path(path) == progress:
+            return real_open(forged, flags)
+        return real_open(path, flags)
+
+    # The old path-based implementation accepted the forged bytes after the
+    # path was restored.  The handle-bound implementation detects that the
+    # opened file identity does not match the pre-open lstat identity.
+    monkeypatch.setattr(Path, "read_bytes", path_read_aba)
+    monkeypatch.setattr(vscode_lm_bridge.os, "open", redirected_open)
+    with pytest.raises(
+        vscode_lm_bridge.ProgressReadTransientError,
+        match="bridge_progress_snapshot_changed",
+    ):
+        vscode_lm_bridge.read_progress_receipt_snapshot(
+            progress, "a" * 32, "repo_test",
+        )
+
+    assert json.loads(progress.read_text(encoding="utf-8"))["sequence"] == 1
 
 
 def test_worker_streams_monotonic_progress_before_response(
@@ -954,8 +1420,18 @@ def test_worker_streams_monotonic_progress_before_response(
             "edits": [],
         }),
         "error": "",
+        **_response_decision(request),
     }
     sleeps = 0
+    progress_read_failures = 0
+    real_os_read = vscode_lm_bridge.os.read
+
+    def transient_progress_read(fd: int, size: int) -> bytes:
+        nonlocal progress_read_failures
+        if progress_read_failures < 2:
+            progress_read_failures += 1
+            raise PermissionError(13, "simulated Windows sharing violation")
+        return real_os_read(fd, size)
 
     def advance(_seconds: float) -> None:
         nonlocal sleeps
@@ -967,14 +1443,27 @@ def test_worker_streams_monotonic_progress_before_response(
                     "schema_id": vscode_lm_bridge.PROGRESS_RECEIPT_SCHEMA_ID,
                     "request_id": request_id,
                     "repo_id": repo_id,
-                    "sequence": 2,
+                    "sequence": 1,
                     "phase": "tool_turn",
                     "updated_at": "2026-08-06T08:00:00+00:00",
                 },
             )
         elif sleeps == 2:
+            vscode_lm_bridge._atomic_json(
+                progress_path,
+                {
+                    "schema_id": vscode_lm_bridge.PROGRESS_RECEIPT_SCHEMA_ID,
+                    "request_id": request_id,
+                    "repo_id": repo_id,
+                    "sequence": 2,
+                    "phase": "tool_turn",
+                    "updated_at": "2026-08-06T08:00:01+00:00",
+                },
+            )
+        elif sleeps == 5:
             vscode_lm_bridge._atomic_json(request.response_path, response)
 
+    monkeypatch.setattr(vscode_lm_bridge.os, "read", transient_progress_read)
     monkeypatch.setattr(vscode_lm_worker.time, "sleep", advance)
 
     result = vscode_lm_worker.run(request.worker_spec_path)
@@ -985,6 +1474,80 @@ def test_worker_streams_monotonic_progress_before_response(
         "phase": "tool_turn",
         "sequence": 2,
         "type": "aiworkhub_progress",
-        "updated_at": "2026-08-06T08:00:00+00:00",
+        "updated_at": "2026-08-06T08:00:01+00:00",
     }
+    assert sleeps == 5
+    assert progress_read_failures == 2
     assert result["is_error"] is False
+
+
+def test_worker_terminal_progress_read_persistent_error_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    repo_id = repository_state.inspect_repository(repo).manifest.repo_id
+    _host(root, repo_id, models=["glm-5.2"])
+    request_id = "b" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Return one read-only result.",
+        model="glm-5.2",
+        allowed_writes=[],
+        timeout_seconds=30,
+    )
+    worker_spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    progress_path = Path(worker_spec["progress_path"])
+    vscode_lm_bridge._atomic_json(
+        progress_path,
+        {
+            **_progress_payload(sequence=1),
+            "request_id": request_id,
+            "repo_id": repo_id,
+        },
+    )
+    vscode_lm_bridge._atomic_json(
+        request.response_path,
+        {
+            "schema_id": vscode_lm_bridge.RESPONSE_SCHEMA_ID,
+            "request_id": request_id,
+            "repo_id": repo_id,
+            "model": {"id": "glm-5.2"},
+            "text": json.dumps({
+                "schema_id": vscode_lm_bridge.EDIT_RESPONSE_SCHEMA_ID,
+                "summary": "read only",
+                "creates": [],
+                "edits": [],
+            }),
+            "error": "",
+            **_response_decision(request),
+        },
+    )
+    progress_read_attempts = 0
+
+    def persistently_denied(_fd: int) -> bytes:
+        nonlocal progress_read_attempts
+        progress_read_attempts += 1
+        raise vscode_lm_bridge.ProgressReadTransientError(
+            "bridge_progress_read_transient:operation=read:"
+            "type=PermissionError:errno=13"
+        )
+
+    monkeypatch.setattr(vscode_lm_bridge, "_read_progress_fd", persistently_denied)
+    with pytest.raises(RuntimeError) as captured:
+        vscode_lm_worker.run(request.worker_spec_path)
+
+    assert str(captured.value) == (
+        "vscode_lm_progress_terminal_read_failed:"
+        "bridge_progress_read_transient:operation=read:"
+        "type=PermissionError:errno=13"
+    )
+    assert progress_read_attempts == vscode_lm_worker.PROGRESS_READ_MAX_ATTEMPTS

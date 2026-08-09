@@ -72,6 +72,97 @@ def _write_fake_pytest_package(root: Path, body: str = "print('FAKE_PYTEST_MAIN_
     (pkg / "__main__.py").write_text("import sys\n" + body + "\nraise SystemExit(0)\n", encoding="utf-8")
 
 
+class TestApprovedSitePythonpath(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="approved_pytest_site_")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.site = self.root / "site-packages"
+        _write_fake_pytest_package(self.site)
+        _, self.workspace = _manual_workspace(self.root, "approved-site")
+        self._site_patch = mock.patch.object(
+            worker_workspace.site,
+            "getusersitepackages",
+            return_value=str(self.site),
+        )
+        self._site_patch.start()
+        self.addCleanup(self._site_patch.stop)
+
+    def _assert_rejected_before_containment(self, component: str) -> None:
+        with mock.patch.object(
+            worker_workspace,
+            "_require_beneath",
+            side_effect=AssertionError("untrusted path reached filesystem containment"),
+        ) as require_beneath:
+            with self.assertRaisesRegex(
+                worker_workspace.WorkspaceError,
+                "validation_pythonpath_absolute_component_forbidden",
+            ):
+                worker_workspace.resolve_validation_pythonpath(
+                    self.workspace,
+                    worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                    (component,),
+                )
+        require_beneath.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows path anchors")
+    def test_windows_approved_site_uses_candidate_drive_anchor(self) -> None:
+        expected = self.site.resolve()
+        with mock.patch.object(
+            worker_workspace, "_require_beneath", return_value=expected
+        ) as require_beneath:
+            self.assertEqual(
+                worker_workspace._approved_pythonpath_site(str(self.site)),
+                expected,
+            )
+        require_beneath.assert_called_once_with(Path(self.site.anchor), self.site)
+
+    def test_unrelated_absolute_path_is_rejected_before_containment(self) -> None:
+        self._assert_rejected_before_containment(str(self.root / "untrusted-site"))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows UNC and drive syntax")
+    def test_windows_untrusted_rooted_forms_are_rejected_before_containment(self) -> None:
+        for component in (
+            r"\\aiworkhub.invalid\share\pytest-runtime",
+            f"{self.site.drive}relative-site",
+            r"\root-relative-site",
+        ):
+            with self.subTest(component=component):
+                self._assert_rejected_before_containment(component)
+
+    @unittest.skipUnless(os.name == "nt", "covers the Windows in-process path")
+    def test_windows_in_process_pytest_validation_sets_approved_pythonpath(self) -> None:
+        scratch = self.root / "validation-scratch"
+        scratch.mkdir()
+        completed = worker_workspace.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.object(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            return_value=scratch,
+        ), mock.patch.object(
+            worker_workspace, "cleanup_validation_exec_scratch"
+        ), mock.patch.object(
+            worker_workspace,
+            "resolve_trusted_pytest_runtime_root",
+            return_value=self.site.resolve(),
+        ), mock.patch.object(
+            worker_workspace.subprocess, "run", return_value=completed
+        ) as run:
+            results = worker_workspace.run_validations(
+                self.workspace,
+                ["python -m pytest --version"],
+                backend=worker_workspace.VSCODE_LM_IN_PROCESS_BACKEND,
+                adapter_id="glm_vscode_lm",
+            )
+
+        self.assertEqual(results[0]["returncode"], 0)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["PYTHONPATH"], str(self.site.resolve())
+        )
+
+
 @unittest.skipIf(os.name == "nt", "requires POSIX ownership and sandbox semantics")
 class _TolerateNestedSeccompChmodDenial(unittest.TestCase):
     """Base class: swallow only ``PermissionError`` from chmod/fchmod so the

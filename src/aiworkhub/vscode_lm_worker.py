@@ -18,8 +18,12 @@ from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
     EDIT_RESPONSE_SCHEMA_ID_V1,
     EDIT_RESPONSE_SCHEMA_ID_V2,
+    ProgressFileSignature,
+    ProgressReadTransientError,
     RESPONSE_SCHEMA_ID,
-    read_progress_receipt,
+    progress_file_signature,
+    read_progress_receipt_snapshot,
+    read_terminal_decision,
 )
 
 
@@ -27,6 +31,8 @@ MAX_V2_PATHS = 128
 MAX_V2_REPLACEMENTS_PER_FILE = 256
 MAX_V2_REPLACEMENT_BYTES = 2 * 1024 * 1024
 MAX_V2_FILE_BYTES = 16 * 1024 * 1024
+PROGRESS_READ_MAX_ATTEMPTS = 2
+PROGRESS_READ_RETRY_SECONDS = 0.01
 
 
 def _load_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
@@ -282,8 +288,12 @@ def _v2_planned_outputs(
         if target.is_symlink() or not target.is_file():
             raise RuntimeError(f"vscode_lm_edit_response_edit_target_invalid:{relative}")
         current_bytes = target.read_bytes()
-        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
-            raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
+        actual_hash = hashlib.sha256(current_bytes).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_stale_hash:{relative}:"
+                f"expected_sha256={expected_hash}:actual_sha256={actual_hash}"
+            )
         try:
             current_text = current_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -451,8 +461,12 @@ def _v3_planned_outputs(
                 f"vscode_lm_edit_response_edit_target_invalid:{relative}"
             )
         current_bytes = target.read_bytes()
-        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
-            raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
+        actual_hash = hashlib.sha256(current_bytes).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_stale_hash:{relative}:"
+                f"expected_sha256={expected_hash}:actual_sha256={actual_hash}"
+            )
         try:
             current_text = current_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -525,36 +539,84 @@ def _v3_planned_outputs(
     return planned, metrics
 
 
+def _read_progress_with_retry(
+    path: Path,
+    request_id: str,
+    repo_id: str,
+    *,
+    owner_uid: int | None = None,
+    previous_sequence: int | None = None,
+    defer_transient: bool,
+) -> tuple[dict[str, Any], ProgressFileSignature | None]:
+    for attempt in range(1, PROGRESS_READ_MAX_ATTEMPTS + 1):
+        try:
+            return read_progress_receipt_snapshot(
+                path,
+                request_id,
+                repo_id,
+                owner_uid=owner_uid,
+                previous_sequence=previous_sequence,
+            )
+        except ProgressReadTransientError as exc:
+            if attempt >= PROGRESS_READ_MAX_ATTEMPTS:
+                if defer_transient:
+                    return {}, None
+                raise RuntimeError(
+                    f"vscode_lm_progress_terminal_read_failed:{exc}"
+                ) from exc
+            time.sleep(PROGRESS_READ_RETRY_SECONDS)
+    raise AssertionError("unreachable")
+
+
 def run(spec_path: Path) -> dict[str, Any]:
     spec = _load_json(spec_path)
     if spec.get("schema_id") != "aiworkhub.vscode_lm.worker_spec.v1":
         raise RuntimeError("bridge_worker_spec_schema_mismatch")
     workspace = Path(str(spec.get("workspace_path") or "")).resolve(strict=True)
     response_path = Path(str(spec.get("response_path") or ""))
+    terminal_decision_required = spec.get("terminal_decision_required") is True
+    cancel_token = str(spec.get("cancel_token") or "")
+    cancel_path = Path(str(spec.get("cancel_path") or response_path))
+    if terminal_decision_required and cancel_path.resolve(strict=False) != response_path.resolve(
+        strict=False
+    ):
+        raise RuntimeError("vscode_lm_terminal_decision_path_mismatch")
     progress_path_raw = str(spec.get("progress_path") or "")
     progress_path = Path(progress_path_raw) if progress_path_raw else None
     timeout_seconds = max(30, min(int(spec.get("timeout_seconds") or 7200), 86_400))
     deadline = time.monotonic() + timeout_seconds
     last_progress_sequence = 0
-    last_progress_signature: tuple[int, int] | None = None
+    last_progress_signature: ProgressFileSignature | None = None
+    response: dict[str, Any] | None = None
+    decision_action = ""
     while time.monotonic() < deadline:
-        if response_path.is_file():
+        if terminal_decision_required:
+            decision = read_terminal_decision(
+                response_path,
+                request_id=str(spec.get("request_id") or ""),
+                repo_id=str(spec.get("repo_id") or ""),
+                cancel_token=cancel_token,
+            )
+            if decision is not None:
+                response, decision_action = decision
+                break
+        elif response_path.is_file():
+            response = _load_json(response_path)
             break
-        if progress_path is not None and (
-            progress_path.exists() or progress_path.is_symlink()
-        ):
+        if progress_path is not None:
             try:
                 progress_stat = progress_path.lstat()
-                progress_signature = (progress_stat.st_mtime_ns, progress_stat.st_size)
+                progress_signature = progress_file_signature(progress_stat)
             except OSError:
                 progress_signature = None
             if progress_signature is not None and progress_signature != last_progress_signature:
-                progress = read_progress_receipt(
+                progress, validated_signature = _read_progress_with_retry(
                     progress_path,
                     str(spec.get("request_id") or ""),
                     str(spec.get("repo_id") or ""),
                     owner_uid=os.getuid() if hasattr(os, "getuid") else None,
                     previous_sequence=(last_progress_sequence or None),
+                    defer_transient=True,
                 )
                 if progress:
                     last_progress_sequence = int(progress["sequence"])
@@ -571,22 +633,29 @@ def run(spec_path: Path) -> dict[str, Any]:
                         ),
                         flush=True,
                     )
-                last_progress_signature = progress_signature
+                    last_progress_signature = validated_signature
         time.sleep(0.1)
     else:
         raise RuntimeError("vscode_lm_response_timeout")
 
-    response = _load_json(response_path)
+    if response is None:
+        raise RuntimeError("vscode_lm_terminal_decision_missing")
     if response.get("schema_id") != RESPONSE_SCHEMA_ID:
         raise RuntimeError("vscode_lm_response_schema_mismatch")
     if response.get("request_id") != spec.get("request_id"):
         raise RuntimeError("vscode_lm_response_identity_mismatch")
+    if terminal_decision_required:
+        if response.get("repo_id") != spec.get("repo_id"):
+            raise RuntimeError("vscode_lm_response_repo_identity_mismatch")
+        if decision_action not in {"cancel", "response"}:
+            raise RuntimeError("vscode_lm_terminal_decision_action_invalid")
     if progress_path is not None:
-        read_progress_receipt(
+        _read_progress_with_retry(
             progress_path,
             str(spec.get("request_id") or ""),
             str(spec.get("repo_id") or ""),
             owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+            defer_transient=False,
         )
     if response.get("error"):
         diagnostics = response.get("diagnostics")
