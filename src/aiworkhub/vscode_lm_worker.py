@@ -7,6 +7,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
@@ -65,6 +66,72 @@ def _relative_path(raw: Any) -> str:
 
 def _matches(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+_FIDELITY_WORD_MARKERS = re.compile(
+    r"(?<![\w])(?:todo|fixme|xxx|placeholder)(?![\w])",
+    re.IGNORECASE,
+)
+_FIDELITY_ANGLE_PLACEHOLDER = re.compile(
+    r"^\s*<\s*(?:new\s+[\w.:-]+\s+code|test\s+file\s+content|"
+    r"(?:full|complete)\s+file\s+content|insert\s+[^>]+\s+here)\s*>\s*$",
+    re.IGNORECASE,
+)
+_FIDELITY_PHRASE_MARKERS = (
+    "implementation omitted",
+    "omitted for brevity",
+    "rest of the code",
+    "rest unchanged",
+    "remainder unchanged",
+    "unchanged code",
+    "insert code here",
+    "your code here",
+)
+
+
+def _check_edit_fidelity(
+    old_text: str,
+    new_text: str,
+    *,
+    path: str,
+    operation: str,
+) -> dict[str, Any]:
+    """Reject deterministic non-code placeholders before any file mutation."""
+
+    old_bytes = len(old_text.encode("utf-8"))
+    new_bytes = len(new_text.encode("utf-8"))
+    if operation.startswith("v3_range:") and new_text == "":
+        return {
+            "path": path,
+            "operation": operation,
+            "old_bytes": old_bytes,
+            "new_bytes": 0,
+        }
+    lowered = new_text.casefold()
+    marker = _FIDELITY_WORD_MARKERS.search(new_text)
+    phrase = next(
+        (value for value in _FIDELITY_PHRASE_MARKERS if value in lowered),
+        "",
+    )
+    if marker is not None or phrase or _FIDELITY_ANGLE_PLACEHOLDER.fullmatch(new_text):
+        reason = "explicit_non_substantive_marker"
+    elif (
+        old_bytes >= 2048
+        and new_bytes <= 64
+        and not any(char.isalnum() for char in new_text)
+    ):
+        reason = "suspicious_shrink_without_alphanumeric_substance"
+    else:
+        return {
+            "path": path,
+            "operation": operation,
+            "old_bytes": old_bytes,
+            "new_bytes": new_bytes,
+        }
+    raise RuntimeError(
+        "vscode_lm_edit_fidelity_rejected:"
+        f"{reason}:{path}:{operation}:old_bytes={old_bytes}:new_bytes={new_bytes}"
+    )
 
 
 def _write_atomic(workspace: Path, relative: str, content: str) -> None:
@@ -134,7 +201,11 @@ def _validate_allowed_path(raw_path: Any, allowed: list[str]) -> str:
     return relative
 
 
-def _v1_planned_outputs(edit: dict[str, Any], allowed: list[str]) -> list[tuple[str, str]]:
+def _v1_planned_outputs(
+    workspace: Path,
+    edit: dict[str, Any],
+    allowed: list[str],
+) -> list[tuple[str, str]]:
     files = edit.get("files")
     if not isinstance(files, list):
         raise RuntimeError("vscode_lm_edit_response_files_invalid")
@@ -147,7 +218,18 @@ def _v1_planned_outputs(edit: dict[str, Any], allowed: list[str]) -> list[tuple[
         if relative in seen:
             raise RuntimeError(f"vscode_lm_edit_response_duplicate_path:{relative}")
         seen.add(relative)
-        planned.append((relative, item["content"]))
+        target = _target_path(workspace, relative)
+        old_text = ""
+        if target.is_file() and not target.is_symlink():
+            old_text = target.read_bytes().decode("utf-8", errors="replace")
+        content = item["content"]
+        _check_edit_fidelity(
+            old_text,
+            content,
+            path=relative,
+            operation="v1_file",
+        )
+        planned.append((relative, content))
     return planned
 
 
@@ -236,6 +318,12 @@ def _v2_planned_outputs(
                 raise RuntimeError(
                     f"vscode_lm_edit_response_replacement_too_large:{relative}"
                 )
+            _check_edit_fidelity(
+                old,
+                new,
+                path=relative,
+                operation=f"v2_replacement:{replacement_index}",
+            )
             actual_count = next_text.count(old)
             if actual_count != expected_count:
                 old_bytes = old.encode("utf-8")
@@ -272,6 +360,7 @@ def _v2_planned_outputs(
         content = item["content"]
         if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        _check_edit_fidelity("", content, path=relative, operation="v2_create")
         planned.append((relative, content))
     return planned
 
@@ -380,6 +469,19 @@ def _v3_planned_outputs(
                 f"vscode_lm_semantic_edit_rejected:{relative}:"
                 f"entry_index1={first_idx}:{exc}"
             ) from exc
+        current_lines = current_text.splitlines(keepends=True)
+        for range_index, range_item in enumerate(ranges):
+            start = range_item["start_line"]
+            end = range_item["end_line"]
+            old_fragment = (
+                "" if not current_lines else "".join(current_lines[start - 1 : end])
+            )
+            _check_edit_fidelity(
+                old_fragment,
+                range_item["new"],
+                path=relative,
+                operation=f"v3_range:{range_index}",
+            )
         next_bytes = next_text.encode("utf-8")
         if len(next_bytes) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
@@ -411,6 +513,7 @@ def _v3_planned_outputs(
         content = item["content"]
         if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        _check_edit_fidelity("", content, path=relative, operation="v3_create")
         planned.append((relative, content))
         metrics.append({
             "path": relative,
@@ -510,7 +613,7 @@ def run(spec_path: Path) -> dict[str, Any]:
     try:
         semantic_metrics: list[dict[str, Any]] = []
         if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
-            planned = _v1_planned_outputs(edit, allowed)
+            planned = _v1_planned_outputs(workspace, edit, allowed)
         elif edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V2:
             create_paths = {
                 str(value) for value in spec.get("create_paths") or [] if str(value)

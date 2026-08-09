@@ -994,7 +994,7 @@ def test_allow_unchanged_required_outputs_accepts_exact_baseline_match(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
-def test_allow_unchanged_required_outputs_rejects_changed_output(
+def test_allow_unchanged_required_outputs_accepts_changed_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     repo: Path,
@@ -1002,15 +1002,28 @@ def test_allow_unchanged_required_outputs_rejects_changed_output(
     workspace = _workspace(monkeypatch, tmp_path, repo, "allow-unchanged-changed")
     try:
         (workspace.path / "out" / "result.txt").write_text("worker-result\n", encoding="utf-8")
-        with pytest.raises(
-            worker_workspace.WorkspaceError,
-            match="allow_unchanged_required_output_changed",
-        ):
-            worker_workspace.validate_required_outputs(
-                workspace,
-                ["out/result.txt"],
-                allow_unchanged=("out/result.txt",),
-            )
+        records = worker_workspace.validate_required_outputs(
+            workspace,
+            ["out/result.txt"],
+            allow_unchanged=("out/result.txt",),
+        )
+        target = workspace.path / "out" / "result.txt"
+        changed_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        changed_hash = f"file:{stat.S_IMODE(target.stat().st_mode):o}:{changed_digest}"
+        assert records == [
+            {
+                "pattern": "out/result.txt",
+                "path": "out/result.txt",
+                "bytes": len(target.read_bytes()),
+                "sha256": changed_hash,
+                "unchanged_allowed": False,
+            }
+        ]
+        changed = worker_workspace.enforce_scope(workspace)
+        promotable = sorted(
+            set(changed) | {rec["path"] for rec in records if not rec["unchanged_allowed"]}
+        )
+        assert promotable == ["out/result.txt"]
     finally:
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
@@ -1590,3 +1603,124 @@ def test_provisioned_scratch_supports_git_init(
         assert (target / ".git").is_dir()
     finally:
         worker_workspace.cleanup_validation_exec_scratch(scratch)
+
+
+class TestCopyOne:
+    @staticmethod
+    def test_copies_bytes(tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.write_bytes(b"hello")
+        dst = tmp_path / "dst"
+        worker_workspace._copy_one(src, dst)
+        assert dst.read_bytes() == b"hello"
+
+    @staticmethod
+    def test_executable_mode(tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.write_bytes(b"#!/bin/sh\necho hi\n")
+        src.chmod(0o755)
+        dst = tmp_path / "dst"
+        worker_workspace._copy_one(src, dst)
+        st = os.stat(dst)
+        assert stat.S_IMODE(st.st_mode) == 0o755
+
+    @staticmethod
+    def test_existing_destination(tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.write_bytes(b"new")
+        dst = tmp_path / "dst"
+        dst.write_bytes(b"old")
+        worker_workspace._copy_one(src, dst)
+        assert dst.read_bytes() == b"new"
+
+    @staticmethod
+    def test_hardlink_safety(tmp_path: Path) -> None:
+        if not hasattr(os, "link"):
+            pytest.skip("os.link not available")
+        src = tmp_path / "src"
+        src.write_bytes(b"content")
+        dst = tmp_path / "dst"
+        dst.write_bytes(b"initial")
+        link = tmp_path / "link"
+        os.link(dst, link)
+        worker_workspace._copy_one(src, dst)
+        assert dst.read_bytes() == b"content"
+        assert link.read_bytes() == b"initial"
+
+    @staticmethod
+    def test_source_symlink_fails(tmp_path: Path) -> None:
+        if not hasattr(os, "symlink"):
+            pytest.skip("os.symlink not available")
+        src = tmp_path / "src"
+        src.write_bytes(b"x")
+        sym = tmp_path / "sym"
+        os.symlink(src, sym)
+        with pytest.raises(worker_workspace.WorkspaceError, match="symlink_seed_forbidden"):
+            worker_workspace._copy_one(sym, tmp_path / "dst")
+
+    @staticmethod
+    def test_destination_symlink_fails(tmp_path: Path) -> None:
+        if not hasattr(os, "symlink"):
+            pytest.skip("os.symlink not available")
+        src = tmp_path / "src"
+        src.write_bytes(b"x")
+        dst = tmp_path / "dst"
+        os.symlink(src, dst)
+        with pytest.raises(worker_workspace.WorkspaceError, match="destination_symlink_forbidden"):
+            worker_workspace._copy_one(src, dst)
+
+    @staticmethod
+    def test_nonregular_source_fails(tmp_path: Path) -> None:
+        # FIFO: skip if unsupported, always retain directory coverage
+        if hasattr(os, "mkfifo"):
+            fifo = tmp_path / "fifo"
+            os.mkfifo(fifo)
+            with pytest.raises(worker_workspace.WorkspaceError, match="non_regular_seed_forbidden"):
+                worker_workspace._copy_one(fifo, tmp_path / "dst")
+        dir_ = tmp_path / "dir"
+        dir_.mkdir()
+        with pytest.raises(worker_workspace.WorkspaceError, match="non_regular_seed_forbidden"):
+            worker_workspace._copy_one(dir_, tmp_path / "dst")
+
+    @staticmethod
+    def test_failure_cleanup(tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.write_bytes(b"data")
+        dst_dir = tmp_path / "dst_dir"
+        dst_dir.mkdir()
+        dst = dst_dir / "dst"
+        dst.mkdir()
+        with pytest.raises(OSError):  # os.replace on a directory
+            worker_workspace._copy_one(src, dst)
+        remaining = list(dst_dir.iterdir())
+        assert [p.name for p in remaining if not p.is_symlink()] == ["dst"]
+
+    @staticmethod
+    def test_nested_parent(tmp_path: Path) -> None:
+        """_copy_one creates nested parent directories when needed."""
+        src = tmp_path / "src"
+        src.write_bytes(b"nested")
+        dst = tmp_path / "a" / "b" / "c"
+        worker_workspace._copy_one(src, dst)
+        assert dst.read_bytes() == b"nested"
+
+    @staticmethod
+    def test_partial_write(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Complete-write loop handles partial os.write returns."""
+        src = tmp_path / "src"
+        src.write_bytes(b"x" * 8192)
+        dst = tmp_path / "dst"
+
+        orig_write = os.write
+        call_count = [0]
+
+        def partial_write(fd: int, data: bytes) -> int:
+            call_count[0] += 1
+            if call_count[0] == 1 and len(data) > 1:
+                return orig_write(fd, data[:1])  # write 1 byte on first call
+            return orig_write(fd, data)
+
+        monkeypatch.setattr(os, "write", partial_write)
+        worker_workspace._copy_one(src, dst)
+        assert dst.read_bytes() == b"x" * 8192
+        assert call_count[0] >= 2  # at least one retry

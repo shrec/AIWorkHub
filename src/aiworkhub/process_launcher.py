@@ -153,14 +153,12 @@ else:
                         raise WorkspaceError(f"required_output_unchanged:{relative}")
                     if workspace.parent_baseline.get(relative) != current:
                         raise WorkspaceError(f"required_output_unchanged_parent_mismatch:{relative}")
-                if not is_unchanged and relative in unchanged_allowed:
-                    raise WorkspaceError(f"allow_unchanged_required_output_changed:{relative}")
                 if is_unchanged and size <= 0:
                     raise WorkspaceError(f"required_output_unchanged:{relative}")
                 records.append({
                     "path": relative,
                     "bytes": size,
-                    "sha256": digest,
+                    "sha256": current,
                     "unchanged_allowed": is_unchanged,
                 })
         return records

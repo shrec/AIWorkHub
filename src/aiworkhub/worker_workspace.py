@@ -535,14 +535,74 @@ def _resolve_one_quoted_include(
 
 
 def _copy_one(source: Path, destination: Path) -> None:
-    if source.is_symlink():
-        raise WorkspaceError(f"symlink_seed_forbidden:{source}")
-    if source.is_dir():
-        raise WorkspaceError(f"directory_seed_forbidden:{source}")
-    if not source.exists():
+    # lstat source; silently return on FileNotFoundError
+    try:
+        source_lstat = os.lstat(source)
+    except FileNotFoundError:
         return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
+    except OSError as exc:
+        raise WorkspaceError(f"lstat_source_failed:{source}:{exc}") from exc
+    if stat.S_ISLNK(source_lstat.st_mode):
+        raise WorkspaceError(f"symlink_seed_forbidden:{source}")
+    if not stat.S_ISREG(source_lstat.st_mode):
+        raise WorkspaceError(f"non_regular_seed_forbidden:{source}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, flags)
+    except OSError as exc:
+        raise WorkspaceError(f"open_source_failed:{source}:{exc}") from exc
+
+    temp_fd = None
+    temp_path = None
+    replaced = False
+    try:
+        source_fstat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_fstat.st_mode):
+            raise WorkspaceError(f"source_not_regular_after_open:{source}")
+        if not os.path.samestat(source_lstat, source_fstat):
+            raise WorkspaceError(f"source_stat_mismatch:{source}")
+
+        source_mode = stat.S_IMODE(source_fstat.st_mode)
+
+        # Ensure destination parent directory exists (nested mkdir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_fd, temp_path = tempfile.mkstemp(dir=str(destination.parent))
+
+        # Copy all bytes with explicit complete-write loop
+        while True:
+            data = os.read(source_fd, 65536)
+            if not data:
+                break
+            written = 0
+            while written < len(data):
+                w = os.write(temp_fd, data[written:])
+                if w == 0:
+                    raise OSError("write returned 0")
+                written += w
+
+        # chmod temp fd to ordinary permission bits only
+        chmod_fd(temp_fd, source_mode & 0o777)
+
+        # reject an existing destination symlink
+        if destination.is_symlink():
+            raise WorkspaceError(f"destination_symlink_forbidden:{destination}")
+
+        # atomic replacement; hardlink-safe
+        os.replace(temp_path, destination)
+        replaced = True
+    finally:
+        # Single ownership cleanup: close each fd at most once,
+        # unlink temp exactly once unless os.replace succeeded.
+        os.close(source_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_path is not None and not replaced:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
 def _touch_placeholder(worktree: Path, relative: str) -> None:
@@ -1555,8 +1615,6 @@ def validate_required_outputs(
                     raise WorkspaceError(f"required_output_unchanged_parent_mismatch:{relative}")
                 if current_hash is None or target.is_symlink() or not target.is_file() or size <= 0:
                     raise WorkspaceError(f"required_output_unchanged_invalid:{relative}")
-            if is_unchanged is False and relative in unchanged_allowed:
-                raise WorkspaceError(f"allow_unchanged_required_output_changed:{relative}")
             record = {
                 "pattern": pattern,
                 "path": relative,
