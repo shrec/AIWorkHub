@@ -6,6 +6,27 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.30] - 2026-08-09
+
+### Fixed
+
+- Windows isolated-workspace staging now routes policy and dependency seed
+  publication through the shared bounded `atomic_replace` helper and closes its
+  own temporary writer handle before rename. Neither that handle nor a transient
+  destination reader (observed on read-only `AGENTS.md`) now turns workspace
+  preparation into `WinError 32`; source bytes and policy files remain unchanged
+  and symlink/hardlink protections stay fail-closed.
+- VS Code LM request publication now tolerates one repo-spool cleanup race and
+  recognizes an immediate owner-only `.claim-*` move by the trusted extension
+  host instead of reporting a false missing-request launch failure. Permission,
+  parent-identity, ownership and mode failures are never retried.
+
+### Tests
+
+- Added transient Windows sharing-violation coverage, exact `AGENTS.md` source
+  immutability and destination-byte checks, bounded spool reprovisioning, and
+  immediate secure-claim publication regressions.
+
 ## [0.9.29] - 2026-08-09
 
 ### Fixed

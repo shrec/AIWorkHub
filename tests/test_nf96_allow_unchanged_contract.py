@@ -341,6 +341,65 @@ def test_acceptance_5a_copy_one_fd_atomic_bytes(
     assert dst.read_bytes() == b"nf96-contract-bytes"
 
 
+def test_acceptance_5a_copy_one_uses_cross_platform_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Workspace staging routes destination publication through platform_io."""
+    src = tmp_path / "AGENTS.md.source"
+    src.write_bytes(b"read-only worker policy\n")
+    dst = tmp_path / "worktree" / "AGENTS.md"
+    calls: list[tuple[Path, Path]] = []
+
+    def tracked_replace(source, destination) -> None:
+        calls.append((Path(source), Path(destination)))
+        os.replace(source, destination)
+
+    monkeypatch.setattr(worker_workspace, "atomic_replace", tracked_replace)
+
+    worker_workspace._copy_one(src, dst)
+
+    assert calls and calls[0][1] == dst
+    assert dst.read_bytes() == b"read-only worker policy\n"
+    assert src.read_bytes() == b"read-only worker policy\n"
+
+
+def test_acceptance_5a_copy_one_closes_temp_handle_before_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The process must not create its own Windows sharing violation."""
+    src = tmp_path / "AGENTS.md.source"
+    src.write_bytes(b"policy\n")
+    dst = tmp_path / "worktree" / "AGENTS.md"
+    real_mkstemp = worker_workspace.tempfile.mkstemp
+    real_close = worker_workspace.os.close
+    real_replace = os.replace
+    state: dict[str, object] = {"temp_fd": None, "temp_closed": False}
+
+    def tracked_mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(*args, **kwargs)
+        state["temp_fd"] = fd
+        return fd, path
+
+    def tracked_close(fd: int) -> None:
+        if fd == state["temp_fd"]:
+            state["temp_closed"] = True
+        real_close(fd)
+
+    def assert_closed_then_replace(source, destination) -> None:
+        assert state["temp_closed"] is True
+        real_replace(source, destination)
+
+    monkeypatch.setattr(worker_workspace.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(worker_workspace.os, "close", tracked_close)
+    monkeypatch.setattr(worker_workspace, "atomic_replace", assert_closed_then_replace)
+
+    worker_workspace._copy_one(src, dst)
+
+    assert dst.read_bytes() == b"policy\n"
+
+
 def test_acceptance_5b_copy_one_hardlink_safety(
     tmp_path: Path,
 ) -> None:

@@ -67,6 +67,25 @@ def test_chmod_path_applies_posix_mode(monkeypatch, tmp_path):
     assert calls == [(target, 0o600)]
 
 
+def test_atomic_replace_retries_transient_windows_sharing_violation(monkeypatch):
+    calls: list[tuple[object, object]] = []
+
+    def transient_replace(source, destination):
+        calls.append((source, destination))
+        if len(calls) == 1:
+            raise PermissionError(32, "file is being used by another process")
+
+    monotonic_values = iter((10.0, 10.1))
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io.os, "replace", transient_replace)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(platform_io.time, "sleep", lambda _seconds: None)
+
+    platform_io.atomic_replace("seed.tmp", "AGENTS.md")
+
+    assert calls == [("seed.tmp", "AGENTS.md"), ("seed.tmp", "AGENTS.md")]
+
+
 def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
     calls: list[tuple[int, int, int]] = []
     fake_msvcrt = SimpleNamespace(

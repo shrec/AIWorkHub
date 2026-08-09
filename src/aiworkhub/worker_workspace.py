@@ -35,8 +35,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 try:
-    from .platform_io import chmod_fd, chmod_path
+    from .platform_io import atomic_replace, chmod_fd, chmod_path
 except ImportError:  # direct-script Landlock entrypoint
+    def atomic_replace(
+        source: str | os.PathLike[str], destination: str | os.PathLike[str]
+    ) -> None:
+        os.replace(source, destination)
+
     def chmod_fd(fd: int, mode: int) -> None:
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
@@ -589,8 +594,17 @@ def _copy_one(source: Path, destination: Path) -> None:
         if destination.is_symlink():
             raise WorkspaceError(f"destination_symlink_forbidden:{destination}")
 
-        # atomic replacement; hardlink-safe
-        os.replace(temp_path, destination)
+        # Windows refuses to rename a mkstemp file while this process still
+        # owns its CRT handle (WinError 32). Close our writer before publish;
+        # the finally block sees None and cannot double-close it.
+        os.close(temp_fd)
+        temp_fd = None
+
+        # Atomic replacement; hardlink-safe. The shared helper performs one
+        # bounded retry window for transient Windows sharing violations (for
+        # example an editor/AV reader holding AGENTS.md) while POSIX remains a
+        # single replace call. Source policy files are never modified.
+        atomic_replace(temp_path, destination)
         replaced = True
     finally:
         # Single ownership cleanup: close each fd at most once,

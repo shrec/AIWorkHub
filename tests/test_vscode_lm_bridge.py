@@ -171,6 +171,53 @@ def test_atomic_json_remains_portable_when_getuid_absent(
     assert target.stat().st_mode & 0o777 == 0o600
 
 
+def test_atomic_json_retries_repo_spool_cleanup_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "requests" / "repo_test" / "request.json"
+    real_replace = os.replace
+    replace_calls = 0
+
+    def cleanup_before_first_publish(src, dst):
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            Path(src).unlink()
+            Path(dst).parent.rmdir()
+            raise FileNotFoundError(dst)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "replace", cleanup_before_first_publish)
+
+    vscode_lm_bridge._atomic_json(target, {"retry": "bounded"})  # noqa: SLF001
+
+    assert replace_calls == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {"retry": "bounded"}
+
+
+def test_atomic_json_accepts_immediate_owner_only_request_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "requests" / "repo_test" / "request.json"
+    claim = Path(f"{target}.claim-window_test")
+    real_replace = os.replace
+
+    def claim_immediately(src, dst):
+        real_replace(src, dst)
+        real_replace(dst, claim)
+
+    monkeypatch.setattr(vscode_lm_bridge.os, "replace", claim_immediately)
+
+    vscode_lm_bridge._atomic_json(  # noqa: SLF001
+        target,
+        {"claimed": True},
+        allow_owner_claim_move=True,
+    )
+
+    assert not target.exists()
+    assert json.loads(claim.read_text(encoding="utf-8")) == {"claimed": True}
+
+
 def _repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()

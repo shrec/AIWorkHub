@@ -59,6 +59,7 @@ DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 6 * 1024 * 1024
+ATOMIC_JSON_MAX_ATTEMPTS = 2
 _REQUEST_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _CONTEXT_RECEIPT_PREFIX = "PROJECT_CONTEXT_RECEIPT:"
 SOURCE_GRAPH_WORKFLOW_STAGES: tuple[str, ...] = (
@@ -136,7 +137,59 @@ def resolve_editor_model_alias(model: str | None, observed_models: Iterable[str]
     return None
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _owner_only_claim_exists(path: Path) -> bool:
+    """Return true only for a secure consumer claim of ``path``."""
+    try:
+        candidates = list(path.parent.glob(f"{path.name}.claim-*"))
+    except OSError:
+        return False
+    getuid = getattr(os, "getuid", None)
+    for candidate in candidates[:32]:
+        try:
+            claim_stat = candidate.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(claim_stat.st_mode):
+            continue
+        if getuid is not None and claim_stat.st_uid != getuid():
+            continue
+        if posix_path_modes_supported() and stat.S_IMODE(claim_stat.st_mode) != 0o600:
+            continue
+        return True
+    return False
+
+
+def _atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    allow_owner_claim_move: bool = False,
+) -> None:
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise BridgeError("bridge_document_too_large")
+    for attempt in range(ATOMIC_JSON_MAX_ATTEMPTS):
+        try:
+            _atomic_json_once(
+                path,
+                encoded,
+                allow_owner_claim_move=allow_owner_claim_move,
+            )
+            return
+        except FileNotFoundError:
+            # A bridge-host cleanup may remove an empty repo spool between
+            # mkdir/mkstemp/replace. Re-provision once from scratch; never
+            # retry permission, identity, ownership or mode failures.
+            if attempt + 1 >= ATOMIC_JSON_MAX_ATTEMPTS:
+                raise
+
+
+def _atomic_json_once(
+    path: Path,
+    encoded: bytes,
+    *,
+    allow_owner_claim_move: bool,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Some secure validation sandboxes deny chmod/fchmod syscalls even when
     # the freshly-created object already has the required owner-only mode.
@@ -148,9 +201,6 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         chmod_path(path.parent, 0o700)
     parent_stat = os.stat(path.parent)
     parent_dev, parent_ino = parent_stat.st_dev, parent_stat.st_ino
-    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    if len(encoded) > MAX_REQUEST_BYTES:
-        raise BridgeError("bridge_document_too_large")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         # Fail closed if the parent directory identity changed between the
@@ -167,6 +217,18 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        temp_stat = os.fstat(fd)
+        if posix_path_modes_supported() and stat.S_IMODE(temp_stat.st_mode) != 0o600:
+            raise BridgeError("bridge_temp_mode_insecure")
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None and temp_stat.st_uid != getuid():
+            raise BridgeError("bridge_temp_owner_mismatch")
+        current_parent_stat = os.stat(path.parent)
+        if (
+            current_parent_stat.st_dev != parent_dev
+            or current_parent_stat.st_ino != parent_ino
+        ):
+            raise BridgeError("bridge_parent_identity_changed")
         # Windows refuses to replace a file while this process still holds
         # the mkstemp handle open (WinError 32).  POSIX permits it, which hid
         # the bug in the original implementation.
@@ -178,7 +240,16 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         # chmod TOCTOU window after replacement. O_NOFOLLOW fails closed on
         # a symlink swapped in during the race.
         open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        verify_fd = os.open(path, open_flags)
+        try:
+            verify_fd = os.open(path, open_flags)
+        except FileNotFoundError:
+            # Request files are published by rename and may be claimed by the
+            # trusted extension host immediately. Accept only its owner-only
+            # regular `.claim-*` rename; generic atomic documents remain
+            # strict and a missing target still fails closed.
+            if allow_owner_claim_move and _owner_only_claim_exists(path):
+                return
+            raise
         try:
             final_stat = os.fstat(verify_fd)
             if (
@@ -509,7 +580,7 @@ def create_request(
         "project_context_receipt": context_receipt,
     }
     _atomic_json(worker_spec_path, worker)
-    _atomic_json(request_path, shared)
+    _atomic_json(request_path, shared, allow_owner_claim_move=True)
     return BridgeRequest(request_id, repo_id, request_path, response_path, worker_spec_path)
 
 
