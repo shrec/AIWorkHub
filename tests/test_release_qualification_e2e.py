@@ -59,9 +59,10 @@ def _create() -> dict:
         RUNNER,
         TOPIC,
         "Exercise the portable lifecycle without launching a paid model.",
-        ["terminal review and callback are durable"],
-        ["qualification-evidence.json"],
-        validation=["python -c \"print('qualification')\""],
+            ["terminal review and callback are durable"],
+            ["qualification-evidence.json"],
+            required_outputs=["qualification-evidence.json"],
+            validation=["python -c \"print('qualification')\""],
     )
     assert result["ok"] is True, result
     return json.loads(result["stdout"])

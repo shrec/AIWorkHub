@@ -522,6 +522,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         objective="Prove canonical MCP task creation.",
         acceptance=["created once"],
         allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
         max_live_tokens=250_000,
@@ -547,6 +548,7 @@ def test_manager_create_task_derives_route_and_never_overwrites(writable_repo, m
         objective="Prove canonical MCP task creation.",
         acceptance=["created once"],
         allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
         forbidden=["secrets/**"],
         validation=["python -m pytest -q"],
         max_live_tokens=250_000,
@@ -740,6 +742,7 @@ def test_manager_create_rejects_mutating_code_task_without_validation(
         objective="Change code without a behavioral check.",
         acceptance=["changed"],
         allowed_writes=["src/example.py"],
+        required_outputs=["src/example.py"],
     )
 
     assert result["ok"] is False
@@ -767,6 +770,7 @@ def test_manager_create_rejects_validation_syntax_worker_cannot_execute(
         objective="Fail before spending a provider run.",
         acceptance=["Rejected at creation."],
         allowed_writes=["docs/result.md"],
+        required_outputs=["docs/result.md"],
         validation=[
             "python -c \"from pathlib import Path; assert Path('docs/result.md').exists()\""
         ],
@@ -828,9 +832,10 @@ def test_concurrent_create_and_lost_ack_retry_reconcile_once(writable_repo, monk
             runner="claude_worker",
             topic="coding",
             objective="Commit once and reconcile every identical retry.",
-            acceptance=["one canonical row", "durable receipt"],
-            allowed_writes=["src/example.py"],
-            validation=["python -m pytest -q"],
+                acceptance=["one canonical row", "durable receipt"],
+                allowed_writes=["src/example.py"],
+                required_outputs=["src/example.py"],
+                validation=["python -m pytest -q"],
         )
 
     # Model three overlapping MCP writes.  Exactly one creates the row; the

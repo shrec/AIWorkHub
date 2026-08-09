@@ -769,6 +769,87 @@ def resolve_needfix(
         conn.close()
 
 
+def resolve_verified_needfix(
+    repo_root: str | Path,
+    needfix_id: str,
+    *,
+    resolution_note: str,
+) -> dict[str, Any]:
+    """Resolve an accepted NeedFix from manager-verified durable evidence.
+
+    This is deliberately separate from :func:`resolve_needfix`: ordinary
+    task-backed closure must still follow ``task_created -> resolved``.  The
+    direct path exists for fixes that the manager independently verified on
+    canonical HEAD without fabricating a task solely to satisfy lifecycle
+    ceremony.  It fails closed unless triage is complete and the row already
+    carries bounded durable evidence and evidence references.
+    """
+    note = str(resolution_note or "").strip()
+    if not note:
+        raise NeedFixValidationError(
+            "resolution_note is required for manager-verified resolution"
+        )
+    if len(note.encode("utf-8")) > 4000:
+        raise NeedFixValidationError("resolution_note exceeds bounded size")
+
+    conn = _connect(repo_root)
+    try:
+        row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+        if row is None:
+            raise NeedFixNotFoundError(needfix_id)
+        if row["status"] == "resolved":
+            return _row_to_dict(row)
+        if row["status"] != "accepted":
+            raise NeedFixConflictError(
+                "manager-verified resolution requires current_status='accepted'; "
+                f"current_status={row['status']!r}"
+            )
+        if int(row["readiness_score"] or 0) != 100:
+            raise NeedFixConflictError(
+                "manager-verified resolution requires readiness_score=100"
+            )
+        evidence = json.loads(row["evidence_json"] or "{}")
+        evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        if not isinstance(evidence, dict) or not evidence:
+            raise NeedFixConflictError(
+                "manager-verified resolution requires non-empty durable evidence"
+            )
+        if (
+            not isinstance(evidence_refs, list)
+            or not evidence_refs
+            or any(not isinstance(ref, str) or not ref.strip() for ref in evidence_refs)
+        ):
+            raise NeedFixConflictError(
+                "manager-verified resolution requires non-empty durable evidence_refs"
+            )
+
+        now = _utcnow_iso()
+        conn.execute(
+            "UPDATE needfix SET status = 'resolved', updated_at = ?, resolved_at = ? "
+            "WHERE id = ? AND status = 'accepted'",
+            (now, now, needfix_id),
+        )
+        if conn.total_changes != 1:
+            raise NeedFixConflictError(
+                "manager-verified resolution lost an atomic status race"
+            )
+        _record_event(
+            conn,
+            needfix_id,
+            "manager_verified_resolved",
+            {
+                "prior_status": "accepted",
+                "resolution_note": note,
+                "readiness_score": 100,
+                "evidence_ref_count": len(evidence_refs),
+            },
+        )
+        updated = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+        return _row_to_dict(updated)
+    finally:
+        conn.close()
+
+
 def update_needfix(
     repo_root: str | Path,
     needfix_id: str,
@@ -1000,20 +1081,19 @@ def preview_convert(
 
 
 def default_task_card(needfix_snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    """Build a structured, executable task-conversion plan from one NeedFix.
+    """Build the scope-derived base for an explicit task-conversion plan.
 
     Used only when the caller does not supply an explicit
     ``task_card_builder``. Scope (``allowed_writes``/``read_first``) comes
     solely from the NeedFix's own recorded ``scope_files`` -- never
     invented. A NeedFix with no recorded scope files converts to a
-    read-only investigation card instead of an unscoped, unlaunchable
-    "writable" card. ``required_outputs`` is deliberately left unset by
-    default: recorded scope files may include unchanged evidence/supporting
-    context rather than files every conversion must modify, and forcing all
-    of them to be required would produce false ``required_output_unchanged``
-    failures. A caller-supplied ``task_plan`` may still declare an explicit
-    ``required_outputs`` subset. Never sets ``max_live_tokens`` (uncapped
-    unless a caller-supplied plan says otherwise).
+    read-only investigation base instead of an unscoped writable card.
+    ``required_outputs`` is never inferred from scope files because scope may
+    include unchanged evidence/supporting context. Consequently a writable
+    conversion is complete only after the manager supplies an explicit
+    ``required_outputs`` subset plus the workforce-selected ``runner`` and
+    ``topic`` through ``task_plan``. Never sets ``max_live_tokens`` (uncapped
+    unless the owner explicitly requests a cap).
     """
     needfix_id = needfix_snapshot["id"]
     scope_files = [
@@ -1124,13 +1204,22 @@ def normalize_task_plan(
     set an explicit cap (uncapped otherwise).
     """
     validated = validate_task_plan(task_plan)
-    # Fail closed on an explicitly contradictory caller-supplied plan.
+    # Report contradictory authority before missing routing fields so callers
+    # get the most fundamental contract error first.
     if validated.get("read_only") is True and (
         validated.get("allowed_writes") or validated.get("required_outputs")
     ):
         raise NeedFixValidationError(
             "task_plan cannot combine read_only=True with a non-empty "
             "allowed_writes/required_outputs -- contradictory read/write intent"
+        )
+    missing_launch_fields = [
+        field for field in ("runner", "topic") if field not in validated
+    ]
+    if missing_launch_fields:
+        raise NeedFixValidationError(
+            "needfix conversion requires an explicit workforce launch contract; "
+            f"missing task_plan fields: {missing_launch_fields}"
         )
     card = default_task_card(needfix_snapshot)
     for field, value in validated.items():
@@ -1149,10 +1238,15 @@ def normalize_task_plan(
     # If the caller explicitly set read_only=True, strip any write
     # fields that may have leaked from the default or the override
     # (the override case is already rejected above).
-    if validated.get("read_only") is True:
+    if card.get("read_only") is True:
         card.pop("allowed_writes", None)
         card.pop("required_outputs", None)
         card.pop("validation", None)
+    elif not card.get("required_outputs"):
+        raise NeedFixValidationError(
+            "writable needfix conversion requires explicit non-empty "
+            "task_plan.required_outputs"
+        )
     return card
 
 def plan_digest(card: Mapping[str, Any]) -> str:

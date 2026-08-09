@@ -552,14 +552,13 @@ class TestConvertAtomicIdempotent:
 
 
 class TestDefaultTaskCard:
-    """Default conversion plan: executable, scoped, uncapped -- never an
-    empty writable code card."""
+    """Scope defaults never guess launch identity or writable outputs."""
 
     def _create_task_capture(self, card):
         self.captured_card = card
         return {"ok": True, "task_id": "task-captured"}
 
-    def test_default_card_is_scoped_and_executable_with_scope_files(self, init_store: Path):
+    def test_default_writable_card_requires_explicit_launch_contract(self, init_store: Path):
         r = needfix_store.capture_proposal(
             init_store,
             title="T",
@@ -568,13 +567,8 @@ class TestDefaultTaskCard:
         )
         needfix_store.triage_needfix(init_store, r["id"])
         needfix_store.accept_needfix(init_store, r["id"])
-        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
-        card = self.captured_card
-        assert card["read_only"] is False
-        assert card["allowed_writes"] == ["src/aiworkhub/foo.py"]
-        assert card["validation"]
-        assert card["task_type"] == "code"
-        assert card.get("max_live_tokens") is None
+        with pytest.raises(needfix_store.NeedFixValidationError, match="launch contract"):
+            needfix_store.preview_convert(init_store, r["id"])
 
     def test_default_card_does_not_infer_required_outputs_from_scope_files(self, init_store: Path):
         """Scope files may include unchanged evidence/supporting context --
@@ -589,8 +583,9 @@ class TestDefaultTaskCard:
         )
         needfix_store.triage_needfix(init_store, r["id"])
         needfix_store.accept_needfix(init_store, r["id"])
-        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
-        card = self.captured_card
+        card = needfix_store.default_task_card(
+            needfix_store.get_needfix(init_store, r["id"])
+        )
         assert card["allowed_writes"] == ["src/aiworkhub/foo.py", "docs/evidence.md"]
         assert not card.get("required_outputs")
 
@@ -598,8 +593,10 @@ class TestDefaultTaskCard:
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
         needfix_store.triage_needfix(init_store, r["id"])
         needfix_store.accept_needfix(init_store, r["id"])
-        needfix_store.convert_needfix(init_store, r["id"], self._create_task_capture)
-        card = self.captured_card
+        card = needfix_store.normalize_task_plan(
+            needfix_store.get_needfix(init_store, r["id"]),
+            {"runner": "deepseek_v4-pro", "topic": "needfix_readonly"},
+        )
         assert card["read_only"] is True
         assert not card.get("allowed_writes")
         assert not card.get("required_outputs")
@@ -626,15 +623,28 @@ class TestNeedFixConversionPublicPlanContract:
 
     def test_preview_returns_normalized_card_and_digest(self, init_store: Path):
         r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
-        pv = needfix_store.preview_convert(init_store, r["id"])
+        pv = needfix_store.preview_convert(
+            init_store,
+            r["id"],
+            {
+                "runner": "deepseek_v4-pro",
+                "topic": "needfix_fix",
+                "required_outputs": ["src/aiworkhub/foo.py"],
+            },
+        )
         assert pv["claimable"] is True
         assert pv["task_plan"]["allowed_writes"] == ["src/aiworkhub/foo.py"]
-        assert not pv["task_plan"].get("required_outputs")
+        assert pv["task_plan"]["required_outputs"] == ["src/aiworkhub/foo.py"]
         assert pv["plan_digest"] == needfix_store.plan_digest(pv["task_plan"])
 
     def test_preview_reflects_caller_supplied_task_plan_overrides(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
-        plan = {"acceptance": ["Custom acceptance"], "priority": "high"}
+        plan = {
+            "acceptance": ["Custom acceptance"],
+            "priority": "high",
+            "runner": "deepseek_v4-pro",
+            "topic": "needfix_research",
+        }
         pv = needfix_store.preview_convert(init_store, r["id"], plan)
         assert pv["task_plan"]["acceptance"] == ["Custom acceptance"]
         assert pv["task_plan"]["priority"] == "high"
@@ -696,7 +706,12 @@ class TestNeedFixConversionPublicPlanContract:
     def test_read_only_intent_overrides_scope_derived_writes(self, init_store: Path):
         r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
         card = needfix_store.normalize_task_plan(
-            needfix_store.get_needfix(init_store, r["id"]), {"read_only": True}
+            needfix_store.get_needfix(init_store, r["id"]),
+            {
+                "read_only": True,
+                "runner": "deepseek_v4-pro",
+                "topic": "needfix_readonly",
+            },
         )
         assert card["read_only"] is True
         assert not card.get("allowed_writes")
@@ -709,12 +724,16 @@ class TestNeedFixConversionPublicPlanContract:
         closed instead of silently committing a different plan, restoring
         the NeedFix to its pre-claim status."""
         r = self._accepted_with_scope(init_store)
-        pv = needfix_store.preview_convert(init_store, r["id"])
+        readonly_plan = {
+            "runner": "deepseek_v4-pro",
+            "topic": "needfix_research",
+        }
+        pv = needfix_store.preview_convert(init_store, r["id"], readonly_plan)
         stale_digest = pv["plan_digest"]
         needfix_store.update_needfix(init_store, r["id"], title="Changed after preview")
 
         def _digest_bound_builder(snapshot):
-            card = needfix_store.normalize_task_plan(snapshot, None)
+            card = needfix_store.normalize_task_plan(snapshot, readonly_plan)
             actual = needfix_store.plan_digest(card)
             if actual != stale_digest:
                 raise needfix_store.NeedFixConflictError("task_plan digest mismatch")
@@ -730,7 +749,11 @@ class TestNeedFixConversionPublicPlanContract:
 
     def test_plan_based_conversion_retry_is_idempotent_no_duplicate(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
-        plan = {"acceptance": ["Resolve it"]}
+        plan = {
+            "acceptance": ["Resolve it"],
+            "runner": "deepseek_v4-pro",
+            "topic": "needfix_research",
+        }
         builder = lambda snapshot: needfix_store.normalize_task_plan(snapshot, plan)
         c1 = needfix_store.convert_needfix(
             init_store, r["id"], self._create_task_capture, task_card_builder=builder
@@ -745,11 +768,17 @@ class TestNeedFixConversionPublicPlanContract:
     def test_uncapped_unless_plan_explicitly_sets_max_live_tokens(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
         default_card = needfix_store.normalize_task_plan(
-            needfix_store.get_needfix(init_store, r["id"]), None
+            needfix_store.get_needfix(init_store, r["id"]),
+            {"runner": "deepseek_v4-pro", "topic": "needfix_research"},
         )
         assert default_card.get("max_live_tokens") is None
         capped_card = needfix_store.normalize_task_plan(
-            needfix_store.get_needfix(init_store, r["id"]), {"max_live_tokens": 5000}
+            needfix_store.get_needfix(init_store, r["id"]),
+            {
+                "max_live_tokens": 5000,
+                "runner": "deepseek_v4-pro",
+                "topic": "needfix_research",
+            },
         )
         assert capped_card["max_live_tokens"] == 5000
 
@@ -993,6 +1022,95 @@ class TestLinkExistingTask:
         assert resolved["status"] == "resolved"
 
 
+class TestManagerVerifiedResolution:
+    def _accepted(self, init_store: Path, *, readiness_score: int = 100, evidence=None, refs=None):
+        row = needfix_store.capture_proposal(
+            init_store,
+            title="Canonical fix",
+            description="Manager verified this fix directly on canonical HEAD.",
+            evidence=evidence if evidence is not None else {"validation": "pytest passed"},
+            evidence_refs=refs if refs is not None else ["commit:0123456789abcdef"],
+        )
+        needfix_store.triage_needfix(init_store, row["id"])
+        return needfix_store.accept_needfix(
+            init_store, row["id"], readiness_score=readiness_score
+        )
+
+    def test_resolve_verified_closes_accepted_evidenced_item(self, init_store: Path):
+        row = self._accepted(init_store)
+        resolved = needfix_store.resolve_verified_needfix(
+            init_store, row["id"], resolution_note="Verified focused and full suites on HEAD."
+        )
+        assert resolved["status"] == "resolved"
+        assert resolved["resolved_at"]
+        assert resolved["converted_task_id"] is None
+        events = needfix_store.list_events(init_store, row["id"])
+        assert events[0]["event"] == "manager_verified_resolved"
+        assert events[0]["detail"]["evidence_ref_count"] == 1
+
+    @pytest.mark.parametrize(
+        ("readiness_score", "evidence", "refs", "message"),
+        [
+            (99, {"validation": "passed"}, ["commit:abc1234"], "readiness_score=100"),
+            (100, {}, ["commit:abc1234"], "durable evidence"),
+            (100, {"validation": "passed"}, [], "evidence_refs"),
+        ],
+    )
+    def test_resolve_verified_fails_closed_without_proof(
+        self, init_store: Path, readiness_score, evidence, refs, message
+    ):
+        row = self._accepted(
+            init_store,
+            readiness_score=readiness_score,
+            evidence=evidence,
+            refs=refs,
+        )
+        with pytest.raises(needfix_store.NeedFixConflictError, match=message):
+            needfix_store.resolve_verified_needfix(
+                init_store, row["id"], resolution_note="Verified."
+            )
+        assert needfix_store.get_needfix(init_store, row["id"])["status"] == "accepted"
+
+    def test_resolve_verified_requires_note(self, init_store: Path):
+        row = self._accepted(init_store)
+        with pytest.raises(needfix_store.NeedFixValidationError, match="resolution_note"):
+            needfix_store.resolve_verified_needfix(init_store, row["id"], resolution_note="")
+
+    def test_resolve_verified_is_idempotent_after_resolution(self, init_store: Path):
+        row = self._accepted(init_store)
+        first = needfix_store.resolve_verified_needfix(
+            init_store, row["id"], resolution_note="Verified."
+        )
+        second = needfix_store.resolve_verified_needfix(
+            init_store, row["id"], resolution_note="Verified again."
+        )
+        assert second == first
+
+    def test_ordinary_resolve_still_rejects_accepted_item(self, init_store: Path):
+        row = self._accepted(init_store)
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.resolve_needfix(init_store, row["id"])
+
+    def test_dashboard_delegates_verified_resolution(self, monkeypatch):
+        from aiworkhub import core, dashboard_mcp_app
+
+        calls = []
+
+        def fake(needfix_id, *, resolution_note):
+            calls.append((needfix_id, resolution_note))
+            return {"id": needfix_id, "status": "resolved"}
+
+        monkeypatch.setattr(core, "needfix_resolve_verified", fake)
+        result = dashboard_mcp_app.needfix_transition_view(
+            "NF-2026-00001",
+            "resolve_verified",
+            reason="Canonical tests passed.",
+            confirm=True,
+        )
+        assert result["ok"] is True
+        assert calls == [("NF-2026-00001", "Canonical tests passed.")]
+
+
 class TestExistingTaskLinkCanonicalDelegation:
     """Core, server MCP, and dashboard MCP call the same canonical implementation."""
 
@@ -1216,7 +1334,11 @@ class TestPreviewConvert:
 
     def test_preview_captured_not_claimable(self, init_store: Path):
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
-        pv = needfix_store.preview_convert(init_store, r["id"])
+        pv = needfix_store.preview_convert(
+            init_store,
+            r["id"],
+            {"runner": "deepseek_v4-pro", "topic": "needfix_research"},
+        )
         assert pv["claimable"] is False
         assert pv["unverified"] is True
 
@@ -1224,7 +1346,11 @@ class TestPreviewConvert:
         r = needfix_store.capture_proposal(init_store, title="T", description="D")
         needfix_store.triage_needfix(init_store, r["id"])
         needfix_store.accept_needfix(init_store, r["id"])
-        pv = needfix_store.preview_convert(init_store, r["id"])
+        pv = needfix_store.preview_convert(
+            init_store,
+            r["id"],
+            {"runner": "deepseek_v4-pro", "topic": "needfix_research"},
+        )
         assert pv["claimable"] is True
 
 

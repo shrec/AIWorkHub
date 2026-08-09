@@ -213,6 +213,7 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
     ("terminal_state", "terminal_error"),
     [
         ("finalize_failed", ""),
+        ("release_pending", "terminal_failure_transition_failed:sqlite_busy"),
         (
             "validation_failed",
             "validation_exec_scratch_unavailable:C:\\Temp:noexec",
@@ -308,11 +309,14 @@ def test_retry_finalization_reuses_retained_workspace_without_provider(
     assert result["ok"] is True, result
     assert result["state"] == "review_ready"
     assert result["provider_relaunched"] is False
-    assert transitions and transitions[0][0][1:4] == (
-        "TASK_B1",
-        "claude_worker_b1",
-        request_id,
-    )
+    if terminal_state == "release_pending":
+        assert transitions == []
+    else:
+        assert transitions and transitions[0][0][1:4] == (
+            "TASK_B1",
+            "claude_worker_b1",
+            request_id,
+        )
 
 
 def test_retry_finalization_rejects_product_validation_failure(monkeypatch, tmp_path):
@@ -1341,6 +1345,15 @@ def test_validation_only_replay_authorization_fails_closed_before_launch():
     )
     assert exact is not card["validation_only_replay_authorization"]
     assert exact["changed_path_hashes"] == {"out/result.json": digest}
+
+    no_validation = json.loads(json.dumps(card))
+    no_validation["validation"] = []
+    exact_no_validation = process_launcher._validation_only_replay_authorization(
+        no_validation, "TASK_REPLAY"
+    )
+    assert exact_no_validation["changed_path_hashes"] == {
+        "out/result.json": digest
+    }
 
     stale = json.loads(json.dumps(card))
     stale["validation_only_replay_authorization"]["next_claim_epoch"] = 3

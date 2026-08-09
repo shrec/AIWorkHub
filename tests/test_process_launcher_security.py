@@ -455,6 +455,46 @@ def test_missing_supervisor_status_releases_on_restart_and_retries_failed_releas
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
+def test_status_does_not_wait_when_release_pending_finalizer_owns_request_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    card = _card()
+    card.update({
+        "status": "processing",
+        "worker_status": "in_progress",
+        "claimed_by": card["runner"],
+    })
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(card),
+        collision_guard=_collision,
+        adapter_builder=_plan([]),
+    )
+    request_id = "f" * 32
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "topic": card["topic"],
+        "state": "release_pending",
+        "metadata_path": str(tmp_path / "request.json"),
+        "pid": 0,
+    })
+
+    def busy(*_args, **_kwargs):
+        raise BlockingIOError("request lock busy")
+
+    monkeypatch.setattr(manager, "_finalize_isolated_request", busy)
+    result = manager.status(request_id)
+    assert result["ok"] is True
+    assert result["state"] == "release_pending"
+    assert result["latest_event"]["reconciliation_deferred"] == "request_lock_busy"
+
+
 def test_vscode_lm_structured_response_timeout_is_terminal_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

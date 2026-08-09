@@ -6,6 +6,34 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.36] - 2026-08-09
+
+### Fixed
+
+- Provider-free `validation_only_replay` now permits an explicitly empty
+  validation contract. Hash-pinned required-output verification remains
+  mandatory, while Windows executable-scratch provisioning is skipped.
+- `release_pending` is now an explicit retained-workspace finalization-retry
+  state. The retry does not relaunch a provider or require a synthetic
+  `finalize_failed` task transition.
+- Request status/collection no longer waits on a concurrently owned Windows
+  finalizer lock. It returns the current durable snapshot with
+  `reconciliation_deferred=request_lock_busy` instead of a 20-second MCP
+  transport timeout.
+- Writable task creation and NeedFix conversion now reject missing
+  `required_outputs` before persistence, matching the launcher contract.
+  NeedFix conversion additionally requires the exact workforce `runner` and
+  `topic`, and the Webview carries the previewed plan and digest into commit.
+- Accepted, fully evidenced NeedFix items can use the separate
+  `resolve_verified` manager action without fabricating a task; ordinary
+  task-backed resolution remains `task_created -> resolved`.
+
+### Tests
+
+- Added Windows release-pending lock contention, provider-free replay,
+  manager-verified NeedFix closure and fail-before-create conversion
+  regressions. Full Python qualification passes 2,634 tests with 28 skipped.
+
 ## [0.9.35] - 2026-08-09
 
 ### Fixed

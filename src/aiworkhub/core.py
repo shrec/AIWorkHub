@@ -3154,6 +3154,11 @@ def create_task(
             return _lifecycle_error("read_only_output_exceptions_forbidden", 2)
     elif not writes2 and not outputs2:
         return _lifecycle_error("read_only_declaration_required", 2)
+    elif not outputs2:
+        # Launch rejects a writable card with no authenticated result and
+        # promotion contract. Reject it before durable task creation too, so
+        # task_create and launch cannot disagree after provider work is queued.
+        return _lifecycle_error("required_outputs_invalid", 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
     # Parse every validation command before persisting the card.  The worker
@@ -6194,6 +6199,13 @@ def needfix_resolve(needfix_id: str, *, resolution_note: str | None = None) -> d
     return ns.resolve_needfix(repo_root(), needfix_id, resolution_note=resolution_note)
 
 
+def needfix_resolve_verified(needfix_id: str, *, resolution_note: str) -> dict[str, Any]:
+    ns = _needfix_store_module()
+    return ns.resolve_verified_needfix(
+        repo_root(), needfix_id, resolution_note=resolution_note
+    )
+
+
 def needfix_update(
     needfix_id: str,
     *,
@@ -6268,16 +6280,15 @@ def needfix_convert(
 ) -> dict[str, Any]:
     """Explicit conversion using the existing authoritative create_task.
 
-    With no ``task_plan``, the executable card is built entirely from the
-    NeedFix's own recorded scope (``needfix_store.default_task_card``). A
-    caller-supplied ``task_plan`` is strictly validated and overrides that
-    card field by field (``needfix_store.normalize_task_plan``); fields it
-    omits keep the scope-derived default. Never infers ``max_live_tokens``
-    on the caller's behalf -- the created task stays uncapped unless
-    ``task_plan`` explicitly sets it. Every confirmed non-idempotent
+    ``task_plan`` must explicitly bind the workforce-selected ``runner`` and
+    ``topic``; writable cards must also declare non-empty
+    ``required_outputs``. Scope-derived defaults never guess either decision.
+    The plan is strictly validated and overrides the scope-derived base field
+    by field. Never infers ``max_live_tokens`` on the caller's behalf -- the
+    created task stays uncapped unless ``task_plan`` explicitly sets it.
+    Every confirmed non-idempotent
     conversion must bind to a ``plan_digest`` the matching preview
-    returned -- the default card is held to the same digest discipline
-    as an explicit plan, so any NeedFix drift between preview and commit
+    returned, so any NeedFix drift between preview and commit
     fails closed instead of silently committing a different plan.
     Idempotent already-task_created retries short-circuit before this
     enforcement, preserving reconciliation without a new create.

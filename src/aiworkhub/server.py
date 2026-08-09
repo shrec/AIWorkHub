@@ -778,8 +778,9 @@ def aiworkhub_task_create(
     only when the selected provider exposes structured usage while running;
     terminal-only usage remains posthoc evidence, never a false live-
     enforcement claim.
-    ``required_outputs`` contains only repo-relative file paths or glob
-    patterns covered by ``allowed_writes``. Human-readable outcome
+    Every writable task requires a non-empty ``required_outputs`` contract;
+    it contains only repo-relative file paths or glob patterns covered by
+    ``allowed_writes``. Human-readable outcome
     descriptions belong in ``acceptance``; mixing prose into
     ``required_outputs`` is rejected before a provider run is launched.
     ``allow_unchanged_required_outputs`` explicitly names required files that
@@ -2363,15 +2364,23 @@ def needfix_events(needfix_id: str, limit: int = 100) -> list[dict]:
 
 
 @mcp.tool()
-def needfix_preview_convert(needfix_id: str) -> dict:
-    """Preview the task that would be created on conversion."""
-    return core.needfix_preview_convert(needfix_id)
+def needfix_preview_convert(
+    needfix_id: str, task_plan: dict[str, Any] | None = None
+) -> dict:
+    """Preview an explicit workforce-bound task conversion."""
+    return core.needfix_preview_convert(needfix_id, task_plan=task_plan)
 
 
 @mcp.tool()
-def needfix_convert(needfix_id: str) -> dict:
-    """Explicit conversion atomically claims and creates a task."""
-    return core.needfix_convert(needfix_id)
+def needfix_convert(
+    needfix_id: str,
+    task_plan: dict[str, Any] | None = None,
+    plan_digest: str | None = None,
+) -> dict:
+    """Commit the exact previewed workforce-bound task conversion."""
+    return core.needfix_convert(
+        needfix_id, task_plan=task_plan, plan_digest=plan_digest
+    )
 
 
 @mcp.tool()

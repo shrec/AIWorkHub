@@ -112,7 +112,8 @@ def test_finalizer_uses_request_lock_not_global_registry(
     observed: list[str] = []
 
     @contextmanager
-    def request_lock(request_id: str):
+    def request_lock(request_id: str, *, blocking: bool = True):
+        assert blocking is True
         observed.append(request_id)
         yield
 

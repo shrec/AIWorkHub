@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.35";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.36";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -6314,7 +6314,14 @@ function handleInboundMessage(view, message) {
       if (action === "archive") Object.assign(args, { reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
       if (action === "restore") Object.assign(args, { target_status: String(message.targetStatus || "captured").slice(0, 40), confirm: message.confirm === true });
       if (action === "purge") Object.assign(args, { audit_reason: String(message.reason || "").slice(0, 1000), confirm: message.confirm === true });
+      if (action === "convertPreview" && message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) {
+        args.task_plan = message.taskPlan;
+      }
       if (action === "convertCommit") args.confirm = message.confirm === true;
+      if (action === "convertCommit") {
+        if (message.taskPlan && typeof message.taskPlan === "object" && !Array.isArray(message.taskPlan)) args.task_plan = message.taskPlan;
+        args.plan_digest = String(message.planDigest || "").slice(0, 128);
+      }
       runNeedfixAction(view, action, args);
       break;
     }

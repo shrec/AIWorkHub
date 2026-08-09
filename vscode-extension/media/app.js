@@ -2267,13 +2267,25 @@ function renderNeedfixDetail(payload) {
     needfixActionButton("Triage", "triage"), needfixActionButton("Accept", "accept"),
     needfixActionButton("Defer", "defer"), needfixActionButton("Reject", "reject", "danger-button"),
     needfixActionButton("Duplicate", "duplicate"), needfixActionButton("Task planned", "task_planned"),
-    needfixActionButton("Resolve", "resolve"), needfixActionButton("Archive", "archive"),
+    needfixActionButton("Resolve", "resolve"),
+    needfixActionButton("Resolve verified", "resolve_verified"),
+    needfixActionButton("Archive", "archive"),
   );
   if (item.archived_at) controls.appendChild(needfixActionButton("Restore", "restore"));
   controls.append(needfixActionButton("Preview task", "convertPreview"), needfixActionButton("Purge", "purge", "danger-button"));
   fragment.appendChild(controls);
-  const conversion = createElement("div", "needfix-conversion", "Task conversion requires a preview before explicit confirmation.");
+  const conversion = createElement("div", "needfix-conversion");
   conversion.id = "needfix-conversion";
+  conversion.appendChild(createElement(
+    "p",
+    "",
+    "Task conversion requires a preview. Paste the exact workforce launch contract; writable plans also require explicit outputs.",
+  ));
+  const planEditor = createElement("textarea", "needfix-plan-editor");
+  planEditor.id = "needfix-task-plan";
+  planEditor.rows = 6;
+  planEditor.placeholder = '{"runner":"deepseek_v4-pro","topic":"needfix_fix","required_outputs":["src/file.py"]}';
+  conversion.appendChild(planEditor);
   fragment.appendChild(conversion);
   appendNeedfixObject(fragment, "Provenance", item.provenance, true);
   appendNeedfixObject(fragment, "Evidence", item.evidence, true);
@@ -4131,18 +4143,36 @@ elements.needfixDetailPanel.addEventListener("click", (event) => {
   const action = target.dataset.needfixAction;
   const needfixId = String(item.id || "");
   if (action === "convertPreview") {
-    vscode.postMessage({ type: "needfixConvertPreview", needfixId });
+    const editor = document.getElementById("needfix-task-plan");
+    let taskPlan;
+    try {
+      taskPlan = JSON.parse(String((editor && editor.value) || ""));
+    } catch (_err) {
+      showToast("Enter a valid task plan JSON object before preview.");
+      return;
+    }
+    if (!taskPlan || Array.isArray(taskPlan) || typeof taskPlan !== "object") {
+      showToast("Task plan must be a JSON object.");
+      return;
+    }
+    vscode.postMessage({ type: "needfixConvertPreview", needfixId, taskPlan });
     return;
   }
   if (action === "convertCommit") {
     if (state.needfixConversionPreview && window.confirm(`Create a task from ${needfixId}? This does not launch a worker.`)) {
-      vscode.postMessage({ type: "needfixConvertCommit", needfixId, confirm: true });
+      vscode.postMessage({
+        type: "needfixConvertCommit",
+        needfixId,
+        confirm: true,
+        taskPlan: state.needfixConversionPreview.task_plan,
+        planDigest: state.needfixConversionPreview.plan_digest,
+      });
     }
     return;
   }
   let reason = "";
   let duplicateParentId = "";
-  if (["triage", "defer", "reject", "resolve", "archive", "purge"].includes(action)) {
+  if (["triage", "defer", "reject", "resolve", "resolve_verified", "archive", "purge"].includes(action)) {
     reason = String(window.prompt(`${action} reason`, "") || "").trim();
     if (["reject", "purge"].includes(action) && !reason) return;
   }

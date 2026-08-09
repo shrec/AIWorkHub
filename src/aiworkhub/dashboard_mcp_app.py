@@ -1074,6 +1074,10 @@ def needfix_transition_view(
                 row = core.needfix_mark_task_planned(candidate)
             elif selected == "resolve":
                 row = core.needfix_resolve(candidate, resolution_note=str(reason)[:1000] or None)
+            elif selected == "resolve_verified":
+                row = core.needfix_resolve_verified(
+                    candidate, resolution_note=str(reason)[:1000]
+                )
             else:
                 return _needfix_response(
                     {"ok": False, "error": "invalid_needfix_transition"},

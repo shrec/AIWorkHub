@@ -961,8 +961,10 @@ def _validation_only_replay_authorization(
         raise LaunchRejected("validation_only_replay_claim_epoch_mismatch")
     if not list(card.get("required_outputs") or []):
         raise LaunchRejected("validation_only_replay_required_outputs_missing")
-    if not list(card.get("validation") or []):
-        raise LaunchRejected("validation_only_replay_validation_missing")
+    # A replay may exist solely to re-finalize hash-pinned inherited outputs
+    # after an operational finalizer failure. An explicitly empty validation
+    # contract is authoritative and must not force executable scratch or a
+    # provider call; required-output/hash verification still gates review.
     return dict(raw)
 
 
@@ -3008,7 +3010,7 @@ class ProcessManager:
         yield
 
     @contextmanager
-    def _request_lock(self, request_id: str):
+    def _request_lock(self, request_id: str, *, blocking: bool = True):
         """Serialize one request's reconciliation without blocking launches.
 
         Finalization can run validation, quality gates, usage extraction and
@@ -3028,7 +3030,7 @@ class ProcessManager:
         fd = os.open(lock_path, flags, 0o600)
         chmod_fd(fd, 0o600)
         with os.fdopen(fd, "a+", encoding="utf-8") as fh:
-            lock_fd(fh.fileno(), blocking=True)
+            lock_fd(fh.fileno(), blocking=blocking)
             try:
                 yield
             finally:
@@ -5429,9 +5431,11 @@ class ProcessManager:
         self,
         request_id: str,
         supervisor_returncode: int | None = None,
+        *,
+        lock_blocking: bool = True,
     ) -> dict[str, Any] | None:
         finalization_started = time.monotonic()
-        with self._request_lock(request_id):
+        with self._request_lock(request_id, blocking=lock_blocking):
             events = self._request_events(request_id)
             if not events:
                 return None
@@ -6259,10 +6263,23 @@ class ProcessManager:
                 or ticks in (None, "")
                 or not _pid_matches(pid, ticks)
             ):
-                self._finalize_isolated_request(request_id)
+                try:
+                    self._finalize_isolated_request(
+                        request_id, lock_blocking=False
+                    )
+                except OSError:
+                    # Status is a read surface. A concurrent finalizer owns
+                    # the exact request lock, so report the current durable
+                    # snapshot instead of waiting 20 seconds or surfacing a
+                    # transport failure. The owner remains the only writer.
+                    latest["reconciliation_deferred"] = "request_lock_busy"
                 events = self._request_events(request_id)
                 lineage = self._event_identity(events)
-                latest = {**lineage, **events[-1]}
+                latest = {**lineage, **events[-1], **{
+                    key: value
+                    for key, value in latest.items()
+                    if key == "reconciliation_deferred"
+                }}
         with self._lock:
             live = self._live.get(request_id)
             if live is not None:
@@ -6855,7 +6872,12 @@ class ProcessManager:
                     )
                 )
             )
-            if latest_state != "finalize_failed" and not retryable_validation_failure:
+            retryable_release_pending = latest_state == "release_pending"
+            if (
+                latest_state != "finalize_failed"
+                and not retryable_validation_failure
+                and not retryable_release_pending
+            ):
                 return {
                     "ok": False,
                     "request_id": request_id,
@@ -6942,23 +6964,28 @@ class ProcessManager:
                     "task_id": task_id,
                     "error": "finalization_retry_worker_not_successful",
                 }
-            transition = task_engine.retry_finalize_failed(
-                self.repo,
-                task_id,
-                runner,
-                request_id,
-                actor=core.CODEX_RUNNER,
-            )
-            if not transition.get("ok"):
-                return {
-                    "ok": False,
-                    "request_id": request_id,
-                    "task_id": task_id,
-                    "error": (
-                        "finalization_retry_transition_failed:"
-                        + str(transition.get("stderr") or transition.get("stdout") or "")
-                    )[:500],
-                }
+            if not retryable_release_pending:
+                transition = task_engine.retry_finalize_failed(
+                    self.repo,
+                    task_id,
+                    runner,
+                    request_id,
+                    actor=core.CODEX_RUNNER,
+                )
+                if not transition.get("ok"):
+                    return {
+                        "ok": False,
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "error": (
+                            "finalization_retry_transition_failed:"
+                            + str(
+                                transition.get("stderr")
+                                or transition.get("stdout")
+                                or ""
+                            )
+                        )[:500],
+                    }
             self._append_event({
                 **self._event_identity(events),
                 "request_id": request_id,

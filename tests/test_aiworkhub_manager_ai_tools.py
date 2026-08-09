@@ -522,6 +522,7 @@ def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
         objective="Prove every manager-created code task receives mandatory AI context.",
         acceptance=["Context is persisted."],
         allowed_writes=["research/context_default.json"],
+        required_outputs=["research/context_default.json"],
         validation=["python3 -m json.tool research/context_default.json"],
     )
     assert result["ok"] is True, result
