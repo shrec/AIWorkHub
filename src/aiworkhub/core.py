@@ -1479,6 +1479,63 @@ def _resolve_repo_root_env(raw: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _implicit_windows_codex_repository_root() -> Path | None:
+    """Resolve a repo-neutral Windows MCP from its owning VS Code window.
+
+    Codex does not consistently propagate ``CODEX_THREAD_ID`` to stdio MCP
+    children on Windows.  The shared route registry still carries a stronger
+    local binding: the live extension-host PID that owns the repository
+    window.  Accept that route only when the host is in this process's
+    same-user ancestor chain and exactly one coherent Codex window matches.
+    """
+
+    try:
+        registry = shared_router.list_known_repositories(limit=256)
+    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(registry, dict) or not registry.get("ok"):
+        return None
+
+    matches: dict[tuple[str, str, str], Path] = {}
+    for record in registry.get("repositories", []):
+        if not isinstance(record, dict):
+            continue
+        if not bool(record.get("extension_host_alive")) or bool(record.get("stale")):
+            continue
+        if str(record.get("selected_provider") or "").strip().lower() != "codex":
+            continue
+        extension_host_pid = int(record.get("extension_host_pid") or 0)
+        if extension_host_pid <= 1 or not _pid_in_same_windows_user_ancestor_chain(
+            extension_host_pid,
+            max_depth=16,
+        ):
+            continue
+        repo_id = str(record.get("repo_id") or "").strip()
+        window_id = str(record.get("window_id") or "").strip()
+        root_raw = str(record.get("repo_root") or "").strip()
+        targets = record.get("targets")
+        codex_target = targets.get("codex") if isinstance(targets, dict) else None
+        route = codex_target.get("route") if isinstance(codex_target, dict) else None
+        if not repo_id or not window_id or not root_raw or not isinstance(route, dict):
+            continue
+        capability_state = str(codex_target.get("capability_state") or "").strip().lower()
+        if capability_state not in {"available", "ready", "route_pending"}:
+            continue
+        if str(route.get("repo_id") or "").strip() != repo_id:
+            continue
+        if str(route.get("window_id") or "").strip() != window_id:
+            continue
+        try:
+            root = Path(root_raw).resolve()
+        except (OSError, RuntimeError):
+            continue
+        matches[(repo_id, window_id, str(root))] = root
+
+    if len(matches) != 1:
+        return None
+    return next(iter(matches.values()))
+
+
 def _implicit_codex_repository_root() -> Path | None:
     """Resolve a repo-neutral Codex MCP process from its live chat route.
 
@@ -1488,6 +1545,11 @@ def _implicit_codex_repository_root() -> Path | None:
     ``provider/thread/window`` route over that stale cwd, while keeping all
     explicitly repo-bound extension/worker children unchanged.
     """
+
+    if os.name == "nt":
+        routed = _implicit_windows_codex_repository_root()
+        if routed is not None:
+            return routed
 
     thread_id = ""
     extension_host_pid = 0

@@ -596,6 +596,7 @@ def test_codex_vscode_env_identity_survives_route_pending(tmp_path, monkeypatch)
 def test_repo_root_prefers_exact_live_codex_route_over_stale_cwd(tmp_path, monkeypatch):
     routed = tmp_path / "routed"
     routed.mkdir()
+    monkeypatch.setattr(core, "_implicit_windows_codex_repository_root", lambda: None)
     monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
     monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
     monkeypatch.setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex_vscode")
@@ -608,6 +609,88 @@ def test_repo_root_prefers_exact_live_codex_route_over_stale_cwd(tmp_path, monke
     )
 
     assert core.repo_root() == routed.resolve()
+
+
+def test_windows_repo_root_prefers_exact_owning_window_without_thread_env(tmp_path, monkeypatch):
+    routed = tmp_path / "routed-windows"
+    routed.mkdir()
+    repo_id = "repo_" + "a" * 32
+    record = {
+        "repo_id": repo_id,
+        "repo_root": str(routed),
+        "window_id": "window_windows",
+        "extension_host_pid": 12345,
+        "extension_host_alive": True,
+        "stale": False,
+        "selected_provider": "codex",
+        "targets": {
+            "codex": {
+                "capability_state": "available",
+                "route": {
+                    "repo_id": repo_id,
+                    "window_id": "window_windows",
+                    "thread_id": "",
+                    "session_id": "episode_windows",
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(
+        shared_router,
+        "list_known_repositories",
+        lambda *, limit: {"ok": True, "repositories": [record]},
+    )
+    monkeypatch.setattr(
+        core,
+        "_pid_in_same_windows_user_ancestor_chain",
+        lambda pid, *, max_depth: pid == 12345 and max_depth == 16,
+    )
+
+    assert core._implicit_windows_codex_repository_root() == routed.resolve()
+
+
+def test_windows_repo_root_route_fails_closed_when_two_owning_windows_match(tmp_path, monkeypatch):
+    records = []
+    for index in range(2):
+        root = tmp_path / f"routed-{index}"
+        root.mkdir()
+        repo_id = "repo_" + str(index + 1) * 32
+        window_id = f"window_{index}"
+        records.append({
+            "repo_id": repo_id,
+            "repo_root": str(root),
+            "window_id": window_id,
+            "extension_host_pid": 12345 + index,
+            "extension_host_alive": True,
+            "stale": False,
+            "selected_provider": "codex",
+            "targets": {
+                "codex": {
+                    "capability_state": "available",
+                    "route": {"repo_id": repo_id, "window_id": window_id},
+                },
+            },
+        })
+    monkeypatch.setattr(
+        shared_router,
+        "list_known_repositories",
+        lambda *, limit: {"ok": True, "repositories": records},
+    )
+    monkeypatch.setattr(
+        core,
+        "_pid_in_same_windows_user_ancestor_chain",
+        lambda pid, *, max_depth: True,
+    )
+
+    assert core._implicit_windows_codex_repository_root() is None
+
+
+def test_implicit_codex_repo_uses_windows_window_route_before_thread_env(tmp_path, monkeypatch):
+    routed = (tmp_path / "routed-windows").resolve()
+    monkeypatch.setattr(core, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(core, "_implicit_windows_codex_repository_root", lambda: routed)
+
+    assert core._implicit_codex_repository_root() == routed
 
 
 def test_repo_root_explicit_binding_wins_over_dynamic_chat_route(tmp_path, monkeypatch):
