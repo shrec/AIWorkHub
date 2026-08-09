@@ -825,6 +825,70 @@ def _worker_launch_cwd(
     return str(resolved)
 
 
+def _validation_only_replay_authorization(
+    card: Mapping[str, Any], task_id: str
+) -> dict[str, Any] | None:
+    """Return one exact provider-free replay grant or fail closed.
+
+    The task store mints this coordinator-only grant while recovering a
+    blocked task.  Merely finding a similarly named field must never select
+    the deterministic lane: every immutable episode binding is checked before
+    a claim, workspace mutation, credential lookup, or provider operation.
+    Output bytes are checked again by ``validate_required_outputs`` inside the
+    ordinary finalizer, so this routing check cannot authorize stale content.
+    """
+
+    raw = card.get("validation_only_replay_authorization")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise LaunchRejected("validation_only_replay_authorization_invalid")
+    if raw.get("one_episode_binding") is not True:
+        raise LaunchRejected("validation_only_replay_episode_binding_missing")
+    if str(raw.get("task_id") or "") != task_id:
+        raise LaunchRejected("validation_only_replay_task_mismatch")
+    if str(raw.get("actor") or "") != core.CODEX_RUNNER:
+        raise LaunchRejected("validation_only_replay_actor_mismatch")
+
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, dict):
+        raise LaunchRejected("validation_only_replay_predecessor_missing")
+    predecessor_request_id = str(predecessor.get("request_id") or "").strip()
+    if not predecessor_request_id or str(
+        raw.get("predecessor_request_id") or ""
+    ) != predecessor_request_id:
+        raise LaunchRejected("validation_only_replay_predecessor_mismatch")
+    predecessor_hashes = predecessor.get("changed_path_hashes")
+    authorized_hashes = raw.get("changed_path_hashes")
+    if (
+        not isinstance(predecessor_hashes, dict)
+        or not predecessor_hashes
+        or not isinstance(authorized_hashes, dict)
+        or authorized_hashes != predecessor_hashes
+    ):
+        raise LaunchRejected("validation_only_replay_hash_manifest_mismatch")
+    if not all(
+        isinstance(path, str)
+        and path.strip()
+        and isinstance(digest, str)
+        and re.fullmatch(r"[a-f0-9]{64}", digest)
+        for path, digest in authorized_hashes.items()
+    ):
+        raise LaunchRejected("validation_only_replay_hash_manifest_invalid")
+    try:
+        authorized_epoch = int(str(raw.get("next_claim_epoch")))
+        claim_epoch = int(str(card.get("claim_epoch")))
+    except (TypeError, ValueError):
+        raise LaunchRejected("validation_only_replay_claim_epoch_invalid") from None
+    if authorized_epoch != claim_epoch:
+        raise LaunchRejected("validation_only_replay_claim_epoch_mismatch")
+    if not list(card.get("required_outputs") or []):
+        raise LaunchRejected("validation_only_replay_required_outputs_missing")
+    if not list(card.get("validation") or []):
+        raise LaunchRejected("validation_only_replay_validation_missing")
+    return dict(raw)
+
+
 def _usage_from_output(
     path: Path,
     *,
@@ -3171,6 +3235,229 @@ class ProcessManager:
             timeout_seconds=timeout_seconds,
         )
 
+    def _launch_validation_only_replay(
+        self,
+        *,
+        task_id: str,
+        runner: str,
+        topic: str,
+        adapter_id: str,
+        model: str | None,
+        timeout_seconds: int,
+        card: dict[str, Any],
+        authorization: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run a hash-pinned validation replay without invoking a provider.
+
+        This lane deliberately reuses the canonical isolated-worktree
+        finalizer.  It changes only how the successful execution receipt is
+        produced: no prompt, credential, adapter plan, worker MCP runtime,
+        supervisor, or provider process exists.  The normal finalizer still
+        owns exact claim verification, inherited-byte/hash authorization,
+        sandboxed validation, review evidence, and the terminal transition.
+        """
+
+        request_id = uuid.uuid4().hex
+        workspace: WorkerWorkspace | None = None
+        claimed = False
+        try:
+            with self._launch_reservation({
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": runner,
+                "topic": topic,
+                "adapter_id": adapter_id,
+                "model": model,
+                "timeout_seconds": timeout_seconds,
+                "authority": "coordinator_validation_only_replay",
+                "sandbox_backend": "deterministic_validation",
+                "execution_mode": "validation_only_replay",
+                "provider_launched": False,
+            }):
+                self.process_dir.mkdir(parents=True, exist_ok=True)
+                chmod_path(self.process_dir, 0o700)
+                stdout_path = self.process_dir / f"{request_id}.stdout.log"
+                stderr_path = self.process_dir / f"{request_id}.stderr.log"
+                status_path = self.process_dir / f"{request_id}.supervisor.json"
+                cancel_path = self.process_dir / f"{request_id}.cancel.json"
+                metadata_path = self.process_dir / f"{request_id}.request.json"
+                _touch_0600(stdout_path)
+                _touch_0600(stderr_path)
+
+                workspace = create_workspace(self.repo, request_id, card, adapter_id)
+                residual_contract_manifest = build_residual_contract_manifest(
+                    workspace, card
+                )
+                immutable_inputs = [
+                    str(path) for path in (card.get("immutable_inputs") or [])
+                ]
+                immutable_input_manifest = _path_manifest(
+                    self.repo, immutable_inputs
+                )
+
+                claim = task_engine.claim_start_exact(
+                    self.repo, task_id, runner, topic, request_id=request_id
+                )
+                if not claim.get("ok"):
+                    raise LaunchRejected(
+                        "claim_start_failed:"
+                        + str(claim.get("stderr") or claim.get("stdout") or "")[:300]
+                    )
+                claimed = True
+
+                metadata = {
+                    "schema_id": "aiworkhub.task_mcp.isolated_request.v1",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "claim_epoch": int(card.get("claim_epoch") or 0),
+                    "rework_predecessor": dict(card["rework_predecessor"]),
+                    "validation_only_replay_authorization": authorization,
+                    "execution_mode": "validation_only_replay",
+                    "provider_launched": False,
+                    "adapter_id": adapter_id,
+                    "model": model,
+                    "timeout_seconds": timeout_seconds,
+                    "token_budget": None,
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "supervisor_status_path": str(status_path),
+                    "cancel_path": str(cancel_path),
+                    "metadata_path": str(metadata_path),
+                    "prompt_sha256": hashlib.sha256(b"").hexdigest(),
+                    "prompt_budget": {
+                        "schema_id": "aiworkhub.worker_prompt_budget.v1",
+                        "mode": "validation_only_replay",
+                        "total_bytes": 0,
+                        "byte_labels_are_token_truth": False,
+                    },
+                    "project_context": None,
+                    "project_context_delivery": {
+                        "injected": False,
+                        "reason": "deterministic_validation_only_replay",
+                    },
+                    "worker_mcp": {},
+                    "sandbox_backend": "deterministic_validation",
+                    "validation": list(card.get("validation") or []),
+                    "required_outputs": list(card.get("required_outputs") or []),
+                    "read_only": card.get("read_only") is True,
+                    "allow_empty_required_outputs": list(
+                        card.get("allow_empty_required_outputs") or []
+                    ),
+                    "allow_unchanged_required_outputs": list(
+                        card.get("allow_unchanged_required_outputs") or []
+                    ),
+                    "immutable_inputs": immutable_inputs,
+                    "immutable_input_manifest": immutable_input_manifest,
+                    "residual_contract_manifest": residual_contract_manifest,
+                    "external_readonly_dirs": [],
+                    "workspace": workspace.as_metadata(),
+                    "quality_review": None,
+                }
+                write_json_0600(metadata_path, metadata)
+                _write_terminal_authority_grant(
+                    self._terminal_authority_grant_path(request_id),
+                    self._terminal_authority_key(),
+                    repo=self.repo,
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                    request_id=request_id,
+                )
+                write_json_0600(
+                    status_path,
+                    {
+                        "state": "exited",
+                        "exit_code": 0,
+                        "execution_mode": "validation_only_replay",
+                        "provider_launched": False,
+                        "started_at_epoch": time.time(),
+                    },
+                )
+                started_at = _utcnow()
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": adapter_id,
+                    "model": model,
+                    "state": "running",
+                    "pid": 0,
+                    "started_at": started_at,
+                    "timeout_seconds": timeout_seconds,
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "metadata_path": str(metadata_path),
+                    "supervisor_status_path": str(status_path),
+                    "workspace_isolated": True,
+                    "sandbox_backend": "deterministic_validation",
+                    "execution_mode": "validation_only_replay",
+                    "provider_launched": False,
+                    "shell": False,
+                })
+                # Validation can legitimately take longer than the MCP
+                # request timeout.  Finalize asynchronously just like a real
+                # worker while retaining the already-written exited status
+                # and metadata: a server restart can reconcile the same
+                # request without a provider rerun or a replacement task.
+                thread = threading.Thread(
+                    target=self._finalize_isolated_request,
+                    args=(request_id, 0),
+                    name=f"aiworkhub-validation-replay-{request_id[:8]}",
+                    daemon=True,
+                )
+                thread.start()
+                return {
+                    "ok": True,
+                    "launch_implemented": LAUNCH_IMPLEMENTED,
+                    "launch_enabled": True,
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": topic,
+                    "adapter_id": adapter_id,
+                    "model": model,
+                    "state": "running",
+                    "terminal": False,
+                    "pid": None,
+                    "workspace_isolated": True,
+                    "sandbox_backend": "deterministic_validation",
+                    "execution_mode": "validation_only_replay",
+                    "provider_launched": False,
+                    "stdout_path": str(stdout_path),
+                    "stderr_path": str(stderr_path),
+                    "shell": False,
+                }
+        except (LaunchRejected, OSError, ValueError, WorkspaceError) as exc:
+            if claimed:
+                task_engine.mark_launch_failed(
+                    self.repo,
+                    task_id,
+                    runner,
+                    reason=f"validation_only_replay_launch_failed:{exc}"[:500],
+                    request_id=request_id,
+                )
+            if workspace is not None and not claimed:
+                try:
+                    cleanup_workspace(workspace.repo, workspace.path, workspace.home)
+                except WorkspaceError:
+                    pass
+            return self._blocked(
+                task_id,
+                runner,
+                topic,
+                adapter_id,
+                str(exc),
+                request_id=request_id,
+                state="launch_failed" if claimed else "blocked",
+                diagnostic={
+                    "execution_mode": "validation_only_replay",
+                    "provider_launched": "false",
+                },
+            )
+
     _QUALITY_REVIEW_PREP_LOCK = threading.Lock()
     _QUALITY_REVIEW_PREP_MAX = 8
     _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
@@ -3520,6 +3807,20 @@ class ProcessManager:
             card = self._preflight_card(task_id, runner, topic, adapter_id)
             claimed = core._lifecycle_state(card) == "processing"
             card = self._with_dependency_inputs(card)
+            replay_authorization = _validation_only_replay_authorization(
+                card, task_id
+            )
+            if replay_authorization is not None:
+                return self._launch_validation_only_replay(
+                    task_id=task_id,
+                    runner=runner,
+                    topic=topic,
+                    adapter_id=adapter_id,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    card=card,
+                    authorization=replay_authorization,
+                )
             external_readonly_dirs = _external_readonly_dirs(card, adapter_id)
             authority_repo = _task_authority_repo(self.repo, card)
             context_result = _launch_project_context(
@@ -4449,16 +4750,21 @@ class ProcessManager:
         model: str,
         stdout_path: Path,
         topic: str | None = None,
+        execution_mode: str = "",
     ) -> tuple[dict[str, Any], bool, str]:
         usage = _usage_from_output(stdout_path, include_samples=True)
         usage["requested_model"] = model
+        usage["execution_mode"] = execution_mode or "provider_worker"
+        usage["provider_launched"] = execution_mode != "validation_only_replay"
         usage_recorded = False
         usage_error = ""
         total_input = _ledger_input_tokens(usage, adapter_id)
         total_output = _ledger_output_tokens(usage)
         usage["recorded_input_tokens"] = total_input
         usage["recorded_output_tokens"] = total_output
-        if usage.get("usage_observed"):
+        if execution_mode == "validation_only_replay":
+            usage["telemetry_reason"] = "provider_not_invoked_deterministic_replay"
+        elif usage.get("usage_observed"):
             usage["telemetry_reason"] = ""
         elif adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
             # vscode.lm currently exposes the model response stream but no
@@ -4469,6 +4775,11 @@ class ProcessManager:
             usage["telemetry_reason"] = "provider_usage_report_not_observed"
         usage_role = "worker"
         note = f"task_mcp_request:{request_id}"
+        ledger_model = (
+            "deterministic_validation_replay"
+            if execution_mode == "validation_only_replay"
+            else str(usage.get("observed_model") or model)
+        )
         try:
             card = _parse_card(self._show_task(task_id), task_id)
             topic = topic or str(card.get("topic") or "")
@@ -4488,11 +4799,15 @@ class ProcessManager:
         args = [
             "usage", task_id,
             "--runner", runner,
-            "--model", str(usage.get("observed_model") or model),
+            "--model", ledger_model,
             "--requested-model", model,
             "--observed-model", str(usage.get("observed_model") or ""),
             "--role", usage_role,
-            "--provider", adapter_id.removesuffix("_cli"),
+            "--provider", (
+                "deterministic_validation_replay"
+                if execution_mode == "validation_only_replay"
+                else adapter_id.removesuffix("_cli")
+            ),
             "--source", "task_mcp_launcher",
             "--note", note,
             "--input-tokens", str(total_input),
@@ -5625,6 +5940,7 @@ class ProcessManager:
                     str(metadata.get("model") or metadata["adapter_id"]),
                     stdout_path,
                     topic=str(metadata["topic"]),
+                    execution_mode=str(metadata.get("execution_mode") or ""),
                 )
             context_ack = _project_context_receipt_from_output(
                 stdout_path,
@@ -5670,6 +5986,8 @@ class ProcessManager:
                 "workspace_isolated": True,
                 "workspace_retained": not cleanup,
                 "sandbox_backend": metadata.get("sandbox_backend"),
+                "execution_mode": metadata.get("execution_mode") or "provider_worker",
+                "provider_launched": metadata.get("provider_launched") is not False,
                 "changed_paths": changed,
                 "promoted_paths": promoted,
                 "required_outputs": required_output_records,

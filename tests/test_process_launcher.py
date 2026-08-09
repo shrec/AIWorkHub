@@ -1139,6 +1139,206 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     assert record["replay_evidence"]["claim_epoch"] == 3
     assert evidence["validation_only_replay"] == [record["replay_evidence"]]
 
+
+def test_validation_only_replay_authorization_fails_closed_before_launch():
+    digest = "a" * 64
+    card = {
+        "task_id": "TASK_REPLAY",
+        "claim_epoch": 4,
+        "required_outputs": ["out/result.json"],
+        "validation": ["python3 -m py_compile out/result.json"],
+        "rework_predecessor": {
+            "request_id": "predecessor-4",
+            "changed_path_hashes": {"out/result.json": digest},
+        },
+        "validation_only_replay_authorization": {
+            "task_id": "TASK_REPLAY",
+            "actor": process_launcher.core.CODEX_RUNNER,
+            "predecessor_request_id": "predecessor-4",
+            "changed_path_hashes": {"out/result.json": digest},
+            "next_claim_epoch": 4,
+            "one_episode_binding": True,
+        },
+    }
+    exact = process_launcher._validation_only_replay_authorization(
+        card, "TASK_REPLAY"
+    )
+    assert exact is not card["validation_only_replay_authorization"]
+    assert exact["changed_path_hashes"] == {"out/result.json": digest}
+
+    stale = json.loads(json.dumps(card))
+    stale["validation_only_replay_authorization"]["next_claim_epoch"] = 3
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="validation_only_replay_claim_epoch_mismatch",
+    ):
+        process_launcher._validation_only_replay_authorization(
+            stale, "TASK_REPLAY"
+        )
+
+    forged = json.loads(json.dumps(card))
+    forged["validation_only_replay_authorization"]["actor"] = "worker"
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="validation_only_replay_actor_mismatch",
+    ):
+        process_launcher._validation_only_replay_authorization(
+            forged, "TASK_REPLAY"
+        )
+
+
+def test_isolated_validation_only_replay_never_resolves_or_starts_provider(
+    monkeypatch, tmp_path
+):
+    _open_gates(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workspace_dir = tmp_path / "workspace"
+    home_dir = tmp_path / "home"
+    workspace_dir.mkdir()
+    home_dir.mkdir()
+    digest = "b" * 64
+    card = {
+        **_card(task_id="TASK_REPLAY"),
+        "claim_epoch": 7,
+        "validation": ["python3 -m py_compile out/result.py"],
+        "required_outputs": ["out/result.py"],
+        "rework_predecessor": {
+            "request_id": "predecessor-7",
+            "changed_path_hashes": {"out/result.py": digest},
+        },
+        "validation_only_replay_authorization": {
+            "task_id": "TASK_REPLAY",
+            "actor": process_launcher.core.CODEX_RUNNER,
+            "predecessor_request_id": "predecessor-7",
+            "changed_path_hashes": {"out/result.py": digest},
+            "next_claim_epoch": 7,
+            "one_episode_binding": True,
+        },
+    }
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="placeholder",
+        repo=repo,
+        path=workspace_dir,
+        home=home_dir,
+        allowed_writes=("out/result.py",),
+        parent_baseline={"out/result.py": None},
+        workspace_baseline={"out/result.py": digest},
+        inherited_rework_paths=("out/result.py",),
+    )
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(lambda: card),
+        collision_guard=_collision,
+        adapter_builder=lambda **_: (_ for _ in ()).throw(
+            AssertionError("provider adapter plan must not be built")
+        ),
+    )
+    monkeypatch.setattr(manager, "_preflight_card", lambda *a, **k: dict(card))
+    monkeypatch.setattr(
+        manager,
+        "_resolve_provider_env",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("provider credentials must not be resolved")
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_popen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("provider/supervisor process must not start")
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "create_workspace",
+        lambda repo_arg, request_id, card_arg, adapter_id: process_launcher.replace(
+            workspace, request_id=request_id
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "build_residual_contract_manifest",
+        lambda *a, **k: [],
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "claim_start_exact",
+        lambda *a, **k: {"ok": True},
+    )
+    finalized = []
+    monkeypatch.setattr(
+        manager,
+        "_finalize_isolated_request",
+        lambda request_id, supervisor_returncode=None: finalized.append(
+            (request_id, supervisor_returncode)
+        ),
+    )
+
+    result = manager.launch(
+        task_id="TASK_REPLAY",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        model="claude-sonnet-5",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "running"
+    assert result["terminal"] is False
+    assert result["execution_mode"] == "validation_only_replay"
+    assert result["provider_launched"] is False
+    assert result["pid"] is None
+    assert not list((tmp_path / "processes").glob("*.supervisor-spec.json"))
+    deadline = time.monotonic() + 2
+    while not finalized and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert finalized == [(result["request_id"], 0)]
+
+
+def test_provider_free_replay_usage_is_labeled_without_fabricated_observation(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "empty-provider-output.jsonl"
+    output.write_text("", encoding="utf-8")
+    card = _card()
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: card),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    calls = []
+
+    def fake_run_taskctl(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(process_launcher.core, "run_taskctl", fake_run_taskctl)
+    usage, recorded, error = manager._record_usage(
+        "request-replay",
+        card["task_id"],
+        card["runner"],
+        "claude_cli",
+        "claude-sonnet-5",
+        output,
+        topic=card["topic"],
+        execution_mode="validation_only_replay",
+    )
+
+    assert recorded is True
+    assert error == ""
+    assert usage["provider_launched"] is False
+    assert usage["usage_observed"] is False
+    assert usage["telemetry_reason"] == "provider_not_invoked_deterministic_replay"
+    argv = calls[0][0]
+    assert argv[argv.index("--provider") + 1] == "deterministic_validation_replay"
+    assert argv[argv.index("--model") + 1] == "deterministic_validation_replay"
+    assert argv[argv.index("--requested-model") + 1] == "claude-sonnet-5"
+    assert "--usage-observed" not in argv
+
 def test_usage_parser_reads_claude_result_json(tmp_path):
     output = tmp_path / "claude.json"
     output.write_text(json.dumps({

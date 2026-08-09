@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.29] - 2026-08-09
+
+### Fixed
+
+- Manager-authorized validation-only rework now takes a deterministic,
+  provider-free launch lane. Exact task, coordinator actor, predecessor
+  request, hash manifest and claim epoch bindings fail closed before claim;
+  inherited bytes are reverified by the ordinary finalizer before review.
+- Provider credentials, prompts, adapter plans, worker MCP bootstrap and
+  provider/supervisor processes are no longer created for validation-only
+  replay. Sandboxed validations finalize asynchronously so long-running checks
+  do not hold the initiating MCP request open.
+- Replay accounting now records an explicit deterministic execution mode and
+  `provider_launched=false`, retaining the requested model as provenance while
+  avoiding fabricated provider-usage observation.
+
+### Tests
+
+- Added stale-epoch/forged-actor fail-closed coverage, a no-provider launch
+  regression that forbids credential, adapter and process calls, and truthful
+  zero-provider accounting assertions. The focused launcher/recovery suite
+  passes with 120 tests; the repository suite passes with 2,481 tests.
+
 ## [0.9.28] - 2026-08-09
 
 ### Fixed
