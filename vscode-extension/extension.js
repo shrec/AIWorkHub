@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.36";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.37";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -1581,8 +1581,17 @@ class McpStdioClient {
       inProgress: false,
       episode: this.recovery.episode + 1,
     };
-    this.runtimeRepairAttempts = 0;
-    this.runtimeRepairBlockedReason = "";
+    // Preserve a partially-spent runtime-repair episode so the dashboard's
+    // explicit Retry action advances 1/3 -> 2/3 -> 3/3 instead of lying at
+    // 0/3 forever. Once an episode is genuinely exhausted/blocked, a user
+    // retry starts one fresh bounded episode.
+    if (
+      this.runtimeRepairAttempts >= MCP_MAX_RUNTIME_REPAIR_ATTEMPTS
+      || this.runtimeRepairBlockedReason
+    ) {
+      this.runtimeRepairAttempts = 0;
+      this.runtimeRepairBlockedReason = "";
+    }
   }
 
   _clearRecoveryTimer() {
@@ -5114,9 +5123,11 @@ async function pushRuntimeInfo(view) {
   }
 
   let status;
+  let healthError = "";
   try {
     status = await checkRuntimeHealth(client);
   } catch (err) {
+    healthError = sanitizeErrorMessage(err);
     status = { matches: false, missing: [], runtimeVersion: "unavailable" };
   }
 
@@ -5130,7 +5141,11 @@ async function pushRuntimeInfo(view) {
     return;
   }
 
-  const mismatchReason = status.missing.length ? "mcp_capability_mismatch" : "mcp_version_mismatch";
+  const mismatchReason = healthError
+    ? `mcp_health_check_failed:${healthError}`
+    : status.missing.length
+      ? "mcp_capability_mismatch"
+      : "mcp_version_mismatch";
   const repair = await client.attemptRuntimeRepair(mismatchReason);
   if (!repair.repaired) {
     view.postMessage({
@@ -5140,6 +5155,8 @@ async function pushRuntimeInfo(view) {
         degraded: true,
         repairAttempted: repair.attempted,
         reason: repair.attempted ? `runtime_repair_failed: ${repair.reason}` : repair.reason,
+        attempts: client.runtimeRepairAttempts,
+        maxAttempts: MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,
       }),
     });
     return;
@@ -6174,7 +6191,13 @@ function handleInboundMessage(view, message) {
     case "retry": {
       const client = getMcpClient();
       client.beginExplicitRecovery();
-      runBackgroundTask("dashboard retry", () => pushSnapshot(view));
+      runBackgroundTask("dashboard retry", async () => {
+        // Retry both transport data and the runtime repair state machine.
+        // Previously only snapshot was retried, leaving runtimeInfo frozen at
+        // the first failed repair forever even after the child recovered.
+        await pushRuntimeInfo(view);
+        await pushSnapshot(view);
+      });
       break;
     }
     case "selectTask": {
@@ -6587,7 +6610,7 @@ function getHtmlForWebview(webview, extensionUri) {
     </section>
 
     <section class="source-alert reload-alert" id="reload-alert" aria-live="polite" hidden>
-      <strong>Runtime repair in progress</strong>
+      <strong id="reload-alert-title">MCP runtime degraded</strong>
       <span id="reload-alert-message"></span>
     </section>
 

@@ -377,6 +377,8 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
     const last = messages.filter((m) => m.type === "runtimeInfo").pop();
     assert.strictEqual(last.payload.reloadRequired, false, "a failed restart must never fall back to a manual reload instruction");
     assert.strictEqual(last.payload.degraded, true);
+    assert.ok(last.payload.attempts >= 1, `failed repair must expose spent attempts, got ${last.payload.attempts}`);
+    assert.strictEqual(last.payload.maxAttempts, 3);
     assert.ok(typeof last.payload.reason === "string" && last.payload.reason.length > 0, "a failed restart must surface a readable degraded reason");
     // Never silently attaches another repo: the bound client is still keyed
     // to this exact repository root/id after the failed repair.
@@ -388,6 +390,29 @@ async function testFailedRestartDegradesWithoutCrossRepoFallback(tmp) {
   } finally {
     fake.restore();
   }
+}
+
+function testExplicitRetryPreservesPartialRuntimeRepairBudget(tmp) {
+  const repoRoot = path.join(tmp, "retry-budget");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_retrybudget00000000000000000007", "retry-budget");
+  const host = loadExtensionHost(repoRoot);
+  const client = new host.extension.__testInternals.McpStdioClient(
+    repoRoot,
+    { repoId: "repo_retrybudget00000000000000000007", repoName: "retry-budget" },
+    { appendLine: () => {} },
+    { claimEpisode: "episode_retry_budget" },
+  );
+
+  client.runtimeRepairAttempts = 1;
+  client.beginExplicitRecovery();
+  assert.strictEqual(client.runtimeRepairAttempts, 1, "manual retry must continue a partially-spent repair episode");
+
+  client.runtimeRepairAttempts = 3;
+  client.runtimeRepairBlockedReason = "runtime_repair_budget_exhausted:test";
+  client.beginExplicitRecovery();
+  assert.strictEqual(client.runtimeRepairAttempts, 0, "manual retry may start fresh only after bounded exhaustion");
+  assert.strictEqual(client.runtimeRepairBlockedReason, "");
 }
 
 async function testTwoWorkspacesRepairInIsolation(tmp) {
@@ -533,6 +558,7 @@ function testPlatformPythonResolution(tmp) {
   await testBoundedRetryOnPersistentMismatch(tmp);
   await testFailedRestartDegradesWithoutCrossRepoFallback(tmp);
   await testTwoWorkspacesRepairInIsolation(tmp);
+  testExplicitRetryPreservesPartialRuntimeRepairBudget(tmp);
   testPlatformPythonResolution(tmp);
   console.log("AIWorkHub reloadless runtime-repair regression passed");
 })().catch((err) => {

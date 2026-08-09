@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 from aiworkhub import process_event_ledger
 
@@ -25,3 +28,88 @@ def test_stream_reader_skips_malformed_rows(tmp_path: Path) -> None:
     path = tmp_path / "process_events.jsonl"
     path.write_text('{"request_id":"good"}\nnot-json\n', encoding="utf-8")
     assert list(process_event_ledger.iter_events(path)) == [{"request_id": "good"}]
+
+
+def test_append_lock_timeout_publishes_ordered_immutable_spill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    earlier = {
+        "request_id": "request-old",
+        "state": "release_pending",
+        "timestamp": "2026-08-09T10:00:00+00:00",
+    }
+    recovery = {
+        "request_id": "request-old",
+        "state": "finalize_failed",
+        "timestamp": "2026-08-09T10:01:00+00:00",
+    }
+    process_event_ledger.append_event(path, earlier)
+
+    @contextmanager
+    def timed_out_lock(_path: Path):
+        raise TimeoutError("windows_advisory_lock_timeout after 20s")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_lock)
+    process_event_ledger.append_event(path, recovery)
+
+    spills = [
+        candidate
+        for candidate in process_event_ledger.ledger_paths(path)
+        if ".spill." in candidate.name
+    ]
+    assert len(spills) == 1
+    assert list(process_event_ledger.iter_events(path)) == [earlier, recovery]
+
+
+def test_multiple_spills_merge_with_active_events_by_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+    first = {
+        "request_id": "request-a",
+        "state": "starting",
+        "timestamp": "2026-08-09T10:00:00+00:00",
+    }
+    process_event_ledger.append_event(path, first)
+
+    @contextmanager
+    def timed_out_lock(_path: Path):
+        raise TimeoutError("windows_advisory_lock_timeout after 20s")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_lock)
+    second = {
+        "request_id": "request-b",
+        "state": "starting",
+        "timestamp": "2026-08-09T10:00:01+00:00",
+    }
+    third = {
+        "request_id": "request-a",
+        "state": "running",
+        "timestamp": "2026-08-09T10:00:02+00:00",
+    }
+    process_event_ledger.append_event(path, third)
+    process_event_ledger.append_event(path, second)
+
+    assert list(process_event_ledger.iter_events(path)) == [first, second, third]
+
+
+def test_non_timeout_append_lock_failure_remains_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "process_events.jsonl"
+
+    @contextmanager
+    def denied_lock(_path: Path):
+        raise PermissionError("denied")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", denied_lock)
+    with pytest.raises(PermissionError, match="denied"):
+        process_event_ledger.append_event(path, {"request_id": "request-a"})
+    assert process_event_ledger.ledger_paths(path) == []

@@ -8,6 +8,7 @@ rotated files remain immutable and readers stream them in chronological order.
 from __future__ import annotations
 
 import json
+import heapq
 import os
 import stat
 import uuid
@@ -24,6 +25,14 @@ ACTIVE_LEDGER_MAX_BYTES = 48 * 1024 * 1024
 
 def _archive_pattern(path: Path) -> str:
     return f"{path.stem}.*{path.suffix}"
+
+
+def _spill_marker(path: Path) -> str:
+    return f"{path.stem}.spill."
+
+
+def _is_spill(path: Path, candidate: Path) -> bool:
+    return candidate.name.startswith(_spill_marker(path))
 
 
 def ledger_paths(path: Path) -> list[Path]:
@@ -84,6 +93,50 @@ def _rotate(path: Path) -> Path:
     return archive
 
 
+def _write_immutable_spill(path: Path, payload: bytes) -> Path:
+    """Persist one event without the shared append lock.
+
+    A Windows process can retain the advisory append lock after its provider
+    and supervisor have already exited.  Status, cancellation, finalization
+    recovery and unrelated launches must not all become unavailable behind
+    that one stale owner.  A uniquely named, atomically published immutable
+    segment preserves the event without stealing or deleting the lock.
+
+    Readers merge spill segments by the event's canonical timestamp, so an
+    older row in the active file cannot overwrite a newer recovery event.
+    """
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    identity = f"{os.getpid()}.{uuid.uuid4().hex}"
+    spill = path.with_name(f"{path.stem}.spill.{stamp}.{identity}{path.suffix}")
+    temporary = path.with_name(f".{spill.name}.tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temporary, flags, 0o600)
+    published = False
+    try:
+        chmod_fd(fd, 0o600)
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise OSError("short_process_event_spill_write")
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        atomic_replace(temporary, spill)
+        os.chmod(spill, 0o600)
+        published = True
+        return spill
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not published:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
 def append_event(
     path: Path,
     event: dict[str, Any],
@@ -99,41 +152,84 @@ def append_event(
         raise ValueError("process_event_exceeds_active_ledger_bound")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
-    with _append_lock(path):
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            info = None
-        if info is not None:
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise OSError("process_event_ledger_invalid")
-            if info.st_size and info.st_size + len(payload) > max_active_bytes:
-                _rotate(path)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o600)
-        try:
-            chmod_fd(fd, 0o600)
-            written = os.write(fd, payload)
-            if written != len(payload):
-                raise OSError("short_process_event_write")
-        finally:
-            os.close(fd)
+    try:
+        with _append_lock(path):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    raise OSError("process_event_ledger_invalid")
+                if info.st_size and info.st_size + len(payload) > max_active_bytes:
+                    _rotate(path)
+            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags, 0o600)
+            try:
+                chmod_fd(fd, 0o600)
+                written = os.write(fd, payload)
+                if written != len(payload):
+                    raise OSError("short_process_event_write")
+            finally:
+                os.close(fd)
+    except TimeoutError:
+        _write_immutable_spill(path, payload)
+
+
+def _iter_ledger_file(path: Path) -> Iterator[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
 
 
 def iter_events(path: Path) -> Iterator[dict[str, Any]]:
     """Stream valid object rows across rotations without whole-file reads."""
 
-    for ledger in ledger_paths(path):
+    ledgers = ledger_paths(path)
+    if not any(_is_spill(path, ledger) for ledger in ledgers):
+        for ledger in ledgers:
+            yield from _iter_ledger_file(ledger)
+        return
+
+    # Each ordinary ledger is append-ordered and every spill contains one
+    # atomically published row. Merge their heads instead of loading the
+    # bounded-but-potentially-large ledger history into memory.
+    streams = [iter(_iter_ledger_file(ledger)) for ledger in ledgers]
+    heap: list[tuple[str, int, int, dict[str, Any]]] = []
+    ordinals = [0] * len(streams)
+    for index, stream in enumerate(streams):
         try:
-            with ledger.open("r", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(row, dict):
-                        yield row
-        except OSError:
+            row = next(stream)
+        except StopIteration:
             continue
+        heapq.heappush(
+            heap,
+            (str(row.get("timestamp") or ""), index, 0, row),
+        )
+    while heap:
+        _timestamp, index, _ordinal, row = heapq.heappop(heap)
+        yield row
+        try:
+            following = next(streams[index])
+        except StopIteration:
+            continue
+        ordinals[index] += 1
+        heapq.heappush(
+            heap,
+            (
+                str(following.get("timestamp") or ""),
+                index,
+                ordinals[index],
+                following,
+            ),
+        )

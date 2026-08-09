@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from aiworkhub import core
+from aiworkhub import core, process_event_ledger
 from aiworkhub.process_launcher import LaunchRejected, ProcessManager
 
 
@@ -86,6 +86,36 @@ def test_launch_reservation_blocks_duplicate_task_before_pid_exists(
         with pytest.raises(LaunchRejected, match="duplicate_reserved_task"):
             with second._launch_reservation({**event, "request_id": "c" * 32}):
                 pass
+
+
+def test_stale_event_append_lock_does_not_block_unrelated_launch_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    event = {
+        "request_id": "d" * 32,
+        "task_id": "TASK_UNRELATED",
+        "runner": "worker_a",
+        "topic": "code",
+        "adapter_id": "glm_vscode_lm",
+    }
+
+    @contextmanager
+    def timed_out_append_lock(_path: Path):
+        raise TimeoutError("windows_advisory_lock_timeout after 20s")
+        yield
+
+    monkeypatch.setattr(process_event_ledger, "_append_lock", timed_out_append_lock)
+    with manager._launch_reservation(event):
+        latest = manager._latest_by_request()[event["request_id"]]
+        assert latest["state"] == "starting"
+        assert latest["task_id"] == "TASK_UNRELATED"
+
+    assert any(
+        ".spill." in candidate.name
+        for candidate in process_event_ledger.ledger_paths(manager.process_log_path)
+    )
 
 
 def test_same_request_finalizers_remain_serialized(tmp_path: Path) -> None:

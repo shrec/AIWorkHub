@@ -6,6 +6,33 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.37] - 2026-08-09
+
+### Fixed
+
+- Dashboard runtime-repair failures now report the real bounded attempt count
+  instead of remaining at the misleading `0/3` state.
+- The dashboard `Retry` action now advances both MCP runtime repair and the
+  snapshot request. A recovered child therefore clears the stale repair
+  banner without requiring a window reload.
+- A partially spent repair episode survives explicit retry so attempts
+  progress truthfully through `1/3`, `2/3`, and `3/3`; only an exhausted or
+  blocked episode starts a fresh bounded budget.
+- Failed repair is rendered as `Runtime repair failed`, rather than the
+  inaccurate `Runtime repair in progress`, and transport-health failures keep
+  their exact bounded reason.
+- A stale Windows process-event append lock no longer blocks status, cancel,
+  finalization recovery, and unrelated launches together. Timed-out writers
+  atomically publish a unique immutable ledger segment; readers merge those
+  segments by canonical event time, preserving append-only audit truth without
+  deleting or stealing another process's lock.
+
+### Tests
+
+- Added repair-attempt telemetry, explicit-retry budget, Webview title,
+  runtime-plus-snapshot retry, immutable ledger fallback, chronological merge,
+  and fail-closed non-timeout regressions.
+
 ## [0.9.36] - 2026-08-09
 
 ### Fixed

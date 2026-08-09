@@ -25,6 +25,7 @@ for (const token of [
   'id="storage-registration-prune"',
   'id="terminal-log-cleanup-preview"',
   'id="runtime-cleanup-preview"',
+  'id="reload-alert-title"',
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -67,9 +68,15 @@ for (const token of [
   "requestRuntimeCleanup",
   "requestRuntimeRestore",
   "requestRuntimePurge",
+  'elements.reloadAlertTitle.textContent = payload.repairAttempted',
+  '"Runtime repair failed"',
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }
+assert.ok(
+  extension.includes('await pushRuntimeInfo(view);') && extension.includes('await pushSnapshot(view);'),
+  "dashboard Retry must advance runtime repair and refresh the snapshot",
+);
 assert.ok(css.includes(".storage-row"), "storage dashboard styling is missing");
 assert.ok(css.includes(".storage-section-title"), "storage section styling is missing");
 assert.ok(css.includes(".storage-batch-row"), "storage quarantine styling is missing");

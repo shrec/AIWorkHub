@@ -117,6 +117,7 @@ const elements = {
   sourceAlertTitle: document.querySelector("#source-alert-title"),
   sourceAlertMessage: document.querySelector("#source-alert-message"),
   reloadAlert: document.querySelector("#reload-alert"),
+  reloadAlertTitle: document.querySelector("#reload-alert-title"),
   reloadAlertMessage: document.querySelector("#reload-alert-message"),
   offlineAlert: document.querySelector("#offline-alert"),
   offlineAlertMessage: document.querySelector("#offline-alert-message"),
@@ -2563,10 +2564,18 @@ function renderRuntimeInfo(info) {
     elements.reloadAlert.hidden = false;
     const attempts = Number(payload.attempts || 0);
     const maxAttempts = Number(payload.maxAttempts || 3);
+    if (elements.reloadAlertTitle) {
+      elements.reloadAlertTitle.textContent = payload.repairAttempted
+        ? "Runtime repair failed"
+        : "MCP runtime degraded";
+    }
     elements.reloadAlertMessage.textContent =
       `MCP runtime degraded: ${String(payload.reason || "unavailable")} (${attempts}/${maxAttempts}).`;
   } else {
     elements.reloadAlert.hidden = true;
+    if (elements.reloadAlertTitle) {
+      elements.reloadAlertTitle.textContent = "MCP runtime degraded";
+    }
     elements.reloadAlertMessage.textContent = "";
   }
 }
