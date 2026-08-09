@@ -190,6 +190,7 @@ def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
     repo.mkdir()
     executable = tmp_path / "claude.exe"
     executable.write_bytes(b"MZ")
+    executable.chmod(0o755)
     monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: True)
     monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _binary: str(executable))
 
