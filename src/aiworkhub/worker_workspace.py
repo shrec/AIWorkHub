@@ -3598,8 +3598,20 @@ def validation_argv(command: str) -> list[str]:
 
 
 def _approved_pythonpath_site(component: str) -> Path:
+    candidate = Path(component)
+    if not candidate.is_absolute():
+        raise WorkspaceError(
+            f"validation_pythonpath_absolute_component_forbidden:{component}"
+        )
+    approved_raw = Path(site.getusersitepackages())
+    approved_site = approved_raw.resolve()
+    # Reject untrusted spellings before containment can dereference a UNC path.
+    if candidate not in (approved_raw, approved_site):
+        raise WorkspaceError(
+            f"validation_pythonpath_absolute_component_forbidden:{component}"
+        )
     try:
-        target = _require_beneath(Path("/"), Path(component))
+        target = _require_beneath(Path(candidate.anchor), candidate)
     except WorkspaceError as exc:
         # Normalize the shared _require_beneath invariant's lexical-symlink /
         # escape rejections at this public validation boundary so callers see
@@ -3612,7 +3624,6 @@ def _approved_pythonpath_site(component: str) -> Path:
                 f"validation_pythonpath_absolute_component_forbidden:{component}"
             ) from exc
         raise
-    approved_site = Path(site.getusersitepackages()).resolve()
     if target != approved_site or not target.is_dir():
         raise WorkspaceError(
             f"validation_pythonpath_absolute_component_forbidden:{component}"
@@ -3631,7 +3642,8 @@ def resolve_validation_pythonpath(
         if component == ".":
             resolved.append(base)
             continue
-        if component.startswith("/"):
+        component_path = Path(component)
+        if component_path.is_absolute():
             target = _approved_pythonpath_site(component)
             resolved.append(
                 f"/validation-pythonpath/{absolute_index}"
@@ -3640,6 +3652,10 @@ def resolve_validation_pythonpath(
             )
             absolute_index += 1
             continue
+        if component_path.anchor:
+            raise WorkspaceError(
+                f"validation_pythonpath_absolute_component_forbidden:{component}"
+            )
         target = _require_beneath(workspace.path, workspace.path / component)
         if target.is_symlink() or not target.is_dir():
             raise WorkspaceError(f"validation_pythonpath_not_directory:{component}")

@@ -197,6 +197,7 @@ SUPERVISOR_GRACE_SECONDS = 90
 TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
 TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
+WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES = {"starting", "running"}
 FINALIZATION_PENDING_STATES = {
     "finalizing", "release_pending", "review_pending", "reconcile_pending",
 }
@@ -217,6 +218,10 @@ TERMINAL_PROCESS_STATES = {
     "monitor_error",
     "blocked",
 }
+
+
+class _BridgeCancellationDeferred(RuntimeError):
+    """Bridge terminal decision could not be published; never finalize yet."""
 
 
 def sanitized_env(
@@ -2837,6 +2842,7 @@ class _LiveProcess:
     metadata_path: Path | None = None
     supervisor_status_path: Path | None = None
     pid_start_ticks: int | None = None
+    bridge_request: vscode_lm_bridge.BridgeRequest | None = None
 
 
 class ProcessManager:
@@ -4193,6 +4199,11 @@ class ProcessManager:
                     "metadata_path": str(metadata_path),
                     "prompt_sha256": prompt_hash,
                     "prompt_budget": prompt_budget,
+                    "vscode_lm_bridge": (
+                        vscode_lm_bridge.bridge_request_metadata(bridge_request)
+                        if bridge_request is not None
+                        else None
+                    ),
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -4347,6 +4358,7 @@ class ProcessManager:
                     metadata_path=metadata_path,
                     supervisor_status_path=status_path,
                     pid_start_ticks=start_ticks,
+                    bridge_request=bridge_request,
                 )
                 with self._lock:
                     self._live[request_id] = live
@@ -4743,6 +4755,16 @@ class ProcessManager:
                     "metadata_path": str(live.metadata_path or ""),
                     "supervisor_status_path": str(live.supervisor_status_path or ""),
                 })
+            try:
+                self._publish_bridge_cancellation_before_finalization(
+                    live.request_id,
+                    live,
+                )
+            except _BridgeCancellationDeferred:
+                with self._lock:
+                    self._live.pop(live.request_id, None)
+                    self._cancelled.discard(live.request_id)
+                return
             self._finalize_after_process_exit(live.request_id, live.process.poll())
             with self._lock:
                 self._live.pop(live.request_id, None)
@@ -4750,6 +4772,119 @@ class ProcessManager:
             return
 
         self._monitor_direct_for_tests(live)
+
+    def _bridge_request_for_cancellation(
+        self,
+        request_id: str,
+        live: _LiveProcess | None,
+        status: dict[str, Any],
+    ) -> vscode_lm_bridge.BridgeRequest | None:
+        """Recover the exact bridge receipt before any lifecycle cancellation."""
+        if live is not None and live.bridge_request is not None:
+            return live.bridge_request
+        events = self._request_events(request_id)
+        latest = status.get("latest_event")
+        if not isinstance(latest, dict) and events:
+            latest = events[-1]
+        adapter_id = str(
+            (latest.get("adapter_id") if isinstance(latest, dict) else "")
+            or status.get("adapter_id")
+            or ""
+        )
+        if adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+            return None
+        metadata_path = self._metadata_from_events(events)
+        if metadata_path is None or not metadata_path.is_file():
+            raise vscode_lm_bridge.BridgeError(
+                "bridge_cancel_metadata_missing"
+            )
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise vscode_lm_bridge.BridgeError(
+                f"bridge_cancel_metadata_invalid:{type(exc).__name__}:{exc}"
+            ) from exc
+        return vscode_lm_bridge.bridge_request_from_metadata(
+            metadata.get("vscode_lm_bridge"),
+            expected_request_id=request_id,
+        )
+
+    def _publish_bridge_cancellation_before_finalization(
+        self,
+        request_id: str,
+        live: _LiveProcess | None = None,
+    ) -> str:
+        """Publish the bridge terminal decision or defer finalization.
+
+        This gate is deliberately independent of the in-memory live-process
+        registry. A restarted manager must recover the exact token-bound
+        bridge receipt from owner-only request metadata before it can release
+        or finalize a dead supervisor's workspace.
+        """
+        events = self._request_events(request_id)
+        if events:
+            lineage = self._event_identity(events)
+            latest = {**lineage, **events[-1]}
+        elif live is not None:
+            lineage = {
+                "task_id": live.task_id,
+                "runner": live.runner,
+                "topic": live.topic,
+                "adapter_id": live.adapter_id,
+            }
+            latest = {
+                **lineage,
+                "request_id": request_id,
+                "state": "running",
+                "pid": live.process.pid,
+                "pid_start_ticks": live.pid_start_ticks,
+                "metadata_path": str(live.metadata_path or ""),
+                "supervisor_status_path": str(
+                    live.supervisor_status_path or ""
+                ),
+            }
+        else:
+            return ""
+        status = {
+            "request_id": request_id,
+            "state": latest.get("state"),
+            "adapter_id": latest.get("adapter_id"),
+            "latest_event": latest,
+        }
+        errors: list[str] = []
+        for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                request = self._bridge_request_for_cancellation(
+                    request_id,
+                    live,
+                    status,
+                )
+                if request is None:
+                    return ""
+                return vscode_lm_bridge.cancel_request(request)
+            except Exception as exc:  # noqa: BLE001 - fail closed below
+                errors.append(
+                    f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
+                )
+
+        error = "bridge_cancel_publication_failed:" + "|".join(errors)
+        self._append_event({
+            **lineage,
+            "request_id": request_id,
+            "state": "reconcile_pending",
+            "pid": latest.get("pid"),
+            "pid_start_ticks": latest.get("pid_start_ticks"),
+            "metadata_path": latest.get("metadata_path"),
+            "supervisor_status_path": latest.get("supervisor_status_path"),
+            "workspace_retained": True,
+            "bridge_provider_may_be_active": True,
+            "bridge_cancel_status": "failed",
+            "reconciliation_deferred": "bridge_cancel_publication_failed",
+            "error": error[:500],
+        })
+        raise _BridgeCancellationDeferred(error[:500])
 
     def _monitor_direct_for_tests(self, live: _LiveProcess) -> None:
         timed_out = False
@@ -4772,6 +4907,16 @@ class ProcessManager:
                 "pid": live.process.pid,
                 "error": str(exc)[:500],
             })
+        try:
+            self._publish_bridge_cancellation_before_finalization(
+                live.request_id,
+                live,
+            )
+        except _BridgeCancellationDeferred:
+            with self._lock:
+                self._live.pop(live.request_id, None)
+                self._cancelled.discard(live.request_id)
+            return
         try:
             card = _parse_card(self._show_task(live.task_id), live.task_id)
             task_state = core._lifecycle_state(card)
@@ -5141,6 +5286,8 @@ class ProcessManager:
         self,
         request_id: str,
         supervisor_returncode: int | None = None,
+        *,
+        lock_blocking: bool = True,
     ) -> dict[str, Any] | None:
         """Reconcile a dead supervisor without silently stranding its task.
 
@@ -5154,14 +5301,28 @@ class ProcessManager:
         The isolated workspace remains retained for diagnosis.
         """
         finalization_started = time.monotonic()
-        with self._request_lock(request_id):
+        with self._lock:
+            live = self._live.get(request_id)
+        try:
+            self._publish_bridge_cancellation_before_finalization(
+                request_id,
+                live,
+            )
+        except _BridgeCancellationDeferred:
+            deferred = self._request_events(request_id)
+            return deferred[-1] if deferred else None
+
+        with self._request_lock(request_id, blocking=lock_blocking):
             events = self._request_events(request_id)
             if not events:
                 return None
             latest = events[-1]
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
-            if latest.get("state") not in {"finalizing", "cancel_requested"}:
+            if (
+                lock_blocking
+                and latest.get("state") not in {"finalizing", "cancel_requested"}
+            ):
                 self._append_event({
                     **self._event_identity(events),
                     "request_id": request_id,
@@ -5179,10 +5340,20 @@ class ProcessManager:
                 event = self._finalize_isolated_request(
                     request_id,
                     supervisor_returncode,
+                    lock_blocking=lock_blocking,
                 )
                 if event is not None:
                     return event
                 errors.append(f"attempt={attempt}:no_terminal_event")
+            except _BridgeCancellationDeferred:
+                deferred = self._request_events(request_id)
+                return deferred[-1] if deferred else None
+            except OSError as exc:
+                if not lock_blocking:
+                    raise
+                errors.append(
+                    f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
+                )
             except Exception as exc:  # noqa: BLE001 - monitor must remain durable
                 errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
 
@@ -5264,7 +5435,11 @@ class ProcessManager:
                 thread.start()
                 watched += 1
             else:
-                if self._finalize_after_process_exit(request_id) is not None:
+                finalized_event = self._finalize_after_process_exit(request_id)
+                if (
+                    finalized_event is not None
+                    and finalized_event.get("state") in TERMINAL_PROCESS_STATES
+                ):
                     finalized += 1
         return {"watched": watched, "finalized": finalized}
 
@@ -5443,6 +5618,12 @@ class ProcessManager:
             finalization_retry = bool(latest.get("finalization_retry"))
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
+            with self._lock:
+                live = self._live.get(request_id)
+            self._publish_bridge_cancellation_before_finalization(
+                request_id,
+                live,
+            )
             metadata_path = self._metadata_from_events(events)
             if metadata_path is None or not metadata_path.is_file():
                 return None
@@ -6264,7 +6445,7 @@ class ProcessManager:
                 or not _pid_matches(pid, ticks)
             ):
                 try:
-                    self._finalize_isolated_request(
+                    self._finalize_after_process_exit(
                         request_id, lock_blocking=False
                     )
                 except OSError:
@@ -6350,7 +6531,7 @@ class ProcessManager:
         }
         if latest.get("adapter_id") not in vscode_lm_adapters:
             return {"ok": False, "reason": "worker_bridge_adapter_mismatch"}
-        if latest.get("state") not in ACTIVE_PROCESS_STATES:
+        if latest.get("state") not in WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES:
             return {"ok": False, "reason": "worker_bridge_request_not_active"}
         metadata_path = self._metadata_from_events(events)
         if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
@@ -6724,14 +6905,52 @@ class ProcessManager:
     def cancel(self, request_id: str, reason: str = "owner_cancelled") -> dict[str, Any]:
         with self._lock:
             live = self._live.get(request_id)
-        status = self.status(request_id)
-        if not status.get("ok"):
-            return status
+        # Cancellation must inspect the durable lineage without invoking
+        # status() reconciliation first. A restarted manager can observe a
+        # dead supervisor while the already-claimed editor provider is still
+        # running; status() would finalize/release the workspace before the
+        # bridge cancellation decision was published.
+        initial_events = self._request_events(request_id)
+        if not initial_events:
+            return {"ok": False, "request_id": request_id, "state": "not_found"}
+        initial_lineage = self._event_identity(initial_events)
+        initial_latest = {**initial_lineage, **initial_events[-1]}
+        status = {
+            "ok": True,
+            "request_id": request_id,
+            "state": initial_latest.get("state"),
+            "adapter_id": initial_latest.get("adapter_id"),
+            "latest_event": initial_latest,
+        }
         if status.get("state") in TERMINAL_PROCESS_STATES:
             return {
                 "ok": True,
                 "request_id": request_id,
                 "state": status.get("state"),
+                "idempotent_noop": True,
+            }
+        bridge_cancel_status = ""
+        try:
+            bridge_cancel_status = (
+                self._publish_bridge_cancellation_before_finalization(
+                    request_id,
+                    live,
+                )
+            )
+        except _BridgeCancellationDeferred as exc:
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "state": "reconcile_pending",
+                "blocked_reason": str(exc)[:500],
+            }
+        if bridge_cancel_status == "completed":
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "state": status.get("state"),
+                "bridge_cancel_status": "completed",
+                "completion_won": True,
                 "idempotent_noop": True,
             }
         if live is not None and not live.isolated:
@@ -6750,6 +6969,7 @@ class ProcessManager:
                 "finished_at": _utcnow(),
                 "stdout_path": str(live.stdout_path),
                 "stderr_path": str(live.stderr_path),
+                "bridge_cancel_status": bridge_cancel_status,
             })
             with self._lock:
                 self._live.pop(request_id, None)
@@ -6818,6 +7038,7 @@ class ProcessManager:
                     "metadata_path": str(metadata_path),
                     "supervisor_status_path": metadata.get("supervisor_status_path"),
                     "cancel_path": str(cancel_path),
+                    "bridge_cancel_status": bridge_cancel_status,
                 })
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -6825,7 +7046,7 @@ class ProcessManager:
                     should_finalize = True
 
         if should_finalize:
-            self._finalize_isolated_request(request_id)
+            self._finalize_after_process_exit(request_id)
             refreshed = self.status(request_id)
             return {
                 "ok": bool(refreshed.get("ok")),

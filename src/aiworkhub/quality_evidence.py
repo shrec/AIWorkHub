@@ -5,11 +5,12 @@ import ast
 import fnmatch
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
 from . import eval_artifact_gate, known_bug_scanner
@@ -795,6 +796,133 @@ def _declared_check_applicability(
     return False, "changed_paths_not_applicable"
 
 
+def _windows_noncanonical_path_alias(value: str) -> bool:
+    """Return whether a raw Windows path contains a dot/space alias."""
+
+    raw_path = PureWindowsPath(value)
+    components = list(raw_path.parts)
+    if raw_path.anchor and components and components[0] == raw_path.anchor:
+        components = components[1:]
+    drive = raw_path.drive.replace("/", "\\")
+    if drive.startswith("\\\\"):
+        # PureWindowsPath stores a UNC server/share pair inside the anchor.
+        # Validate those authority components instead of treating the whole
+        # anchor like a drive-letter root.  Namespace markers remain harmless
+        # components, while server/share aliases still fail closed.
+        components = [
+            part for part in drive.lstrip("\\").split("\\") if part
+        ] + components
+    return any(part != part.rstrip(" .") for part in components)
+
+
+def _windows_path_component_chain_error(path: Path) -> str:
+    """Reject symlink, junction, or other reparse components in a raw path."""
+
+    components = list(path.parts)
+    if path.anchor and components and components[0] == path.anchor:
+        current = Path(path.anchor)
+        components = components[1:]
+    else:
+        current = Path()
+    for component in components:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            # Descendants cannot exist through a missing ancestor.  Strict
+            # resolution below will produce the canonical not-found result.
+            break
+        except OSError:
+            return "windows_path_component_inspection_failed"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "windows_path_reparse_forbidden"
+        try:
+            is_junction = getattr(current, "is_junction", None)
+            if callable(is_junction) and is_junction():
+                return "windows_path_reparse_forbidden"
+        except OSError:
+            return "windows_path_component_inspection_failed"
+        file_attributes = getattr(metadata, "st_file_attributes", 0)
+        if file_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return "windows_path_reparse_forbidden"
+    return ""
+
+
+def _windows_native_command_argv(argv: list[str]) -> tuple[list[str] | None, str]:
+    """Resolve a Windows command to native executable argv or fail closed.
+
+    Windows may ask ``cmd.exe`` to interpret ``.cmd``/``.bat`` files even
+    when ``subprocess.run(..., shell=False)`` is used.  That violates this
+    module's exact-argv contract because metacharacters in later arguments
+    regain shell meaning.  Never return a batch file as argv[0].
+
+    The one supported wrapper is npm's standard ``npm.cmd`` installation:
+    execute its adjacent native ``node.exe`` with the exact, verified
+    ``node_modules/npm/bin/npm-cli.js`` entry point.  Other batch wrappers and
+    incomplete/non-standard npm layouts remain unavailable.
+    """
+
+    resolved = _which(argv[0])
+    if resolved is None:
+        return None, "command_not_found"
+    raw_path = PureWindowsPath(resolved)
+    if _windows_noncanonical_path_alias(resolved):
+        return None, "windows_noncanonical_executable_alias"
+    raw_suffix = raw_path.suffix.casefold()
+    native_suffixes = {".exe", ".com"}
+    batch_suffixes = {".cmd", ".bat"}
+    if raw_suffix not in native_suffixes | batch_suffixes:
+        return None, "windows_non_native_executable_forbidden"
+    unresolved = Path(resolved)
+    component_error = _windows_path_component_chain_error(unresolved)
+    if component_error:
+        return None, component_error
+    try:
+        executable = unresolved.resolve(strict=True)
+    except FileNotFoundError:
+        return None, "command_not_found"
+    except (OSError, RuntimeError):
+        return None, "windows_executable_resolution_failed"
+    executable_suffix = executable.suffix.casefold()
+    if raw_suffix in native_suffixes:
+        if executable_suffix not in native_suffixes or not executable.is_file():
+            return None, "windows_native_executable_unavailable"
+        return [str(executable), *argv[1:]], ""
+    if executable_suffix not in batch_suffixes:
+        return None, "windows_batch_wrapper_forbidden"
+    if (
+        PureWindowsPath(argv[0]).name.casefold() not in {"npm", "npm.cmd"}
+        or executable.name.casefold() != "npm.cmd"
+    ):
+        return None, "windows_batch_wrapper_forbidden"
+    if not executable.is_file():
+        return None, "npm_native_entrypoint_unavailable"
+    try:
+        install_root = executable.parent.resolve(strict=True)
+        node = install_root / "node.exe"
+        npm_cli = install_root / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        for entrypoint in (node, npm_cli):
+            component_error = _windows_path_component_chain_error(entrypoint)
+            if component_error:
+                return None, component_error
+        if (
+            node.is_symlink()
+            or npm_cli.is_symlink()
+            or not node.is_file()
+            or not npm_cli.is_file()
+        ):
+            return None, "npm_native_entrypoint_unavailable"
+        node = node.resolve(strict=True)
+        npm_cli = npm_cli.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "npm_native_entrypoint_unavailable"
+    if node.parent != install_root or npm_cli != (
+        install_root / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    ):
+        return None, "npm_native_entrypoint_unavailable"
+    return [str(node), str(npm_cli), *argv[1:]], ""
+
+
 def _run_command_array(
     command: Iterable[str],
     *,
@@ -810,6 +938,16 @@ def _run_command_array(
         # bind that interpreter token to the already-running trusted runtime.
         argv[0] = sys.executable
     start = time.monotonic()
+    if os.name == "nt" and argv:
+        native_argv, resolution_error = _windows_native_command_argv(argv)
+        if native_argv is None:
+            return (
+                STATUS_NOT_AVAILABLE,
+                "",
+                resolution_error,
+                time.monotonic() - start,
+            )
+        argv = native_argv
     try:
         completed = subprocess.run(
             argv,
@@ -823,6 +961,8 @@ def _run_command_array(
         return STATUS_NOT_AVAILABLE, "", "command_not_found", time.monotonic() - start
     except subprocess.TimeoutExpired:
         return STATUS_FAILED, "", "timeout", time.monotonic() - start
+    except OSError:
+        return STATUS_NOT_AVAILABLE, "", "process_start_failed", time.monotonic() - start
     duration = time.monotonic() - start
     status = STATUS_PASSED if completed.returncode == 0 else STATUS_FAILED
     return status, completed.stdout, completed.stderr, duration

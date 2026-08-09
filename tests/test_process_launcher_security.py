@@ -334,6 +334,260 @@ def test_cancel_from_restarted_manager_is_durable_and_releases_exact_owner(
     assert (repo / "out" / "result.txt").read_text(encoding="utf-8") == "baseline\n"
 
 
+def test_restarted_manager_publishes_claimed_bridge_cancel_before_lifecycle_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    bridge = process_launcher.vscode_lm_bridge
+    bridge_root = tmp_path / "bridge"
+    monkeypatch.setenv(bridge.BRIDGE_ROOT_ENV, str(bridge_root))
+    request_id = "a" * 32
+    repo_id = "repo_" + "b" * 32
+    token = "c" * 64
+    workspace_root = tmp_path / request_id
+    worktree = workspace_root / "worktree"
+    home = workspace_root / "home"
+    worktree.mkdir(parents=True)
+    home.mkdir()
+    request_path = bridge_root / "requests" / repo_id / f"{request_id}.json"
+    response_path = home / ".aiworkhub_vscode_lm_response.json"
+    worker_spec_path = home / ".aiworkhub_vscode_lm_worker.json"
+    bridge._atomic_json(  # noqa: SLF001 - exact persisted bridge receipt
+        request_path,
+        {
+            "schema_id": bridge.REQUEST_SCHEMA_ID,
+            "request_id": request_id,
+            "repo_id": repo_id,
+            "cancel_token": token,
+        },
+    )
+    request = bridge.BridgeRequest(
+        request_id=request_id,
+        repo_id=repo_id,
+        request_path=request_path,
+        response_path=response_path,
+        worker_spec_path=worker_spec_path,
+        cancel_path=response_path,
+        cancel_token=token,
+    )
+    claim_path = Path(f"{request_path}.claim-window_test")
+    request_path.rename(claim_path)
+
+    process_dir = tmp_path / "processes"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{request_id}.request.json"
+    supervisor_cancel_path = process_dir / f"{request_id}.cancel.json"
+    process_launcher.write_json_0600(
+        metadata_path,
+        {
+            "request_id": request_id,
+            "cancel_path": str(supervisor_cancel_path),
+            "supervisor_status_path": str(process_dir / f"{request_id}.status.json"),
+            "vscode_lm_bridge": bridge.bridge_request_metadata(request),
+        },
+    )
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=process_dir,
+    )
+    manager._append_event({  # noqa: SLF001 - persisted restart setup
+        "request_id": request_id,
+        "task_id": "RESTARTED_BRIDGE_CANCEL_TEST",
+        "runner": "codex",
+        "topic": "bridge-cancel",
+        "adapter_id": "vscode_lm",
+        "state": "running",
+        "pid": 424242,
+        "pid_start_ticks": 17,
+        "metadata_path": str(metadata_path),
+    })
+    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        process_launcher.os,
+        "kill",
+        lambda pid, signal_number: kills.append((pid, signal_number)),
+    )
+    real_append = manager._append_event
+
+    def append_after_bridge_decision(event: dict) -> dict:
+        if event.get("state") == "cancel_requested":
+            payload, action = bridge.read_terminal_decision(
+                response_path,
+                request_id=request_id,
+                repo_id=repo_id,
+                cancel_token=token,
+            ) or ({}, "")
+            assert action == "cancel"
+            assert payload["decision"]["cancel_token"] == token
+        return real_append(event)
+
+    monkeypatch.setattr(manager, "_append_event", append_after_bridge_decision)
+
+    result = manager.cancel(request_id, reason="restart bridge cancellation")
+
+    assert result["ok"] is True
+    assert result["state"] == "cancel_requested"
+    assert result.get("bridge_cancel_status") is None
+    assert kills == [(424242, process_launcher.signal.SIGTERM)]
+    assert supervisor_cancel_path.is_file()
+    assert not request_path.exists()
+    assert claim_path.exists()
+
+
+def test_dead_supervisor_reconciliation_starts_only_after_bridge_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    bridge = process_launcher.vscode_lm_bridge
+    bridge_root = tmp_path / "bridge-dead"
+    monkeypatch.setenv(bridge.BRIDGE_ROOT_ENV, str(bridge_root))
+    request_id = "d" * 32
+    repo_id = "repo_" + "e" * 32
+    token = "f" * 64
+    home = tmp_path / request_id / "home"
+    (tmp_path / request_id / "worktree").mkdir(parents=True)
+    home.mkdir()
+    request_path = bridge_root / "requests" / repo_id / f"{request_id}.json"
+    response_path = home / ".aiworkhub_vscode_lm_response.json"
+    worker_spec_path = home / ".aiworkhub_vscode_lm_worker.json"
+    bridge._atomic_json(  # noqa: SLF001 - exact persisted bridge receipt
+        request_path,
+        {
+            "schema_id": bridge.REQUEST_SCHEMA_ID,
+            "request_id": request_id,
+            "repo_id": repo_id,
+            "cancel_token": token,
+        },
+    )
+    request = bridge.BridgeRequest(
+        request_id=request_id,
+        repo_id=repo_id,
+        request_path=request_path,
+        response_path=response_path,
+        worker_spec_path=worker_spec_path,
+        cancel_path=response_path,
+        cancel_token=token,
+    )
+    request_path.rename(Path(f"{request_path}.claim-window_dead"))
+    process_dir = tmp_path / "processes-dead"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{request_id}.request.json"
+    process_launcher.write_json_0600(
+        metadata_path,
+        {
+            "request_id": request_id,
+            "cancel_path": str(process_dir / f"{request_id}.cancel.json"),
+            "vscode_lm_bridge": bridge.bridge_request_metadata(request),
+        },
+    )
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events-dead.jsonl",
+        process_dir=process_dir,
+    )
+    manager._append_event({  # noqa: SLF001 - persisted restart setup
+        "request_id": request_id,
+        "task_id": "DEAD_BRIDGE_CANCEL_TEST",
+        "runner": "codex",
+        "topic": "bridge-cancel",
+        "adapter_id": "vscode_lm",
+        "state": "running",
+        "pid": 434343,
+        "pid_start_ticks": 19,
+        "metadata_path": str(metadata_path),
+    })
+    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: False)
+
+    def finalize_after_cancel(
+        bound_request_id: str,
+        _returncode: int | None = None,
+        *,
+        lock_blocking: bool = True,
+    ) -> dict:
+        assert bound_request_id == request_id
+        assert lock_blocking is False
+        decision = bridge.read_terminal_decision(
+            response_path,
+            request_id=request_id,
+            repo_id=repo_id,
+            cancel_token=token,
+        )
+        assert decision is not None and decision[1] == "cancel"
+        return manager._append_event({  # noqa: SLF001 - terminal reconciliation stub
+            "request_id": request_id,
+            "task_id": "DEAD_BRIDGE_CANCEL_TEST",
+            "runner": "codex",
+            "topic": "bridge-cancel",
+            "adapter_id": "vscode_lm",
+            "state": "cancelled",
+        })
+
+    monkeypatch.setattr(manager, "_finalize_isolated_request", finalize_after_cancel)
+
+    result = manager.status(request_id)
+
+    assert result["ok"] is True
+    assert result["state"] == "cancelled"
+
+
+def test_bridge_cancel_publication_failure_defers_dead_supervisor_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    repo: Path,
+) -> None:
+    request_id = "9" * 32
+    process_dir = tmp_path / "processes-deferred"
+    process_dir.mkdir()
+    metadata_path = process_dir / f"{request_id}.request.json"
+    process_launcher.write_json_0600(metadata_path, {})
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events-deferred.jsonl",
+        process_dir=process_dir,
+    )
+    manager._append_event({  # noqa: SLF001 - persisted restart setup
+        "request_id": request_id,
+        "task_id": "DEFER_BRIDGE_CANCEL_TEST",
+        "runner": "codex",
+        "topic": "bridge-cancel",
+        "adapter_id": "vscode_lm",
+        "state": "running",
+        "pid": 454545,
+        "pid_start_ticks": 23,
+        "metadata_path": str(metadata_path),
+    })
+    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: False)
+    publication_attempts: list[str] = []
+
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        publication_attempts.append("attempt")
+        raise OSError("simulated Win32 publication failure")
+
+    monkeypatch.setattr(manager, "_bridge_request_for_cancellation", fail_publication)
+    finalized: list[str] = []
+    monkeypatch.setattr(
+        manager,
+        "_finalize_isolated_request",
+        lambda *_args, **_kwargs: finalized.append("called"),
+    )
+
+    result = manager.status(request_id)
+
+    assert result["ok"] is True
+    assert result["state"] == "reconcile_pending"
+    assert (
+        result["latest_event"]["reconciliation_deferred"]
+        == "bridge_cancel_publication_failed"
+    )
+    assert result["latest_event"]["bridge_cancel_status"] == "failed"
+    assert len(publication_attempts) == 3
+    assert finalized == []
+
+
 def _persisted_request(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
