@@ -6,6 +6,38 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.39] - 2026-08-09
+
+### Added
+
+- Added strict evidence-level contracts, scoped audit packets and
+  manager-gated learning commits so assurance claims, bounded review scope
+  and durable lessons have explicit provider-neutral schemas.
+- Added a bounded attempt-artifact manifest with deterministic serialization,
+  exact hash/size coverage, required/optional presence truth, duplicate-key
+  rejection and fail-closed path, identifier and media-type validation.
+
+### Fixed
+
+- Windows MCP runtime routing now binds to the active workspace route instead
+  of retaining stale repository authority across editor windows.
+- Windows validation no longer treats POSIX world-writable mode bits as ACL
+  evidence, and Ruff/mypy quality gates run through the selected trusted
+  Python runtime.
+- Canonical blocked `finalize_failed` tasks now appear exactly once in the
+  completion inbox and are enriched from the exact process request without
+  losing a truthful `workspace_retained=false` value.
+- Windows runtime regression probes remain executable and portable on Linux,
+  preventing platform simulation from constructing unsupported `WindowsPath`
+  objects.
+
+### Tests
+
+- Added adversarial artifact-manifest coverage and Windows runtime,
+  finalization and completion-inbox regressions. The full Python suite passes
+  3,125 tests with 28 platform-dependent skips; the 12-test release
+  qualification matrix, extension suite, Ruff, mypy and diff checks pass.
+
 ## [0.9.38] - 2026-08-09
 
 ### Fixed

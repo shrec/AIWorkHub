@@ -148,6 +148,7 @@ fs.mkdirSync(extensionDir, { recursive: true });
 for (const rel of [
   "package.json",
   "README.md",
+  "CHANGELOG.md",
   "extension.js",
   "runtime-retention.js",
   "media/app.js",
@@ -237,6 +238,7 @@ const manifest = `<?xml version="1.0" encoding="utf-8"?>
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/${pkg.icon}" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Changelog" Path="extension/CHANGELOG.md" Addressable="true"/>
   </Assets>
 </PackageManifest>
 `;

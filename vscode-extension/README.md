@@ -12,6 +12,22 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
+## What's new in 0.9.39
+
+- Added strict evidence levels, scoped audit packets, manager-gated learning
+  commits and a bounded attempt-artifact manifest for trustworthy review and
+  durable, provider-neutral engineering evidence.
+- Hardened Windows multi-window runtime routing so each editor stays bound to
+  its active repository authority.
+- Fixed Windows validation-runtime trust checks and made Ruff/mypy quality
+  gates use the selected trusted Python interpreter.
+- Restored truthful completion-inbox reporting for blocked finalization
+  failures, including exact request identity and retained-workspace state.
+- Added adversarial manifest tests plus cross-platform Windows runtime and
+  finalization regressions.
+
+See the packaged **Changelog** for the complete release summary.
+
 <div align="center">
   <img src="https://raw.githubusercontent.com/shrec/AIWorkHub/main/docs/assets/demo/aiworkhub-task-review-loop.gif" alt="AIWorkHub task, worker, evidence and review loop" width="100%">
   <br>
