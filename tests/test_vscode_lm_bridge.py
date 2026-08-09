@@ -34,8 +34,9 @@ def test_atomic_json_skips_redundant_chmod_in_restricted_sandbox(
     vscode_lm_bridge._atomic_json(target, {"text": "ქართული → UTF-8"})
 
     assert json.loads(target.read_text(encoding="utf-8"))["text"] == "ქართული → UTF-8"
-    assert target.parent.stat().st_mode & 0o777 == 0o700
-    assert target.stat().st_mode & 0o777 == 0o600
+    if vscode_lm_bridge.posix_path_modes_supported():
+        assert target.parent.stat().st_mode & 0o777 == 0o700
+        assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_vscode_lm_tool_input_invalid_has_bounded_diagnostics() -> None:
@@ -168,7 +169,8 @@ def test_atomic_json_remains_portable_when_getuid_absent(
     assert "über".encode("utf-8") in raw
     assert json.loads(raw.decode("utf-8")) == payload
     assert target.is_file()
-    assert target.stat().st_mode & 0o777 == 0o600
+    if vscode_lm_bridge.posix_path_modes_supported():
+        assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_atomic_json_retries_repo_spool_cleanup_once(
@@ -764,7 +766,7 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     workspace.mkdir(parents=True)
     source_file = workspace / "src" / "app.py"
     source_file.parent.mkdir()
-    source_file.write_text("before\ndef target():\n    return 1\nafter\n", encoding="utf-8")
+    source_file.write_bytes(b"before\ndef target():\n    return 1\nafter\n")
     home.mkdir()
     ledger = home / "audit.jsonl"
     key = home / "audit.key"

@@ -72,6 +72,7 @@ def _write_fake_pytest_package(root: Path, body: str = "print('FAKE_PYTEST_MAIN_
     (pkg / "__main__.py").write_text("import sys\n" + body + "\nraise SystemExit(0)\n", encoding="utf-8")
 
 
+@unittest.skipIf(os.name == "nt", "requires POSIX ownership and sandbox semantics")
 class _TolerateNestedSeccompChmodDenial(unittest.TestCase):
     """Base class: swallow only ``PermissionError`` from chmod/fchmod so the
     real ``create_workspace``/``sanitized_env``/``run_validations`` code
@@ -84,7 +85,7 @@ class _TolerateNestedSeccompChmodDenial(unittest.TestCase):
 
     def setUp(self) -> None:
         self._real_chmod = os.chmod
-        self._real_fchmod = os.fchmod
+        self._real_fchmod = getattr(os, "fchmod", None)
 
         def _chmod(path, mode, *a, **kw):
             try:
@@ -94,20 +95,27 @@ class _TolerateNestedSeccompChmodDenial(unittest.TestCase):
 
         def _fchmod(fd, mode):
             try:
+                assert self._real_fchmod is not None
                 return self._real_fchmod(fd, mode)
             except PermissionError:
                 return None
 
         self._chmod_patch = mock.patch("os.chmod", _chmod)
-        self._fchmod_patch = mock.patch("os.fchmod", _fchmod)
+        self._fchmod_patch = (
+            mock.patch("os.fchmod", _fchmod)
+            if self._real_fchmod is not None
+            else None
+        )
         self._chmod_patch.start()
-        self._fchmod_patch.start()
+        if self._fchmod_patch is not None:
+            self._fchmod_patch.start()
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmp.name)
 
     def tearDown(self) -> None:
         self._chmod_patch.stop()
-        self._fchmod_patch.stop()
+        if self._fchmod_patch is not None:
+            self._fchmod_patch.stop()
         self._tmp.cleanup()
 
 

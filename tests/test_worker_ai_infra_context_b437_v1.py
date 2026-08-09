@@ -206,7 +206,7 @@ def test_required_empty_code_source_graph_fails_before_claim(monkeypatch: pytest
     monkeypatch.setenv(process_launcher.ALLOW_LAUNCH_ENV, "1")
     monkeypatch.setenv(process_launcher.ALLOW_WRITES_ENV, "1")
     monkeypatch.setattr(os, "chmod", lambda *args, **kwargs: None)
-    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
+    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None, raising=False)
     repo = _repo(tmp_path)
     _stub_source_graph_direct(monkeypatch, "{}")
     claims: list[tuple] = []
@@ -344,13 +344,15 @@ def test_receipt_survives_long_stream_suffix(tmp_path: Path) -> None:
 def test_audit_append_accepts_seccomp_denied_fchmod_on_existing_0600_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("requires POSIX fchmod and mode semantics")
     ledger = tmp_path / "audit.jsonl"
     ledger.touch(mode=0o600)
 
     def denied(_fd: int, _mode: int) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    monkeypatch.setattr(os, "fchmod", denied)
+    monkeypatch.setattr(os, "fchmod", denied, raising=False)
     worker_ai_tools_mcp._append_line_0600(ledger, '{"ok":true}\n')
     assert ledger.read_text(encoding="utf-8") == '{"ok":true}\n'
     assert ledger.stat().st_mode & 0o777 == 0o600

@@ -35,7 +35,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 try:
-    from .platform_io import atomic_replace, chmod_fd, chmod_path
+    from .platform_io import (
+        atomic_replace,
+        chmod_fd,
+        chmod_path,
+        posix_path_modes_supported,
+    )
 except ImportError:  # direct-script Landlock entrypoint
     def atomic_replace(
         source: str | os.PathLike[str], destination: str | os.PathLike[str]
@@ -50,6 +55,9 @@ except ImportError:  # direct-script Landlock entrypoint
     def chmod_path(path: str | os.PathLike[str], mode: int) -> None:
         if os.name != "nt":
             os.chmod(path, mode)
+
+    def posix_path_modes_supported(platform_name: str | None = None) -> bool:
+        return (platform_name or os.name) != "nt"
 
 
 def bubblewrap_home_env_value() -> str:
@@ -1877,8 +1885,16 @@ def _probe_exec_capable_dir(directory: Path) -> bool:
         # (e.g. this exact code running nested under its own
         # ``_apply_metadata_seccomp`` deny-list) and closes the TOCTOU window
         # a create-then-chmod sequence would otherwise leave open.
+        # ``O_BINARY`` is mandatory on Windows.  Without it, writing a native
+        # executable through ``os.write`` performs CRLF translation and
+        # silently corrupts the private COMSPEC copy used by the probe.
         fd = os.open(
-            probe_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o700
+            probe_path,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_BINARY", 0),
+            0o700,
         )
     except OSError:
         return False
@@ -2180,7 +2196,7 @@ def _resolve_trusted_validation_executable(
             raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
         if os.name != "nt" and root_info.st_uid != os.getuid():
             raise WorkspaceError(f"validation_executable_runtime_root_untrusted_owner:{root}")
-        if stat.S_IMODE(root_info.st_mode) & 0o002:
+        if posix_path_modes_supported(os.name) and stat.S_IMODE(root_info.st_mode) & 0o002:
             raise WorkspaceError(f"validation_executable_runtime_root_world_writable:{root}")
         return _trusted_validation_executable_from_resolved(name, root, resolved)
     raise WorkspaceError(f"validation_executable_unavailable:{name}")
@@ -2195,7 +2211,7 @@ def _trusted_validation_executable_from_resolved(
         raise WorkspaceError(f"validation_executable_unavailable:{name}") from exc
     if os.name != "nt" and info.st_uid != os.getuid():
         raise WorkspaceError(f"validation_executable_untrusted_owner:{resolved}")
-    if stat.S_IMODE(info.st_mode) & 0o002:
+    if posix_path_modes_supported(os.name) and stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError(f"validation_executable_world_writable:{resolved}")
     return TrustedValidationExecutable(path=resolved, root=root)
 
@@ -3426,7 +3442,17 @@ def _tokenize_validation_command(command: str) -> list[str]:
     if any(ch in command for ch in ("\n", "\r", "|", ";", "`", ">", "<")):
         raise WorkspaceError(f"validation_shell_syntax_forbidden:{command[:120]}")
     try:
-        argv = shlex.split(command, posix=True)
+        if _is_windows_host():
+            # Keep POSIX-style quote removal because task-card validation
+            # commands are cross-platform, but do not treat every backslash
+            # in a native Windows path as an escape character.
+            lexer = shlex.shlex(command, posix=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            lexer.escape = ""
+            argv = list(lexer)
+        else:
+            argv = shlex.split(command, posix=True)
     except ValueError as exc:
         raise WorkspaceError(f"validation_parse_failed:{exc}") from exc
     if not argv:

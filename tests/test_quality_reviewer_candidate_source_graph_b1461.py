@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from aiworkhub import process_launcher
 from aiworkhub import quality_reviewer
@@ -249,6 +252,7 @@ def test_review_packet_many_nf3_hunks_stays_per_path_bounded(
     assert omitted > 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids control characters in paths")
 def test_review_packet_escapes_control_character_path_in_hunk_header(
     tmp_path: Path,
 ) -> None:

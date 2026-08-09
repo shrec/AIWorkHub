@@ -50,7 +50,14 @@ def _run_supervisor(spec_path: Path) -> subprocess.CompletedProcess[bytes]:
 
 
 def _read_status(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def test_supervisor_success_persists_status_and_private_logs(tmp_path: Path) -> None:

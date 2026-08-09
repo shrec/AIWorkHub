@@ -33,14 +33,23 @@ def _executable(path: Path) -> Path:
     return path
 
 
+def _runtime_executable(runtime_root: Path, name: str) -> Path:
+    relative = (
+        Path("Scripts") / f"{name}.exe"
+        if os.name == "nt"
+        else Path("bin") / name
+    )
+    return _executable(runtime_root / relative)
+
+
 def test_bare_approved_ruff_resolves_to_arbitrary_repo_venv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "D Dev Project"
     runtime_root = repo / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
     home = tmp_path / "home"
-    home_runtime = _executable(home / "AIWorkHub" / ".venv" / "bin" / "ruff")
+    home_runtime = _runtime_executable(home / "AIWorkHub" / ".venv", "ruff")
     monkeypatch.setattr(worker_workspace.Path, "home", lambda: home)
 
     assert home_runtime.resolve() != ruff.resolve()
@@ -58,7 +67,7 @@ def test_python_module_ruff_resolves_to_trusted_console_executable(
 ) -> None:
     repo = tmp_path / "project"
     runtime_root = repo / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
     monkeypatch.setattr(
         worker_workspace,
         "_trusted_validation_runtime_roots",
@@ -93,7 +102,7 @@ def test_unrelated_home_aiworkhub_runtime_is_not_selected(
     repo = tmp_path / "customer-repository"
     repo.mkdir()
     home = tmp_path / "home"
-    _executable(home / "AIWorkHub" / ".venv" / "bin" / "ruff")
+    _runtime_executable(home / "AIWorkHub" / ".venv", "ruff")
     monkeypatch.setattr(worker_workspace.Path, "home", lambda: home)
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     monkeypatch.setattr(
@@ -150,7 +159,11 @@ def test_runtime_symlink_escape_fails_closed(
 ) -> None:
     runtime_root = tmp_path / "project" / ".venv"
     escaped = _executable(tmp_path / "elsewhere" / "ruff")
-    link = runtime_root / "bin" / "ruff"
+    link = (
+        runtime_root / "Scripts" / "ruff.exe"
+        if os.name == "nt"
+        else runtime_root / "bin" / "ruff"
+    )
     link.parent.mkdir(parents=True)
     link.symlink_to(escaped)
     monkeypatch.setattr(
@@ -169,8 +182,13 @@ def test_runtime_symlink_escape_fails_closed(
 def test_world_writable_runtime_root_and_executable_fail_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(
+        worker_workspace,
+        "posix_path_modes_supported",
+        lambda _platform=None: True,
+    )
     runtime_root = tmp_path / "project" / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
     monkeypatch.setattr(
         worker_workspace,
         "_trusted_validation_runtime_roots",
@@ -204,7 +222,7 @@ def test_world_writable_runtime_root_and_executable_fail_closed(
 def test_bubblewrap_binds_runtime_root_and_rewrites_executable_path(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     runtime_root = tmp_path / "runtime" / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
 
     argv = worker_workspace.sandbox_argv(
         workspace,
@@ -223,7 +241,8 @@ def test_bubblewrap_binds_runtime_root_and_rewrites_executable_path(tmp_path: Pa
     assert ["--ro-bind", str(runtime_root.resolve()), alias] == argv[
         argv.index(str(runtime_root.resolve())) - 1 : argv.index(str(runtime_root.resolve())) + 2
     ]
-    assert argv[-3:] == [f"{alias}/bin/ruff", "check", "src"]
+    sandbox_relative = "Scripts/ruff.exe" if os.name == "nt" else "bin/ruff"
+    assert argv[-3:] == [f"{alias}/{sandbox_relative}", "check", "src"]
 
 
 def test_run_validations_resolves_ruff_before_landlock_exec(
@@ -231,7 +250,7 @@ def test_run_validations_resolves_ruff_before_landlock_exec(
 ) -> None:
     workspace = _workspace(tmp_path)
     runtime_root = tmp_path / "project" / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         worker_workspace,
@@ -279,7 +298,7 @@ def test_run_validations_passes_runtime_root_to_bubblewrap(
 ) -> None:
     workspace = _workspace(tmp_path)
     runtime_root = tmp_path / "project" / ".venv"
-    ruff = _executable(runtime_root / "bin" / "ruff")
+    ruff = _runtime_executable(runtime_root, "ruff")
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         worker_workspace,
@@ -325,16 +344,10 @@ def test_pytest_console_script_normalization_is_preserved() -> None:
 
 
 def test_repo_venv_mypy_preferred_over_system(tmp_path, monkeypatch) -> None:
-    venv_bin = tmp_path / ".venv" / "bin"
-    venv_bin.mkdir(parents=True, exist_ok=True)
-    repo_mypy = venv_bin / "mypy"
-    _executable(repo_mypy)
+    repo_mypy = _runtime_executable(tmp_path / ".venv", "mypy")
 
     sys_prefix = tmp_path / "sys"
-    sys_prefix_bin = sys_prefix / "bin"
-    sys_prefix_bin.mkdir(parents=True, exist_ok=True)
-    sys_mypy = sys_prefix_bin / "mypy"
-    _executable(sys_mypy)
+    sys_mypy = _runtime_executable(sys_prefix, "mypy")
 
     fake_module = tmp_path / "src" / "aiworkhub" / "worker_workspace.py"
     fake_module.parent.mkdir(parents=True, exist_ok=True)
@@ -364,7 +377,7 @@ def test_run_validations_mypy_declared_argv_bare_executed_is_repo_venv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     workspace = _workspace(tmp_path)
-    mypy = _executable(tmp_path / ".venv" / "bin" / "mypy")
+    mypy = _runtime_executable(tmp_path / ".venv", "mypy")
     captured: dict[str, object] = {}
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     monkeypatch.setattr(

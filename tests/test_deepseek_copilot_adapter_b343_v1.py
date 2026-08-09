@@ -31,6 +31,12 @@ from aiworkhub import (  # noqa: E402
     worker_workspace,
 )
 
+
+@pytest.fixture(autouse=True)
+def _exercise_portable_adapter_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_adapters, "_is_windows_host", lambda: False)
+
+
 # An obviously-fake, non-real key. It must never appear in argv, logs, audit
 # events, dashboard payloads, or Git -- only in the launched child env.
 FAKE_KEY = "sk-deepseek-B343-FAKE-not-a-real-key"

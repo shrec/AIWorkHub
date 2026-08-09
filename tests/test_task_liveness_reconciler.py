@@ -117,7 +117,10 @@ def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
 def _kill_if_alive(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            if os.name == "nt":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
 
@@ -233,7 +236,10 @@ def test_supervisor_status_read_secure_modes_and_symlink_rejection(tmp_path):
     fd = os.open(insecure, os.O_CREAT | os.O_WRONLY, 0o644)
     with os.fdopen(fd, "w") as fh:
         json.dump(payload, fh)
-    assert process_launcher.read_supervisor_status(insecure) == {}
+    if os.name == "nt":
+        assert process_launcher.read_supervisor_status(insecure) == payload
+    else:
+        assert process_launcher.read_supervisor_status(insecure) == {}
 
     malformed = tmp_path / "status_malformed.json"
     fd = os.open(malformed, os.O_CREAT | os.O_WRONLY, 0o600)
@@ -246,6 +252,8 @@ def test_supervisor_status_read_secure_modes_and_symlink_rejection(tmp_path):
 
 
 def test_supervisor_status_read_rejects_foreign_owner(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("Windows ownership is ACL-based, not st_uid-based")
     real = tmp_path / "status.json"
     fd = os.open(real, os.O_CREAT | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as fh:

@@ -228,7 +228,9 @@ def test_collision_guard_uses_native_aiworkhub_store_not_repo_scripts(repo):
     payload = json.loads(result["stdout"].split("\n\n", 1)[1])
     assert payload["schema_id"] == "aiworkhub.task_collision_report.v1"
     assert payload["source"] == "canonical_task_store"
-    assert payload["cards_source"].endswith("/.aiworkhub/tasking/task_queue.sqlite")
+    assert payload["cards_source"].replace("\\", "/").endswith(
+        "/.aiworkhub/tasking/task_queue.sqlite"
+    )
     assert "bitnnv2/data/tasking" not in payload["cards_source"]
 
 

@@ -20,6 +20,7 @@ from statistics import median
 from typing import Any, Iterable, Mapping
 
 from . import repo_policy, task_store, workforce_router
+from .platform_io import posix_path_modes_supported
 
 
 SCHEMA_ID = "aiworkhub.workforce_catalog.v1"
@@ -194,16 +195,23 @@ def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
     fd, name = tempfile.mkstemp(prefix=".workforce-", suffix=".tmp", dir=path.parent)
     tmp = Path(name)
     try:
-        if os.fstat(fd).st_mode & 0o777 != 0o600:
+        if (
+            posix_path_modes_supported()
+            and os.fstat(fd).st_mode & 0o777 != 0o600
+        ):
             os.chmod(tmp, 0o600)
-        with os.fdopen(fd, "wb") as handle:
+        handle = os.fdopen(fd, "wb")
+        fd = -1  # ownership transferred to ``handle``
+        with handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        if path.stat().st_mode & 0o777 != 0o600:
+        if posix_path_modes_supported() and path.stat().st_mode & 0o777 != 0o600:
             os.chmod(path, 0o600)
     finally:
+        if fd >= 0:
+            os.close(fd)
         tmp.unlink(missing_ok=True)
 
 

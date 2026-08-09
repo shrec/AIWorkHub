@@ -116,7 +116,9 @@ def test_shadow_uses_sqlite_backup_api_with_active_wal_and_preserves_parity(tmp_
     finally:
         writer.close()
     assert result["cutover_performed"] is False
-    assert result["paths"]["canonical_db"].endswith(".aiworkhub/tasking/task_queue.sqlite")
+    assert result["paths"]["canonical_db"].replace("\\", "/").endswith(
+        ".aiworkhub/tasking/task_queue.sqlite"
+    )
     assert result["parity"]["ok"] is True
     assert result["parity"]["source"]["counts"]["task_events"] == 3
 

@@ -698,7 +698,10 @@ def main(argv: list[str] | None = None) -> int:
     receipt = str(result.pop("project_context_receipt", "") or "").strip()
     if receipt:
         print(receipt)
-    print(json.dumps(result, ensure_ascii=False))
+    # Keep the stdio protocol independent of the Windows console code page.
+    # A default cp1251/cp1252 stdout cannot encode otherwise-valid model text
+    # such as arrows or CJK characters, while JSON escapes round-trip exactly.
+    print(json.dumps(result, ensure_ascii=True))
     return 0
 
 

@@ -38,10 +38,13 @@ def repo(tmp_path: Path) -> Path:
     assert _git(root, "config", "user.name", "Task MCP Tests").returncode == 0
     (root / "read").mkdir()
     (root / "out").mkdir()
-    (root / "read" / "input.txt").write_text("input-v1\n", encoding="utf-8")
-    (root / "out" / "result.txt").write_text("result-v1\n", encoding="utf-8")
-    (root / "AGENTS.md").write_text("agents-v1\n", encoding="utf-8")
-    (root / "parent-secret.txt").write_text("secret\n", encoding="utf-8")
+    # These bytes participate in Git/tree and workspace-baseline hashes.  Use
+    # byte-exact writes so Windows newline translation cannot change the
+    # checked-out worktree relative to the fixture's parent tree.
+    (root / "read" / "input.txt").write_bytes(b"input-v1\n")
+    (root / "out" / "result.txt").write_bytes(b"result-v1\n")
+    (root / "AGENTS.md").write_bytes(b"agents-v1\n")
+    (root / "parent-secret.txt").write_bytes(b"secret\n")
     assert (
         _git(
             root,
@@ -109,7 +112,7 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
     successor = None
     try:
         candidate = predecessor.path / "out" / "result.txt"
-        candidate.write_text("reviewed candidate\n", encoding="utf-8")
+        candidate.write_bytes(b"reviewed candidate\n")
         candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
         successor = worker_workspace.create_workspace(
             repo,
@@ -142,7 +145,7 @@ def test_rework_workspace_materializes_hash_pinned_predecessor_baseline(
             "reviewed candidate\n"
         )
 
-        successor_output.write_text("reworked candidate\n", encoding="utf-8")
+        successor_output.write_bytes(b"reworked candidate\n")
         assert worker_workspace.enforce_scope(successor) == ["out/result.txt"]
     finally:
         if successor is not None:
@@ -170,7 +173,7 @@ def test_validate_required_outputs_replay_authorization_permits_hash_pinned_unch
         candidate = predecessor.path / "out" / "result.txt"
         # Byte-identical to the canonical repo: no real delta to promote, so
         # the ordinary inherited-change carve-out (B561) never applies here.
-        candidate.write_text("result-v1\n", encoding="utf-8")
+        candidate.write_bytes(b"result-v1\n")
         candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
         successor = worker_workspace.create_workspace(
             repo,
@@ -563,6 +566,7 @@ print('landlock-root-file-bounded')
 def test_secure_sandbox_selection_fails_closed_without_bwrap_or_landlock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: False)
     monkeypatch.setenv(worker_workspace.SANDBOX_BACKEND_ENV, "auto")
     monkeypatch.setattr(worker_workspace, "_bubblewrap_usable", lambda _path: False)
     monkeypatch.setattr(worker_workspace, "landlock_abi_version", lambda: 0)
@@ -842,7 +846,7 @@ def test_promotion_includes_validated_required_output_not_in_changed_paths(
     try:
         (workspace.path / "out").mkdir(parents=True, exist_ok=True)
         (workspace.path / "out" / "data.bin").write_bytes(b"\x01\x02\x03\x04\x05\x06\x07\x08")
-        (workspace.path / "out" / "result.txt").write_text("worker-result\n", encoding="utf-8")
+        (workspace.path / "out" / "result.txt").write_bytes(b"worker-result\n")
 
         changed = worker_workspace.enforce_scope(workspace)
         assert "out/data.bin" not in changed  # gitignored
@@ -1061,6 +1065,18 @@ def test_validation_pythonpath_prefix_is_removed_from_executable_argv() -> None:
     assert worker_workspace.validation_argv("python3 AITools/taskctl.py verify") == [
         "python3", "AITools/taskctl.py", "verify"
     ]
+
+
+def test_windows_validation_tokenizer_preserves_native_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_workspace, "_is_windows_host", lambda: True)
+    assert worker_workspace.validation_argv(
+        r'"C:\Program Files\Python\python.exe" verify_route.py'
+    ) == [r"C:\Program Files\Python\python.exe", "verify_route.py"]
+    assert worker_workspace.validation_argv(
+        r"C:\Python312\python.exe verify_route.py"
+    ) == [r"C:\Python312\python.exe", "verify_route.py"]
 
 
 @pytest.mark.parametrize(
@@ -1564,6 +1580,7 @@ def test_run_validations_declared_vs_executed_relative_venv_receipt(
         worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX chmod metadata semantics")
 def test_probe_metadata_capable_dir_rejects_chmod_hostile_filesystem(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1585,9 +1602,11 @@ def test_windows_exec_probe_executes_private_native_copy(
 ) -> None:
     calls: list[tuple[list[str], dict[str, str]]] = []
     comspec = tmp_path / "cmd.exe"
-    comspec.write_bytes(b"fake portable executable")
+    executable_payload = b"fake\nportable\nexecutable"
+    comspec.write_bytes(executable_payload)
 
     def _run(argv, **kwargs):
+        assert Path(argv[0]).read_bytes() == executable_payload
         calls.append((list(argv), dict(kwargs["env"])))
         return subprocess.CompletedProcess(argv, 0)
 
@@ -1666,6 +1685,7 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
 ) -> None:
     """A /dev/shm-like root that execs but rejects chmod must be skipped in
     favour of the next chmod-capable candidate, never handed back."""
+    monkeypatch.setattr(worker_workspace.sys, "platform", "linux")
     hostile = tmp_path / "shm-like"
     portable = tmp_path / "tmp-like"
     hostile.mkdir()
@@ -1700,6 +1720,7 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
 def test_provision_validation_exec_scratch_fails_closed_without_metadata_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(worker_workspace.sys, "platform", "linux")
     only = tmp_path / "only"
     only.mkdir()
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
@@ -1724,7 +1745,7 @@ def test_provisioned_scratch_supports_git_init(
     repository write authority."""
     root = tmp_path / "scratch-root"
     root.mkdir()
-    monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, str(root))
     monkeypatch.setattr(worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (root,))
     # Exercise the real metadata probe; only the exec probe is stubbed so the
     # test does not depend on the exec-capability of the test filesystem.
@@ -1751,6 +1772,7 @@ class TestCopyOne:
         assert dst.read_bytes() == b"hello"
 
     @staticmethod
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode semantics")
     def test_executable_mode(tmp_path: Path) -> None:
         src = tmp_path / "src"
         src.write_bytes(b"#!/bin/sh\necho hi\n")

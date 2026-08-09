@@ -37,7 +37,7 @@ def _new_repo(tmp_path: Path, name: str = "repo") -> Path:
 
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_bytes(text.encode("utf-8"))
 
 
 def _sha256(text: str) -> str:
@@ -300,7 +300,7 @@ def test_index_file_preserves_unrelated_rows(tmp_path):
 
     # Re-index a.py with a modified version.
     source1b = "def first():\n    return 42\n"
-    (repo / "a.py").write_text(source1b, encoding="utf-8")
+    _write(repo / "a.py", source1b)
     sg.index_file(repo, "a.py", _sha256(source1b))
 
     conn = sg.connect(sg.resolve_db_path(repo))
@@ -388,7 +388,7 @@ def test_index_file_exactly_one_file_mutated(tmp_path):
 
     # Rewrite only b.py, assert only b.py changes.
     source_b2 = "def b():\n    return 'b-changed'\n"
-    (repo / "b.py").write_text(source_b2, encoding="utf-8")
+    _write(repo / "b.py", source_b2)
     sg.index_file(repo, "b.py", _sha256(source_b2))
 
     conn = sg.connect(sg.resolve_db_path(repo))

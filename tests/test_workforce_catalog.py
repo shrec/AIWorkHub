@@ -20,7 +20,10 @@ def test_catalog_atomic_write_skips_redundant_chmod_when_already_private(
     path, created = workforce_catalog.ensure_catalog(root)
 
     assert created is True
-    assert path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+    else:
+        assert path.is_file()
 
 
 def _root(tmp_path: Path) -> Path:

@@ -13,8 +13,8 @@ def test_collect_rehydrates_request_truth_after_bounded_gc_event(tmp_path: Path)
     stdout_path = process_dir / f"{request_id}.stdout.log"
     stderr_path = process_dir / f"{request_id}.stderr.log"
     metadata_path = process_dir / f"{request_id}.request.json"
-    stdout_path.write_text("exact provider error\n", encoding="utf-8")
-    stderr_path.write_text("exact stderr\n", encoding="utf-8")
+    stdout_path.write_bytes(b"exact provider error\n")
+    stderr_path.write_bytes(b"exact stderr\n")
     metadata_path.write_text("{}", encoding="utf-8")
     manager = ProcessManager(
         repo=tmp_path,

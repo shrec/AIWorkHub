@@ -9,6 +9,12 @@ from aiworkhub import worker_workspace
 from aiworkhub.worker_workspace import WorkspaceError
 
 
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="requires POSIX Landlock/seccomp sandbox semantics",
+)
+
+
 def _workspace(tmp_path: Path) -> worker_workspace.WorkerWorkspace:
     worktree = tmp_path / "worktree"
     home = tmp_path / "home"

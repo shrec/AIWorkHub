@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -13,7 +15,7 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     candidate.mkdir()
     path = candidate / "result.py"
-    path.write_text("answer = 42\n", encoding="utf-8")
+    path.write_bytes(b"answer = 42\n")
     path.chmod(0o644)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     report = evidence.review_evidence_audit(
@@ -25,6 +27,7 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
     )
     assert report["status"] == "pass"
     assert report["required_outputs_verified"] == 1
+    actual_mode = stat.S_IMODE(path.stat().st_mode)
     manifest_token = evidence.review_evidence_audit(
         tmp_path,
         candidate,
@@ -32,34 +35,36 @@ def test_review_evidence_audit_recomputes_hash_and_size(tmp_path: Path) -> None:
         stored_hashes={"result.py": digest},
         required_outputs=[{
             "path": "result.py",
-            "sha256": f"file:644:{digest}",
+            "sha256": f"file:{actual_mode:o}:{digest}",
             "bytes": 12,
         }],
     )
     assert manifest_token["status"] == "pass"
-    path.chmod(0o4755)
-    executable_token = evidence.review_evidence_audit(
-        tmp_path,
-        candidate,
-        changed_paths=["result.py"],
-        stored_hashes={"result.py": digest},
-        required_outputs=[{
-            "path": "result.py",
-            "sha256": f"file:4755:{digest}",
-            "bytes": 12,
-        }],
-    )
-    assert executable_token["status"] == "pass"
+    if os.name != "nt":
+        path.chmod(0o4755)
+        executable_token = evidence.review_evidence_audit(
+            tmp_path,
+            candidate,
+            changed_paths=["result.py"],
+            stored_hashes={"result.py": digest},
+            required_outputs=[{
+                "path": "result.py",
+                "sha256": f"file:4755:{digest}",
+                "bytes": 12,
+            }],
+        )
+        assert executable_token["status"] == "pass"
     path.chmod(0o644)
+    actual_mode = stat.S_IMODE(path.stat().st_mode)
     malformed_values = (
-        f"file:644:{digest[:-1]}",
-        f"file:644:{'0' * 64}",
-        f"file:755:{digest}",
+        f"file:{actual_mode:o}:{digest[:-1]}",
+        f"file:{actual_mode:o}:{'0' * 64}",
+        f"file:{actual_mode ^ 0o100:o}:{digest}",
         f"file:xyz:{digest}",
         f"file:888:{digest}",
-        f"file:644:extra:{digest}",
-        f"file:644:{digest.upper()}",
-        f" file:644:{digest}",
+        f"file:{actual_mode:o}:extra:{digest}",
+        f"file:{actual_mode:o}:{digest.upper()}",
+        f" file:{actual_mode:o}:{digest}",
     )
     for malformed in malformed_values:
         malformed_token = evidence.review_evidence_audit(

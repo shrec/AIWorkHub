@@ -280,6 +280,7 @@ def test_main_unbound_app_server_starts_deferred_mux_without_sideband_authority(
 
 def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    monkeypatch.delenv(asm.ENV_EXTENSION_HOST_PID, raising=False)
     monkeypatch.setenv(asm.ENV_ROUTE_WAIT_SECONDS, "1")
     attempts = {"count": 0}
 
@@ -307,6 +308,7 @@ def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkey
 
 def test_resolve_repo_id_for_mux_uses_exact_parent_extension_host_route(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    monkeypatch.delenv(asm.ENV_EXTENSION_HOST_PID, raising=False)
     monkeypatch.setattr(asm.os, "getppid", lambda: 4242)
     monkeypatch.setattr(
         asm.shared_router,
@@ -337,6 +339,7 @@ def test_resolve_repo_id_for_mux_uses_exact_parent_extension_host_route(monkeypa
 
 def test_resolve_repo_id_for_mux_fails_closed_on_ambiguous_parent(monkeypatch):
     monkeypatch.delenv(asm.ENV_REPO_ID, raising=False)
+    monkeypatch.delenv(asm.ENV_EXTENSION_HOST_PID, raising=False)
     monkeypatch.setattr(asm.os, "getppid", lambda: 4242)
     monkeypatch.setattr(
         asm.shared_router,
