@@ -3728,7 +3728,11 @@ def resolve_trusted_pytest_runtime_root() -> Path:
     # tree, and os.getuid() is unavailable there.
     if os.name != "nt" and info.st_uid != os.getuid():
         raise WorkspaceError(f"validation_pytest_runtime_untrusted_owner:{candidate}")
-    if stat.S_IMODE(info.st_mode) & 0o002:
+    # POSIX mode bits are only an authoritative world-writable determination
+    # on POSIX. On Windows st_mode carries no ACL information, so the 0o002
+    # bit there is meaningless and previously rejected every pytest
+    # validation with validation_pytest_runtime_world_writable.
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o002:
         raise WorkspaceError(f"validation_pytest_runtime_world_writable:{candidate}")
     package_init = candidate / "pytest" / "__init__.py"
     if package_init.is_symlink() or not package_init.is_file():

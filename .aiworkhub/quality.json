@@ -25,6 +25,8 @@
       "id": "python-critical-lint",
       "kind": "lint",
       "command": [
+        "{python}",
+        "-m",
         "ruff",
         "check",
         "src/aiworkhub",
@@ -44,6 +46,8 @@
       "id": "typed-kernel",
       "kind": "typecheck",
       "command": [
+        "{python}",
+        "-m",
         "mypy"
       ],
       "paths": ["src/aiworkhub/*.py", "src/aiworkhub/**/*.py"]
