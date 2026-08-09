@@ -461,23 +461,38 @@ function renderSummary(snapshot) {
     const errors = preflight ? asArray(preflight.errors) : [];
     const providers = preflight ? asArray(preflight.providers) : [];
     const readyProviders = providers.filter((item) => item && item.launchable).length;
+    const providerSummary = preflight && preflight.provider_summary
+      && typeof preflight.provider_summary === "object"
+      ? preflight.provider_summary
+      : {};
+    const unavailableRoutes = asArray(providerSummary.unavailable_routes).length
+      ? asArray(providerSummary.unavailable_routes)
+      : providers.filter((item) => item && !item.launchable);
+    const coverageStatus = String(providerSummary.coverage_status || (
+      readyProviders === 0 ? "blocked" : (readyProviders < providers.length ? "degraded" : "full")
+    ));
     const broker = providers.find((item) => item && item.adapter_id === "vscode_lm") || null;
     const brokerModels = broker ? asArray(broker.observed_models) : [];
     elements.headerPreflightValue.textContent = preflight
-      ? (preflight.ok ? "Ready" : "Blocked")
+      ? (!preflight.ok ? "Blocked" : (coverageStatus === "degraded" ? "Degraded" : "Ready"))
       : "Unavailable";
     elements.headerPreflightDetail.textContent = preflight
       ? (brokerModels.length
-        ? `${brokerModels.length} editor models · ${readyProviders}/${providers.length} routes · ${errors.length} blockers`
-        : `${readyProviders}/${providers.length} routes · ${errors.length} blockers`)
+        ? `${brokerModels.length} editor models · ${readyProviders}/${providers.length} secure routes · ${unavailableRoutes.length} unavailable`
+        : `${readyProviders}/${providers.length} secure routes · ${unavailableRoutes.length} unavailable`)
       : "No evidence";
     if (elements.headerPreflight) {
+      const unavailableDetail = unavailableRoutes
+        .map((item) => `${String((item && item.adapter_id) || "unknown")}: ${String((item && item.reason) || "unavailable")}`)
+        .join(" · ");
       elements.headerPreflight.title = preflight
         ? (errors.length
           ? errors.join(" · ")
-          : (broker && !broker.launchable
+          : (unavailableDetail
+            ? `Usable with reduced route coverage · ${unavailableDetail}`
+            : (broker && !broker.launchable
             ? `Core preflight passed; editor model broker ${broker.reason || "unavailable"}`
-            : "Repository, policy, runtime and editor model broker preflight passed"))
+            : "Repository, policy, runtime and editor model broker preflight passed")))
         : "Unified preflight unavailable";
     }
   }

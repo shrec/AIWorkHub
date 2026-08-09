@@ -94,6 +94,49 @@ def test_ready_vscode_lm_route_does_not_require_subprocess_sandbox(monkeypatch, 
     assert report["sandbox"]["backend"] == "vscode_lm_in_process"
     assert report["sandbox"]["native_cli_enforceable"] is False
     assert report["provider_summary"]["launchable_route_count"] >= 1
+    assert report["ok"] is True
+    assert report["status"] == "degraded"
+    assert report["provider_summary"]["coverage_status"] == "degraded"
+    assert report["provider_summary"]["unavailable_route_count"] >= 1
+    assert report["provider_summary"]["unavailable_routes"]
+    assert all(
+        item["adapter_id"] and item["status"] and item["reason"]
+        for item in report["provider_summary"]["unavailable_routes"]
+    )
+
+
+def test_zero_launchable_routes_is_a_global_preflight_blocker(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    _common(monkeypatch, graph=_ready_graph())
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(worker_workspace.WorkspaceError("unavailable")),
+    )
+    monkeypatch.setattr(
+        repo_policy.runtime_adapters,
+        "resolve_executable",
+        lambda adapter_id: runtime_adapters.ExecutableResolution(
+            adapter_id, "", False, "executable_absent"
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": False,
+            "blocker_reason": "bridge_unavailable",
+            "access_observed": False,
+        },
+    )
+
+    report = repo_policy.build_preflight(root)
+
+    assert report["ok"] is False
+    assert report["status"] == "blocked"
+    assert "no_launchable_provider_routes" in report["errors"]
+    assert report["provider_summary"]["coverage_status"] == "blocked"
+    assert report["provider_summary"]["launchable_route_count"] == 0
 
 
 def test_visible_vscode_lm_route_reports_consent_required_without_global_blocker(monkeypatch, tmp_path):

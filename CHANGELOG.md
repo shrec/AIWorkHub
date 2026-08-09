@@ -6,6 +6,28 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.34] - 2026-08-09
+
+### Fixed
+
+- Unified preflight now distinguishes usable-but-reduced provider coverage
+  from full readiness. A host with some unavailable routes reports
+  `status=degraded`, exposes the exact unavailable adapter reasons, and the
+  dashboard renders `Degraded` plus secure-route coverage instead of the
+  misleading `Ready · 0 blockers`. Zero launchable routes are now a global
+  preflight blocker.
+- Coordinator-authorized `validation_only_replay` accepts its truthful
+  `deterministic_validation` execution-lane receipt without comparing it to
+  the predecessor provider sandbox. The original adapter identity still
+  selects the validation safety boundary, no provider is relaunched, and the
+  exception remains forbidden for ordinary worker execution.
+
+### Tests
+
+- Added partial/zero route-coverage preflight regressions, dashboard truth
+  contract coverage, and positive/negative validation-only replay backend
+  identity tests.
+
 ## [0.9.33] - 2026-08-09
 
 ### Fixed

@@ -432,6 +432,14 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
     elif selected is not None and not selected["launchable"]:
         errors.append("selected_adapter_not_launchable")
     launchable_routes = [item for item in providers if item.get("launchable")]
+    unavailable_routes = [item for item in providers if not item.get("launchable")]
+    if not launchable_routes:
+        errors.append("no_launchable_provider_routes")
+    route_coverage_status = (
+        "blocked"
+        if not launchable_routes
+        else ("degraded" if unavailable_routes else "full")
+    )
     selected_route_backend = str((selected or {}).get("sandbox_backend") or "")
     route_enforceable = bool(
         selected_route_backend and (selected or {}).get("launchable")
@@ -460,11 +468,22 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
             "ok": False,
             "reason": f"workspace_hygiene_unavailable:{type(exc).__name__}",
         }
+    unique_errors = list(dict.fromkeys(errors))
+    warnings = (
+        ["provider_route_coverage_degraded"]
+        if route_coverage_status == "degraded"
+        else []
+    )
     return {
-        "ok": not errors,
+        "ok": not unique_errors,
         "schema_id": PREFLIGHT_SCHEMA_ID,
-        "status": "ready" if not errors else "blocked",
-        "errors": list(dict.fromkeys(errors)),
+        "status": (
+            "blocked"
+            if unique_errors
+            else ("degraded" if route_coverage_status == "degraded" else "ready")
+        ),
+        "errors": unique_errors,
+        "warnings": warnings,
         "repository": {
             "ready": bool(readiness.ready),
             "reason": str(readiness.reason)[:200],
@@ -537,7 +556,20 @@ def build_preflight(repo_root: Path | str, adapter_id: str | None = None) -> dic
         "provider_summary": {
             "route_count": len(providers),
             "launchable_route_count": len(launchable_routes),
-            "unavailable_route_count": len(providers) - len(launchable_routes),
+            "unavailable_route_count": len(unavailable_routes),
+            "coverage_status": route_coverage_status,
+            "coverage_ratio": (
+                round(len(launchable_routes) / len(providers), 6) if providers else 0.0
+            ),
+            "unavailable_routes": [
+                {
+                    "adapter_id": str(item.get("adapter_id") or "")[:128],
+                    "status": str(item.get("status") or "unavailable")[:128],
+                    "reason": str(item.get("reason") or "unavailable")[:200],
+                    "sandbox_backend": str(item.get("sandbox_backend") or "")[:128],
+                }
+                for item in unavailable_routes
+            ],
         },
         "selected_adapter": selected,
     }

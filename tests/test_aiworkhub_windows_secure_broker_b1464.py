@@ -143,6 +143,44 @@ def test_finalizer_rejects_recorded_backend_drift() -> None:
         })
 
 
+def test_validation_only_replay_accepts_deterministic_lane_without_provider_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        process_launcher,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable"
+            )
+        ),
+    )
+
+    route = process_launcher._validation_route_kwargs({
+        "adapter_id": "vscode_lm",
+        "sandbox_backend": "deterministic_validation",
+        "execution_mode": "validation_only_replay",
+        "provider_launched": False,
+    })
+
+    assert route == {
+        "backend": "vscode_lm_in_process",
+        "adapter_id": "vscode_lm",
+    }
+
+
+def test_deterministic_lane_is_forbidden_outside_validation_only_replay() -> None:
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="validation_route_backend_mismatch",
+    ):
+        process_launcher._validation_route_kwargs({
+            "adapter_id": "vscode_lm",
+            "sandbox_backend": "deterministic_validation",
+            "execution_mode": "provider_worker",
+        })
+
+
 def test_windows_native_cli_plan_requires_appcontainer_grade_boundary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -290,13 +290,23 @@ def _validation_route_kwargs(metadata: Mapping[str, Any]) -> dict[str, str]:
 
     Finalization must not rediscover a host-native sandbox for an editor-hosted
     worker.  Conversely, a forged/stale metadata backend must never let a
-    native CLI route borrow the in-process boundary.
+    native CLI route borrow the in-process boundary.  A coordinator-authorized
+    validation-only replay records ``deterministic_validation`` as its
+    execution lane because no provider was launched.  That value is not a
+    provider sandbox and must not be compared to the original adapter backend;
+    the adapter identity still selects the validation safety boundary.
     """
     adapter_id = str(metadata.get("adapter_id") or "").strip()
     if not adapter_id:
         raise WorkspaceError("validation_route_adapter_missing")
     expected_backend = _sandbox_backend_for_adapter(adapter_id)
     recorded_backend = str(metadata.get("sandbox_backend") or "").strip()
+    execution_mode = str(metadata.get("execution_mode") or "").strip()
+    if (
+        execution_mode == "validation_only_replay"
+        and recorded_backend == "deterministic_validation"
+    ):
+        return {"backend": expected_backend, "adapter_id": adapter_id}
     if recorded_backend and recorded_backend != expected_backend:
         raise WorkspaceError(
             "validation_route_backend_mismatch:"
