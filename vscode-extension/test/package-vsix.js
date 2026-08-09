@@ -3,11 +3,9 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
-const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const dist = path.join(root, "dist");
 const staging = path.join(dist, "vsix-staging");
 const extensionDir = path.join(staging, "extension");
-const out = path.join(dist, `${pkg.name}-${pkg.version}.vsix`);
 
 // Canonical, single source of truth for the bundled Python MCP runtime: the
 // same src/aiworkhub package this repo tests/ships everywhere else. Copied
@@ -28,6 +26,273 @@ const NATIVE_LAUNCHER_SRC = path.join(root, "native-launcher", "main.go");
 // and its data assets (e.g. dashboard_static/*.css/.js/.html).
 const PY_RUNTIME_SKIP_DIRS = new Set(["__pycache__", ".pytest_cache"]);
 const PY_RUNTIME_SKIP_FILE_SUFFIXES = [".pyc", ".pyo", ".DS_Store"];
+const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
+const PACKAGE_JSON_READ_CHUNK_BYTES = 64 * 1024;
+const RELEASE_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+const PYTHON_VERSION_LITERAL = /^__version__\s*=\s*["']([^"']+)["']\s*$/gm;
+const EXTENSION_VERSION_LITERAL = /^const EXPECTED_MCP_PACKAGE_VERSION\s*=\s*["']([^"']+)["'];\s*$/gm;
+
+function readVersionLiteral(filePath, sourceName, pattern) {
+  const source = fs.readFileSync(filePath, "utf8");
+  const matches = Array.from(source.matchAll(pattern));
+  if (matches.length !== 1) {
+    throw new Error(`Release version consistency check failed: ${sourceName} must contain exactly one version literal`);
+  }
+  const version = matches[0][1];
+  if (!RELEASE_VERSION.test(version)) {
+    throw new Error(`Release version consistency check failed: ${sourceName} has invalid version ${JSON.stringify(version)}`);
+  }
+  return version;
+}
+
+function statValue(stat, field) {
+  return stat[field] === undefined ? "unavailable" : String(stat[field]);
+}
+
+function sameFileIdentity(left, right) {
+  const leftDevice = statValue(left, "dev");
+  const rightDevice = statValue(right, "dev");
+  const deviceMatches = leftDevice === rightDevice || leftDevice === "0" || rightDevice === "0";
+  return deviceMatches && statValue(left, "ino") === statValue(right, "ino");
+}
+
+function snapshotChanged(left, right) {
+  return !sameFileIdentity(left, right)
+    || statValue(left, "size") !== statValue(right, "size")
+    || statValue(left, "mtimeNs") !== statValue(right, "mtimeNs")
+    || statValue(left, "ctimeNs") !== statValue(right, "ctimeNs");
+}
+
+function readStableBoundedTextFile(filePath, sourceName, fileOps = fs) {
+  let descriptor;
+  try {
+    const pathBefore = fileOps.lstatSync(filePath, { bigint: true });
+    if (pathBefore.isSymbolicLink() || !pathBefore.isFile()) {
+      throw new Error(
+        `Release version consistency check failed: ${sourceName} must be a non-symlink regular file`,
+      );
+    }
+    const noFollow = typeof fileOps.constants.O_NOFOLLOW === "number"
+      ? fileOps.constants.O_NOFOLLOW
+      : 0;
+    descriptor = fileOps.openSync(filePath, fileOps.constants.O_RDONLY | noFollow);
+    const descriptorBefore = fileOps.fstatSync(descriptor, { bigint: true });
+    if (!descriptorBefore.isFile()) {
+      throw new Error(`Release version consistency check failed: ${sourceName} descriptor is not a regular file`);
+    }
+    if (!sameFileIdentity(pathBefore, descriptorBefore)) {
+      throw new Error(`Release version consistency check failed: ${sourceName} changed while being opened`);
+    }
+    if (BigInt(descriptorBefore.size) > BigInt(MAX_PACKAGE_JSON_BYTES)) {
+      throw new Error(
+        `Release version consistency check failed: ${sourceName} exceeds ${MAX_PACKAGE_JSON_BYTES} bytes; `
+        + `actual size=${descriptorBefore.size}`,
+      );
+    }
+
+    const buffer = Buffer.allocUnsafe(MAX_PACKAGE_JSON_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const requested = Math.min(PACKAGE_JSON_READ_CHUNK_BYTES, buffer.length - total);
+      const read = fileOps.readSync(descriptor, buffer, total, requested, total);
+      if (read === 0) break;
+      if (!Number.isSafeInteger(read) || read < 0 || read > requested) {
+        throw new Error(`Release version consistency check failed: ${sourceName} returned an invalid read length`);
+      }
+      total += read;
+    }
+
+    const descriptorAfter = fileOps.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fileOps.lstatSync(filePath, { bigint: true });
+    if (pathAfter.isSymbolicLink() || !pathAfter.isFile()) {
+      throw new Error(`Release version consistency check failed: ${sourceName} path was replaced while being read`);
+    }
+    if (snapshotChanged(descriptorBefore, descriptorAfter)) {
+      throw new Error(`Release version consistency check failed: ${sourceName} descriptor changed while being read`);
+    }
+    if (snapshotChanged(descriptorAfter, pathAfter)) {
+      throw new Error(`Release version consistency check failed: ${sourceName} path identity changed while being read`);
+    }
+    if (total > MAX_PACKAGE_JSON_BYTES) {
+      throw new Error(
+        `Release version consistency check failed: ${sourceName} exceeds ${MAX_PACKAGE_JSON_BYTES} bytes while being read`,
+      );
+    }
+    if (BigInt(total) !== BigInt(descriptorAfter.size)) {
+      throw new Error(
+        `Release version consistency check failed: ${sourceName} read size ${total} does not match `
+        + `descriptor size ${descriptorAfter.size}`,
+      );
+    }
+    return buffer.subarray(0, total).toString("utf8");
+  } finally {
+    if (descriptor !== undefined) fileOps.closeSync(descriptor);
+  }
+}
+
+function skipJsonWhitespace(source, start) {
+  let index = start;
+  while (index < source.length && /[\t\n\r ]/.test(source[index])) index += 1;
+  return index;
+}
+
+function jsonStringEnd(source, start, sourceName) {
+  if (source[start] !== '"') {
+    throw new Error(`Release version consistency check failed: ${sourceName} contains an invalid object key`);
+  }
+  for (let index = start + 1; index < source.length; index += 1) {
+    if (source[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (source[index] === '"') return index + 1;
+  }
+  throw new Error(`Release version consistency check failed: ${sourceName} contains an unterminated object key`);
+}
+
+function topLevelJsonMemberNames(source, sourceName) {
+  if (Buffer.byteLength(source, "utf8") > MAX_PACKAGE_JSON_BYTES) {
+    throw new Error(
+      `Release version consistency check failed: ${sourceName} exceeds ${MAX_PACKAGE_JSON_BYTES} bytes`,
+    );
+  }
+  const parsed = JSON.parse(source);
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+    const actualType = parsed === null ? "null" : (Array.isArray(parsed) ? "array" : typeof parsed);
+    throw new Error(
+      `Release version consistency check failed: ${sourceName} root must be an object; actual type=${actualType}`,
+    );
+  }
+
+  const names = [];
+  let index = skipJsonWhitespace(source, 0);
+  if (source[index] !== "{") {
+    throw new Error(`Release version consistency check failed: ${sourceName} root must be an object`);
+  }
+  index += 1;
+  while (index < source.length) {
+    index = skipJsonWhitespace(source, index);
+    if (source[index] === "}") return { names, parsed };
+    const keyEnd = jsonStringEnd(source, index, sourceName);
+    names.push(JSON.parse(source.slice(index, keyEnd)));
+    index = skipJsonWhitespace(source, keyEnd);
+    if (source[index] !== ":") {
+      throw new Error(`Release version consistency check failed: ${sourceName} contains an invalid object member`);
+    }
+    index += 1;
+
+    let nestedDepth = 0;
+    while (index < source.length) {
+      const token = source[index];
+      if (token === '"') {
+        index = jsonStringEnd(source, index, sourceName);
+        continue;
+      }
+      if (token === "{" || token === "[") {
+        nestedDepth += 1;
+      } else if (token === "}" && nestedDepth === 0) {
+        return { names, parsed };
+      } else if (token === "}" || token === "]") {
+        nestedDepth -= 1;
+      } else if (token === "," && nestedDepth === 0) {
+        index += 1;
+        break;
+      }
+      index += 1;
+    }
+  }
+  throw new Error(`Release version consistency check failed: ${sourceName} has no closing object delimiter`);
+}
+
+function readReleaseVersions(repositoryRoot, { packageFileOps = fs } = {}) {
+  const canonicalSource = "src/aiworkhub/_version.py";
+  const packageSource = "vscode-extension/package.json";
+  const extensionSource = "vscode-extension/extension.js EXPECTED_MCP_PACKAGE_VERSION";
+  const canonicalVersion = readVersionLiteral(
+    path.join(repositoryRoot, "src", "aiworkhub", "_version.py"),
+    canonicalSource,
+    PYTHON_VERSION_LITERAL,
+  );
+  const packagePath = path.join(repositoryRoot, "vscode-extension", "package.json");
+  const packageSourceText = readStableBoundedTextFile(packagePath, packageSource, packageFileOps);
+  const { names: packageMemberNames, parsed: packageJson } = topLevelJsonMemberNames(
+    packageSourceText,
+    packageSource,
+  );
+  const versionMemberCount = packageMemberNames.filter((name) => name === "version").length;
+  if (versionMemberCount === 0) {
+    throw new Error(
+      `Release version consistency check failed: ${packageSource} version must be a primitive string `
+      + "and appear exactly once as a top-level member; actual type=undefined value=missing; "
+      + "actual top-level member count=0",
+    );
+  }
+  if (versionMemberCount !== 1) {
+    throw new Error(
+      `Release version consistency check failed: ${packageSource} must contain exactly one top-level version member; `
+      + `actual count=${versionMemberCount}`,
+    );
+  }
+  const packageVersion = packageJson.version;
+  if (typeof packageVersion !== "string") {
+    const actualType = packageVersion === null
+      ? "null"
+      : (Array.isArray(packageVersion) ? "array" : typeof packageVersion);
+    const actualValue = packageVersion === undefined ? "missing" : JSON.stringify(packageVersion);
+    throw new Error(
+      `Release version consistency check failed: ${packageSource} version must be a primitive string; `
+      + `actual type=${actualType} value=${actualValue}`,
+    );
+  }
+  if (!RELEASE_VERSION.test(packageVersion)) {
+    throw new Error(
+      `Release version consistency check failed: ${packageSource} has invalid version ${JSON.stringify(packageVersion)}`,
+    );
+  }
+  const extensionVersion = readVersionLiteral(
+    path.join(repositoryRoot, "vscode-extension", "extension.js"),
+    extensionSource,
+    EXTENSION_VERSION_LITERAL,
+  );
+  return {
+    canonicalSource,
+    canonicalVersion,
+    packageSnapshot: {
+      json: packageJson,
+      source: packageSourceText,
+    },
+    projections: {
+      [packageSource]: packageVersion,
+      [extensionSource]: extensionVersion,
+    },
+  };
+}
+
+function assertReleaseVersionConsistency(
+  repositoryRoot = path.resolve(root, ".."),
+  options = {},
+) {
+  const versions = readReleaseVersions(repositoryRoot, options);
+  const mismatches = Object.entries(versions.projections)
+    .filter(([, actual]) => actual !== versions.canonicalVersion);
+  if (mismatches.length > 0) {
+    const actuals = mismatches.map(([source, actual]) => `${source}=${actual}`).join(", ");
+    throw new Error(
+      `Release version consistency check failed: expected ${versions.canonicalSource}=${versions.canonicalVersion}; actual ${actuals}`,
+    );
+  }
+  return versions;
+}
+
+function packageWithVersionGate({
+  repositoryRoot = path.resolve(root, ".."),
+  packageAction = buildVsix,
+  packageFileOps = fs,
+} = {}) {
+  const versions = assertReleaseVersionConsistency(repositoryRoot, { packageFileOps });
+  const result = packageAction(versions.packageSnapshot);
+  return { versions, result };
+}
 
 // VSIX is a regular ZIP container.  Build it with Node primitives so a clean
 // Windows host does not need a separately-installed `zip` executable.  Stored
@@ -115,9 +380,13 @@ function writePortableZip(sourceDirectory, destination) {
   fs.writeFileSync(destination, Buffer.concat([...localParts, ...centralParts, end]));
 }
 
-function copyFile(rel) {
+function copyFile(rel, packageSourceText) {
   const target = path.join(extensionDir, rel);
   fs.mkdirSync(path.dirname(target), { recursive: true });
+  if (rel === "package.json") {
+    fs.writeFileSync(target, packageSourceText, "utf8");
+    return;
+  }
   // README.md is the one bundled asset that lives one directory up (this
   // extension shares this repo's top-level README.md as its packaged
   // description rather than duplicating a second copy inside
@@ -141,6 +410,9 @@ function copyPythonRuntime(srcDir, destDir) {
   }
 }
 
+function buildVsix(packageSnapshot) {
+const pkg = packageSnapshot.json;
+const out = path.join(dist, `${pkg.name}-${pkg.version}.vsix`);
 fs.rmSync(staging, { recursive: true, force: true });
 fs.rmSync(out, { force: true });
 fs.mkdirSync(extensionDir, { recursive: true });
@@ -163,7 +435,7 @@ for (const rel of [
   "media/aiworkhub-hero.svg",
   "media/aiworkhub-hero.png",
 ]) {
-  copyFile(rel);
+  copyFile(rel, packageSnapshot.source);
 }
 
 if (!fs.existsSync(path.join(PY_RUNTIME_SRC, "__init__.py"))) {
@@ -264,3 +536,17 @@ fs.writeFileSync(path.join(staging, "[Content_Types].xml"), contentTypes, "utf8"
 writePortableZip(staging, out);
 fs.rmSync(staging, { recursive: true, force: true });
 console.log(out);
+return out;
+}
+
+if (require.main === module) {
+  packageWithVersionGate();
+}
+
+module.exports = {
+  MAX_PACKAGE_JSON_BYTES,
+  PACKAGE_JSON_READ_CHUNK_BYTES,
+  assertReleaseVersionConsistency,
+  packageWithVersionGate,
+  readStableBoundedTextFile,
+};
