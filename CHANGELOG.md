@@ -6,6 +6,30 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.28] - 2026-08-09
+
+### Fixed
+
+- `allow_unchanged_required_outputs` now means an output may remain identical;
+  a valid changed output is no longer rejected merely because the same path is
+  also permitted to remain unchanged.
+- Isolated-workspace seed copying now uses descriptor-bound, no-follow source
+  verification and atomic destination replacement, preserving file modes while
+  rejecting symlink/non-regular races.
+- VS Code LM semantic edits now reject known placeholder, omission and TODO
+  payloads plus punctuation-only destructive shrink before any mutation across
+  V1 files, V2 replacements/creates and V3 ranges/creates. Valid concise code,
+  generics, comparisons, JSX/XML, prose ellipses and explicit V3 deletion remain
+  supported.
+
+### Tests
+
+- Added exact allow-unchanged contract and descriptor-safe seed-copy regression
+  coverage; the focused NF96/NF98 suite passes with 94 tests.
+- Added historical placeholder, false-positive, V1/V2/V3 integration and
+  no-partial-write fidelity regressions; the focused VS Code LM suite passes
+  with 97 tests.
+
 ## [0.9.27] - 2026-08-08
 
 ### Fixed
