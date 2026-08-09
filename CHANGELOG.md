@@ -6,6 +6,31 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.38] - 2026-08-09
+
+### Fixed
+
+- Blocked-rework recovery now has an explicit coordinator-only clean-root
+  path when retention has already removed the exact predecessor workspace.
+  The recovery preserves the predecessor request identity, changed-path
+  hashes, feedback and audit history while removing only the stale workspace
+  materialization authority.
+- Clean-root recovery fails closed when the predecessor workspace still
+  exists, repository/request identity is inconsistent, paths or hashes are
+  malformed, or validation-only replay is requested. Exact replay continues
+  to require the original retained bytes.
+- A task already returned to `pending` by ordinary recovery can receive the
+  same one-episode clean-root authorization without creating a replacement
+  task or duplicating the earlier recovery event.
+- The product roadmap now contains a current `0.9.37` evidence checkpoint that
+  separates five real pending foundations from 79 historical lifecycle
+  attempts and records the current Windows/Source Graph qualification gates.
+
+### Tests
+
+- Added missing-predecessor, already-recovered and validation-only replay
+  regressions. Full Python qualification passes 2,641 tests with 28 skipped.
+
 ## [0.9.37] - 2026-08-09
 
 ### Fixed

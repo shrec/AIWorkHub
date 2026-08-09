@@ -1064,6 +1064,7 @@ def aiworkhub_task_recover_blocked_rework(
     task_id: str,
     feedback_reason: str = "",
     validation_only_replay: bool = False,
+    clean_root_if_predecessor_missing: bool = False,
 ) -> dict[str, Any]:
     """Recover one exact blocked task through the canonical transaction."""
 
@@ -1071,6 +1072,9 @@ def aiworkhub_task_recover_blocked_rework(
         task_id,
         feedback_reason=feedback_reason,
         validation_only_replay=bool(validation_only_replay),
+        clean_root_if_predecessor_missing=bool(
+            clean_root_if_predecessor_missing
+        ),
     )
 
 @mcp.tool()

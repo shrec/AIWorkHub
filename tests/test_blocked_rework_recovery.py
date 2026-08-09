@@ -212,6 +212,123 @@ def test_recover_blocked_worker_failed_with_feedback_requeues_to_pending(
     assert _get_card(repo, "BLOCKED_WORKER_FAIL")["status"] == "pending"
 
 
+def _missing_rework_predecessor(repo: Path, tmp_path: Path) -> dict:
+    request_id = "a" * 32
+    return {
+        "request_id": request_id,
+        "changed_path_hashes": {"src/aiworkhub/task_store.py": "b" * 64},
+        "workspace": {
+            "request_id": request_id,
+            "repo": str(repo),
+            "path": str((tmp_path / "removed-worktree").resolve()),
+            "home": str((tmp_path / "removed-home").resolve()),
+            "allowed_writes": ["src/aiworkhub/task_store.py"],
+        },
+    }
+
+
+def test_recover_missing_predecessor_can_explicitly_use_clean_root(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "CLEAN_ROOT_MISSING_PREDECESSOR",
+        terminal_substatus="validation_failed",
+        reject_review_reason="Reconstruct the bounded candidate on current HEAD",
+        extra_card={
+            "rework_predecessor": _missing_rework_predecessor(repo, tmp_path),
+        },
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "CLEAN_ROOT_MISSING_PREDECESSOR",
+        actor="coordinator",
+        feedback_reason="Reconstruct the bounded candidate on current HEAD",
+        clean_root_if_predecessor_missing=True,
+    )
+
+    assert (ok, state) == (True, "recovered")
+    task = _get_card(repo, "CLEAN_ROOT_MISSING_PREDECESSOR")
+    assert "rework_predecessor" not in task
+    assert task["recovery_mode"] == "clean_root_missing_predecessor"
+    authorization = task["clean_root_recovery_authorization"]
+    assert authorization["predecessor_request_id"] == "a" * 32
+    assert authorization["changed_path_hashes"] == {
+        "src/aiworkhub/task_store.py": "b" * 64
+    }
+    events = task_store.get_task_events(repo, "CLEAN_ROOT_MISSING_PREDECESSOR")
+    assert "blocked_rework_recovery" in {event["event"] for event in events}
+
+
+def test_already_recovered_missing_predecessor_can_be_clean_root_authorized(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "CLEAN_ROOT_AFTER_RECOVERY",
+        terminal_substatus="validation_failed",
+        reject_review_reason="Reconstruct on current HEAD",
+        extra_card={
+            "rework_predecessor": _missing_rework_predecessor(repo, tmp_path),
+        },
+    )
+    assert task_store.recover_blocked_rework(
+        repo,
+        "CLEAN_ROOT_AFTER_RECOVERY",
+        actor="coordinator",
+        feedback_reason="Reconstruct on current HEAD",
+    ) == (True, "recovered")
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "CLEAN_ROOT_AFTER_RECOVERY",
+        actor="coordinator",
+        feedback_reason="Reconstruct on current HEAD",
+        clean_root_if_predecessor_missing=True,
+    )
+
+    assert (ok, state) == (True, "recovered_clean_root")
+    task = _get_card(repo, "CLEAN_ROOT_AFTER_RECOVERY")
+    assert "rework_predecessor" not in task
+    assert task["recovery_mode"] == "clean_root_missing_predecessor"
+    events = task_store.get_task_events(repo, "CLEAN_ROOT_AFTER_RECOVERY")
+    assert "blocked_rework_clean_root_authorized" in {
+        event["event"] for event in events
+    }
+
+
+def test_clean_root_recovery_is_incompatible_with_validation_only_replay(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "CLEAN_ROOT_REPLAY_FORBIDDEN",
+        terminal_substatus="validation_failed",
+        reject_review_reason="Replay exact retained bytes",
+        extra_card={
+            "rework_predecessor": _missing_rework_predecessor(repo, tmp_path),
+        },
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "CLEAN_ROOT_REPLAY_FORBIDDEN",
+        actor="coordinator",
+        feedback_reason="Replay exact retained bytes",
+        validation_only_replay=True,
+        clean_root_if_predecessor_missing=True,
+    )
+
+    assert (ok, state) == (
+        False,
+        "clean_root_incompatible_with_validation_only_replay",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Idempotent retry
 # ---------------------------------------------------------------------------

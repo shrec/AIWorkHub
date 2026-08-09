@@ -17,6 +17,54 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
+## Current delivery checkpoint (0.9.37, 2026-08-09)
+
+This checkpoint is the current operational snapshot; the older baseline below
+remains useful history. It does not promote an unchecked roadmap item to
+shipped status.
+
+- Release `v0.9.37` is published from commit `b0f1482`. Local qualification
+  completed with 2,638 Python tests passed (28 skipped), all 30 extension test
+  files passed apart from one explicitly native-Windows-only skip, and the
+  packaged release/CI matrix is green.
+- The canonical queue is operationally clean: no running process, review item,
+  operational failure, stale-processing row or orphaned processing task was
+  present at this checkpoint.
+- The Plan DAG contains 216 cards: 132 terminal and 84 reported actionable.
+  Seventy-nine of the 84 are historical lifecycle-blocked attempts/canaries
+  that require audited reconciliation or supersession, not blind relaunch.
+  The five current pending foundation cards are:
+  - common evidence-level contract;
+  - common-evidence-dependent meaningful-output contract;
+  - common-evidence-dependent graph-scoped audit packet;
+  - common-evidence-dependent manager-gated Learning Commit contract;
+  - NeedFix Markdown intake with preview and deterministic deduplication.
+- The common evidence-level contract remains the real critical-path
+  predecessor. Its canonical module and focused tests are not present in HEAD;
+  the three dependent contracts must not be called delivered until that
+  predecessor is implemented, independently reviewed and accepted.
+- NeedFix contains 101 durable records: 22 resolved, 1 duplicate, 57 captured,
+  4 triaged, 14 accepted and 3 linked to created tasks. Captured ideas are not
+  accepted roadmap commitments, and accepted findings are not resolved fixes.
+- Windows packaged-runtime qualification remains the immediate platform gate.
+  The `v0.9.37` dashboard now reports failed repair attempts truthfully, and
+  the shared event-ledger lock fallback is implemented, but live confirmation
+  is still required for finalization recovery and validation-only replay. One
+  VS Code window timed out during MCP child recovery while another window on
+  the same machine launched successfully, narrowing the remaining MCP defect
+  to window-local child/session/extension-host ownership or recovery routing.
+- A fresh Source Graph generation was present, but the roadmap-oriented focus
+  query returned zero file/entity evidence. Exact-target fallback was therefore
+  required for this checkpoint. Broad-query retrieval truth remains open even
+  though exact file/body retrieval and the checked exact-symbol fixture work.
+
+The next closure order is: reconcile the Windows live runtime path, implement
+and accept clean-root recovery for a removed rework predecessor, implement and
+accept the common evidence-level contract, release its three dependency-safe
+foundation successors, fix the Markdown-intake dependencies, then remove
+historical attempts from the active denominator without deleting their audit
+evidence. Only after that should lower-priority product expansion resume.
+
 ## Assessment intake and assurance roadmap (2026-08-06)
 
 Eight owner-supplied product and architecture reviews are preserved under

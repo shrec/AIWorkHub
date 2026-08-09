@@ -1399,6 +1399,7 @@ def recover_blocked_rework(
     actor: str = "coordinator",
     feedback_reason: str = "",
     validation_only_replay: bool = False,
+    clean_root_if_predecessor_missing: bool = False,
 ) -> tuple[bool, str]:
     """Recover the same blocked task ID for rework when retained predecessor
     evidence and actionable residual feedback are present.
@@ -1420,8 +1421,18 @@ def recover_blocked_rework(
       - explicit validation_only_replay authorization lacking retained
         predecessor request_id or changed_path_hashes
 
+    ``clean_root_if_predecessor_missing`` is an explicit coordinator escape
+    hatch for an ordinary rework episode whose hash-pinned predecessor
+    workspace has already been removed by retention.  It preserves the
+    predecessor identity and hashes as audit evidence, removes only the stale
+    materialization authority, and records a clean-root authorization.  It is
+    incompatible with validation-only replay, which requires the original
+    bytes.
+
     Idempotent: returns ``(True, "already_recovered")`` when a prior recovery
-    already re-queued the same task, without duplicating audit history.
+    already re-queued the same task, without duplicating audit history.  A
+    pending recovered task may still receive the explicit clean-root
+    authorization once when its predecessor is demonstrably missing.
     """
     _readiness, db_path = _require_ready(root)
     conn = _connect(db_path)
@@ -1436,6 +1447,71 @@ def recover_blocked_rework(
 
         current_canonical = canonical_status(dict(row))
 
+        try:
+            card = json.loads(str(row["card_json"] or "{}"))
+        except json.JSONDecodeError:
+            return False, "card_json_invalid"
+        if not isinstance(card, dict):
+            return False, "card_json_not_dict"
+
+        if clean_root_if_predecessor_missing and validation_only_replay:
+            return False, "clean_root_incompatible_with_validation_only_replay"
+
+        def missing_predecessor_authority() -> tuple[bool, str, dict[str, Any]]:
+            predecessor = card.get("rework_predecessor")
+            if not isinstance(predecessor, dict):
+                return False, "clean_root_rework_predecessor_invalid", {}
+            request_id = str(predecessor.get("request_id") or "").strip()
+            hashes = predecessor.get("changed_path_hashes")
+            workspace = predecessor.get("workspace")
+            if (
+                len(request_id) != 32
+                or any(ch not in "0123456789abcdef" for ch in request_id)
+                or not isinstance(hashes, dict)
+                or not hashes
+            ):
+                return False, "clean_root_rework_predecessor_invalid", {}
+            for raw_path, expected_hash in hashes.items():
+                if not isinstance(raw_path, str):
+                    return False, "clean_root_rework_predecessor_invalid", {}
+                path_parts = raw_path.split("/")
+                if (
+                    not raw_path
+                    or raw_path.startswith("/")
+                    or "\\" in raw_path
+                    or any(part in {"", ".", ".."} for part in path_parts)
+                ):
+                    return False, "clean_root_rework_predecessor_invalid", {}
+                if expected_hash is not None and (
+                    not isinstance(expected_hash, str)
+                    or len(expected_hash) != 64
+                    or any(
+                        ch not in "0123456789abcdef" for ch in expected_hash
+                    )
+                ):
+                    return False, "clean_root_rework_predecessor_invalid", {}
+            if not isinstance(workspace, dict):
+                return False, "clean_root_rework_workspace_invalid", {}
+            if str(workspace.get("request_id") or "").strip() != request_id:
+                return False, "clean_root_rework_identity_mismatch", {}
+            try:
+                authority_repo = Path(str(workspace.get("repo") or "")).resolve()
+                expected_repo = Path(root).resolve()
+                source_workspace = Path(str(workspace.get("path") or ""))
+            except (OSError, RuntimeError, ValueError):
+                return False, "clean_root_rework_workspace_invalid", {}
+            if authority_repo != expected_repo or not source_workspace.is_absolute():
+                return False, "clean_root_rework_identity_mismatch", {}
+            if source_workspace.is_symlink():
+                return False, "clean_root_rework_workspace_invalid", {}
+            if source_workspace.exists():
+                return False, "clean_root_rework_workspace_still_available", {}
+            return True, "missing", {
+                "predecessor_request_id": request_id,
+                "changed_path_hashes": dict(hashes),
+                "missing_workspace": str(source_workspace),
+            }
+
         already = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id=? AND event='blocked_rework_recovery' LIMIT 1",
@@ -1443,17 +1519,50 @@ def recover_blocked_rework(
         ).fetchone()
         if already is not None:
             if current_canonical == "pending":
-                return True, "already_recovered"
+                if not clean_root_if_predecessor_missing:
+                    return True, "already_recovered"
+                allowed, reason, clean_root_evidence = missing_predecessor_authority()
+                if not allowed:
+                    return False, reason
+                now = datetime.now(timezone.utc).isoformat()
+                card.pop("rework_predecessor", None)
+                card["clean_root_recovery_authorization"] = {
+                    **clean_root_evidence,
+                    "task_id": task_id,
+                    "actor": actor,
+                    "authorized_at": now,
+                    "claim_epoch": card.get("claim_epoch"),
+                    "one_episode_binding": True,
+                }
+                card["recovery_mode"] = "clean_root_missing_predecessor"
+                conn.execute(
+                    "UPDATE tasks SET updated_at=?, card_json=? WHERE task_id=?",
+                    (now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
+                )
+                conn.execute(
+                    "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+                    "VALUES (?, 'blocked_rework_clean_root_authorized', ?, ?, ?)",
+                    (
+                        task_id,
+                        actor[:120],
+                        json.dumps(
+                            {
+                                **clean_root_evidence,
+                                "claim_epoch": card.get("claim_epoch"),
+                                "actor": actor[:120],
+                                "recorded_at": now,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                conn.commit()
+                return True, "recovered_clean_root"
 
         if current_canonical != "blocked":
             return False, f"not_blocked:current={current_canonical}"
-
-        try:
-            card = json.loads(str(row["card_json"] or "{}"))
-        except json.JSONDecodeError:
-            return False, "card_json_invalid"
-        if not isinstance(card, dict):
-            return False, "card_json_not_dict"
 
         worker_status = str(row["worker_status"] or "").strip()
         claimed_by = str(row["claimed_by"] or "").strip()
@@ -1569,6 +1678,24 @@ def recover_blocked_rework(
             }
         else:
             card.pop("validation_only_replay_authorization", None)
+
+        if clean_root_if_predecessor_missing:
+            allowed, reason, clean_root_evidence = missing_predecessor_authority()
+            if not allowed:
+                return False, reason
+            card.pop("rework_predecessor", None)
+            card["clean_root_recovery_authorization"] = {
+                **clean_root_evidence,
+                "task_id": task_id,
+                "actor": actor,
+                "authorized_at": now,
+                "claim_epoch": claim_epoch,
+                "one_episode_binding": True,
+            }
+            card["recovery_mode"] = "clean_root_missing_predecessor"
+        else:
+            card.pop("clean_root_recovery_authorization", None)
+            card.pop("recovery_mode", None)
 
         conn.execute(
             "UPDATE tasks SET status='pending', worker_status='unclaimed', "
