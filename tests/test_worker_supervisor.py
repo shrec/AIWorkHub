@@ -555,7 +555,7 @@ def test_abrupt_supervisor_loss_does_not_orphan_worker(tmp_path: Path) -> None:
             break
         try:
             raw = proc_stat.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             # The worker may exit between the existence probe and the read;
             # disappearing from procfs is the successful outcome under test.
             break

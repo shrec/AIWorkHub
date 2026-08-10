@@ -770,6 +770,8 @@ def _v3_planned_outputs(
                 f"vscode_lm_edit_response_edit_target_invalid:{relative}"
             )
         current_bytes = target.read_bytes()
+        if relative in required_creates and current_bytes:
+            raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         actual_hash = hashlib.sha256(current_bytes).hexdigest()
         if actual_hash != expected_hash:
             raise RuntimeError(
@@ -808,6 +810,12 @@ def _v3_planned_outputs(
         next_bytes = next_text.encode("utf-8")
         if len(next_bytes) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        if relative in required_creates:
+            # The bridge stages declared new outputs as empty placeholders so
+            # v3 can fill them with a bounded virtual-line edit.  That is a
+            # create for contract/fidelity purposes even though the protocol
+            # represents it in ``edits`` rather than ``creates``.
+            create_contents[relative] = next_text
         planned.append((relative, next_text))
         metrics.append({
             "path": relative,

@@ -126,6 +126,26 @@ def test_v3_can_fill_declared_empty_placeholder_with_virtual_line(tmp_path: Path
     assert metric["whole_file_output_required"] is False
 
 
+def test_v3_rejects_nonempty_declared_create_placeholder(tmp_path: Path) -> None:
+    current = "unexpected\n"
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[{
+            "path": "out/result.txt",
+            "current_sha256": hashlib.sha256(current.encode()).hexdigest(),
+            "ranges": [{"start_line": 1, "end_line": 1, "new": "created\n"}],
+        }]),
+        create_paths=["out/result.txt"],
+    )
+    target = workspace / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_text(current, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="create_exists"):
+        vscode_lm_worker.run(spec)
+    assert target.read_text(encoding="utf-8") == current
+
+
 def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> None:
     current = "one\ntwo\nthree\n"
     overlap, workspace = _request(
