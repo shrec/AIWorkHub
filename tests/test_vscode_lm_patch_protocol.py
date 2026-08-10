@@ -125,6 +125,35 @@ def test_v3_can_fill_existing_empty_file_with_virtual_line(tmp_path: Path) -> No
     assert metric["whole_file_output_required"] is False
 
 
+def test_v3_can_fill_required_empty_placeholder_with_virtual_line(
+    tmp_path: Path,
+) -> None:
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[{
+            "path": "out/result.txt",
+            "current_sha256": empty_sha256,
+            "ranges": [{"start_line": 1, "end_line": 1, "new": "created\n"}],
+        }]),
+        create_paths=["out/result.txt"],
+    )
+    target = workspace / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"")
+
+    result = vscode_lm_worker.run(spec)
+
+    assert result["changed_paths"] == ["out/result.txt"]
+    assert target.read_text(encoding="utf-8") == "created\n"
+    metric = result["semantic_edit_metrics"][0]
+    assert metric["old_region_bytes"] == 0
+    assert metric["create"] is True
+    assert metric["replacement_bytes"] == len(b"created\n")
+    assert metric["whole_file_output_required"] is True
+    assert metric["token_savings_claimed"] is False
+
+
 def test_v3_create_replaces_only_declared_empty_workspace_placeholder(
     tmp_path: Path,
 ) -> None:
@@ -145,6 +174,75 @@ def test_v3_create_replaces_only_declared_empty_workspace_placeholder(
     assert metric["create"] is True
     assert metric["replacement_bytes"] == len(b"created\n")
     assert metric["whole_file_output_required"] is True
+
+
+def test_v3_rejects_nonempty_declared_create_placeholder(tmp_path: Path) -> None:
+    current = "unexpected\n"
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[{
+            "path": "out/result.txt",
+            "current_sha256": hashlib.sha256(current.encode()).hexdigest(),
+            "ranges": [{"start_line": 1, "end_line": 1, "new": "created\n"}],
+        }]),
+        create_paths=["out/result.txt"],
+    )
+    target = workspace / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_text(current, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="create_exists"):
+        vscode_lm_worker.run(spec)
+    assert target.read_text(encoding="utf-8") == current
+
+
+def test_v3_required_pyi_ellipsis_rejected_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = "def keep():\n    return 1\n"
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    spec, workspace = _request(
+        tmp_path,
+        _v3(edits=[
+            {
+                "path": "src/app.py",
+                "current_sha256": hashlib.sha256(current.encode()).hexdigest(),
+                "ranges": [{
+                    "start_line": 1,
+                    "end_line": 2,
+                    "new": "def keep():\n    return 2\n",
+                }],
+            },
+            {
+                "path": "stubs/new.pyi",
+                "current_sha256": empty_sha256,
+                "ranges": [{"start_line": 1, "end_line": 1, "new": "..."}],
+            },
+        ]),
+        allowed=["src/*.py", "stubs/*.pyi"],
+        create_paths=["stubs/new.pyi"],
+    )
+    existing = workspace / "src" / "app.py"
+    existing.parent.mkdir()
+    existing.write_bytes(current.encode("utf-8"))
+    placeholder = workspace / "stubs" / "new.pyi"
+    placeholder.parent.mkdir()
+    placeholder.write_bytes(b"")
+    changed_paths: list[str] = []
+    real_write = vscode_lm_worker._write_atomic
+
+    def recording_write(workspace: Path, relative: str, content: str) -> None:
+        changed_paths.append(relative)
+        real_write(workspace, relative, content)
+
+    monkeypatch.setattr(vscode_lm_worker, "_write_atomic", recording_write)
+
+    with pytest.raises(RuntimeError, match=r"ellipsis_only:stubs/new\.pyi:v3_create"):
+        vscode_lm_worker.run(spec)
+    assert changed_paths == []
+    assert existing.read_text(encoding="utf-8") == current
+    assert placeholder.read_bytes() == b""
 
 
 def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> None:

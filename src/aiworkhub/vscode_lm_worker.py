@@ -769,7 +769,10 @@ def _v3_planned_outputs(
             raise RuntimeError(
                 f"vscode_lm_edit_response_edit_target_invalid:{relative}"
             )
+        required_create = relative in required_creates
         current_bytes = target.read_bytes()
+        if required_create and current_bytes:
+            raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         actual_hash = hashlib.sha256(current_bytes).hexdigest()
         if actual_hash != expected_hash:
             raise RuntimeError(
@@ -808,14 +811,35 @@ def _v3_planned_outputs(
         next_bytes = next_text.encode("utf-8")
         if len(next_bytes) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        if required_create:
+            # The bridge stages declared new outputs as empty placeholders so
+            # v3 can fill them with a bounded virtual-line edit.  That is a
+            # create for contract/fidelity purposes even though the protocol
+            # represents it in ``edits`` rather than ``creates``.
+            _check_edit_fidelity(
+                "",
+                next_text,
+                path=relative,
+                operation="v3_create",
+                create=True,
+            )
+            create_contents[relative] = next_text
         planned.append((relative, next_text))
-        metrics.append({
+        metric = {
             "path": relative,
             "file_bytes": len(current_bytes),
             "entry_index1": group["first_idx"],
             "entry_count": group["entry_count"],
             **edit_metrics,
-        })
+        }
+        if required_create:
+            metric.update({
+                "create": True,
+                "replacement_bytes": len(next_bytes),
+                "whole_file_output_required": True,
+                "token_savings_claimed": False,
+            })
+        metrics.append(metric)
 
     for item in creates:
         if not isinstance(item, dict) or not isinstance(item.get("content"), str):
