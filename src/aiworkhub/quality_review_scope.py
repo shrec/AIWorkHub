@@ -18,7 +18,7 @@ import json
 import sqlite3
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import source_graph
 from . import source_graph_ast as sgast
@@ -137,7 +137,10 @@ def _graph_connection(authority_repo: Path) -> sqlite3.Connection | None:
         db_path = source_graph.resolve_db_path(authority_repo)
         if not db_path.is_file() or db_path.stat().st_size <= 0:
             return None
-        return source_graph.connect(db_path, read_only=True)
+        return cast(
+            sqlite3.Connection,
+            source_graph.connect(db_path, read_only=True),
+        )
     except (OSError, sqlite3.Error, source_graph.SourceGraphError):
         return None
 

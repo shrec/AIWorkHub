@@ -15,7 +15,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from . import context_graph, context_writes, evidence_levels, feature_settings, task_store
 from .learning_commit import LearningCommit, Outcome, learning_commit_from_dict, validate_repo_match
@@ -115,7 +115,7 @@ def _canonical_acceptance_reference(card: dict[str, Any], request_id: str) -> st
         raise LearningCommitStoreError("learning_commit_acceptance_not_fixed_and_verified")
     if not record.reference:
         raise LearningCommitStoreError("learning_commit_acceptance_reference_missing")
-    return record.reference
+    return cast(str, record.reference)
 
 
 def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
@@ -130,7 +130,7 @@ def _request_matches_candidate(card: dict[str, Any], request_id: str) -> bool:
 
 def _open(repo: Path) -> sqlite3.Connection:
     _readiness, db_path = task_store._require_ready(repo)
-    con = task_store._connect(db_path)
+    con = cast(sqlite3.Connection, task_store._connect(db_path))
     con.executescript(_SCHEMA)
     return con
 
