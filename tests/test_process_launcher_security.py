@@ -403,7 +403,18 @@ def test_restarted_manager_publishes_claimed_bridge_cancel_before_lifecycle_even
         "pid_start_ticks": 17,
         "metadata_path": str(metadata_path),
     })
-    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: True)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda pid, ticks: process_launcher.PidIdentityEvidence(
+            verdict=process_launcher.PidIdentityVerdict.MATCH,
+            pid=int(pid),
+            expected_start_ticks=int(ticks),
+            observed_start_ticks=int(ticks),
+            attempts=1,
+            operation="test_exact_match",
+        ),
+    )
     kills: list[tuple[int, int]] = []
     monkeypatch.setattr(
         process_launcher.os,
@@ -500,7 +511,18 @@ def test_dead_supervisor_reconciliation_starts_only_after_bridge_cancel(
         "pid_start_ticks": 19,
         "metadata_path": str(metadata_path),
     })
-    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: False)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda pid, ticks: process_launcher.PidIdentityEvidence(
+            verdict=process_launcher.PidIdentityVerdict.MISMATCH,
+            pid=int(pid),
+            expected_start_ticks=int(ticks),
+            observed_start_ticks=None,
+            attempts=1,
+            operation="test_process_absent",
+        ),
+    )
 
     def finalize_after_cancel(
         bound_request_id: str,
@@ -510,6 +532,9 @@ def test_dead_supervisor_reconciliation_starts_only_after_bridge_cancel(
     ) -> dict:
         assert bound_request_id == request_id
         assert lock_blocking is False
+        manager._publish_bridge_cancellation_before_finalization(  # noqa: SLF001
+            request_id
+        )
         decision = bridge.read_terminal_decision(
             response_path,
             request_id=request_id,
@@ -560,7 +585,18 @@ def test_bridge_cancel_publication_failure_defers_dead_supervisor_finalization(
         "pid_start_ticks": 23,
         "metadata_path": str(metadata_path),
     })
-    monkeypatch.setattr(process_launcher, "_pid_matches", lambda _pid, _ticks: False)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda pid, ticks: process_launcher.PidIdentityEvidence(
+            verdict=process_launcher.PidIdentityVerdict.MISMATCH,
+            pid=int(pid),
+            expected_start_ticks=int(ticks),
+            observed_start_ticks=None,
+            attempts=1,
+            operation="test_process_absent",
+        ),
+    )
     publication_attempts: list[str] = []
 
     def fail_publication(*_args: object, **_kwargs: object) -> None:
@@ -569,10 +605,17 @@ def test_bridge_cancel_publication_failure_defers_dead_supervisor_finalization(
 
     monkeypatch.setattr(manager, "_bridge_request_for_cancellation", fail_publication)
     finalized: list[str] = []
+
+    def finalize_after_bridge_gate(*_args: object, **_kwargs: object) -> None:
+        manager._publish_bridge_cancellation_before_finalization(  # noqa: SLF001
+            request_id
+        )
+        finalized.append("called")
+
     monkeypatch.setattr(
         manager,
         "_finalize_isolated_request",
-        lambda *_args, **_kwargs: finalized.append("called"),
+        finalize_after_bridge_gate,
     )
 
     result = manager.status(request_id)

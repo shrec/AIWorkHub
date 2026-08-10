@@ -2842,9 +2842,6 @@ async function invokeVscodeLmPrivateTool(call, requestId = "") {
 }
 
 function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
-  const examplePath = Array.isArray(allowedWrites) && allowedWrites.length
-    ? String(allowedWrites[0])
-    : "output.json";
   return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
     `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
     `- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review, or rework.\n` +
@@ -2856,17 +2853,30 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- After body discovery call aiworkhub_manager_semantic_edit_prepare with that file and exact line range. Copy current_sha256 from its receipt; the receipt returns only the selected old fragment, never the whole file.\n` +
     `- The prepare tool input is exactly {"file_path":"repo/relative/path","start_line":1,"end_line":1}; use file_path, not path, in that tool request.\n` +
     `- Semantic edits must name an allowed path, copy current_sha256 from path_contracts, and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
-    `- new contains only replacement code; it may be empty for deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
-    `- creates must name an allowed path and complete UTF-8 content. A path_contract action=create means the runtime owns an empty placeholder and the final response MUST use creates for that path.\n` +
+    `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
+    `- creates must name an allowed path and contain complete, nonempty UTF-8 content. Every path_contract whose action is create MUST appear exactly once in creates.\n` +
+    `- The final object is executable edit data, not a template. Sentinel-only values, prose placeholder labels, TODO/FIXME-only text, and omitted-code notices are rejected.\n` +
     `- For action=edit, copy current_sha256 exactly from semantic-edit prepare (or the identical exact path_contract); do not infer or recompute it.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
     `- path_contracts=${JSON.stringify(pathContracts || {})}\n` +
-    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<copy from path_contracts>","ranges":[{"start_line":10,"end_line":18,"new":"replacement code only","preserve_trailing_newline":true}]}],"creates":[]}`;
+    `- Required fields are schema_id=${VSCODE_LM_EDIT_RESPONSE_SCHEMA}, an actual summary, an edits array of hash-bound line ranges, and a creates array of complete new files. Do not copy instructional metasyntax into any field.`;
+}
+
+function vscodeLmNormalizedPath(rawPath) {
+  return String(rawPath || "").replace(/\\/g, "/");
+}
+
+function vscodeLmContractMap(pathContracts) {
+  const result = new Map();
+  for (const [rawPath, contract] of Object.entries(pathContracts || {})) {
+    result.set(vscodeLmNormalizedPath(rawPath), contract);
+  }
+  return result;
 }
 
 function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
-  const value = String(rawPath || "").replace(/\\/g, "/");
-  const pattern = String(rawPattern || "").replace(/\\/g, "/");
+  const value = vscodeLmNormalizedPath(rawPath);
+  const pattern = vscodeLmNormalizedPath(rawPattern);
   if (!value || value.startsWith("/") || value.split("/").includes("..")) return false;
   let expression = "^";
   for (let index = 0; index < pattern.length; index += 1) {
@@ -2881,12 +2891,114 @@ function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
   return new RegExp(`${expression}$`).test(value);
 }
 
+function vscodeLmTrimOuterBlankLines(value) {
+  const lines = String(value).split(/\r\n?|\n/);
+  let start = 0;
+  let end = lines.length;
+  while (start < end && !lines[start].trim()) start += 1;
+  while (end > start && !lines[end - 1].trim()) end -= 1;
+  return lines.slice(start, end).join("\n");
+}
+
+function vscodeLmMarkdownFenceBody(value) {
+  const lines = String(value).split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const opening = lines[0].match(/^ {0,3}(`{3,}|~{3,}).*$/);
+  if (!opening) return null;
+  const fence = opening[1];
+  const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*$`);
+  if (!closing.test(lines[lines.length - 1])) return null;
+  return vscodeLmTrimOuterBlankLines(lines.slice(1, -1).join("\n"));
+}
+
+function vscodeLmClassificationPayload(rawValue) {
+  const marker = "\uE000";
+  const prepared = String(rawValue).replace(/…/g, marker);
+  const normalizedPrepared = prepared.normalize("NFKC");
+  const compatibilityChanged = normalizedPrepared !== prepared;
+  let value = vscodeLmTrimOuterBlankLines(normalizedPrepared);
+  let wrapped = false;
+  let remainingUnwrapBudget = value.length;
+  while (remainingUnwrapBudget > 0) {
+    let nextValue = null;
+    const fenceBody = vscodeLmMarkdownFenceBody(value);
+    if (fenceBody !== null) {
+      nextValue = fenceBody;
+    }
+    const stripped = value.trim();
+    const cBlock = stripped.match(/^\/\*([\s\S]*?)\*\/$/);
+    if (cBlock) {
+      nextValue = vscodeLmTrimOuterBlankLines(
+        cBlock[1].split(/\r\n?|\n/).map((line) => line.replace(/^\s*\*+\s?/, "")).join("\n"),
+      );
+    }
+    const htmlBlock = stripped.match(/^<!--([\s\S]*?)-->$/);
+    if (htmlBlock) {
+      nextValue = vscodeLmTrimOuterBlankLines(htmlBlock[1]);
+    }
+    const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const comments = lines.map((line) => line.match(/^(?:\/{2,}|#+|--+|;+)[ \t]?(.*)$/));
+    if (lines.length && comments.every(Boolean)) {
+      nextValue = vscodeLmTrimOuterBlankLines(comments.map((match) => match[1]).join("\n"));
+    }
+    if (nextValue === null) break;
+    const reduction = value.length - nextValue.length;
+    if (reduction <= 0) break;
+    value = nextValue;
+    remainingUnwrapBudget -= reduction;
+    wrapped = true;
+  }
+  const unicodeEllipsis = value.trim() === marker;
+  const candidate = value.replace(new RegExp(marker, "g"), "...").normalize("NFKC")
+    .trim().replace(/\s+/g, " ").toLowerCase();
+  return { candidate, wrapped, unicodeEllipsis, compatibilityChanged };
+}
+
+function vscodeLmPlaceholderReason(rawValue, rawPath, { create = false } = {}) {
+  if (typeof rawValue !== "string") return "";
+  const stripped = rawValue.trim();
+  if (create && !stripped) return "empty_required_create";
+  if (!stripped) return "";
+  const { candidate, wrapped, unicodeEllipsis, compatibilityChanged } = vscodeLmClassificationPayload(rawValue);
+  if (wrapped && !candidate) return create ? "empty_required_create" : "placeholder_phrase";
+  const pythonPath = /\.pyi?$/i.test(String(rawPath || ""));
+  if (candidate === "..." && (unicodeEllipsis || compatibilityChanged || wrapped || create || !pythonPath)) {
+    return "ellipsis_only";
+  }
+  const placeholder = /^(?:(?:todo|fixme|xxx)(?:\s*[:\-].*)?|placeholder|replacement\s+code\s+only|(?:test\s+)?file\s+content|(?:implementation|code)\s+omitted(?:\s+for\s+brevity)?|omitted\s+(?:code|for\s+brevity)|(?:the\s+)?rest\s+of\s+(?:the\s+)?code(?:\s+unchanged)?|rest\s+unchanged|remainder\s+unchanged|unchanged\s+code|insert\s+code\s+here|your\s+code\s+here)[.!;,\-:]*$/i;
+  const anglePlaceholder = /^\s*<\s*(?:new\s+[\w.:-]+\s+code|test\s+file\s+content|(?:full|complete)\s+file\s+content|insert\s+[^>]+\s+here)\s*>\s*$/i;
+  return placeholder.test(candidate) || anglePlaceholder.test(candidate) ? "placeholder_phrase" : "";
+}
+
+function vscodeLmFidelityError(value, pathValue, operation, options = {}) {
+  const reason = vscodeLmPlaceholderReason(value, pathValue, options);
+  return reason ? `final_edit_fidelity_rejected:${reason}:${pathValue}:${operation}` : "";
+}
+
+function vscodeLmRequiredCreateError(items, contractByPath, contentKey, operation) {
+  const byPath = new Map((items || []).filter((item) => item && typeof item.path === "string")
+    .map((item) => [vscodeLmNormalizedPath(item.path), item]));
+  for (const [requiredPath, contract] of contractByPath.entries()) {
+    if (!contract || contract.action !== "create") continue;
+    const item = byPath.get(requiredPath);
+    if (!item) return `final_edit_fidelity_rejected:missing_required_create:${requiredPath}:${operation}`;
+    if (typeof item[contentKey] !== "string" || !item[contentKey].trim()) {
+      return `final_edit_fidelity_rejected:empty_required_create:${requiredPath}:${operation}`;
+    }
+  }
+  return "";
+}
+
 function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}) {
   if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
   }
+  const summaryFidelity = vscodeLmFidelityError(envelope.summary, "summary", "summary");
+  if (summaryFidelity) return summaryFidelity;
+  const contractByPath = vscodeLmContractMap(pathContracts);
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
     if (!Array.isArray(envelope.files)) return "final_files_invalid";
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.files, contractByPath, "content", "v1_file");
     for (const file of envelope.files) {
       if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
         return "final_file_invalid";
@@ -2894,15 +3006,22 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
       if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(file.path, pattern))) {
         return `final_path_not_allowed:${file.path}`;
       }
+      const contract = contractByPath.get(vscodeLmNormalizedPath(file.path));
+      const fidelity = vscodeLmFidelityError(file.content, file.path, "v1_file", {
+        create: contract && contract.action === "create",
+      });
+      if (fidelity) return fidelity;
     }
+    if (requiredCreateError) return requiredCreateError;
     return "";
   }
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2) {
     if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) return "final_v2_shape_invalid";
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v2_create");
     for (const edit of envelope.edits) {
       if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) return "final_edit_invalid";
       if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
-      const contract = pathContracts[edit.path];
+      const contract = contractByPath.get(vscodeLmNormalizedPath(edit.path));
       if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "") &&
           edit.current_sha256 !== contract.current_sha256) return `final_hash_stale:${edit.path}`;
       if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) return `final_path_not_allowed:${edit.path}`;
@@ -2910,19 +3029,31 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
         if (!replacement || typeof replacement.old !== "string" || !replacement.old ||
             typeof replacement.new !== "string" || !replacement.new ||
             !Number.isSafeInteger(replacement.expected_count) || replacement.expected_count < 1) return `final_replacement_invalid:${edit.path}`;
+        const fidelity = vscodeLmFidelityError(replacement.new, edit.path, "v2_replacement");
+        if (fidelity) return fidelity;
       }
     }
+    for (const create of envelope.creates) {
+      if (!create || typeof create.path !== "string" || typeof create.content !== "string") return "final_create_invalid";
+      const contract = contractByPath.get(vscodeLmNormalizedPath(create.path));
+      if (contract && contract.action === "edit") return `final_action_mismatch:${create.path}:create_on_edit`;
+      if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) return `final_path_not_allowed:${create.path}`;
+      const fidelity = vscodeLmFidelityError(create.content, create.path, "v2_create", { create: true });
+      if (fidelity) return fidelity;
+    }
+    if (requiredCreateError) return requiredCreateError;
     return "";
   }
   if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) return "final_schema_invalid";
   if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
     return "final_v2_shape_invalid";
   }
+  const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v3_create");
   for (const edit of envelope.edits) {
     if (!edit || typeof edit.path !== "string" || !Array.isArray(edit.ranges)) {
       return "final_edit_invalid";
     }
-    const contract = pathContracts[edit.path];
+    const contract = contractByPath.get(vscodeLmNormalizedPath(edit.path));
     if (typeof edit.current_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(edit.current_sha256)) {
       if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "")) {
         edit.current_sha256 = contract.current_sha256;
@@ -2950,19 +3081,25 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
       if (contract && Number.isSafeInteger(contract.line_count) && range.end_line > contract.line_count) {
         return `final_range_out_of_bounds:${edit.path}:start=${range.start_line}:end=${range.end_line}:lines=${contract.line_count}`;
       }
+      const fidelity = vscodeLmFidelityError(range.new, edit.path, "v3_range");
+      if (fidelity) return fidelity;
     }
   }
   for (const create of envelope.creates) {
     if (!create || typeof create.path !== "string" || typeof create.content !== "string") {
       return "final_create_invalid";
     }
-    if (pathContracts[create.path] && pathContracts[create.path].action === "edit") {
+    const contract = contractByPath.get(vscodeLmNormalizedPath(create.path));
+    if (contract && contract.action === "edit") {
       return `final_action_mismatch:${create.path}:create_on_edit`;
     }
     if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) {
       return `final_path_not_allowed:${create.path}`;
     }
+    const fidelity = vscodeLmFidelityError(create.content, create.path, "v3_create", { create: true });
+    if (fidelity) return fidelity;
   }
+  if (requiredCreateError) return requiredCreateError;
   return "";
 }
 
