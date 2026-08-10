@@ -1109,3 +1109,419 @@ def test_daemon_writes_lifecycle_transitions_with_writes_enabled(tmp_path, monke
     events = manager._request_events("req-daemon-writes-lifecycle")
     assert events[-1]["state"] == "review_ready"
     assert card["status"] == "review"
+
+
+def _pid_evidence(
+    verdict: process_launcher.PidIdentityVerdict,
+) -> process_launcher.PidIdentityEvidence:
+    return process_launcher.PidIdentityEvidence(
+        verdict=verdict,
+        pid=123,
+        expected_start_ticks=456,
+        observed_start_ticks=456 if verdict is process_launcher.PidIdentityVerdict.MATCH else None,
+        attempts=1,
+        operation="test",
+    )
+
+
+def test_persisted_watcher_bounds_unknown_and_cleans_up_without_finalizing(monkeypatch):
+    identity_calls = []
+    sleep_calls = []
+    finalizer_calls = []
+
+    def unknown_identity(pid, ticks):
+        identity_calls.append((pid, ticks))
+        return _pid_evidence(process_launcher.PidIdentityVerdict.UNKNOWN)
+
+    monkeypatch.setattr(process_launcher, "_pid_identity_evidence", unknown_identity)
+    monkeypatch.setattr(
+        process_launcher.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+    manager = SimpleNamespace(
+        _lock=contextlib.nullcontext(),
+        _watching={"request-unknown"},
+        _finalize_after_process_exit=lambda request_id: finalizer_calls.append(request_id),
+    )
+
+    process_launcher.ProcessManager._watch_persisted_request(
+        manager,
+        "request-unknown",
+        123,
+        456,
+    )
+
+    limit = process_launcher._PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE
+    assert identity_calls == [(123, 456)] * limit
+    assert sleep_calls == [0.2] * (limit - 1)
+    assert finalizer_calls == []
+    assert manager._watching == set()
+
+
+def test_persisted_watcher_match_resets_unknown_streak(monkeypatch):
+    limit = process_launcher._PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE
+    verdicts = iter(
+        [process_launcher.PidIdentityVerdict.UNKNOWN] * (limit - 1)
+        + [process_launcher.PidIdentityVerdict.MATCH]
+        + [process_launcher.PidIdentityVerdict.UNKNOWN] * limit
+    )
+    sleep_calls = []
+    finalizer_calls = []
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(next(verdicts)),
+    )
+    monkeypatch.setattr(
+        process_launcher.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+    manager = SimpleNamespace(
+        _lock=contextlib.nullcontext(),
+        _watching={"request-reset"},
+        _finalize_after_process_exit=lambda request_id: finalizer_calls.append(request_id),
+    )
+
+    process_launcher.ProcessManager._watch_persisted_request(
+        manager,
+        "request-reset",
+        123,
+        456,
+    )
+
+    assert len(sleep_calls) == (limit - 1) + 1 + (limit - 1)
+    assert finalizer_calls == []
+    assert manager._watching == set()
+
+
+def test_persisted_watcher_finalizes_only_on_mismatch(monkeypatch):
+    finalizer_calls = []
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(process_launcher.PidIdentityVerdict.MISMATCH),
+    )
+    monkeypatch.setattr(
+        process_launcher.time,
+        "sleep",
+        lambda _seconds: pytest.fail("MISMATCH must not sleep"),
+    )
+    manager = SimpleNamespace(
+        _lock=contextlib.nullcontext(),
+        _watching={"request-mismatch"},
+        _finalize_after_process_exit=lambda request_id: finalizer_calls.append(request_id),
+    )
+
+    process_launcher.ProcessManager._watch_persisted_request(
+        manager,
+        "request-mismatch",
+        123,
+        456,
+    )
+
+    assert finalizer_calls == ["request-mismatch"]
+    assert manager._watching == set()
+
+
+def test_reconciler_retries_unknown_later_and_starts_exactly_one_watcher(monkeypatch):
+    candidate = {
+        "state": "running",
+        "pid": 123,
+        "pid_start_ticks": 456,
+        "metadata_path": "metadata.json",
+    }
+    verdicts = iter(
+        [
+            process_launcher.PidIdentityVerdict.UNKNOWN,
+            process_launcher.PidIdentityVerdict.MATCH,
+            process_launcher.PidIdentityVerdict.MATCH,
+        ]
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(next(verdicts)),
+    )
+    threads = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            threads.append(self)
+
+    monkeypatch.setattr(process_launcher.threading, "Thread", FakeThread)
+    finalizer_calls = []
+    watch_target = lambda *_args: None
+    manager = SimpleNamespace(
+        _lock=contextlib.nullcontext(),
+        _watching=set(),
+        _live={},
+        _latest_by_request=lambda: {"request-retry": candidate},
+        _watch_persisted_request=watch_target,
+        _finalize_after_process_exit=lambda request_id: finalizer_calls.append(request_id),
+    )
+
+    first = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+    second = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+    third = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+
+    assert first == {"watched": 0, "finalized": 0}
+    assert second == {"watched": 1, "finalized": 0}
+    assert third == {"watched": 0, "finalized": 0}
+    assert len(threads) == 1
+    assert threads[0].target is watch_target
+    assert threads[0].args == ("request-retry", 123, 456)
+    assert manager._watching == {"request-retry"}
+    assert finalizer_calls == []
+
+
+@pytest.mark.parametrize("state", sorted(process_launcher.FINALIZATION_PENDING_STATES))
+def test_reconciler_finalization_pending_bypasses_identity_and_finalizes_once(
+    monkeypatch,
+    state,
+):
+    candidate = {
+        "state": state,
+        "pid": 123,
+        "pid_start_ticks": None,
+    }
+
+    def identity_must_not_run(_pid, _ticks):
+        raise AssertionError("finalization-pending entries must bypass PID identity")
+
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        identity_must_not_run,
+    )
+    finalizer_calls = []
+    manager = SimpleNamespace(
+        _latest_by_request=lambda: {"request-pending": candidate},
+        _finalize_after_process_exit=lambda request_id: (
+            finalizer_calls.append(request_id) or {"state": "review_ready"}
+        ),
+    )
+
+    result = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+
+    assert result == {"watched": 0, "finalized": 1}
+    assert finalizer_calls == ["request-pending"]
+
+
+def test_reconciler_active_unknown_retains_request_without_side_effects(monkeypatch):
+    candidate = {
+        "state": "running",
+        "pid": 123,
+        "pid_start_ticks": 456,
+        "metadata_path": "metadata.json",
+    }
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(process_launcher.PidIdentityVerdict.UNKNOWN),
+    )
+    monkeypatch.setattr(
+        process_launcher.threading,
+        "Thread",
+        lambda *_args, **_kwargs: pytest.fail("UNKNOWN must not start a watcher"),
+    )
+
+    def finalizer_must_not_run(_request_id):
+        raise AssertionError("UNKNOWN must not enter finalization side effects")
+
+    manager = SimpleNamespace(
+        _watching=set(),
+        _live={},
+        _latest_by_request=lambda: {"request-active-unknown": candidate},
+        _finalize_after_process_exit=finalizer_must_not_run,
+    )
+
+    result = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+
+    assert result == {"watched": 0, "finalized": 0}
+    assert candidate["state"] == "running"
+    assert manager._watching == set()
+
+
+def test_reconciler_active_mismatch_finalizes_once(monkeypatch):
+    candidate = {
+        "state": "running",
+        "pid": 123,
+        "pid_start_ticks": 456,
+        "metadata_path": "metadata.json",
+    }
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(process_launcher.PidIdentityVerdict.MISMATCH),
+    )
+    finalizer_calls = []
+    manager = SimpleNamespace(
+        _watching=set(),
+        _live={},
+        _latest_by_request=lambda: {"request-active-mismatch": candidate},
+        _finalize_after_process_exit=lambda request_id: (
+            finalizer_calls.append(request_id) or {"state": "worker_failed"}
+        ),
+    )
+
+    result = process_launcher.ProcessManager._reconcile_persisted_requests(manager)
+
+    assert result == {"watched": 0, "finalized": 1}
+    assert finalizer_calls == ["request-active-mismatch"]
+
+
+@pytest.mark.parametrize("status_kind", ["active", "missing"])
+def test_finalizer_pid_unknown_defers_without_side_effects_then_recovers(
+    monkeypatch,
+    tmp_path,
+    status_kind,
+):
+    card = _card(task_id="TASK_W1_FINALIZE", runner="claude_worker_w1")
+    manager = _build_manager(tmp_path, card)
+    request_id = "request-w1-finalize"
+    now = time.time()
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=123,
+        supervisor_ticks=456,
+        supervisor_status={
+            "state": "running",
+            "heartbeat_at_epoch": now,
+            "last_output_change_epoch": now,
+            "started_at_epoch": now,
+        },
+    )
+    if status_kind == "missing":
+        (tmp_path / "processes" / f"{request_id}.supervisor.json").unlink()
+    verdict = {"value": process_launcher.PidIdentityVerdict.UNKNOWN}
+
+    def identity(pid, _ticks):
+        if int(pid or 0) == 123:
+            return _pid_evidence(verdict["value"])
+        return _pid_evidence(process_launcher.PidIdentityVerdict.MISMATCH)
+
+    bridge_calls = []
+    release_calls = []
+    monkeypatch.setattr(process_launcher, "_pid_identity_evidence", identity)
+    monkeypatch.setattr(
+        manager,
+        "_publish_bridge_cancellation_before_finalization",
+        lambda request_id_arg, _live: bridge_calls.append(request_id_arg) or "",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminal_failure_exact",
+        lambda metadata, substatus, *, request_id, evidence: (
+            release_calls.append((request_id, substatus)) or {"ok": True}
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_record_usage",
+        lambda *_args, **_kwargs: ({}, False, ""),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminate_process_group",
+        lambda *_args, **_kwargs: pytest.fail("UNKNOWN must not signal"),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "cleanup_workspace",
+        lambda *_args, **_kwargs: pytest.fail("UNKNOWN must retain workspace"),
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_failure",
+        lambda *_args, **_kwargs: pytest.fail("UNKNOWN must not release/callback"),
+    )
+    before = manager._request_events(request_id)
+
+    unknown = manager._finalize_after_process_exit(request_id)
+
+    assert unknown["state"] == "running"
+    assert unknown["reconciliation_deferred"] == "pid_identity_unknown"
+    assert unknown["workspace_retained"] is True
+    assert manager._request_events(request_id) == before
+    assert bridge_calls == []
+    assert release_calls == []
+    with manager._request_lock(request_id, blocking=False):
+        pass
+
+    verdict["value"] = process_launcher.PidIdentityVerdict.MATCH
+    matched = manager._finalize_after_process_exit(request_id)
+    assert matched["state"] == "running"
+    assert manager._request_events(request_id) == before
+    assert bridge_calls == []
+    assert release_calls == []
+
+    verdict["value"] = process_launcher.PidIdentityVerdict.MISMATCH
+    finalized = manager._finalize_after_process_exit(request_id)
+    assert finalized["state"] == "worker_failed"
+    assert "supervisor_incomplete" in finalized["error"]
+    assert release_calls == [(request_id, "worker_failed")]
+    assert bridge_calls == [request_id]
+    assert manager._finalize_after_process_exit(request_id) == finalized
+    assert release_calls == [(request_id, "worker_failed")]
+    assert bridge_calls == [request_id]
+
+
+def test_terminal_supervisor_status_bypasses_unknown_pid_and_finalizes_once(
+    monkeypatch,
+    tmp_path,
+):
+    card = _card(task_id="TASK_W1_TERMINAL", runner="deepseek_worker_w1")
+    manager = _build_manager(tmp_path, card)
+    request_id = "request-w1-terminal"
+    _seed_request(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        supervisor_pid=123,
+        supervisor_ticks=456,
+        supervisor_status={"state": "cancelled", "exit_code": 143},
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _pid_evidence(
+            process_launcher.PidIdentityVerdict.UNKNOWN
+        ),
+    )
+    releases = []
+    monkeypatch.setattr(
+        manager,
+        "_terminal_failure_exact",
+        lambda metadata, substatus, *, request_id, evidence: (
+            releases.append((request_id, substatus)) or {"ok": True}
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_record_usage",
+        lambda *_args, **_kwargs: ({}, False, ""),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_terminate_process_group",
+        lambda *_args, **_kwargs: pytest.fail("terminal artifact needs no signal"),
+    )
+
+    first = manager._finalize_after_process_exit(request_id)
+    second = manager._finalize_after_process_exit(request_id)
+
+    assert first["state"] == "cancelled"
+    assert second == first
+    assert releases == [(request_id, "cancelled")]

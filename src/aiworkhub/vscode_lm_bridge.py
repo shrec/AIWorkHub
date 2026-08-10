@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 import time
@@ -46,6 +47,8 @@ EDIT_RESPONSE_SCHEMA_ID_V1 = "aiworkhub.vscode_lm.edit_response.v1"
 EDIT_RESPONSE_SCHEMA_ID_V2 = "aiworkhub.vscode_lm.edit_response.v2"
 EDIT_RESPONSE_SCHEMA_ID = "aiworkhub.vscode_lm.semantic_edit_response.v3"
 PROGRESS_RECEIPT_SCHEMA_ID = "aiworkhub.vscode_lm.progress_receipt.v1"
+CANCEL_DECISION_SCHEMA_ID = RESPONSE_SCHEMA_ID
+BRIDGE_REQUEST_METADATA_SCHEMA_ID = "aiworkhub.vscode_lm.bridge_request_metadata.v1"
 PROGRESS_PHASES: tuple[str, ...] = (
     "request_accepted",
     "provider_response",
@@ -54,6 +57,9 @@ PROGRESS_PHASES: tuple[str, ...] = (
     "terminal_error",
 )
 MAX_PROGRESS_BYTES = 4096
+MAX_CANCEL_DECISION_BYTES = 4096
+TERMINAL_DECISION_READ_MAX_ATTEMPTS = 3
+TERMINAL_DECISION_READ_RETRY_SECONDS = 0.01
 BRIDGE_ROOT_ENV = "AIWORKHUB_VSCODE_LM_BRIDGE_ROOT"
 DEFAULT_ROOT_REL = Path(".aiworkhub") / "vscode_lm_bridge"
 HOST_TTL_SECONDS = 45
@@ -61,6 +67,8 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 6 * 1024 * 1024
 ATOMIC_JSON_MAX_ATTEMPTS = 2
 _REQUEST_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_REPO_ID_RE = re.compile(r"^repo_[a-f0-9]{32}$")
+_CANCEL_TOKEN_RE = re.compile(r"^[a-f0-9]{64}$")
 _CONTEXT_RECEIPT_PREFIX = "PROJECT_CONTEXT_RECEIPT:"
 SOURCE_GRAPH_WORKFLOW_STAGES: tuple[str, ...] = (
     "orientation", "implementation", "validation", "review", "rework", "unspecified",
@@ -102,6 +110,42 @@ class BridgeError(RuntimeError):
     pass
 
 
+class ProgressReadTransientError(BridgeError):
+    """A progress sidecar read failed in a way that permits one bounded retry."""
+
+
+class TerminalDecisionTransientError(BridgeError):
+    """A terminal decision exists but may still be a just-created legacy file."""
+
+
+def _progress_read_transient_error(
+    operation: str, exc: OSError,
+) -> ProgressReadTransientError:
+    details = [
+        "bridge_progress_read_transient",
+        f"operation={operation}",
+        f"type={type(exc).__name__}",
+    ]
+    if exc.errno is not None:
+        details.append(f"errno={exc.errno}")
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        details.append(f"winerror={winerror}")
+    return ProgressReadTransientError(":".join(details))
+
+
+ProgressFileSignature = tuple[int, int, int, int]
+
+
+def progress_file_signature(metadata: os.stat_result) -> ProgressFileSignature:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_size),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeRequest:
     request_id: str
@@ -109,6 +153,73 @@ class BridgeRequest:
     request_path: Path
     response_path: Path
     worker_spec_path: Path
+    cancel_path: Path
+    cancel_token: str
+
+
+def bridge_request_metadata(request: BridgeRequest) -> dict[str, str]:
+    """Return the exact secret-bearing bridge receipt persisted by the manager."""
+    return {
+        "schema_id": BRIDGE_REQUEST_METADATA_SCHEMA_ID,
+        "request_id": request.request_id,
+        "repo_id": request.repo_id,
+        "request_path": str(request.request_path),
+        "response_path": str(request.response_path),
+        "worker_spec_path": str(request.worker_spec_path),
+        "cancel_path": str(request.cancel_path),
+        "cancel_token": request.cancel_token,
+    }
+
+
+def bridge_request_from_metadata(
+    value: Any,
+    *,
+    expected_request_id: str,
+) -> BridgeRequest:
+    """Rebuild a bridge request only from a path- and identity-bound receipt."""
+    if not isinstance(value, dict) or value.get("schema_id") != BRIDGE_REQUEST_METADATA_SCHEMA_ID:
+        raise BridgeError("bridge_request_metadata_schema_mismatch")
+    request_id = str(value.get("request_id") or "")
+    repo_id = str(value.get("repo_id") or "")
+    cancel_token = str(value.get("cancel_token") or "")
+    if request_id != expected_request_id or not _REQUEST_ID_RE.fullmatch(request_id):
+        raise BridgeError("bridge_request_metadata_request_id_mismatch")
+    if not _REPO_ID_RE.fullmatch(repo_id):
+        raise BridgeError("bridge_request_metadata_repo_id_invalid")
+    if not _CANCEL_TOKEN_RE.fullmatch(cancel_token):
+        raise BridgeError("bridge_request_metadata_cancel_token_invalid")
+    request_path = Path(str(value.get("request_path") or "")).resolve(strict=False)
+    response_path = Path(str(value.get("response_path") or "")).resolve(strict=False)
+    worker_spec_path = Path(str(value.get("worker_spec_path") or "")).resolve(
+        strict=False
+    )
+    cancel_path = Path(str(value.get("cancel_path") or "")).resolve(strict=False)
+    expected_request_path = (
+        bridge_root() / "requests" / repo_id / f"{request_id}.json"
+    ).resolve(strict=False)
+    if request_path != expected_request_path:
+        raise BridgeError("bridge_request_metadata_request_path_mismatch")
+    workspace_home = worker_spec_path.parent
+    if (
+        workspace_home.name != "home"
+        or workspace_home.parent.name != request_id
+        or worker_spec_path.name != ".aiworkhub_vscode_lm_worker.json"
+    ):
+        raise BridgeError("bridge_request_metadata_workspace_mismatch")
+    expected_response_path = (
+        workspace_home / ".aiworkhub_vscode_lm_response.json"
+    ).resolve(strict=False)
+    if response_path != expected_response_path or cancel_path != expected_response_path:
+        raise BridgeError("bridge_request_metadata_decision_path_mismatch")
+    return BridgeRequest(
+        request_id=request_id,
+        repo_id=repo_id,
+        request_path=request_path,
+        response_path=response_path,
+        worker_spec_path=worker_spec_path,
+        cancel_path=cancel_path,
+        cancel_token=cancel_token,
+    )
 
 
 def bridge_root() -> Path:
@@ -455,6 +566,17 @@ def create_request(
     progress_path = workspace_home / ".aiworkhub_vscode_lm_progress.json"
     worker_spec_path = workspace_home / ".aiworkhub_vscode_lm_worker.json"
     request_path = bridge_root() / "requests" / repo_id / f"{request_id}.json"
+    # The response path is also the exclusive terminal arbitration path.  A
+    # complete cancellation receipt and a provider response race on the same
+    # no-replace publication primitive, so both can never be committed.
+    cancel_path = response_path
+    cancel_token = secrets.token_hex(32)
+    try:
+        cancel_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise BridgeError("bridge_cancel_decision_exists")
     allowed = [str(value) for value in allowed_writes]
     parent_baseline = dict(workspace_parent_baseline or {})
     path_contracts: dict[str, dict[str, Any]] = {}
@@ -540,6 +662,8 @@ def create_request(
         "workspace_path": str(workspace_path),
         "workspace_home": str(workspace_home),
         "response_path": str(response_path),
+        "cancel_path": str(cancel_path),
+        "cancel_token": cancel_token,
         "model": model,
         "prompt": prompt,
         "allowed_writes": allowed,
@@ -578,9 +702,9 @@ def create_request(
     context_receipt = ""
     marker = prompt.rfind(_CONTEXT_RECEIPT_PREFIX)
     if marker >= 0:
-        candidate = prompt[marker + len(_CONTEXT_RECEIPT_PREFIX):].lstrip()
+        receipt_candidate = prompt[marker + len(_CONTEXT_RECEIPT_PREFIX):].lstrip()
         try:
-            value, _end = json.JSONDecoder().raw_decode(candidate)
+            value, _end = json.JSONDecoder().raw_decode(receipt_candidate)
             if isinstance(value, dict):
                 context_receipt = _CONTEXT_RECEIPT_PREFIX + " " + json.dumps(
                     value, ensure_ascii=False, sort_keys=True
@@ -593,6 +717,9 @@ def create_request(
         "repo_id": repo_id,
         "workspace_path": str(workspace_path),
         "response_path": str(response_path),
+        "cancel_path": str(cancel_path),
+        "cancel_token": cancel_token,
+        "terminal_decision_required": True,
         "progress_path": str(progress_path),
         "allowed_writes": allowed,
         "create_paths": sorted(create_paths),
@@ -602,42 +729,415 @@ def create_request(
     }
     _atomic_json(worker_spec_path, worker)
     _atomic_json(request_path, shared, allow_owner_claim_move=True)
-    return BridgeRequest(request_id, repo_id, request_path, response_path, worker_spec_path)
+    return BridgeRequest(
+        request_id,
+        repo_id,
+        request_path,
+        response_path,
+        worker_spec_path,
+        cancel_path,
+        cancel_token,
+    )
 
 
-def cancel_request(request: BridgeRequest) -> None:
-    try:
-        request.request_path.unlink()
-    except FileNotFoundError:
-        pass
+PrivateFileIdentity = tuple[int, int, int, int]
 
 
-def _validate_progress_receipt(
+def _private_file_identity(metadata: os.stat_result) -> PrivateFileIdentity:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _is_reparse_metadata(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _validate_private_file_metadata(
+    metadata: os.stat_result,
+    *,
+    max_bytes: int,
+    error_prefix: str,
+) -> None:
+    if _is_reparse_metadata(metadata):
+        raise BridgeError(f"{error_prefix}_reparse")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise BridgeError(f"{error_prefix}_not_regular")
+    if metadata.st_size < 1 or metadata.st_size > max_bytes:
+        raise TerminalDecisionTransientError(f"{error_prefix}_size_invalid")
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None and metadata.st_uid != getuid():
+        raise BridgeError(f"{error_prefix}_foreign_owner")
+    if posix_path_modes_supported() and stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise BridgeError(f"{error_prefix}_insecure_mode")
+
+
+def _read_private_json_snapshot(
     path: Path,
+    *,
+    max_bytes: int,
+    error_prefix: str,
+) -> tuple[dict[str, Any], PrivateFileIdentity]:
+    """Read JSON from one stable owner-only handle and rebind it to the path."""
+    try:
+        initial_metadata = path.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise TerminalDecisionTransientError(
+            f"{error_prefix}_lstat_failed:{type(exc).__name__}:{exc}"
+        ) from exc
+    _validate_private_file_metadata(
+        initial_metadata, max_bytes=max_bytes, error_prefix=error_prefix
+    )
+    flags = os.O_RDONLY
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW"):
+        flags |= int(getattr(os, flag_name, 0))
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise TerminalDecisionTransientError(
+            f"{error_prefix}_open_failed:{type(exc).__name__}:{exc}"
+        ) from exc
+    try:
+        opened_metadata = os.fstat(fd)
+        _validate_private_file_metadata(
+            opened_metadata, max_bytes=max_bytes, error_prefix=error_prefix
+        )
+        initial_identity = _private_file_identity(initial_metadata)
+        opened_identity = _private_file_identity(opened_metadata)
+        if opened_identity != initial_identity:
+            raise TerminalDecisionTransientError(
+                f"{error_prefix}_identity_changed"
+            )
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            try:
+                chunk = os.read(fd, min(remaining, 64 * 1024))
+            except OSError as exc:
+                raise TerminalDecisionTransientError(
+                    f"{error_prefix}_read_failed:{type(exc).__name__}:{exc}"
+                ) from exc
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > max_bytes:
+            raise BridgeError(f"{error_prefix}_too_large")
+        validated_metadata = os.fstat(fd)
+        _validate_private_file_metadata(
+            validated_metadata, max_bytes=max_bytes, error_prefix=error_prefix
+        )
+        validated_identity = _private_file_identity(validated_metadata)
+        if validated_identity != opened_identity:
+            raise TerminalDecisionTransientError(
+                f"{error_prefix}_identity_changed"
+            )
+        try:
+            path_metadata = path.lstat()
+        except OSError as exc:
+            raise TerminalDecisionTransientError(
+                f"{error_prefix}_path_rebind_failed:{type(exc).__name__}:{exc}"
+            ) from exc
+        _validate_private_file_metadata(
+            path_metadata, max_bytes=max_bytes, error_prefix=error_prefix
+        )
+        if _private_file_identity(path_metadata) != validated_identity:
+            raise TerminalDecisionTransientError(
+                f"{error_prefix}_identity_changed"
+            )
+    finally:
+        os.close(fd)
+    try:
+        decoded = raw.decode("utf-8")
+        payload = json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TerminalDecisionTransientError(
+            f"{error_prefix}_invalid_json:{type(exc).__name__}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise BridgeError(f"{error_prefix}_not_object")
+    return payload, validated_identity
+
+
+def _validate_terminal_decision(
+    payload: dict[str, Any],
+    *,
     request_id: str,
     repo_id: str,
+    cancel_token: str,
+) -> str:
+    if (
+        payload.get("schema_id") != RESPONSE_SCHEMA_ID
+        or payload.get("request_id") != request_id
+        or payload.get("repo_id") != repo_id
+    ):
+        raise BridgeError("bridge_terminal_decision_identity_mismatch")
+    decision = payload.get("decision")
+    if not isinstance(decision, dict):
+        raise BridgeError("bridge_terminal_decision_contract_missing")
+    action = str(decision.get("action") or "")
+    token = str(decision.get("cancel_token") or "")
+    if action not in {"cancel", "response"} or not secrets.compare_digest(
+        token, cancel_token
+    ):
+        raise BridgeError("bridge_terminal_decision_contract_mismatch")
+    if action == "cancel" and payload.get("error") != "vscode_lm_request_cancelled":
+        raise BridgeError("bridge_terminal_decision_cancel_error_mismatch")
+    return action
+
+
+def read_terminal_decision(
+    path: Path,
+    *,
+    request_id: str,
+    repo_id: str,
+    cancel_token: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Return one durable response/cancel decision, retrying legacy partial files."""
+    if not _REQUEST_ID_RE.fullmatch(request_id):
+        raise BridgeError("bridge_terminal_decision_request_id_invalid")
+    if not _REPO_ID_RE.fullmatch(repo_id):
+        raise BridgeError("bridge_terminal_decision_repo_id_invalid")
+    if not _CANCEL_TOKEN_RE.fullmatch(cancel_token):
+        raise BridgeError("bridge_terminal_decision_cancel_token_invalid")
+    last_error: TerminalDecisionTransientError | None = None
+    for attempt in range(TERMINAL_DECISION_READ_MAX_ATTEMPTS):
+        try:
+            payload, _identity = _read_private_json_snapshot(
+                path,
+                max_bytes=MAX_REQUEST_BYTES,
+                error_prefix="bridge_terminal_decision",
+            )
+            action = _validate_terminal_decision(
+                payload,
+                request_id=request_id,
+                repo_id=repo_id,
+                cancel_token=cancel_token,
+            )
+            return payload, action
+        except FileNotFoundError:
+            return None
+        except TerminalDecisionTransientError as exc:
+            last_error = exc
+            if attempt + 1 < TERMINAL_DECISION_READ_MAX_ATTEMPTS:
+                time.sleep(TERMINAL_DECISION_READ_RETRY_SECONDS)
+    raise BridgeError(
+        f"bridge_terminal_decision_persistent_invalid:{last_error}"
+    ) from last_error
+
+
+def _remove_unclaimed_request(request: BridgeRequest) -> bool:
+    """Move then remove only the exact authenticated request snapshot."""
+    last_error: TerminalDecisionTransientError | None = None
+    for attempt in range(TERMINAL_DECISION_READ_MAX_ATTEMPTS):
+        try:
+            payload, identity = _read_private_json_snapshot(
+                request.request_path,
+                max_bytes=MAX_REQUEST_BYTES,
+                error_prefix="bridge_cancel_request",
+            )
+            break
+        except FileNotFoundError:
+            return False
+        except TerminalDecisionTransientError as exc:
+            last_error = exc
+            if attempt + 1 < TERMINAL_DECISION_READ_MAX_ATTEMPTS:
+                time.sleep(TERMINAL_DECISION_READ_RETRY_SECONDS)
+    else:
+        raise BridgeError(
+            f"bridge_cancel_request_persistent_invalid:{last_error}"
+        ) from last_error
+    if (
+        payload.get("schema_id") != REQUEST_SCHEMA_ID
+        or payload.get("request_id") != request.request_id
+        or payload.get("repo_id") != request.repo_id
+        or not secrets.compare_digest(
+            str(payload.get("cancel_token") or ""), request.cancel_token
+        )
+    ):
+        raise BridgeError("bridge_cancel_request_identity_mismatch")
+    quarantine_path = request.request_path.with_name(
+        f".{request.request_path.name}.cancel-{secrets.token_hex(16)}"
+    )
+    try:
+        os.rename(request.request_path, quarantine_path)
+    except FileNotFoundError:
+        return False
+    quarantine_metadata = quarantine_path.lstat()
+    if (
+        _is_reparse_metadata(quarantine_metadata)
+        or _private_file_identity(quarantine_metadata) != identity
+    ):
+        # Preserve the unexpected object for diagnosis. Never follow or unlink it.
+        raise BridgeError("bridge_cancel_request_quarantined_identity_changed")
+    final_metadata = quarantine_path.lstat()
+    if _private_file_identity(final_metadata) != identity:
+        raise BridgeError("bridge_cancel_request_quarantined_identity_changed")
+    quarantine_path.unlink()
+    return True
+
+
+def _publish_cancel_decision(request: BridgeRequest) -> bool:
+    payload = {
+        "schema_id": RESPONSE_SCHEMA_ID,
+        "request_id": request.request_id,
+        "repo_id": request.repo_id,
+        "model": {},
+        "text": "",
+        "error": "vscode_lm_request_cancelled",
+        "diagnostics": {
+            "phase": "cancelled",
+            "action": "cancel",
+            "cancel_token": request.cancel_token,
+        },
+        "decision": {
+            "action": "cancel",
+            "cancel_token": request.cancel_token,
+        },
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    if len(encoded) > MAX_CANCEL_DECISION_BYTES:
+        raise BridgeError("bridge_cancel_decision_too_large")
+    parent = request.cancel_path.parent
+    parent_before = parent.lstat()
+    if not stat.S_ISDIR(parent_before.st_mode) or stat.S_ISLNK(parent_before.st_mode):
+        raise BridgeError("bridge_cancel_parent_invalid")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{request.cancel_path.name}.cancel-",
+        suffix=".tmp",
+        dir=parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        initial_temp_metadata = os.fstat(fd)
+        if (
+            posix_path_modes_supported()
+            and stat.S_IMODE(initial_temp_metadata.st_mode) != 0o600
+        ):
+            chmod_fd(fd, 0o600)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("bridge_cancel_decision_short_write")
+            view = view[written:]
+        os.fsync(fd)
+        temp_metadata = os.fstat(fd)
+        if not stat.S_ISREG(temp_metadata.st_mode):
+            raise BridgeError("bridge_cancel_temp_not_regular")
+        parent_after = parent.lstat()
+        if (
+            parent_after.st_dev != parent_before.st_dev
+            or parent_after.st_ino != parent_before.st_ino
+        ):
+            raise BridgeError("bridge_cancel_parent_changed")
+        try:
+            os.link(temp_path, request.cancel_path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def cancel_request(request: BridgeRequest) -> str:
+    """Remove an unclaimed request or cancel its claimed provider invocation.
+
+    The response path itself is the cross-process commit point.  Cancellation
+    publishes a complete, authenticated cancellation response with no-replace
+    semantics.  The extension publishes a complete provider response through
+    the same primitive; whichever wins is final and cannot be overwritten.
+    """
+    if _remove_unclaimed_request(request):
+        return "removed"
+    decision = read_terminal_decision(
+        request.cancel_path,
+        request_id=request.request_id,
+        repo_id=request.repo_id,
+        cancel_token=request.cancel_token,
+    )
+    if decision is None and _publish_cancel_decision(request):
+        return "cancelled"
+    if decision is None:
+        decision = read_terminal_decision(
+            request.cancel_path,
+            request_id=request.request_id,
+            repo_id=request.repo_id,
+            cancel_token=request.cancel_token,
+        )
+    if decision is None:
+        raise BridgeError("bridge_terminal_decision_missing_after_race")
+    _payload, action = decision
+    return "cancelled" if action == "cancel" else "completed"
+
+
+def _validate_progress_metadata(
+    metadata: os.stat_result,
     *,
     owner_uid: int | None = None,
-    previous_sequence: int | None = None,
-) -> dict[str, Any]:
-    """Validate one bounded progress snapshot without treating it as completion."""
-    if not _REQUEST_ID_RE.fullmatch(request_id):
-        raise BridgeError("bridge_progress_request_id_invalid")
-    if path.is_symlink():
+) -> None:
+    """Fail closed for a progress file that is not a private regular file."""
+    if stat.S_ISLNK(metadata.st_mode):
         raise BridgeError("bridge_progress_symlink")
-    if not path.is_file():
+    if not stat.S_ISREG(metadata.st_mode):
         raise BridgeError("bridge_progress_not_file")
-    metadata = path.stat()
     if metadata.st_size > MAX_PROGRESS_BYTES:
         raise BridgeError("bridge_progress_too_large")
     if owner_uid is not None and metadata.st_uid != owner_uid:
         raise BridgeError("bridge_progress_foreign_owner")
     if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
         raise BridgeError("bridge_progress_insecure_mode")
+
+
+def _validate_progress_receipt(
+    raw_payload: bytes,
+    request_id: str,
+    repo_id: str,
+    *,
+    previous_sequence: int | None = None,
+) -> dict[str, Any]:
+    """Validate one bounded progress snapshot without treating it as completion."""
+    if not _REQUEST_ID_RE.fullmatch(request_id):
+        raise BridgeError("bridge_progress_request_id_invalid")
+    if len(raw_payload) > MAX_PROGRESS_BYTES:
+        raise BridgeError("bridge_progress_too_large")
+    payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        raise BridgeError("bridge_progress_invalid_json") from None
+        payload_text = raw_payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BridgeError(
+            "bridge_progress_invalid_json:"
+            f"utf8_offset={exc.start}:bytes={len(raw_payload)}:sha256={payload_sha256}"
+        ) from None
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(
+            "bridge_progress_invalid_json:"
+            f"line={exc.lineno}:column={exc.colno}:"
+            f"bytes={len(raw_payload)}:sha256={payload_sha256}"
+        ) from None
     if not isinstance(payload, dict):
         raise BridgeError("bridge_progress_not_object")
     if payload.get("schema_id") != PROGRESS_RECEIPT_SCHEMA_ID:
@@ -663,6 +1163,100 @@ def _validate_progress_receipt(
     return payload
 
 
+def _read_progress_fd(fd: int) -> bytes:
+    """Read one bounded snapshot from an already-open progress file handle."""
+    chunks: list[bytes] = []
+    remaining = MAX_PROGRESS_BYTES + 1
+    while remaining > 0:
+        try:
+            chunk = os.read(fd, remaining)
+        except OSError as exc:
+            raise _progress_read_transient_error("read", exc) from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > MAX_PROGRESS_BYTES:
+        raise BridgeError("bridge_progress_too_large")
+    return payload
+
+
+def read_progress_receipt_snapshot(
+    path: Path,
+    request_id: str,
+    repo_id: str,
+    *,
+    owner_uid: int | None = None,
+    previous_sequence: int | None = None,
+) -> tuple[dict[str, Any], ProgressFileSignature | None]:
+    """Return one validated receipt and the signature of that exact snapshot."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {}, None
+    except OSError as exc:
+        raise _progress_read_transient_error("lstat", exc) from exc
+    _validate_progress_metadata(metadata, owner_uid=owner_uid)
+
+    flags = os.O_RDONLY
+    for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW"):
+        flags |= int(getattr(os, flag_name, 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise _progress_read_transient_error("open", exc) from exc
+
+    try:
+        try:
+            opened_metadata = os.fstat(fd)
+        except OSError as exc:
+            raise _progress_read_transient_error("fstat", exc) from exc
+        _validate_progress_metadata(opened_metadata, owner_uid=owner_uid)
+        initial_signature = progress_file_signature(metadata)
+        opened_signature = progress_file_signature(opened_metadata)
+        if opened_signature != initial_signature:
+            raise ProgressReadTransientError(
+                "bridge_progress_snapshot_changed:"
+                f"initial={initial_signature}:opened={opened_signature}"
+            )
+
+        raw_payload = _read_progress_fd(fd)
+        try:
+            validated_metadata = os.fstat(fd)
+        except OSError as exc:
+            raise _progress_read_transient_error("post_read_fstat", exc) from exc
+        _validate_progress_metadata(validated_metadata, owner_uid=owner_uid)
+        validated_signature = progress_file_signature(validated_metadata)
+        if validated_signature != opened_signature:
+            raise ProgressReadTransientError(
+                "bridge_progress_snapshot_changed:"
+                f"opened={opened_signature}:validated={validated_signature}"
+            )
+        try:
+            path_metadata = path.lstat()
+        except OSError as exc:
+            raise _progress_read_transient_error("post_read_lstat", exc) from exc
+        if stat.S_ISLNK(path_metadata.st_mode):
+            raise ProgressReadTransientError("bridge_progress_snapshot_changed:path=symlink")
+        path_signature = progress_file_signature(path_metadata)
+        if path_signature != validated_signature:
+            raise ProgressReadTransientError(
+                "bridge_progress_snapshot_changed:"
+                f"validated={validated_signature}:path={path_signature}"
+            )
+    finally:
+        os.close(fd)
+
+    payload = _validate_progress_receipt(
+        raw_payload,
+        request_id,
+        repo_id,
+        previous_sequence=previous_sequence,
+    )
+    return payload, validated_signature
+
+
 def read_progress_receipt(
     path: Path,
     request_id: str,
@@ -672,12 +1266,11 @@ def read_progress_receipt(
     previous_sequence: int | None = None,
 ) -> dict[str, Any]:
     """Return no-progress for an absent sidecar; fail closed for an unsafe one."""
-    if not path.exists() and not path.is_symlink():
-        return {}
-    return _validate_progress_receipt(
+    payload, _signature = read_progress_receipt_snapshot(
         path,
         request_id,
         repo_id,
         owner_uid=owner_uid,
         previous_sequence=previous_sequence,
     )
+    return payload

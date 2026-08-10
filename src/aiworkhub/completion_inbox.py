@@ -408,6 +408,34 @@ def _is_operational_finalization_failure(entry: dict[str, Any]) -> bool:
     )
 
 
+def _is_operational_worker_failure(entry: dict[str, Any]) -> bool:
+    """Precise operational predicate for blocked ``worker_failed`` cards.
+
+    Returns True only when the entry is ``worker_failed`` AND the recorded
+    error carries a supervisor/process infrastructure signature (e.g.
+    ``supervisor_incomplete:state=running:rc=None``). Ordinary provider/user
+    errors -- monthly credit limits, quota exhaustion, model refusals -- are
+    NOT AIWorkHub operational failures and are excluded from
+    ``operational_failures``.
+    """
+    if str(entry.get("terminal_substatus") or "") != "worker_failed":
+        return False
+    error = str(entry.get("operational_error") or "")
+    _supervisor_process_markers = (
+        "supervisor_incomplete:",
+        "supervisor_incomplete_",
+        "supervisor_crashed:",
+        "supervisor_died:",
+        "supervisor_missing:",
+        "supervisor_aborted:",
+        "supervisor_unreachable:",
+        "process_missing:",
+        "process_crashed:",
+        "process_unreachable:",
+    )
+    return any(marker in error for marker in _supervisor_process_markers)
+
+
 def _stale_processing_entry(
     card: dict[str, Any],
     mismatch: str,
@@ -535,7 +563,11 @@ def build_completion_inbox(
     }
     for card in cards_by_status.get("blocked", []):
         entry = _compact_blocked_entry(card, _runner_task_batch_mismatch(card))
-        if entry.get("terminal_substatus") != "finalize_failed":
+        terminal_sub = entry.get("terminal_substatus")
+        if (
+            terminal_sub != "finalize_failed"
+            and not _is_operational_worker_failure(entry)
+        ):
             continue
         key = (entry.get("task_id"), entry.get("request_id"))
         if key in _blocked_failure_keys:

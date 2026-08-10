@@ -303,6 +303,15 @@ def test_successful_readonly_research_reaches_review_ready(
         or {"ok": True},
     )
     monkeypatch.setattr(manager, "_record_usage", lambda *_a, **_k: ({}, False, ""))
+    # This test owns the read-only result/finalization contract, not the
+    # separately covered VS Code LM cancellation transport. Production launch
+    # metadata always carries a token-bound bridge receipt; this synthetic
+    # fixture intentionally does not construct one.
+    monkeypatch.setattr(
+        manager,
+        "_publish_bridge_cancellation_before_finalization",
+        lambda *_args, **_kwargs: "",
+    )
     manager._append_event(
         {
             "request_id": REQUEST_ID,

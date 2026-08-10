@@ -5,6 +5,25 @@ const path = require("path");
 const Module = require("module");
 
 const extensionPath = path.resolve(__dirname, "..", "extension.js");
+const fakeCancellationSources = [];
+class FakeCancellationTokenSource {
+  constructor() {
+    let resolveCancellation;
+    const cancelled = new Promise((resolve) => { resolveCancellation = resolve; });
+    this.token = { isCancellationRequested: false, cancelled };
+    this.cancelCount = 0;
+    this._resolveCancellation = resolveCancellation;
+    fakeCancellationSources.push(this);
+  }
+  cancel() {
+    this.cancelCount += 1;
+    if (!this.token.isCancellationRequested) {
+      this.token.isCancellationRequested = true;
+      this._resolveCancellation();
+    }
+  }
+  dispose() {}
+}
 const fakeVscode = {
   workspace: { workspaceFolders: [], getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
   LanguageModelChatToolMode: { Auto: 1, Required: 2 },
@@ -15,6 +34,7 @@ const fakeVscode = {
     User: (content) => ({ role: "user", content }),
     Assistant: (content) => ({ role: "assistant", content }),
   },
+  CancellationTokenSource: FakeCancellationTokenSource,
 };
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
@@ -80,6 +100,11 @@ assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).include
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"file_path":"repo/relative/path"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("absence of native toolCalling does not mean tools are unavailable"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("never report that MCP/callable tools are missing"));
+const nf97Prompt = internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]);
+assert.ok(nf97Prompt.includes("complete, substantive replacement"));
+assert.ok(nf97Prompt.includes("Every path_contract whose action is create MUST appear"));
+assert.ok(!nf97Prompt.includes('"summary":"..."'));
+assert.ok(!nf97Prompt.includes('"new":"replacement code only"'));
 assert.strictEqual(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -109,6 +134,237 @@ assert.match(
     creates: [],
   }, ["src/*.py"]),
   /final_hash_invalid/,
+);
+
+for (const sentinel of ["…", "replacement code only", "file content", "TODO", "# FIXME", "implementation omitted"]) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "actual change",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: sentinel }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    /final_edit_fidelity_rejected/,
+  );
+}
+let deeplyNestedSentinel = "replacement code only";
+for (let depth = 0; depth < 8; depth += 1) {
+  const fence = depth % 2 === 0 ? "```" : "~~~";
+  deeplyNestedSentinel = `${fence}\n${deeplyNestedSentinel}\n${fence}`;
+}
+for (const wrappedSentinel of [
+  "```text\nreplacement code only\n```",
+  "```\n...\n```",
+  "```\nreplacement code only\n````",
+  "```python title=generated replacement\nfile content\n```",
+  "~~~text title=generated replacement\nTODO\n~~~~",
+  "```text\nreplacement code only\n   ```",
+  "~~~text\nfile content\n  ~~~",
+  "   ```text\nreplacement code only\n   ````",
+  "  ~~~text\nfile content\n ~~~~",
+  "```text\r\nreplacement code only\r\n   ```",
+  deeplyNestedSentinel,
+  "/* file content */",
+  "<!-- implementation omitted -->",
+  "/// FIXME: implement this",
+  "// …",
+  "．．．",
+  "ｒｅｐｌａｃｅｍｅｎｔ　ｃｏｄｅ　ｏｎｌｙ",
+]) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "actual change",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: wrappedSentinel }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    /final_edit_fidelity_rejected/,
+  );
+}
+for (const nonWrapperFence of [
+  "    ```text\nreplacement code only\n```",
+  "```text\nreplacement code only\n    ```",
+  "```text\nreplacement code only\n~~~",
+  "````text\nreplacement code only\n```",
+  "<!--\n    ```text\nreplacement code only\n```\n-->",
+]) {
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "literal non-wrapper fence content",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: nonWrapperFence }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    "",
+  );
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "possible abstract stub",
+    edits: [{
+      path: "src/app.py",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 1, new: "..." }],
+    }],
+    creates: [],
+  }, ["src/*.py"]),
+  "",
+);
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "document markers",
+    edits: [{
+      path: "src/app.js",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 2, new: 'const note = "TODO";\n// FIXME is supported documentation\nreturn note;' }],
+    }],
+    creates: [],
+  }, ["src/*.js"]),
+  "",
+);
+for (const substantiveFence of [
+  "```python title=reviewed replacement\n# TODO is documented\nreturn 1\n   ````",
+  "  ~~~python title=reviewed replacement\n# TODO is documented\nreturn 1\n ~~~~",
+  "   ```python title=reviewed replacement\r\n# TODO is documented\r\nreturn 1\r\n  ```",
+]) {
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "substantive fenced code",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 2, new: substantiveFence }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    "",
+  );
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "inline fence text",
+    edits: [{
+      path: "src/app.py",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 2, new: 'const marker = "```not a whole fence```";\nreturn marker;' }],
+    }],
+    creates: [],
+  }, ["src/*.py"]),
+  "",
+);
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "type stub",
+    edits: [{
+      path: "src/api.pyi",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 1, new: "..." }],
+    }],
+    creates: [],
+  }, ["src/*.pyi"]),
+  "",
+);
+const requiredCreateContract = {
+  "tests/new.py": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+};
+const requiredCreateCases = [
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "missing v1", files: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "empty v1", files: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "valid v1", files: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "missing v2", edits: [], creates: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "empty v2", edits: [], creates: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "valid v2", edits: [], creates: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "missing v3", edits: [], creates: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "empty v3", edits: [], creates: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "valid v3", edits: [], creates: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+];
+for (const createCase of requiredCreateCases) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope(createCase.missing, ["tests/*.py"], requiredCreateContract),
+    /missing_required_create/,
+  );
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope(createCase.empty, ["tests/*.py"], requiredCreateContract),
+    /empty_required_create/,
+  );
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope(createCase.valid, ["tests/*.py"], requiredCreateContract),
+    "",
+  );
+}
+const pyiCreateContract = {
+  "tests/new.pyi": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+};
+const pyiCreateCases = [
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1,
+    summary: "v1 pyi create",
+    files: [{ path: "tests\\new.pyi", content }],
+  }),
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2,
+    summary: "v2 pyi create",
+    edits: [],
+    creates: [{ path: "tests/new.pyi", content }],
+  }),
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "v3 pyi create",
+    edits: [],
+    creates: [{ path: "tests/new.pyi", content }],
+  }),
+];
+for (const makePyiCreate of pyiCreateCases) {
+  for (const ellipsis of ["...", "…", "．．．"]) {
+    assert.match(
+      internals.validateVscodeLmFinalEnvelope(
+        makePyiCreate(ellipsis), ["tests/*.pyi"], pyiCreateContract,
+      ),
+      /ellipsis_only/,
+    );
+  }
+  for (const wrappedEmpty of [
+    "```python title=generated stub\n\n````",
+    "~~~text title=generated stub\n\n~~~~",
+  ]) {
+    assert.match(
+      internals.validateVscodeLmFinalEnvelope(
+        makePyiCreate(wrappedEmpty), ["tests/*.pyi"], pyiCreateContract,
+      ),
+      /empty_required_create/,
+    );
+  }
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope(
+    pyiCreateCases[0]("class Created:\n    value: int\n"),
+    ["tests/*.pyi"],
+    pyiCreateContract,
+  ),
+  "",
 );
 
 async function textProtocolChecks() {
@@ -366,6 +622,83 @@ async function textProtocolChecks() {
   );
   assert.strictEqual(correctedResult, finalResponse);
 
+  const editContract = {
+    "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+  };
+  const staleV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "stale v3",
+    edits: [{ path: "src/app.py", current_sha256: "b".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: "stale" }] }],
+    creates: [],
+  });
+  const freshV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "fresh v3",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: "fresh" }] }],
+    creates: [],
+  });
+  const v3HashTurns = [staleV3, freshV3];
+  const v3HashMessages = [];
+  const v3HashModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      v3HashMessages.push(JSON.stringify(messages));
+      return { stream: (async function* stream() { yield { value: v3HashTurns.shift() }; }()) };
+    },
+  };
+  const v3HashResult = await internals.runVscodeLmTextProtocol(
+    v3HashModel,
+    {
+      prompt: "bounded hash retry",
+      allowedWrites: ["src/app.py"],
+      path_contracts: editContract,
+      initial_source_graph_request: { mode: "focus", query: "hash contract" },
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+  );
+  assert.strictEqual(v3HashResult, freshV3);
+  assert.strictEqual(v3HashMessages.length, 2);
+  assert.ok(v3HashMessages[1].includes("final_hash_stale:src/app.py"));
+
+  const copiedSentinelV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "attempted bounded change",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: deeplyNestedSentinel }] }],
+    creates: [],
+  });
+  const substantiveV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "implemented bounded change",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: "return 2" }] }],
+    creates: [],
+  });
+  const fidelityTurns = [copiedSentinelV3, substantiveV3];
+  const fidelityMessages = [];
+  const fidelityModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      fidelityMessages.push(JSON.stringify(messages));
+      return { stream: (async function* stream() { yield { value: fidelityTurns.shift() }; }()) };
+    },
+  };
+  const fidelityResult = await internals.runVscodeLmTextProtocol(
+    fidelityModel,
+    {
+      prompt: "bounded fidelity retry",
+      allowedWrites: ["src/app.py"],
+      path_contracts: editContract,
+      initial_source_graph_request: { mode: "focus", query: "fidelity contract" },
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+  );
+  assert.strictEqual(fidelityResult, substantiveV3);
+  assert.strictEqual(fidelityMessages.length, 2);
+  assert.ok(fidelityMessages[1].includes("final_edit_fidelity_rejected"));
+
   const invalidThenFinal = ["I should inspect the project first.", finalResponse];
   const recoveringTextModel = {
     capabilities: { toolCalling: false },
@@ -507,6 +840,24 @@ async function permissionPersistenceChecks() {
   assert.strictEqual(host.modelAccessState(exact), "granted_remembered");
   assert.strictEqual(await host.ensurePermission(exact), true);
   assert.strictEqual(prompts, 1, "explicit approval must survive provider failure/retry");
+
+  let resolvePrompt;
+  fakeVscode.window.showInformationMessage = () => new Promise((resolve) => { resolvePrompt = resolve; });
+  const cancelledRemembered = new Map();
+  const cancelledHost = new internals.VscodeLmBridgeHost({
+    globalState: {
+      get: (key, fallback) => cancelledRemembered.has(key) ? cancelledRemembered.get(key) : fallback,
+      update: async (key, value) => { cancelledRemembered.set(key, value); },
+    },
+  });
+  const permissionSource = new FakeCancellationTokenSource();
+  const permission = cancelledHost.ensurePermission(exact, permissionSource.token);
+  await new Promise((resolve) => setImmediate(resolve));
+  permissionSource.cancel();
+  await assert.rejects(permission, /vscode_lm_request_cancelled/);
+  resolvePrompt("Allow VS Code models");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(cancelledRemembered.size, 0, "cancelled permission must not persist later approval");
 }
 
 async function boundedParallelBridgeChecks() {
@@ -614,6 +965,47 @@ async function nativeProtocolChecks() {
   assert.strictEqual(nativePrefetchCalls.length, 0);
   assert.ok(String(nativePrefetchMessages[0][0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
   assert.strictEqual(nativePrefetchOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
+
+  const editContract = {
+    "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+  };
+  const staleV2 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2,
+    summary: "stale v2",
+    edits: [{ path: "src/app.py", current_sha256: "b".repeat(64), replacements: [{ old: "before", new: "stale", expected_count: 1 }] }],
+    creates: [],
+  });
+  const freshV2 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2,
+    summary: "fresh v2",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), replacements: [{ old: "before", new: "fresh", expected_count: 1 }] }],
+    creates: [],
+  });
+  const v2HashTurns = [staleV2, freshV2];
+  const v2HashMessages = [];
+  const v2HashModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (messages) => {
+      v2HashMessages.push(JSON.stringify(messages));
+      const value = v2HashTurns.shift();
+      return { stream: (async function* stream() { yield { value }; }()) };
+    },
+  };
+  const v2HashResult = await internals.runVscodeLmAgent(
+    v2HashModel,
+    {
+      requestId: "7".repeat(32),
+      prompt: "bounded hash retry",
+      allowedWrites: ["src/app.py"],
+      path_contracts: editContract,
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+  );
+  assert.strictEqual(v2HashResult, freshV2);
+  assert.strictEqual(v2HashMessages.length, 2);
+  assert.ok(v2HashMessages[1].includes("final_hash_stale:src/app.py"));
 
   let reviewTurn = 0;
   const readOnlyNativeFinal = JSON.stringify({
@@ -768,6 +1160,9 @@ async function main() {
   const allowed = ["src/*.py", "tests/*.py"];
   const contracts = {
     "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+  };
+  const contractsWithCreate = {
+    ...contracts,
     "tests/new.py": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
   };
   const repaired = {
@@ -778,6 +1173,16 @@ async function main() {
   };
   assert.strictEqual(internals.validateVscodeLmFinalEnvelope(repaired, allowed, contracts), "");
   assert.strictEqual(repaired.edits[0].current_sha256, "a".repeat(64));
+  const hashRetry = {
+    ...repaired,
+    edits: [{ path: "src/app.py", current_sha256: "b".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: "fixed" }] }],
+  };
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope(hashRetry, allowed, contracts),
+    "final_hash_stale:src/app.py",
+  );
+  hashRetry.edits[0].current_sha256 = "a".repeat(64);
+  assert.strictEqual(internals.validateVscodeLmFinalEnvelope(hashRetry, allowed, contracts), "");
   assert.match(internals.validateVscodeLmFinalEnvelope({
     ...repaired,
     edits: [{ path: "src/app.py", current_sha256: "bad", ranges: [{ start_line: 3, end_line: 3, new: "bad" }] }],
@@ -786,7 +1191,7 @@ async function main() {
     schema_id: schema, summary: "wrong action",
     edits: [{ path: "tests/new.py", current_sha256: "b".repeat(64), ranges: [{ start_line: 1, end_line: 1, new: "bad" }] }],
     creates: [],
-  }, allowed, contracts), /final_action_mismatch/);
+  }, allowed, contractsWithCreate), /final_action_mismatch/);
   assert.match(internals.validateVscodeLmFinalEnvelope({
     schema_id: schema, summary: "wrong create", edits: [],
     creates: [{ path: "src/app.py", content: "bad\n" }],
@@ -802,6 +1207,385 @@ async function main() {
   await permissionPersistenceChecks();
   await boundedParallelBridgeChecks();
   await progressReceiptChecks();
+  await claimedCancellationChecks();
+  await cancellationToolBoundaryChecks();
+}
+
+async function cancellationToolBoundaryChecks() {
+  const toolEnvelope = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_manager_session_current_state",
+    input: { limit: 1 },
+  });
+  const request = {
+    requestId: "9".repeat(32),
+    request_kind: "worker",
+    prompt: "Cancellation boundary test.",
+    allowedWrites: [],
+    path_contracts: {},
+    initial_source_graph_request: { mode: "focus", query: "cancel boundary", workflow_stage: "orientation" },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+  };
+
+  const textToken = { isCancellationRequested: false };
+  let textToolCalls = 0;
+  const textModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() {
+        yield { value: toolEnvelope };
+        textToken.isCancellationRequested = true;
+      }()),
+    }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      textModel,
+      request,
+      textToken,
+      async () => { textToolCalls += 1; return { ok: true }; },
+    ),
+    /vscode_lm_request_cancelled/,
+  );
+  assert.strictEqual(textToolCalls, 0);
+
+  const afterToolToken = { isCancellationRequested: false };
+  let afterToolCalls = 0;
+  const afterToolModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: toolEnvelope }; }()),
+    }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      afterToolModel,
+      request,
+      afterToolToken,
+      async () => {
+        afterToolCalls += 1;
+        afterToolToken.isCancellationRequested = true;
+        return { ok: true };
+      },
+    ),
+    /vscode_lm_request_cancelled/,
+  );
+  assert.strictEqual(afterToolCalls, 1);
+
+  const nativeToken = { isCancellationRequested: false };
+  let nativeToolCalls = 0;
+  const nativeModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => ({
+      stream: (async function* stream() {
+        nativeToken.isCancellationRequested = true;
+        yield { callId: "cancel-native", name: "aiworkhub_manager_session_current_state", input: { limit: 1 } };
+      }()),
+    }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      nativeModel,
+      request,
+      nativeToken,
+      async () => { nativeToolCalls += 1; return { ok: true }; },
+    ),
+    /vscode_lm_request_cancelled/,
+  );
+  assert.strictEqual(nativeToolCalls, 0);
+
+  const ignoredToolSource = new FakeCancellationTokenSource();
+  let ignoredToolStartedResolve;
+  const ignoredToolStarted = new Promise((resolve) => { ignoredToolStartedResolve = resolve; });
+  let ignoredToolResolve;
+  const ignoredTool = new Promise((resolve) => { ignoredToolResolve = resolve; });
+  let ignoredToolTurns = 0;
+  const ignoredToolModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: toolEnvelope }; }()),
+    }),
+  };
+  const ignoredRun = internals.runVscodeLmTextProtocol(
+    ignoredToolModel,
+    request,
+    ignoredToolSource.token,
+    async () => {
+      ignoredToolStartedResolve();
+      return ignoredTool;
+    },
+    () => { ignoredToolTurns += 1; },
+  );
+  await ignoredToolStarted;
+  ignoredToolSource.cancel();
+  await assert.rejects(ignoredRun, /vscode_lm_request_cancelled/);
+  ignoredToolResolve({ ok: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(ignoredToolTurns, 0, "late tool result must not emit a tool-turn side effect");
+}
+
+function bridgeRequestFixture(root, repoInfo, requestId, cancelToken) {
+  const requestDir = path.join(root, "requests", repoInfo.repoId);
+  const requestPath = path.join(requestDir, `${requestId}.json`);
+  const workspacePath = path.join(root, "workspaces", requestId, "worktree");
+  const workspaceHome = path.join(root, "workspaces", requestId, "home");
+  fs.mkdirSync(workspacePath, { recursive: true });
+  fs.mkdirSync(workspaceHome);
+  const responsePath = path.join(workspaceHome, ".aiworkhub_vscode_lm_response.json");
+  const progressPath = path.join(workspaceHome, ".aiworkhub_vscode_lm_progress.json");
+  const cancelPath = responsePath;
+  internals.atomicWriteOwnerJson(requestPath, {
+    schema_id: internals.constants.VSCODE_LM_REQUEST_SCHEMA,
+    request_id: requestId,
+    repo_id: repoInfo.repoId,
+    repo_root: repoInfo.root,
+    workspace_path: workspacePath,
+    workspace_home: workspaceHome,
+    response_path: responsePath,
+    progress_path: progressPath,
+    cancel_path: cancelPath,
+    cancel_token: cancelToken,
+    model: "glm-5.2",
+    prompt: "Bounded cancellation bridge test.",
+    request_kind: "worker",
+    allowed_writes: [],
+    path_contracts: {},
+    initial_source_graph_request: { mode: "focus", query: "cancellation bridge", workflow_stage: "orientation" },
+    initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    deadline: new Date(Date.now() + 60000).toISOString(),
+  });
+  return { requestPath, responsePath, progressPath, cancelPath, cancelToken, requestId };
+}
+
+function publishCancelDecision(request, repoInfo) {
+  internals.atomicWriteOwnerJson(request.cancelPath, {
+    schema_id: internals.constants.VSCODE_LM_RESPONSE_SCHEMA,
+    request_id: request.requestId,
+    repo_id: repoInfo.repoId,
+    model: {},
+    text: "",
+    error: "vscode_lm_request_cancelled",
+    diagnostics: { phase: "cancelled", action: "cancel", cancel_token: request.cancelToken },
+    decision: { action: "cancel", cancel_token: request.cancelToken },
+    completed_at: new Date().toISOString(),
+  });
+}
+
+async function claimedCancellationChecks() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-claimed-cancel-"));
+  const previousRoot = process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+  process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = root;
+  try {
+    const repoInfo = { root: path.join(root, "repo"), repoId: `repo_${"c".repeat(32)}` };
+    fs.mkdirSync(repoInfo.root);
+    const host = new internals.VscodeLmBridgeHost({
+      globalState: { get: () => true, update: async () => {} },
+    });
+    host.repoInfo = { ...repoInfo };
+    host.ensurePermission = async () => true;
+
+    const partial = bridgeRequestFixture(root, repoInfo, "1".repeat(32), "1".repeat(64));
+    fs.writeFileSync(partial.responsePath, "{", { mode: 0o600 });
+    const partialState = { invalidReads: 0 };
+    assert.deepStrictEqual(
+      internals.readVscodeLmCancelDecision({ ...partial, repo_id: repoInfo.repoId }, partialState),
+      { action: "pending" },
+    );
+    assert.deepStrictEqual(
+      internals.readVscodeLmCancelDecision({ ...partial, repo_id: repoInfo.repoId }, partialState),
+      { action: "pending" },
+    );
+    assert.throws(
+      () => internals.readVscodeLmCancelDecision({ ...partial, repo_id: repoInfo.repoId }, partialState),
+      /vscode_lm_cancel_decision_persistent_invalid_json/,
+    );
+    assert.strictEqual(fs.readFileSync(partial.responsePath, "utf8"), "{");
+    fs.unlinkSync(partial.responsePath);
+    fs.unlinkSync(partial.requestPath);
+
+    const cancelled = bridgeRequestFixture(root, repoInfo, "5".repeat(32), "a".repeat(64));
+    let providerStartedResolve;
+    const providerStarted = new Promise((resolve) => { providerStartedResolve = resolve; });
+    const blockingModel = {
+      ...exact,
+      sendRequest: async (_messages, _options, token) => {
+        providerStartedResolve();
+        return {
+          stream: (async function* stream() {
+            await token.cancelled;
+            throw new Error("provider_cancelled_by_test");
+          }()),
+        };
+      },
+    };
+    host.models = async () => [blockingModel];
+    const cancelStartIndex = fakeCancellationSources.length;
+    const cancelledPoll = host.poll();
+    await Promise.race([
+      providerStarted,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("provider_start_timeout")), 2000)),
+    ]);
+    publishCancelDecision(cancelled, repoInfo);
+    await cancelledPoll;
+    assert.strictEqual(JSON.parse(fs.readFileSync(cancelled.responsePath, "utf8")).error, "vscode_lm_request_cancelled");
+    assert.ok(fakeCancellationSources.slice(cancelStartIndex).some((source) => source.cancelCount > 0));
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(cancelled.requestPath)), []);
+
+    const forgedReceipt = path.join(path.dirname(cancelled.responsePath), "forged-response.json");
+    fs.copyFileSync(cancelled.responsePath, forgedReceipt);
+    const originalOpenSync = fs.openSync;
+    fs.openSync = (filePath, flags, ...args) => (
+      path.resolve(String(filePath)) === path.resolve(cancelled.responsePath)
+        ? originalOpenSync(forgedReceipt, flags, ...args)
+        : originalOpenSync(filePath, flags, ...args)
+    );
+    try {
+      assert.throws(
+        () => internals.readVscodeLmCancelDecision({ ...cancelled, repo_id: repoInfo.repoId }),
+        /vscode_lm_cancel_decision_identity_changed/,
+      );
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.unlinkSync(forgedReceipt);
+    }
+
+    // A cancellation that lands after provider completion but before response
+    // publication still wins the exclusive decision race.
+    const raced = bridgeRequestFixture(root, repoInfo, "6".repeat(32), "b".repeat(64));
+    const finalResponse = JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "no changes",
+      edits: [],
+      creates: [],
+    });
+    const raceModel = {
+      ...exact,
+      sendRequest: async () => ({
+        stream: (async function* stream() {
+          publishCancelDecision(raced, repoInfo);
+          yield { value: finalResponse };
+        }()),
+      }),
+    };
+    host.models = async () => [raceModel];
+    await host.poll();
+    assert.strictEqual(JSON.parse(fs.readFileSync(raced.responsePath, "utf8")).error, "vscode_lm_request_cancelled");
+
+    // A marker for another request cannot cancel or reserve this request.
+    const isolatedMarker = {
+      ...raced,
+      requestId: "7".repeat(32),
+      cancelToken: "c".repeat(64),
+      cancelPath: path.join(root, "workspaces", "7".repeat(32), "home", ".aiworkhub_vscode_lm_response.json"),
+    };
+    fs.mkdirSync(path.dirname(isolatedMarker.cancelPath), { recursive: true });
+    publishCancelDecision(isolatedMarker, repoInfo);
+    const successful = bridgeRequestFixture(root, repoInfo, "8".repeat(32), "d".repeat(64));
+    const successModel = {
+      ...exact,
+      sendRequest: async () => ({
+        stream: (async function* stream() { yield { value: finalResponse }; }()),
+      }),
+    };
+    host.models = async () => [successModel];
+    await host.poll();
+    assert.ok(
+      fs.existsSync(successful.responsePath),
+      JSON.stringify(internals.systemLogSnapshot().slice(-8)),
+    );
+    assert.strictEqual(JSON.parse(fs.readFileSync(successful.responsePath, "utf8")).error, "");
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(successful.responsePath, "utf8")).decision,
+      { action: "response", cancel_token: successful.cancelToken },
+    );
+    assert.strictEqual(
+      internals.atomicWriteOwnerJsonExclusive(successful.responsePath, {
+        schema_id: internals.constants.VSCODE_LM_RESPONSE_SCHEMA,
+        request_id: successful.requestId,
+        repo_id: repoInfo.repoId,
+        error: "vscode_lm_request_cancelled",
+        decision: { action: "cancel", cancel_token: successful.cancelToken },
+      }),
+      false,
+      "a durable response decision must win every later cancellation attempt",
+    );
+    assert.strictEqual(
+      internals.readVscodeLmCancelDecision({ ...successful, repo_id: repoInfo.repoId }).action,
+      "response",
+    );
+    assert.strictEqual(fs.existsSync(successful.cancelPath), true);
+    assert.strictEqual(fs.existsSync(isolatedMarker.cancelPath), true);
+    fs.unlinkSync(isolatedMarker.cancelPath);
+
+    const modelStageHost = new internals.VscodeLmBridgeHost({
+      globalState: { get: () => true, update: async () => {} },
+    });
+    modelStageHost.repoInfo = { ...repoInfo };
+    modelStageHost.ensurePermission = async () => true;
+    const modelStage = bridgeRequestFixture(root, repoInfo, "a".repeat(32), "e".repeat(64));
+    let modelStageStartedResolve;
+    const modelStageStarted = new Promise((resolve) => { modelStageStartedResolve = resolve; });
+    let resolveModels;
+    modelStageHost.models = () => {
+      modelStageStartedResolve();
+      return new Promise((resolve) => { resolveModels = resolve; });
+    };
+    const modelStagePoll = modelStageHost.poll();
+    await modelStageStarted;
+    modelStageHost.stop();
+    await Promise.race([
+      modelStagePoll,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("model_cancel_timeout")), 2000)),
+    ]);
+    assert.strictEqual(modelStageHost.activeClaims.size, 0);
+    assert.strictEqual(JSON.parse(fs.readFileSync(modelStage.responsePath, "utf8")).decision.action, "cancel");
+    resolveModels([exact]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const ignoredProviderHost = new internals.VscodeLmBridgeHost({
+      globalState: { get: () => true, update: async () => {} },
+    });
+    ignoredProviderHost.repoInfo = { ...repoInfo };
+    ignoredProviderHost.ensurePermission = async () => true;
+    const ignoredProvider = bridgeRequestFixture(root, repoInfo, "b".repeat(32), "f".repeat(64));
+    let providerStageStartedResolve;
+    const providerStageStarted = new Promise((resolve) => { providerStageStartedResolve = resolve; });
+    let resolveProvider;
+    const providerPromise = new Promise((resolve) => { resolveProvider = resolve; });
+    ignoredProviderHost.models = async () => [{
+      ...exact,
+      sendRequest: () => {
+        providerStageStartedResolve();
+        return providerPromise;
+      },
+    }];
+    const ignoredProviderPoll = ignoredProviderHost.poll();
+    await providerStageStarted;
+    ignoredProviderHost.stop();
+    await Promise.race([
+      ignoredProviderPoll,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("ignored_provider_cancel_timeout")), 2000)),
+    ]);
+    const cancelBytes = fs.readFileSync(ignoredProvider.responsePath);
+    const progressBytes = fs.existsSync(ignoredProvider.progressPath)
+      ? fs.readFileSync(ignoredProvider.progressPath)
+      : null;
+    assert.strictEqual(ignoredProviderHost.activeClaims.size, 0, "cancelled claim must release its slot");
+    assert.strictEqual(JSON.parse(cancelBytes.toString("utf8")).decision.action, "cancel");
+    resolveProvider({ stream: (async function* stream() { yield { value: finalResponse }; }()) });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepStrictEqual(fs.readFileSync(ignoredProvider.responsePath), cancelBytes, "late provider must not replace cancellation");
+    assert.deepStrictEqual(
+      fs.existsSync(ignoredProvider.progressPath) ? fs.readFileSync(ignoredProvider.progressPath) : null,
+      progressBytes,
+      "late provider must not emit progress",
+    );
+    host.dispose();
+  } finally {
+    if (previousRoot === undefined) delete process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT;
+    else process.env.AIWORKHUB_VSCODE_LM_BRIDGE_ROOT = previousRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function progressReceiptChecks() {

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import json
 import os
 import re
 import tempfile
+import textwrap
 import time
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -18,8 +21,12 @@ from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID,
     EDIT_RESPONSE_SCHEMA_ID_V1,
     EDIT_RESPONSE_SCHEMA_ID_V2,
+    ProgressFileSignature,
+    ProgressReadTransientError,
     RESPONSE_SCHEMA_ID,
-    read_progress_receipt,
+    progress_file_signature,
+    read_progress_receipt_snapshot,
+    read_terminal_decision,
 )
 
 
@@ -27,6 +34,8 @@ MAX_V2_PATHS = 128
 MAX_V2_REPLACEMENTS_PER_FILE = 256
 MAX_V2_REPLACEMENT_BYTES = 2 * 1024 * 1024
 MAX_V2_FILE_BYTES = 16 * 1024 * 1024
+PROGRESS_READ_MAX_ATTEMPTS = 2
+PROGRESS_READ_RETRY_SECONDS = 0.01
 
 
 def _load_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
@@ -68,25 +77,264 @@ def _matches(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
-_FIDELITY_WORD_MARKERS = re.compile(
-    r"(?<![\w])(?:todo|fixme|xxx|placeholder)(?![\w])",
-    re.IGNORECASE,
-)
 _FIDELITY_ANGLE_PLACEHOLDER = re.compile(
     r"^\s*<\s*(?:new\s+[\w.:-]+\s+code|test\s+file\s+content|"
     r"(?:full|complete)\s+file\s+content|insert\s+[^>]+\s+here)\s*>\s*$",
     re.IGNORECASE,
 )
-_FIDELITY_PHRASE_MARKERS = (
-    "implementation omitted",
-    "omitted for brevity",
-    "rest of the code",
-    "rest unchanged",
-    "remainder unchanged",
-    "unchanged code",
-    "insert code here",
-    "your code here",
+_FIDELITY_PLACEHOLDER_ONLY = re.compile(
+    r"^(?:(?:todo|fixme|xxx)(?:\s*[:\-].*)?|placeholder|"
+    r"replacement\s+code\s+only|(?:test\s+)?file\s+content|"
+    r"(?:implementation|code)\s+omitted(?:\s+for\s+brevity)?|"
+    r"omitted\s+(?:code|for\s+brevity)|"
+    r"(?:the\s+)?rest\s+of\s+(?:the\s+)?code(?:\s+unchanged)?|"
+    r"rest\s+unchanged|remainder\s+unchanged|unchanged\s+code|"
+    r"insert\s+code\s+here|your\s+code\s+here)"
+    r"[.!;,\-:]*$",
+    re.IGNORECASE,
 )
+_CODE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js",
+    ".jsx", ".kt", ".php", ".py", ".pyi", ".rb", ".rs", ".swift", ".ts",
+    ".tsx",
+}
+
+
+def _classification_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return re.sub(r"\s+", " ", normalized.strip()).casefold()
+
+
+def _trim_outer_blank_lines(value: str) -> str:
+    lines = value.splitlines()
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
+def _markdown_fence_body(value: str) -> str | None:
+    lines = value.splitlines()
+    if len(lines) < 2:
+        return None
+    opening = re.fullmatch(r" {0,3}(?P<fence>`{3,}|~{3,}).*", lines[0])
+    if opening is None:
+        return None
+    fence = opening.group("fence")
+    closing = re.fullmatch(
+        rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*",
+        lines[-1],
+    )
+    if closing is None:
+        return None
+    return _trim_outer_blank_lines("\n".join(lines[1:-1]))
+
+
+def _classification_payload(text: str) -> tuple[str, bool, bool, bool]:
+    marker = "\ue000"
+    prepared = text.replace("…", marker)
+    normalized_prepared = unicodedata.normalize("NFKC", prepared)
+    compatibility_changed = normalized_prepared != prepared
+    value = _trim_outer_blank_lines(normalized_prepared)
+    wrapped = False
+    remaining_unwrap_budget = len(value)
+    while remaining_unwrap_budget > 0:
+        next_value: str | None = None
+        fence_body = _markdown_fence_body(value)
+        if fence_body is not None:
+            next_value = fence_body
+        stripped = value.strip()
+        c_block = re.fullmatch(r"/\*(?P<body>.*?)\*/", stripped, re.DOTALL)
+        if c_block is not None:
+            next_value = _trim_outer_blank_lines(
+                "\n".join(
+                    re.sub(r"^\s*\*+\s?", "", line)
+                    for line in c_block.group("body").splitlines()
+                )
+            )
+        html_block = re.fullmatch(r"<!--(?P<body>.*?)-->", stripped, re.DOTALL)
+        if html_block is not None:
+            next_value = _trim_outer_blank_lines(html_block.group("body"))
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        line_values: list[str] = []
+        for line in lines:
+            comment = re.fullmatch(r"(?:/{2,}|#+|--+|;+)[ \t]?(?P<body>.*)", line)
+            if comment is None:
+                line_values = []
+                break
+            line_values.append(comment.group("body"))
+        if lines and line_values:
+            next_value = _trim_outer_blank_lines("\n".join(line_values))
+        if next_value is None:
+            break
+        reduction = len(value) - len(next_value)
+        if reduction <= 0:
+            break
+        value = next_value
+        remaining_unwrap_budget -= reduction
+        wrapped = True
+    unicode_ellipsis = value.strip() == marker
+    return (
+        _classification_text(value.replace(marker, "...")),
+        wrapped,
+        unicode_ellipsis,
+        compatibility_changed,
+    )
+
+
+def _python_fragment_tree(text: str) -> ast.AST | None:
+    source = textwrap.dedent(text)
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        try:
+            wrapped = "def __aiworkhub_fragment__():\n" + textwrap.indent(source, "    ")
+            return ast.parse(wrapped)
+        except SyntaxError:
+            return None
+
+
+def _stub_statement(node: ast.AST) -> bool:
+    if isinstance(node, ast.Pass):
+        return True
+    if (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is Ellipsis
+    ):
+        return True
+    if isinstance(node, ast.Raise) and isinstance(node.exc, (ast.Name, ast.Call)):
+        name = node.exc.id if isinstance(node.exc, ast.Name) else getattr(node.exc.func, "id", "")
+        return name == "NotImplementedError"
+    return False
+
+
+def _stub_definition(node: ast.AST) -> bool:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return bool(body) and all(
+        _stub_statement(child) or _stub_definition(child)
+        for child in body
+    )
+
+
+def _decorator_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _base_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Subscript):
+        return _base_name(node.value)
+    return ""
+
+
+def _stub_context(old_text: str, path: str) -> bool:
+    if PurePosixPath(path).suffix.casefold() == ".pyi":
+        return True
+    tree = _python_fragment_tree(old_text)
+    if tree is None:
+        return False
+    bodies: list[ast.stmt] = list(getattr(tree, "body", []))
+    if (
+        len(bodies) == 1
+        and isinstance(bodies[0], ast.FunctionDef)
+        and bodies[0].name == "__aiworkhub_fragment__"
+    ):
+        bodies = bodies[0].body
+    significant = [
+        node
+        for node in bodies
+        if not isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    if len(significant) == 1:
+        node = significant[0]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+            _decorator_name(decorator) in {"abstractmethod", "overload"}
+            for decorator in node.decorator_list
+        ):
+            return True
+        if (
+            isinstance(node, ast.ClassDef)
+            and any(_base_name(base) == "Protocol" for base in node.bases)
+            and _stub_definition(node)
+        ):
+            return True
+    return bool(significant) and all(
+        _stub_statement(node) or _stub_definition(node)
+        for node in significant
+    )
+
+
+def _pass_only(text: str) -> bool:
+    tree = _python_fragment_tree(text)
+    if tree is None:
+        return False
+    bodies: list[ast.stmt] = list(getattr(tree, "body", []))
+    if len(bodies) == 1 and isinstance(bodies[0], ast.FunctionDef) and bodies[0].name == "__aiworkhub_fragment__":
+        bodies = bodies[0].body
+    return bool(bodies) and all(
+        isinstance(node, ast.Pass)
+        or (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+        for node in bodies
+    ) and any(isinstance(node, ast.Pass) for node in bodies)
+
+
+def _meaningful_old_code(old_text: str, path: str) -> bool:
+    if not old_text.strip() or _stub_context(old_text, path):
+        return False
+    suffix = PurePosixPath(path).suffix.casefold()
+    if suffix in {".py", ".pyi"}:
+        tree = _python_fragment_tree(old_text)
+        if tree is None:
+            return False
+        meaningful = (
+            ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Call, ast.ClassDef,
+            ast.For, ast.FunctionDef, ast.AsyncFunctionDef, ast.If, ast.Import,
+            ast.ImportFrom, ast.Match, ast.Return, ast.Try, ast.While, ast.With,
+            ast.Yield, ast.YieldFrom,
+        )
+        return any(isinstance(node, meaningful) for node in ast.walk(tree))
+    if suffix not in _CODE_SUFFIXES:
+        return False
+    return bool(re.search(r"[{}();=]|\b(?:class|def|function|return|if|for|while|import|const|let|var)\b", old_text))
+
+
+def _prose_not_code(new_text: str, path: str) -> bool:
+    value = new_text.strip()
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", value)
+    if len(words) < 2 or len(value) > 256 or re.search(r"[{};=]", value):
+        return False
+    suffix = PurePosixPath(path).suffix.casefold()
+    if suffix in {".py", ".pyi"} and _python_fragment_tree(value) is not None:
+        return False
+    if re.search(r"\b(?:return|raise|yield|import|from|class|def|if|for|while|const|let|var|function)\b", value):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9\s.,'\"!?()\-]+", value))
+
+
+def _fidelity_reject(reason: str, path: str, operation: str) -> None:
+    raise RuntimeError(f"vscode_lm_edit_fidelity_rejected:{reason}:{path}:{operation}")
 
 
 def _check_edit_fidelity(
@@ -95,6 +343,7 @@ def _check_edit_fidelity(
     *,
     path: str,
     operation: str,
+    create: bool = False,
 ) -> dict[str, Any]:
     """Reject deterministic non-code placeholders before any file mutation."""
 
@@ -107,31 +356,43 @@ def _check_edit_fidelity(
             "old_bytes": old_bytes,
             "new_bytes": 0,
         }
-    lowered = new_text.casefold()
-    marker = _FIDELITY_WORD_MARKERS.search(new_text)
-    phrase = next(
-        (value for value in _FIDELITY_PHRASE_MARKERS if value in lowered),
-        "",
+    normalized, wrapped, unicode_ellipsis, compatibility_changed = (
+        _classification_payload(new_text)
     )
-    if marker is not None or phrase or _FIDELITY_ANGLE_PLACEHOLDER.fullmatch(new_text):
-        reason = "explicit_non_substantive_marker"
-    elif (
-        old_bytes >= 2048
-        and new_bytes <= 64
-        and not any(char.isalnum() for char in new_text)
+    if create and not normalized:
+        _fidelity_reject("empty_required_create", path, operation)
+    if normalized == "..." and (
+        create
+        or unicode_ellipsis
+        or compatibility_changed
+        or wrapped
+        or not _stub_context(old_text, path)
     ):
-        reason = "suspicious_shrink_without_alphanumeric_substance"
-    else:
-        return {
-            "path": path,
-            "operation": operation,
-            "old_bytes": old_bytes,
-            "new_bytes": new_bytes,
-        }
-    raise RuntimeError(
-        "vscode_lm_edit_fidelity_rejected:"
-        f"{reason}:{path}:{operation}:old_bytes={old_bytes}:new_bytes={new_bytes}"
-    )
+        _fidelity_reject("ellipsis_only", path, operation)
+    if (
+        _FIDELITY_PLACEHOLDER_ONLY.fullmatch(normalized)
+        or _FIDELITY_ANGLE_PLACEHOLDER.fullmatch(normalized)
+    ):
+        _fidelity_reject("placeholder_phrase", path, operation)
+    if (
+        _pass_only(new_text)
+        and _meaningful_old_code(old_text, path)
+        and not _stub_context(old_text, path)
+    ):
+        _fidelity_reject("pass_only_nontrivial_replacement", path, operation)
+    if (
+        old_bytes >= 64
+        and new_bytes <= max(24, int(old_bytes * 0.35))
+        and _meaningful_old_code(old_text, path)
+        and _prose_not_code(new_text, path)
+    ):
+        _fidelity_reject("destructive_non_code_shrink", path, operation)
+    return {
+        "path": path,
+        "operation": operation,
+        "old_bytes": old_bytes,
+        "new_bytes": new_bytes,
+    }
 
 
 def _write_atomic(workspace: Path, relative: str, content: str) -> None:
@@ -201,16 +462,45 @@ def _validate_allowed_path(raw_path: Any, allowed: list[str]) -> str:
     return relative
 
 
+def _required_create_paths(
+    create_paths: set[str] | None,
+    allowed: list[str],
+) -> set[str]:
+    return {
+        _validate_allowed_path(value, allowed)
+        for value in (create_paths or set())
+    }
+
+
+def _check_required_creates(
+    required: set[str],
+    contents: dict[str, str],
+    *,
+    operation: str,
+) -> None:
+    for relative in sorted(required):
+        if relative not in contents:
+            _fidelity_reject("missing_required_create", relative, operation)
+        normalized, _wrapped, _unicode_ellipsis, _compatibility_changed = (
+            _classification_payload(contents[relative])
+        )
+        if not normalized:
+            _fidelity_reject("empty_required_create", relative, operation)
+
+
 def _v1_planned_outputs(
     workspace: Path,
     edit: dict[str, Any],
     allowed: list[str],
+    create_paths: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     files = edit.get("files")
     if not isinstance(files, list):
         raise RuntimeError("vscode_lm_edit_response_files_invalid")
     planned: list[tuple[str, str]] = []
     seen: set[str] = set()
+    required_creates = _required_create_paths(create_paths, allowed)
+    create_contents: dict[str, str] = {}
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get("content"), str):
             raise RuntimeError("vscode_lm_edit_response_file_invalid")
@@ -223,13 +513,22 @@ def _v1_planned_outputs(
         if target.is_file() and not target.is_symlink():
             old_text = target.read_bytes().decode("utf-8", errors="replace")
         content = item["content"]
+        is_create = relative in required_creates
+        if is_create:
+            create_contents[relative] = content
         _check_edit_fidelity(
             old_text,
             content,
             path=relative,
             operation="v1_file",
+            create=is_create,
         )
         planned.append((relative, content))
+    _check_required_creates(
+        required_creates,
+        create_contents,
+        operation="v1_file",
+    )
     return planned
 
 
@@ -262,6 +561,8 @@ def _v2_planned_outputs(
     _validate_v2_counts(edits, creates)
     planned: list[tuple[str, str]] = []
     seen: set[str] = set()
+    required_creates = _required_create_paths(create_paths, allowed)
+    create_contents: dict[str, str] = {}
 
     for item in edits:
         if not isinstance(item, dict):
@@ -282,8 +583,12 @@ def _v2_planned_outputs(
         if target.is_symlink() or not target.is_file():
             raise RuntimeError(f"vscode_lm_edit_response_edit_target_invalid:{relative}")
         current_bytes = target.read_bytes()
-        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
-            raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
+        actual_hash = hashlib.sha256(current_bytes).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_stale_hash:{relative}:"
+                f"expected_sha256={expected_hash}:actual_sha256={actual_hash}"
+            )
         try:
             current_text = current_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -358,10 +663,22 @@ def _v2_planned_outputs(
         if (target.exists() or target.is_symlink()) and not precreated_placeholder:
             raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         content = item["content"]
+        create_contents[relative] = content
         if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
-        _check_edit_fidelity("", content, path=relative, operation="v2_create")
+        _check_edit_fidelity(
+            "",
+            content,
+            path=relative,
+            operation="v2_create",
+            create=True,
+        )
         planned.append((relative, content))
+    _check_required_creates(
+        required_creates,
+        create_contents,
+        operation="v2_create",
+    )
     return planned
 
 
@@ -382,6 +699,8 @@ def _v3_planned_outputs(
     planned: list[tuple[str, str]] = []
     metrics: list[dict[str, Any]] = []
     seen: set[str] = set()
+    required_creates = _required_create_paths(create_paths, allowed)
+    create_contents: dict[str, str] = {}
 
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -451,8 +770,14 @@ def _v3_planned_outputs(
                 f"vscode_lm_edit_response_edit_target_invalid:{relative}"
             )
         current_bytes = target.read_bytes()
-        if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
-            raise RuntimeError(f"vscode_lm_edit_response_stale_hash:{relative}")
+        if relative in required_creates and current_bytes:
+            raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
+        actual_hash = hashlib.sha256(current_bytes).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"vscode_lm_edit_response_stale_hash:{relative}:"
+                f"expected_sha256={expected_hash}:actual_sha256={actual_hash}"
+            )
         try:
             current_text = current_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -485,6 +810,12 @@ def _v3_planned_outputs(
         next_bytes = next_text.encode("utf-8")
         if len(next_bytes) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
+        if relative in required_creates:
+            # The bridge stages declared new outputs as empty placeholders so
+            # v3 can fill them with a bounded virtual-line edit.  That is a
+            # create for contract/fidelity purposes even though the protocol
+            # represents it in ``edits`` rather than ``creates``.
+            create_contents[relative] = next_text
         planned.append((relative, next_text))
         metrics.append({
             "path": relative,
@@ -511,9 +842,16 @@ def _v3_planned_outputs(
         if (target.exists() or target.is_symlink()) and not precreated_placeholder:
             raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         content = item["content"]
+        create_contents[relative] = content
         if len(content.encode("utf-8")) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
-        _check_edit_fidelity("", content, path=relative, operation="v3_create")
+        _check_edit_fidelity(
+            "",
+            content,
+            path=relative,
+            operation="v3_create",
+            create=True,
+        )
         planned.append((relative, content))
         metrics.append({
             "path": relative,
@@ -522,7 +860,41 @@ def _v3_planned_outputs(
             "whole_file_output_required": True,
             "token_savings_claimed": False,
         })
+    _check_required_creates(
+        required_creates,
+        create_contents,
+        operation="v3_create",
+    )
     return planned, metrics
+
+
+def _read_progress_with_retry(
+    path: Path,
+    request_id: str,
+    repo_id: str,
+    *,
+    owner_uid: int | None = None,
+    previous_sequence: int | None = None,
+    defer_transient: bool,
+) -> tuple[dict[str, Any], ProgressFileSignature | None]:
+    for attempt in range(1, PROGRESS_READ_MAX_ATTEMPTS + 1):
+        try:
+            return read_progress_receipt_snapshot(
+                path,
+                request_id,
+                repo_id,
+                owner_uid=owner_uid,
+                previous_sequence=previous_sequence,
+            )
+        except ProgressReadTransientError as exc:
+            if attempt >= PROGRESS_READ_MAX_ATTEMPTS:
+                if defer_transient:
+                    return {}, None
+                raise RuntimeError(
+                    f"vscode_lm_progress_terminal_read_failed:{exc}"
+                ) from exc
+            time.sleep(PROGRESS_READ_RETRY_SECONDS)
+    raise AssertionError("unreachable")
 
 
 def run(spec_path: Path) -> dict[str, Any]:
@@ -531,30 +903,49 @@ def run(spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("bridge_worker_spec_schema_mismatch")
     workspace = Path(str(spec.get("workspace_path") or "")).resolve(strict=True)
     response_path = Path(str(spec.get("response_path") or ""))
+    terminal_decision_required = spec.get("terminal_decision_required") is True
+    cancel_token = str(spec.get("cancel_token") or "")
+    cancel_path = Path(str(spec.get("cancel_path") or response_path))
+    if terminal_decision_required and cancel_path.resolve(strict=False) != response_path.resolve(
+        strict=False
+    ):
+        raise RuntimeError("vscode_lm_terminal_decision_path_mismatch")
     progress_path_raw = str(spec.get("progress_path") or "")
     progress_path = Path(progress_path_raw) if progress_path_raw else None
     timeout_seconds = max(30, min(int(spec.get("timeout_seconds") or 7200), 86_400))
     deadline = time.monotonic() + timeout_seconds
     last_progress_sequence = 0
-    last_progress_signature: tuple[int, int] | None = None
+    last_progress_signature: ProgressFileSignature | None = None
+    response: dict[str, Any] | None = None
+    decision_action = ""
     while time.monotonic() < deadline:
-        if response_path.is_file():
+        if terminal_decision_required:
+            decision = read_terminal_decision(
+                response_path,
+                request_id=str(spec.get("request_id") or ""),
+                repo_id=str(spec.get("repo_id") or ""),
+                cancel_token=cancel_token,
+            )
+            if decision is not None:
+                response, decision_action = decision
+                break
+        elif response_path.is_file():
+            response = _load_json(response_path)
             break
-        if progress_path is not None and (
-            progress_path.exists() or progress_path.is_symlink()
-        ):
+        if progress_path is not None:
             try:
                 progress_stat = progress_path.lstat()
-                progress_signature = (progress_stat.st_mtime_ns, progress_stat.st_size)
+                progress_signature = progress_file_signature(progress_stat)
             except OSError:
                 progress_signature = None
             if progress_signature is not None and progress_signature != last_progress_signature:
-                progress = read_progress_receipt(
+                progress, validated_signature = _read_progress_with_retry(
                     progress_path,
                     str(spec.get("request_id") or ""),
                     str(spec.get("repo_id") or ""),
                     owner_uid=os.getuid() if hasattr(os, "getuid") else None,
                     previous_sequence=(last_progress_sequence or None),
+                    defer_transient=True,
                 )
                 if progress:
                     last_progress_sequence = int(progress["sequence"])
@@ -571,22 +962,29 @@ def run(spec_path: Path) -> dict[str, Any]:
                         ),
                         flush=True,
                     )
-                last_progress_signature = progress_signature
+                    last_progress_signature = validated_signature
         time.sleep(0.1)
     else:
         raise RuntimeError("vscode_lm_response_timeout")
 
-    response = _load_json(response_path)
+    if response is None:
+        raise RuntimeError("vscode_lm_terminal_decision_missing")
     if response.get("schema_id") != RESPONSE_SCHEMA_ID:
         raise RuntimeError("vscode_lm_response_schema_mismatch")
     if response.get("request_id") != spec.get("request_id"):
         raise RuntimeError("vscode_lm_response_identity_mismatch")
+    if terminal_decision_required:
+        if response.get("repo_id") != spec.get("repo_id"):
+            raise RuntimeError("vscode_lm_response_repo_identity_mismatch")
+        if decision_action not in {"cancel", "response"}:
+            raise RuntimeError("vscode_lm_terminal_decision_action_invalid")
     if progress_path is not None:
-        read_progress_receipt(
+        _read_progress_with_retry(
             progress_path,
             str(spec.get("request_id") or ""),
             str(spec.get("repo_id") or ""),
             owner_uid=os.getuid() if hasattr(os, "getuid") else None,
+            defer_transient=False,
         )
     if response.get("error"):
         diagnostics = response.get("diagnostics")
@@ -612,17 +1010,14 @@ def run(spec_path: Path) -> dict[str, Any]:
     allowed = [str(value) for value in spec.get("allowed_writes") or []]
     try:
         semantic_metrics: list[dict[str, Any]] = []
+        create_paths = {
+            str(value) for value in spec.get("create_paths") or [] if str(value)
+        }
         if edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V1:
-            planned = _v1_planned_outputs(workspace, edit, allowed)
+            planned = _v1_planned_outputs(workspace, edit, allowed, create_paths)
         elif edit.get("schema_id") == EDIT_RESPONSE_SCHEMA_ID_V2:
-            create_paths = {
-                str(value) for value in spec.get("create_paths") or [] if str(value)
-            }
             planned = _v2_planned_outputs(workspace, edit, allowed, create_paths)
         else:
-            create_paths = {
-                str(value) for value in spec.get("create_paths") or [] if str(value)
-            }
             planned, semantic_metrics = _v3_planned_outputs(
                 workspace, edit, allowed, create_paths
             )

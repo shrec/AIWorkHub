@@ -271,6 +271,7 @@ const VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 = "aiworkhub.vscode_lm.edit_response.v2"
 const VSCODE_LM_TOOL_REQUEST_SCHEMA = "aiworkhub.vscode_lm.tool_request.v1";
 const VSCODE_LM_TOOL_RESULT_SCHEMA = "aiworkhub.vscode_lm.tool_result.v1";
 const VSCODE_LM_PROGRESS_SCHEMA = "aiworkhub.vscode_lm.progress_receipt.v1";
+const VSCODE_LM_CANCEL_DECISION_SCHEMA = "aiworkhub.vscode_lm.response.v1";
 const VSCODE_LM_PROGRESS_PHASES = Object.freeze([
   "request_accepted", "provider_response", "tool_turn", "final_edit", "terminal_error",
 ]);
@@ -284,6 +285,8 @@ const VSCODE_LM_MODEL_ALIASES = Object.freeze({
 });
 const VSCODE_LM_REQUESTED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}$/;
 const VSCODE_LM_POLL_MS = 500;
+const VSCODE_LM_CANCEL_POLL_MS = 50;
+const VSCODE_LM_CANCEL_INVALID_READ_LIMIT = 3;
 const VSCODE_LM_HEARTBEAT_MS = 10000;
 const VSCODE_LM_MAX_PARALLEL_REQUESTS = 3;
 const VSCODE_LM_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -2477,7 +2480,127 @@ function ownerOnlyRegularFile(filePath, maxBytes = VSCODE_LM_MAX_REQUEST_BYTES) 
   }
 }
 
-function validateVscodeLmRequest(payload, repoInfo) {
+function vscodeLmRequestPathFromClaim(claimPath) {
+  const suffix = `.claim-${WINDOW_SCOPE_ID}`;
+  const resolvedClaim = path.resolve(String(claimPath || ""));
+  if (!resolvedClaim.endsWith(suffix)) throw new Error("vscode_lm_claim_path_invalid");
+  const requestPath = resolvedClaim.slice(0, -suffix.length);
+  if (!requestPath.endsWith(".json") ||
+      !VSCODE_LM_REQUEST_ID_RE.test(path.basename(requestPath, ".json"))) {
+    throw new Error("vscode_lm_claim_path_invalid");
+  }
+  return requestPath;
+}
+
+function readVscodeLmCancelDecision(request, retryState = null) {
+  const identity = (metadata) => [
+    ...(process.platform === "win32" ? [] : [String(metadata.dev)]),
+    String(metadata.ino), String(metadata.size),
+  ].join(":");
+  const snapshotIdentity = (metadata) => [identity(metadata), String(metadata.mtimeNs)].join(":");
+  const validateMetadata = (metadata) => {
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > BigInt(VSCODE_LM_MAX_REQUEST_BYTES) ||
+        (process.platform !== "win32" && ((metadata.mode & 0o077n) !== 0n ||
+          (typeof process.getuid === "function" && metadata.uid !== BigInt(process.getuid()))))) {
+      throw new Error("vscode_lm_cancel_decision_not_owner_only");
+    }
+  };
+  let initialMetadata;
+  try {
+    initialMetadata = fs.lstatSync(request.cancelPath, { bigint: true });
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw err;
+  }
+  validateMetadata(initialMetadata);
+  let flags = fs.constants.O_RDONLY;
+  if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+  let fd;
+  try {
+    fd = fs.openSync(request.cancelPath, flags);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw err;
+  }
+  try {
+    const openedMetadata = fs.fstatSync(fd, { bigint: true });
+    validateMetadata(openedMetadata);
+    if (snapshotIdentity(openedMetadata) !== snapshotIdentity(initialMetadata)) throw new Error("vscode_lm_cancel_decision_identity_changed");
+    const raw = fs.readFileSync(fd, "utf8");
+    const validatedMetadata = fs.fstatSync(fd, { bigint: true });
+    validateMetadata(validatedMetadata);
+    if (snapshotIdentity(validatedMetadata) !== snapshotIdentity(openedMetadata)) throw new Error("vscode_lm_cancel_decision_identity_changed");
+    const pathMetadata = fs.lstatSync(request.cancelPath, { bigint: true });
+    validateMetadata(pathMetadata);
+    if (snapshotIdentity(pathMetadata) !== snapshotIdentity(validatedMetadata)) throw new Error("vscode_lm_cancel_decision_identity_changed");
+    let receipt;
+    try {
+      receipt = JSON.parse(raw);
+    } catch (_err) {
+      if (retryState && typeof retryState === "object") {
+        retryState.invalidReads = Number(retryState.invalidReads || 0) + 1;
+        if (retryState.invalidReads < VSCODE_LM_CANCEL_INVALID_READ_LIMIT) {
+          return { action: "pending" };
+        }
+      }
+      throw new Error("vscode_lm_cancel_decision_persistent_invalid_json");
+    }
+    if (!receipt || receipt.schema_id !== VSCODE_LM_RESPONSE_SCHEMA ||
+        receipt.request_id !== request.requestId || receipt.repo_id !== request.repo_id) {
+      throw new Error("vscode_lm_cancel_decision_identity_mismatch");
+    }
+    const decision = receipt.decision;
+    if (!decision || !["cancel", "response"].includes(decision.action) ||
+        decision.cancel_token !== request.cancelToken) {
+      throw new Error("vscode_lm_cancel_decision_contract_mismatch");
+    }
+    if (decision.action === "cancel" && receipt.error !== "vscode_lm_request_cancelled") {
+      throw new Error("vscode_lm_cancel_decision_contract_mismatch");
+    }
+    if (retryState && typeof retryState === "object") retryState.invalidReads = 0;
+    return { action: decision.action, receipt };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function vscodeLmCancelPayload(request, repoId, reason = "host_cancelled") {
+  return {
+    schema_id: VSCODE_LM_RESPONSE_SCHEMA,
+    request_id: request.requestId,
+    repo_id: repoId,
+    model: {},
+    text: "",
+    error: "vscode_lm_request_cancelled",
+    diagnostics: { phase: "cancelled", action: "cancel", reason: String(reason).slice(0, 120) },
+    decision: { action: "cancel", cancel_token: request.cancelToken },
+    completed_at: new Date().toISOString(),
+  };
+}
+
+function atomicWriteOwnerJsonExclusive(filePath, payload) {
+  const parent = path.dirname(filePath);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const encoded = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  if (encoded.length > VSCODE_LM_MAX_REQUEST_BYTES) throw new Error("vscode_lm_response_too_large");
+  const nonce = crypto.randomBytes(8).toString("hex");
+  const tempPath = path.join(parent, `.${path.basename(filePath)}.${process.pid}.${nonce}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, encoded, { flag: "wx", mode: 0o600 });
+    try { fs.chmodSync(tempPath, 0o600); } catch (_err) { /* Windows/filesystem */ }
+    const fd = fs.openSync(tempPath, fs.constants.O_RDWR);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.linkSync(tempPath, filePath);
+    return true;
+  } catch (err) {
+    if (err && err.code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch (_err) { /* exact temp only */ }
+  }
+}
+
+function validateVscodeLmRequest(payload, repoInfo, expectedRequestPath = null) {
   if (!payload || typeof payload !== "object" || payload.schema_id !== VSCODE_LM_REQUEST_SCHEMA) {
     throw new Error("vscode_lm_request_schema_mismatch");
   }
@@ -2514,6 +2637,16 @@ function validateVscodeLmRequest(payload, repoInfo) {
   if (progressPath !== path.join(workspaceHome, ".aiworkhub_vscode_lm_progress.json")) {
     throw new Error("vscode_lm_progress_path_invalid");
   }
+  let cancelPath = null;
+  let cancelToken = "";
+  if (expectedRequestPath !== null || payload.cancel_path !== undefined || payload.cancel_token !== undefined) {
+    cancelPath = path.resolve(String(payload.cancel_path || ""));
+    cancelToken = String(payload.cancel_token || "");
+    if (!/^[a-f0-9]{64}$/.test(cancelToken)) throw new Error("vscode_lm_cancel_token_invalid");
+    if (expectedRequestPath !== null && cancelPath !== responsePath) {
+      throw new Error("vscode_lm_cancel_path_invalid");
+    }
+  }
   const allowedWrites = payload.allowed_writes;
   if (!Array.isArray(allowedWrites) || allowedWrites.some((value) => typeof value !== "string" || value.length > 512)) {
     throw new Error("vscode_lm_allowed_writes_invalid");
@@ -2542,7 +2675,7 @@ function validateVscodeLmRequest(payload, repoInfo) {
   }
   const deadline = Date.parse(String(payload.deadline || ""));
   if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error("vscode_lm_request_expired");
-  return { ...payload, request_kind: requestKind, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, progressPath, allowedWrites };
+  return { ...payload, request_kind: requestKind, model: requestedModel, requestId, workspacePath, workspaceHome, responsePath, progressPath, cancelPath, cancelToken, allowedWrites };
 }
 
 const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
@@ -2709,9 +2842,6 @@ async function invokeVscodeLmPrivateTool(call, requestId = "") {
 }
 
 function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
-  const examplePath = Array.isArray(allowedWrites) && allowedWrites.length
-    ? String(allowedWrites[0])
-    : "output.json";
   return `${prompt}\n\nAIWorkHub VS Code GLM worker contract:\n` +
     `- Source Graph is mandatory throughout code discovery; never request or simulate grep/rg/find/tree.\n` +
     `- Set workflow_stage on every Source Graph call: orientation, implementation, validation, review, or rework.\n` +
@@ -2723,17 +2853,30 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- After body discovery call aiworkhub_manager_semantic_edit_prepare with that file and exact line range. Copy current_sha256 from its receipt; the receipt returns only the selected old fragment, never the whole file.\n` +
     `- The prepare tool input is exactly {"file_path":"repo/relative/path","start_line":1,"end_line":1}; use file_path, not path, in that tool request.\n` +
     `- Semantic edits must name an allowed path, copy current_sha256 from path_contracts, and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
-    `- new contains only replacement code; it may be empty for deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
-    `- creates must name an allowed path and complete UTF-8 content. A path_contract action=create means the runtime owns an empty placeholder and the final response MUST use creates for that path.\n` +
+    `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
+    `- creates must name an allowed path and contain complete, nonempty UTF-8 content. Every path_contract whose action is create MUST appear exactly once in creates.\n` +
+    `- The final object is executable edit data, not a template. Sentinel-only values, prose placeholder labels, TODO/FIXME-only text, and omitted-code notices are rejected.\n` +
     `- For action=edit, copy current_sha256 exactly from semantic-edit prepare (or the identical exact path_contract); do not infer or recompute it.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
     `- path_contracts=${JSON.stringify(pathContracts || {})}\n` +
-    `Required shape using the real allowed path: {"schema_id":"${VSCODE_LM_EDIT_RESPONSE_SCHEMA}","summary":"...","edits":[{"path":${JSON.stringify(examplePath)},"current_sha256":"<copy from path_contracts>","ranges":[{"start_line":10,"end_line":18,"new":"replacement code only","preserve_trailing_newline":true}]}],"creates":[]}`;
+    `- Required fields are schema_id=${VSCODE_LM_EDIT_RESPONSE_SCHEMA}, an actual summary, an edits array of hash-bound line ranges, and a creates array of complete new files. Do not copy instructional metasyntax into any field.`;
+}
+
+function vscodeLmNormalizedPath(rawPath) {
+  return String(rawPath || "").replace(/\\/g, "/");
+}
+
+function vscodeLmContractMap(pathContracts) {
+  const result = new Map();
+  for (const [rawPath, contract] of Object.entries(pathContracts || {})) {
+    result.set(vscodeLmNormalizedPath(rawPath), contract);
+  }
+  return result;
 }
 
 function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
-  const value = String(rawPath || "").replace(/\\/g, "/");
-  const pattern = String(rawPattern || "").replace(/\\/g, "/");
+  const value = vscodeLmNormalizedPath(rawPath);
+  const pattern = vscodeLmNormalizedPath(rawPattern);
   if (!value || value.startsWith("/") || value.split("/").includes("..")) return false;
   let expression = "^";
   for (let index = 0; index < pattern.length; index += 1) {
@@ -2748,12 +2891,114 @@ function vscodeLmPathMatchesPattern(rawPath, rawPattern) {
   return new RegExp(`${expression}$`).test(value);
 }
 
+function vscodeLmTrimOuterBlankLines(value) {
+  const lines = String(value).split(/\r\n?|\n/);
+  let start = 0;
+  let end = lines.length;
+  while (start < end && !lines[start].trim()) start += 1;
+  while (end > start && !lines[end - 1].trim()) end -= 1;
+  return lines.slice(start, end).join("\n");
+}
+
+function vscodeLmMarkdownFenceBody(value) {
+  const lines = String(value).split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const opening = lines[0].match(/^ {0,3}(`{3,}|~{3,}).*$/);
+  if (!opening) return null;
+  const fence = opening[1];
+  const closing = new RegExp(`^ {0,3}${fence[0]}{${fence.length},}[ \\t]*$`);
+  if (!closing.test(lines[lines.length - 1])) return null;
+  return vscodeLmTrimOuterBlankLines(lines.slice(1, -1).join("\n"));
+}
+
+function vscodeLmClassificationPayload(rawValue) {
+  const marker = "\uE000";
+  const prepared = String(rawValue).replace(/…/g, marker);
+  const normalizedPrepared = prepared.normalize("NFKC");
+  const compatibilityChanged = normalizedPrepared !== prepared;
+  let value = vscodeLmTrimOuterBlankLines(normalizedPrepared);
+  let wrapped = false;
+  let remainingUnwrapBudget = value.length;
+  while (remainingUnwrapBudget > 0) {
+    let nextValue = null;
+    const fenceBody = vscodeLmMarkdownFenceBody(value);
+    if (fenceBody !== null) {
+      nextValue = fenceBody;
+    }
+    const stripped = value.trim();
+    const cBlock = stripped.match(/^\/\*([\s\S]*?)\*\/$/);
+    if (cBlock) {
+      nextValue = vscodeLmTrimOuterBlankLines(
+        cBlock[1].split(/\r\n?|\n/).map((line) => line.replace(/^\s*\*+\s?/, "")).join("\n"),
+      );
+    }
+    const htmlBlock = stripped.match(/^<!--([\s\S]*?)-->$/);
+    if (htmlBlock) {
+      nextValue = vscodeLmTrimOuterBlankLines(htmlBlock[1]);
+    }
+    const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const comments = lines.map((line) => line.match(/^(?:\/{2,}|#+|--+|;+)[ \t]?(.*)$/));
+    if (lines.length && comments.every(Boolean)) {
+      nextValue = vscodeLmTrimOuterBlankLines(comments.map((match) => match[1]).join("\n"));
+    }
+    if (nextValue === null) break;
+    const reduction = value.length - nextValue.length;
+    if (reduction <= 0) break;
+    value = nextValue;
+    remainingUnwrapBudget -= reduction;
+    wrapped = true;
+  }
+  const unicodeEllipsis = value.trim() === marker;
+  const candidate = value.replace(new RegExp(marker, "g"), "...").normalize("NFKC")
+    .trim().replace(/\s+/g, " ").toLowerCase();
+  return { candidate, wrapped, unicodeEllipsis, compatibilityChanged };
+}
+
+function vscodeLmPlaceholderReason(rawValue, rawPath, { create = false } = {}) {
+  if (typeof rawValue !== "string") return "";
+  const stripped = rawValue.trim();
+  if (create && !stripped) return "empty_required_create";
+  if (!stripped) return "";
+  const { candidate, wrapped, unicodeEllipsis, compatibilityChanged } = vscodeLmClassificationPayload(rawValue);
+  if (wrapped && !candidate) return create ? "empty_required_create" : "placeholder_phrase";
+  const pythonPath = /\.pyi?$/i.test(String(rawPath || ""));
+  if (candidate === "..." && (unicodeEllipsis || compatibilityChanged || wrapped || create || !pythonPath)) {
+    return "ellipsis_only";
+  }
+  const placeholder = /^(?:(?:todo|fixme|xxx)(?:\s*[:\-].*)?|placeholder|replacement\s+code\s+only|(?:test\s+)?file\s+content|(?:implementation|code)\s+omitted(?:\s+for\s+brevity)?|omitted\s+(?:code|for\s+brevity)|(?:the\s+)?rest\s+of\s+(?:the\s+)?code(?:\s+unchanged)?|rest\s+unchanged|remainder\s+unchanged|unchanged\s+code|insert\s+code\s+here|your\s+code\s+here)[.!;,\-:]*$/i;
+  const anglePlaceholder = /^\s*<\s*(?:new\s+[\w.:-]+\s+code|test\s+file\s+content|(?:full|complete)\s+file\s+content|insert\s+[^>]+\s+here)\s*>\s*$/i;
+  return placeholder.test(candidate) || anglePlaceholder.test(candidate) ? "placeholder_phrase" : "";
+}
+
+function vscodeLmFidelityError(value, pathValue, operation, options = {}) {
+  const reason = vscodeLmPlaceholderReason(value, pathValue, options);
+  return reason ? `final_edit_fidelity_rejected:${reason}:${pathValue}:${operation}` : "";
+}
+
+function vscodeLmRequiredCreateError(items, contractByPath, contentKey, operation) {
+  const byPath = new Map((items || []).filter((item) => item && typeof item.path === "string")
+    .map((item) => [vscodeLmNormalizedPath(item.path), item]));
+  for (const [requiredPath, contract] of contractByPath.entries()) {
+    if (!contract || contract.action !== "create") continue;
+    const item = byPath.get(requiredPath);
+    if (!item) return `final_edit_fidelity_rejected:missing_required_create:${requiredPath}:${operation}`;
+    if (typeof item[contentKey] !== "string" || !item[contentKey].trim()) {
+      return `final_edit_fidelity_rejected:empty_required_create:${requiredPath}:${operation}`;
+    }
+  }
+  return "";
+}
+
 function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = {}) {
   if (!envelope || typeof envelope.summary !== "string") {
     return "final_shape_invalid";
   }
+  const summaryFidelity = vscodeLmFidelityError(envelope.summary, "summary", "summary");
+  if (summaryFidelity) return summaryFidelity;
+  const contractByPath = vscodeLmContractMap(pathContracts);
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
     if (!Array.isArray(envelope.files)) return "final_files_invalid";
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.files, contractByPath, "content", "v1_file");
     for (const file of envelope.files) {
       if (!file || typeof file.path !== "string" || typeof file.content !== "string") {
         return "final_file_invalid";
@@ -2761,38 +3006,64 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
       if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(file.path, pattern))) {
         return `final_path_not_allowed:${file.path}`;
       }
+      const contract = contractByPath.get(vscodeLmNormalizedPath(file.path));
+      const fidelity = vscodeLmFidelityError(file.content, file.path, "v1_file", {
+        create: contract && contract.action === "create",
+      });
+      if (fidelity) return fidelity;
     }
+    if (requiredCreateError) return requiredCreateError;
     return "";
   }
   if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2) {
     if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) return "final_v2_shape_invalid";
+    const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v2_create");
     for (const edit of envelope.edits) {
       if (!edit || typeof edit.path !== "string" || typeof edit.current_sha256 !== "string" || !Array.isArray(edit.replacements)) return "final_edit_invalid";
       if (!/^[0-9a-f]{64}$/.test(edit.current_sha256)) return `final_hash_invalid:${edit.path}`;
+      const contract = contractByPath.get(vscodeLmNormalizedPath(edit.path));
+      if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "") &&
+          edit.current_sha256 !== contract.current_sha256) return `final_hash_stale:${edit.path}`;
       if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(edit.path, pattern))) return `final_path_not_allowed:${edit.path}`;
       for (const replacement of edit.replacements) {
         if (!replacement || typeof replacement.old !== "string" || !replacement.old ||
             typeof replacement.new !== "string" || !replacement.new ||
             !Number.isSafeInteger(replacement.expected_count) || replacement.expected_count < 1) return `final_replacement_invalid:${edit.path}`;
+        const fidelity = vscodeLmFidelityError(replacement.new, edit.path, "v2_replacement");
+        if (fidelity) return fidelity;
       }
     }
+    for (const create of envelope.creates) {
+      if (!create || typeof create.path !== "string" || typeof create.content !== "string") return "final_create_invalid";
+      const contract = contractByPath.get(vscodeLmNormalizedPath(create.path));
+      if (contract && contract.action === "edit") return `final_action_mismatch:${create.path}:create_on_edit`;
+      if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) return `final_path_not_allowed:${create.path}`;
+      const fidelity = vscodeLmFidelityError(create.content, create.path, "v2_create", { create: true });
+      if (fidelity) return fidelity;
+    }
+    if (requiredCreateError) return requiredCreateError;
     return "";
   }
   if (envelope.schema_id !== VSCODE_LM_EDIT_RESPONSE_SCHEMA) return "final_schema_invalid";
   if (!Array.isArray(envelope.edits) || !Array.isArray(envelope.creates)) {
     return "final_v2_shape_invalid";
   }
+  const requiredCreateError = vscodeLmRequiredCreateError(envelope.creates, contractByPath, "content", "v3_create");
   for (const edit of envelope.edits) {
     if (!edit || typeof edit.path !== "string" || !Array.isArray(edit.ranges)) {
       return "final_edit_invalid";
     }
-    const contract = pathContracts[edit.path];
+    const contract = contractByPath.get(vscodeLmNormalizedPath(edit.path));
     if (typeof edit.current_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(edit.current_sha256)) {
       if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "")) {
         edit.current_sha256 = contract.current_sha256;
       } else {
         return `final_hash_invalid:${edit.path}`;
       }
+    }
+    if (contract && contract.action === "edit" && /^[0-9a-f]{64}$/.test(contract.current_sha256 || "") &&
+        edit.current_sha256 !== contract.current_sha256) {
+      return `final_hash_stale:${edit.path}`;
     }
     if (contract && contract.action === "create") {
       return `final_action_mismatch:${edit.path}:edit_on_create`;
@@ -2810,19 +3081,25 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
       if (contract && Number.isSafeInteger(contract.line_count) && range.end_line > contract.line_count) {
         return `final_range_out_of_bounds:${edit.path}:start=${range.start_line}:end=${range.end_line}:lines=${contract.line_count}`;
       }
+      const fidelity = vscodeLmFidelityError(range.new, edit.path, "v3_range");
+      if (fidelity) return fidelity;
     }
   }
   for (const create of envelope.creates) {
     if (!create || typeof create.path !== "string" || typeof create.content !== "string") {
       return "final_create_invalid";
     }
-    if (pathContracts[create.path] && pathContracts[create.path].action === "edit") {
+    const contract = contractByPath.get(vscodeLmNormalizedPath(create.path));
+    if (contract && contract.action === "edit") {
       return `final_action_mismatch:${create.path}:create_on_edit`;
     }
     if (!allowedWrites.some((pattern) => vscodeLmPathMatchesPattern(create.path, pattern))) {
       return `final_path_not_allowed:${create.path}`;
     }
+    const fidelity = vscodeLmFidelityError(create.content, create.path, "v3_create", { create: true });
+    if (fidelity) return fidelity;
   }
+  if (requiredCreateError) return requiredCreateError;
   return "";
 }
 
@@ -2840,7 +3117,42 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     `- Never wrap JSON in Markdown or add prose.`;
 }
 
-async function collectVscodeLmResponseText(response, onProviderPart = null) {
+function vscodeLmCancellationPromise(cancellationToken) {
+  if (!cancellationToken) return null;
+  return new Promise((_resolve, reject) => {
+    const rejectCancelled = () => reject(new Error("vscode_lm_request_cancelled"));
+    if (cancellationToken.isCancellationRequested) {
+      rejectCancelled();
+      return;
+    }
+    if (typeof cancellationToken.onCancellationRequested === "function") {
+      const disposable = cancellationToken.onCancellationRequested(rejectCancelled);
+      if (disposable && typeof disposable.dispose === "function") {
+        // The listener is intentionally tiny and request-bounded. VS Code
+        // disposes it with the token source; callers also stop retaining the
+        // raced promise as soon as either branch settles.
+      }
+    } else if (cancellationToken.cancelled && typeof cancellationToken.cancelled.then === "function") {
+      cancellationToken.cancelled.then(rejectCancelled, rejectCancelled);
+    }
+  });
+}
+
+async function raceVscodeLmCancellation(value, cancellationToken) {
+  throwIfVscodeLmCancelled(cancellationToken);
+  const providerPromise = Promise.resolve(value);
+  // A provider may ignore the VS Code token and reject minutes after the
+  // bridge has released its claim. Always attach a terminal handler.
+  providerPromise.catch(() => {});
+  const cancellationPromise = vscodeLmCancellationPromise(cancellationToken);
+  const result = cancellationPromise
+    ? await Promise.race([providerPromise, cancellationPromise])
+    : await providerPromise;
+  throwIfVscodeLmCancelled(cancellationToken);
+  return result;
+}
+
+async function collectVscodeLmResponseText(response, onProviderPart = null, cancellationToken = null) {
   const textParts = [];
   const observations = { text: [], stream: [] };
   // VS Code documents `response.text` as a filtered view of `response.stream`,
@@ -2850,7 +3162,12 @@ async function collectVscodeLmResponseText(response, onProviderPart = null) {
   // authority; use `text` only for older/custom responses with no stream.
   const collectParts = async (iterable, channel) => {
     if (!iterable || typeof iterable[Symbol.asyncIterator] !== "function") return;
-    for await (const part of iterable) {
+    const iterator = iterable[Symbol.asyncIterator]();
+    while (true) {
+      const step = await raceVscodeLmCancellation(iterator.next(), cancellationToken);
+      if (!step || step.done) break;
+      const part = step.value;
+      throwIfVscodeLmCancelled(cancellationToken);
       if (typeof onProviderPart === "function") {
         try { onProviderPart(); } catch (_err) { /* liveness only */ }
       }
@@ -3023,6 +3340,12 @@ function vscodeLmProtocolFailure(code, trace, preview = "") {
   return error;
 }
 
+function throwIfVscodeLmCancelled(cancellationToken) {
+  if (cancellationToken && cancellationToken.isCancellationRequested) {
+    throw new Error("vscode_lm_request_cancelled");
+  }
+}
+
 async function runVscodeLmTextProtocol(
   model,
   request,
@@ -3030,17 +3353,24 @@ async function runVscodeLmTextProtocol(
   invokeTool = invokeVscodeLmPrivateTool,
   onToolTurn = null,
   onProviderPart = null,
+  assertActive = null,
 ) {
+  const assertRequestActive = () => {
+    if (typeof assertActive === "function") assertActive();
+    throwIfVscodeLmCancelled(cancellationToken);
+  };
   let sourceGraphAcknowledged = request.request_kind === "quality_review";
   let initialSourceGraphResult = null;
   if (request.initial_source_graph_request) {
     initialSourceGraphResult = request.initial_source_graph_result || null;
     if (!initialSourceGraphResult) {
       try {
-        initialSourceGraphResult = await invokeTool({
+        assertRequestActive();
+        initialSourceGraphResult = await raceVscodeLmCancellation(invokeTool({
           name: "aiworkhub_manager_source_graph_query",
           input: request.initial_source_graph_request,
-        }, request.requestId);
+        }, request.requestId), cancellationToken);
+        assertRequestActive();
       } catch (cause) {
         const error = vscodeLmProtocolFailure(
           "vscode_lm_initial_source_graph_failed",
@@ -3088,6 +3418,7 @@ async function runVscodeLmTextProtocol(
   const protocolTrace = [];
   let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    assertRequestActive();
     if (sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
       forceFinal = true;
     }
@@ -3102,12 +3433,15 @@ async function runVscodeLmTextProtocol(
         `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
       ));
     }
-    const response = await model.sendRequest(messages, {
+    assertRequestActive();
+    const response = await raceVscodeLmCancellation(model.sendRequest(messages, {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
-    }, cancellationToken);
+    }, cancellationToken), cancellationToken);
+    assertRequestActive();
     let text;
     try {
-      text = await collectVscodeLmResponseText(response, onProviderPart);
+      text = await collectVscodeLmResponseText(response, onProviderPart, cancellationToken);
+      assertRequestActive();
     } catch (err) {
       if (String(err && err.message || err) !== "vscode_lm_empty_response") throw err;
       messages.push(vscode.LanguageModelChatMessage.User(
@@ -3204,8 +3538,14 @@ async function runVscodeLmTextProtocol(
     }
     let result;
     try {
-      result = await invokeTool({ name: envelope.name, input: envelope.input }, request.requestId);
+      assertRequestActive();
+      result = await raceVscodeLmCancellation(
+        invokeTool({ name: envelope.name, input: envelope.input }, request.requestId),
+        cancellationToken,
+      );
+      assertRequestActive();
     } catch (err) {
+      if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
       result = { ok: false, error: sanitizeErrorMessage(err) };
     }
     if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
@@ -3233,13 +3573,18 @@ async function runVscodeLmAgent(
   invokeTool = invokeVscodeLmPrivateTool,
   onToolTurn = null,
   onProviderPart = null,
+  assertActive = null,
 ) {
   if (!model) throw new Error("vscode_lm_model_not_visible");
   if (!model.capabilities || !model.capabilities.toolCalling) {
     return runVscodeLmTextProtocol(
-      model, request, cancellationToken, invokeTool, onToolTurn, onProviderPart,
+      model, request, cancellationToken, invokeTool, onToolTurn, onProviderPart, assertActive,
     );
   }
+  const assertRequestActive = () => {
+    if (typeof assertActive === "function") assertActive();
+    throwIfVscodeLmCancelled(cancellationToken);
+  };
   const initialSourceGraphResult = request.initial_source_graph_result || null;
   const messages = [vscode.LanguageModelChatMessage.User(
     glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts) +
@@ -3255,6 +3600,7 @@ async function runVscodeLmAgent(
   const protocolTrace = [];
   let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
+    assertRequestActive();
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
         !forceFinal) {
@@ -3280,11 +3626,22 @@ async function runVscodeLmAgent(
       options.tools = availableTools;
       options.toolMode = sourceGraphAcknowledged ? vscode.LanguageModelChatToolMode.Auto : vscode.LanguageModelChatToolMode.Required;
     }
-    const response = await model.sendRequest(messages, options, cancellationToken);
+    assertRequestActive();
+    const response = await raceVscodeLmCancellation(
+      model.sendRequest(messages, options, cancellationToken), cancellationToken,
+    );
+    assertRequestActive();
     const assistantParts = [];
     const textParts = [];
     const calls = [];
-    for await (const part of response.stream) {
+    const streamIterator = response.stream[Symbol.asyncIterator]();
+    while (true) {
+      const step = await raceVscodeLmCancellation(
+        streamIterator.next(), cancellationToken,
+      );
+      if (!step || step.done) break;
+      const part = step.value;
+      assertRequestActive();
       if (typeof onProviderPart === "function") {
         try { onProviderPart(); } catch (_err) { /* liveness only */ }
       }
@@ -3355,8 +3712,13 @@ async function runVscodeLmAgent(
     for (const call of calls) {
       let result;
       try {
-        result = await invokeTool(call, request.requestId);
+        assertRequestActive();
+        result = await raceVscodeLmCancellation(
+          invokeTool(call, request.requestId), cancellationToken,
+        );
+        assertRequestActive();
       } catch (err) {
+        if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
         result = { ok: false, error: sanitizeErrorMessage(err) };
       }
       if (call.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
@@ -3380,8 +3742,9 @@ class VscodeLmBridgeHost {
     this.repoInfo = null;
     this.pollTimer = null;
     this.heartbeatTimer = null;
-    this.activeClaims = new Set();
+    this.activeClaims = new Map();
     this.activeSources = new Set();
+    this.cancelledRequestKeys = new Set();
     this.maxParallelRequests = VSCODE_LM_MAX_PARALLEL_REQUESTS;
     this.permissionPrompts = new Map();
     this.disposed = false;
@@ -3411,8 +3774,25 @@ class VscodeLmBridgeHost {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.pollTimer = null;
     this.heartbeatTimer = null;
+    for (const execution of this.activeClaims.values()) {
+      execution.cancelRequested = true;
+      if (execution.requestKey) this.cancelledRequestKeys.add(execution.requestKey);
+      if (execution.request) {
+        try {
+          atomicWriteOwnerJsonExclusive(
+            execution.request.responsePath,
+            vscodeLmCancelPayload(execution.request, execution.repoInfo.repoId, "bridge_host_stopped"),
+          );
+        } catch (err) {
+          recordSystemLog(`[vscode lm bridge] stop cancellation publish failed ${sanitizeErrorMessage(err)}`);
+        }
+      }
+      if (execution.source) {
+        try { execution.source.cancel(); } catch (_err) { /* already disposed */ }
+      }
+    }
     for (const source of this.activeSources) {
-      try { source.cancel(); } catch (_err) { /* already disposed */ }
+      try { source.cancel(); } catch (_err) { /* compatibility cleanup */ }
     }
     if (this.repoInfo && REAL_REPO_ID_RE.test(String(this.repoInfo.repoId || ""))) {
       const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
@@ -3492,7 +3872,7 @@ class VscodeLmBridgeHost {
     atomicWriteOwnerJson(hostPath, payload);
   }
 
-  async ensurePermission(model) {
+  async ensurePermission(model, cancellationToken = null) {
     if (this.modelAccessState(model).startsWith("granted")) return true;
     const permissionKey = vscodeLmPermissionStorageKey(model);
     if (!this.permissionPrompts.has(permissionKey)) {
@@ -3501,22 +3881,31 @@ class VscodeLmBridgeHost {
         `AIWorkHub has a queued worker task for ${label}. Allow this VS Code model?`,
         { modal: true, detail: "Permission is scoped to this exact VS Code model and is remembered immediately after approval. Provider failures will not ask again." },
         "Allow VS Code models",
-      ).then(async (choice) => {
-        if (choice !== "Allow VS Code models") return false;
-        // Persist the user's decision before the provider request.  The old
-        // success-only write created a circular failure: a timeout meant the
-        // approval was forgotten and the same modal appeared on every retry.
-        await this.rememberModelPermission(model);
-        try { await this.publishHeartbeat(); } catch (_err) { /* next heartbeat retries */ }
-        return true;
-      }).finally(() => {
+      ).finally(() => {
         if (this.permissionPrompts.get(permissionKey) === prompt) {
           this.permissionPrompts.delete(permissionKey);
         }
       });
       this.permissionPrompts.set(permissionKey, prompt);
     }
-    return this.permissionPrompts.get(permissionKey);
+    const choice = await raceVscodeLmCancellation(
+      this.permissionPrompts.get(permissionKey), cancellationToken,
+    );
+    throwIfVscodeLmCancelled(cancellationToken);
+    if (choice !== "Allow VS Code models") return false;
+    // Persist only while this exact request is still live. A cancelled task
+    // must not mutate permission memory when a modal resolves later.
+    await raceVscodeLmCancellation(
+      this.rememberModelPermission(model), cancellationToken,
+    );
+    throwIfVscodeLmCancelled(cancellationToken);
+    try {
+      await raceVscodeLmCancellation(this.publishHeartbeat(), cancellationToken);
+    } catch (err) {
+      if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
+      // The next heartbeat retries provider-catalog failures.
+    }
+    return true;
   }
 
   async poll() {
@@ -3532,35 +3921,110 @@ class VscodeLmBridgeHost {
     catch (_err) { return; }
     if (!names.length) return;
     let claimPath = null;
+    let execution = null;
     try {
       const requestPath = path.join(requestDir, names[0]);
       claimPath = `${requestPath}.claim-${WINDOW_SCOPE_ID}`;
       try { fs.renameSync(requestPath, claimPath); } catch (_err) { return; }
-      this.activeClaims.add(claimPath);
-      await this.processClaim(claimPath, repoInfo);
+      execution = {
+        claimPath,
+        repoInfo,
+        request: null,
+        requestKey: "",
+        source: null,
+        cancelRequested: false,
+      };
+      this.activeClaims.set(claimPath, execution);
+      await this.processClaim(claimPath, repoInfo, execution);
     } catch (err) {
       recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`);
     } finally {
       if (claimPath) {
+        if (execution && execution.requestKey) {
+          this.cancelledRequestKeys.delete(execution.requestKey);
+        }
         this.activeClaims.delete(claimPath);
         try { fs.unlinkSync(claimPath); } catch (_err) { /* absent */ }
       }
     }
   }
 
-  async processClaim(claimPath, repoInfo) {
+  async processClaim(claimPath, repoInfo, execution = null) {
+    const state = execution || {
+      claimPath, repoInfo, request: null, requestKey: "", source: null, cancelRequested: false,
+    };
     let source = null;
+    let request = null;
+    let deadlineTimer = null;
+    let cancelTimer = null;
+    let terminalDecisionAction = "";
+    const decisionRetryState = { invalidReads: 0 };
     let progressSequence = 0;
     let lastProviderProgressAt = 0;
     try {
       if (!ownerOnlyRegularFile(claimPath)) throw new Error("vscode_lm_request_not_owner_only");
       const payload = JSON.parse(fs.readFileSync(claimPath, "utf8"));
-      const request = validateVscodeLmRequest(payload, repoInfo);
-      const models = await this.models();
+      const requestPath = vscodeLmRequestPathFromClaim(claimPath);
+      request = validateVscodeLmRequest(payload, repoInfo, requestPath);
+      state.request = request;
+      state.requestKey = `${request.repo_id}:${request.requestId}`;
+      if (this.cancelledRequestKeys.has(state.requestKey)) state.cancelRequested = true;
+      source = new vscode.CancellationTokenSource();
+      state.source = source;
+      this.activeSources.add(source);
+      const cancellationObserved = () => (
+        state.cancelRequested || this.cancelledRequestKeys.has(state.requestKey)
+      );
+      const cancelExecution = (reason, { publish = false } = {}) => {
+        state.cancelRequested = true;
+        this.cancelledRequestKeys.add(state.requestKey);
+        if (publish && !terminalDecisionAction) {
+          try {
+            if (atomicWriteOwnerJsonExclusive(
+              request.responsePath, vscodeLmCancelPayload(request, repoInfo.repoId, reason),
+            )) terminalDecisionAction = "cancel";
+          } catch (err) {
+            recordSystemLog(`[vscode lm bridge] cancellation publish failed ${sanitizeErrorMessage(err)}`);
+          }
+        }
+        try { source.cancel(); } catch (_err) { /* already disposed */ }
+      };
+      const observeCancellation = () => {
+        if (terminalDecisionAction === "cancel") return;
+        if (cancellationObserved()) {
+          cancelExecution("bridge_host_stopped", { publish: true });
+        }
+        try {
+          const decision = readVscodeLmCancelDecision(request, decisionRetryState);
+          if (!decision) return;
+          if (decision.action === "pending") return;
+          terminalDecisionAction = decision.action;
+          if (decision.action === "cancel") {
+            cancelExecution("manager_cancelled");
+          } else {
+            cancelExecution("response_already_committed");
+            recordSystemLog("[vscode lm bridge] terminal response already committed");
+          }
+        } catch (err) {
+          cancelExecution("invalid_terminal_decision");
+          recordSystemLog(`[vscode lm bridge] cancel decision rejected ${sanitizeErrorMessage(err)}`);
+        }
+      };
+      observeCancellation();
+      cancelTimer = setInterval(observeCancellation, VSCODE_LM_CANCEL_POLL_MS);
+      if (cancelTimer && typeof cancelTimer.unref === "function") cancelTimer.unref();
+      if (cancellationObserved()) return;
+      const models = await raceVscodeLmCancellation(this.models(), source.token);
+      observeCancellation();
+      if (cancellationObserved()) return;
       const model = selectVscodeLanguageModel(models, request.model);
       if (!model) throw new Error("vscode_lm_model_not_visible");
-      if (!(await this.ensurePermission(model))) throw new Error("vscode_lm_permission_denied");
+      if (!(await this.ensurePermission(model, source.token))) throw new Error("vscode_lm_permission_denied");
+      observeCancellation();
+      if (cancellationObserved()) return;
       const writeProgress = (phase, extra = {}, minimumIntervalMs = 0) => {
+        observeCancellation();
+        if (cancellationObserved()) return;
         const now = Date.now();
         if (minimumIntervalMs && now - lastProviderProgressAt < minimumIntervalMs) return;
         progressSequence += 1;
@@ -3580,20 +4044,33 @@ class VscodeLmBridgeHost {
       writeProgress("request_accepted");
       const onToolTurn = (toolName) => writeProgress("tool_turn", { tool_name: String(toolName || "").slice(0, 200) });
       const onProviderPart = () => writeProgress("provider_response", {}, 2000);
-      source = new vscode.CancellationTokenSource();
-      this.activeSources.add(source);
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
-      const timer = setTimeout(() => source.cancel(), remainingMs);
+      deadlineTimer = setTimeout(() => {
+        source.cancel();
+      }, remainingMs);
       let text = "";
       let error = "";
       let diagnostics = null;
       try {
         text = await runVscodeLmAgent(
-          model, request, source.token, invokeVscodeLmPrivateTool, onToolTurn, onProviderPart,
+          model,
+          request,
+          source.token,
+          invokeVscodeLmPrivateTool,
+          onToolTurn,
+          onProviderPart,
+          () => {
+            observeCancellation();
+            if (cancellationObserved()) {
+              throw new Error("vscode_lm_request_cancelled");
+            }
+          },
         );
         writeProgress("final_edit");
       }
       catch (err) {
+        observeCancellation();
+        if (cancellationObserved()) return;
         error = sanitizeErrorMessage(err);
         writeProgress("terminal_error", { error: error.slice(0, 256) });
         diagnostics = {
@@ -3611,8 +4088,18 @@ class VscodeLmBridgeHost {
         }
         recordSystemLog(`[vscode lm bridge] ${error} trace=${JSON.stringify(diagnostics.turn_trace)}`);
       }
-      finally { clearTimeout(timer); source.dispose(); }
-      atomicWriteOwnerJson(request.responsePath, {
+      finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      observeCancellation();
+      if (cancellationObserved()) return;
+      // The response path itself is the single terminal commit point.  Both
+      // Python cancellation and provider completion publish a fully-written
+      // owner-only file through an atomic no-replace hard link.  There is no
+      // separate reservation to leak after a host crash and no overwrite
+      // window in which a late provider response can replace cancellation.
+      const responsePayload = {
         schema_id: VSCODE_LM_RESPONSE_SCHEMA,
         request_id: request.requestId,
         repo_id: repoInfo.repoId,
@@ -3620,12 +4107,25 @@ class VscodeLmBridgeHost {
         text,
         error,
         diagnostics,
+        decision: { action: "response", cancel_token: request.cancelToken },
         completed_at: new Date().toISOString(),
-      });
+      };
+      if (!atomicWriteOwnerJsonExclusive(request.responsePath, responsePayload)) {
+        observeCancellation();
+        return;
+      }
+      if (cancelTimer) clearInterval(cancelTimer);
+      cancelTimer = null;
     } catch (err) {
       recordSystemLog(`[glm bridge] ERROR ${sanitizeErrorMessage(err)}`);
     } finally {
-      if (source) this.activeSources.delete(source);
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (cancelTimer) clearInterval(cancelTimer);
+      if (source) {
+        this.activeSources.delete(source);
+        try { source.dispose(); } catch (_err) { /* already disposed */ }
+      }
+      state.source = null;
     }
   }
 }
@@ -7594,6 +8094,9 @@ module.exports = {
     glmTextToolProtocolPrompt,
     atomicWriteOwnerJson,
     ownerOnlyRegularFile,
+    vscodeLmRequestPathFromClaim,
+    readVscodeLmCancelDecision,
+    atomicWriteOwnerJsonExclusive,
     VSCODE_LM_PRIVATE_TOOLS,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
@@ -7620,6 +8123,8 @@ module.exports = {
       VSCODE_LM_TOOL_RESULT_SCHEMA,
       VSCODE_LM_PROGRESS_SCHEMA,
       VSCODE_LM_PROGRESS_PHASES,
+      VSCODE_LM_CANCEL_DECISION_SCHEMA,
+      VSCODE_LM_CANCEL_POLL_MS,
     },
   },
 };

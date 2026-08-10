@@ -15,7 +15,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import vscode_lm_worker  # noqa: E402
+from aiworkhub import vscode_lm_bridge, vscode_lm_worker  # noqa: E402
 
 
 def test_main_stdout_is_safe_for_legacy_windows_code_pages(
@@ -1036,3 +1036,114 @@ def test_write_atomic_preserves_exact_bytes_no_newline_translation(
     actual_hash = hashlib.sha256(actual_bytes).hexdigest()
     assert actual_hash == expected_hash
     assert actual_bytes.decode('utf-8') == content
+
+
+def _strict_terminal_fixture(
+    tmp_path: Path,
+    *,
+    request_id: str = "f" * 32,
+) -> tuple[Path, Path, str, str]:
+    workspace = tmp_path / "strict" / "worktree"
+    home = tmp_path / "strict" / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    response_path = home / ".aiworkhub_vscode_lm_response.json"
+    token = "a" * 64
+    repo_id = "repo_" + "b" * 32
+    spec_path = home / ".aiworkhub_vscode_lm_worker.json"
+    vscode_lm_bridge._atomic_json(  # noqa: SLF001 - exact worker contract
+        spec_path,
+        {
+            "schema_id": "aiworkhub.vscode_lm.worker_spec.v1",
+            "request_id": request_id,
+            "repo_id": repo_id,
+            "workspace_path": str(workspace),
+            "response_path": str(response_path),
+            "cancel_path": str(response_path),
+            "cancel_token": token,
+            "terminal_decision_required": True,
+            "timeout_seconds": 30,
+            "allowed_writes": [],
+        },
+    )
+    return spec_path, response_path, repo_id, token
+
+
+def _strict_provider_response(
+    *, request_id: str, repo_id: str, token: str,
+) -> dict[str, object]:
+    return {
+        "schema_id": vscode_lm_worker.RESPONSE_SCHEMA_ID,
+        "request_id": request_id,
+        "repo_id": repo_id,
+        "model": {"id": "glm-5.2"},
+        "text": json.dumps({
+            "schema_id": vscode_lm_worker.EDIT_RESPONSE_SCHEMA_ID,
+            "summary": "read-only complete",
+            "edits": [],
+            "creates": [],
+        }),
+        "error": "",
+        "decision": {"action": "response", "cancel_token": token},
+    }
+
+
+def test_worker_requires_exact_token_bound_response_decision(tmp_path: Path) -> None:
+    request_id = "f" * 32
+    spec_path, response_path, repo_id, token = _strict_terminal_fixture(
+        tmp_path, request_id=request_id,
+    )
+    forged = _strict_provider_response(
+        request_id=request_id, repo_id=repo_id, token=token,
+    )
+    forged["decision"] = {"action": "response", "cancel_token": "0" * 64}
+    vscode_lm_bridge._atomic_json(response_path, forged)  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="terminal_decision_contract_mismatch"):
+        vscode_lm_worker.run(spec_path)
+
+    assert response_path.is_file()
+
+
+def test_worker_consumes_durable_response_decision_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    request_id = "e" * 32
+    spec_path, response_path, repo_id, token = _strict_terminal_fixture(
+        tmp_path, request_id=request_id,
+    )
+    response = _strict_provider_response(
+        request_id=request_id, repo_id=repo_id, token=token,
+    )
+    vscode_lm_bridge._atomic_json(response_path, response)  # noqa: SLF001
+
+    result = vscode_lm_worker.run(spec_path)
+
+    assert result["is_error"] is False
+    assert result["changed_paths"] == []
+    assert json.loads(response_path.read_text(encoding="utf-8")) == response
+
+
+def test_worker_rejects_cancel_won_decision_without_writes(tmp_path: Path) -> None:
+    request_id = "d" * 32
+    spec_path, response_path, repo_id, token = _strict_terminal_fixture(
+        tmp_path, request_id=request_id,
+    )
+    cancel = {
+        "schema_id": vscode_lm_worker.RESPONSE_SCHEMA_ID,
+        "request_id": request_id,
+        "repo_id": repo_id,
+        "model": {},
+        "text": "",
+        "error": "vscode_lm_request_cancelled",
+        "decision": {"action": "cancel", "cancel_token": token},
+    }
+    vscode_lm_bridge._atomic_json(response_path, cancel)  # noqa: SLF001
+
+    with pytest.raises(
+        RuntimeError,
+        match="vscode_lm_request_failed:vscode_lm_request_cancelled",
+    ):
+        vscode_lm_worker.run(spec_path)
+
+    assert response_path.is_file()

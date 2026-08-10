@@ -31,6 +31,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -197,6 +198,8 @@ SUPERVISOR_GRACE_SECONDS = 90
 TERMINAL_AUTHORITY_SCHEMA_ID = terminal_authority.SCHEMA_ID
 TERMINAL_AUTHORITY_KEY_FILENAME = terminal_authority.KEY_FILENAME
 ACTIVE_PROCESS_STATES = {"starting", "running", "cancel_requested"}
+WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES = {"starting", "running"}
+_PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE = 3
 FINALIZATION_PENDING_STATES = {
     "finalizing", "release_pending", "review_pending", "reconcile_pending",
 }
@@ -217,6 +220,14 @@ TERMINAL_PROCESS_STATES = {
     "monitor_error",
     "blocked",
 }
+
+
+class _BridgeCancellationDeferred(RuntimeError):
+    """Bridge terminal decision could not be published; never finalize yet."""
+
+
+class _PidIdentityUnknownDeferred(RuntimeError):
+    """Supervisor identity is temporarily unknowable; retain active work."""
 
 
 def sanitized_env(
@@ -2837,6 +2848,7 @@ class _LiveProcess:
     metadata_path: Path | None = None
     supervisor_status_path: Path | None = None
     pid_start_ticks: int | None = None
+    bridge_request: vscode_lm_bridge.BridgeRequest | None = None
 
 
 class ProcessManager:
@@ -3273,9 +3285,10 @@ class ProcessManager:
             ):
                 active.add(request_id)
                 continue
-            if pid and (
-                (not event.get("metadata_path") and _pid_matches(pid, ticks))
-                or (ticks not in (None, "") and _pid_matches(pid, ticks))
+            if (
+                pid
+                and _pid_identity_evidence(pid, ticks).verdict
+                is not PidIdentityVerdict.MISMATCH
             ):
                 active.add(request_id)
         return active
@@ -4193,6 +4206,11 @@ class ProcessManager:
                     "metadata_path": str(metadata_path),
                     "prompt_sha256": prompt_hash,
                     "prompt_budget": prompt_budget,
+                    "vscode_lm_bridge": (
+                        vscode_lm_bridge.bridge_request_metadata(bridge_request)
+                        if bridge_request is not None
+                        else None
+                    ),
                     "project_context": (
                         context_result.metadata if context_result is not None else None
                     ),
@@ -4347,6 +4365,7 @@ class ProcessManager:
                     metadata_path=metadata_path,
                     supervisor_status_path=status_path,
                     pid_start_ticks=start_ticks,
+                    bridge_request=bridge_request,
                 )
                 with self._lock:
                     self._live[request_id] = live
@@ -4499,7 +4518,11 @@ class ProcessManager:
                 raise LaunchRejected(
                     f"duplicate_reserved_task:{event.get('request_id')}"
                 )
-            if pid and _pid_matches(pid, ticks):
+            if (
+                pid
+                and _pid_identity_evidence(pid, ticks).verdict
+                is not PidIdentityVerdict.MISMATCH
+            ):
                 raise LaunchRejected(f"duplicate_persisted_task:{event.get('request_id')}")
 
     def _launch_direct_for_tests(
@@ -4559,14 +4582,23 @@ class ProcessManager:
                     if live.task_id == task_id and live.process.poll() is None:
                         raise LaunchRejected(f"duplicate_live_task:{live.request_id}")
                 for event in self._latest_by_request().values():
-                    if event.get("task_id") == task_id and event.get("state") in {"starting", "running"}:
+                    if (
+                        event.get("task_id") == task_id
+                        and event.get("state") in ACTIVE_PROCESS_STATES
+                    ):
                         pid = int(event.get("pid") or 0)
-                        # PID + proc start-tick match, consistently with every
-                        # other duplicate/liveness check in this module (see
+                        # PID identity evidence, consistently with every other
+                        # admission check in this module (see
                         # _assert_no_duplicate_task, _active_request_ids,
-                        # cancel()). A bare _pid_alive() check would falsely
-                        # match an unrelated process that recycled the PID.
-                        if pid and _pid_matches(pid, event.get("pid_start_ticks")):
+                        # cancel()). UNKNOWN remains conservatively active;
+                        # only a proven mismatch clears the persisted request.
+                        if (
+                            pid
+                            and _pid_identity_evidence(
+                                pid, event.get("pid_start_ticks")
+                            ).verdict
+                            is not PidIdentityVerdict.MISMATCH
+                        ):
                             raise LaunchRejected(f"duplicate_persisted_task:{event.get('request_id')}")
 
                 request_id = uuid.uuid4().hex
@@ -4743,6 +4775,16 @@ class ProcessManager:
                     "metadata_path": str(live.metadata_path or ""),
                     "supervisor_status_path": str(live.supervisor_status_path or ""),
                 })
+            try:
+                self._publish_bridge_cancellation_before_finalization(
+                    live.request_id,
+                    live,
+                )
+            except _BridgeCancellationDeferred:
+                with self._lock:
+                    self._live.pop(live.request_id, None)
+                    self._cancelled.discard(live.request_id)
+                return
             self._finalize_after_process_exit(live.request_id, live.process.poll())
             with self._lock:
                 self._live.pop(live.request_id, None)
@@ -4750,6 +4792,119 @@ class ProcessManager:
             return
 
         self._monitor_direct_for_tests(live)
+
+    def _bridge_request_for_cancellation(
+        self,
+        request_id: str,
+        live: _LiveProcess | None,
+        status: dict[str, Any],
+    ) -> vscode_lm_bridge.BridgeRequest | None:
+        """Recover the exact bridge receipt before any lifecycle cancellation."""
+        if live is not None and live.bridge_request is not None:
+            return live.bridge_request
+        events = self._request_events(request_id)
+        latest = status.get("latest_event")
+        if not isinstance(latest, dict) and events:
+            latest = events[-1]
+        adapter_id = str(
+            (latest.get("adapter_id") if isinstance(latest, dict) else "")
+            or status.get("adapter_id")
+            or ""
+        )
+        if adapter_id not in _VSCODE_LM_IN_PROCESS_ADAPTERS:
+            return None
+        metadata_path = self._metadata_from_events(events)
+        if metadata_path is None or not metadata_path.is_file():
+            raise vscode_lm_bridge.BridgeError(
+                "bridge_cancel_metadata_missing"
+            )
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise vscode_lm_bridge.BridgeError(
+                f"bridge_cancel_metadata_invalid:{type(exc).__name__}:{exc}"
+            ) from exc
+        return vscode_lm_bridge.bridge_request_from_metadata(
+            metadata.get("vscode_lm_bridge"),
+            expected_request_id=request_id,
+        )
+
+    def _publish_bridge_cancellation_before_finalization(
+        self,
+        request_id: str,
+        live: _LiveProcess | None = None,
+    ) -> str:
+        """Publish the bridge terminal decision or defer finalization.
+
+        This gate is deliberately independent of the in-memory live-process
+        registry. A restarted manager must recover the exact token-bound
+        bridge receipt from owner-only request metadata before it can release
+        or finalize a dead supervisor's workspace.
+        """
+        events = self._request_events(request_id)
+        if events:
+            lineage = self._event_identity(events)
+            latest = {**lineage, **events[-1]}
+        elif live is not None:
+            lineage = {
+                "task_id": live.task_id,
+                "runner": live.runner,
+                "topic": live.topic,
+                "adapter_id": live.adapter_id,
+            }
+            latest = {
+                **lineage,
+                "request_id": request_id,
+                "state": "running",
+                "pid": live.process.pid,
+                "pid_start_ticks": live.pid_start_ticks,
+                "metadata_path": str(live.metadata_path or ""),
+                "supervisor_status_path": str(
+                    live.supervisor_status_path or ""
+                ),
+            }
+        else:
+            return ""
+        status = {
+            "request_id": request_id,
+            "state": latest.get("state"),
+            "adapter_id": latest.get("adapter_id"),
+            "latest_event": latest,
+        }
+        errors: list[str] = []
+        for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                request = self._bridge_request_for_cancellation(
+                    request_id,
+                    live,
+                    status,
+                )
+                if request is None:
+                    return ""
+                return vscode_lm_bridge.cancel_request(request)
+            except Exception as exc:  # noqa: BLE001 - fail closed below
+                errors.append(
+                    f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
+                )
+
+        error = "bridge_cancel_publication_failed:" + "|".join(errors)
+        self._append_event({
+            **lineage,
+            "request_id": request_id,
+            "state": "reconcile_pending",
+            "pid": latest.get("pid"),
+            "pid_start_ticks": latest.get("pid_start_ticks"),
+            "metadata_path": latest.get("metadata_path"),
+            "supervisor_status_path": latest.get("supervisor_status_path"),
+            "workspace_retained": True,
+            "bridge_provider_may_be_active": True,
+            "bridge_cancel_status": "failed",
+            "reconciliation_deferred": "bridge_cancel_publication_failed",
+            "error": error[:500],
+        })
+        raise _BridgeCancellationDeferred(error[:500])
 
     def _monitor_direct_for_tests(self, live: _LiveProcess) -> None:
         timed_out = False
@@ -4772,6 +4927,16 @@ class ProcessManager:
                 "pid": live.process.pid,
                 "error": str(exc)[:500],
             })
+        try:
+            self._publish_bridge_cancellation_before_finalization(
+                live.request_id,
+                live,
+            )
+        except _BridgeCancellationDeferred:
+            with self._lock:
+                self._live.pop(live.request_id, None)
+                self._cancelled.discard(live.request_id)
+            return
         try:
             card = _parse_card(self._show_task(live.task_id), live.task_id)
             task_state = core._lifecycle_state(card)
@@ -5129,10 +5294,20 @@ class ProcessManager:
         pid: int,
         start_ticks: Any,
     ) -> None:
+        unknown_streak = 0
         try:
-            while _pid_matches(pid, start_ticks):
+            while True:
+                verdict = _pid_identity_evidence(pid, start_ticks).verdict
+                if verdict is PidIdentityVerdict.MISMATCH:
+                    self._finalize_after_process_exit(request_id)
+                    return
+                if verdict is PidIdentityVerdict.MATCH:
+                    unknown_streak = 0
+                else:
+                    unknown_streak += 1
+                    if unknown_streak >= _PERSISTED_WATCH_UNKNOWN_MAX_CONSECUTIVE:
+                        return
                 time.sleep(0.2)
-            self._finalize_after_process_exit(request_id)
         finally:
             with self._lock:
                 self._watching.discard(request_id)
@@ -5141,6 +5316,8 @@ class ProcessManager:
         self,
         request_id: str,
         supervisor_returncode: int | None = None,
+        *,
+        lock_blocking: bool = True,
     ) -> dict[str, Any] | None:
         """Reconcile a dead supervisor without silently stranding its task.
 
@@ -5154,22 +5331,6 @@ class ProcessManager:
         The isolated workspace remains retained for diagnosis.
         """
         finalization_started = time.monotonic()
-        with self._request_lock(request_id):
-            events = self._request_events(request_id)
-            if not events:
-                return None
-            latest = events[-1]
-            if latest.get("state") in TERMINAL_PROCESS_STATES:
-                return latest
-            if latest.get("state") not in {"finalizing", "cancel_requested"}:
-                self._append_event({
-                    **self._event_identity(events),
-                    "request_id": request_id,
-                    "state": "finalizing",
-                    "provider_process_alive": False,
-                    "finalization_started_at": _utcnow(),
-                    "worker_terminal_state": latest.get("worker_terminal_state"),
-                })
 
         errors: list[str] = []
         for attempt, delay in enumerate((0.0, 0.05, 0.2), start=1):
@@ -5179,10 +5340,43 @@ class ProcessManager:
                 event = self._finalize_isolated_request(
                     request_id,
                     supervisor_returncode,
+                    lock_blocking=lock_blocking,
                 )
                 if event is not None:
                     return event
+                deferred = self._request_events(request_id)
+                if deferred:
+                    latest = deferred[-1]
+                    identity = _pid_identity_evidence(
+                        latest.get("pid"), latest.get("pid_start_ticks")
+                    )
+                    if identity.verdict is PidIdentityVerdict.MATCH:
+                        return latest
+                    if identity.verdict is PidIdentityVerdict.UNKNOWN:
+                        return {
+                            **latest,
+                            "reconciliation_deferred": "pid_identity_unknown",
+                            "workspace_retained": True,
+                        }
                 errors.append(f"attempt={attempt}:no_terminal_event")
+            except _BridgeCancellationDeferred:
+                deferred = self._request_events(request_id)
+                return deferred[-1] if deferred else None
+            except _PidIdentityUnknownDeferred:
+                deferred = self._request_events(request_id)
+                if not deferred:
+                    return None
+                return {
+                    **deferred[-1],
+                    "reconciliation_deferred": "pid_identity_unknown",
+                    "workspace_retained": True,
+                }
+            except OSError as exc:
+                if not lock_blocking:
+                    raise
+                errors.append(
+                    f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500]
+                )
             except Exception as exc:  # noqa: BLE001 - monitor must remain durable
                 errors.append(f"attempt={attempt}:{type(exc).__name__}:{exc}"[:500])
 
@@ -5241,16 +5435,29 @@ class ProcessManager:
         candidates = {
             request_id: event
             for request_id, event in self._latest_by_request().items()
-            if event.get("state") in ACTIVE_PROCESS_STATES | FINALIZATION_PENDING_STATES
-            and event.get("metadata_path")
+            if event.get("state") in FINALIZATION_PENDING_STATES
+            or (
+                event.get("state") in ACTIVE_PROCESS_STATES
+                and event.get("metadata_path")
+            )
         }
         for request_id, event in candidates.items():
+            state = event.get("state")
+            if state in FINALIZATION_PENDING_STATES:
+                finalized_event = self._finalize_after_process_exit(request_id)
+                if (
+                    finalized_event is not None
+                    and finalized_event.get("state") in TERMINAL_PROCESS_STATES
+                ):
+                    finalized += 1
+                continue
+
             pid = int(event.get("pid") or 0)
             ticks = event.get("pid_start_ticks")
-            if (
-                event.get("state") in ACTIVE_PROCESS_STATES
-                and _pid_matches(pid, ticks)
-            ):
+            verdict = _pid_identity_evidence(pid, ticks).verdict
+            if verdict is PidIdentityVerdict.UNKNOWN:
+                continue
+            if verdict is PidIdentityVerdict.MATCH:
                 with self._lock:
                     if request_id in self._watching or request_id in self._live:
                         continue
@@ -5264,7 +5471,11 @@ class ProcessManager:
                 thread.start()
                 watched += 1
             else:
-                if self._finalize_after_process_exit(request_id) is not None:
+                finalized_event = self._finalize_after_process_exit(request_id)
+                if (
+                    finalized_event is not None
+                    and finalized_event.get("state") in TERMINAL_PROCESS_STATES
+                ):
                     finalized += 1
         return {"watched": watched, "finalized": finalized}
 
@@ -5443,6 +5654,28 @@ class ProcessManager:
             finalization_retry = bool(latest.get("finalization_retry"))
             if latest.get("state") in TERMINAL_PROCESS_STATES:
                 return latest
+            with self._lock:
+                live = self._live.get(request_id)
+            identity = _pid_identity_evidence(
+                latest.get("pid"), latest.get("pid_start_ticks")
+            )
+            status_hint_path = Path(
+                str(latest.get("supervisor_status_path") or "")
+            )
+            status_hint = (
+                self._read_supervisor_status(status_hint_path)
+                if str(status_hint_path) not in {"", "."}
+                else {}
+            )
+            status_hint_state = str(status_hint.get("state") or "")
+            terminal_status_hint = bool(
+                status_hint and status_hint_state not in {"starting", "running"}
+            )
+            if not terminal_status_hint:
+                if identity.verdict is PidIdentityVerdict.UNKNOWN:
+                    raise _PidIdentityUnknownDeferred("pid_identity_unknown")
+                if identity.verdict is PidIdentityVerdict.MATCH and not status_hint:
+                    return None
             metadata_path = self._metadata_from_events(events)
             if metadata_path is None or not metadata_path.is_file():
                 return None
@@ -5450,6 +5683,11 @@ class ProcessManager:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 workspace = WorkerWorkspace.from_metadata(metadata["workspace"])
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                if (
+                    not terminal_status_hint
+                    and identity.verdict is PidIdentityVerdict.MATCH
+                ):
+                    return None
                 return self._append_event({
                     **self._event_identity(events),
                     "state": "finalize_failed",
@@ -5461,18 +5699,29 @@ class ProcessManager:
             supervisor_status = self._read_supervisor_status(status_path)
             supervisor_pid = int(latest.get("pid") or 0)
             supervisor_ticks = latest.get("pid_start_ticks")
-            supervisor_alive = bool(_identity_verified_pid(supervisor_pid, supervisor_ticks))
+            supervisor_state = str(supervisor_status.get("state") or "")
+            terminal_status_artifact = bool(
+                supervisor_status and supervisor_state not in {"starting", "running"}
+            )
+            if not terminal_status_artifact:
+                if identity.verdict is PidIdentityVerdict.UNKNOWN:
+                    raise _PidIdentityUnknownDeferred("pid_identity_unknown")
+                if (
+                    identity.verdict is PidIdentityVerdict.MATCH
+                    and not supervisor_status
+                ):
+                    return None
+            supervisor_alive = identity.verdict is PidIdentityVerdict.MATCH
             # The supervisor process is spawned before its first atomic status
             # write.  A concurrent reconciler can therefore observe the exact
             # live PID while the status file is still absent for a few
             # milliseconds.  That launch window is active work, not evidence
             # of failure; the PID watcher will call us again after exit.
-            if supervisor_alive and not supervisor_status:
-                return None
             liveness_lost = False
             stall_detected = False
             stall_idle_seconds: float | None = None
             stall_error = ""
+            terminate_supervisor = False
             if supervisor_status.get("state") in {"starting", "running"} and supervisor_alive:
                 liveness = derive_liveness_state(
                     now_epoch=time.time(),
@@ -5490,10 +5739,15 @@ class ProcessManager:
                     if stall_idle_seconds > stall_grace_seconds():
                         # Reverify the exact process identity immediately before
                         # termination. A bare or recycled PID is never killed.
-                        if _identity_verified_pid(supervisor_pid, supervisor_ticks):
+                        recheck = _pid_identity_evidence(
+                            supervisor_pid, supervisor_ticks
+                        )
+                        if recheck.verdict is PidIdentityVerdict.UNKNOWN:
+                            raise _PidIdentityUnknownDeferred("pid_identity_unknown")
+                        if recheck.verdict is PidIdentityVerdict.MATCH:
                             stall_detected = True
                             liveness_lost = True
-                            _terminate_process_group(supervisor_pid, grace_seconds=5.0)
+                            terminate_supervisor = True
                             supervisor_alive = False
                             stall_error = (
                                 "worker_stalled:no_meaningful_activity:"
@@ -5514,9 +5768,30 @@ class ProcessManager:
                 # bare "process exists" signal alone.
                 if not stall_detected:
                     liveness_lost = True
-                    if _identity_verified_pid(supervisor_pid, supervisor_ticks):
-                        _terminate_process_group(supervisor_pid, grace_seconds=5.0)
+                    recheck = _pid_identity_evidence(supervisor_pid, supervisor_ticks)
+                    if recheck.verdict is PidIdentityVerdict.UNKNOWN:
+                        raise _PidIdentityUnknownDeferred("pid_identity_unknown")
+                    terminate_supervisor = recheck.verdict is PidIdentityVerdict.MATCH
                     supervisor_alive = False
+
+            self._publish_bridge_cancellation_before_finalization(
+                request_id,
+                live,
+            )
+            if (
+                lock_blocking
+                and latest.get("state") not in {"finalizing", "cancel_requested"}
+            ):
+                self._append_event({
+                    **self._event_identity(events),
+                    "request_id": request_id,
+                    "state": "finalizing",
+                    "provider_process_alive": False,
+                    "finalization_started_at": _utcnow(),
+                    "worker_terminal_state": latest.get("worker_terminal_state"),
+                })
+            if terminate_supervisor:
+                _terminate_process_group(supervisor_pid, grace_seconds=5.0)
 
             # An abruptly lost (or heartbeat-lease-lost) supervisor may leave
             # its child running. Kill only when both PID and proc start time
@@ -5534,7 +5809,6 @@ class ProcessManager:
                 _terminate_process_group(verified_child_pid, grace_seconds=5.0)
 
             exit_code = supervisor_status.get("exit_code")
-            supervisor_state = str(supervisor_status.get("state") or "")
             error = stall_error or str(supervisor_status.get("error") or "")[:500]
             if liveness_lost and not error:
                 error = f"liveness_lost:heartbeat_lease_and_recovery_grace_exceeded:rc={supervisor_returncode}"
@@ -6258,13 +6532,23 @@ class ProcessManager:
         ):
             pid = int(latest.get("pid") or 0)
             ticks = latest.get("pid_start_ticks")
+            identity = _pid_identity_evidence(pid, ticks)
+            status_path = Path(str(latest.get("supervisor_status_path") or ""))
+            supervisor_status = (
+                self._read_supervisor_status(status_path)
+                if str(status_path) not in {"", "."}
+                else {}
+            )
+            supervisor_state = str(supervisor_status.get("state") or "")
+            terminal_status_artifact = bool(
+                supervisor_status and supervisor_state not in {"starting", "running"}
+            )
             if (
-                latest.get("state") in FINALIZATION_PENDING_STATES
-                or ticks in (None, "")
-                or not _pid_matches(pid, ticks)
+                identity.verdict is PidIdentityVerdict.MISMATCH
+                or terminal_status_artifact
             ):
                 try:
-                    self._finalize_isolated_request(
+                    self._finalize_after_process_exit(
                         request_id, lock_blocking=False
                     )
                 except OSError:
@@ -6280,6 +6564,8 @@ class ProcessManager:
                     for key, value in latest.items()
                     if key == "reconciliation_deferred"
                 }}
+            elif identity.verdict is PidIdentityVerdict.UNKNOWN:
+                latest["reconciliation_deferred"] = "pid_identity_unknown"
         with self._lock:
             live = self._live.get(request_id)
             if live is not None:
@@ -6350,7 +6636,7 @@ class ProcessManager:
         }
         if latest.get("adapter_id") not in vscode_lm_adapters:
             return {"ok": False, "reason": "worker_bridge_adapter_mismatch"}
-        if latest.get("state") not in ACTIVE_PROCESS_STATES:
+        if latest.get("state") not in WORKER_BRIDGE_AUTHORIZED_PROCESS_STATES:
             return {"ok": False, "reason": "worker_bridge_request_not_active"}
         metadata_path = self._metadata_from_events(events)
         if metadata_path is None or metadata_path.parent.resolve() != self.process_dir.resolve():
@@ -6724,14 +7010,52 @@ class ProcessManager:
     def cancel(self, request_id: str, reason: str = "owner_cancelled") -> dict[str, Any]:
         with self._lock:
             live = self._live.get(request_id)
-        status = self.status(request_id)
-        if not status.get("ok"):
-            return status
+        # Cancellation must inspect the durable lineage without invoking
+        # status() reconciliation first. A restarted manager can observe a
+        # dead supervisor while the already-claimed editor provider is still
+        # running; status() would finalize/release the workspace before the
+        # bridge cancellation decision was published.
+        initial_events = self._request_events(request_id)
+        if not initial_events:
+            return {"ok": False, "request_id": request_id, "state": "not_found"}
+        initial_lineage = self._event_identity(initial_events)
+        initial_latest = {**initial_lineage, **initial_events[-1]}
+        status = {
+            "ok": True,
+            "request_id": request_id,
+            "state": initial_latest.get("state"),
+            "adapter_id": initial_latest.get("adapter_id"),
+            "latest_event": initial_latest,
+        }
         if status.get("state") in TERMINAL_PROCESS_STATES:
             return {
                 "ok": True,
                 "request_id": request_id,
                 "state": status.get("state"),
+                "idempotent_noop": True,
+            }
+        bridge_cancel_status = ""
+        try:
+            bridge_cancel_status = (
+                self._publish_bridge_cancellation_before_finalization(
+                    request_id,
+                    live,
+                )
+            )
+        except _BridgeCancellationDeferred as exc:
+            return {
+                "ok": False,
+                "request_id": request_id,
+                "state": "reconcile_pending",
+                "blocked_reason": str(exc)[:500],
+            }
+        if bridge_cancel_status == "completed":
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "state": status.get("state"),
+                "bridge_cancel_status": "completed",
+                "completion_won": True,
                 "idempotent_noop": True,
             }
         if live is not None and not live.isolated:
@@ -6750,6 +7074,7 @@ class ProcessManager:
                 "finished_at": _utcnow(),
                 "stdout_path": str(live.stdout_path),
                 "stderr_path": str(live.stderr_path),
+                "bridge_cancel_status": bridge_cancel_status,
             })
             with self._lock:
                 self._live.pop(request_id, None)
@@ -6776,7 +7101,16 @@ class ProcessManager:
                 }
             pid = int(latest.get("pid") or 0)
             ticks = latest.get("pid_start_ticks")
-            if ticks in (None, "") or not pid or not _pid_matches(pid, ticks):
+            identity = _pid_identity_evidence(pid, ticks)
+            if identity.verdict is PidIdentityVerdict.UNKNOWN:
+                return {
+                    "ok": False,
+                    "request_id": request_id,
+                    "state": latest.get("state"),
+                    "blocked_reason": "pid_identity_unknown",
+                    "reconciliation_deferred": "pid_identity_unknown",
+                }
+            if identity.verdict is PidIdentityVerdict.MISMATCH:
                 should_finalize = True
             else:
                 metadata_path = self._metadata_from_events(events)
@@ -6818,6 +7152,7 @@ class ProcessManager:
                     "metadata_path": str(metadata_path),
                     "supervisor_status_path": metadata.get("supervisor_status_path"),
                     "cancel_path": str(cancel_path),
+                    "bridge_cancel_status": bridge_cancel_status,
                 })
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -6825,7 +7160,7 @@ class ProcessManager:
                     should_finalize = True
 
         if should_finalize:
-            self._finalize_isolated_request(request_id)
+            self._finalize_after_process_exit(request_id)
             refreshed = self.status(request_id)
             return {
                 "ok": bool(refreshed.get("ok")),
@@ -8072,6 +8407,265 @@ def _pid_matches(pid: int, expected_start_ticks: Any) -> bool:
     return _pid_start_ticks(pid) == expected
 
 
+class PidIdentityVerdict(Enum):
+    """Truthful result of an exact PID plus creation-time identity probe."""
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PidIdentityEvidence:
+    """Immutable evidence captured at the process-identity boundary."""
+
+    verdict: PidIdentityVerdict
+    pid: int | None
+    expected_start_ticks: int | None
+    observed_start_ticks: int | None
+    attempts: int
+    operation: str
+    winerror: int | None = None
+    exception: str = ""
+
+
+_PID_IDENTITY_MAX_ATTEMPTS = 3
+_PID_IDENTITY_RETRY_DELAY_SECONDS = 0.01
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WINDOWS_ERROR_INVALID_PARAMETER = 87
+
+
+def _windows_pid_identity_once(
+    pid: int,
+    expected_start_ticks: int,
+    *,
+    attempt: int,
+) -> PidIdentityEvidence:
+    """Perform one Windows identity probe and capture failure provenance."""
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    try:
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.GetProcessTimes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = ctypes.c_int
+        getattr(ctypes, "set_last_error")(0)
+        handle = kernel32.OpenProcess(
+            _WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION,
+            False,
+            pid,
+        )
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror is None:
+            winerror = int(getattr(ctypes, "get_last_error")()) or None
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=pid,
+            expected_start_ticks=expected_start_ticks,
+            observed_start_ticks=None,
+            attempts=attempt,
+            operation="OpenProcess",
+            winerror=winerror,
+            exception=type(exc).__name__,
+        )
+
+    if not handle:
+        winerror = int(getattr(ctypes, "get_last_error")()) or None
+        absent = winerror == _WINDOWS_ERROR_INVALID_PARAMETER
+        return PidIdentityEvidence(
+            verdict=(
+                PidIdentityVerdict.MISMATCH
+                if absent
+                else PidIdentityVerdict.UNKNOWN
+            ),
+            pid=pid,
+            expected_start_ticks=expected_start_ticks,
+            observed_start_ticks=None,
+            attempts=attempt,
+            operation="OpenProcess",
+            winerror=winerror,
+            exception="ProcessAbsent" if absent else "OpenProcessFailed",
+        )
+
+    creation = _FileTime()
+    exit_time = _FileTime()
+    kernel = _FileTime()
+    user = _FileTime()
+    try:
+        try:
+            getattr(ctypes, "set_last_error")(0)
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            )
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror is None:
+                winerror = int(getattr(ctypes, "get_last_error")()) or None
+            return PidIdentityEvidence(
+                verdict=PidIdentityVerdict.UNKNOWN,
+                pid=pid,
+                expected_start_ticks=expected_start_ticks,
+                observed_start_ticks=None,
+                attempts=attempt,
+                operation="GetProcessTimes",
+                winerror=winerror,
+                exception=type(exc).__name__,
+            )
+        if not ok:
+            winerror = int(getattr(ctypes, "get_last_error")()) or None
+            return PidIdentityEvidence(
+                verdict=PidIdentityVerdict.UNKNOWN,
+                pid=pid,
+                expected_start_ticks=expected_start_ticks,
+                observed_start_ticks=None,
+                attempts=attempt,
+                operation="GetProcessTimes",
+                winerror=winerror,
+                exception="GetProcessTimesFailed",
+            )
+        observed = (int(creation.high) << 32) | int(creation.low)
+        return PidIdentityEvidence(
+            verdict=(
+                PidIdentityVerdict.MATCH
+                if observed == expected_start_ticks
+                else PidIdentityVerdict.MISMATCH
+            ),
+            pid=pid,
+            expected_start_ticks=expected_start_ticks,
+            observed_start_ticks=observed,
+            attempts=attempt,
+            operation="GetProcessTimes",
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_identity_evidence(pid: Any, expected_start_ticks: Any) -> PidIdentityEvidence:
+    """Return bounded, fail-closed PID identity evidence on every platform."""
+
+    try:
+        numeric_pid = int(pid or 0)
+    except (TypeError, ValueError) as exc:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=None,
+            expected_start_ticks=None,
+            observed_start_ticks=None,
+            attempts=0,
+            operation="parse_pid",
+            exception=type(exc).__name__,
+        )
+    if numeric_pid <= 0:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.MISMATCH,
+            pid=numeric_pid,
+            expected_start_ticks=None,
+            observed_start_ticks=None,
+            attempts=0,
+            operation="pid_absent",
+            exception="NonPositivePid",
+        )
+    if expected_start_ticks in (None, ""):
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=numeric_pid,
+            expected_start_ticks=None,
+            observed_start_ticks=None,
+            attempts=0,
+            operation="parse_expected_start_ticks",
+            exception="ExpectedStartTicksMissing",
+        )
+    try:
+        expected = int(expected_start_ticks)
+    except (TypeError, ValueError) as exc:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=numeric_pid,
+            expected_start_ticks=None,
+            observed_start_ticks=None,
+            attempts=0,
+            operation="parse_expected_start_ticks",
+            exception=type(exc).__name__,
+        )
+
+    if os.name == "nt":
+        evidence: PidIdentityEvidence | None = None
+        for attempt in range(1, _PID_IDENTITY_MAX_ATTEMPTS + 1):
+            evidence = _windows_pid_identity_once(
+                numeric_pid,
+                expected,
+                attempt=attempt,
+            )
+            if evidence.verdict is not PidIdentityVerdict.UNKNOWN:
+                return evidence
+            if attempt < _PID_IDENTITY_MAX_ATTEMPTS:
+                time.sleep(_PID_IDENTITY_RETRY_DELAY_SECONDS)
+        assert evidence is not None
+        return evidence
+
+    try:
+        os.kill(numeric_pid, 0)
+    except ProcessLookupError as exc:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.MISMATCH,
+            pid=numeric_pid,
+            expected_start_ticks=expected,
+            observed_start_ticks=None,
+            attempts=1,
+            operation="kill_zero",
+            exception=type(exc).__name__,
+        )
+    except PermissionError as exc:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=numeric_pid,
+            expected_start_ticks=expected,
+            observed_start_ticks=None,
+            attempts=1,
+            operation="kill_zero",
+            exception=type(exc).__name__,
+        )
+    observed = _pid_start_ticks(numeric_pid)
+    if observed is None:
+        return PidIdentityEvidence(
+            verdict=PidIdentityVerdict.UNKNOWN,
+            pid=numeric_pid,
+            expected_start_ticks=expected,
+            observed_start_ticks=None,
+            attempts=1,
+            operation="_pid_start_ticks",
+            exception="StartTicksUnavailable",
+        )
+    return PidIdentityEvidence(
+        verdict=(
+            PidIdentityVerdict.MATCH
+            if observed == expected
+            else PidIdentityVerdict.MISMATCH
+        ),
+        pid=numeric_pid,
+        expected_start_ticks=expected,
+        observed_start_ticks=observed,
+        attempts=1,
+        operation="_pid_start_ticks",
+    )
+
+
 def _identity_verified_pid(pid: Any, ticks: Any) -> int:
     """Return ``pid`` only when its recorded creation timestamp still matches.
 
@@ -8091,13 +8685,13 @@ def _identity_verified_pid(pid: Any, ticks: Any) -> int:
     owns.  Requiring the creation timestamp closes that hole.
     """
 
-    try:
-        numeric = int(pid or 0)
-    except (TypeError, ValueError):
-        return 0
-    if numeric <= 0 or ticks in (None, ""):
-        return 0
-    return numeric if _pid_matches(numeric, ticks) else 0
+    evidence = _pid_identity_evidence(pid, ticks)
+    return (
+        int(evidence.pid)
+        if evidence.verdict is PidIdentityVerdict.MATCH
+        and evidence.pid is not None
+        else 0
+    )
 
 
 def _canonical_task_status(card: dict[str, Any]) -> str:
@@ -8109,17 +8703,8 @@ def _canonical_task_status(card: dict[str, Any]) -> str:
 
 def _process_proven_dead(pid: int, ticks: Any) -> bool:
     """Fail closed: a live PID with unknown start ticks is not proven dead."""
-    if pid <= 0:
-        return True
-    if not _pid_alive(pid):
-        return True
-    if ticks in (None, ""):
-        return False
-    try:
-        expected = int(ticks)
-    except (TypeError, ValueError):
-        return False
-    return _pid_start_ticks(pid) != expected
+    evidence = _pid_identity_evidence(pid, ticks)
+    return evidence.verdict is PidIdentityVerdict.MISMATCH
 
 
 def _terminate_process_group(pid: int, grace_seconds: float) -> None:
