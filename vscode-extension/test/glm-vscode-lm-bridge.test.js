@@ -88,6 +88,8 @@ assert.strictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vsco
 assert.notStrictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vscodeLmPermissionStorageKey(deepseek));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_session_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_ai_memory_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_kb_write_intent"));
@@ -109,6 +111,8 @@ assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "resea
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=body with query equal to the exact indexed symbol name"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_prepare"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_stage"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("assembles the final envelope offline"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"file_path":"repo/relative/path"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("absence of native toolCalling does not mean tools are unavailable"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("never report that MCP/callable tools are missing"));
@@ -702,6 +706,112 @@ async function textProtocolChecks() {
   assert.strictEqual(v3HashMessages.length, 2);
   assert.ok(v3HashMessages[1].includes("final_hash_stale:src/app.py"));
 
+  const stagedTextTurns = [
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_semantic_edit_stage",
+      input: {
+        operation: "replace_range",
+        file_path: "src/app.py",
+        start_line: 2,
+        end_line: 2,
+        new: "return 2",
+      },
+    }),
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_semantic_edit_stage",
+      input: {
+        operation: "create",
+        file_path: "tests/test_app.py",
+        content: "def test_app():\n    assert True\n",
+      },
+    }),
+    JSON.stringify({
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_manager_semantic_edit_finalize",
+      input: { summary: "Updated app and added its focused test." },
+    }),
+  ];
+  const stagedTextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: stagedTextTurns.shift() }; }()),
+    }),
+  };
+  const stagedTextCalls = [];
+  const stagedTextResult = JSON.parse(await internals.runVscodeLmTextProtocol(
+    stagedTextModel,
+    {
+      requestId: "1".repeat(32),
+      prompt: "stage bounded edits",
+      allowedWrites: ["src/app.py", "tests/test_app.py"],
+      path_contracts: {
+        ...editContract,
+        "tests/test_app.py": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+      initial_source_graph_request: { mode: "focus", query: "staged edit", budget: 48 },
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async (call) => {
+      stagedTextCalls.push(call);
+      assert.strictEqual(call.name, "aiworkhub_manager_semantic_edit_prepare");
+      return { ok: true, path: "src/app.py", current_sha256: "a".repeat(64) };
+    },
+  ));
+  assert.strictEqual(stagedTextCalls.length, 1);
+  assert.strictEqual(stagedTextResult.summary, "Updated app and added its focused test.");
+  assert.deepStrictEqual(stagedTextResult.edits, [{
+    path: "src/app.py",
+    current_sha256: "a".repeat(64),
+    ranges: [{
+      start_line: 2,
+      end_line: 2,
+      new: "return 2",
+      preserve_trailing_newline: true,
+    }],
+  }]);
+  assert.deepStrictEqual(stagedTextResult.creates, [{
+    path: "tests/test_app.py",
+    content: "def test_app():\n    assert True\n",
+  }]);
+
+  const atomicCollector = internals.createVscodeLmStagedEditCollector({
+    allowedWrites: ["src/app.py"],
+    path_contracts: editContract,
+  });
+  const prepareAtomic = async () => ({
+    ok: true,
+    path: "src/app.py",
+    current_sha256: "a".repeat(64),
+  });
+  assert.strictEqual((await atomicCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 2,
+    end_line: 2,
+    new: "return 4",
+  }, prepareAtomic)).ok, true);
+  const rejectedOverlap = await atomicCollector.stage({
+    operation: "replace_range",
+    file_path: "src/app.py",
+    start_line: 1,
+    end_line: 2,
+    new: "corrupt overlap",
+  }, prepareAtomic);
+  assert.strictEqual(rejectedOverlap.ok, false);
+  assert.match(rejectedOverlap.reason, /range_overlap/);
+  const atomicFinal = atomicCollector.finalize("Kept only the verified staged range.");
+  assert.strictEqual(atomicFinal.ok, true);
+  assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges.length, 1);
+  assert.strictEqual(atomicFinal.__finalEnvelope.edits[0].ranges[0].new, "return 4");
+
   const copiedSentinelV3 = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
     summary: "attempted bounded change",
@@ -971,6 +1081,60 @@ async function nativeProtocolChecks() {
   );
   assert.strictEqual(result, finalResponse);
   assert.ok(originalInvoke.length > 0);
+
+  const stagedNativeTurns = [
+    [{
+      callId: "stage-1",
+      name: "aiworkhub_manager_semantic_edit_stage",
+      input: {
+        operation: "replace_range",
+        file_path: "src/app.py",
+        start_line: 2,
+        end_line: 2,
+        new: "return 3",
+      },
+    }],
+    [{
+      callId: "finalize-1",
+      name: "aiworkhub_manager_semantic_edit_finalize",
+      input: { summary: "Applied one staged native edit." },
+    }],
+  ];
+  const stagedNativeModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => ({
+      stream: (async function* stream() {
+        for (const part of stagedNativeTurns.shift()) yield part;
+      }()),
+    }),
+  };
+  const stagedNativeCalls = [];
+  const stagedNativeResult = JSON.parse(await internals.runVscodeLmAgent(
+    stagedNativeModel,
+    {
+      requestId: "2".repeat(32),
+      prompt: "stage native edit",
+      allowedWrites: ["src/app.py"],
+      path_contracts: {
+        "src/app.py": {
+          action: "edit",
+          current_sha256: "a".repeat(64),
+          line_count: 2,
+          parent_existed: true,
+        },
+      },
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async (call) => {
+      stagedNativeCalls.push(call);
+      assert.strictEqual(call.name, "aiworkhub_manager_semantic_edit_prepare");
+      return { ok: true, path: "src/app.py", current_sha256: "a".repeat(64) };
+    },
+  ));
+  assert.strictEqual(stagedNativeCalls.length, 1);
+  assert.strictEqual(stagedNativeResult.summary, "Applied one staged native edit.");
+  assert.strictEqual(stagedNativeResult.edits[0].ranges[0].new, "return 3");
 
   const nativePrefetchCalls = [];
   const nativePrefetchMessages = [];

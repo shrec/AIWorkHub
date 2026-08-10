@@ -341,7 +341,7 @@ never inherit the manager launch capability.
 | Area | Current capability |
 | --- | --- |
 | Tasks | Dependency DAG, collision checks, isolated workers, truthful terminal states and manager review |
-| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing, replacement-only semantic edits and continuous-use telemetry |
+| Source Graph | 34 configurable code/data/documentation families, 31 bounded structural and analytical modes, automatic incremental indexing, staged replacement-only semantic edits with offline envelope assembly and continuous-use telemetry |
 | Context | Repository-scoped Session Manager, AI Memory and KB read/write MCP tools |
 | Quality | Deterministic verification, combined-tree validation, diff-scoped multi-language Known Bug Scanner, truth-preserving SARIF 2.1.0 export and configurable evidence gates |
 | Operations | KPI charts, Review Inbox, callbacks, live output, authenticated all-tool telemetry, bounded logs, reversible task/archive retention and workforce scoring |
@@ -360,7 +360,10 @@ shown as `not_configured`, `inconclusive` or `unknown`; they never become zero
 or a synthetic savings multiplier.
 Focused semantic edits additionally report authenticated source-file, selected-region and
 replacement byte totals, including how many whole-file bytes the model did not
-re-emit. This is structural evidence, not a token multiplier. Every rate
+re-emit. Text-only and native VS Code LM providers can submit these fragments
+one at a time; the local bridge validates hashes and overlaps, retains no
+workspace mutation during staging, and assembles the final response offline.
+This is structural evidence, not a token multiplier. Every rate
 carries its sample window or denominator; token savings and causal quality
 gains are deliberately not inferred. Inter-call gaps at or above the bounded
 15-minute informational threshold are surfaced, but never mislabeled as proof

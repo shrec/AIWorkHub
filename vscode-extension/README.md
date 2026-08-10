@@ -12,17 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.40
+## What's new in 0.9.41
 
-- Required semantic-edit creates now reject literal placeholder output,
-  including retained rework that leaves an invalid required file unchanged.
-- Repository Ruff and mypy checks can use their trusted PATH entrypoint when
-  the active MCP interpreter does not provide the declared module, while the
-  exact executed command remains visible in evidence receipts.
-- Task supersession verifies the replacement task before archiving the
-  original card, preventing a transient broken edge in the Plan DAG.
-- Quality-verdict aggregation keeps a strict typed evidence shape and ships
-  with focused placeholder, quality-tool and replacement-edge regressions.
+- VS Code LM workers can stage small hash-bound replacements and new files one
+  at a time, then finalize with a short summary; AIWorkHub assembles the full
+  edit envelope offline instead of asking the model to regenerate it.
+- Text-only GLM/DeepSeek and native tool-calling providers share the same
+  fail-closed staged-edit contract, including overlap and stale-hash checks.
+- Validation-only replay no longer cancels an editor bridge when durable
+  evidence proves that no provider was launched.
+- Bounded dashboard event-stream primitives now cover gaps, overflow,
+  reconnect and authoritative resync; live server/webview wiring remains a
+  tracked follow-up.
 
 See the packaged **Changelog** for the complete release summary.
 
@@ -38,6 +39,9 @@ See the packaged **Changelog** for the complete release summary.
 - Delegate to supported local model adapters and track real terminal outcomes.
 - Replace repeated raw-source discovery with a repository Source Graph covering
   34 configurable code, data and documentation families.
+- Send focused code fragments through staged semantic edits and let the local
+  bridge assemble the hash-bound final envelope without model-side full-file
+  regeneration.
 - Use 31 bounded source-intelligence modes for symbols, calls, tests, impact,
   complexity, ownership, hotspots, gaps and task-shaped context bundles.
 - Preserve continuity through Session Manager, AI Memory and KB.

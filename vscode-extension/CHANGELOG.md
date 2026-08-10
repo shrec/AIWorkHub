@@ -1,5 +1,27 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.41 — 2026-08-10
+
+### Added
+
+- Stage bounded semantic-edit replacements and creates through small tool
+  calls, then assemble the final worker envelope offline from hash-bound
+  receipts after a summary-only finalize call.
+- Added bounded event-stream primitives with gap, overflow, reconnect and
+  authoritative-resync behavior for the next dashboard transport stage.
+
+### Fixed
+
+- Validation-only replay skips editor-bridge cancellation only when durable
+  request evidence proves that no provider was launched.
+- Required-create range edits are revalidated as complete create content, and
+  authenticated read-only finalization follows the normal cancel contract.
+
+### Validation
+
+- Text-only and native provider paths share staged-edit parity tests; rejected
+  overlapping ranges cannot mutate the accumulated final envelope.
+
 ## 0.9.40 — 2026-08-10
 
 ### Fixed

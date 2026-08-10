@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.41] - 2026-08-10
+
+### Added
+
+- Text-only and native VS Code LM workers can stage one bounded replacement or
+  create at a time and finish with a summary-only tool call. AIWorkHub keeps
+  the hash-bound fragments in memory and assembles the final semantic-edit
+  envelope offline, avoiding fragile full-response regeneration.
+- Added bounded, gap-aware dashboard event-stream primitives with deterministic
+  overflow and authoritative-resync behavior. Server and webview wiring remain
+  an explicitly tracked follow-up rather than an implied completed claim.
+
+### Changed
+
+- Extracted runner/topic allowlist authority from the core task module into a
+  dedicated policy module while preserving public imports and exact decisions.
+
+### Fixed
+
 ### Fixed
 
 - Integrated PR #16: authenticated VS Code LM read-only finalization now
@@ -19,7 +38,9 @@ noted by package/extension version and release tag.
 ### Tests
 
 - Added required-create placeholder, `.pyi` ellipsis, bridge-lifecycle and
-  provider-free replay regressions.
+  provider-free replay regressions, plus staged-edit parity checks for
+  text-only and native tool-calling providers and atomic rejection of
+  overlapping staged ranges.
 
 ## [0.9.40] - 2026-08-10
 
