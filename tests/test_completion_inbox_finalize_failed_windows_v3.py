@@ -117,6 +117,122 @@ def test_blocked_finalize_failed_terminal_failure_evidence():
     assert entry["workspace_retained"] is True
 
 
+def test_blocked_worker_failed_supervisor_incomplete_operational():
+    """Blocked worker_failed + supervisor_incomplete appears exactly once."""
+    card = {
+        "task_id": "BLOCKED_WF_01",
+        "runner": "fixture_runner_wf",
+        "claimed_by": "fixture_runner_wf",
+        "topic": "task_mcp",
+        "priority": "normal",
+        "objective": "fixture worker_failed blocked task",
+        "allowed_writes": ["src/b.py"],
+        "updated_at": "2026-08-09T15:00:00+00:00",
+        "terminal_substatus": "worker_failed",
+        "launch_request_id": "req_launch_wf_01",
+        "terminal_failure": {
+            "substatus": "worker_failed",
+            "evidence": {
+                "request_id": "req_wf_ev_01",
+                "error": "supervisor_incomplete:state=running:rc=None",
+            },
+        },
+        "workspace_retained": True,
+    }
+
+    def stub_list_tasks(status="pending", topic=None, limit=80):
+        if status != "blocked":
+            return {"stdout": "", "returncode": 0}
+        return {
+            "stdout": f"[blocked] [task_mcp] [fixture_runner_wf] {card['task_id']}",
+            "returncode": 0,
+        }
+
+    def stub_show_task(task_id):
+        return {"stdout": json.dumps(card), "returncode": 0}
+
+    result = completion_inbox.build_completion_inbox(
+        topic="task_mcp",
+        limit=50,
+        _list_tasks=stub_list_tasks,
+        _show_task=stub_show_task,
+    )
+
+    failures = [
+        e for e in result["operational_failures"]
+        if e["task_id"] == card["task_id"]
+    ]
+    assert len(failures) == 1
+    entry = failures[0]
+
+    assert entry["terminal_substatus"] == "worker_failed"
+    assert entry["request_id"] == "req_wf_ev_01"
+    assert entry["launch_request_id"] == "req_launch_wf_01"
+    assert (
+        entry["operational_error"]
+        == "supervisor_incomplete:state=running:rc=None"
+    )
+    assert entry["workspace_retained"] is True
+
+    assert _entry_by_task_id(result["review_queue"], card["task_id"]) is None
+    assert _entry_by_task_id(result["stale_processing"], card["task_id"]) is None
+
+    counts = result["counts"]
+    assert counts["blocked_scanned"] == 1
+    assert counts["operational_failures"] == 1
+    assert counts["review_queue"] == 0
+    assert counts["stale_processing"] == 0
+
+
+def test_blocked_worker_failed_monthly_credit_excluded():
+    """Provider quota/credit errors are NOT operational failures."""
+    card = {
+        "task_id": "BLOCKED_WF_02",
+        "runner": "fixture_runner_wf2",
+        "claimed_by": "fixture_runner_wf2",
+        "topic": "task_mcp",
+        "priority": "normal",
+        "objective": "fixture worker_failed credit limit task",
+        "allowed_writes": ["src/c.py"],
+        "updated_at": "2026-08-09T16:00:00+00:00",
+        "terminal_substatus": "worker_failed",
+        "launch_request_id": "req_launch_wf_02",
+        "terminal_failure": {
+            "substatus": "worker_failed",
+            "evidence": {
+                "request_id": "req_wf_ev_02",
+                "error": "provider_error:monthly_credit_limit_exceeded",
+            },
+        },
+        "workspace_retained": False,
+    }
+
+    def stub_list_tasks(status="pending", topic=None, limit=80):
+        if status != "blocked":
+            return {"stdout": "", "returncode": 0}
+        return {
+            "stdout": f"[blocked] [task_mcp] [fixture_runner_wf2] {card['task_id']}",
+            "returncode": 0,
+        }
+
+    def stub_show_task(task_id):
+        return {"stdout": json.dumps(card), "returncode": 0}
+
+    result = completion_inbox.build_completion_inbox(
+        topic="task_mcp",
+        limit=50,
+        _list_tasks=stub_list_tasks,
+        _show_task=stub_show_task,
+    )
+
+    assert _entry_by_task_id(result["operational_failures"], card["task_id"]) is None
+    assert _entry_by_task_id(result["review_queue"], card["task_id"]) is None
+
+    counts = result["counts"]
+    assert counts["blocked_scanned"] == 1
+    assert counts["operational_failures"] == 0
+    assert counts["review_queue"] == 0
+
 def test_blocked_non_finalize_failed_excluded():
     card = {
         "task_id": "BLOCKED_OTHER_03",

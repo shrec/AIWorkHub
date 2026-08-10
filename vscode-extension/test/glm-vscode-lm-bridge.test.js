@@ -100,6 +100,11 @@ assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).include
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"file_path":"repo/relative/path"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("absence of native toolCalling does not mean tools are unavailable"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("never report that MCP/callable tools are missing"));
+const nf97Prompt = internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]);
+assert.ok(nf97Prompt.includes("complete, substantive replacement"));
+assert.ok(nf97Prompt.includes("Every path_contract whose action is create MUST appear"));
+assert.ok(!nf97Prompt.includes('"summary":"..."'));
+assert.ok(!nf97Prompt.includes('"new":"replacement code only"'));
 assert.strictEqual(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -129,6 +134,237 @@ assert.match(
     creates: [],
   }, ["src/*.py"]),
   /final_hash_invalid/,
+);
+
+for (const sentinel of ["…", "replacement code only", "file content", "TODO", "# FIXME", "implementation omitted"]) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "actual change",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: sentinel }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    /final_edit_fidelity_rejected/,
+  );
+}
+let deeplyNestedSentinel = "replacement code only";
+for (let depth = 0; depth < 8; depth += 1) {
+  const fence = depth % 2 === 0 ? "```" : "~~~";
+  deeplyNestedSentinel = `${fence}\n${deeplyNestedSentinel}\n${fence}`;
+}
+for (const wrappedSentinel of [
+  "```text\nreplacement code only\n```",
+  "```\n...\n```",
+  "```\nreplacement code only\n````",
+  "```python title=generated replacement\nfile content\n```",
+  "~~~text title=generated replacement\nTODO\n~~~~",
+  "```text\nreplacement code only\n   ```",
+  "~~~text\nfile content\n  ~~~",
+  "   ```text\nreplacement code only\n   ````",
+  "  ~~~text\nfile content\n ~~~~",
+  "```text\r\nreplacement code only\r\n   ```",
+  deeplyNestedSentinel,
+  "/* file content */",
+  "<!-- implementation omitted -->",
+  "/// FIXME: implement this",
+  "// …",
+  "．．．",
+  "ｒｅｐｌａｃｅｍｅｎｔ　ｃｏｄｅ　ｏｎｌｙ",
+]) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "actual change",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: wrappedSentinel }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    /final_edit_fidelity_rejected/,
+  );
+}
+for (const nonWrapperFence of [
+  "    ```text\nreplacement code only\n```",
+  "```text\nreplacement code only\n    ```",
+  "```text\nreplacement code only\n~~~",
+  "````text\nreplacement code only\n```",
+  "<!--\n    ```text\nreplacement code only\n```\n-->",
+]) {
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "literal non-wrapper fence content",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 1, new: nonWrapperFence }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    "",
+  );
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "possible abstract stub",
+    edits: [{
+      path: "src/app.py",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 1, new: "..." }],
+    }],
+    creates: [],
+  }, ["src/*.py"]),
+  "",
+);
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "document markers",
+    edits: [{
+      path: "src/app.js",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 2, new: 'const note = "TODO";\n// FIXME is supported documentation\nreturn note;' }],
+    }],
+    creates: [],
+  }, ["src/*.js"]),
+  "",
+);
+for (const substantiveFence of [
+  "```python title=reviewed replacement\n# TODO is documented\nreturn 1\n   ````",
+  "  ~~~python title=reviewed replacement\n# TODO is documented\nreturn 1\n ~~~~",
+  "   ```python title=reviewed replacement\r\n# TODO is documented\r\nreturn 1\r\n  ```",
+]) {
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope({
+      schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+      summary: "substantive fenced code",
+      edits: [{
+        path: "src/app.py",
+        current_sha256: "a".repeat(64),
+        ranges: [{ start_line: 1, end_line: 2, new: substantiveFence }],
+      }],
+      creates: [],
+    }, ["src/*.py"]),
+    "",
+  );
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "inline fence text",
+    edits: [{
+      path: "src/app.py",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 2, new: 'const marker = "```not a whole fence```";\nreturn marker;' }],
+    }],
+    creates: [],
+  }, ["src/*.py"]),
+  "",
+);
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "type stub",
+    edits: [{
+      path: "src/api.pyi",
+      current_sha256: "a".repeat(64),
+      ranges: [{ start_line: 1, end_line: 1, new: "..." }],
+    }],
+    creates: [],
+  }, ["src/*.pyi"]),
+  "",
+);
+const requiredCreateContract = {
+  "tests/new.py": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+};
+const requiredCreateCases = [
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "missing v1", files: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "empty v1", files: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1, summary: "valid v1", files: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "missing v2", edits: [], creates: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "empty v2", edits: [], creates: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2, summary: "valid v2", edits: [], creates: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+  {
+    missing: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "missing v3", edits: [], creates: [] },
+    empty: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "empty v3", edits: [], creates: [{ path: "tests/new.py", content: " \n" }] },
+    valid: { schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA, summary: "valid v3", edits: [], creates: [{ path: "tests/new.py", content: "VALUE = 1\n" }] },
+  },
+];
+for (const createCase of requiredCreateCases) {
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope(createCase.missing, ["tests/*.py"], requiredCreateContract),
+    /missing_required_create/,
+  );
+  assert.match(
+    internals.validateVscodeLmFinalEnvelope(createCase.empty, ["tests/*.py"], requiredCreateContract),
+    /empty_required_create/,
+  );
+  assert.strictEqual(
+    internals.validateVscodeLmFinalEnvelope(createCase.valid, ["tests/*.py"], requiredCreateContract),
+    "",
+  );
+}
+const pyiCreateContract = {
+  "tests/new.pyi": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
+};
+const pyiCreateCases = [
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1,
+    summary: "v1 pyi create",
+    files: [{ path: "tests\\new.pyi", content }],
+  }),
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2,
+    summary: "v2 pyi create",
+    edits: [],
+    creates: [{ path: "tests/new.pyi", content }],
+  }),
+  (content) => ({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "v3 pyi create",
+    edits: [],
+    creates: [{ path: "tests/new.pyi", content }],
+  }),
+];
+for (const makePyiCreate of pyiCreateCases) {
+  for (const ellipsis of ["...", "…", "．．．"]) {
+    assert.match(
+      internals.validateVscodeLmFinalEnvelope(
+        makePyiCreate(ellipsis), ["tests/*.pyi"], pyiCreateContract,
+      ),
+      /ellipsis_only/,
+    );
+  }
+  for (const wrappedEmpty of [
+    "```python title=generated stub\n\n````",
+    "~~~text title=generated stub\n\n~~~~",
+  ]) {
+    assert.match(
+      internals.validateVscodeLmFinalEnvelope(
+        makePyiCreate(wrappedEmpty), ["tests/*.pyi"], pyiCreateContract,
+      ),
+      /empty_required_create/,
+    );
+  }
+}
+assert.strictEqual(
+  internals.validateVscodeLmFinalEnvelope(
+    pyiCreateCases[0]("class Created:\n    value: int\n"),
+    ["tests/*.pyi"],
+    pyiCreateContract,
+  ),
+  "",
 );
 
 async function textProtocolChecks() {
@@ -425,6 +661,43 @@ async function textProtocolChecks() {
   assert.strictEqual(v3HashResult, freshV3);
   assert.strictEqual(v3HashMessages.length, 2);
   assert.ok(v3HashMessages[1].includes("final_hash_stale:src/app.py"));
+
+  const copiedSentinelV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "attempted bounded change",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: deeplyNestedSentinel }] }],
+    creates: [],
+  });
+  const substantiveV3 = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "implemented bounded change",
+    edits: [{ path: "src/app.py", current_sha256: "a".repeat(64), ranges: [{ start_line: 2, end_line: 2, new: "return 2" }] }],
+    creates: [],
+  });
+  const fidelityTurns = [copiedSentinelV3, substantiveV3];
+  const fidelityMessages = [];
+  const fidelityModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (messages) => {
+      fidelityMessages.push(JSON.stringify(messages));
+      return { stream: (async function* stream() { yield { value: fidelityTurns.shift() }; }()) };
+    },
+  };
+  const fidelityResult = await internals.runVscodeLmTextProtocol(
+    fidelityModel,
+    {
+      prompt: "bounded fidelity retry",
+      allowedWrites: ["src/app.py"],
+      path_contracts: editContract,
+      initial_source_graph_request: { mode: "focus", query: "fidelity contract" },
+      initial_source_graph_result: { ok: true, content: "prefetched graph" },
+    },
+    undefined,
+    async () => { throw new Error("prefetched_source_graph_must_not_requery"); },
+  );
+  assert.strictEqual(fidelityResult, substantiveV3);
+  assert.strictEqual(fidelityMessages.length, 2);
+  assert.ok(fidelityMessages[1].includes("final_edit_fidelity_rejected"));
 
   const invalidThenFinal = ["I should inspect the project first.", finalResponse];
   const recoveringTextModel = {
@@ -887,6 +1160,9 @@ async function main() {
   const allowed = ["src/*.py", "tests/*.py"];
   const contracts = {
     "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
+  };
+  const contractsWithCreate = {
+    ...contracts,
     "tests/new.py": { action: "create", current_sha256: "", line_count: 0, parent_existed: false },
   };
   const repaired = {
@@ -915,7 +1191,7 @@ async function main() {
     schema_id: schema, summary: "wrong action",
     edits: [{ path: "tests/new.py", current_sha256: "b".repeat(64), ranges: [{ start_line: 1, end_line: 1, new: "bad" }] }],
     creates: [],
-  }, allowed, contracts), /final_action_mismatch/);
+  }, allowed, contractsWithCreate), /final_action_mismatch/);
   assert.match(internals.validateVscodeLmFinalEnvelope({
     schema_id: schema, summary: "wrong create", edits: [],
     creates: [{ path: "src/app.py", content: "bad\n" }],

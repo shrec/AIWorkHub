@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -143,10 +144,10 @@ def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_
     })
     attempts = []
 
-    def flaky_finalize(request_id, supervisor_returncode=None):
+    def flaky_finalize(request_id, supervisor_returncode=None, *, lock_blocking=True):
         attempts.append((request_id, supervisor_returncode))
-        assert manager._request_events(request_id)[-1]["state"] == "finalizing"
-        assert manager._request_events(request_id)[-1]["provider_process_alive"] is False
+        assert lock_blocking is True
+        assert manager._request_events(request_id)[-1]["state"] == "running"
         if len(attempts) < 3:
             raise OSError("transient windows finalizer race")
         return {"request_id": request_id, "state": "review_ready"}
@@ -174,7 +175,7 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
         "task_id": "TASK_B1",
         "runner": "claude_worker_b1",
         "topic": "task_mcp",
-        "adapter_id": "vscode_lm",
+        "adapter_id": "claude_cli",
         "state": "running",
     })
     monkeypatch.setattr(
@@ -347,7 +348,7 @@ def test_retry_finalization_rejects_product_validation_failure(monkeypatch, tmp_
     )
 
 
-def test_reconcile_watches_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
+def test_reconcile_defers_live_windows_pid_without_start_ticks(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,
         show_task=_show(lambda: _card(state="processing")),
@@ -364,7 +365,6 @@ def test_reconcile_watches_live_windows_pid_without_start_ticks(monkeypatch, tmp
         "pid_start_ticks": None,
         "metadata_path": str(tmp_path / "metadata.json"),
     })
-    monkeypatch.setattr(process_launcher, "_pid_matches", lambda pid, ticks: pid == 4242 and ticks is None)
     watched = []
     monkeypatch.setattr(manager, "_watch_persisted_request", lambda *args: watched.append(args))
     monkeypatch.setattr(
@@ -385,8 +385,8 @@ def test_reconcile_watches_live_windows_pid_without_start_ticks(monkeypatch, tmp
 
     result = manager._reconcile_persisted_requests()
 
-    assert result == {"watched": 1, "finalized": 0}
-    assert watched == [(request_id, 4242, None)]
+    assert result == {"watched": 0, "finalized": 0}
+    assert watched == []
 
 
 @pytest.mark.parametrize(
@@ -1818,3 +1818,556 @@ def test_quality_review_card_identification_rejects_mutation():
         "required_outputs": [],
     }
     assert process_launcher._card_is_readonly_quality_review(card) is False
+
+
+def _w1_pid_evidence(
+    verdict: process_launcher.PidIdentityVerdict,
+) -> process_launcher.PidIdentityEvidence:
+    return process_launcher.PidIdentityEvidence(
+        verdict=verdict,
+        pid=123,
+        expected_start_ticks=456,
+        observed_start_ticks=(
+            456 if verdict is process_launcher.PidIdentityVerdict.MATCH else None
+        ),
+        attempts=1,
+        operation="test",
+    )
+
+
+def test_status_pid_identity_unknown_defers_without_mutation_then_mismatch_finalizes(
+    monkeypatch,
+    tmp_path,
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "status-pid-identity"
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "running",
+        "pid": 123,
+        "pid_start_ticks": 456,
+        "metadata_path": str(tmp_path / "request.json"),
+    })
+    verdict = {"value": process_launcher.PidIdentityVerdict.UNKNOWN}
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _w1_pid_evidence(verdict["value"]),
+    )
+    monkeypatch.setattr(process_launcher, "_pid_matches", lambda *_args: False)
+    finalizer_calls = []
+
+    def finalize(request_id_arg, *, lock_blocking=True):
+        finalizer_calls.append((request_id_arg, lock_blocking))
+        manager._append_event({
+            "request_id": request_id_arg,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "state": "worker_failed",
+        })
+
+    monkeypatch.setattr(manager, "_finalize_after_process_exit", finalize)
+    before = manager._request_events(request_id)
+
+    unknown = manager.status(request_id)
+
+    assert unknown["state"] == "running"
+    assert unknown["latest_event"]["reconciliation_deferred"] == "pid_identity_unknown"
+    assert manager._request_events(request_id) == before
+    assert finalizer_calls == []
+
+    verdict["value"] = process_launcher.PidIdentityVerdict.MATCH
+    assert manager.status(request_id)["state"] == "running"
+    assert finalizer_calls == []
+
+    verdict["value"] = process_launcher.PidIdentityVerdict.MISMATCH
+    assert manager.status(request_id)["state"] == "worker_failed"
+    assert finalizer_calls == [(request_id, False)]
+    assert manager.status(request_id)["state"] == "worker_failed"
+    assert finalizer_calls == [(request_id, False)]
+
+
+def test_cancel_pid_identity_tri_state_and_bridge_completion_order(
+    monkeypatch,
+    tmp_path,
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    verdicts = {}
+    ordering = []
+    bridge_results = {}
+    signals = []
+    finalizer_calls = []
+
+    def seed(request_id):
+        metadata_path = tmp_path / f"{request_id}.json"
+        cancel_path = tmp_path / f"{request_id}.cancel.json"
+        metadata_path.write_text(
+            json.dumps({"cancel_path": str(cancel_path)}), encoding="utf-8"
+        )
+        manager._append_event({
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "topic": "task_mcp",
+            "adapter_id": "claude_cli",
+            "state": "running",
+            "pid": 123,
+            "pid_start_ticks": 456,
+            "metadata_path": str(metadata_path),
+        })
+        return cancel_path
+
+    def bridge(request_id, _live):
+        ordering.append((request_id, "bridge"))
+        return bridge_results.get(request_id, "")
+
+    def identity(_pid, _ticks):
+        request_id = ordering[-1][0]
+        ordering.append((request_id, "identity"))
+        return _w1_pid_evidence(verdicts[request_id])
+
+    def finalize(request_id):
+        ordering.append((request_id, "finalize"))
+        finalizer_calls.append(request_id)
+        manager._append_event({
+            "request_id": request_id,
+            "task_id": "TASK_B1",
+            "runner": "claude_worker_b1",
+            "state": "worker_failed",
+        })
+
+    monkeypatch.setattr(
+        manager, "_publish_bridge_cancellation_before_finalization", bridge
+    )
+    monkeypatch.setattr(process_launcher, "_pid_identity_evidence", identity)
+    monkeypatch.setattr(manager, "_finalize_after_process_exit", finalize)
+    monkeypatch.setattr(
+        process_launcher.os,
+        "kill",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    unknown_id = "cancel-unknown"
+    unknown_cancel_path = seed(unknown_id)
+    verdicts[unknown_id] = process_launcher.PidIdentityVerdict.UNKNOWN
+    before = manager._request_events(unknown_id)
+    unknown = manager.cancel(unknown_id)
+    assert unknown["blocked_reason"] == "pid_identity_unknown"
+    assert manager._request_events(unknown_id) == before
+    assert not unknown_cancel_path.exists()
+    assert signals == []
+    assert finalizer_calls == []
+    assert ordering == [(unknown_id, "bridge"), (unknown_id, "identity")]
+
+    completed_id = "cancel-completed"
+    completed_path = seed(completed_id)
+    bridge_results[completed_id] = "completed"
+    completed = manager.cancel(completed_id)
+    assert completed["completion_won"] is True
+    assert not completed_path.exists()
+    assert (completed_id, "identity") not in ordering
+
+    match_id = "cancel-match"
+    match_path = seed(match_id)
+    verdicts[match_id] = process_launcher.PidIdentityVerdict.MATCH
+    matched = manager.cancel(match_id)
+    assert matched["state"] == "cancel_requested"
+    assert json.loads(match_path.read_text(encoding="utf-8"))["request_id"] == match_id
+    assert signals == [(123, signal.SIGTERM)]
+    assert ordering[-2:] == [(match_id, "bridge"), (match_id, "identity")]
+
+    mismatch_id = "cancel-mismatch"
+    mismatch_path = seed(mismatch_id)
+    verdicts[mismatch_id] = process_launcher.PidIdentityVerdict.MISMATCH
+    mismatched = manager.cancel(mismatch_id)
+    assert mismatched["state"] == "worker_failed"
+    assert not mismatch_path.exists()
+    assert finalizer_calls == [mismatch_id]
+    assert ordering[-3:] == [
+        (mismatch_id, "bridge"),
+        (mismatch_id, "identity"),
+        (mismatch_id, "finalize"),
+    ]
+
+
+_W2_ADMISSION_CASES = [
+    pytest.param(process_launcher.PidIdentityVerdict.MATCH, 456, True, id="match"),
+    pytest.param(process_launcher.PidIdentityVerdict.UNKNOWN, 456, True, id="unknown"),
+    pytest.param(process_launcher.PidIdentityVerdict.MISMATCH, 456, False, id="mismatch"),
+    pytest.param(process_launcher.PidIdentityVerdict.UNKNOWN, None, True, id="missing-ticks"),
+    pytest.param(
+        process_launcher.PidIdentityVerdict.UNKNOWN,
+        "malformed-ticks",
+        True,
+        id="malformed-ticks",
+    ),
+]
+
+
+def _seed_w2_persisted_request(
+    manager,
+    *,
+    request_id,
+    task_id,
+    ticks,
+    state="running",
+    pid=123,
+):
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": task_id,
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": state,
+        "pid": pid,
+        "pid_start_ticks": ticks,
+        "metadata_path": "persisted-request.json",
+    })
+
+
+def _forbid_w2_admission_side_effects(monkeypatch, manager):
+    calls = []
+
+    def forbidden(name):
+        def record(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"admission triggered forbidden side effect: {name}")
+
+        return record
+
+    monkeypatch.setattr(
+        manager,
+        "_finalize_after_process_exit",
+        forbidden("terminal_event"),
+    )
+    monkeypatch.setattr(manager, "_release_exact", forbidden("release"))
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_failure",
+        forbidden("callback"),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "cleanup_workspace",
+        forbidden("gc"),
+    )
+    return calls
+
+
+@pytest.mark.parametrize("verdict,ticks,expected_active", _W2_ADMISSION_CASES)
+def test_active_request_ids_pid_identity_admission_matrix(
+    monkeypatch,
+    tmp_path,
+    verdict,
+    ticks,
+    expected_active,
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "w2-capacity-persisted"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=request_id,
+        task_id="OTHER_TASK_B1",
+        ticks=ticks,
+    )
+    before = manager._request_events(request_id)
+    identity_calls = []
+
+    def identity(pid, expected_ticks):
+        identity_calls.append((pid, expected_ticks))
+        return _w1_pid_evidence(verdict)
+
+    monkeypatch.setattr(process_launcher, "_pid_identity_evidence", identity)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_matches",
+        lambda *_args: pytest.fail("admission must not use reporting-only _pid_matches"),
+    )
+    side_effects = _forbid_w2_admission_side_effects(monkeypatch, manager)
+
+    active = manager._active_request_ids()
+
+    assert (request_id in active) is expected_active
+    assert manager._active_count() == int(expected_active)
+    assert identity_calls == [(123, ticks), (123, ticks)]
+    assert manager._request_events(request_id) == before
+    assert side_effects == []
+
+
+@pytest.mark.parametrize("verdict,ticks,expected_blocked", _W2_ADMISSION_CASES)
+def test_assert_no_duplicate_task_pid_identity_admission_matrix(
+    monkeypatch,
+    tmp_path,
+    verdict,
+    ticks,
+    expected_blocked,
+):
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "w2-assert-duplicate"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=request_id,
+        task_id="TASK_B1",
+        ticks=ticks,
+    )
+    before = manager._request_events(request_id)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _w1_pid_evidence(verdict),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_matches",
+        lambda *_args: pytest.fail("admission must not use reporting-only _pid_matches"),
+    )
+    side_effects = _forbid_w2_admission_side_effects(monkeypatch, manager)
+
+    if expected_blocked:
+        with pytest.raises(
+            process_launcher.LaunchRejected,
+            match=f"duplicate_persisted_task:{request_id}",
+        ):
+            manager._assert_no_duplicate_task("TASK_B1")
+    else:
+        manager._assert_no_duplicate_task("TASK_B1")
+
+    assert manager._request_events(request_id) == before
+    assert side_effects == []
+
+
+@pytest.mark.parametrize("verdict,ticks,expected_blocked", _W2_ADMISSION_CASES)
+def test_direct_launch_duplicate_pid_identity_admission_matrix(
+    monkeypatch,
+    tmp_path,
+    verdict,
+    ticks,
+    expected_blocked,
+):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "w2-direct-duplicate"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=request_id,
+        task_id="TASK_B1",
+        ticks=ticks,
+    )
+    before = manager._request_events(request_id)
+    monkeypatch.setattr(manager, "_active_count", lambda: 0)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _w1_pid_evidence(verdict),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_matches",
+        lambda *_args: pytest.fail("admission must not use reporting-only _pid_matches"),
+    )
+    side_effects = (
+        _forbid_w2_admission_side_effects(monkeypatch, manager)
+        if expected_blocked
+        else []
+    )
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is not expected_blocked
+    if expected_blocked:
+        assert result["blocked_reason"] == f"duplicate_persisted_task:{request_id}"
+    else:
+        _wait_terminal(manager, result["request_id"])
+    assert manager._request_events(request_id) == before
+    assert side_effects == []
+
+
+@pytest.mark.parametrize(
+    "verdict,expected_blocked",
+    [
+        pytest.param(process_launcher.PidIdentityVerdict.MATCH, True, id="match"),
+        pytest.param(
+            process_launcher.PidIdentityVerdict.UNKNOWN,
+            True,
+            id="unknown",
+        ),
+        pytest.param(
+            process_launcher.PidIdentityVerdict.MISMATCH,
+            False,
+            id="mismatch",
+        ),
+    ],
+)
+def test_direct_launch_cancel_requested_pid_identity_admission_matrix(
+    monkeypatch,
+    tmp_path,
+    verdict,
+    expected_blocked,
+):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "w2-direct-cancel-requested"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=request_id,
+        task_id="TASK_B1",
+        ticks=456,
+        state="cancel_requested",
+    )
+    before = manager._request_events(request_id)
+    monkeypatch.setattr(manager, "_active_count", lambda: 0)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _w1_pid_evidence(verdict),
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_matches",
+        lambda *_args: pytest.fail("admission must not use reporting-only _pid_matches"),
+    )
+    side_effects = (
+        _forbid_w2_admission_side_effects(monkeypatch, manager)
+        if expected_blocked
+        else []
+    )
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is not expected_blocked
+    if expected_blocked:
+        assert result["blocked_reason"] == f"duplicate_persisted_task:{request_id}"
+    else:
+        _wait_terminal(manager, result["request_id"])
+    assert manager._request_events(request_id) == before
+    assert side_effects == []
+
+
+def test_missing_pid_is_mismatch_inactive_and_allows_direct_launch(
+    monkeypatch,
+    tmp_path,
+):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    request_id = "w2-direct-missing-pid"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=request_id,
+        task_id="TASK_B1",
+        ticks=None,
+        state="cancel_requested",
+        pid=0,
+    )
+    before = manager._request_events(request_id)
+
+    identity = process_launcher._pid_identity_evidence(0, None)
+    assert identity.verdict is process_launcher.PidIdentityVerdict.MISMATCH
+    assert request_id not in manager._active_request_ids()
+    manager._assert_no_duplicate_task("TASK_B1")
+
+    result = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+
+    assert result["ok"] is True
+    _wait_terminal(manager, result["request_id"])
+    assert manager._request_events(request_id) == before
+
+
+def test_unknown_duplicate_recovery_allows_direct_launch_after_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    _open_gates(monkeypatch)
+    manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card()),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    persisted_id = "w2-direct-recovery"
+    _seed_w2_persisted_request(
+        manager,
+        request_id=persisted_id,
+        task_id="TASK_B1",
+        ticks=None,
+    )
+    before = manager._request_events(persisted_id)
+    verdict = {"value": process_launcher.PidIdentityVerdict.UNKNOWN}
+    monkeypatch.setattr(manager, "_active_count", lambda: 0)
+    monkeypatch.setattr(
+        process_launcher,
+        "_pid_identity_evidence",
+        lambda _pid, _ticks: _w1_pid_evidence(verdict["value"]),
+    )
+
+    blocked = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+    assert blocked["blocked_reason"] == f"duplicate_persisted_task:{persisted_id}"
+    assert manager._request_events(persisted_id) == before
+
+    verdict["value"] = process_launcher.PidIdentityVerdict.MISMATCH
+    recovered = manager.launch(
+        task_id="TASK_B1",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        adapter_id="claude_cli",
+        timeout_seconds=30,
+    )
+
+    assert recovered["ok"] is True
+    _wait_terminal(manager, recovered["request_id"])
+    assert manager._request_events(persisted_id) == before
