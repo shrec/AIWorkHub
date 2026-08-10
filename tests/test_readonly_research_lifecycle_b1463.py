@@ -257,6 +257,19 @@ def test_successful_readonly_research_reaches_review_ready(
         parent_baseline={},
         workspace_baseline={},
     )
+    bridge = process_launcher.vscode_lm_bridge
+    bridge_root = tmp_path / "bridge"
+    repo_id = "repo_" + "b" * 32
+    monkeypatch.setenv(bridge.BRIDGE_ROOT_ENV, str(bridge_root))
+    bridge_request = bridge.BridgeRequest(
+        request_id=REQUEST_ID,
+        repo_id=repo_id,
+        request_path=bridge_root / "requests" / repo_id / f"{REQUEST_ID}.json",
+        response_path=home / ".aiworkhub_vscode_lm_response.json",
+        worker_spec_path=home / ".aiworkhub_vscode_lm_worker.json",
+        cancel_path=home / ".aiworkhub_vscode_lm_response.json",
+        cancel_token="c" * 64,
+    )
     card = _research_card(workspace)
     card.update(status="processing", worker_status="claimed")
     process_dir = tmp_path / "processes"
@@ -291,6 +304,7 @@ def test_successful_readonly_research_reaches_review_ready(
             "validation": [],
             "residual_contract_manifest": [],
             "workspace": workspace.as_metadata(),
+            "vscode_lm_bridge": bridge.bridge_request_metadata(bridge_request),
         },
     )
     captured: list[dict] = []
@@ -329,6 +343,13 @@ def test_successful_readonly_research_reaches_review_ready(
     evidence = captured[0]["evidence"]
     assert evidence["changed_path_hashes"] == {}
     assert evidence["research_result"]["meaningful_output"] is True
+    decision = bridge.read_terminal_decision(
+        bridge_request.cancel_path,
+        request_id=REQUEST_ID,
+        repo_id=repo_id,
+        cancel_token=bridge_request.cancel_token,
+    )
+    assert decision is not None and decision[1] == "cancel"
 
 
 def test_accept_revalidates_exact_readonly_research_stdout(

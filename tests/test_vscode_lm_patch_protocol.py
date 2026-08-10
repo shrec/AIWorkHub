@@ -102,7 +102,7 @@ def test_v3_applies_only_bounded_line_range_and_reports_accounting(tmp_path: Pat
     assert metric["token_savings_claimed"] is False
 
 
-def test_v3_can_fill_declared_empty_placeholder_with_virtual_line(tmp_path: Path) -> None:
+def test_v3_can_fill_existing_empty_file_with_virtual_line(tmp_path: Path) -> None:
     empty_sha256 = hashlib.sha256(b"").hexdigest()
     spec, workspace = _request(
         tmp_path,
@@ -111,7 +111,6 @@ def test_v3_can_fill_declared_empty_placeholder_with_virtual_line(tmp_path: Path
             "current_sha256": empty_sha256,
             "ranges": [{"start_line": 1, "end_line": 1, "new": "created\n"}],
         }]),
-        create_paths=["out/result.txt"],
     )
     target = workspace / "out" / "result.txt"
     target.parent.mkdir()
@@ -124,6 +123,28 @@ def test_v3_can_fill_declared_empty_placeholder_with_virtual_line(tmp_path: Path
     assert metric["old_region_bytes"] == 0
     assert metric["replacement_bytes"] == len(b"created\n")
     assert metric["whole_file_output_required"] is False
+
+
+def test_v3_create_replaces_only_declared_empty_workspace_placeholder(
+    tmp_path: Path,
+) -> None:
+    spec, workspace = _request(
+        tmp_path,
+        _v3(creates=[{"path": "out/result.txt", "content": "created\n"}]),
+        create_paths=["out/result.txt"],
+    )
+    target = workspace / "out" / "result.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"")
+
+    result = vscode_lm_worker.run(spec)
+
+    assert result["changed_paths"] == ["out/result.txt"]
+    assert target.read_text(encoding="utf-8") == "created\n"
+    metric = result["semantic_edit_metrics"][0]
+    assert metric["create"] is True
+    assert metric["replacement_bytes"] == len(b"created\n")
+    assert metric["whole_file_output_required"] is True
 
 
 def test_v3_rejects_overlap_and_stale_hash_without_mutation(tmp_path: Path) -> None:
