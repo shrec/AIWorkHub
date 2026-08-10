@@ -99,12 +99,16 @@ def _install_windows_probe(
         process_launcher.ctypes,
         "WinDLL",
         lambda _name, use_last_error=True: kernel32,
+        raising=False,
     )
-    monkeypatch.setattr(process_launcher.ctypes, "set_last_error", set_last_error)
+    monkeypatch.setattr(
+        process_launcher.ctypes, "set_last_error", set_last_error, raising=False,
+    )
     monkeypatch.setattr(
         process_launcher.ctypes,
         "get_last_error",
         lambda: last_error["value"],
+        raising=False,
     )
     monkeypatch.setattr(
         process_launcher.time,
