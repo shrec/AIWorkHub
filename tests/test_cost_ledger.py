@@ -1,6 +1,194 @@
 from aiworkhub import cost_ledger
 
 
+def test_cost_per_accepted_outcome_uses_exact_matched_population() -> None:
+    usage = [
+        {
+            "task_id": "accepted",
+            "role": "worker",
+            "model": "cheap-model",
+            "total_tokens": 100,
+            "cost_usd": 0.25,
+            "cost_known": True,
+        },
+        {
+            "task_id": "accepted",
+            "role": "worker",
+            "model": "cheap-model",
+            "total_tokens": 50,
+            "cost_usd": 0.05,
+            "cost_known": True,
+        },
+        {
+            "task_id": "rejected",
+            "role": "worker",
+            "model": "cheap-model",
+            "total_tokens": 200,
+            "cost_usd": 0.20,
+            "cost_known": True,
+        },
+        {
+            "task_id": "accepted",
+            "role": "reviewer",
+            "model": "review-model",
+            "total_tokens": 10,
+            "cost_usd": 9.0,
+            "cost_known": True,
+        },
+    ]
+    decisions = {
+        "accepted": {"decision": "accepted"},
+        "rejected": {"decision": "rejected"},
+    }
+    cards = [
+        {
+            "task_id": task_id,
+            "project_context": {"task_type": "code"},
+        }
+        for task_id in decisions
+    ]
+
+    view = cost_ledger.cost_per_accepted_outcome_view(
+        usage, decisions, cards
+    )
+    row = view["routes"]["cheap-model"]["unknown"]["code"]["unknown"]
+
+    assert row["state"] == "MEASURED"
+    assert row["matched_decided_tasks"] == 2
+    assert row["accepted_outcomes"] == 1
+    assert row["attempt_records"] == 3
+    assert row["total_cost_usd"] == 0.5
+    assert row["cost_per_accepted_outcome_usd"] == 0.5
+    assert row["cost_coverage"] == 1.0
+    assert "review-model" not in view["routes"]
+    assert view["automatic_routing"] is False
+
+
+def test_cost_per_accepted_outcome_unknown_and_mixed_models_fail_closed() -> None:
+    usage = [
+        {
+            "task_id": "unknown-cost",
+            "role": "worker",
+            "model": "model-a",
+            "cost_usd": 0.0,
+            "cost_known": False,
+        },
+        {
+            "task_id": "mixed",
+            "role": "worker",
+            "model": "model-a",
+            "cost_usd": 0.1,
+            "cost_known": True,
+        },
+        {
+            "task_id": "mixed",
+            "role": "worker",
+            "model": "model-b",
+            "cost_usd": 0.1,
+            "cost_known": True,
+        },
+    ]
+    decisions = {
+        "unknown-cost": {"decision": "accepted"},
+        "mixed": {"decision": "accepted"},
+    }
+    cards = [
+        {
+            "task_id": task_id,
+            "project_context": {"task_type": "research"},
+        }
+        for task_id in decisions
+    ]
+
+    view = cost_ledger.cost_per_accepted_outcome_view(
+        usage, decisions, cards
+    )
+    row = view["routes"]["model-a"]["unknown"]["research"]["unknown"]
+
+    assert row["state"] == "UNKNOWN"
+    assert row["cost_per_accepted_outcome_usd"] is None
+    assert view["mixed_model_tasks"] == 1
+
+
+def test_cost_per_accepted_outcome_without_acceptance_is_unmeasured() -> None:
+    view = cost_ledger.cost_per_accepted_outcome_view(
+        [{
+            "task_id": "rejected",
+            "role": "worker",
+            "model": "model-a",
+            "cost_usd": 0.3,
+            "cost_known": True,
+        }],
+        {"rejected": {"decision": "rejected"}},
+        [{
+            "task_id": "rejected",
+            "project_context": {"task_type": "code"},
+        }],
+    )
+
+    row = view["routes"]["model-a"]["unknown"]["code"]["unknown"]
+    assert row["state"] == "UNMEASURED"
+    assert row["cost_per_accepted_outcome_usd"] is None
+
+
+def test_cost_per_accepted_outcome_normalizes_declared_model_aliases() -> None:
+    view = cost_ledger.cost_per_accepted_outcome_view(
+        [
+            {
+                "task_id": "accepted",
+                "role": "worker",
+                "observed_model": (
+                    "copilot/claude-sonnet-5/claude-sonnet-5/"
+                    "Claude Sonnet 5/claude-sonnet-5"
+                ),
+                "requested_model": "sonnet",
+                "cost_usd": 1.0,
+                "cost_known": True,
+            },
+            {
+                "task_id": "accepted",
+                "role": "worker",
+                "model": "sonnet",
+                "cost_usd": 2.0,
+                "cost_known": True,
+            },
+        ],
+        {"accepted": {"decision": "accepted"}},
+        [{
+            "task_id": "accepted",
+            "project_context": {"task_type": "code"},
+        }],
+    )
+
+    assert view["mixed_model_tasks"] == 0
+    assert view["routes"]["sonnet"]["unknown"]["code"]["unknown"][
+        "cost_per_accepted_outcome_usd"
+    ] == 3.0
+
+
+def test_cost_per_accepted_outcome_partitions_explicit_risk() -> None:
+    view = cost_ledger.cost_per_accepted_outcome_view(
+        [{
+            "task_id": "high-risk",
+            "role": "worker",
+            "model": "model-a",
+            "provider": "codex",
+            "cost_usd": 4.0,
+            "cost_known": True,
+        }],
+        {"high-risk": {"decision": "accepted"}},
+        [{
+            "task_id": "high-risk",
+            "risk_tier": "high",
+            "project_context": {"task_type": "code"},
+        }],
+    )
+
+    row = view["routes"]["model-a"]["codex_cli"]["code"]["high"]
+    assert row["state"] == "MEASURED"
+    assert row["risk_evidence"] == "explicit_task_card"
+
+
 def test_token_usage_without_provider_price_is_unknown_not_free() -> None:
     rows = cost_ledger._parse_usage_stdout(
         "TASK_A | runner=deepseek | topic=code | records=1 | tokens=120 "
@@ -42,6 +230,7 @@ def test_repo_bound_usage_preserves_model_and_unknown_cost_truth(monkeypatch, tm
             "output_tokens": 20,
             "visible_output_tokens": 15,
             "reasoning_output_tokens": 5,
+            "cache_write_input_tokens": 7,
             "total_tokens": 120,
             "cost_usd": 0.0,
             "created_at": "2026-08-03T01:02:03+00:00",
@@ -53,6 +242,7 @@ def test_repo_bound_usage_preserves_model_and_unknown_cost_truth(monkeypatch, tm
     assert result["tasks"][0]["requested_model"] == "gpt-5.5"
     assert result["tasks"][0]["observed_model"] == "gpt-5.5-codex"
     assert result["tasks"][0]["reasoning_output_tokens"] == 5
+    assert result["tasks"][0]["cache_write_input_tokens"] == 7
     assert result["tasks"][0]["provider"] == "openai"
     assert result["tasks"][0]["role"] == "worker"
     assert result["tasks"][0]["role_observed"] is False
@@ -77,6 +267,7 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
             "total_tokens": 120,
             "cached_input_tokens": cached,
             "cache_creation_input_tokens": 0,
+            "cache_write_input_tokens": 3,
             "cache_metrics_observed": True,
             "cost_usd": 0.0,
             "cost_observed": True,
@@ -109,6 +300,7 @@ def test_repo_bound_usage_preserves_retries_and_cache_economics(monkeypatch, tmp
         "observed_records": 2,
         "cached_input_tokens": 100,
         "cache_creation_input_tokens": 0,
+        "cache_write_input_tokens": 6,
         "absent_metrics_are_unknown_not_zero": True,
     }
     provider = result["aggregates"]["by_provider"]["codex"]

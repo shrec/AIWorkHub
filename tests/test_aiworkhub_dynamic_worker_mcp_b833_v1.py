@@ -415,6 +415,29 @@ def test_source_graph_query_runs_bounded_and_second_call_is_cached(monkeypatch: 
     }
 
 
+def test_source_graph_cache_can_return_full_content_for_internal_evaluation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    repo = _fake_repo(tmp_path)
+    _stub_source_graph_engine(
+        monkeypatch,
+        relevant_files=("src/right.py", "src/other.py"),
+    )
+    ctx = _ctx(repo, home=tmp_path / "home")
+
+    first = w.source_graph_query(ctx, mode="focus", query="symbol", budget=8)
+    replay = w.source_graph_query(
+        ctx, mode="focus", query="symbol", budget=8, compact_replay=False,
+    )
+
+    assert replay["cache_hit"] is True
+    assert replay["cache_receipt"] is False
+    assert replay["content"] == first["content"]
+    assert replay["bytes"] == first["bytes"]
+    assert replay["replay_bytes_avoided"] == 0
+
+
 def test_source_graph_orientation_truncation_preserves_full_evidence_counts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

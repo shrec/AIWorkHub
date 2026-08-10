@@ -1,5 +1,10 @@
 # AIWorkHub — Bug & Optimization Audit Report
 
+> Historical snapshot, not the current defect backlog. Current-HEAD dispositions
+> are recorded in `docs/LEGACY_AUDIT_REVALIDATION_2026-08-10.md` and the canonical
+> NeedFix registry. Performance estimates below remain hypotheses unless a current
+> benchmark artifact verifies them.
+
 **Date:** 2026-08-06
 **Methodology:** Parallel subagent exploration (3 agents: Python bugs, Python optimizations, TypeScript/extension bugs)
 **Scope:** Full repository — `src/aiworkhub/`, `vscode-extension/`, `scripts/`, `tests/`
@@ -115,32 +120,6 @@
 ---
 
 ## Part 3: Recommendations — Priority Order
-
-### Newly observed runtime regression: false worker progress
-
-**P1 — Provider stream events can hide a stalled worker.** During the
-`GLM52_AIWORKHUB_FULL_SUITE_IMPORT_ORDER_TEST_FIX_V1` run, the worker emitted
-more than 228 `provider_response` events for over eight minutes while producing
-no tool call, edit receipt, changed target hash, validation phase, or usable
-artifact. Runtime telemetry still reported `stall_detected=false` because raw
-provider output refreshed `last_meaningful_progress_epoch`.
-
-This is an observability and cost-control defect: a model can remain active
-indefinitely without advancing the task, while the task board presents the
-stream as meaningful progress. Stall accounting must distinguish transport
-activity from task progress. Only a bounded semantic milestone, tool call,
-edit/file-hash change, validation transition, or submitted evidence should
-refresh the meaningful-progress lease. Raw stream events may refresh transport
-liveness, but must not suppress stalled-worker reconciliation.
-
-Required regression coverage:
-
-- repeated provider text/events with unchanged target hashes become stalled;
-- real tool/edit/validation receipts renew the meaningful-progress lease;
-- long legitimate reasoning remains alive at the transport layer but is shown
-  separately from task progress;
-- reconciliation moves an exhausted no-op run to a truthful review/terminal
-  state with its retained diagnostic evidence.
 
 ### Immediate (low-risk, high-impact)
 

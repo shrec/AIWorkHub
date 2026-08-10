@@ -27,7 +27,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import aiworkhub  # noqa: E402
-from aiworkhub import callback_store, core, task_store  # noqa: E402
+from aiworkhub import (  # noqa: E402
+    callback_store,
+    core,
+    cost_ledger,
+    process_launcher,
+    task_store,
+)
 
 
 NOW = "2026-07-20T00:00:00+00:00"
@@ -1060,6 +1066,8 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
             "4",
             "--cache-creation-input-tokens",
             "2",
+            "--cache-write-input-tokens",
+            "3",
             "--cache-metrics-observed",
             "--cost-usd",
             "0.01",
@@ -1078,6 +1086,7 @@ def test_run_taskctl_usage_records_native_event(writable_repo):
     [event] = task_store.list_usage_events(writable_repo)
     assert event["cached_input_tokens"] == 4
     assert event["cache_creation_input_tokens"] == 2
+    assert event["cache_write_input_tokens"] == 3
     assert event["cache_metrics_observed"] is True
     assert event["cost_observed"] is True
     assert event["model"] == "observed-model"
@@ -1137,6 +1146,78 @@ def test_run_taskctl_usage_preserves_unobserved_attempt_without_fake_zero(writab
     assert event["usage_observed"] is False
     assert event["cost_observed"] is False
     assert event["telemetry_reason"] == "provider_api_usage_unavailable"
+
+
+def test_provider_stream_usage_reaches_durable_ledger_without_field_loss(
+    writable_repo: Path,
+) -> None:
+    _insert_task(
+        writable_repo,
+        "TASK_USAGE_STREAM",
+        "codex_worker",
+        "coding",
+        worker_status="claimed",
+        status="processing",
+        claimed_by="codex_worker",
+    )
+    stdout_path = writable_repo / "provider.jsonl"
+    stdout_path.write_text(
+        json.dumps({
+            "type": "turn.completed",
+            "model": "gpt-5.5-codex-observed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "reasoning_output_tokens": 5,
+                "cached_input_tokens": 60,
+                "cache_creation_input_tokens": 7,
+                "cache_write_input_tokens": 3,
+            },
+            "cost_usd": 0.0125,
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    manager = process_launcher.ProcessManager(
+        repo=writable_repo,
+        process_log_path=writable_repo / "process-events.jsonl",
+        process_dir=writable_repo / "processes",
+        isolation_enabled=False,
+    )
+
+    usage, recorded, error = manager._record_usage(
+        "stream-attempt-1",
+        "TASK_USAGE_STREAM",
+        "codex_worker",
+        "codex_cli",
+        "gpt-5.5-codex-requested",
+        stdout_path,
+        topic="coding",
+    )
+
+    assert recorded is True, error
+    assert usage["observed_model"] == "gpt-5.5-codex-observed"
+    [event] = task_store.list_usage_events(writable_repo)
+    assert event["requested_model"] == "gpt-5.5-codex-requested"
+    assert event["observed_model"] == "gpt-5.5-codex-observed"
+    assert event["model_observed"] is True
+    assert event["visible_output_tokens"] == 20
+    assert event["reasoning_output_tokens"] == 5
+    assert event["cached_input_tokens"] == 60
+    assert event["cache_creation_input_tokens"] == 7
+    assert event["cache_write_input_tokens"] == 3
+    assert event["total_tokens"] == 125
+    assert event["cost_observed"] is True
+
+    ledger = cost_ledger.build_cost_ledger(
+        repo_root=writable_repo,
+        include_tasks=True,
+    )
+    [row] = ledger["tasks"]
+    assert row["attempt_id"] == "stream-attempt-1"
+    assert row["observed_model"] == "gpt-5.5-codex-observed"
+    assert row["reasoning_output_tokens"] == 5
+    assert row["cache_write_input_tokens"] == 3
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,21 @@ USAGE_LINE_RE = re.compile(
     r"\| records=(?P<records>\d+) \| tokens=(?P<tokens>\d+) "
     r"\| in=(?P<input_tokens>\d+) out=(?P<output_tokens>\d+) \| cost=\$(?P<cost>[0-9.]+)"
 )
+_ECONOMIC_MODEL_ALIASES: tuple[tuple[str, str], ...] = (
+    ("gpt-5.3-codex-spark", "gpt-5.3-codex-spark"),
+    ("gpt-5.3-codex", "gpt-5.3-codex"),
+    ("gpt-5.5", "gpt-5.5"),
+    ("deepseek-v4-flash", "deepseek-v4-flash"),
+    ("deepseek-v4-pro", "deepseek-v4-pro"),
+    ("glm-5.2", "glm-5.2"),
+    ("claude-sonnet-5", "sonnet"),
+    ("claude-sonnet", "sonnet"),
+    ("claude-opus-5", "opus"),
+    ("claude-opus", "opus"),
+    ("claude-haiku-4-5", "haiku"),
+    ("claude-haiku-4.5", "haiku"),
+    ("claude-haiku", "haiku"),
+)
 
 
 def _parse_usage_stdout(stdout: str) -> list[dict[str, Any]]:
@@ -37,6 +52,7 @@ def _parse_usage_stdout(stdout: str) -> list[dict[str, Any]]:
             "total_tokens": int(data["tokens"]),
             "cached_input_tokens": 0,
             "cache_creation_input_tokens": 0,
+            "cache_write_input_tokens": 0,
             "cache_metrics_observed": False,
             "cost_usd": float(data["cost"]),
             "cost_known": not (
@@ -73,6 +89,7 @@ def _launch_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             "total_tokens": int(entry.get("usage_total_tokens") or 0),
             "cached_input_tokens": int(entry.get("usage_cached_input_tokens") or 0),
             "cache_creation_input_tokens": int(entry.get("usage_cache_creation_input_tokens") or 0),
+            "cache_write_input_tokens": int(entry.get("usage_cache_write_input_tokens") or 0),
             "cache_metrics_observed": bool(entry.get("usage_cache_metrics_observed")),
             "cost_usd": float(entry.get("cost_usd") or 0.0),
             "cost_known": not (
@@ -126,6 +143,7 @@ def _canonical_usage_rows(repo_root: Path | str) -> list[dict[str, Any]]:
             "total_tokens": total_tokens,
             "cached_input_tokens": int(entry.get("cached_input_tokens") or 0),
             "cache_creation_input_tokens": int(entry.get("cache_creation_input_tokens") or 0),
+            "cache_write_input_tokens": int(entry.get("cache_write_input_tokens") or 0),
             "cache_metrics_observed": bool(entry.get("cache_metrics_observed")),
             "usage_observed": bool(usage_observed),
             "telemetry_reason": str(entry.get("telemetry_reason") or ""),
@@ -155,6 +173,7 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "cache_creation_input_tokens": 0,
+        "cache_write_input_tokens": 0,
         "usage_observed_records": 0,
         "usage_unknown_records": 0,
         "cache_observed_records": 0,
@@ -180,6 +199,9 @@ def _aggregate(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]
         out[bucket]["cached_input_tokens"] += int(row.get("cached_input_tokens") or 0)
         out[bucket]["cache_creation_input_tokens"] += int(
             row.get("cache_creation_input_tokens") or 0
+        )
+        out[bucket]["cache_write_input_tokens"] += int(
+            row.get("cache_write_input_tokens") or 0
         )
         if row.get("usage_observed"):
             out[bucket]["usage_observed_records"] += int(row.get("records") or 0)
@@ -280,6 +302,222 @@ def _model_outcome_matrix(
         "attribution": "latest_usage_attempt_at_or_before_latest_manager_decision",
         "models": dict(sorted(matrix.items())),
         "unmatched_decisions": unmatched_decisions,
+    }
+
+
+def _task_family(card: dict[str, Any]) -> str:
+    """Return the explicit routing family recorded on a canonical card.
+
+    Historical cards do not persist the workforce ``kinds`` argument.  The
+    project-context task type is the closest durable authority and is mapped
+    without inspecting prose.  Missing/unsupported values remain ``unknown``
+    instead of being guessed from titles or topics.
+    """
+
+    if str(card.get("topic") or "").strip() == "quality_review":
+        return "review"
+    project_context = card.get("project_context")
+    task_type = (
+        str(project_context.get("task_type") or "").strip().lower()
+        if isinstance(project_context, dict)
+        else ""
+    )
+    return {
+        "code": "code",
+        "research": "research",
+        "data_classification": "linguistic",
+    }.get(task_type, "unknown")
+
+
+def _task_risk(card: dict[str, Any]) -> str:
+    risk = str(card.get("risk_tier") or "").strip().lower()
+    return risk if risk in {"low", "medium", "high", "critical"} else "unknown"
+
+
+def _economic_model_identity(row: dict[str, Any]) -> str:
+    """Normalize only declared provider model aliases, never adapter names."""
+
+    candidates = (
+        row.get("observed_model"),
+        row.get("model"),
+        row.get("requested_model"),
+    )
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        folded = raw.casefold()
+        if not raw:
+            continue
+        for marker, canonical in _ECONOMIC_MODEL_ALIASES:
+            if marker in folded:
+                return canonical
+        if folded not in {
+            "claude_cli", "codex_cli", "vscode_lm", "glm_vscode_lm",
+            "deepseek_vscode_lm", "deepseek_copilot_cli", "glm_copilot_cli",
+        }:
+            return raw
+    return ""
+
+
+def _economic_route_identity(row: dict[str, Any]) -> str:
+    """Return the recorded adapter/transport authority for one usage row."""
+
+    explicit = str(row.get("adapter_id") or "").strip()
+    if explicit:
+        return explicit
+    provider = str(row.get("provider") or "").strip().lower()
+    return {
+        "claude": "claude_cli",
+        "codex": "codex_cli",
+        "deepseek_copilot": "deepseek_copilot_cli",
+        "glm_copilot": "glm_copilot_cli",
+    }.get(provider, provider or "unknown")
+
+
+def cost_per_accepted_outcome_view(
+    usage_rows: list[dict[str, Any]],
+    decisions: dict[str, dict[str, str]],
+    cards: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Join exact task cost and manager decisions on one matched population.
+
+    A task is attributable to a model only when every worker attempt for that
+    task reports the same non-empty model identity.  Reviewer usage is not
+    charged to the worker model.  Any unknown-cost attempt makes that exact
+    model/family bucket ``UNKNOWN``; zero accepted outcomes makes it
+    ``UNMEASURED``.  Consequently neither missing telemetry nor a zero-dollar
+    placeholder can rank as free.
+    """
+
+    card_by_task = {
+        str(card.get("task_id") or ""): card
+        for card in cards
+        if str(card.get("task_id") or "")
+    }
+    usage_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in usage_rows:
+        task_id = str(row.get("task_id") or "")
+        if task_id and str(row.get("role") or "worker") == "worker":
+            usage_by_task[task_id].append(row)
+
+    buckets: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(lambda: {
+        "matched_decided_tasks": 0,
+        "accepted_outcomes": 0,
+        "rejected_outcomes": 0,
+        "attempt_records": 0,
+        "cost_known_attempts": 0,
+        "cost_unknown_attempts": 0,
+        "total_cost_usd": 0.0,
+        "total_tokens": 0,
+    })
+    unmatched_decisions = 0
+    unknown_model_tasks = 0
+    mixed_model_tasks = 0
+    for task_id, decision_row in decisions.items():
+        decision = str(decision_row.get("decision") or "").strip().lower()
+        if decision not in {"accepted", "rejected"}:
+            continue
+        rows = usage_by_task.get(task_id) or []
+        if not rows:
+            unmatched_decisions += 1
+            continue
+        models = {_economic_model_identity(row) for row in rows}
+        models.discard("")
+        if not models:
+            unknown_model_tasks += 1
+            continue
+        if len(models) != 1:
+            mixed_model_tasks += 1
+            continue
+        routes = {_economic_route_identity(row) for row in rows}
+        if len(routes) != 1:
+            mixed_model_tasks += 1
+            continue
+        model = next(iter(models))
+        route = next(iter(routes))
+        family = _task_family(card_by_task.get(task_id) or {})
+        risk = _task_risk(card_by_task.get(task_id) or {})
+        bucket = buckets[(model, route, family, risk)]
+        bucket["matched_decided_tasks"] += 1
+        bucket[f"{decision}_outcomes"] += 1
+        bucket["attempt_records"] += len(rows)
+        for row in rows:
+            bucket["total_tokens"] += int(row.get("total_tokens") or 0)
+            if row.get("cost_known") is True:
+                bucket["cost_known_attempts"] += 1
+                bucket["total_cost_usd"] = round(
+                    float(bucket["total_cost_usd"])
+                    + float(row.get("cost_usd") or 0.0),
+                    6,
+                )
+            else:
+                bucket["cost_unknown_attempts"] += 1
+
+    routes: dict[str, dict[str, dict[str, dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(dict))
+    )
+    for (model, route, family, risk), raw in sorted(buckets.items()):
+        row = dict(raw)
+        attempts = int(row["attempt_records"])
+        accepted = int(row["accepted_outcomes"])
+        unknown_cost = int(row["cost_unknown_attempts"])
+        if unknown_cost:
+            state = "UNKNOWN"
+            reason = "one_or_more_matched_attempt_costs_unknown"
+            cost_per_accepted: float | None = None
+        elif accepted == 0:
+            state = "UNMEASURED"
+            reason = "no_accepted_outcome_in_matched_population"
+            cost_per_accepted = None
+        else:
+            state = "MEASURED"
+            reason = "complete_matched_cost_and_acceptance_population"
+            cost_per_accepted = round(
+                float(row["total_cost_usd"]) / accepted, 6
+            )
+        row.update({
+            "state": state,
+            "reason": reason,
+            "cost_coverage": (
+                round(int(row["cost_known_attempts"]) / attempts, 6)
+                if attempts else None
+            ),
+            "acceptance_rate": (
+                round(accepted / int(row["matched_decided_tasks"]), 6)
+                if row["matched_decided_tasks"] else None
+            ),
+            "cost_per_accepted_outcome_usd": cost_per_accepted,
+            "risk_partition": risk,
+            "risk_evidence": (
+                "explicit_task_card"
+                if risk != "unknown"
+                else "not_persisted_on_historical_task_card"
+            ),
+        })
+        routes[model][route][family][risk] = row
+
+    return {
+        "schema_id": "aiworkhub.cost_per_accepted_outcome.v1",
+        "mode": "advisory_only",
+        "automatic_routing": False,
+        "attribution": "single_worker_model_per_task_all_attempt_costs",
+        "routes": {
+            model: {
+                route: {
+                    family: dict(sorted(risks.items()))
+                    for family, risks in sorted(families.items())
+                }
+                for route, families in sorted(model_routes.items())
+            }
+            for model, model_routes in sorted(routes.items())
+        },
+        "unmatched_decisions": unmatched_decisions,
+        "unknown_model_tasks": unknown_model_tasks,
+        "mixed_model_tasks": mixed_model_tasks,
+        "claim_boundary": (
+            "Measured rows are repository associations, not causal savings. "
+            "Shadow or canary activation requires matched uncapped parity "
+            "evidence partitioned by task family and risk."
+        ),
     }
 
 
@@ -401,6 +639,18 @@ def build_cost_ledger(
             seen.add(ident)
             union_rows.append(row)
 
+    try:
+        cards = (
+            task_store.list_task_cards(repo_root, limit=5000)
+            if repo_root is not None
+            else []
+        )
+    except task_store.TaskStoreError:
+        cards = []
+    accepted_economics = cost_per_accepted_outcome_view(
+        usage_rows, manager_decisions, cards
+    )
+
     return {
         "tool": "aiworkhub_task_cost_ledger",
         "contract": "B288_v1_readonly_cost_ledger",
@@ -433,6 +683,9 @@ def build_cost_ledger(
             "cache_creation_input_tokens": sum(
                 int(row.get("cache_creation_input_tokens") or 0) for row in union_rows
             ),
+            "cache_write_input_tokens": sum(
+                int(row.get("cache_write_input_tokens") or 0) for row in union_rows
+            ),
             "absent_metrics_are_unknown_not_zero": True,
         },
         "role_quality": {
@@ -457,6 +710,7 @@ def build_cost_ledger(
             "by_day": _aggregate(union_rows, "day"),
         },
         "model_outcomes": _model_outcome_matrix(usage_rows, manager_decisions),
+        "cost_per_accepted_outcome": accepted_economics,
         "retry_economics": _retry_economics(usage_rows, manager_decisions),
         "tasks": union_rows if include_tasks else [],
         "authority_flags": {

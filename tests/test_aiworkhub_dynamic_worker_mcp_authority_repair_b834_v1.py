@@ -352,6 +352,69 @@ def test_declared_target_scopes_returned_files_without_touching_the_query(
     assert payload["scope"] == "target"
 
 
+def test_scoped_focus_zero_hit_preserves_query_tokens_and_truthful_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    _stub_source_graph_engine(monkeypatch)
+    ctx = _ctx(
+        repo=authority, authority_repo=authority, home=tmp_path / "home",
+        targets=("docs",),
+    )
+
+    result = w.source_graph_query(
+        ctx,
+        mode="focus",
+        query="architecture and recent features",
+        target="docs",
+    )
+
+    assert result["ok"] is True
+    assert result["hit_count"] == 0
+    payload = json.loads(result["content"])
+    assert payload["query_tokens"] == [
+        "architecture", "and", "recent", "features",
+    ]
+    assert payload["query_tokens_source"] == "query"
+    assert payload["retrieval_reason"] == "no_ranked_match_within_target"
+    assert payload["requested_target"] == "docs"
+
+
+def test_scoped_focus_global_zero_hit_preserves_query_tokens_and_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _mute_chmod(monkeypatch)
+    authority = _authority_repo(tmp_path)
+    monkeypatch.setattr(
+        source_graph_mod,
+        "focus",
+        lambda repo_root, query, budget=64: {
+            "mode": "focus",
+            "query": query,
+            "budget": budget,
+            "matches": [],
+            "query_tokens": ["missing", "symbol"],
+            "candidate_files": [],
+            "truncated": False,
+        },
+    )
+    ctx = _ctx(
+        repo=authority, authority_repo=authority, home=tmp_path / "home",
+        targets=("docs",),
+    )
+
+    result = w.source_graph_query(
+        ctx, mode="focus", query="missing symbol", target="docs",
+    )
+
+    assert result["hit_count"] == 0
+    payload = json.loads(result["content"])
+    assert payload["query_tokens"] == ["missing", "symbol"]
+    assert payload["query_tokens_source"] == "query"
+    assert payload["retrieval_reason"] == "no_ranked_semantic_match"
+
+
 def test_context_target_drops_entire_mismatched_context_and_keeps_provenance() -> None:
     payload = {
         "mode": "context",

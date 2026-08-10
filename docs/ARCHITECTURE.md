@@ -69,6 +69,62 @@ and refuses identity collisions; expired payload purge is a separate action,
 while the compact retention audit remains durable. No dashboard action deletes
 an active, processing or review task through this lifecycle.
 
+Ephemeral execution state is repository-bound by default as well. Exact
+repository-aware callers place worker worktrees, request-private homes and
+validation scratch beneath the git-ignored `.aiworkhub/runtime/` tree:
+
+```text
+.aiworkhub/runtime/
+  worktrees/<request-id>/{worktree,home}
+  validation/aiworkhub-validation-<request-id>/
+```
+
+This directory is runtime state, not canonical source or durable task
+evidence. It is excluded from Git and Source Graph through the existing
+`.aiworkhub` boundary and is handled by the worktree/storage retention paths.
+The exact repository-local `runtime/worktrees` shape is the only nested
+worktree root accepted; arbitrary paths inside the parent checkout fail
+closed. Symlinked repository runtime boundaries are rejected.
+
+Operators may put ephemeral state on another volume with
+`AIWORKHUB_RUNTIME_ROOT`; the narrower legacy `AIWORKHUB_WORKTREE_ROOT` still
+overrides only worktree placement, and
+`AIWORKHUB_VALIDATION_EXEC_SCRATCH_ROOT` still overrides executable validation
+scratch. Callers without verified repository identity retain the historical
+system-temporary fallback instead of guessing a repository. Upgrade-time GC
+recognizes the exact old temporary worktree layout, but never broadens its
+deletion authority.
+
+## NeedFix, Roadmap, and Task DAG authority
+
+AIWorkHub keeps discovery, commitment, and execution as three separate durable
+layers:
+
+```text
+NeedFix inbox -> Roadmap outcome -> executable Task DAG
+what was seen    what was approved   what is running now
+```
+
+NeedFix remains the inexpensive intake surface for bugs, ideas, benchmark
+gaps, risks, and investigations. A captured NeedFix is evidence to triage; it
+is not a product commitment and never launches a worker.
+
+The Roadmap registry lives in `.aiworkhub/tasking/roadmap.sqlite`. It stores
+manager-approved outcomes, milestones, acceptance criteria, prerequisite
+Roadmap identities, linked NeedFix records, linked canonical task identities,
+evidence references, and an append-only event history. Roadmap transitions are
+guarded: dependencies must exist and be complete before work starts or closes,
+and an outcome linked to tasks cannot become `completed` until every linked
+canonical task is `finished`. A task-free outcome requires explicit evidence
+instead. Roadmap operations never infer task completion from worker prose and
+never create or launch a task implicitly.
+
+The MCP server exposes bounded manager Roadmap add/list/show/events/transition/
+link operations. The dashboard uses a separate read-only Roadmap surface and a
+dedicated popup; the Webview cannot mutate the registry or read the SQLite file
+directly. This preserves the authority boundary while making dependencies,
+task status, and completion blockers visible to an operator.
+
 ## MCP server surface
 
 `server.py` wires the read-only and write-gated tool sets over
@@ -106,7 +162,14 @@ CLI, or `deepseek_copilot_cli` via `runtime_adapters.py` /
 PID/timeout/cancel tracking and an append-only process-event log.
 `worker_workspace.py` provisions an isolated worker workspace (Landlock
 sandbox where available) so a launched worker's Source Graph queries and
-writes stay bounded to its declared `allowed_writes`.
+writes stay bounded to its declared `allowed_writes`. Repository-aware launch
+uses `.aiworkhub/runtime/worktrees` by default, so a system-temp mount policy
+cannot strand the working copy outside the repository's operational boundary.
+Validation prefers a request-unique directory under
+`.aiworkhub/runtime/validation`, then applies the same executable and metadata
+capability probes used for external scratch roots. Retention, registration
+inventory and cleanup resolve the same repository-aware root; dirty, live or
+review workspaces are not silently purged.
 
 The preferred credential-free editor route is
 `vscode_lm_bridge.py` + `VscodeLmBridgeHost`. The extension publishes a
@@ -161,6 +224,24 @@ generic per-tool ledger. Dashboard aggregation therefore distinguishes calls,
 successful calls, bounded bytes and cache hits for Source Graph, Session
 Manager, AI Memory, KB and other MCP tools without treating a prompt-time
 injected bundle as continuous use.
+
+The repository-owned Source Graph retrieval evaluator runs a checked query
+corpus against complete ranked results, including when the ordinary public
+query path would return a compact cache receipt. Its artifact records
+precision@k, recall@k, MRR, success@k, returned bytes, latency, and explicit
+accepted-outcome coverage. Release assurance can enforce structural minimums,
+but zero accepted-outcome coverage remains visible and blocks causal quality,
+token-savings, and vector-search claims.
+
+Repeated worker Session Manager reads use a request-local delta protocol. The
+first read returns the full bounded current-state payload; later reads with the
+same immutable task, request, repository, topic, limit, and authority identity
+return either a content-hash reference for unchanged state or only added,
+changed, and removed evidence identities when that representation is smaller.
+The canonical Session database and authenticated tool audit retain full state
+identity. The in-process cache is bounded and disposable, so restart falls back
+to a full reconciliation response. Its receipts measure returned structural
+bytes only; they do not claim provider-token, latency, cost, or quality savings.
 
 ## VS Code extension
 

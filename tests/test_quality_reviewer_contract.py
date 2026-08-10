@@ -11,6 +11,58 @@ from aiworkhub import quality_reviewer as qr
 from aiworkhub import process_launcher
 from aiworkhub import worker_ai_tools_mcp as worker_tools
 from aiworkhub import worker_workspace
+from aiworkhub.evidence_levels import EvidenceLevel
+from aiworkhub.scoped_audit import (
+    ChangedPath,
+    KnownUnknown,
+    ReviewLens,
+    ScopedAuditPacket,
+    TargetSymbol,
+    ValidationExpectation,
+)
+
+
+def _scoped_audits() -> dict[str, ScopedAuditPacket]:
+    return {
+        lens: ScopedAuditPacket(
+            packet_id=f"scope-{lens}",
+            task_id="TARGET_TASK_1",
+            created_at="2026-08-10T00:00:00Z",
+            target_symbols=(
+                TargetSymbol("src/aiworkhub/core.py.target", "function"),
+            ),
+            changed_paths=(
+                ChangedPath("src/aiworkhub/core.py", "modified", 1, 10),
+            ),
+            forbidden_changes=(),
+            invariants=("acceptance contract only",),
+            impact_evidence=(),
+            test_evidence=(),
+            contract_evidence=(),
+            prior_lessons=(),
+            review_lens=ReviewLens(
+                lens,
+                f"Apply the {lens} lens.",
+                EvidenceLevel.STATIC_EVIDENCE,
+            ),
+            unknowns=(
+                KnownUnknown(
+                    "impact-unresolved",
+                    "What consumers exist?",
+                    "No graph fixture is required for this contract test.",
+                ),
+            ),
+            validation_expectations=(
+                ValidationExpectation(
+                    "expect-pytest",
+                    "unit",
+                    "python3 -m pytest -q",
+                    "return code 0",
+                ),
+            ),
+        )
+        for lens in ("correctness", "security", "code_quality")
+    }
 
 
 def _packet() -> dict[str, object]:
@@ -41,6 +93,7 @@ def _packet() -> dict[str, object]:
                 "summary": "worker-provided prose must not survive normalization",
             }
         ],
+        scoped_audits=_scoped_audits(),
     )
 
 
@@ -111,6 +164,64 @@ def _verify(receipt: dict[str, object], packet: dict[str, object]) -> dict[str, 
         observed_terminal_state="review_ready",
         audit_verified=True,
     )
+
+
+def _accepted_reviewer_state() -> tuple[dict[str, object], dict[str, object]]:
+    verified = _verify(_receipt(_packet()), _packet())
+    latest = {
+        "request_id": "review-request-1",
+        "task_id": "REVIEW_TASK_1",
+        "adapter_id": "claude_sonnet5",
+        "state": "accepted",
+        "accepted": True,
+        "quality_review_receipt": verified,
+    }
+    card = {
+        "task_id": "REVIEW_TASK_1",
+        "topic": "quality_review",
+        "status": "finished",
+        "worker_status": "done",
+        "accepted_request_id": "review-request-1",
+        "terminal_review": {
+            "evidence": {"quality_review_receipt": copy.deepcopy(verified)}
+        },
+        "accept_evidence": {"quality_review_receipt": copy.deepcopy(verified)},
+    }
+    return latest, card
+
+
+def test_target_acceptance_reuses_canonically_accepted_reviewer_receipt() -> None:
+    latest, card = _accepted_reviewer_state()
+
+    verified = process_launcher._verified_accepted_quality_review_receipt(
+        latest,
+        card,
+        "review-request-1",
+        "target-request-1",
+        "TARGET_TASK_1",
+    )
+
+    assert verified == latest["quality_review_receipt"]
+    assert verified is not latest["quality_review_receipt"]
+
+
+def test_accepted_reviewer_receipt_must_match_all_durable_copies() -> None:
+    latest, card = _accepted_reviewer_state()
+    card["accept_evidence"]["quality_review_receipt"]["report"]["findings"] = [
+        {"id": "tampered"}
+    ]
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError,
+        match="quality_reviewer_accepted_receipt_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest,
+            card,
+            "review-request-1",
+            "target-request-1",
+            "TARGET_TASK_1",
+        )
 
 
 def test_packet_is_deterministic_and_anti_anchored() -> None:
@@ -276,6 +387,130 @@ def test_worker_submission_is_packet_bound_and_hmac_audited(tmp_path: Path) -> N
     assert verified["report"]["provider"] == "claude_cli"
 
 
+def test_worker_submission_preserves_bounded_nonactionable_disposition(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "packet-limit",
+            "severity": "low",
+            "disposition": "process_limit",
+            "summary": "The packet omitted a requested excerpt",
+            "evidence": "review packet source_evidence entry is truncated",
+        }],
+    )
+
+    assert result["ok"] is True
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    finding = audit["verified_payloads"][0]["report"]["findings"][0]
+    assert finding["disposition"] == "process_limit"
+    assert finding["actionable"] is False
+
+
+def test_worker_submission_normalizes_exact_evidence_and_caps_model_level(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    result = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "bounded-defect",
+            "severity": "high",
+            "summary": "Changed branch violates the invariant",
+            "evidence": "src/aiworkhub/core.py:7",
+            "path": "src/aiworkhub/core.py",
+            "line_start": 7,
+            "line_end": 7,
+            "symbol": "src/aiworkhub/core.py.target",
+            "confidence": "high",
+            "evidence_level": "reproduced",
+            "required_validation": "run the focused branch regression",
+        }],
+    )
+
+    assert result["ok"] is True
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    finding = audit["verified_payloads"][0]["report"]["findings"][0]
+    assert finding["evidence_reference"] == {
+        "kind": "source",
+        "path": "src/aiworkhub/core.py",
+        "line_start": 7,
+        "line_end": 7,
+    }
+    assert finding["evidence_level"] == "static_evidence"
+    assert finding["confidence"] == "high"
+    assert finding["claim"] == "Changed branch violates the invariant"
+    assert finding["required_validation"] == "run the focused branch regression"
+
+
+def test_worker_submission_rejects_ungrounded_or_out_of_scope_defect(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+
+    missing = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="security",
+        findings=[{
+            "id": "ungrounded",
+            "severity": "high",
+            "summary": "Unverified claim",
+            "evidence": "the code looks unsafe",
+        }],
+    )
+    assert missing["ok"] is False
+    assert missing["reason"] == "review_finding_0_exact_evidence_required"
+
+    outside = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="security",
+        findings=[{
+            "id": "outside",
+            "severity": "medium",
+            "summary": "Outside scope",
+            "evidence": "other.py:1",
+            "path": "other.py",
+            "line_start": 1,
+            "line_end": 1,
+        }],
+    )
+    assert outside["ok"] is False
+    assert outside["reason"] == "review_finding_0_path_out_of_scope"
+
+
 def test_identical_quality_review_retries_are_one_logical_receipt(
     tmp_path: Path,
 ) -> None:
@@ -283,14 +518,35 @@ def test_identical_quality_review_retries_are_one_logical_receipt(
     packet_path = tmp_path / "review_packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
     ctx = _worker_context(tmp_path, packet_path)
-    for _attempt in range(2):
-        result = worker_tools.quality_review_submit(
-            ctx,
-            packet_sha256=str(packet["packet_sha256"]),
-            lens="correctness",
-            findings=[],
-        )
-        assert result["ok"] is True
+    first = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )
+    second = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )
+    assert first["ok"] is True
+    assert first["durable"] is True
+    assert first["deduplicated"] is False
+    assert second["ok"] is True
+    assert second["durable"] is True
+    assert second["deduplicated"] is True
+    assert second["submission_id"] == first["submission_id"]
+
+    audit = worker_tools.verify_audit_ledger(
+        ctx.audit_ledger_path,
+        ctx.audit_hmac_key_path,
+        task_id=ctx.task_id,
+        runner=ctx.runner,
+        topic=ctx.topic,
+        request_id=ctx.request_id,
+    )
+    assert audit["call_count_by_tool"] == {"quality_review_submit": 1}
 
     workspace = worker_workspace.WorkerWorkspace(
         request_id=ctx.request_id,
@@ -320,31 +576,43 @@ def test_identical_quality_review_retries_are_one_logical_receipt(
         ctx.request_id,
     )
     assert verified["report"]["findings"] == []
+    assert verified["submission_id"] == first["submission_id"]
+    assert verified["physical_submission_count"] == 1
+    assert verified["logical_submission_count"] == 1
 
 
-def test_conflicting_quality_review_retries_fail_closed(tmp_path: Path) -> None:
+def test_quality_review_submit_never_acknowledges_failed_audit_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     packet = _packet()
     packet_path = tmp_path / "review_packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
     ctx = _worker_context(tmp_path, packet_path)
-    assert worker_tools.quality_review_submit(
+
+    def fail_append(_path: Path, _line: str) -> None:
+        raise PermissionError("simulated denied audit append")
+
+    monkeypatch.setattr(worker_tools, "_append_line_0600", fail_append)
+    result = worker_tools.quality_review_submit(
         ctx,
         packet_sha256=str(packet["packet_sha256"]),
         lens="correctness",
         findings=[],
-    )["ok"] is True
-    assert worker_tools.quality_review_submit(
-        ctx,
-        packet_sha256=str(packet["packet_sha256"]),
-        lens="correctness",
-        findings=[{
-            "id": "conflicting-retry",
-            "severity": "low",
-            "summary": "conflicting retry",
-            "evidence": "source.py:1",
-        }],
-    )["ok"] is True
+    )
 
+    assert result["ok"] is False
+    assert result["durable"] is False
+    assert result["reason"] == "quality_review_submission_not_durable"
+    assert len(result["submission_id"]) == 64
+
+
+def test_missing_quality_review_submission_cannot_finalize_review_ready(
+    tmp_path: Path,
+) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
     workspace = worker_workspace.WorkerWorkspace(
         request_id=ctx.request_id,
         repo=tmp_path,
@@ -354,9 +622,10 @@ def test_conflicting_quality_review_retries_fail_closed(tmp_path: Path) -> None:
         parent_baseline={},
         workspace_baseline={},
     )
+
     with pytest.raises(
         worker_workspace.WorkspaceError,
-        match="quality_review_submission_conflict:2",
+        match="quality_review_submission_count:0",
     ):
         process_launcher._verified_quality_review_receipt(
             {
@@ -376,6 +645,62 @@ def test_conflicting_quality_review_retries_fail_closed(tmp_path: Path) -> None:
             workspace,
             ctx.request_id,
         )
+
+
+def test_conflicting_quality_review_retries_fail_closed(tmp_path: Path) -> None:
+    packet = _packet()
+    packet_path = tmp_path / "review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    ctx = _worker_context(tmp_path, packet_path)
+    assert worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[],
+    )["ok"] is True
+    conflict = worker_tools.quality_review_submit(
+        ctx,
+        packet_sha256=str(packet["packet_sha256"]),
+        lens="correctness",
+        findings=[{
+            "id": "conflicting-retry",
+            "severity": "low",
+            "summary": "conflicting retry",
+            "evidence": "src/aiworkhub/core.py:1",
+        }],
+    )
+    assert conflict["ok"] is False
+    assert conflict["reason"] == "quality_review_submission_conflict"
+
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=ctx.request_id,
+        repo=tmp_path,
+        path=tmp_path,
+        home=tmp_path,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+    verified = process_launcher._verified_quality_review_receipt(
+        {
+            "task_id": ctx.task_id,
+            "runner": ctx.runner,
+            "topic": ctx.topic,
+            "adapter_id": "claude_cli",
+            "worker_mcp": {
+                "audit_ledger_path": str(ctx.audit_ledger_path),
+                "audit_hmac_key_path": str(ctx.audit_hmac_key_path),
+            },
+            "quality_review": {
+                "packet_path": str(packet_path),
+                "lens": "correctness",
+            },
+        },
+        workspace,
+        ctx.request_id,
+    )
+    assert verified["physical_submission_count"] == 1
+    assert verified["logical_submission_count"] == 1
 
 
 def test_ordinary_worker_cannot_submit_unbound_review(tmp_path: Path) -> None:

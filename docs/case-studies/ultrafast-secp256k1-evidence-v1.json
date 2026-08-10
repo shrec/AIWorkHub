@@ -1,0 +1,45 @@
+{
+  "schema_id": "aiworkhub.external_case_study.v1",
+  "captured_at": "2026-08-10",
+  "repository": "https://github.com/shrec/UltrafastSecp256k1",
+  "ref_name": "dev",
+  "commit": "2d6de776a9c836fd6fdbb73f4dd29a9099187ba2",
+  "measurement_boundary": "pinned_public_repository_documentation_not_independent_runtime_reproduction",
+  "sources": [
+    {
+      "path": "README.md",
+      "sha256": "047aaa42d8a4b05113dab832a675a58e141945dbdd0cc45dd6298b014caf3ce7"
+    },
+    {
+      "path": "docs/ADOPTION.md",
+      "sha256": "59c7c805ae1b82ed19c62141917140cf521f7a9113d871691a008ce704a56e7e"
+    },
+    {
+      "path": "docs/BENCHMARKS.md",
+      "sha256": "fe1d163b18353fbae3fb5a90108dffc82381fbb0f73f0b46235deb01ec6f1b21"
+    },
+    {
+      "path": "docs/ASSURANCE_LEDGER.md",
+      "sha256": "6a6494f251bdef81b15784232a52d7afa795c8e9fb7571e977d97654c5818c2a"
+    },
+    {
+      "path": "docs/RESIDUAL_RISK_REGISTER.md",
+      "sha256": "5e8e226ffce15b0106d1ea86a9f1fc4f50af7314aa17d5e90999d509c941bb8a"
+    },
+    {
+      "path": "SECURITY.md",
+      "sha256": "c2725f1c33bf0b776d67515aaf3db0ad9a7d211e6090132ed8821305bb2a4cf1"
+    }
+  ],
+  "eligible_claims": [
+    "The pinned repository exposes profile-scoped review material, a claim ledger, benchmark methodology, replay commands and a residual-risk register.",
+    "The pinned security policy explicitly says no external third-party audit has been completed.",
+    "The repository is a useful public design reference for evidence-first engineering controls."
+  ],
+  "excluded_claims": [
+    "AIWorkHub caused or guarantees the donor repository's quality.",
+    "AIWorkHub independently reproduced the donor's performance numbers.",
+    "AIWorkHub independently verified adoption statements.",
+    "Self-audit is equivalent to an independent cryptographic security audit."
+  ]
+}

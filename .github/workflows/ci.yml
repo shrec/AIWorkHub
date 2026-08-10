@@ -21,10 +21,10 @@ jobs:
     name: Static quality gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install development quality tools
@@ -57,17 +57,23 @@ jobs:
           - { name: macos, os: macos-latest, mode: local }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Verify canonical release metadata
         run: python scripts/release_metadata.py check
+
+      - name: Verify release assurance manifest
+        run: python scripts/check_release_assurance.py
+
+      - name: Verify replayable release evidence pack
+        run: python scripts/check_release_evidence_pack.py
 
       - name: Install and qualify cross-platform Python runtime
         env:
@@ -79,12 +85,12 @@ jobs:
           python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py tests/test_quality_calibration.py tests/test_source_graph_tree_sitter_semantic.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.24.x"
           cache: false
@@ -102,7 +108,7 @@ jobs:
         working-directory: vscode-extension
 
       - name: Upload qualification evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: qualification-${{ matrix.name }}
           path: |
@@ -119,12 +125,12 @@ jobs:
       fail-fast: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -147,12 +153,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -172,7 +178,7 @@ jobs:
           test -s "${sdists[0]}"
 
       - name: Upload Python distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: aiworkhub-python-dist
           path: |
@@ -186,17 +192,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.24.x"
           cache: false
@@ -228,7 +234,7 @@ jobs:
           test -s "${vsix[0]}"
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: aiworkhub-vsix
           path: vscode-extension/dist/aiworkhub-*.vsix

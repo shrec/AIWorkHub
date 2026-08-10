@@ -26,6 +26,11 @@ node_modules/
 !.aiworkhub/eval-artifacts.json
 !.aiworkhub/source-graph-retrieval-eval.json
 !.aiworkhub/quality-ratchet.json
+!.aiworkhub/risk-mode-adjudication.jsonl
+!.aiworkhub/release-assurance.json
+!.aiworkhub/release-evidence.json
+!.aiworkhub/release-residual-risks.json
+!.aiworkhub/release-route-parity.json
 
 # Local coordinator handoffs, dated audits, and review scratch reports.
 /AUTONOMOUS_SESSION_SUMMARY.md

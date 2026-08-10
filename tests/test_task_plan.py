@@ -12,7 +12,7 @@ if str(_SRC) not in sys.path:
 from aiworkhub import task_plan  # noqa: E402
 
 
-def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_writes=None, depends_on=None, created_at="2026-01-01T00:00:00Z", launch_request_id=None):
+def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_writes=None, depends_on=None, created_at="2026-01-01T00:00:00Z", launch_request_id=None, **extra):
     return {
         "task_id": task_id,
         "status": status,
@@ -25,6 +25,7 @@ def _card(task_id, *, status="pending", worker_status="unclaimed", allowed_write
             if launch_request_id is None and status == "processing"
             else (launch_request_id or "")
         ),
+        **extra,
     }
 
 
@@ -78,6 +79,130 @@ def test_snapshot_unblocks_once_dependency_finished():
     snap = task_plan.build_snapshot(cards)
     assert "t2" not in snap["blockers"]
     assert "t2" in snap["ready"]
+
+
+def test_snapshot_rewrites_superseded_dependency_to_finished_replacement():
+    cards = [
+        _card(
+            "old",
+            status="archived",
+            archived_at="2026-01-02T00:00:00Z",
+            archive_operation="superseded",
+            superseded_by="replacement",
+        ),
+        _card("replacement", status="finished", worker_status="done"),
+        _card("successor", depends_on=["old"]),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["dependencies"]["successor"] == ["replacement"]
+    assert snap["original_dependencies"]["successor"] == ["old"]
+    assert snap["dependency_replacements"]["successor"]["old"] == {
+        "chain": ["old"],
+        "resolved_to": "replacement",
+    }
+    assert "successor" in snap["ready"]
+    assert snap["dag_valid"] is True
+
+
+def test_snapshot_blocks_until_superseded_replacement_finishes():
+    cards = [
+        _card(
+            "old",
+            status="archived",
+            archived_at="2026-01-02T00:00:00Z",
+            archive_operation="superseded",
+            superseded_by="replacement",
+        ),
+        _card("replacement", status="pending"),
+        _card("successor", depends_on=["old"]),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["blockers"]["successor"] == ["replacement"]
+    assert "successor" not in snap["ready"]
+
+
+@pytest.mark.parametrize(
+    ("archived_cards", "expected_error"),
+    [
+        (
+            [
+                _card(
+                    "old",
+                    status="archived",
+                    archived_at="2026-01-02T00:00:00Z",
+                    archive_operation="superseded",
+                    superseded_by="missing",
+                )
+            ],
+            "__superseded_replacement_not_found__:missing",
+        ),
+        (
+            [
+                _card(
+                    "old",
+                    status="archived",
+                    archived_at="2026-01-02T00:00:00Z",
+                    archive_operation="superseded",
+                    superseded_by="next",
+                ),
+                _card(
+                    "next",
+                    status="archived",
+                    archived_at="2026-01-03T00:00:00Z",
+                    archive_operation="superseded",
+                    superseded_by="old",
+                ),
+            ],
+            "__superseded_replacement_cycle__:old",
+        ),
+        (
+            [
+                _card(
+                    "old",
+                    status="archived",
+                    archived_at="2026-01-02T00:00:00Z",
+                    archive_operation="archived",
+                )
+            ],
+            "__archived_dependency_not_superseded__:old",
+        ),
+    ],
+)
+def test_snapshot_fails_closed_for_invalid_replacement_chain(
+    archived_cards, expected_error
+):
+    snap = task_plan.build_snapshot(
+        [*archived_cards, _card("successor", depends_on=["old"])]
+    )
+
+    assert snap["blockers"]["successor"] == [expected_error]
+    assert snap["dependency_resolution_errors"]["successor"] == [expected_error]
+    assert "successor" not in snap["ready"]
+    assert snap["dag_valid"] is False
+
+
+def test_snapshot_detects_cycle_created_by_superseded_dependency_rewrite():
+    cards = [
+        _card(
+            "old",
+            status="archived",
+            archived_at="2026-01-02T00:00:00Z",
+            archive_operation="superseded",
+            superseded_by="replacement",
+        ),
+        _card("replacement", depends_on=["successor"]),
+        _card("successor", depends_on=["old"]),
+    ]
+
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["cycle_nodes"] == ["replacement", "successor"]
+    assert snap["dag_valid"] is False
+    assert snap["ready"] == []
 
 
 def test_snapshot_reports_write_scope_overlap_with_retained_processing_card():
@@ -244,6 +369,24 @@ def test_existing_edges_from_cards_flags_invalid_legacy_card():
     edges, invalid_ids = task_plan.existing_edges_from_cards(cards)
     assert invalid_ids == {"t1"}
     assert edges["t1"] == []
+
+
+def test_existing_edges_from_cards_projects_superseded_alias_edge():
+    cards = {
+        "old": _card(
+            "old",
+            status="archived",
+            archived_at="2026-01-02T00:00:00Z",
+            archive_operation="superseded",
+            archive_reason="superseded_by:replacement; legacy audit",
+        ),
+        "replacement": _card("replacement"),
+    }
+
+    edges, invalid_ids = task_plan.existing_edges_from_cards(cards)
+
+    assert edges["old"] == ["replacement"]
+    assert invalid_ids == set()
 
 
 def test_validate_new_dependency_edge_rejects_dependency_with_invalid_depends_on():

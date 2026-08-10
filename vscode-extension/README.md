@@ -12,19 +12,17 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.39
+## What's new in 0.9.40
 
-- Added strict evidence levels, scoped audit packets, manager-gated learning
-  commits and a bounded attempt-artifact manifest for trustworthy review and
-  durable, provider-neutral engineering evidence.
-- Hardened Windows multi-window runtime routing so each editor stays bound to
-  its active repository authority.
-- Fixed Windows validation-runtime trust checks and made Ruff/mypy quality
-  gates use the selected trusted Python interpreter.
-- Restored truthful completion-inbox reporting for blocked finalization
-  failures, including exact request identity and retained-workspace state.
-- Added adversarial manifest tests plus cross-platform Windows runtime and
-  finalization regressions.
+- Required semantic-edit creates now reject literal placeholder output,
+  including retained rework that leaves an invalid required file unchanged.
+- Repository Ruff and mypy checks can use their trusted PATH entrypoint when
+  the active MCP interpreter does not provide the declared module, while the
+  exact executed command remains visible in evidence receipts.
+- Task supersession verifies the replacement task before archiving the
+  original card, preventing a transient broken edge in the Plan DAG.
+- Quality-verdict aggregation keeps a strict typed evidence shape and ships
+  with focused placeholder, quality-tool and replacement-edge regressions.
 
 See the packaged **Changelog** for the complete release summary.
 

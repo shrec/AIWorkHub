@@ -23,8 +23,8 @@ jobs:
     name: Build static product site
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
+      - uses: actions/checkout@v7
+      - uses: actions/configure-pages@v6
       - name: Validate public documentation and SEO contracts
         run: python scripts/check_public_docs.py
       - name: Assemble Pages artifact
@@ -35,7 +35,7 @@ jobs:
           cp vscode-extension/media/aiworkhub-marketplace-icon.svg _site/assets/
           rm -f _site/SEO_SETUP.md
           touch _site/.nojekyll
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -49,4 +49,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

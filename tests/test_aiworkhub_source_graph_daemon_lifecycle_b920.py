@@ -81,6 +81,7 @@ def test_init_repo_triggers_initial_index_without_blocking(tmp_path, cleanup_dae
     ignore_config = root / ".aiworkhub" / "config" / "source_graph.json"
     assert ignore_config.is_file()
     assert source_graph.load_ignore_policy(root).exclude_dirs >= source_graph.DEFAULT_EXCLUDE_DIR_NAMES
+    assert ".aiworkhub" in source_graph.load_ignore_policy(root).exclude_dirs
 
     daemon = source_graph_daemon.get_daemon(root)
     assert daemon is not None

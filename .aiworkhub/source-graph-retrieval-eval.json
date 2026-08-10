@@ -1,6 +1,11 @@
 {
   "schema_id": "aiworkhub.source_graph_retrieval_eval.registry.v1",
   "ground_truth": "stable canonical symbol ownership",
+  "minimums": {
+    "recall_at_k": 1.0,
+    "mrr": 0.8,
+    "success_at_k": 1.0
+  },
   "cases": [
     {
       "id": "worker-audit-verifier",
@@ -21,6 +26,55 @@
       "mode": "focus",
       "query": "render_projection",
       "expected_paths": ["src/aiworkhub/agent_tool_instructions.py"],
+      "k": 10
+    },
+    {
+      "id": "source-graph-retrieval-evaluator",
+      "mode": "focus",
+      "query": "source_graph_retrieval_eval",
+      "expected_paths": ["src/aiworkhub/evidence_instruments.py"],
+      "k": 10
+    },
+    {
+      "id": "dashboard-snapshot-builder",
+      "mode": "focus",
+      "query": "build_snapshot dashboard",
+      "expected_paths": ["src/aiworkhub/dashboard.py"],
+      "k": 10
+    },
+    {
+      "id": "accepted-outcome-cost-view",
+      "mode": "focus",
+      "query": "cost_per_accepted_outcome_view",
+      "expected_paths": ["src/aiworkhub/cost_ledger.py"],
+      "k": 10
+    },
+    {
+      "id": "needfix-transition-view",
+      "mode": "focus",
+      "query": "needfix_transition_view",
+      "expected_paths": ["src/aiworkhub/dashboard_mcp_app.py"],
+      "k": 10
+    },
+    {
+      "id": "context-graph-session-append",
+      "mode": "focus",
+      "query": "append_session_document_in_transaction",
+      "expected_paths": ["src/aiworkhub/context_graph.py"],
+      "k": 10
+    },
+    {
+      "id": "worker-source-graph-wrapper",
+      "mode": "focus",
+      "query": "session_current_state worker",
+      "expected_paths": ["src/aiworkhub/worker_ai_tools_mcp.py"],
+      "k": 10
+    },
+    {
+      "id": "worker-prompt-builder",
+      "mode": "focus",
+      "query": "build_worker_prompt",
+      "expected_paths": ["src/aiworkhub/process_launcher.py"],
       "k": 10
     }
   ]

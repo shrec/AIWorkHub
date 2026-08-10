@@ -14,12 +14,12 @@ import os
 import re
 import stat
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Mapping
 
-from . import repo_policy, task_store, workforce_router
+from . import cost_ledger, repo_policy, task_store, workforce_router
 from .platform_io import posix_path_modes_supported
 
 
@@ -29,6 +29,19 @@ AUDIT_RELATIVE_PATH = Path(".aiworkhub/config/workforce.audit.jsonl")
 MAX_CATALOG_BYTES = 256 * 1024
 MAX_WORKERS = 64
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+ROUTE_CIRCUIT_COOLDOWN_SECONDS = 600.0
+ROUTE_CIRCUIT_LOOKBACK_SECONDS = 86_400.0
+ROUTE_CIRCUIT_TRANSIENT_THRESHOLD = 2
+_ROUTE_SUCCESS_STATES = frozenset({"accepted", "review_ready", "validation_failed"})
+_ROUTE_AUTH_MARKERS = (
+    "authentication_failed", "authorization_failed", "invalid_api_key",
+    "unauthorized", "http_status=401", "http_status=403",
+)
+_ROUTE_TRANSIENT_MARKERS = (
+    "provider_timeout", "mcp_request_timeout", "no_terminal_event",
+    "empty_provider_response", "direct app-server input", "turn/start failed",
+    "access is denied", "mcp_unavailable", "malformed_stream",
+)
 
 
 def execution_runner(worker_id: str, adapter_id: str) -> str:
@@ -300,6 +313,96 @@ def _iso_seconds(start: Any, finish: Any) -> float | None:
     return max(0.0, (last - first).total_seconds())
 
 
+def _process_event_epoch(process: Mapping[str, Any]) -> float | None:
+    for field in ("finished_at", "timestamp", "started_at"):
+        raw = process.get(field)
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def _route_failure_kind(process: Mapping[str, Any]) -> str:
+    state = str(process.get("state") or "").strip().casefold()
+    error = str(process.get("error") or "").strip().casefold()
+    if any(marker in error for marker in _ROUTE_AUTH_MARKERS):
+        return "auth"
+    if state in {"launch_failed", "timed_out"}:
+        return "transient"
+    if state == "worker_failed" and any(
+        marker in error for marker in _ROUTE_TRANSIENT_MARKERS
+    ):
+        return "transient"
+    return ""
+
+
+def _route_circuit(
+    matched: Iterable[Mapping[str, Any]], *, now_epoch: float,
+) -> dict[str, Any]:
+    """Derive one exact adapter+model circuit from durable process evidence.
+
+    Validation/finalization failures are route successes: the provider
+    returned a usable result and must not be penalized for a downstream gate.
+    Only authenticated route failures and repeated transport failures count.
+    The circuit is advisory/selection-local; it never mutates or disables the
+    shared MCP control plane.
+    """
+
+    observed = [
+        (epoch, process)
+        for process in matched
+        if (epoch := _process_event_epoch(process)) is not None
+        and 0.0 <= now_epoch - epoch <= ROUTE_CIRCUIT_LOOKBACK_SECONDS
+    ]
+    observed.sort(key=lambda item: item[0], reverse=True)
+    consecutive = 0
+    latest_kind = ""
+    latest_failure_epoch: float | None = None
+    for epoch, process in observed:
+        kind = _route_failure_kind(process)
+        state = str(process.get("state") or "").strip().casefold()
+        if kind:
+            consecutive += 1
+            latest_kind = latest_kind or kind
+            latest_failure_epoch = (
+                epoch if latest_failure_epoch is None else latest_failure_epoch
+            )
+            if kind == "auth":
+                break
+            continue
+        if state in _ROUTE_SUCCESS_STATES:
+            break
+
+    threshold = 1 if latest_kind == "auth" else ROUTE_CIRCUIT_TRANSIENT_THRESHOLD
+    failure_age = (
+        max(0.0, now_epoch - latest_failure_epoch)
+        if latest_failure_epoch is not None else None
+    )
+    tripped = bool(latest_kind and consecutive >= threshold)
+    open_now = bool(
+        tripped
+        and failure_age is not None
+        and failure_age < ROUTE_CIRCUIT_COOLDOWN_SECONDS
+    )
+    return {
+        "schema_id": "aiworkhub.route_failure_circuit.v1",
+        "scope": "exact_adapter_and_model",
+        "state": "open" if open_now else ("half_open" if tripped else "closed"),
+        "failure_kind": latest_kind,
+        "consecutive_failures": consecutive,
+        "threshold": threshold,
+        "latest_failure_age_seconds": failure_age,
+        "cooldown_seconds": ROUTE_CIRCUIT_COOLDOWN_SECONDS,
+        "mcp_control_plane_affected": False,
+    }
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
@@ -319,20 +422,32 @@ def _resolve_effective_adapter(
     def launchable(adapter_id: str, readiness: Mapping[str, Any]) -> bool:
         if not readiness.get("launchable"):
             return False
+        observed = readiness.get("observed_models")
+        model = str(worker.get("model") or "")
+        if adapter_id == "codex_cli":
+            # An installed Codex binary proves neither account access nor
+            # model entitlement. Require a current authenticated capability
+            # receipt for this exact model; historical outcomes remain useful
+            # scoring evidence but cannot override present route authority.
+            if readiness.get("access_observed") is not True:
+                return False
+            if not isinstance(observed, list):
+                return False
+            return model in {
+                str(value) for value in observed if isinstance(value, str)
+            }
         if adapter_id not in {
             "vscode_lm",
             "deepseek_vscode_lm",
             "glm_vscode_lm",
         }:
             return True
-        observed = readiness.get("observed_models")
         # Older/fake preflight receipts have no catalog. Preserve their
         # explicit launchable verdict; current receipts always include a
         # bounded observed_models list and therefore get exact model gating.
         if not isinstance(observed, list):
             return True
         visible = {str(value) for value in observed if isinstance(value, str)}
-        model = str(worker.get("model") or "")
         accepted = {model, *_EDITOR_MODEL_ALIASES.get(model, ())}
         return bool(visible.intersection(accepted))
 
@@ -344,7 +459,14 @@ def _resolve_effective_adapter(
         candidate = ready_by_adapter.get(fallback, {})
         if launchable(fallback, candidate):
             return fallback, candidate
-    return declared, ready_by_adapter.get(declared, {})
+    unavailable = dict(ready_by_adapter.get(declared, {}))
+    if unavailable.get("launchable"):
+        unavailable["transport_launchable"] = True
+    unavailable["launchable"] = False
+    if declared == "codex_cli":
+        unavailable["status"] = "model_access_unverified"
+        unavailable["reason"] = "codex_model_capability_not_observed"
+    return declared, unavailable
 
 
 def build_catalog(
@@ -354,6 +476,8 @@ def build_catalog(
     process_rows: Iterable[Mapping[str, Any]] | None = None,
     usage_rows: Iterable[Mapping[str, Any]] | None = None,
     preflight: Mapping[str, Any] | None = None,
+    cost_per_accepted_outcome: Mapping[str, Any] | None = None,
+    now_epoch: float | None = None,
 ) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     catalog = load_catalog(root)
@@ -393,6 +517,18 @@ def build_catalog(
         for item in readiness.get("providers") or []
         if isinstance(item, Mapping)
     }
+    observed_now_epoch = (
+        float(now_epoch)
+        if now_epoch is not None
+        else datetime.now(timezone.utc).timestamp()
+    )
+    economic_view = dict(
+        cost_per_accepted_outcome
+        or cost_ledger.cost_per_accepted_outcome_view(usage, {}, task_cards)
+    )
+    economics_by_model = economic_view.get("routes")
+    if not isinstance(economics_by_model, Mapping):
+        economics_by_model = {}
     rows: list[dict[str, Any]] = []
     attributed_process_ids: set[int] = set()
     for worker in catalog["workers"]:
@@ -490,6 +626,16 @@ def build_catalog(
         )
         effective_score = max(0.0, min(100.0, (observed_score if observed_score is not None else 50.0) + worker["manager_score_adjustment"]))
         access_observed = bool(adapter_ready.get("access_observed"))
+        route_health = _route_circuit(matched, now_epoch=observed_now_epoch)
+        route_available = route_health["state"] != "open"
+        model_routes = economics_by_model.get(worker["model"])
+        if not isinstance(model_routes, Mapping):
+            model_routes = {}
+        model_economics = model_routes.get(effective_adapter)
+        if not isinstance(model_economics, Mapping):
+            model_economics = model_routes.get(worker["adapter_id"])
+        if not isinstance(model_economics, Mapping):
+            model_economics = {}
         rows.append({
             "execution_runner": execution_runner(
                 worker["worker_id"], effective_adapter
@@ -497,9 +643,18 @@ def build_catalog(
             **worker,
             "effective_adapter_id": effective_adapter,
             "adapter_fallback_used": effective_adapter != worker["adapter_id"],
-            "available": bool(worker["enabled"] and adapter_ready.get("launchable")),
+            "available": bool(
+                worker["enabled"]
+                and adapter_ready.get("launchable")
+                and route_available
+            ),
             "availability_observed": access_observed or bool(sample_count > 0),
-            "readiness_status": str(adapter_ready.get("status") or "unobserved"),
+            "readiness_status": (
+                "route_circuit_open"
+                if not route_available
+                else str(adapter_ready.get("status") or "unobserved")
+            ),
+            "route_health": route_health,
             "quota_observed": False,
             "quota_state": "unavailable_from_provider_api",
             "outcomes": {
@@ -530,6 +685,7 @@ def build_catalog(
                 ),
                 "evidence_source": "observed" if sample_count else "conservative_prior",
             },
+            "cost_per_accepted_outcome": dict(model_economics),
             "observed_score": observed_score,
             "effective_score": round(effective_score, 2),
         })
@@ -558,6 +714,8 @@ def build_catalog(
             "provider_quota_fabricated": False,
             "missing_outcomes_use_labeled_prior": True,
             "manager_adjustment_range": [-20.0, 20.0],
+            "economic_routing_is_advisory_only": True,
+            "unknown_cost_never_ranks_as_free": True,
         },
     }
 
@@ -565,10 +723,27 @@ def build_catalog(
 def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *, catalog: Mapping[str, Any] | None = None) -> dict[str, Any]:
     snapshot = dict(catalog or build_catalog(repo_root))
     workers: list[workforce_router.WorkerCapability] = []
+    requested_families = [
+        family
+        for family in ("code", "research", "linguistic", "review", "mechanical")
+        if family in task.kinds
+    ]
+    requested_family = (
+        requested_families[0] if len(requested_families) == 1 else "unknown"
+    )
     for item in snapshot.get("workers") or []:
         outcomes = item.get("outcomes") if isinstance(item, Mapping) else {}
         if not isinstance(outcomes, Mapping):
             outcomes = {}
+        economic_by_family = item.get("cost_per_accepted_outcome") if isinstance(item, Mapping) else {}
+        if not isinstance(economic_by_family, Mapping):
+            economic_by_family = {}
+        economics = economic_by_family.get(requested_family)
+        if not isinstance(economics, Mapping):
+            economics = {}
+        economics = economics.get(task.risk)
+        if not isinstance(economics, Mapping):
+            economics = {}
         workers.append(workforce_router.WorkerCapability.build(
             worker_id=item["worker_id"], adapter_id=item.get("effective_adapter_id") or item["adapter_id"], model=item["model"], provider=item["provider"],
             supports=item["supports"], tools=item["tools"], max_context_tokens=item["max_context_tokens"],
@@ -581,10 +756,19 @@ def rank_task(repo_root: Path | str, task: workforce_router.TaskRequirements, *,
                 p95_latency_seconds=outcomes.get("p95_latency_seconds"), cost_usd_per_1k_tokens=outcomes.get("cost_usd_per_1k_tokens"),
                 estimated_tokens=outcomes.get("estimated_tokens_per_attempt"),
                 tool_discipline_score=outcomes.get("tool_discipline_score"),
+                cost_per_accepted_outcome_usd=economics.get("cost_per_accepted_outcome_usd"),
+                economic_evidence_state=str(economics.get("state") or "UNMEASURED"),
+                economic_matched_tasks=int(economics.get("matched_decided_tasks") or 0),
+                economic_accepted_outcomes=int(economics.get("accepted_outcomes") or 0),
+                economic_cost_coverage=economics.get("cost_coverage"),
                 sample_count=int(outcomes.get("sample_count") or 0),
             ),
         ))
-    decision = workforce_router.rank_workforce(task, workers).as_dict()
+    raw_decision = workforce_router.rank_workforce(task, workers)
+    decision = raw_decision.as_dict()
+    decision["economic_advisory"] = workforce_router.economic_advisory(raw_decision)
+    decision["economic_advisory"]["task_family"] = requested_family
+    decision["economic_advisory"]["risk_tier"] = task.risk
     by_worker = {
         str(item.get("worker_id") or ""): item
         for item in snapshot.get("workers") or []

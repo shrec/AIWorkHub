@@ -27,6 +27,18 @@ remains an isolated AI engineering workspace; no AIWorkHub cloud account or
 HTTP service is required. Visit the [AIWorkHub product site](https://shrec.github.io/AIWorkHub/)
 or follow the [getting-started guide](docs/GETTING_STARTED.md).
 
+## What's new in 0.9.40
+
+- Required semantic-edit creates reject literal placeholder output, including
+  retained rework that leaves an invalid required file unchanged.
+- Repository Ruff and mypy checks can use their trusted PATH entrypoint when
+  the active MCP interpreter does not provide the declared module; receipts
+  still record the command and executable that actually ran.
+- Task supersession now verifies the replacement task before archiving the
+  original card, so the Plan DAG never observes a broken replacement edge.
+- Quality-verdict aggregation keeps a strict typed evidence shape, with new
+  focused regressions alongside the full Python and VS Code extension suites.
+
 ## Supported models
 
 AIWorkHub routes by runner family and adapter. Editor routes use models already

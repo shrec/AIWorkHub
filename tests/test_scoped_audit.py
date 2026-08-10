@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from aiworkhub.evidence_levels import EvidenceLevel as CanonicalEvidenceLevel
 from aiworkhub.scoped_audit import (
     ALLOWED_REVIEW_LENSES,
     BLOCKER_MIN_EVIDENCE_LEVEL,
@@ -34,6 +35,10 @@ from aiworkhub.scoped_audit import (
     canonical_json,
     packet_fingerprint,
 )
+
+
+def test_scoped_audit_reexports_canonical_evidence_level() -> None:
+    assert EvidenceLevel is CanonicalEvidenceLevel
 
 
 def _target(name: str = "src/mod.Foo", kind: str = "function") -> TargetSymbol:

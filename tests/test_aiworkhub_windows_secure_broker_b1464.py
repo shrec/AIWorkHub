@@ -16,6 +16,8 @@ from aiworkhub import (  # noqa: E402
     repo_policy,
     runtime_adapters,
     vscode_lm_bridge,
+    workforce_catalog,
+    workforce_router,
     worker_workspace,
 )
 
@@ -237,6 +239,74 @@ def test_windows_preflight_excludes_native_cli_but_keeps_editor_bridge_ready(
     assert report["provider_summary"]["coverage_status"] == "full"
     assert report["provider_summary"]["unavailable_route_count"] == 0
     assert report["provider_summary"]["excluded_route_count"] == 4
+
+
+def test_windows_workforce_allocation_uses_only_launchable_editor_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _initialized_root(tmp_path)
+    _ready_preflight_deps(monkeypatch)
+    monkeypatch.setattr(repo_policy, "_is_windows_host", lambda: True)
+    monkeypatch.setattr(
+        repo_policy.worker_workspace,
+        "select_sandbox_backend",
+        lambda: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError(
+                "windows_appcontainer_sandbox_unavailable"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        repo_policy.vscode_lm_bridge,
+        "bridge_readiness",
+        lambda *args, **kwargs: {
+            "launchable": True,
+            "blocker_reason": "",
+            "window_id": "window_test",
+            "live_host_count": 1,
+            "stale_host_count": 0,
+            "observed_models": ["deepseek-v4-pro", "glm-5.2"],
+        },
+    )
+
+    preflight = repo_policy.build_preflight(root)
+    catalog = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight=preflight,
+    )
+    native_adapters = {
+        "claude_cli",
+        "codex_cli",
+        "deepseek_copilot_cli",
+        "glm_copilot_cli",
+    }
+    assert all(
+        worker["available"] is False
+        for worker in catalog["workers"]
+        if worker["effective_adapter_id"] in native_adapters
+    )
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-windows-editor-route",
+        repo_id="repo_test",
+        kinds=["code"],
+        risk="high",
+        owner_model_pin="glm-5.2",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=catalog)
+
+    assert decision["selected_worker_id"] == "glm-5.2"
+    assert decision["selected_adapter_id"] == "glm_vscode_lm"
+    assert decision["launch_contract"] == {
+        "runner": "glm_5.2",
+        "adapter_id": "glm_vscode_lm",
+        "model": "glm-5.2",
+        "task_id": "T-windows-editor-route",
+        "identity_rule": "use_same_runner_for_task_create_and_agent_launch_task",
+    }
 
 
 def test_editor_model_aliases_resolve_only_to_observed_same_provider_models() -> None:

@@ -124,6 +124,7 @@ ENV_SESSION_TOPIC = "AIWORKHUB_WORKER_MCP_SESSION_TOPIC"
 ENV_AUDIT_LEDGER_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_LEDGER_PATH"
 ENV_AUDIT_HMAC_KEY_PATH = "AIWORKHUB_WORKER_MCP_AUDIT_HMAC_KEY_PATH"
 ENV_QUALITY_REVIEW_PACKET_PATH = "AIWORKHUB_WORKER_MCP_QUALITY_REVIEW_PACKET_PATH"
+ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
 # The interpreter's own import-path variable (never an AIWORKHUB_* identity
 # binding) -- carries the portable ".../src" import root so `python -m
 # aiworkhub.worker_ai_tools_mcp` resolves regardless of the launcher's cwd.
@@ -178,6 +179,8 @@ MAX_RAW_TOOL_OUTPUT_BYTES = 512 * 1024
 MAX_DECLARED_INPUT_PREVIEW_BYTES = 12 * 1024
 MAX_DECLARED_INPUT_HASH_BYTES = 8 * 1024 * 1024
 MAX_QUALITY_REVIEW_PACKET_BYTES = 256 * 1024
+MAX_REWORK_OVERLAY_PACKET_BYTES = 12 * 1024 * 1024
+MAX_REWORK_OVERLAY_FILES = 512
 MAX_QUALITY_REVIEW_FINDINGS = 50
 SQLITE_QUERY_TIMEOUT_SECONDS = 5
 SESSION_SNIPPET_CHARS = 280
@@ -225,6 +228,7 @@ class WorkerToolContext:
     quality_review_packet_path: Path | None = None
     allowed_writes: tuple[str, ...] = ()
     rework_overlay_packet: dict[str, Any] | None = None
+    rework_overlay_packet_path: Path | None = None
 
 
 def load_context_from_env(env: Any = None) -> WorkerToolContext:
@@ -273,9 +277,16 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
     rework_packet: dict[str, Any] | None = None
     if rework_overlay_raw:
         overlay_path = Path(rework_overlay_raw).resolve()
-        if not overlay_path.is_file():
+        if overlay_path.is_symlink() or not overlay_path.is_file():
             raise WorkerToolError(f"worker_mcp_rework_overlay_path_not_file:{overlay_path}")
-        rework_packet = json.loads(overlay_path.read_bytes().decode("utf-8"))
+        if overlay_path.stat().st_size > MAX_REWORK_OVERLAY_PACKET_BYTES:
+            raise WorkerToolError("worker_mcp_rework_overlay_packet_too_large")
+        try:
+            rework_packet = json.loads(overlay_path.read_bytes().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkerToolError("worker_mcp_rework_overlay_packet_unreadable") from exc
+        if not isinstance(rework_packet, dict):
+            raise WorkerToolError("worker_mcp_rework_overlay_packet_invalid")
         _verify_rework_overlay_packet(
             rework_packet,
             str(source[ENV_TASK_ID]),
@@ -299,6 +310,7 @@ def load_context_from_env(env: Any = None) -> WorkerToolContext:
             Path(str(review_packet_raw)) if review_packet_raw else None
         ),
         rework_overlay_packet=rework_packet,
+        rework_overlay_packet_path=(overlay_path if rework_overlay_raw else None),
     )
 
 
@@ -361,7 +373,20 @@ def _json_hit_count(value: Any) -> int:
         total = 0
         saw_container = False
         for key, item in value.items():
-            if key in {"items", "results", "matches", "rows", "symbols", "files", "sections"}:
+            # Retrieval provenance is useful even on a zero-hit response, but
+            # it is not itself graph evidence.  Counting restored query
+            # tokens as hits would turn an honest scoped miss into a false
+            # positive and could satisfy the live Source Graph gate.
+            if key == "query_tokens":
+                saw_container = True
+                continue
+            if key in {
+                "items", "results", "matches", "rows", "symbols", "files",
+                "sections", "relevant_files", "candidate_files", "neighbors",
+                "contexts", "entities", "edges", "call_edges",
+                "cross_file_edges", "hot_symbols", "related_tests", "risks",
+                "suspects", "todos",
+            }:
                 saw_container = True
                 total += _json_hit_count(item)
             elif isinstance(item, (dict, list)):
@@ -501,7 +526,7 @@ _SOURCE_GRAPH_DB_OVERRIDE_LOCK = threading.RLock()
 
 @contextmanager
 def _with_source_graph_db(source_graph_module: Any, db_path: Path):
-    """Temporarily bind Source Graph resolution to one already-verified DB.
+    """Context-locally bind Source Graph to one already-verified DB.
 
     The worker MCP server is one process per request, but FastMCP may dispatch
     concurrent calls.  The module-level resolver is therefore changed only
@@ -511,13 +536,11 @@ def _with_source_graph_db(source_graph_module: Any, db_path: Path):
     directory, not in that read-only worktree.
     """
 
-    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
-        original = source_graph_module.resolve_db_path
-        source_graph_module.resolve_db_path = lambda _repo_root: db_path
-        try:
-            yield
-        finally:
-            source_graph_module.resolve_db_path = original
+    override = getattr(source_graph_module, "database_path_override", None)
+    if override is None:
+        raise WorkerToolError("source_graph_context_override_unavailable")
+    with override(db_path):
+        yield
 
 
 def _candidate_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
@@ -650,8 +673,136 @@ def _resolve_authority_db(ctx: WorkerToolContext, *, component: str, db_id: str)
     return AuthorityBinding(db_path=db_path, authority_source="canonical", authority_state=state)
 
 
+def _canonical_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding:
+    """Resolve the repository's canonical Source Graph database."""
+
+    from . import storage_registry as _storage_registry_mod
+    try:
+        registry = _storage_registry_mod.load_storage_registry(ctx.authority_repo)
+        db_path = _storage_registry_mod.resolve_database_path(registry, "source_graph")
+    except (RepositoryStateError, _storage_registry_mod.StorageRegistryError) as exc:
+        raise WorkerToolError(
+            f"authority_registry_unresolved:source_graph.source_graph:{exc}"
+        ) from exc
+    if not db_path.is_file() or db_path.stat().st_size <= 0:
+        raise WorkerToolError(
+            "authority_db_absent_or_empty:source_graph.source_graph:canonical"
+        )
+    return AuthorityBinding(
+        db_path=db_path,
+        authority_source="canonical",
+        authority_state="sole_authority",
+        authority_repo=ctx.authority_repo,
+    )
+
+
+def _rework_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
+    """Return a request-local graph with retained predecessor paths overlaid.
+
+    The durable graph remains the sole canonical authority.  This private DB
+    is a copy-on-first-query view for one immutable request: canonical rows
+    are copied, then only the packet-bound retained paths are reconciled from
+    the isolated workspace.  Later edits to those same paths are re-indexed
+    on the next query, so a worker never falls back to stale canonical bytes.
+    """
+
+    packet = ctx.rework_overlay_packet
+    packet_path = ctx.rework_overlay_packet_path
+    if packet is None:
+        return None
+    if packet_path is None:
+        raise WorkerToolError("rework_overlay_packet_path_missing")
+
+    from . import source_graph as _source_graph_mod
+
+    canonical = _canonical_source_graph_binding(ctx)
+    runtime_dir = packet_path.parent.resolve()
+    if packet_path.resolve().parent != runtime_dir:
+        raise WorkerToolError("rework_overlay_runtime_invalid")
+    packet_digest = str(packet.get("canonical_digest") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", packet_digest):
+        raise WorkerToolError("rework_overlay_digest_invalid")
+    db_path = runtime_dir / f"rework_source_graph_{packet_digest[:16]}.sqlite"
+
+    snapshot_rows: list[dict[str, Any]] = []
+    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
+        if db_path.is_symlink():
+            raise WorkerToolError("rework_overlay_source_graph_symlink")
+        if not db_path.is_file() or db_path.stat().st_size <= 0:
+            temporary = runtime_dir / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                source_conn = _source_graph_mod.connect(
+                    canonical.db_path, read_only=True
+                )
+                destination_conn = sqlite3.connect(temporary)
+                try:
+                    source_conn.backup(destination_conn)
+                    destination_conn.commit()
+                finally:
+                    destination_conn.close()
+                    source_conn.close()
+                os.replace(temporary, db_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        with _with_source_graph_db(_source_graph_mod, db_path):
+            for entry in packet["files"]:
+                relative = str(entry["path"])
+                candidate = (ctx.repo / relative).resolve(strict=False)
+                if not candidate.is_relative_to(ctx.repo.resolve()):
+                    raise WorkerToolError(
+                        f"rework_overlay_path_escapes_workspace:{relative}"
+                    )
+                if candidate.is_symlink():
+                    raise WorkerToolError(
+                        f"rework_overlay_path_symlink:{relative}"
+                    )
+                if candidate.is_file():
+                    observed_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                    check_conn = _source_graph_mod.connect(db_path, read_only=True)
+                    try:
+                        row = check_conn.execute(
+                            "SELECT source_hash FROM files WHERE file_path=?",
+                            (relative,),
+                        ).fetchone()
+                    finally:
+                        check_conn.close()
+                    indexed_hash = str(row[0]) if row is not None else ""
+                    if indexed_hash != observed_hash:
+                        _source_graph_mod.index_file(
+                            ctx.repo, relative, observed_hash
+                        )
+                    snapshot_rows.append(
+                        {"path": relative, "sha256": observed_hash}
+                    )
+                elif candidate.exists():
+                    raise WorkerToolError(
+                        f"rework_overlay_path_not_file:{relative}"
+                    )
+                else:
+                    _source_graph_mod.remove_file(ctx.repo, relative)
+                    snapshot_rows.append({"path": relative, "deleted": True})
+
+    snapshot_digest = hashlib.sha256(
+        json.dumps(
+            {"packet": packet_digest, "files": snapshot_rows},
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return AuthorityBinding(
+        db_path=db_path,
+        authority_source="rework_overlay",
+        authority_state="request_scoped_predecessor",
+        authority_repo=ctx.repo,
+        target_request_id=str(packet.get("predecessor_request_id") or ""),
+        target_task_id=str(packet.get("predecessor_task_id") or ""),
+        packet_sha256=snapshot_digest,
+    )
+
+
 def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
-    """Resolve the canonical Source Graph database -- AIWorkHub's SOLE authority.
+    """Resolve canonical Source Graph or a request-scoped verified overlay.
 
     Unlike the other components resolved by ``_resolve_authority_db``, Source
     Graph is never read from a legacy/canonical toggle: task B849 made
@@ -664,21 +815,10 @@ def _resolve_source_graph_db(ctx: WorkerToolContext) -> AuthorityBinding:
     candidate = _candidate_source_graph_binding(ctx)
     if candidate is not None:
         return candidate
-
-    from . import storage_registry as _storage_registry_mod
-    try:
-        registry = _storage_registry_mod.load_storage_registry(ctx.authority_repo)
-        db_path = _storage_registry_mod.resolve_database_path(registry, "source_graph")
-    except (RepositoryStateError, _storage_registry_mod.StorageRegistryError) as exc:
-        raise WorkerToolError(f"authority_registry_unresolved:source_graph.source_graph:{exc}") from exc
-    if not db_path.is_file() or db_path.stat().st_size <= 0:
-        raise WorkerToolError("authority_db_absent_or_empty:source_graph.source_graph:canonical")
-    return AuthorityBinding(
-        db_path=db_path,
-        authority_source="canonical",
-        authority_state="sole_authority",
-        authority_repo=ctx.authority_repo,
-    )
+    rework = _rework_source_graph_binding(ctx)
+    if rework is not None:
+        return rework
+    return _canonical_source_graph_binding(ctx)
 
 
 def _source_graph_index_identity(db_path: Path, *, default_revision: str) -> dict[str, str]:
@@ -847,13 +987,13 @@ def _append_audit(
     authority_state: str = "",
     authority_repo: Path | None = None,
     payload: Mapping[str, Any] | None = None,
-) -> None:
+) -> bool:
     if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
-        return
+        return False
     try:
         key = ctx.audit_hmac_key_path.read_bytes()
     except OSError:
-        return
+        return False
     entry = {
         "schema_id": AUDIT_ENTRY_SCHEMA_ID,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -876,14 +1016,15 @@ def _append_audit(
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
         if len(encoded_payload) > MAX_TOOL_OUTPUT_BYTES:
-            return
+            return False
         entry["payload"] = dict(payload)
     digest = _hmac_entry(entry, key)
     line = json.dumps({**entry, "hmac_sha256": digest}, ensure_ascii=False, sort_keys=True) + "\n"
     try:
         _append_line_0600(ctx.audit_ledger_path, line)
     except OSError:
-        return
+        return False
+    return True
 
 
 def verify_audit_ledger(
@@ -1352,6 +1493,21 @@ def tool_discipline_report(verification: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_SESSION_DELTA_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_MAX_SESSION_DELTA_ENTRIES = 256
+_SESSION_DELTA_LOCK = threading.Lock()
+
+
+def _remember_session_state(key: tuple[Any, ...], value: dict[str, Any]) -> None:
+    with _SESSION_DELTA_LOCK:
+        _SESSION_DELTA_CACHE[key] = value
+        while len(_SESSION_DELTA_CACHE) > _MAX_SESSION_DELTA_ENTRIES:
+            _SESSION_DELTA_CACHE.pop(next(iter(_SESSION_DELTA_CACHE)))
+
+
+def _prior_session_state(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _SESSION_DELTA_LOCK:
+        return _SESSION_DELTA_CACHE.get(key)
 
 
 def _violation(ctx: WorkerToolContext, tool: str, reason: str) -> dict[str, Any]:
@@ -1502,6 +1658,7 @@ def source_graph_query(
     target: str | None = None,
     bundle_type: SourceGraphBundleType = "explore",
     workflow_stage: WorkflowStage = "unspecified",
+    compact_replay: bool = True,
 ) -> dict[str, Any]:
     """Bounded Source Graph discovery and repository analytics.
 
@@ -1584,7 +1741,7 @@ def source_graph_query(
             separators=(",", ":"),
         )
         receipt_bytes = len(receipt_content.encode("utf-8"))
-        use_receipt = receipt_bytes < int(cached["bytes"])
+        use_receipt = compact_replay and receipt_bytes < int(cached["bytes"])
         returned_content = receipt_content if use_receipt else str(cached_result["content"])
         returned_bytes = receipt_bytes if use_receipt else int(cached["bytes"])
         replay_bytes_avoided = max(0, int(cached["bytes"]) - returned_bytes)
@@ -1690,6 +1847,21 @@ def source_graph_query(
     elif scope is not None:
         unscoped_payload = payload
         payload = _filter_by_scope(payload, scope) or {}
+        # ``_filter_by_scope`` deliberately treats bare string-list entries
+        # as file paths because Source Graph emits several path-only lists.
+        # Query tokens are also a string list, but they are retrieval
+        # provenance rather than repository paths.  Restore that bounded
+        # metadata after the security filter so a scoped zero-hit response
+        # never erases the query that was actually evaluated (NF-71).
+        if isinstance(payload, dict) and isinstance(unscoped_payload, dict):
+            query_tokens = unscoped_payload.get("query_tokens")
+            if not isinstance(query_tokens, list):
+                query_tokens = _source_graph_mod._query_tokens(bounded_query)
+            if isinstance(query_tokens, list):
+                payload["query_tokens"] = list(query_tokens)
+                payload["query_tokens_source"] = str(
+                    unscoped_payload.get("query_tokens_source") or "query"
+                )
         # An exact body symbol can legitimately live in a second coordinator-
         # declared target even when the model carried forward a narrower
         # orientation target.  Preserve the security boundary: broaden only
@@ -1728,6 +1900,13 @@ def source_graph_query(
                 }
         if isinstance(payload, dict) and payload:
             payload.setdefault("scope", "target")
+            if mode == "focus" and _json_hit_count(payload) == 0:
+                payload["retrieval_reason"] = (
+                    "no_ranked_match_within_target"
+                    if _json_hit_count(unscoped_payload) > 0
+                    else "no_ranked_semantic_match"
+                )
+                payload["requested_target"] = scope
     hit_count = _json_hit_count(payload)
     evidence_counts = _source_graph_evidence_counts(payload)
     raw_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1971,7 +2150,7 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
         }
         selected_columns = [
             column for column in (
-                "source", "source_id", "session_id", "timestamp",
+                "doc_id", "source", "source_id", "session_id", "timestamp",
                 "kind", "speaker", "content", "tags",
             )
             if column in doc_columns
@@ -1990,10 +2169,13 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
         if not clauses:
             rows = []
         else:
+            order_by = "timestamp DESC"
+            if "doc_id" in doc_columns:
+                order_by += ", doc_id DESC"
             rows = con.execute(
                 f"SELECT {','.join(selected_columns)} FROM documents "
                 f"WHERE {' OR '.join(clauses)} "
-                "ORDER BY timestamp DESC LIMIT ?",
+                f"ORDER BY {order_by} LIMIT ?",
                 (*params, limit),
             ).fetchall()
     except sqlite3.Error as exc:
@@ -2003,8 +2185,9 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     finally:
         con.close()
 
-    evidence = [
-        {
+    evidence_rows: list[tuple[dict[str, Any], str]] = []
+    for ordinal, row in enumerate(rows):
+        item = {
             "source": row["source"] if "source" in row.keys() else "",
             "source_id": row["source_id"],
             "session_id": row["session_id"] if "session_id" in row.keys() else None,
@@ -2014,8 +2197,12 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
             "kind": row["kind"] if "kind" in row.keys() else "",
             "snippet": (row["content"] or "")[:SESSION_SNIPPET_CHARS],
         }
-        for row in rows
-    ]
+        identity = str(row["doc_id"]) if "doc_id" in row.keys() else hashlib.sha256(
+            f"{ordinal}:".encode("utf-8")
+            + json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        evidence_rows.append((item, identity))
+    evidence = [item for item, _identity in evidence_rows]
     state = "unknown" if not evidence else "current"
     payload = {
         "topic": ctx.session_topic, "state": state, "evidence_count": len(evidence),
@@ -2029,16 +2216,103 @@ def session_current_state(ctx: WorkerToolContext, *, limit: int = 12) -> dict[st
     text, truncated = _bounded_text(
         json.dumps(payload, ensure_ascii=False, sort_keys=True), MAX_TOOL_OUTPUT_BYTES,
     )
+    content_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    delta_key = (
+        "session_current_state",
+        ctx.task_id,
+        ctx.request_id,
+        str(ctx.authority_repo),
+        ctx.session_topic,
+        limit,
+        session_binding.authority_source,
+        session_binding.authority_state,
+    )
+    previous = _prior_session_state(delta_key)
+    returned_text = text
+    delta_applied = False
+    unchanged_reference = False
+    base_content_sha256: str | None = None
+    if previous is not None:
+        base_content_sha256 = str(previous.get("content_sha256") or "") or None
+        prior_evidence = {
+            str(identity): item
+            for identity, item in (previous.get("evidence_by_identity") or {}).items()
+            if str(identity) and isinstance(item, Mapping)
+        }
+        current_evidence = {
+            identity: item
+            for item, identity in evidence_rows
+            if identity
+        }
+        unchanged_reference = base_content_sha256 == content_sha256
+        removed_identities = sorted(prior_evidence.keys() - current_evidence.keys())
+        delta_payload = {
+            "schema_id": "aiworkhub.session_context_delta.v1",
+            "topic": ctx.session_topic,
+            "base_content_sha256": base_content_sha256,
+            "content_sha256": content_sha256,
+            "unchanged": unchanged_reference,
+            "current_state": state,
+            "current_evidence_count": len(evidence),
+            "added_or_changed": [
+                current_evidence[identity]
+                for identity in sorted(current_evidence)
+                if prior_evidence.get(identity) != current_evidence[identity]
+            ],
+            "removed_source_ids": sorted({
+                str(prior_evidence[identity].get("source_id") or "")
+                for identity in removed_identities
+                if str(prior_evidence[identity].get("source_id") or "")
+            }),
+            "removed_evidence_refs": removed_identities,
+            "full_content_omitted": True,
+            "canonical_audit_retained": True,
+        }
+        candidate = json.dumps(
+            delta_payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(candidate.encode("utf-8")) < len(text.encode("utf-8")):
+            returned_text = candidate
+            delta_applied = True
+    _remember_session_state(delta_key, {
+        "content_sha256": content_sha256,
+        "evidence_by_identity": {
+            identity: item for item, identity in evidence_rows if identity
+        },
+    })
     hit_count = len(evidence)
-    bytes_returned = len(text.encode("utf-8"))
+    bytes_returned = len(returned_text.encode("utf-8"))
+    original_bytes = len(text.encode("utf-8"))
+    replay_bytes_avoided = max(0, original_bytes - bytes_returned)
     _append_audit(
-        ctx, tool=tool, ok=True, cache_hit=False, hit_count=hit_count, bytes_returned=bytes_returned,
+        ctx, tool=tool, ok=True, cache_hit=delta_applied,
+        hit_count=hit_count, bytes_returned=bytes_returned,
         authority_source=session_binding.authority_source, authority_state=session_binding.authority_state,
+        payload={
+            "session_delta": delta_applied,
+            "unchanged_reference": unchanged_reference,
+            "content_sha256": content_sha256,
+            "base_content_sha256": base_content_sha256,
+            "replay_original_bytes": original_bytes,
+            "replay_returned_bytes": bytes_returned,
+            "replay_bytes_avoided": replay_bytes_avoided,
+            "provider_tokens_saved": None,
+            "provider_token_savings_measured": False,
+        },
     )
     return {
         "ok": True, "tool": tool, "topic": ctx.session_topic, "limit": limit,
         "truncated": truncated, "hit_count": hit_count, "bytes": bytes_returned,
-        "content": text, "cache_hit": False,
+        "content": returned_text, "cache_hit": delta_applied,
+        "delta_receipt": delta_applied,
+        "unchanged_reference": unchanged_reference,
+        "content_sha256": content_sha256,
+        "base_content_sha256": base_content_sha256,
+        "replay_original_bytes": original_bytes,
+        "replay_bytes_avoided": replay_bytes_avoided,
+        "provider_tokens_saved": None,
+        "provider_token_savings_measured": False,
         "authority_source": session_binding.authority_source, "authority_state": session_binding.authority_state,
     }
 
@@ -2457,6 +2731,11 @@ def quality_review_submit(
     if packet.get("packet_sha256") != packet_sha256:
         return _violation(ctx, tool, "quality_review_packet_digest_mismatch")
     try:
+        normalized_findings = quality_reviewer.normalize_packet_findings(
+            packet,
+            lens=lens,
+            findings=findings,
+        )
         # Recompute the digest instead of trusting the file's digest field.
         quality_reviewer.verify_reviewer_receipt(
             {
@@ -2472,7 +2751,7 @@ def quality_review_submit(
                     "lens": lens,
                     "read_only": True,
                     "can_mutate_repo": False,
-                    "findings": findings,
+                    "findings": normalized_findings,
                 },
             },
             packet=packet,
@@ -2491,7 +2770,7 @@ def quality_review_submit(
                 "provider": ctx.runner,
                 "read_only": True,
                 "can_mutate_repo": False,
-                "findings": findings,
+                "findings": normalized_findings,
             }
         ]
     )
@@ -2516,24 +2795,102 @@ def quality_review_submit(
             "provider": "",
         },
     }
-    _append_audit(
+    receipt_bytes = json.dumps(
+        receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    submission_id = hashlib.sha256(receipt_bytes).hexdigest()
+
+    def durable_ack(*, deduplicated: bool, retry_count: int) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "tool": tool,
+            "status": "submitted",
+            "durable": True,
+            "submission_id": submission_id,
+            "logical_receipt_count": 1,
+            "retry_count": max(0, int(retry_count)),
+            "deduplicated": bool(deduplicated),
+            "packet_sha256": packet_sha256,
+            "finding_count": len(normalized_findings),
+        }
+
+    def verified_payloads() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if ctx.audit_ledger_path is None or ctx.audit_hmac_key_path is None:
+            return {}, []
+        verification = verify_audit_ledger(
+            ctx.audit_ledger_path,
+            ctx.audit_hmac_key_path,
+            task_id=ctx.task_id,
+            runner=ctx.runner,
+            topic=ctx.topic,
+            request_id=ctx.request_id,
+        )
+        payloads = [
+            payload
+            for payload in verification.get("verified_payloads") or []
+            if isinstance(payload, dict)
+        ]
+        return verification, payloads
+
+    # A provider may retry after losing the tool response.  Reuse the already
+    # authenticated record instead of appending another physical receipt.
+    before, prior_payloads = verified_payloads()
+    if prior_payloads:
+        if any(payload != receipt for payload in prior_payloads):
+            return {
+                "ok": False,
+                "tool": tool,
+                "reason": "quality_review_submission_conflict",
+                "submission_id": submission_id,
+                "durable": bool(before.get("ok")),
+            }
+        if before.get("ok") and int(before.get("entries_tampered") or 0) == 0:
+            return durable_ack(deduplicated=True, retry_count=len(prior_payloads))
+
+    appended = _append_audit(
         ctx,
         tool=tool,
         ok=True,
         cache_hit=False,
-        hit_count=len(findings),
+        hit_count=len(normalized_findings),
         bytes_returned=0,
         authority_source="runtime",
         authority_state="process_bound",
         payload=receipt,
     )
-    return {
-        "ok": True,
-        "tool": tool,
-        "status": "submitted",
-        "packet_sha256": packet_sha256,
-        "finding_count": len(findings),
-    }
+    if not appended:
+        return {
+            "ok": False,
+            "tool": tool,
+            "reason": "quality_review_submission_not_durable",
+            "submission_id": submission_id,
+            "durable": False,
+        }
+    after, persisted_payloads = verified_payloads()
+    if (
+        not after.get("ok")
+        or int(after.get("entries_tampered") or 0) != 0
+        or not persisted_payloads
+    ):
+        return {
+            "ok": False,
+            "tool": tool,
+            "reason": "quality_review_submission_not_durable",
+            "submission_id": submission_id,
+            "durable": False,
+        }
+    if any(payload != receipt for payload in persisted_payloads):
+        return {
+            "ok": False,
+            "tool": tool,
+            "reason": "quality_review_submission_conflict",
+            "submission_id": submission_id,
+            "durable": True,
+        }
+    return durable_ack(
+        deduplicated=len(persisted_payloads) > 1,
+        retry_count=max(0, len(persisted_payloads) - 1),
+    )
 
 
 class WorkerSemanticEditSession:
@@ -2741,6 +3098,7 @@ def generate_worker_mcp_runtime(
     allowed_writes: list[str] | tuple[str, ...] = (),
     python_executable: str | None = None,
     quality_review_packet_path: Path | None = None,
+    rework_overlay_path: Path | None = None,
 ) -> WorkerMcpRuntime:
     """Provision this request's isolated MCP config, env and audit ledger.
 
@@ -2813,6 +3171,8 @@ def generate_worker_mcp_runtime(
     }
     if quality_review_packet_path is not None:
         env[ENV_QUALITY_REVIEW_PACKET_PATH] = str(quality_review_packet_path)
+    if rework_overlay_path is not None:
+        env[ENV_REWORK_OVERLAY_PATH] = str(rework_overlay_path)
 
     module_file = Path(__file__).resolve()
     package_module = f"{module_file.parent.name}.{module_file.stem}"
@@ -3082,9 +3442,6 @@ __all__ = [
 ]
 
 
-ENV_REWORK_OVERLAY_PATH = "AIWORKHUB_REWORK_OVERLAY_PATH"
-
-
 def _verify_rework_overlay_packet(
     packet: dict[str, Any],
     successor_task_id: str,
@@ -3111,8 +3468,10 @@ def _verify_rework_overlay_packet(
         )
     if packet["successor_request_id"] == packet["predecessor_request_id"]:
         raise WorkerToolError("rework_packet_identity_not_distinct")
-    if packet["successor_task_id"] == packet["predecessor_task_id"]:
-        raise WorkerToolError("rework_packet_identity_not_distinct")
+    # A rework episode normally keeps the same canonical task ID. Distinct
+    # request IDs are the attempt identity and are mandatory above.
+    if not str(packet["successor_task_id"]) or not str(packet["predecessor_task_id"]):
+        raise WorkerToolError("rework_packet_task_identity_missing")
     if not _REQUEST_ID_RE.fullmatch(packet["successor_request_id"]):
         raise WorkerToolError("rework_packet_invalid_successor_request_id")
     if not _REQUEST_ID_RE.fullmatch(packet["predecessor_request_id"]):
@@ -3131,12 +3490,52 @@ def _verify_rework_overlay_packet(
             f"rework_packet_digest_mismatch:"
             f"{packet['canonical_digest']} vs {expected_digest}"
         )
+    if not isinstance(packet["files"], list):
+        raise WorkerToolError("rework_packet_files_invalid")
+    if len(packet["files"]) > MAX_REWORK_OVERLAY_FILES:
+        raise WorkerToolError("rework_packet_file_count_exceeded")
+    seen_paths: set[str] = set()
+    total_content_bytes = 0
     for entry in packet["files"]:
+        if not isinstance(entry, dict):
+            raise WorkerToolError("rework_packet_file_entry_invalid")
         p = str(entry.get("path", ""))
-        if not p or ".." in p or p.startswith("/"):
+        parts = p.split("/")
+        if (
+            not p
+            or p.startswith("/")
+            or "\\" in p
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
             raise WorkerToolError(f"rework_packet_invalid_file_path:{p}")
+        if p in seen_paths:
+            raise WorkerToolError(f"rework_packet_duplicate_file_path:{p}")
+        seen_paths.add(p)
         if "deleted" in entry and "sha256" in entry:
             raise WorkerToolError(f"rework_packet_file_both_deleted_and_sha:{p}")
+        if entry.get("deleted") is True:
+            if "content_base64" in entry:
+                raise WorkerToolError(f"rework_packet_deleted_file_has_content:{p}")
+            continue
+        expected_hash = str(entry.get("sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise WorkerToolError(f"rework_packet_file_hash_invalid:{p}")
+        encoded = entry.get("content_base64")
+        if encoded is not None:
+            import base64
+            try:
+                content = base64.b64decode(str(encoded), validate=True)
+            except (ValueError, TypeError) as exc:
+                raise WorkerToolError(
+                    f"rework_packet_file_content_invalid:{p}"
+                ) from exc
+            total_content_bytes += len(content)
+            if total_content_bytes > MAX_REWORK_OVERLAY_PACKET_BYTES:
+                raise WorkerToolError("rework_packet_content_bytes_exceeded")
+            if hashlib.sha256(content).hexdigest() != expected_hash:
+                raise WorkerToolError(
+                    f"rework_packet_file_content_hash_mismatch:{p}"
+                )
 
 
 def _build_rework_overlay_map(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:

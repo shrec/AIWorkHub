@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -46,6 +47,40 @@ def _insert_task(repo: Path, task_id: str, *, status: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def test_write_connections_use_bounded_wal_concurrency_pragmas(tmp_path: Path) -> None:
+    database = tmp_path / "task.sqlite"
+    connection = task_store._connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_atomic_json_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "registry.json"
+    descriptor = os.open(tmp_path / "owned.tmp", os.O_RDWR | os.O_CREAT, 0o600)
+    temp_path = tmp_path / "atomic.tmp"
+    monkeypatch.setattr(
+        task_store.tempfile,
+        "mkstemp",
+        lambda **_kwargs: (descriptor, str(temp_path)),
+    )
+    monkeypatch.setattr(
+        task_store.os,
+        "fdopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fdopen failed")),
+    )
+
+    with pytest.raises(OSError, match="fdopen failed"):
+        task_store._atomic_write_json(target, {"ok": True})
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_archive_removes_pending_card_from_active_lists_and_preserves_events(tmp_path: Path) -> None:
@@ -165,12 +200,18 @@ def test_supersede_removes_processing_orphan_without_deleting_audit(tmp_path: Pa
         reason="orphaned canary",
         allow_processing=True,
         operation="superseded",
+        superseded_by="TASK_REPLACEMENT_B891",
     )
     assert (ok, state) == (True, "superseded")
     assert task_store.list_tasks(repo, status="processing") == []
     archived = task_store.list_tasks(repo, status="archived")
     assert archived[0]["task_id"] == "TASK_SUPERSEDE_B891"
-    assert task_store.get_task_events(repo, "TASK_SUPERSEDE_B891")[0]["event"] == "superseded"
+    detail = task_store.get_task(repo, "TASK_SUPERSEDE_B891")
+    assert detail is not None
+    assert detail["superseded_by"] == "TASK_REPLACEMENT_B891"
+    event = task_store.get_task_events(repo, "TASK_SUPERSEDE_B891")[0]
+    assert event["event"] == "superseded"
+    assert json.loads(event["payload"])["superseded_by"] == "TASK_REPLACEMENT_B891"
 
 
 @pytest.mark.parametrize(
@@ -209,6 +250,78 @@ def test_mark_terminal_review_routes_processing_task_to_review_for_every_termina
     assert card["terminal_substatus"] == substatus
     events = [e["event"] for e in task_store.get_task_events(repo, task_id)]
     assert "terminal_review" in events
+
+
+def test_missing_retained_review_workspace_blocks_exact_episode_and_releases_claim(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_id = "TASK_REVIEW_WORKSPACE_MISSING"
+    request_id = "req-review-workspace-missing"
+    _insert_task(repo, task_id, status="processing")
+    ok, state = task_store.mark_terminal_review(
+        repo,
+        task_id,
+        runner="codex_worker_b891",
+        substatus="review_ready",
+        evidence={
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "runner": "codex_worker_b891",
+            },
+            "workspace": {},
+            "changed_path_hashes": {},
+        },
+    )
+    assert (ok, state) == (True, "review")
+
+    ok, state = task_store.mark_review_workspace_missing(
+        repo,
+        task_id,
+        runner="codex_worker_b891",
+        request_id=request_id,
+        reason="review_workspace_missing",
+    )
+
+    assert (ok, state) == (True, "blocked")
+    card = task_store.get_task(repo, task_id)
+    assert card is not None
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "finalize_failed"
+    assert card["claimed_by"] is None
+    assert card["workspace_retention_failure"]["request_id"] == request_id
+    assert card["terminal_review"]["evidence"]["request_identity"]["request_id"] == request_id
+    events = [row["event"] for row in task_store.get_task_events(repo, task_id)]
+    assert "review_workspace_missing" in events
+
+
+def test_missing_retained_review_workspace_rejects_stale_request_identity(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_id = "TASK_REVIEW_WORKSPACE_STALE"
+    _insert_task(repo, task_id, status="processing")
+    task_store.mark_terminal_review(
+        repo,
+        task_id,
+        runner="codex_worker_b891",
+        substatus="review_ready",
+        evidence={"request_identity": {"request_id": "current-request"}},
+    )
+
+    ok, state = task_store.mark_review_workspace_missing(
+        repo,
+        task_id,
+        runner="codex_worker_b891",
+        request_id="stale-request",
+        reason="review_workspace_missing",
+    )
+
+    assert (ok, state) == (False, "review_request_identity_mismatch")
+    assert task_store.get_task(repo, task_id)["status"] == "review"
 
 
 def test_mark_terminal_review_allows_launch_failed_from_pending(tmp_path: Path) -> None:

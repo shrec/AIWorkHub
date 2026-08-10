@@ -1,0 +1,7 @@
+{
+  "schema_id": "aiworkhub.release_evidence_manifest.v1",
+  "assurance_manifest": ".aiworkhub/release-assurance.json",
+  "residual_risk_register": ".aiworkhub/release-residual-risks.json",
+  "route_parity_matrix": ".aiworkhub/release-route-parity.json",
+  "measurement_boundary": "replayable_evidence_join_not_release_approval_risk_waiver_or_runtime_guarantee"
+}

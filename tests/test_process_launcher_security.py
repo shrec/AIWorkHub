@@ -969,6 +969,7 @@ def test_cached_token_accounting_matches_provider_semantics(
             "cached_input_tokens": 80,
             "cache_read_input_tokens": 80,
             "cache_creation_input_tokens": 25,
+            "cache_write_input_tokens": 7,
         },
     }), encoding="utf-8")
     card = _card()
@@ -1004,6 +1005,7 @@ def test_cached_token_accounting_matches_provider_semantics(
     assert args[args.index("--total-tokens") + 1] == str(expected_input + 45)
     assert args[args.index("--cached-input-tokens") + 1] == "80"
     assert args[args.index("--cache-creation-input-tokens") + 1] == "25"
+    assert args[args.index("--cache-write-input-tokens") + 1] == "7"
     assert args[args.index("--role") + 1] == "worker"
     assert "--cache-metrics-observed" in args
 

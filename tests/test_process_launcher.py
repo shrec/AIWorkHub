@@ -127,6 +127,212 @@ def test_launch_contract_rejects_legacy_required_output_prose():
         process_launcher._validate_required_outputs_contract(card)
 
 
+def test_quality_review_launch_requires_exact_packet_binding() -> None:
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="quality_review_binding_required",
+    ):
+        process_launcher._enforce_quality_review_launch_binding(
+            "quality_review", None
+        )
+
+    with pytest.raises(
+        process_launcher.LaunchRejected,
+        match="quality_review_binding_topic_mismatch",
+    ):
+        process_launcher._enforce_quality_review_launch_binding(
+            "task_mcp", {"packet": {}}
+        )
+
+    process_launcher._enforce_quality_review_launch_binding(
+        "quality_review", {"packet": {}}
+    )
+
+
+def test_rework_overlay_materialization_uses_same_task_distinct_request(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir()
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    candidate = worktree / "src" / "service.py"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"def repaired():\n    return True\n")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="successor-request",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": digest},
+        inherited_rework_paths=("src/service.py",),
+    )
+
+    path, packet = process_launcher._materialize_worker_rework_overlay(
+        workspace,
+        task_id="TASK_SAME",
+        card={
+            "rework_predecessor": {
+                "request_id": "predecessor-request",
+                "changed_path_hashes": {"src/service.py": digest},
+            }
+        },
+    )
+
+    assert path is not None and path.is_file()
+    assert packet is not None
+    assert packet["successor_task_id"] == "TASK_SAME"
+    assert packet["predecessor_task_id"] == "TASK_SAME"
+    assert packet["successor_request_id"] == "successor-request"
+    assert packet["predecessor_request_id"] == "predecessor-request"
+    assert json.loads(path.read_text(encoding="utf-8")) == packet
+
+
+def test_crash_retry_packet_reuses_bounded_failure_evidence_without_stale_tree(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    process_dir = repo / ".aiworkhub" / "runtime" / "process_logs" / "processes"
+    worktree = tmp_path / "successor" / "worktree"
+    home = tmp_path / "successor" / "home"
+    repo.mkdir()
+    process_dir.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    home.mkdir(parents=True)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="successor-request",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=("src/service.py",),
+        parent_baseline={"src/service.py": None},
+        workspace_baseline={"src/service.py": "a" * 64},
+        inherited_rework_paths=("src/service.py",),
+    )
+    predecessor = "predecessor-request"
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.request.json",
+        {
+            "request_id": predecessor,
+            "task_id": "TASK_SAME",
+            "workspace": {"repo": str(repo)},
+        },
+    )
+    process_launcher.write_json_0600(
+        process_dir / f"{predecessor}.supervisor.json",
+        {"state": "supervisor_error", "exit_code": 126, "error": "bridge crashed"},
+    )
+    (process_dir / f"{predecessor}.stdout.log").write_text(
+        "useful-step\n" + ("x" * 9000), encoding="utf-8"
+    )
+    (process_dir / f"{predecessor}.stderr.log").write_text(
+        "exact-provider-error\n", encoding="utf-8"
+    )
+    process_launcher.attempt_artifacts.persist_json_bundle(
+        process_dir / "attempt-artifacts" / predecessor,
+        attempt_id=predecessor,
+        payloads={
+            "metadata": {"request_id": predecessor},
+            "diff": {"changed_paths": ["src/service.py"]},
+            "validation": {
+                "checks": [{
+                    "returncode": 1,
+                    "argv": ["pytest", "tests/test_service.py"],
+                    "stderr_tail": "AssertionError: expected true",
+                }]
+            },
+            "usage": {"usage_observed": False},
+            "review": {"target_state": "validation_failed"},
+        },
+    )
+    overlay = {
+        "predecessor_request_id": predecessor,
+        "predecessor_task_id": "TASK_SAME",
+        "canonical_digest": "b" * 64,
+    }
+
+    path, packet = process_launcher._materialize_crash_retry_packet(
+        process_dir,
+        workspace,
+        task_id="TASK_SAME",
+        card={"rework_predecessor": {"request_id": predecessor}},
+        rework_overlay_packet=overlay,
+    )
+
+    assert path is not None and path.is_file()
+    assert packet is not None
+    assert packet["predecessor_state"] == "supervisor_error"
+    assert packet["predecessor_exit_code"] == 126
+    assert "exact-provider-error" in packet["stderr_tail"]
+    assert len(packet["stdout_tail"].encode("utf-8")) <= 4096
+    assert packet["rework_overlay_sha256"] == "b" * 64
+    assert packet["validation_failure_delta"]["failure_count"] == 1
+    assert packet["validation_failure_delta"]["receipts"][0][
+        "failure_class"
+    ] == "test_failure"
+    assert len(packet["validation_manifest_sha256"]) == 64
+    assert packet["stale_worktree_bytes_authoritative"] is False
+    assert packet["canonical_reread_savings_claimed"] is False
+    assert "path" not in packet and "home" not in packet
+    prompt = process_launcher.build_worker_prompt(
+        task_id="TASK_SAME",
+        runner="claude_worker_b1",
+        topic="task_mcp",
+        card={"task_id": "TASK_SAME", "rework_predecessor": {}},
+        crash_retry_packet=packet,
+    )
+    assert prompt.count("CRASH_RETRY_PACKET_JSON:") == 1
+    # Later mutations of the old log cannot alter the request-private packet.
+    (process_dir / f"{predecessor}.stderr.log").write_text(
+        "stale-later-data", encoding="utf-8"
+    )
+    assert "stale-later-data" not in path.read_text(encoding="utf-8")
+
+
+def test_crash_retry_packet_rejects_cross_task_predecessor(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    process_dir = tmp_path / "processes"
+    worktree = tmp_path / "worktree"
+    home = tmp_path / "home"
+    for directory in (repo, process_dir, worktree, home):
+        directory.mkdir(parents=True)
+    workspace = process_launcher.WorkerWorkspace(
+        request_id="successor-request",
+        repo=repo,
+        path=worktree,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+        inherited_rework_paths=("src/service.py",),
+    )
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="crash_retry_predecessor_identity_mismatch",
+    ):
+        process_launcher._materialize_crash_retry_packet(
+            process_dir,
+            workspace,
+            task_id="TASK_SAME",
+            card={
+                "rework_predecessor": {
+                    "request_id": "predecessor-request",
+                    "task_id": "OTHER_TASK",
+                }
+            },
+            rework_overlay_packet={
+                "predecessor_request_id": "predecessor-request",
+                "predecessor_task_id": "OTHER_TASK",
+            },
+        )
+
+
 def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_path):
     manager = _manager(
         tmp_path,
@@ -175,6 +381,8 @@ def test_finalize_after_process_exit_emits_terminal_callback_fallback(
         "task_id": "TASK_B1",
         "runner": "claude_worker_b1",
         "topic": "task_mcp",
+        # This test covers the generic terminal-callback fallback. Bridge
+        # routes have a separate fail-closed cancellation publication gate.
         "adapter_id": "claude_cli",
         "state": "running",
     })
@@ -1093,6 +1301,164 @@ def test_successful_isolated_reconcile_enters_review_without_promoting(
     }
     assert evidence["workspace"]["request_id"] == "req-review-first-1"
     assert evidence["workspace"]["path"] == str(workspace_dir)
+    artifact_receipt = evidence["attempt_artifact_manifest"]
+    assert artifact_receipt["verified"] is True
+    assert event["attempt_artifact_manifest"] == artifact_receipt
+    verification = process_launcher.attempt_artifacts.verify_json_bundle(
+        Path(artifact_receipt["manifest_path"]).parent
+    )
+    assert verification["attempt_id"] == "req-review-first-1"
+    assert verification["roles"] == [
+        "diff",
+        "metadata",
+        "review",
+        "usage",
+        "validation",
+    ]
+    evidence_record = process_launcher.evidence_levels.validate_evidence_record(
+        evidence["evidence_record"]
+    )
+    assert (
+        evidence_record.evidence_level
+        == process_launcher.evidence_levels.EvidenceLevel.STATIC_EVIDENCE
+    )
+
+
+def test_quality_reviewer_finalization_seals_attempt_bundle(
+    monkeypatch, tmp_path
+):
+    if os.name == "nt":
+        pytest.skip("review finalization requires the POSIX secure sandbox backend")
+    _open_gates(monkeypatch)
+    from aiworkhub import worker_workspace
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workspace_dir = tmp_path / "review-workspace"
+    workspace_dir.mkdir()
+    marker = workspace_dir / "README.md"
+    marker.write_text("review target\n", encoding="utf-8")
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=workspace_dir, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=workspace_dir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Task MCP Tests"],
+        cwd=workspace_dir,
+        check=True,
+    )
+    subprocess.run(["git", "add", "README.md"], cwd=workspace_dir, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "baseline"], cwd=workspace_dir, check=True
+    )
+    home = tmp_path / "review-home"
+    home.mkdir()
+    request_id = "req-quality-artifacts-1"
+    workspace = worker_workspace.WorkerWorkspace(
+        request_id=request_id,
+        repo=repo,
+        path=workspace_dir,
+        home=home,
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+    def processing_card():
+        card = _card()
+        card.update({
+            "status": "processing",
+            "worker_status": "claimed",
+            "claimed_by": "claude_worker_b1",
+            "topic": "task_mcp",
+        })
+        return card
+
+    manager = process_launcher.ProcessManager(
+        repo=repo,
+        process_log_path=tmp_path / "events.jsonl",
+        process_dir=tmp_path / "processes",
+        show_task=_show(processing_card),
+        collision_guard=_collision,
+        adapter_builder=_plan([sys.executable, "-c", "pass"], repo),
+        isolation_enabled=False,
+    )
+    stdout_path = tmp_path / f"{request_id}.stdout.log"
+    stderr_path = tmp_path / f"{request_id}.stderr.log"
+    status_path = tmp_path / f"{request_id}.supervisor.json"
+    metadata_path = tmp_path / f"{request_id}.request.json"
+    stdout_path.write_text("review complete\n", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    worker_workspace.write_json_0600(
+        status_path, {"state": "exited", "exit_code": 0}
+    )
+    metadata = {
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "model": "claude-sonnet",
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "supervisor_status_path": str(status_path),
+        "sandbox_backend": "landlock",
+        "quality_review": {
+            "target_request_id": "target-request",
+            "target_task_id": "TARGET_TASK",
+            "lens": "correctness",
+        },
+        "workspace": workspace.as_metadata(),
+    }
+    worker_workspace.write_json_0600(metadata_path, metadata)
+    manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "adapter_id": "claude_cli",
+        "state": "running",
+        "pid": 999_999_999,
+        "pid_start_ticks": 1,
+        "metadata_path": str(metadata_path),
+        "supervisor_status_path": str(status_path),
+    })
+    verified_receipt = {
+        "schema_id": "aiworkhub.quality_reviewer_receipt.v1",
+        "report": {"lens": "correctness", "findings": []},
+    }
+    monkeypatch.setattr(
+        process_launcher,
+        "_verified_quality_review_receipt",
+        lambda *_args: verified_receipt,
+    )
+    review_calls = []
+    monkeypatch.setattr(
+        manager,
+        "_review_terminal_exact",
+        lambda _metadata, substatus, **kwargs: (
+            review_calls.append((substatus, kwargs["evidence"]))
+            or {"ok": True}
+        ),
+    )
+
+    event = manager._finalize_isolated_request(request_id, supervisor_returncode=0)
+
+    assert event["state"] == "review_ready"
+    assert len(review_calls) == 1
+    receipt = review_calls[0][1]["attempt_artifact_manifest"]
+    assert receipt["verified"] is True
+    assert event["attempt_artifact_manifest"] == receipt
+    assert process_launcher.attempt_artifacts.verify_json_bundle(
+        Path(receipt["manifest_path"]).parent
+    )["verified"] is True
+    assert review_calls[0][1]["evidence_record"]["evidence_level"] == (
+        "static_evidence"
+    )
 
 
 def test_empty_declared_validation_skips_route_and_scratch(monkeypatch, tmp_path):
@@ -1128,6 +1494,30 @@ def test_operational_scratch_failure_is_not_quality_review_eligible():
     assert process_launcher._is_operational_validation_failure(
         "validation_failed", "validation_failed:pytest:rc=1"
     ) is False
+
+
+def test_validation_only_replay_skips_bridge_cancellation_only_without_provider():
+    assert process_launcher._requires_bridge_cancellation(
+        {
+            "execution_mode": "validation_only_replay",
+            "provider_launched": False,
+            "adapter_id": "deepseek_vscode_lm",
+        }
+    ) is False
+    assert process_launcher._requires_bridge_cancellation(
+        {
+            "execution_mode": "validation_only_replay",
+            "provider_launched": True,
+            "adapter_id": "deepseek_vscode_lm",
+        }
+    ) is True
+    assert process_launcher._requires_bridge_cancellation(
+        {
+            "execution_mode": "provider_worker",
+            "provider_launched": False,
+            "adapter_id": "deepseek_vscode_lm",
+        }
+    ) is True
 
 
 def test_finalize_isolated_request_validation_only_replay_authorization(
@@ -1291,6 +1681,10 @@ def test_finalize_isolated_request_validation_only_replay_authorization(
     unauthorized_event = _run("req-replay-unauthorized", None)
     assert unauthorized_event["state"] == "validation_failed"
     assert "required_output_unchanged:out/result.json" in unauthorized_event["error"]
+    assert unauthorized_event["attempt_artifact_manifest"]["verified"] is True
+    assert process_launcher.attempt_artifacts.verify_json_bundle(
+        Path(unauthorized_event["attempt_artifact_manifest"]["manifest_path"]).parent
+    )["attempt_id"] == "req-replay-unauthorized"
 
     # A wrong claim epoch (stale/replayed episode) fails closed the same way.
     stale_authorization = {

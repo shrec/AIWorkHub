@@ -11,7 +11,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
-from . import task_store
+from . import roadmap_store, task_store
 from .tool_recovery import unknown_tool_message
 
 try:
@@ -93,15 +93,15 @@ except ModuleNotFoundError:
             if len(args) == 1:
                 return _stdio_json_schema_for_annotation(args[0])
         if origin in (list, tuple) or annotation in (list, tuple):
-            args = typing.get_args(annotation)
-            item_annotation = args[0] if args else Any
+            annotation_args = typing.get_args(annotation)
+            item_annotation = annotation_args[0] if annotation_args else Any
             return {
                 "type": "array",
                 "items": _stdio_json_schema_for_annotation(item_annotation),
             }
         if origin is dict or annotation is dict:
-            args = typing.get_args(annotation)
-            value_annotation = args[1] if len(args) == 2 else Any
+            annotation_args = typing.get_args(annotation)
+            value_annotation = annotation_args[1] if len(annotation_args) == 2 else Any
             return {
                 "type": "object",
                 "additionalProperties": _stdio_json_schema_for_annotation(value_annotation),
@@ -555,6 +555,27 @@ def aiworkhub_manager_workforce_rank(
 
 
 @mcp.tool()
+def aiworkhub_manager_task_decomposition_preview(
+    parent_task_id: str,
+    objective: str,
+    source_graph_receipt: dict[str, Any],
+    children: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """MANAGER READ: validate a Source Graph-grounded child-DAG proposal.
+
+    This operation never creates or launches tasks. The returned digest is an
+    advisory proposal that requires a separate explicit manager decision.
+    """
+
+    return manager_ai_tools.task_decomposition_preview(
+        parent_task_id=parent_task_id,
+        objective=objective,
+        source_graph_receipt=source_graph_receipt,
+        children=children,
+    )
+
+
+@mcp.tool()
 def aiworkhub_manager_session_write(
     action: context_writes.SessionAction,
     topic: str,
@@ -607,6 +628,71 @@ def aiworkhub_manager_kb_write(
         action=action, key=key, title=title, body=body, category=category,
         tags=tags, source_refs=source_refs, replacement_key=replacement_key,
         idempotency_key=idempotency_key, provenance=provenance,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_learning_commit(
+    task_id: str,
+    request_id: str,
+    repo_area: str,
+    outcome: str,
+    evidence_ids: list[str],
+    idempotency_key: str,
+    provenance: str,
+    root_cause_candidate: str = "",
+    invariant_candidate: str = "",
+    lesson_candidate: str = "",
+    edge_candidates: list[dict[str, str]] | None = None,
+    promote_ai_memory: bool = False,
+    promote_context_graph: bool = False,
+    promote_kb: bool = False,
+) -> dict[str, Any]:
+    """MANAGER WRITE: persist and project one verified Learning Commit."""
+
+    return manager_ai_tools.learning_commit(
+        task_id=task_id,
+        request_id=request_id,
+        repo_area=repo_area,
+        outcome=outcome,
+        evidence_ids=evidence_ids,
+        idempotency_key=idempotency_key,
+        provenance=provenance,
+        root_cause_candidate=root_cause_candidate,
+        invariant_candidate=invariant_candidate,
+        lesson_candidate=lesson_candidate,
+        edge_candidates=edge_candidates,
+        promote_ai_memory=promote_ai_memory,
+        promote_context_graph=promote_context_graph,
+        promote_kb=promote_kb,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_needfix_markdown_preview(
+    source_paths: list[str] | None = None,
+    follow_links: bool = True,
+) -> dict[str, Any]:
+    """MANAGER READ: preview bounded captured NeedFix candidates from Markdown."""
+
+    return manager_ai_tools.needfix_markdown_preview(
+        source_paths=source_paths,
+        follow_links=follow_links,
+    )
+
+
+@mcp.tool()
+def aiworkhub_manager_needfix_markdown_commit(
+    preview_id: str,
+    source_paths: list[str] | None = None,
+    follow_links: bool = True,
+) -> dict[str, Any]:
+    """MANAGER WRITE: commit an exact Markdown preview as captured items only."""
+
+    return manager_ai_tools.needfix_markdown_commit(
+        source_paths=source_paths,
+        preview_id=preview_id,
+        follow_links=follow_links,
     )
 
 
@@ -760,6 +846,9 @@ def aiworkhub_task_create(
     immutable_inputs: list[str] | None = None,
     read_only: bool = False,
     max_live_tokens: int | None = None,
+    work_kind: str = "generic",
+    validation_roles: list[str] | None = None,
+    risk_tier: str | None = None,
 ) -> dict[str, Any]:
     """MANAGER WRITE: create one new canonical repo-local task card.
 
@@ -795,6 +884,13 @@ def aiworkhub_task_create(
     ``aiworkhub_manager_workforce_rank.launch_contract.runner``. The exact
     value ``codex`` is reserved for the verified manager and is rejected for
     worker cards.
+    ``work_kind`` is an explicit behavioral contract, never inferred from the
+    title or worker prose. Specialized values require one ``validation_roles``
+    entry per validation command: bugfix=reproduction+regression,
+    refactor=parity, performance=baseline+delta, security=negative_fixture,
+    and data_ml=schema+distribution. Missing roles are rejected before launch.
+    ``risk_tier`` is optional explicit routing/economic evidence. It is never
+    inferred from priority or prose; omitted historical cards remain unknown.
     """
 
     return core.create_task(
@@ -817,6 +913,9 @@ def aiworkhub_task_create(
         immutable_inputs=immutable_inputs,
         read_only=read_only,
         max_live_tokens=max_live_tokens,
+        work_kind=work_kind,
+        validation_roles=validation_roles,
+        risk_tier=risk_tier,
     )
 
 
@@ -1708,7 +1807,13 @@ def aiworkhub_completion_inbox(
                     "usage_observed",
                     "input_tokens",
                     "output_tokens",
+                    "visible_output_tokens",
+                    "reasoning_output_tokens",
                     "cached_input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_write_input_tokens",
+                    "observed_model",
+                    "model_observed",
                     "cost_observed",
                     "cost_usd",
                 )
@@ -2095,7 +2200,10 @@ def aiworkhub_source_graph_retrieval_eval() -> dict[str, Any]:
     """READ-ONLY: run registered precision@k/MRR cases through manager MCP wrapper."""
 
     return evidence_instruments.source_graph_retrieval_eval(
-        core.repo_root(), query_fn=manager_ai_tools.source_graph_query
+        core.repo_root(),
+        query_fn=lambda **kwargs: manager_ai_tools.source_graph_query(
+            **kwargs, compact_replay=False,
+        ),
     )
 
 
@@ -2254,6 +2362,12 @@ def main() -> None:
     except Exception:
         # Keep MCP diagnostics alive if the auxiliary store cannot be opened;
         # the bounded NeedFix APIs will then return the concrete store error.
+        pass
+    try:
+        roadmap_store.initialize_repository(root)
+    except Exception:
+        # Roadmap is additive; keep diagnostics/NeedFix/task control alive and
+        # let the bounded Roadmap tools report the concrete storage failure.
         pass
     # Every independently launched manager MCP child owns its repository's
     # in-process Source Graph daemon.  Dashboard activation already calls the
@@ -2441,6 +2555,87 @@ def needfix_convert(
 def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict:
     """Manager-only: atomically link a NeedFix to an existing, finished, accepted task."""
     return core.needfix_link_existing_task(needfix_id, existing_task_id)
+
+
+@mcp.tool()
+def needfix_reopen_superseded_task_link(needfix_id: str, reason: str) -> dict:
+    """Manager-only: reopen a NeedFix whose exact linked task was superseded."""
+    return core.needfix_reopen_superseded_task_link(needfix_id, reason)
+
+
+# --- Roadmap MCP manager tools (repository-native; never launch workers) ---
+
+
+@mcp.tool()
+def roadmap_list(
+    status: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """List bounded repository Roadmap outcomes."""
+    return core.roadmap_list(
+        status=status,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@mcp.tool()
+def roadmap_show(roadmap_id: str) -> dict:
+    """Show one Roadmap outcome."""
+    return core.roadmap_show(roadmap_id)
+
+
+@mcp.tool()
+def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict]:
+    """List bounded audit events for one Roadmap outcome."""
+    return core.roadmap_events(roadmap_id, limit=limit)
+
+
+@mcp.tool()
+def roadmap_snapshot(limit: int = 200, include_archived: bool = False) -> dict:
+    """Join bounded Roadmap outcomes to canonical Task-DAG lifecycle."""
+    return core.roadmap_snapshot(limit=limit, include_archived=include_archived)
+
+
+@mcp.tool()
+def roadmap_add(
+    title: str,
+    outcome: str,
+    priority: str = "medium",
+    milestone: str = "",
+    acceptance: list[str] | None = None,
+    needfix_ids: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    provenance: dict | None = None,
+    evidence_refs: list[str] | None = None,
+) -> dict:
+    """Manager-only Roadmap proposal; does not create or launch a task."""
+    return core.roadmap_add(
+        title,
+        outcome,
+        priority=priority,
+        milestone=milestone,
+        acceptance=acceptance,
+        needfix_ids=needfix_ids,
+        depends_on=depends_on,
+        provenance=provenance,
+        evidence_refs=evidence_refs,
+    )
+
+
+@mcp.tool()
+def roadmap_transition(roadmap_id: str, target_status: str, reason: str) -> dict:
+    """Manager-only guarded Roadmap lifecycle transition."""
+    return core.roadmap_transition(roadmap_id, target_status, reason=reason)
+
+
+@mcp.tool()
+def roadmap_link_task(roadmap_id: str, task_id: str) -> dict:
+    """Link one existing canonical task to a Roadmap outcome."""
+    return core.roadmap_link_task(roadmap_id, task_id)
 
 
 if __name__ == "__main__":

@@ -231,6 +231,7 @@ def backfill_usage_capture(repo_root: Path | str, *, confirm: bool) -> dict[str,
             "total_tokens": input_tokens + output_tokens,
             "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
             "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            "cache_write_input_tokens": int(usage.get("cache_write_input_tokens") or 0),
             "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
             "usage_observed": bool(usage.get("usage_observed")),
             "telemetry_reason": (

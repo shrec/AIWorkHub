@@ -39,6 +39,7 @@ def _insert_blocked_task(
     extra_card: dict | None = None,
     worker_status: str = "validation_failed",
     claimed_by: str = "",
+    topic: str = "aiworkhub_blocked_rework_recovery",
 ) -> None:
     """Insert a blocked task with terminal-review predecessor evidence."""
     _readiness, db_path = task_store._require_ready(repo)
@@ -48,7 +49,7 @@ def _insert_blocked_task(
     card = {
         "task_id": task_id,
         "runner": runner,
-        "topic": "aiworkhub_blocked_rework_recovery",
+        "topic": topic,
         "mode": "",
         "allowed_writes": ["src/aiworkhub/task_store.py"],
         "objective": "Implement blocked rework recovery",
@@ -102,11 +103,12 @@ def _insert_blocked_task(
             "INSERT INTO tasks(task_id, runner, topic, status, worker_status, priority, "
             "objective, card_json, created_at, updated_at, claimed_by, claimed_at, started_at, "
             "completed_at) "
-            "VALUES (?, ?, 'aiworkhub_blocked_rework_recovery', 'blocked', ?, '', '', "
+            "VALUES (?, ?, ?, 'blocked', ?, '', '', "
             "?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 runner,
+                topic,
                 worker_status,
                 json.dumps(card),
                 now,
@@ -210,6 +212,41 @@ def test_recover_blocked_worker_failed_with_feedback_requeues_to_pending(
     )
     assert (ok, state) == (True, "recovered")
     assert _get_card(repo, "BLOCKED_WORKER_FAIL")["status"] == "pending"
+
+
+def test_quality_review_recovery_requires_packet_bound_relaunch(
+    tmp_path: Path,
+) -> None:
+    repo = _setup_repo(tmp_path)
+    _insert_blocked_task(
+        repo,
+        "BLOCKED_REVIEWER",
+        topic="quality_review",
+        terminal_substatus="worker_failed",
+        reject_review_reason="Retry exact reviewer packet",
+        extra_card={
+            "quality_review": {
+                "target_request_id": "a" * 32,
+                "target_task_id": "TARGET_TASK",
+                "packet_sha256": "b" * 64,
+            }
+        },
+    )
+
+    ok, state = task_store.recover_blocked_rework(
+        repo,
+        "BLOCKED_REVIEWER",
+        actor="coordinator",
+        feedback_reason="Retry exact reviewer packet",
+    )
+
+    assert (ok, state) == (
+        False,
+        "quality_review_recovery_requires_bound_relaunch",
+    )
+    assert _get_card(repo, "BLOCKED_REVIEWER")["status"] == "blocked"
+    events = task_store.get_task_events(repo, "BLOCKED_REVIEWER")
+    assert "blocked_rework_recovery" not in {event["event"] for event in events}
 
 
 def _missing_rework_predecessor(repo: Path, tmp_path: Path) -> dict:

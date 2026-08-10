@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE TABLE IF NOT EXISTS callback_outbox (
   outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
   origin_thread_id TEXT NOT NULL DEFAULT '',
   episode_id TEXT NOT NULL DEFAULT '',
   event_id TEXT NOT NULL DEFAULT '',
@@ -215,6 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_task_store_callback_outbox_state ON callback_outb
 
 CREATE TABLE IF NOT EXISTS callback_batches (
   batch_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL DEFAULT '',
   origin_thread_id TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT NOT NULL,
@@ -281,9 +283,13 @@ class StorageReadiness:
 def _connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     if not readonly:
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path))
+        conn = sqlite3.connect(str(path), timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
     else:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA query_only=ON")
     conn.row_factory = sqlite3.Row
     return conn
@@ -292,12 +298,19 @@ def _connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    descriptor_open = True
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            descriptor_open = False
             json.dump(dict(payload), fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
         os.replace(tmp_name, path)
     finally:
+        if descriptor_open:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_name)
         except FileNotFoundError:
@@ -527,7 +540,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
         outbox_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()
         }
-        for column in ("episode_id", "batch_id", "event_id", "request_id"):
+        for column in ("provider", "episode_id", "batch_id", "event_id", "request_id"):
             if column not in outbox_columns:
                 conn.execute(
                     f"ALTER TABLE callback_outbox ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
@@ -541,7 +554,7 @@ def _upgrade_compatible_schema(path: Path) -> bool:
         batch_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(callback_batches)").fetchall()
         }
-        for column in ("not_before_at", "last_failure_kind", "last_error"):
+        for column in ("provider", "not_before_at", "last_failure_kind", "last_error"):
             if column not in batch_columns:
                 conn.execute(
                     f"ALTER TABLE callback_batches ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
@@ -679,27 +692,47 @@ def exact_status_counts(root: str | Path) -> dict[str, int]:
 def list_tasks(root: str | Path, *, status: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
     """List canonical tasks, optionally filtered to one canonical status."""
     _readiness, db_path = _require_ready(root)
+    bounded_limit = max(1, min(int(limit), 5000))
+    canonical_status_sql = """
+        CASE
+          WHEN COALESCE(archived_at, '') <> '' THEN 'archived'
+          WHEN lower(COALESCE(status, '')) IN ('finished', 'completed', 'stale_already_done')
+            OR lower(COALESCE(worker_status, '')) = 'done' THEN 'finished'
+          WHEN lower(COALESCE(status, '')) LIKE 'blocked%'
+            OR lower(COALESCE(worker_status, '')) LIKE 'blocked%'
+            OR lower(COALESCE(worker_status, '')) LIKE 'deferred%' THEN 'blocked'
+          WHEN lower(COALESCE(status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review')
+            OR lower(COALESCE(worker_status, '')) IN ('review', 'ready_for_review', 'codex_review', 'awaiting_review') THEN 'review'
+          WHEN lower(COALESCE(status, '')) IN ('processing', 'in_progress')
+            OR lower(COALESCE(worker_status, '')) IN ('claimed', 'in_progress') THEN 'processing'
+          WHEN lower(COALESCE(status, '')) = 'superseded'
+            OR lower(COALESCE(worker_status, '')) = 'superseded' THEN 'superseded'
+          ELSE 'pending'
+        END
+    """
+    query = (
+        "SELECT task_id, runner, "
+        "COALESCE(NULLIF(topic, ''), json_extract(card_json, '$.topic'), '') AS topic, "
+        "mode, status, worker_status, priority, objective, "
+        "created_at, updated_at, claimed_by, claimed_at, started_at, completed_at, archived_at "
+        "FROM tasks"
+    )
+    params: list[Any] = []
+    if status and status != "all":
+        query += f" WHERE ({canonical_status_sql}) = ?"
+        params.append(status)
+    query += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(bounded_limit)
     conn = _connect(db_path, readonly=True)
     try:
-        rows = conn.execute(
-            "SELECT task_id, runner, "
-            "COALESCE(NULLIF(topic, ''), json_extract(card_json, '$.topic'), '') AS topic, "
-            "mode, status, worker_status, priority, objective, "
-            "created_at, updated_at, claimed_by, claimed_at, started_at, completed_at, archived_at "
-            "FROM tasks ORDER BY updated_at DESC"
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
     finally:
         conn.close()
-    bounded_limit = max(1, min(int(limit), 5000))
     result: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         item["status"] = canonical_status(item)
-        if status and status != "all" and item["status"] != status:
-            continue
         result.append(item)
-        if len(result) >= bounded_limit:
-            break
     return result
 
 
@@ -798,6 +831,11 @@ def callback_bridge_health(root: str | Path) -> dict[str, Any]:
             "SELECT task_id, transition, updated_at, last_error FROM callback_outbox "
             "WHERE state='dead_letter' ORDER BY updated_at DESC, outbox_id DESC LIMIT 1"
         ).fetchone()
+        latest_terminal = conn.execute(
+            "SELECT state, updated_at, last_error FROM callback_outbox "
+            "WHERE state IN ('delivered','dead_letter') "
+            "ORDER BY updated_at DESC, outbox_id DESC LIMIT 1"
+        ).fetchone()
         oldest_pending = conn.execute(
             "SELECT MIN(created_at) AS created_at FROM callback_outbox "
             "WHERE state IN ('pending', 'inflight')"
@@ -814,6 +852,12 @@ def callback_bridge_health(root: str | Path) -> dict[str, Any]:
     finally:
         conn.close()
     backlog_count = counts["pending"] + counts["inflight"]
+    latest_terminal_state = str(latest_terminal["state"] if latest_terminal else "")
+    current_delivery_error = (
+        str(latest_terminal["last_error"] or "")[:500]
+        if latest_terminal is not None and latest_terminal_state == "dead_letter"
+        else ""
+    )
     return {
         "ok": True,
         "total": sum(counts.values()),
@@ -830,6 +874,19 @@ def callback_bridge_health(root: str | Path) -> dict[str, Any]:
         "last_dead_letter_transition": str(last_dead_letter["transition"] if last_dead_letter else ""),
         "last_dead_letter_at": str(last_dead_letter["updated_at"] if last_dead_letter else ""),
         "last_dead_letter_error": str(last_dead_letter["last_error"] if last_dead_letter else "")[:500],
+        # ``last_dead_letter_*`` is immutable history, not current health.
+        # A later successful delivery proves recovery and must prevent the
+        # dashboard from rendering an old failure as a live outage.
+        "current_delivery_status": (
+            "degraded" if latest_terminal_state == "dead_letter" else
+            "healthy" if latest_terminal_state == "delivered" else
+            "unknown"
+        ),
+        "current_delivery_error": current_delivery_error,
+        "latest_terminal_at": str(latest_terminal["updated_at"] if latest_terminal else ""),
+        "recovered_after_last_dead_letter": bool(
+            last_dead_letter is not None and latest_terminal_state == "delivered"
+        ),
         "batches": {
             "total": sum(batch_counts.values()),
             "by_state": batch_counts,
@@ -878,6 +935,7 @@ def archive_task(
     reason: str = "",
     allow_processing: bool = False,
     operation: str = "archived",
+    superseded_by: str = "",
 ) -> tuple[bool, str]:
     """Archive one task in the bound canonical queue without deleting audit history."""
     _readiness, db_path = _require_ready(root)
@@ -903,6 +961,8 @@ def archive_task(
         card["archived_at"] = now
         card["archive_operation"] = operation
         card["archive_reason"] = reason[:200]
+        if operation == "superseded" and str(superseded_by or "").strip():
+            card["superseded_by"] = str(superseded_by).strip()
         conn.execute(
             "UPDATE tasks SET archived_at=?, updated_at=?, card_json=? WHERE task_id=?",
             (now, now, json.dumps(card, ensure_ascii=False, sort_keys=True), task_id),
@@ -914,7 +974,18 @@ def archive_task(
                 task_id,
                 operation,
                 actor,
-                json.dumps({"reason": reason[:200]}, sort_keys=True),
+                json.dumps(
+                    {
+                        "reason": reason[:200],
+                        **(
+                            {"superseded_by": str(superseded_by).strip()}
+                            if operation == "superseded"
+                            and str(superseded_by or "").strip()
+                            else {}
+                        ),
+                    },
+                    sort_keys=True,
+                ),
                 now,
             ),
         )
@@ -924,27 +995,112 @@ def archive_task(
         conn.close()
 
 
-def mark_terminal_review(
-    root: str | Path,
+_ATOMIC_CALLBACK_TRANSITIONS: frozenset[str] = frozenset(
+    {
+        "review_ready",
+        "blocked",
+        "launch_failed",
+        "worker_failed",
+        "validation_failed",
+        "scope_rejected",
+        "timed_out",
+        "token_budget_exceeded",
+        "output_budget_exceeded",
+        "cancelled",
+    }
+)
+
+
+def _enqueue_terminal_callback_row(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    provider: str,
+    origin_thread_id: str,
+    transition: str,
+    episode_id: str,
+    request_id: str,
+    now: str,
+) -> bool:
+    """Insert one callback row without committing the caller's transaction."""
+
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_origin = str(origin_thread_id or "").strip()
+    if normalized_provider not in {"", "codex", "claude", "copilot"}:
+        return False
+    if not normalized_origin or transition not in _ATOMIC_CALLBACK_TRANSITIONS:
+        return False
+    cur = conn.execute(
+        """
+        INSERT INTO callback_outbox(
+          task_id, provider, origin_thread_id, transition, episode_id, event_id,
+          request_id, state, created_at, updated_at
+        )
+        SELECT ?, ?, ?, ?, ?, '', ?, 'pending', ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM callback_outbox
+            WHERE task_id=? AND provider=? AND origin_thread_id=? AND episode_id=?
+         )
+        """,
+        (
+            task_id,
+            normalized_provider,
+            normalized_origin,
+            transition,
+            episode_id,
+            request_id,
+            now,
+            now,
+            task_id,
+            normalized_provider,
+            normalized_origin,
+            episode_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        return False
+    conn.execute(
+        "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+        "VALUES (?, 'callback_enqueued', '', ?, ?)",
+        (
+            task_id,
+            json.dumps(
+                {
+                    "transition": transition,
+                    "episode_id": episode_id,
+                    "provider": normalized_provider,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            now,
+        ),
+    )
+    return True
+
+
+def _mark_terminal_review_transaction(
+    conn: sqlite3.Connection,
     task_id: str,
     *,
     runner: str,
     substatus: str,
-    evidence: Mapping[str, Any] | None = None,
-) -> tuple[bool, str]:
-    """Route a launched terminal outcome to Codex review, preserving evidence."""
-    _readiness, db_path = _require_ready(root)
-    conn = _connect(db_path)
+    evidence: Mapping[str, Any] | None,
+    callback_transition: str = "",
+    callback_provider: str = "",
+    callback_request_id: str = "",
+) -> tuple[bool, str, bool]:
     try:
         row = conn.execute(
-            "SELECT runner, status, worker_status, archived_at, claimed_by, card_json "
+            "SELECT runner, status, worker_status, archived_at, claimed_by, card_json, "
+            "origin_thread_id "
             "FROM tasks WHERE task_id=?",
             (task_id,),
         ).fetchone()
         if row is None:
-            return False, "task_not_found"
+            return False, "task_not_found", False
         if str(row["runner"] or "") != runner:
-            return False, "runner_mismatch"
+            return False, "runner_mismatch", False
         now = datetime.now(timezone.utc).isoformat()
         current_status = canonical_status(dict(row))
         legal, fsm_reason = task_fsm.check_terminal_review_transition(current_status, substatus)
@@ -968,7 +1124,7 @@ def mark_terminal_review(
                 ),
             )
             conn.commit()
-            return False, fsm_reason
+            return False, fsm_reason, False
         try:
             card = json.loads(str(row["card_json"] or "{}"))
         except json.JSONDecodeError:
@@ -1009,8 +1165,173 @@ def mark_terminal_review(
             "VALUES (?, 'terminal_review', ?, ?, ?)",
             (task_id, runner, json.dumps(terminal, ensure_ascii=False, sort_keys=True), now),
         )
+        callback_enqueued = _enqueue_terminal_callback_row(
+            conn,
+            task_id=task_id,
+            provider=callback_provider,
+            origin_thread_id=str(
+                row["origin_thread_id"] or card.get("origin_thread_id") or ""
+            ),
+            transition=callback_transition,
+            episode_id=str(claim_epoch),
+            request_id=callback_request_id,
+            now=now,
+        )
         conn.commit()
-        return True, "review"
+        return True, "review", callback_enqueued
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def mark_terminal_review(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    substatus: str,
+    evidence: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Route a terminal outcome to review without a callback route."""
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        ok, state, _callback_enqueued = _mark_terminal_review_transaction(
+            conn,
+            task_id,
+            runner=runner,
+            substatus=substatus,
+            evidence=evidence,
+        )
+        return ok, state
+    finally:
+        conn.close()
+
+
+def mark_terminal_review_with_callback(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    substatus: str,
+    evidence: Mapping[str, Any] | None = None,
+    callback_transition: str,
+    callback_provider: str,
+    callback_request_id: str = "",
+) -> tuple[bool, str, bool]:
+    """Atomically persist terminal review state, event and callback outbox row."""
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        return _mark_terminal_review_transaction(
+            conn,
+            task_id,
+            runner=runner,
+            substatus=substatus,
+            evidence=evidence,
+            callback_transition=callback_transition,
+            callback_provider=callback_provider,
+            callback_request_id=callback_request_id,
+        )
+    finally:
+        conn.close()
+
+
+def mark_review_workspace_missing(
+    root: str | Path,
+    task_id: str,
+    *,
+    runner: str,
+    request_id: str,
+    reason: str,
+) -> tuple[bool, str]:
+    """Invalidate one exact review whose retained workspace is unavailable.
+
+    Review evidence remains in the immutable task-event history, while the
+    actionable card moves out of ``review`` and releases its claim.  The
+    compare-and-swap identity checks prevent a stale reconciler from blocking
+    a newer review episode.
+    """
+
+    _readiness, db_path = _require_ready(root)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT runner, status, worker_status, claimed_by, card_json "
+            "FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task_not_found"
+        if str(row["runner"] or "") != runner:
+            return False, "runner_mismatch"
+        if canonical_status(dict(row)) != "review" or str(row["worker_status"] or "") != "review":
+            return False, f"not_review:current={canonical_status(dict(row))}"
+        raw_card_json = str(row["card_json"] or "{}")
+        try:
+            card = json.loads(raw_card_json)
+        except json.JSONDecodeError:
+            return False, "review_card_invalid"
+        if not isinstance(card, dict):
+            return False, "review_card_invalid"
+        terminal = card.get("terminal_review")
+        evidence = terminal.get("evidence") if isinstance(terminal, dict) else None
+        identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+        if not isinstance(identity, dict) or str(identity.get("request_id") or "") != request_id:
+            return False, "review_request_identity_mismatch"
+
+        now = datetime.now(timezone.utc).isoformat()
+        bounded_reason = str(reason or "retained_workspace_unavailable")[:500]
+        card.update(
+            status="blocked",
+            worker_status="finalize_failed",
+            terminal_substatus="finalize_failed",
+            blocker_reason=bounded_reason,
+            workspace_retention_failure={
+                "request_id": request_id[:120],
+                "reason": bounded_reason,
+                "detected_at": now,
+            },
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', worker_status='finalize_failed', "
+            "claimed_by=NULL, completed_at=COALESCE(NULLIF(completed_at, ''), ?), "
+            "updated_at=?, card_json=? "
+            "WHERE task_id=? AND status='review' AND worker_status='review' "
+            "AND runner=? AND card_json=?",
+            (
+                now,
+                now,
+                json.dumps(persistable_card_payload(card), ensure_ascii=False, sort_keys=True),
+                task_id,
+                runner,
+                raw_card_json,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False, "review_workspace_transition_conflict"
+        event = {
+            "request_id": request_id[:120],
+            "reason": bounded_reason,
+            "transition": "review->blocked",
+            "worker_status": "finalize_failed",
+            "recorded_at": now,
+        }
+        conn.execute(
+            "INSERT INTO task_events(task_id, event, runner, payload_json, created_at) "
+            "VALUES (?, 'review_workspace_missing', ?, ?, ?)",
+            (
+                task_id,
+                runner,
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        conn.commit()
+        return True, "blocked"
     finally:
         conn.close()
 
@@ -1453,6 +1774,9 @@ def recover_blocked_rework(
             return False, "card_json_invalid"
         if not isinstance(card, dict):
             return False, "card_json_not_dict"
+
+        if str(card.get("topic") or row["topic"] or "") == "quality_review":
+            return False, "quality_review_recovery_requires_bound_relaunch"
 
         if clean_root_if_predecessor_missing and validation_only_replay:
             return False, "clean_root_incompatible_with_validation_only_replay"

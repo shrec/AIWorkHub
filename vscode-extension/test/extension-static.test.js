@@ -243,9 +243,20 @@ assert.ok(ext.includes("callback_required"));
 assert.ok(ext.includes("notify_and_open_chat"));
 assert.ok(app.includes('case "coordinatorTargets"'));
 assert.ok(app.includes('type: "selectCoordinatorTarget"'));
-assert.ok(app.includes("Manager verified · callback unavailable"));
-assert.ok(app.includes("Manager verified · callback route pending"));
-assert.ok(app.includes("Manager identity, route and callback verified"));
+assert.ok(ext.includes('id="identity-manager-check"'));
+assert.ok(ext.includes('id="identity-route-check"'));
+assert.ok(ext.includes('id="identity-callback-check"'));
+assert.ok(ext.includes('id="identity-info"'));
+assert.ok(ext.includes('id="identity-window-id"'));
+assert.ok(ext.includes('id="identity-thread-id"'));
+assert.ok(app.includes("function setIdentityCheck(element, ready, label)"));
+assert.ok(app.includes('fullyReady ? "Manager coordination" : "Manager coordination needs attention"'));
+assert.ok(css.includes(".identity-info-panel"));
+assert.ok(!ext.includes('id="identity-alert-message"'), "raw identity text line must be removed");
+assert.ok(!app.includes("compactManagerIdentityReason"), "route identifiers must not be projected into the default banner");
+assert.ok(ext.includes('aria-label="Show manager route identifiers"'));
+assert.ok(app.includes("!elements.identityInfo.contains(event.target)"), "outside click must close manager route info");
+assert.ok(app.includes('event.key === "Escape"'), "Escape must close manager route info");
 
 // v0.6.9: Live Output presents the provider's terminal envelope as readable
 // sections and metrics. The opaque JSON is retained only in a collapsed raw

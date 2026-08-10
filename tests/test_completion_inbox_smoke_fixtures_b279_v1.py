@@ -456,12 +456,12 @@ def test_scenario_tool_error_current_bounded_fail_closed(tmp_path, monkeypatch):
     assert "database is locked" in result["stderr"]
 
 
-def test_scenario_tool_error_list_failure_silently_swallowed():
-    """Subtler current gap: when the LIST call returns (does not raise) with
-    a non-zero returncode and empty stdout, `_fetch_full_cards` never checks
-    the LIST result's returncode -- it just parses stdout ("" -> zero rows).
-    Result: a read-source outage on the LIST call is INDISTINGUISHABLE from
-    a genuinely empty queue. fetch_errors stays 0."""
+def test_scenario_tool_error_list_failure_is_visible_as_read_error():
+    """A LIST-call outage must not look like a genuinely empty queue.
+
+    ``fetch_errors`` remains SHOW-scoped for backward compatibility, while
+    the additive ``read_errors`` facet records each failed status bucket.
+    """
     def stub_list_tasks_fail(status="pending", topic=None, limit=80):
         return {"stdout": "", "returncode": 1, "stderr": "sqlite3.OperationalError: database is locked"}
 
@@ -475,7 +475,19 @@ def test_scenario_tool_error_list_failure_silently_swallowed():
     assert result["review_queue"] == []
     assert result["stale_processing"] == []
     assert result["runner_mismatch_warnings"] == []
-    assert result["counts"]["fetch_errors"] == 0  # <- the gap: this stays 0, not >0
+    assert result["counts"]["fetch_errors"] == 0
+    assert result["counts"]["read_errors"] == 4
+    assert {entry["scope"] for entry in result["read_errors"]} == {"list"}
+    assert {entry["error_kind"] for entry in result["read_errors"]} == {
+        "nonzero_returncode"
+    }
+    assert {
+        entry["status"] for entry in result["read_errors"]
+    } == {"pending", "processing", "review", "blocked"}
+    assert all(
+        "database is locked" in entry["error_message"]
+        for entry in result["read_errors"]
+    )
 
 
 def test_scenario_tool_error_show_failure_is_recorded():

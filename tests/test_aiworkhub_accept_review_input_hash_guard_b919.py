@@ -27,6 +27,7 @@ predictably for the scenario under test.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -348,6 +349,40 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         adapter_builder=lambda **_k: None,
     )
     (tmp_path / "processes").mkdir(mode=0o700, exist_ok=True)
+    fixture_workspace = _FakeWorkspace(
+        repo=repo,
+        request_id=request_id,
+        path=workspace_dir,
+        home=workspace_dir,
+    )
+    artifact_receipt = manager._persist_attempt_artifacts(
+        request_id,
+        {
+            "task_id": task_id,
+            "runner": runner,
+            "topic": topic,
+            "adapter_id": "claude_cli",
+            "model": "claude_cli",
+            "stdout_path": str(tmp_path / "processes" / f"{request_id}.stdout.log"),
+            "workspace": fixture_workspace.as_metadata(),
+        },
+        fixture_workspace,
+        target_state="review_ready",
+        changed_paths=[output_relative],
+        changed_path_hashes={
+            output_relative: hashlib.sha256(output_bytes).hexdigest(),
+        },
+        review={"kind": "test_fixture"},
+    )
+    card["terminal_review"]["evidence"].update({
+        "attempt_artifact_manifest": artifact_receipt,
+        "evidence_record": manager._canonical_outcome_evidence(
+            request_id,
+            artifact_receipt,
+            level=process_launcher.evidence_levels.EvidenceLevel.STATIC_EVIDENCE,
+            message="Canonical stale-input test fixture evidence.",
+        ),
+    })
     manager._append_event({
         "request_id": request_id,
         "task_id": task_id,
@@ -633,3 +668,115 @@ def test_accept_review_rejects_caller_supplied_reviewer_identity(
     assert combined_calls == []
     assert promote_calls == []
     assert accept_review_calls == []
+
+
+def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (
+        manager, card, request_id, task_id, runner, topic, repo,
+        workspace_dir, promote_calls, accept_review_calls,
+    ) = _fixture(monkeypatch, tmp_path)
+    reviewer_request_id = "review-request-accepted"
+    reviewer_task_id = "REVIEW_TASK_ACCEPTED"
+    receipt = {
+        "schema_id": process_launcher.quality_reviewer.RECEIPT_SCHEMA_ID,
+        "packet_sha256": "a" * 64,
+        "target": {
+            "request_id": request_id,
+            "task_id": task_id,
+            "claim_epoch": 0,
+        },
+        "reviewer": {
+            "request_id": reviewer_request_id,
+            "task_id": reviewer_task_id,
+            "provider": "deepseek_v4pro",
+        },
+        "report": {
+            "lens": "correctness",
+            "provider": "deepseek_v4pro",
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings": [],
+        },
+        "authority": {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+    }
+    reviewer_card = {
+        "task_id": reviewer_task_id,
+        "topic": "quality_review",
+        "status": "finished",
+        "worker_status": "done",
+        "accepted_request_id": reviewer_request_id,
+        "terminal_review": {
+            "evidence": {"quality_review_receipt": copy.deepcopy(receipt)}
+        },
+        "accept_evidence": {"quality_review_receipt": copy.deepcopy(receipt)},
+    }
+
+    def show(task_id_arg: str) -> dict:
+        selected = reviewer_card if task_id_arg == reviewer_task_id else card
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(selected),
+            "stderr": "",
+        }
+
+    manager._show_task = show
+    manager._append_event({
+        "request_id": reviewer_request_id,
+        "task_id": reviewer_task_id,
+        "runner": "reviewer",
+        "topic": "quality_review",
+        "adapter_id": "deepseek_v4pro",
+        "state": "accepted",
+        "accepted": True,
+        "quality_review_receipt": receipt,
+    })
+    monkeypatch.setattr(
+        process_launcher,
+        "create_combined_validation_workspace",
+        lambda workspace, _card, changed: (
+            workspace,
+            {
+                "schema_id": "aiworkhub.combined_tree.v1",
+                "candidate_paths": list(changed),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        process_launcher.quality_evidence,
+        "run_completion_quality_gate",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "blocking_checks": [],
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "disposition_reviewer_children",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "stdout": json.dumps({"finalized": []}),
+        },
+    )
+
+    result = manager.accept_review(
+        request_id,
+        task_id,
+        requested_risk_tier="medium",
+        reviewer_request_ids=[reviewer_request_id],
+    )
+
+    assert result["ok"] is True
+    assert promote_calls == [["out/result.txt"]]
+    assert len(accept_review_calls) == 1
+    assert result["reviewer_finalization"] == [{
+        "task_id": reviewer_task_id,
+        "finished": True,
+        "cleanup_error": "",
+    }]

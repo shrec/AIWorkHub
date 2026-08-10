@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.39";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.40";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -189,6 +189,8 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
   "requestKb",
   "requestNeedfix",
   "requestNeedfixDetail",
+  "requestRoadmap",
+  "requestRoadmapDetail",
   "needfixCapture",
   "needfixUpdate",
   "needfixTransition",
@@ -235,6 +237,8 @@ const OUTBOUND_TYPES = Object.freeze({
   needfix: "needfix",
   needfixDetail: "needfixDetail",
   needfixAction: "needfixAction",
+  roadmap: "roadmap",
+  roadmapDetail: "roadmapDetail",
   settings: "settings",
 });
 
@@ -294,6 +298,10 @@ const VSCODE_LM_MAX_AGENT_TURNS = 24;
 const VSCODE_LM_MAX_TOOL_TURNS = 16;
 const VSCODE_LM_MAX_POST_SOURCE_TURNS = 12;
 const VSCODE_LM_MAX_FINALIZATION_TURNS = 4;
+// A reviewer has one bounded job: submit one authenticated receipt. Three
+// turns allow an optional Source Graph lookup and one transient submit retry
+// without paying for the generic 24-turn coding-agent loop.
+const VSCODE_LM_MAX_QUALITY_REVIEW_TURNS = 3;
 const VSCODE_LM_MAX_EMULATED_RESPONSE_BYTES = 256 * 1024;
 const VSCODE_LM_MAX_EMULATED_TOOL_INPUT_BYTES = 16 * 1024;
 const VSCODE_LM_REQUEST_ID_RE = /^[a-f0-9]{32}$/;
@@ -325,6 +333,11 @@ const NEEDFIX_TOOLS = Object.freeze({
   convertCommit: "aiworkhub_dashboard_needfix_convert_commit",
 });
 const NEEDFIX_ID_RE = /^NF-\d{4}-\d{5}$/;
+const ROADMAP_TOOLS = Object.freeze({
+  list: "aiworkhub_dashboard_roadmap_list",
+  detail: "aiworkhub_dashboard_roadmap_detail",
+});
+const ROADMAP_ID_RE = /^RM-\d{4}-\d{5}$/;
 const SOURCE_GRAPH_SETTINGS_UPDATE_TOOL = "aiworkhub_dashboard_source_graph_settings_update";
 const FEATURE_SETTING_KEYS = new Set([
   "source_graph",
@@ -1497,7 +1510,10 @@ function extractToolResult(result) {
 // the final extension-host -> Webview boundary.
 function sanitizeWebviewPayload(value) {
   if (typeof value === "string") {
-    return value.replace(/(^|[\s("'=])\/[^\s"'<>|)]+/g, "$1<redacted-host-path>");
+    return value
+      .replace(/(^|[\s("'=])\/[^\s"'<>|)]+/g, "$1<redacted-host-path>")
+      .replace(/(^|[\s("'=])[A-Za-z]:[\\/][^\s"'<>|)]+/g, "$1<redacted-host-path>")
+      .replace(/(^|[\s("'=])\\\\[^\\\s"'<>|)]+\\[^\s"'<>|)]+/g, "$1<redacted-host-path>");
   }
   if (Array.isArray(value)) {
     return value.map((item) => sanitizeWebviewPayload(item));
@@ -1595,6 +1611,29 @@ class McpStdioClient {
       this.runtimeRepairAttempts = 0;
       this.runtimeRepairBlockedReason = "";
     }
+  }
+
+  async replaceForExplicitRecovery() {
+    this.beginExplicitRecovery();
+    const priorStartup = this.startingPromise;
+    const priorPid = this.lifecyclePid;
+    this.outputChannel.appendLine(
+      `[mcp] explicit retry replacing window-owned child phase=child_replacement pid=${priorPid || 0}`,
+    );
+    this.stop({ restart: true });
+    // stop() rejects every request owned by the prior child. Join the prior
+    // startup promise before spawning so a late Python preflight/handshake
+    // cannot publish a second child after the explicit replacement.
+    if (priorStartup) {
+      try { await priorStartup; } catch (_err) { /* replacement owns recovery */ }
+    }
+    await this.ensureStarted();
+    return {
+      replaced: true,
+      prior_pid: priorPid || 0,
+      child_pid: this.lifecyclePid || 0,
+      phase: "ready",
+    };
   }
 
   _clearRecoveryTimer() {
@@ -1847,11 +1886,15 @@ class McpStdioClient {
   }
 
   async _handshake() {
-    await this.request("initialize", {
-      protocolVersion: MCP_PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: { name: "aiworkhub-vscode", version: installedExtensionVersion() },
-    });
+    try {
+      await this.request("initialize", {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "aiworkhub-vscode", version: installedExtensionVersion() },
+      });
+    } catch (err) {
+      throw new Error(`mcp_initialize_failed:${sanitizeErrorMessage(err)}`);
+    }
     this.notify("notifications/initialized", {});
     this.initialized = true;
     // Version/capability convergence is checked by _startWithVersionRepair()
@@ -1874,12 +1917,21 @@ class McpStdioClient {
     try {
       const listed = await this.request("tools/list", {});
       tools = Array.isArray(listed && listed.tools) ? listed.tools : [];
-      health = extractToolResult(await this.request("tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} }));
     } catch (err) {
       this.outputChannel.appendLine(
-        `[mcp] preflight failed error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
+        `[mcp] preflight failed phase=tools_list error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
       );
-      throw new Error(`mcp_health_preflight_failed:${sanitizeErrorMessage(err)}`);
+      throw new Error(`mcp_tools_list_failed:${sanitizeErrorMessage(err)}`);
+    }
+    try {
+      health = extractToolResult(await this.request(
+        "tools/call", { name: DASHBOARD_TOOLS.health, arguments: {} },
+      ));
+    } catch (err) {
+      this.outputChannel.appendLine(
+        `[mcp] preflight failed phase=dashboard_health error=${sanitizeErrorMessage(err)} duration_ms=${Date.now() - startedAt}`,
+      );
+      throw new Error(`mcp_dashboard_health_failed:${sanitizeErrorMessage(err)}`);
     }
     const names = new Set(tools.map((tool) => String((tool && tool.name) || "")));
     const missing = EXPECTED_DASHBOARD_TOOL_NAMES.filter((name) => !names.has(name));
@@ -2813,6 +2865,34 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
   },
 ]);
 
+const VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES = Object.freeze(new Set([
+  "aiworkhub_manager_source_graph_query",
+  "aiworkhub_manager_quality_review_submit",
+]));
+
+function vscodeLmToolsForRequest(request, sourceGraphAcknowledged) {
+  const available = sourceGraphAcknowledged
+    ? VSCODE_LM_PRIVATE_TOOLS
+    : [VSCODE_LM_PRIVATE_TOOLS[0]];
+  if (!request || request.request_kind !== "quality_review") return available;
+  return available.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
+}
+
+function completedQualityReviewResponse(request, toolName, result) {
+  if (!request || request.request_kind !== "quality_review" ||
+      toolName !== "aiworkhub_manager_quality_review_submit" ||
+      !result || result.ok !== true || result.durable !== true ||
+      typeof result.submission_id !== "string" || !/^[0-9a-f]{64}$/.test(result.submission_id)) {
+    return null;
+  }
+  return JSON.stringify({
+    schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${result.submission_id}`,
+    edits: [],
+    creates: [],
+  });
+}
+
 function languageModelTextPart(value) {
   return typeof vscode.LanguageModelTextPart === "function" ? new vscode.LanguageModelTextPart(String(value)) : { value: String(value) };
 }
@@ -3103,16 +3183,26 @@ function validateVscodeLmFinalEnvelope(envelope, allowedWrites, pathContracts = 
   return "";
 }
 
-function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false, pathContracts = {}) {
-  const toolNames = VSCODE_LM_PRIVATE_TOOLS.map((tool) => tool.name);
-  return `${glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts)}\n` +
+function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false, pathContracts = {}, requestKind = "worker") {
+  const qualityReview = requestKind === "quality_review";
+  const toolNames = (qualityReview
+    ? VSCODE_LM_PRIVATE_TOOLS.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name))
+    : VSCODE_LM_PRIVATE_TOOLS).map((tool) => tool.name);
+  const basePrompt = qualityReview
+    ? `${prompt}\n\nAIWorkHub quality-review contract:\n` +
+      `- You MUST finish by calling aiworkhub_manager_quality_review_submit exactly once.\n` +
+      `- Do not output a coding edit envelope, prose-only verdict, or simulated tool receipt.\n`
+    : glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts);
+  return `${basePrompt}\n` +
     `This provider does not expose native tool calling. Use the strict JSON transport below.\n` +
     `The absence of native toolCalling does not mean tools are unavailable: the AIWorkHub tools listed below remain callable through this strict JSON bridge, so never report that MCP/callable tools are missing while that list is present.\n` +
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
       : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
     `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"aiworkhub_manager_source_graph_query","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
-    `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n` +
+    (qualityReview
+      ? `- The only successful terminal action is an authenticated aiworkhub_manager_quality_review_submit request.\n`
+      : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
     `- Never wrap JSON in Markdown or add prose.`;
 }
@@ -3407,7 +3497,13 @@ async function runVscodeLmTextProtocol(
     sourceGraphAcknowledged = true;
   }
   const messages = [vscode.LanguageModelChatMessage.User(
-      glmTextToolProtocolPrompt(request.prompt, request.allowedWrites, sourceGraphAcknowledged, request.path_contracts) +
+      glmTextToolProtocolPrompt(
+        request.prompt,
+        request.allowedWrites,
+        sourceGraphAcknowledged,
+        request.path_contracts,
+        request.request_kind,
+      ) +
       (sourceGraphAcknowledged
         ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
         : ""),
@@ -3419,7 +3515,16 @@ async function runVscodeLmTextProtocol(
   let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
-    if (sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
+    if (request.request_kind === "quality_review" &&
+        postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
+      throw vscodeLmProtocolFailure(
+        "vscode_lm_quality_review_submit_required",
+        protocolTrace,
+        lastProtocolPreview,
+      );
+    }
+    if (request.request_kind !== "quality_review" &&
+        sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
       forceFinal = true;
     }
     if (forceFinal) {
@@ -3444,6 +3549,12 @@ async function runVscodeLmTextProtocol(
       assertRequestActive();
     } catch (err) {
       if (String(err && err.message || err) !== "vscode_lm_empty_response") throw err;
+      if (request.request_kind === "quality_review") {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          [{ turn, phase: "review_submit", outcome: "empty" }],
+        );
+      }
       messages.push(vscode.LanguageModelChatMessage.User(
         forceFinal
           ? `The previous provider turn contained no text. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`
@@ -3466,6 +3577,13 @@ async function runVscodeLmTextProtocol(
     } catch (err) {
       lastProtocolPreview = String((err && err.protocolPreview) || text || "");
       protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: sanitizeErrorMessage(err) });
+      if (request.request_kind === "quality_review") {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          protocolTrace,
+          lastProtocolPreview,
+        );
+      }
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
       messages.push(vscode.LanguageModelChatMessage.User(
         forceFinal
@@ -3477,6 +3595,13 @@ async function runVscodeLmTextProtocol(
     }
     if (envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V2 || envelope.schema_id === VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
+      if (request.request_kind === "quality_review") {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          [{ turn, phase: "review_submit", outcome: "edit_or_prose_instead_of_submit" }],
+          text,
+        );
+      }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
@@ -3503,7 +3628,7 @@ async function runVscodeLmTextProtocol(
     if (envelope.schema_id !== VSCODE_LM_TOOL_REQUEST_SCHEMA) {
       throw new Error("vscode_lm_text_protocol_schema_mismatch");
     }
-    const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
+    const availableTools = vscodeLmToolsForRequest(request, sourceGraphAcknowledged);
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
     if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
@@ -3537,6 +3662,11 @@ async function runVscodeLmTextProtocol(
       throw new Error("vscode_lm_tool_input_too_large");
     }
     let result;
+    let toolFailureReported = false;
+    const toolStartedAt = Date.now();
+    if (typeof onToolTurn === "function") {
+      try { onToolTurn(envelope.name, { tool_state: "started" }); } catch (_err) { /* liveness only */ }
+    }
     try {
       assertRequestActive();
       result = await raceVscodeLmCancellation(
@@ -3547,13 +3677,35 @@ async function runVscodeLmTextProtocol(
     } catch (err) {
       if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
       result = { ok: false, error: sanitizeErrorMessage(err) };
+      if (typeof onToolTurn === "function") {
+        try {
+          onToolTurn(envelope.name, {
+            tool_state: "failed",
+            elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
+            error_code: sanitizeErrorMessage(err).slice(0, 256),
+            timeout_phase: String((err && err.mcpDiagnostics && err.mcpDiagnostics.phase) || "").slice(0, 80),
+            timeout_ms: Number((err && err.mcpDiagnostics && err.mcpDiagnostics.timeout_ms) || 0),
+          });
+        } catch (_err) { /* liveness only */ }
+      }
+      toolFailureReported = true;
     }
     if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
-    if (typeof onToolTurn === "function") {
-      try { onToolTurn(envelope.name); } catch (_err) { /* liveness only */ }
+    if (typeof onToolTurn === "function" && !toolFailureReported) {
+      try {
+        onToolTurn(envelope.name, {
+          tool_state: result && result.ok === false ? "failed" : "completed",
+          elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
+          error_code: result && result.ok === false
+            ? sanitizeErrorMessage(result.error || result.reason || "tool_result_not_ok").slice(0, 256)
+            : "",
+        });
+      } catch (_err) { /* liveness only */ }
     }
+    const completedReview = completedQualityReviewResponse(request, envelope.name, result);
+    if (completedReview) return completedReview;
     protocolTrace.push({ turn, phase: "work", outcome: `tool:${envelope.name}` });
     messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
     messages.push(vscode.LanguageModelChatMessage.User(JSON.stringify({
@@ -3586,8 +3738,14 @@ async function runVscodeLmAgent(
     throwIfVscodeLmCancelled(cancellationToken);
   };
   const initialSourceGraphResult = request.initial_source_graph_result || null;
+  const qualityReview = request.request_kind === "quality_review";
+  const agentPrompt = qualityReview
+    ? `${request.prompt}\n\nAIWorkHub quality-review contract:\n` +
+      `- You MUST finish by calling aiworkhub_manager_quality_review_submit exactly once.\n` +
+      `- Do not output a coding edit envelope, prose-only verdict, or simulated tool receipt.`
+    : glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts);
   const messages = [vscode.LanguageModelChatMessage.User(
-    glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts) +
+    agentPrompt +
     (initialSourceGraphResult
       ? `\nINITIAL_SOURCE_GRAPH_RESULT:${JSON.stringify(initialSourceGraphResult)}`
       : ""),
@@ -3601,6 +3759,13 @@ async function runVscodeLmAgent(
   let lastProtocolPreview = "";
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
+    if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
+      throw vscodeLmProtocolFailure(
+        "vscode_lm_quality_review_submit_required",
+        protocolTrace,
+        lastProtocolPreview,
+      );
+    }
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
         !forceFinal) {
@@ -3618,13 +3783,17 @@ async function runVscodeLmAgent(
       finalizationTurns += 1;
     }
     const startedWithSourceGraph = sourceGraphAcknowledged;
-    const availableTools = sourceGraphAcknowledged ? VSCODE_LM_PRIVATE_TOOLS : [VSCODE_LM_PRIVATE_TOOLS[0]];
+    const availableTools = vscodeLmToolsForRequest(request, sourceGraphAcknowledged);
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
     };
     if (!forceFinal) {
       options.tools = availableTools;
-      options.toolMode = sourceGraphAcknowledged ? vscode.LanguageModelChatToolMode.Auto : vscode.LanguageModelChatToolMode.Required;
+      options.toolMode = qualityReview
+        ? vscode.LanguageModelChatToolMode.Required
+        : sourceGraphAcknowledged
+          ? vscode.LanguageModelChatToolMode.Auto
+          : vscode.LanguageModelChatToolMode.Required;
     }
     assertRequestActive();
     const response = await raceVscodeLmCancellation(
@@ -3654,6 +3823,17 @@ async function runVscodeLmAgent(
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const text = textParts.join("").trim();
+      if (qualityReview) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_quality_review_submit_required",
+          [{
+            turn,
+            phase: "review_submit",
+            outcome: text ? "text_instead_of_submit" : "empty",
+          }],
+          text,
+        );
+      }
       if (!text) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
         messages.push(vscode.LanguageModelChatMessage.User(
@@ -3711,6 +3891,11 @@ async function runVscodeLmAgent(
     const results = [];
     for (const call of calls) {
       let result;
+      let toolFailureReported = false;
+      const toolStartedAt = Date.now();
+      if (typeof onToolTurn === "function") {
+        try { onToolTurn(call.name, { tool_state: "started" }); } catch (_err) { /* liveness only */ }
+      }
       try {
         assertRequestActive();
         result = await raceVscodeLmCancellation(
@@ -3720,13 +3905,35 @@ async function runVscodeLmAgent(
       } catch (err) {
         if (String(err && err.message || err) === "vscode_lm_request_cancelled") throw err;
         result = { ok: false, error: sanitizeErrorMessage(err) };
+        if (typeof onToolTurn === "function") {
+          try {
+            onToolTurn(call.name, {
+              tool_state: "failed",
+              elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
+              error_code: sanitizeErrorMessage(err).slice(0, 256),
+              timeout_phase: String((err && err.mcpDiagnostics && err.mcpDiagnostics.phase) || "").slice(0, 80),
+              timeout_ms: Number((err && err.mcpDiagnostics && err.mcpDiagnostics.timeout_ms) || 0),
+            });
+          } catch (_err) { /* liveness only */ }
+        }
+        toolFailureReported = true;
       }
       if (call.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
         sourceGraphAcknowledged = true;
       }
-      if (typeof onToolTurn === "function") {
-        try { onToolTurn(call.name); } catch (_err) { /* liveness only */ }
+      if (typeof onToolTurn === "function" && !toolFailureReported) {
+        try {
+          onToolTurn(call.name, {
+            tool_state: result && result.ok === false ? "failed" : "completed",
+            elapsed_ms: Math.max(0, Date.now() - toolStartedAt),
+            error_code: result && result.ok === false
+              ? sanitizeErrorMessage(result.error || result.reason || "tool_result_not_ok").slice(0, 256)
+              : "",
+          });
+        } catch (_err) { /* liveness only */ }
       }
+      const completedReview = completedQualityReviewResponse(request, call.name, result);
+      if (completedReview) return completedReview;
       results.push(languageModelToolResultPart(call.callId, result));
     }
     toolTurns += 1;
@@ -4042,7 +4249,16 @@ class VscodeLmBridgeHost {
         } catch (_err) { /* progress is advisory, never completion */ }
       };
       writeProgress("request_accepted");
-      const onToolTurn = (toolName) => writeProgress("tool_turn", { tool_name: String(toolName || "").slice(0, 200) });
+      const onToolTurn = (toolName, details = {}) => writeProgress("tool_turn", {
+        tool_name: String(toolName || "").slice(0, 200),
+        tool_state: ["started", "completed", "failed"].includes(String(details.tool_state || ""))
+          ? String(details.tool_state)
+          : "started",
+        elapsed_ms: Math.max(0, Math.min(Number(details.elapsed_ms || 0), 86_400_000)),
+        error_code: String(details.error_code || "").slice(0, 256),
+        timeout_phase: String(details.timeout_phase || "").slice(0, 80),
+        timeout_ms: Math.max(0, Math.min(Number(details.timeout_ms || 0), 86_400_000)),
+      });
       const onProviderPart = () => writeProgress("provider_response", {}, 2000);
       const remainingMs = Math.max(1, Date.parse(String(request.deadline)) - Date.now());
       deadlineTimer = setTimeout(() => {
@@ -5128,7 +5344,58 @@ function materializePathMuxShim(stableLauncher, options = {}) {
         : ""
     );
     if (nativeLauncher && fs.existsSync(nativeLauncher)) {
-      fs.copyFileSync(nativeLauncher, shim);
+      try {
+        fs.copyFileSync(nativeLauncher, shim);
+      } catch (copyError) {
+        if (!copyError || copyError.code !== "EPERM") throw copyError;
+        // Some validation/AppContainer policies deny copy_file-range style
+        // operations while allowing ordinary process-owned reads, writes and
+        // renames in the exact extension storage directory. Keep the fallback
+        // byte-exact, same-directory and fail-closed; never widen authority or
+        // fall back to a host-global temporary directory.
+        const sourceBytes = fs.readFileSync(nativeLauncher);
+        const tempShim = `${shim}.tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+        let fallbackInstalled = false;
+        try {
+          fs.writeFileSync(tempShim, sourceBytes, { flag: "wx", mode: 0o700 });
+          const stagedBytes = fs.readFileSync(tempShim);
+          if (!Buffer.isBuffer(stagedBytes) || !stagedBytes.equals(sourceBytes)) {
+            const error = new Error("native_mux_fallback_staging_hash_mismatch");
+            error.code = "AIWORKHUB_COPY_VERIFY_FAILED";
+            throw error;
+          }
+          fs.rmSync(shim, { force: true });
+          fs.renameSync(tempShim, shim);
+          fallbackInstalled = true;
+          const installedBytes = fs.readFileSync(shim);
+          if (!Buffer.isBuffer(installedBytes) || !installedBytes.equals(sourceBytes)) {
+            const error = new Error("native_mux_fallback_install_hash_mismatch");
+            error.code = "AIWORKHUB_COPY_VERIFY_FAILED";
+            throw error;
+          }
+        } catch (fallbackError) {
+          const cleanupErrors = [];
+          try {
+            fs.rmSync(tempShim, { force: true });
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+          if (fallbackInstalled) {
+            try {
+              fs.rmSync(shim, { force: true });
+            } catch (cleanupError) {
+              cleanupErrors.push(cleanupError);
+            }
+          }
+          if (cleanupErrors.length) {
+            throw new AggregateError(
+              [fallbackError, ...cleanupErrors],
+              "native_mux_fallback_cleanup_failed",
+            );
+          }
+          throw fallbackError;
+        }
+      }
       const pythonTarget = path.join(path.dirname(stableLauncher), "aiworkhub-app-server-mux.py");
       fs.writeFileSync(`${shim}.target`, `${pythonTarget}\r\n`, "utf8");
     } else {
@@ -6041,6 +6308,46 @@ async function pushNeedfixDetail(view, needfixId) {
   }
 }
 
+async function pushRoadmapList(view, filters = {}) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(ROADMAP_TOOLS.list, {
+      status: String(filters.status || "").slice(0, 40) || null,
+      include_archived: Boolean(filters.includeArchived),
+      limit: 200,
+      offset: 0,
+    });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.roadmap, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.roadmap,
+      payload: { ok: false, error: sanitizeErrorMessage(err), entries: [] },
+    });
+  }
+}
+
+async function pushRoadmapDetail(view, roadmapId) {
+  try {
+    const client = getMcpClient();
+    view.bindClient(client);
+    const payload = await client.callTool(ROADMAP_TOOLS.detail, {
+      roadmap_id: roadmapId,
+      event_limit: 50,
+    });
+    if (view.stillBoundTo(client)) {
+      view.postMessage({ type: OUTBOUND_TYPES.roadmapDetail, payload: sanitizeWebviewPayload(payload) });
+    }
+  } catch (err) {
+    view.postMessage({
+      type: OUTBOUND_TYPES.roadmapDetail,
+      payload: { ok: false, error: sanitizeErrorMessage(err) },
+    });
+  }
+}
+
 async function runNeedfixAction(view, action, args) {
   const tool = NEEDFIX_TOOLS[action];
   if (!tool) return;
@@ -6690,11 +6997,17 @@ function handleInboundMessage(view, message) {
       break;
     case "retry": {
       const client = getMcpClient();
-      client.beginExplicitRecovery();
       runBackgroundTask("dashboard retry", async () => {
-        // Retry both transport data and the runtime repair state machine.
-        // Previously only snapshot was retried, leaving runtimeInfo frozen at
-        // the first failed repair forever even after the child recovered.
+        // Explicit Retry replaces this window's exact child even when the
+        // old process still looks initialized. Reusing cached preflight from
+        // a nonresponsive child kept one window permanently offline while a
+        // second window on the same machine worked normally.
+        try {
+          await client.replaceForExplicitRecovery();
+        } catch (_err) {
+          // pushRuntimeInfo renders the phase-specific startup failure and
+          // owns the bounded repair accounting.
+        }
         await pushRuntimeInfo(view);
         await pushSnapshot(view);
       });
@@ -6779,6 +7092,17 @@ function handleInboundMessage(view, message) {
     case "requestNeedfixDetail": {
       const needfixId = String(message.needfixId || "");
       if (NEEDFIX_ID_RE.test(needfixId)) pushNeedfixDetail(view, needfixId);
+      break;
+    }
+    case "requestRoadmap":
+      pushRoadmapList(view, {
+        status: message.status,
+        includeArchived: message.includeArchived,
+      });
+      break;
+    case "requestRoadmapDetail": {
+      const roadmapId = String(message.roadmapId || "");
+      if (ROADMAP_ID_RE.test(roadmapId)) pushRoadmapDetail(view, roadmapId);
       break;
     }
     case "needfixCapture":
@@ -7053,6 +7377,12 @@ function getHtmlForWebview(webview, extensionUri) {
         <span class="header-insight-detail" id="header-needfix-detail">No entries</span>
       </button>
 
+      <button class="header-insight-card" id="header-roadmap" type="button" title="Open repository Roadmap outcomes and Task-DAG links">
+        <span class="header-storage-label">Roadmap</span>
+        <strong id="header-roadmap-value">—</strong>
+        <span class="header-insight-detail" id="header-roadmap-detail">No outcomes</span>
+      </button>
+
       <div class="header-insight-card" id="header-preflight" title="Unified repository, policy, Source Graph and provider preflight">
         <span class="header-storage-label">Preflight</span>
         <strong id="header-preflight-value">Checking</strong>
@@ -7121,8 +7451,29 @@ function getHtmlForWebview(webview, extensionUri) {
     </section>
 
     <section class="source-alert identity-alert" id="identity-alert" aria-live="polite" hidden>
-      <strong id="identity-alert-title">Manager identity</strong>
-      <span id="identity-alert-message"></span>
+      <strong id="identity-alert-title">Manager coordination</strong>
+      <div class="identity-status-list" aria-label="Manager coordination status">
+        <span class="identity-check" id="identity-manager-check">Manager</span>
+        <span class="identity-check" id="identity-route-check">Route</span>
+        <span class="identity-check" id="identity-callback-check">Callback</span>
+        <span class="identity-badge" id="identity-role-badge">role: unknown</span>
+        <span class="identity-badge" id="identity-provider-badge">provider: unknown</span>
+      </div>
+      <details class="identity-info" id="identity-info">
+        <summary class="identity-info-button" aria-label="Show manager route identifiers" title="Manager route details">i</summary>
+        <div class="identity-info-panel">
+          <strong>Manager route details</strong>
+          <dl>
+            <dt>Window ID</dt><dd id="identity-window-id">Not available</dd>
+            <dt>Thread ID</dt><dd id="identity-thread-id">Not available</dd>
+            <dt>Session ID</dt><dd id="identity-session-id">Not available</dd>
+            <dt>Route state</dt><dd id="identity-route-state">unknown</dd>
+            <dt>Callback state</dt><dd id="identity-callback-state">unknown</dd>
+            <dt>Repository ID</dt><dd id="identity-repo-id">Not available</dd>
+            <dt>Diagnostics</dt><dd id="identity-diagnostics">none</dd>
+          </dl>
+        </div>
+      </details>
     </section>
 
     <section class="callback-observability" id="callback-observability" aria-label="Callback delivery telemetry">
@@ -7150,6 +7501,9 @@ function getHtmlForWebview(webview, extensionUri) {
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-needfix" title="Open NeedFix inbox" aria-label="Open NeedFix inbox">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 4v1M5 5h14v16H5zM8 8h8M8 12h8"/></svg><span>NeedFix</span>
+        </button>
+        <button class="diagnostic-icon-button" type="button" id="open-roadmap" title="Open repository Roadmap" aria-label="Open repository Roadmap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg><span>Roadmap</span>
         </button>
         <button class="diagnostic-icon-button" type="button" id="open-operations" title="Open repository operations" aria-label="Open repository operations">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V11h3v8zm6 0V5h3v14zm6 0V8h3v11M2 21h20"/></svg><span>Operations</span>
@@ -7430,6 +7784,7 @@ function getHtmlForWebview(webview, extensionUri) {
       <select id="needfix-status-filter" aria-label="Filter NeedFix status"><option value="">All statuses</option><option value="captured">Captured</option><option value="triaged">Triaged</option><option value="accepted">Accepted</option><option value="deferred">Deferred</option><option value="rejected">Rejected</option><option value="duplicate">Duplicate</option><option value="task_planned">Task planned</option><option value="task_created">Task created</option><option value="resolved">Resolved</option></select>
       <select id="needfix-kind-filter" aria-label="Filter NeedFix kind"><option value="">All kinds</option><option value="bug">Bug</option><option value="improvement">Improvement</option><option value="idea">Idea</option><option value="technical_debt">Technical debt</option><option value="optimization">Optimization</option><option value="benchmark_gap">Benchmark gap</option><option value="documentation_drift">Documentation drift</option><option value="security_risk">Security risk</option><option value="investigation">Investigation</option><option value="roadmap_candidate">Roadmap candidate</option></select>
       <select id="needfix-severity-filter" aria-label="Filter NeedFix severity"><option value="">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+      <select id="needfix-sort" aria-label="Sort NeedFix entries"><option value="difficulty">Estimated difficulty: easy to hard</option><option value="severity">Impact: critical to low</option><option value="readiness">Readiness: high to low</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select>
       <label class="needfix-archived-toggle"><input id="needfix-include-archived" type="checkbox"> Archived</label>
       <button id="needfix-refresh" type="button">Refresh</button>
     </div>
@@ -7437,6 +7792,25 @@ function getHtmlForWebview(webview, extensionUri) {
       <div class="needfix-list" id="needfix-list" aria-live="polite"></div>
       <section class="needfix-detail" id="needfix-detail" aria-live="polite">
         <div class="panel-list-empty">Select a NeedFix entry</div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog class="diagnostic-dialog needfix-dialog" id="roadmap-dialog">
+    <div class="dialog-heading">
+      <div><h2>Roadmap</h2><span id="roadmap-summary">Durable outcomes between NeedFix and the Task DAG</span></div>
+      <button type="button" class="dialog-close" data-close-dialog="roadmap-dialog">Close</button>
+    </div>
+    <div class="needfix-toolbar">
+      <input id="roadmap-search" type="search" placeholder="Filter Roadmap outcomes" aria-label="Filter Roadmap outcomes">
+      <select id="roadmap-status-filter" aria-label="Filter Roadmap status"><option value="">All statuses</option><option value="proposed">Proposed</option><option value="approved">Approved</option><option value="in_progress">In progress</option><option value="blocked">Blocked</option><option value="deferred">Deferred</option><option value="completed">Completed</option></select>
+      <label class="needfix-archived-toggle"><input id="roadmap-include-archived" type="checkbox"> Archived</label>
+      <button id="roadmap-refresh" type="button">Refresh</button>
+    </div>
+    <div class="needfix-workspace">
+      <div class="needfix-list" id="roadmap-list" aria-live="polite"></div>
+      <section class="needfix-detail" id="roadmap-detail-panel" aria-live="polite">
+        <div class="panel-list-empty">Select a Roadmap outcome</div>
       </section>
     </div>
   </dialog>
@@ -8019,6 +8393,7 @@ module.exports = {
     _buildPreflightDiagnostic,
     getMcpClient,
     sanitizeErrorMessage,
+    sanitizeWebviewPayload,
     codexConfigTomlPath,
     resolveCodexConfigTomlPath,
     resolveExtensionRuntimeDir,

@@ -19,6 +19,8 @@ for (const id of [
 }
 
 assert(app.includes("function renderCallbackObservability(snapshot)"));
+assert(app.includes("health.current_delivery_error"));
+assert(app.includes("historical dead letters; latest terminal delivery recovered"));
 assert(app.includes("function renderReviewEvidence(evidence)"));
 assert(app.includes("returnPageSize: 20"));
 assert(app.includes("filtered.slice(start, start + state.returnPageSize)"));

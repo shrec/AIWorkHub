@@ -50,6 +50,24 @@ enough for a public claim.
 | Quality ratchet | Blocks new violation identities and configured no-net-growth overflow while grandfathering the baseline | missing baseline is non-green `not_configured` |
 | Prompt/bundle A/B | Accepts only matched model/adapter/task-family pairs with observed usage and preregistered metrics | incomplete/unobserved pairs are excluded |
 
+### Current risk and quality-ratchet state
+
+The checked risk corpus contains six explicitly adjudicated predicted
+candidates: four deterministic C++ fixture positives and two Python
+repository-observation false positives. Its current per-language buckets are
+therefore fixture/repository diagnostics, not a general defect-detection
+accuracy claim: C++ `crashes`, `looprisks`, `nullrisks`, and `rawptrs` each
+measure `1/1`, while Python `crashes` measures `0/2`. The zero-precision Python
+bucket is retained rather than hidden because it exposes lexical false
+positives that future extractor work must reduce. The machine-readable rows
+are in `.aiworkhub/risk-mode-adjudication.jsonl`.
+
+The quality-ratchet baseline is configured and currently **fails** rather than
+being silently rebased: `core.py`, `process_launcher.py`, and `extension.js`
+exceed their recorded no-net-growth ceilings. This is truthful technical-debt
+evidence for the authority-module decomposition roadmap; raising the ceilings
+would erase the signal without improving the code.
+
 ## Source Graph exact-symbol slice precision
 
 One deterministic noisy-file fixture contains 80 unrelated entry/helper call

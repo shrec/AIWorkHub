@@ -357,6 +357,17 @@ def _latest_progress_events(
             and phase
         ):
             event = {"sequence": sequence, "phase": phase[:80]}
+            for key, maximum in (
+                ("tool_name", 200), ("tool_state", 16),
+                ("error_code", 256), ("timeout_phase", 80),
+            ):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    event[key] = value[:maximum]
+            for key in ("elapsed_ms", "timeout_ms"):
+                value = payload.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    event[key] = max(0, min(value, 86_400_000))
             if not latest:
                 latest = event
             if phase in MEANINGFUL_PROGRESS_PHASES:
@@ -564,6 +575,8 @@ def supervise(spec: dict[str, Any]) -> int:
         last_meaningful_phase = "worker_started"
         last_progress_sequence = 0
         last_meaningful_progress_sequence = 0
+        last_progress_event: dict[str, Any] = {}
+        last_meaningful_progress_event: dict[str, Any] = {}
         next_heartbeat_monotonic = time.monotonic()
         _write_json_0600(status_path, {
             "state": "running",
@@ -583,6 +596,8 @@ def supervise(spec: dict[str, Any]) -> int:
             "last_meaningful_phase": last_meaningful_phase,
             "last_progress_sequence": last_progress_sequence,
             "last_meaningful_progress_sequence": last_meaningful_progress_sequence,
+            "last_progress_event": last_progress_event,
+            "last_meaningful_progress_event": last_meaningful_progress_event,
         })
         final_state = "exited"
         while True:
@@ -620,11 +635,13 @@ def supervise(spec: dict[str, Any]) -> int:
                 progress_sequence = int(progress.get("sequence") or 0)
                 if progress_sequence > last_progress_sequence:
                     last_progress_sequence = progress_sequence
+                    last_progress_event = progress
                 meaningful_sequence = int(meaningful_progress.get("sequence") or 0)
                 if meaningful_sequence > last_meaningful_progress_sequence:
                     last_meaningful_progress_epoch = time.time()
                     last_meaningful_phase = str(meaningful_progress["phase"])
                     last_meaningful_progress_sequence = meaningful_sequence
+                    last_meaningful_progress_event = meaningful_progress
                 observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
                 if observed_tokens is not None and observed_tokens != last_observed_tokens:
                     last_meaningful_progress_epoch = time.time()
@@ -667,6 +684,8 @@ def supervise(spec: dict[str, Any]) -> int:
                     "last_meaningful_progress_sequence": (
                         last_meaningful_progress_sequence
                     ),
+                    "last_progress_event": last_progress_event,
+                    "last_meaningful_progress_event": last_meaningful_progress_event,
                     "token_budget": supervisor_evidence(
                         token_state,
                         token_decisions,
@@ -712,6 +731,7 @@ def supervise(spec: dict[str, Any]) -> int:
         final_progress_sequence = int(final_progress.get("sequence") or 0)
         if final_progress_sequence > last_progress_sequence:
             last_progress_sequence = final_progress_sequence
+            last_progress_event = final_progress
         final_meaningful_sequence = int(
             final_meaningful_progress.get("sequence") or 0
         )
@@ -719,6 +739,7 @@ def supervise(spec: dict[str, Any]) -> int:
             last_meaningful_progress_epoch = time.time()
             last_meaningful_phase = str(final_meaningful_progress["phase"])
             last_meaningful_progress_sequence = final_meaningful_sequence
+            last_meaningful_progress_event = final_meaningful_progress
         final_observed_tokens = _usage_total_from_output(stdout_path, adapter_id)
         if (
             final_observed_tokens is not None
@@ -758,6 +779,8 @@ def supervise(spec: dict[str, Any]) -> int:
             "last_meaningful_phase": last_meaningful_phase,
             "last_progress_sequence": last_progress_sequence,
             "last_meaningful_progress_sequence": last_meaningful_progress_sequence,
+            "last_progress_event": last_progress_event,
+            "last_meaningful_progress_event": last_meaningful_progress_event,
             "token_budget": supervisor_evidence(
                 token_state,
                 token_decisions,

@@ -1122,11 +1122,20 @@ _TASK_PLAN_LIST_FIELDS: tuple[str, ...] = (
     "required_outputs",
     "forbidden",
     "validation",
+    "validation_roles",
     "read_first",
     "immutable_inputs",
     "depends_on",
 )
-_TASK_PLAN_STR_FIELDS: tuple[str, ...] = ("title", "objective", "runner", "topic", "task_type", "priority")
+_TASK_PLAN_STR_FIELDS: tuple[str, ...] = (
+    "title",
+    "objective",
+    "runner",
+    "topic",
+    "task_type",
+    "priority",
+    "work_kind",
+)
 _TASK_PLAN_BOOL_FIELDS: tuple[str, ...] = ("callback_required", "read_only")
 _TASK_PLAN_INT_FIELDS: tuple[str, ...] = ("max_live_tokens",)
 _TASK_PLAN_ALLOWED_FIELDS: frozenset[str] = frozenset(
@@ -1553,6 +1562,7 @@ def link_existing_task(
     finally:
         conn.close()
 
+
     try:
         task = get_task_fn(existing_task_id)
         if task is None:
@@ -1597,5 +1607,88 @@ def link_existing_task(
             "converted_task_id": existing_task_id,
             "already_converted": False,
         }
+    finally:
+        conn.close()
+
+
+def reopen_superseded_task_link(
+    repo_root: str | Path,
+    needfix_id: str,
+    *,
+    get_task_fn: Callable[[str], Mapping[str, Any] | None],
+    canonical_status_fn: Callable[[Mapping[str, Any]], str],
+    reason: str,
+) -> dict[str, Any]:
+    """Return a stale ``task_created`` NeedFix to ``accepted``.
+
+    This deliberately narrow manager reconciliation path is valid only when
+    the exact linked task still exists in the same canonical task store, is
+    archived, and carries ``archive_operation=superseded``. Active, reviewable,
+    failed-but-recoverable, missing, foreign, and accepted finished tasks all
+    fail closed. The stale link is cleared atomically and retained in the audit
+    event instead of being silently repointed.
+    """
+    note = str(reason or "").strip()
+    if not note:
+        raise NeedFixValidationError("reconciliation reason is required")
+    if len(note.encode("utf-8")) > 4_096:
+        raise NeedFixValidationError("reconciliation reason exceeds 4096 bytes")
+
+    conn = _connect(repo_root)
+    try:
+        row = conn.execute("SELECT * FROM needfix WHERE id = ?", (needfix_id,)).fetchone()
+        if row is None:
+            raise NeedFixNotFoundError(needfix_id)
+        if row["status"] != "task_created":
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} must be task_created for stale-link reconciliation "
+                f"(current status is {row['status']!r})"
+            )
+        linked_task_id = str(row["converted_task_id"] or "").strip()
+        if not linked_task_id:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} has no converted task link to reconcile"
+            )
+
+        task = get_task_fn(linked_task_id)
+        if task is None:
+            raise NeedFixValidationError(
+                f"linked task {linked_task_id!r} not found in this repository"
+            )
+        task_status = canonical_status_fn(task)
+        archive_operation = str(task.get("archive_operation") or "").strip()
+        if task_status != "archived" or archive_operation != "superseded":
+            raise NeedFixConflictError(
+                f"linked task {linked_task_id!r} is not an archived superseded task "
+                f"(canonical status={task_status!r}, archive_operation={archive_operation!r})"
+            )
+
+        now = _utcnow_iso()
+        cur = conn.execute(
+            "UPDATE needfix SET status = 'accepted', converted_task_id = NULL, "
+            "task_planned_at = NULL, updated_at = ? "
+            "WHERE id = ? AND status = 'task_created' AND converted_task_id = ?",
+            (now, needfix_id, linked_task_id),
+        )
+        if cur.rowcount != 1:
+            raise NeedFixConflictError(
+                f"needfix {needfix_id} changed during stale-link reconciliation"
+            )
+        _record_event(
+            conn,
+            needfix_id,
+            "superseded_task_link_reopened",
+            {
+                "prior_status": "task_created",
+                "prior_converted_task_id": linked_task_id,
+                "task_status": task_status,
+                "archive_operation": archive_operation,
+                "reason": note,
+            },
+        )
+        updated = conn.execute(
+            "SELECT * FROM needfix WHERE id = ?", (needfix_id,)
+        ).fetchone()
+        return _row_to_dict(updated)
     finally:
         conn.close()

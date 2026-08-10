@@ -247,9 +247,38 @@ def test_review_packet_many_nf3_hunks_stays_per_path_bounded(
     assert sum(segment["excerpt_bytes"] for segment in row["segments"]) == row[
         "excerpt_bytes"
     ]
+    assert len(row["segments"]) == changed_hunks
+    assert all(segment["changed_start_line"] > 0 for segment in row["segments"])
+    assert all(segment["baseline_start_line"] > 0 for segment in row["segments"])
     assert row["segments"][-1]["truncated"] is True
-    assert omitted >= changed_hunks - len(row["segments"])
     assert omitted > 0
+
+
+def test_review_packet_rejects_omitted_hunks_without_exact_range_metadata() -> None:
+    digest = hashlib.sha256(b"VALUE = 'new'\n").hexdigest()
+
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError,
+        match="invalid_candidate_source_evidence",
+    ):
+        quality_reviewer.build_review_packet(
+            request_id="target-request-1",
+            task_id="TARGET_TASK_1",
+            claim_epoch=1,
+            worker_provider="codex_cli",
+            changed_path_hashes={"module.py": digest},
+            source_evidence={
+                "module.py": {
+                    "candidate_sha256": digest,
+                    "excerpt": "",
+                    "excerpt_bytes": 0,
+                    "source_bytes": 14,
+                    "truncated": True,
+                    "segments": [],
+                    "omission_reason": "changed_hunks_omitted:1",
+                }
+            },
+        )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows forbids control characters in paths")

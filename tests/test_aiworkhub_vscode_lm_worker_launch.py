@@ -96,9 +96,24 @@ def test_three_lenses_reuse_one_preparation(manager):
 def test_prepared_packet_delivers_source_evidence_in_every_lens_prompt(manager):
     mgr, _candidate = manager
     packet = mgr._prepared_quality_review("req1", "task1")["prepared"]["packet"]
+    scoped = packet["candidate"]["scoped_audits"]
+    assert set(scoped) == {"correctness", "security", "code_quality"}
     for lens in ("correctness", "security", "code_quality"):
         prompt = quality_reviewer.build_review_prompt(packet, lens=lens)
         assert "candidate marker" in prompt
+        assert "active graph-scoped audit entry" in prompt
+        scope = scoped[lens]["packet"]
+        assert scope["review_lens"]["lens_kind"] == lens
+        assert scope["changed_paths"] == [
+            {
+                "path": "src/mod.py",
+                "change_kind": "added",
+                "line_start": 1,
+                "line_end": 1,
+            }
+        ]
+        assert scope["target_symbols"]
+        assert scoped[lens]["fingerprint"]
 
 
 def test_unreadable_candidate_fails_closed(manager):

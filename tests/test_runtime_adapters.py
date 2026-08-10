@@ -56,7 +56,6 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--output-format",
         "stream-json",
         "--verbose",
-        "--include-partial-messages",
         "--permission-mode",
         "dontAsk",
         "--allowedTools",
@@ -84,16 +83,33 @@ def test_claude_argv_is_current_noninteractive_shape(monkeypatch, tmp_path):
         "--model",
         "claude-sonnet-current",
     ]
-    assert "--cwd" not in plan.argv
-    assert plan.cwd == str(repo.resolve())
-    assert plan.executable == str(executable)
-    assert plan.launchable is True
-    assert plan.manual_only is False
-    assert plan.validation_ok is True
-    assert plan.validation_reason == ""
+
+
+def test_claude_partial_stream_is_opt_in_for_explicit_live_budget(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = _executable(tmp_path, "claude")
+    monkeypatch.setattr(runtime_adapters.shutil, "which", lambda _: str(executable))
+
+    compact = runtime_adapters.build_runtime_command("claude_cli", "Prompt", repo)
+    live_budget = runtime_adapters.build_runtime_command(
+        "claude_cli", "Prompt", repo, include_partial_messages=True
+    )
+
+    assert "--include-partial-messages" not in compact.argv
+    assert "--include-partial-messages" in live_budget.argv
+    assert "--cwd" not in compact.argv
+    assert compact.cwd == str(repo.resolve())
+    assert compact.executable == str(executable)
+    assert compact.launchable is True
+    assert compact.manual_only is False
+    assert compact.validation_ok is True
+    assert compact.validation_reason == ""
 
     with pytest.raises(FrozenInstanceError):
-        plan.cwd = "/different"  # type: ignore[misc]
+        compact.cwd = "/different"  # type: ignore[misc]
 
 
 def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
@@ -111,7 +127,6 @@ def test_claude_omits_model_when_not_requested(monkeypatch, tmp_path):
         "--output-format",
         "stream-json",
         "--verbose",
-        "--include-partial-messages",
         "--permission-mode",
         "dontAsk",
         "--allowedTools",

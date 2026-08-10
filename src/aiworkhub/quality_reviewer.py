@@ -6,6 +6,9 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from .evidence_levels import EvidenceLevel
+from .scoped_audit import ScopedAuditPacket, packet_fingerprint
+
 
 PACKET_SCHEMA_ID = "aiworkhub.quality_review_packet.v1"
 RECEIPT_SCHEMA_ID = "aiworkhub.quality_reviewer_receipt.v1"
@@ -16,6 +19,7 @@ MAX_TEXT_CHARS = 2_000
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_FINDING_CONFIDENCE = frozenset({"low", "medium", "high"})
 
 
 class ReviewerEvidenceError(ValueError):
@@ -61,6 +65,7 @@ def build_review_packet(
     mechanical_checks: Iterable[Mapping[str, Any]] = (),
     combined_tree_checks: Iterable[Mapping[str, Any]] = (),
     source_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+    scoped_audits: Mapping[str, Mapping[str, Any] | ScopedAuditPacket] | None = None,
 ) -> dict[str, Any]:
     """Build the only evidence packet an independent reviewer may receive.
 
@@ -147,6 +152,12 @@ def build_review_packet(
     candidate: dict[str, Any] = {"changed_paths": path_rows}
     if source_evidence is not None:
         candidate["source_evidence"] = _source_evidence_rows(source_evidence, path_rows)
+    if scoped_audits is not None:
+        candidate["scoped_audits"] = _scoped_audit_rows(
+            scoped_audits,
+            task_id=task_id,
+            changed_paths={row["path"] for row in path_rows},
+        )
     body = {
         "schema_id": PACKET_SCHEMA_ID,
         "target": {
@@ -250,20 +261,294 @@ def build_review_prompt(
     packet_digest = str(packet.get("packet_sha256") or "")
     if not _SHA256_RE.fullmatch(packet_digest) or _canonical_digest(packet_body) != packet_digest:
         raise ReviewerEvidenceError("review_packet_digest_invalid")
+    scoped_audits = (packet.get("candidate") or {}).get("scoped_audits")
+    active_scope = None
+    if scoped_audits is not None:
+        if not isinstance(scoped_audits, Mapping) or lens not in scoped_audits:
+            raise ReviewerEvidenceError("review_scope_lens_missing")
+        active_scope = scoped_audits[lens]
+        if not isinstance(active_scope, Mapping):
+            raise ReviewerEvidenceError("review_scope_invalid")
     encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    scope_instruction = (
+        "Use only the active graph-scoped audit entry for this lens as the "
+        "primary behavior boundary; treat its known_unknowns as explicit limits.\n"
+        if active_scope is not None
+        else ""
+    )
     return (
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
         "Inspect the exact candidate workspace and the deterministic packet below. "
         "You are intentionally not given the worker's rationale, self-verdict, or final answer. "
         "Do not write, edit, format, or delete repository files.\n"
-        "Report only concrete findings supported by file/line or check evidence. "
-        "Use severity critical, high, medium, or low. An empty findings list is valid.\n"
+        f"{scope_instruction}"
+        "Report only concrete items supported by file/line or check evidence. "
+        "Use severity critical, high, medium, or low. Candidate defects use "
+        "disposition=defect (the default). Positive confirmations use "
+        "disposition=observation and packet/tool limitations use "
+        "disposition=process_limit; both must be low severity and are retained "
+        "as non-actionable evidence. Every defect must identify an exact "
+        "packet-permitted path and line (path/line_start/line_end), or a "
+        "mechanical check_id. Include confidence, symbol, claim, reproduction "
+        "and required_validation when known; the submission tool derives and "
+        "caps the canonical evidence level. An empty findings list is valid.\n"
         f"Before finishing, call {submit_tool_name} exactly once with "
         f'packet_sha256="{packet_digest}", lens="{lens}", and your findings array.\n'
         "The tool call is the authoritative submission; prose is not evidence.\n"
         f"QUALITY_REVIEW_PACKET: {encoded}\n"
     )
+
+
+def normalize_packet_findings(
+    packet: Mapping[str, Any],
+    *,
+    lens: str,
+    findings: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Bind reviewer findings to exact paths/checks in one scoped packet.
+
+    A model cannot promote its own evidence level.  The strongest level this
+    boundary assigns is ``static_evidence`` for an exact packet-permitted
+    path/line or mechanical check.  Reproduction/tested levels require later
+    manager-observed execution and therefore cannot originate here.
+    """
+
+    candidate = packet.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise ReviewerEvidenceError("review_scope_missing")
+    scoped = candidate.get("scoped_audits")
+    if not isinstance(scoped, Mapping) or lens not in scoped:
+        raise ReviewerEvidenceError("review_scope_lens_missing")
+    wrapper = scoped[lens]
+    if not isinstance(wrapper, Mapping) or not isinstance(wrapper.get("packet"), Mapping):
+        raise ReviewerEvidenceError("review_scope_invalid")
+    scope = wrapper["packet"]
+    permitted_paths: set[str] = {
+        str(row.get("path") or "")
+        for row in scope.get("changed_paths") or []
+        if isinstance(row, Mapping)
+    }
+    for section in ("impact_evidence", "test_evidence", "contract_evidence"):
+        permitted_paths.update(
+            str(row.get("path") or "")
+            for row in scope.get(section) or []
+            if isinstance(row, Mapping)
+        )
+    permitted_paths.discard("")
+    permitted_checks = {
+        str(row.get("check_id") or "")
+        for section in ("mechanical_checks", "combined_tree_checks")
+        for row in packet.get(section) or []
+        if isinstance(row, Mapping)
+    }
+    permitted_checks.discard("")
+    permitted_symbols = {
+        str(row.get("qualified_name") or "")
+        for row in scope.get("target_symbols") or []
+        if isinstance(row, Mapping)
+    }
+    permitted_symbols.discard("")
+
+    rows = list(findings)
+    if len(rows) > 100:
+        raise ReviewerEvidenceError("review_findings_overflow")
+    normalized: list[dict[str, Any]] = []
+    for index, finding in enumerate(rows):
+        if not isinstance(finding, Mapping):
+            raise ReviewerEvidenceError(f"review_finding_{index}_not_object")
+        disposition = str(finding.get("disposition") or "defect")
+        severity = str(finding.get("severity") or "")
+        summary = str(finding.get("summary") or "").strip()
+        evidence = str(finding.get("evidence") or "").strip()
+        if not summary or not evidence:
+            raise ReviewerEvidenceError(f"review_finding_{index}_text_missing")
+
+        evidence_reference: dict[str, Any] | None = None
+        explicit_path = str(finding.get("path") or "")
+        explicit_check = str(finding.get("check_id") or "")
+        if explicit_path:
+            if explicit_path not in permitted_paths:
+                raise ReviewerEvidenceError(
+                    f"review_finding_{index}_path_out_of_scope"
+                )
+            line_start = finding.get("line_start")
+            line_end = finding.get("line_end", line_start)
+            if (
+                not isinstance(line_start, int)
+                or isinstance(line_start, bool)
+                or line_start < 1
+                or not isinstance(line_end, int)
+                or isinstance(line_end, bool)
+                or line_end < line_start
+            ):
+                raise ReviewerEvidenceError(
+                    f"review_finding_{index}_line_invalid"
+                )
+            evidence_reference = {
+                "kind": "source",
+                "path": explicit_path,
+                "line_start": line_start,
+                "line_end": line_end,
+            }
+        elif explicit_check:
+            if explicit_check not in permitted_checks:
+                raise ReviewerEvidenceError(
+                    f"review_finding_{index}_check_out_of_scope"
+                )
+            evidence_reference = {"kind": "check", "check_id": explicit_check}
+        else:
+            for path in sorted(permitted_paths, key=lambda value: (-len(value), value)):
+                match = re.search(
+                    rf"(?<![A-Za-z0-9_.-]){re.escape(path)}:(\d+)(?:-(\d+))?",
+                    evidence,
+                )
+                if match:
+                    start = int(match.group(1))
+                    end = int(match.group(2) or start)
+                    evidence_reference = {
+                        "kind": "source",
+                        "path": path,
+                        "line_start": start,
+                        "line_end": end,
+                    }
+                    break
+                if f"{path}::" in evidence:
+                    evidence_reference = {
+                        "kind": "test_target",
+                        "path": path,
+                    }
+                    break
+            if evidence_reference is None:
+                for check_id in sorted(permitted_checks):
+                    if check_id and check_id in evidence:
+                        evidence_reference = {
+                            "kind": "check",
+                            "check_id": check_id,
+                        }
+                        break
+
+        actionable = disposition == "defect"
+        if actionable and evidence_reference is None:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_exact_evidence_required"
+            )
+        derived_level = (
+            EvidenceLevel.STATIC_EVIDENCE
+            if evidence_reference is not None
+            else EvidenceLevel.OBSERVATION
+        )
+        requested_raw = finding.get("evidence_level")
+        if requested_raw in (None, ""):
+            evidence_level = derived_level
+        else:
+            try:
+                requested = (
+                    requested_raw
+                    if isinstance(requested_raw, EvidenceLevel)
+                    else EvidenceLevel[str(requested_raw).strip().upper()]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReviewerEvidenceError(
+                    f"review_finding_{index}_evidence_level_invalid"
+                ) from exc
+            evidence_level = min(requested, derived_level)
+        if severity in {"critical", "high"} and evidence_level < EvidenceLevel.STATIC_EVIDENCE:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_blocker_evidence_insufficient"
+            )
+
+        confidence = str(finding.get("confidence") or "")
+        if not confidence:
+            confidence = "medium" if evidence_reference is not None else "low"
+        if confidence not in _FINDING_CONFIDENCE:
+            raise ReviewerEvidenceError(
+                f"review_finding_{index}_confidence_invalid"
+            )
+        symbol = str(finding.get("symbol") or "")[:MAX_TEXT_CHARS]
+        if symbol and symbol not in permitted_symbols:
+            symbol = ""
+        normalized.append(
+            {
+                **dict(finding),
+                "disposition": disposition,
+                "summary": summary[:MAX_TEXT_CHARS],
+                "evidence": evidence[:MAX_TEXT_CHARS],
+                "evidence_reference": evidence_reference,
+                "evidence_level": evidence_level.name.lower(),
+                "confidence": confidence,
+                "symbol": symbol,
+                "claim": str(finding.get("claim") or summary)[:MAX_TEXT_CHARS],
+                "reproduction": str(finding.get("reproduction") or "")[:MAX_TEXT_CHARS],
+                "required_validation": str(
+                    finding.get("required_validation")
+                    or (
+                        "manager must independently validate this finding"
+                        if actionable
+                        else ""
+                    )
+                )[:MAX_TEXT_CHARS],
+            }
+        )
+    return normalized
+
+
+def _scoped_audit_rows(
+    values: Mapping[str, Mapping[str, Any] | ScopedAuditPacket],
+    *,
+    task_id: str,
+    changed_paths: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Validate and canonically embed one scoped packet per reviewer lens."""
+
+    if not isinstance(values, Mapping) or not values:
+        raise ReviewerEvidenceError("review_scope_missing")
+    result: dict[str, dict[str, Any]] = {}
+    for lens, value in sorted(values.items()):
+        if lens not in {"correctness", "security", "code_quality"}:
+            raise ReviewerEvidenceError("review_scope_lens_invalid")
+        if isinstance(value, ScopedAuditPacket):
+            payload = value.as_json()
+            fingerprint = packet_fingerprint(value)
+            schema_id = "aiworkhub.scoped_audit.v1"
+        elif isinstance(value, Mapping):
+            payload = value.get("packet")
+            fingerprint = str(value.get("fingerprint") or "")
+            schema_id = str(value.get("schema_id") or "")
+        else:
+            raise ReviewerEvidenceError("review_scope_invalid")
+        if schema_id != "aiworkhub.scoped_audit.v1" or not isinstance(payload, Mapping):
+            raise ReviewerEvidenceError("review_scope_schema_invalid")
+        if not _SHA256_RE.fullmatch(fingerprint):
+            raise ReviewerEvidenceError("review_scope_fingerprint_invalid")
+        calculated = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if calculated != fingerprint:
+            raise ReviewerEvidenceError("review_scope_fingerprint_invalid")
+        if payload.get("task_id") != task_id:
+            raise ReviewerEvidenceError("review_scope_task_mismatch")
+        review_lens = payload.get("review_lens")
+        if not isinstance(review_lens, Mapping) or review_lens.get("lens_kind") != lens:
+            raise ReviewerEvidenceError("review_scope_lens_mismatch")
+        scope_paths = {
+            str(row.get("path") or "")
+            for row in payload.get("changed_paths") or []
+            if isinstance(row, Mapping)
+        }
+        if scope_paths != changed_paths:
+            raise ReviewerEvidenceError("review_scope_changed_paths_mismatch")
+        result[lens] = {
+            "schema_id": schema_id,
+            "fingerprint": fingerprint,
+            "packet": dict(payload),
+        }
+    return result
 
 
 MAX_SOURCE_EVIDENCE_CHARS = 8_000
@@ -363,6 +648,17 @@ def _source_evidence_rows(
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         segments = segment_rows(row.get("segments"))
         omission_reason = str(row.get("omission_reason") or "")[:MAX_TEXT_CHARS]
+        if omission_reason.startswith("changed_hunks_omitted:"):
+            try:
+                omitted_hunks = int(omission_reason.split(":", 1)[1])
+            except (TypeError, ValueError) as exc:
+                raise ReviewerEvidenceError(
+                    "invalid_candidate_source_evidence"
+                ) from exc
+            if omitted_hunks < 1 or sum(
+                1 for segment in segments if segment["truncated"]
+            ) < omitted_hunks:
+                raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         if not excerpt and not omission_reason and not segments:
             raise ReviewerEvidenceError("invalid_candidate_source_evidence")
         result = {
@@ -393,5 +689,6 @@ __all__ = [
     "ReviewerEvidenceError",
     "build_review_packet",
     "build_review_prompt",
+    "normalize_packet_findings",
     "verify_reviewer_receipt",
 ]

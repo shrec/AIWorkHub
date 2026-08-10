@@ -30,6 +30,61 @@ class TaskPlanError(ValueError):
     """Raised for an invalid depends_on list or an illegal dependency edge."""
 
 
+def _superseded_replacement(card: dict[str, Any]) -> str:
+    """Return the explicit replacement id for one archived superseded card.
+
+    New cards persist ``superseded_by`` as structured audit metadata.  The
+    bounded ``archive_reason`` prefix remains a compatibility source for
+    cards archived before that field existed.
+    """
+    if str(card.get("archive_operation") or "").strip().lower() != "superseded":
+        return ""
+    replacement = str(card.get("superseded_by") or "").strip()
+    if replacement:
+        return replacement
+    reason = str(card.get("archive_reason") or "")
+    if not reason.startswith("superseded_by:"):
+        return ""
+    return reason.removeprefix("superseded_by:").split(";", 1)[0].strip()
+
+
+def resolve_superseded_dependency(
+    dependency_id: str,
+    cards: dict[str, dict[str, Any]],
+) -> tuple[str | None, list[str], str | None]:
+    """Resolve an archived predecessor through explicit replacement edges.
+
+    Returns ``(resolved_id, chain, error)``.  Ordinary active/finished or
+    unknown dependencies are returned unchanged so the existing missing-task
+    validation/blocker remains authoritative.  Only archived predecessors are
+    rewritten, and every malformed, missing, non-superseded, or cyclic chain
+    fails closed with a deterministic blocker.
+    """
+    current = dependency_id
+    chain: list[str] = []
+    seen: set[str] = set()
+    while True:
+        card = cards.get(current)
+        if card is None:
+            if chain:
+                return None, chain, f"__superseded_replacement_not_found__:{current}"
+            return current, chain, None
+        if lifecycle_state(card) != "archived":
+            return current, chain, None
+        if current in seen:
+            return None, chain, f"__superseded_replacement_cycle__:{current}"
+        seen.add(current)
+        chain.append(current)
+        if str(card.get("archive_operation") or "").strip().lower() != "superseded":
+            return None, chain, f"__archived_dependency_not_superseded__:{current}"
+        replacement = _superseded_replacement(card)
+        if not replacement:
+            return None, chain, f"__superseded_dependency_without_replacement__:{current}"
+        if not _TASK_ID_RE.fullmatch(replacement):
+            return None, chain, f"__invalid_superseded_replacement__:{current}"
+        current = replacement
+
+
 def normalize_depends_on(depends_on: list[str] | None) -> list[str]:
     """Bounded, de-duplicated, order-preserving validation of a depends_on list."""
     if depends_on is None:
@@ -63,11 +118,29 @@ def existing_edges_from_cards(
     edges: dict[str, list[str]] = {}
     invalid_ids: set[str] = set()
     for tid, card in cards.items():
+        if lifecycle_state(card) == "archived":
+            resolved, _chain, error = resolve_superseded_dependency(tid, cards)
+            if error is not None or resolved is None or resolved == tid:
+                edges[tid] = []
+                invalid_ids.add(tid)
+            else:
+                edges[tid] = [resolved]
+            continue
         try:
-            edges[tid] = normalize_depends_on(card.get("depends_on"))
+            raw_dependencies = normalize_depends_on(card.get("depends_on"))
         except TaskPlanError:
             edges[tid] = []
             invalid_ids.add(tid)
+            continue
+        resolved_dependencies: list[str] = []
+        for dependency_id in raw_dependencies:
+            resolved, _chain, error = resolve_superseded_dependency(dependency_id, cards)
+            if error is not None or resolved is None:
+                invalid_ids.add(tid)
+                continue
+            if resolved not in resolved_dependencies:
+                resolved_dependencies.append(resolved)
+        edges[tid] = resolved_dependencies
     return edges, invalid_ids
 
 
@@ -185,6 +258,7 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     # Archived cards are audit history, not active Plan-DAG nodes.  Filter
     # them before constructing any derived structure so they cannot reappear
     # as pending/ready, block dependencies, or reserve write scope.
+    all_by_id = {str(c["task_id"]): c for c in cards}
     by_id = {
         str(c["task_id"]): c
         for c in cards
@@ -193,15 +267,37 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
     lifecycle = {tid: lifecycle_state(c) for tid, c in by_id.items()}
 
     dependencies: dict[str, list[str]] = {}
+    original_dependencies: dict[str, list[str]] = {}
+    dependency_replacements: dict[str, dict[str, Any]] = {}
+    dependency_resolution_errors: dict[str, list[str]] = {}
     dependents: dict[str, list[str]] = {tid: [] for tid in by_id}
     blockers: dict[str, list[str]] = {}
     invalid_depends_on: set[str] = set()
     for tid, c in by_id.items():
         try:
-            deps = normalize_depends_on(c.get("depends_on"))
+            raw_dependencies = normalize_depends_on(c.get("depends_on"))
         except TaskPlanError:
-            deps = []
+            raw_dependencies = []
             invalid_depends_on.add(tid)
+        original_dependencies[tid] = raw_dependencies
+        deps: list[str] = []
+        resolution_errors: list[str] = []
+        for dependency_id in raw_dependencies:
+            resolved, chain, error = resolve_superseded_dependency(
+                dependency_id, all_by_id
+            )
+            if error is not None or resolved is None:
+                resolution_errors.append(error or "__dependency_resolution_failed__")
+                continue
+            if chain:
+                dependency_replacements.setdefault(tid, {})[dependency_id] = {
+                    "chain": chain,
+                    "resolved_to": resolved,
+                }
+            if resolved not in deps:
+                deps.append(resolved)
+        if resolution_errors:
+            dependency_resolution_errors[tid] = resolution_errors
         dependencies[tid] = deps
         for dep in deps:
             dependents.setdefault(dep, []).append(tid)
@@ -210,6 +306,8 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
             # card is reported invalid and permanently blocked rather than
             # silently normalized to an edge-free, immediately-ready card.
             blockers[tid] = ["__invalid_depends_on__"]
+        elif resolution_errors:
+            blockers[tid] = resolution_errors
         else:
             blockers[tid] = [d for d in deps if lifecycle.get(d) != "finished"]
 
@@ -223,6 +321,18 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         key=lambda c: (str(c.get("created_at") or ""), str(c.get("task_id"))),
     )
 
+    def has_persisted_noncollision_blocker(card: dict[str, Any]) -> bool:
+        blocker = card.get("operational_blocker")
+        if not isinstance(blocker, dict):
+            return False
+        # collision_guard_failed records a point-in-time pre-claim result.
+        # Re-project collision truth from the current canonical cards below;
+        # otherwise an archived/finished contender leaves ready_capacity at
+        # zero forever even though an exact launch would now pass its live
+        # guard. Other operational blockers remain fail-closed until an exact
+        # claim or explicit repair clears them.
+        return str(blocker.get("reason") or "") != "collision_guard_failed"
+
     ready: list[str] = []
     write_scope_overlaps: dict[str, list[str]] = {}
     claimed_paths: set[str] = set(retained_paths)
@@ -232,7 +342,7 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         if blockers[tid]:
             continue
-        if isinstance(c.get("operational_blocker"), dict):
+        if has_persisted_noncollision_blocker(c):
             continue
         my_writes = set(c.get("allowed_writes") or [])
         overlap = {p for p in my_writes if _paths_conflict_any(p, claimed_paths)}
@@ -304,6 +414,10 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if lifecycle[tid] != "pending" or not isinstance(blocker, dict):
             continue
         reason = str(blocker.get("reason") or blocker.get("kind") or "launch_blocked")
+        if reason == "collision_guard_failed":
+            # Current write_scope_overlaps/ready projection above supersedes
+            # this historical point-in-time collision result.
+            continue
         operational_blockers[tid] = reason[:500]
     operational_blocked_task_ids = sorted(operational_blockers)
     # A pending pre-claim operational blocker is intentionally excluded from
@@ -331,6 +445,9 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "task_ids": sorted(by_id),
         "lifecycle": lifecycle,
         "dependencies": dependencies,
+        "original_dependencies": original_dependencies,
+        "dependency_replacements": dependency_replacements,
+        "dependency_resolution_errors": dependency_resolution_errors,
         "dependents": dependents,
         "blockers": {tid: deps for tid, deps in blockers.items() if deps},
         "invalid_depends_on": sorted(invalid_depends_on),
@@ -357,7 +474,11 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "layers": layers,
         "critical_path": critical_path,
         "critical_path_length": len(critical_path),
-        "dag_valid": not cycle_nodes and not invalid_depends_on,
+        "dag_valid": (
+            not cycle_nodes
+            and not invalid_depends_on
+            and not dependency_resolution_errors
+        ),
         "cycle_nodes": cycle_nodes,
     }
 

@@ -17,34 +17,45 @@ The product remains local-first. Repository state belongs to that repository;
 model prompts, source text, credentials, and memories are not uploaded by
 AIWorkHub telemetry.
 
-## Current delivery checkpoint (0.9.37, 2026-08-09)
+## Current delivery checkpoint (local 0.9.40 candidate, 2026-08-10)
 
 This checkpoint is the current operational snapshot; the older baseline below
 remains useful history. It does not promote an unchecked roadmap item to
 shipped status.
 
-- Release `v0.9.37` is published from commit `b0f1482`. Local qualification
-  completed with 2,638 Python tests passed (28 skipped), all 30 extension test
-  files passed apart from one explicitly native-Windows-only skip, and the
-  packaged release/CI matrix is green.
-- The canonical queue is operationally clean: no running process, review item,
-  operational failure, stale-processing row or orphaned processing task was
-  present at this checkpoint.
-- The Plan DAG contains 216 cards: 132 terminal and 84 reported actionable.
-  Seventy-nine of the 84 are historical lifecycle-blocked attempts/canaries
-  that require audited reconciliation or supersession, not blind relaunch.
-  The five current pending foundation cards are:
-  - common evidence-level contract;
-  - common-evidence-dependent meaningful-output contract;
-  - common-evidence-dependent graph-scoped audit packet;
-  - common-evidence-dependent manager-gated Learning Commit contract;
-  - NeedFix Markdown intake with preview and deterministic deduplication.
-- The common evidence-level contract remains the real critical-path
-  predecessor. Its canonical module and focused tests are not present in HEAD;
-  the three dependent contracts must not be called delivered until that
-  predecessor is implemented, independently reviewed and accepted.
-- NeedFix contains 101 durable records: 22 resolved, 1 duplicate, 57 captured,
-  4 triaged, 14 accepted and 3 linked to created tasks. Captured ideas are not
+- Release `v0.9.39` is the latest published baseline. Local candidate `0.9.40`
+  adds the required-file semantic-edit placeholder guard and truthful
+  `{python} -m ruff|mypy` tool-entrypoint resolution. It passes 3,450 Python
+  tests (35 skipped), the complete extension suite, Ruff, strict mypy, release
+  metadata validation and VSIX packaging. The candidate is installed locally
+  but is not a public release claim.
+- The canonical queue has four actionable cards and no orphaned processing:
+  NF41 is retained at review for provider-free validation replay after the
+  `0.9.40` runtime reload; clean-root GLM successors for NF22, NF45 and NF19
+  are pending and ready.
+- The Plan DAG contains 150 cards: 146 terminal and the four actionable cards
+  described above. There is no dependency cycle or write-scope collision.
+  The common evidence-level contract, durable attempt-artifact manifest and
+  graph-scoped reviewer packet are now implemented and locally validated. The
+  meaningful-output/task-type behavioral contract is also implemented:
+  specialized cards fail before launch without exact validation roles and the
+  same observed receipts are rechecked at finalization and manager acceptance.
+  The manager-gated Learning Commit integration, bounded NeedFix Markdown
+  intake, atomic terminal-review/callback transition, release-assurance gate,
+  fail-closed Windows path-mux staging fallback, and explicit superseded-task
+  replacement-edge projection are now locally complete. Plan-DAG readiness now
+  follows the audited replacement chain, waits for the replacement to finish,
+  and blocks malformed, missing, ordinary-archive, or cyclic chains. A
+  repository-native Roadmap registry is now implemented locally as the
+  explicit manager-approved layer between NeedFix intake and the executable
+  Task DAG. It preserves outcome/dependency/acceptance/task provenance in its
+  own audited store, exposes bounded MCP operations, and has a dedicated
+  read-only VS Code dashboard popup. Completion is gated on canonical finished
+  tasks or explicit task-free evidence.
+  Local proof is not promoted to a release claim.
+- NeedFix contains 115 durable records after the current closure rebase: 85
+  resolved, 3 duplicate, 7 captured, 9 accepted, 1 linked to a created task,
+  4 deferred and 6 archived. Captured ideas are not
   accepted roadmap commitments, and accepted findings are not resolved fixes.
 - Windows packaged-runtime qualification remains the immediate platform gate.
   The `v0.9.37` dashboard now reports failed repair attempts truthfully, and
@@ -53,17 +64,19 @@ shipped status.
   VS Code window timed out during MCP child recovery while another window on
   the same machine launched successfully, narrowing the remaining MCP defect
   to window-local child/session/extension-host ownership or recovery routing.
-- A fresh Source Graph generation was present, but the roadmap-oriented focus
-  query returned zero file/entity evidence. Exact-target fallback was therefore
-  required for this checkpoint. Broad-query retrieval truth remains open even
-  though exact file/body retrieval and the checked exact-symbol fixture work.
+- A fresh Source Graph generation was present, but one roadmap-oriented free-
+  form focus query returned zero file/entity evidence and required exact-target
+  fallback. The checked retrieval corpus is now ten non-empty cases with
+  recall@k `1.0`, MRR `0.95`, success@k `1.0`, mean returned payload
+  `3035.2` bytes, and an environment-observed mean/p95 latency of
+  `19.328/28.936 ms`. Accepted-outcome coverage is still `0`, so this proves
+  the checked structural retrieval contract, not broad-query quality, causal
+  task benefit, provider-token savings, or a vector-search advantage.
 
-The next closure order is: reconcile the Windows live runtime path, implement
-and accept clean-root recovery for a removed rework predecessor, implement and
-accept the common evidence-level contract, release its three dependency-safe
-foundation successors, fix the Markdown-intake dependencies, then remove
-historical attempts from the active denominator without deleting their audit
-evidence. Only after that should lower-priority product expansion resume.
+The next closure order is: reload and live-verify the local `0.9.40` runtime,
+provider-free replay/accept NF41, verify the two new fidelity/tool-resolution
+guards, then resume NF22, NF45 and NF19 from clean task roots. Windows-only and
+matched-benchmark residuals stay open until their stated evidence exists.
 
 ## Assessment intake and assurance roadmap (2026-08-06)
 
@@ -73,28 +86,106 @@ claims. The following checklist is the canonical follow-through so no review is
 lost:
 
 - [x] Preserve each review as a separately attributable repository document.
+- [x] Add the durable Roadmap layer between NeedFix and Task DAG, including
+  dependency and completion gates, canonical task links, MCP tools, audit
+  events, dashboard snapshot data, and a dedicated read-only popup.
+- [x] Add bounded Markdown review/roadmap intake. Preview follows only safe
+  repository-local Markdown links, extracts explicit issue/recommendation/gap
+  lists plus unchecked roadmap items, and seals source hashes and stable source
+  fingerprints without writing. Exact preview commit creates or refreshes only
+  untrusted `captured` NeedFix proposals; it cannot promote or mutate a
+  triaged/accepted/terminal item.
 - [x] Add the deterministic SARIF contract foundation and focused tests.
-- [ ] Complete and promote the common evidence-level contract.
-- [ ] Complete the durable attempt-artifact manifest and later wire it into
-  worker/reviewer finalization.
+- [x] Complete and promote the common evidence-level contract. Worker and
+  reviewer finalization now assign canonical outcome levels from observed
+  gates, manager acceptance enforces a task-type minimum against the sealed
+  attempt manifest, and independent revalidation/promotion emits the durable
+  `fixed_and_verified` acceptance receipt.
+- [x] Complete the durable attempt-artifact manifest and wire it into worker,
+  quality-reviewer, and failed-attempt finalization. Each attempt now seals
+  bounded metadata, change-index, validation, provider-usage, and review
+  artifacts behind exact byte hashes; successful review evidence and the
+  process ledger retain the immediately re-verified manifest receipt.
 - [ ] Finish same-path semantic-edit transactions and byte-fidelity regression
   coverage; then run an uncapped, matched whole-file-versus-semantic A/B.
-- [ ] Add meaningful-output and task-type behavioral anti-collapse gates.
-- [ ] Build graph-scoped reviewer packets with risk-selected lenses and
-  evidence-bearing normalized findings.
-- [ ] Implement the manager-gated Learning Commit Protocol across Session,
-  Context Graph, AI Memory, KB, and accepted task outcomes.
-- [ ] Add assurance-as-code checks for claim-to-evidence, public tool surfaces,
+- [x] Add meaningful-output and task-type behavioral anti-collapse gates.
+  Read-only research rejects empty/tool-only/placeholder finals and retains an
+  exact stdout hash. Writable cards may explicitly select `bugfix`, `refactor`,
+  `performance`, `security`, or `data_ml`; task creation then requires aligned
+  `validation_roles` for reproduction+regression, parity, numeric
+  baseline+delta, negative fixtures, or schema+distribution respectively.
+  Finalization and manager acceptance both recompute the deterministic gate;
+  performance receipts use bounded `AIWORKHUB_METRIC` JSON and AIWorkHub
+  computes direction/tolerance truth instead of trusting model prose.
+- [x] Build graph-scoped reviewer packets with risk-selected lenses and
+  evidence-bearing normalized findings. Production review preparation now
+  resolves changed symbols from exact candidate bytes, joins bounded canonical
+  caller/test evidence, carries invariants/forbidden changes/validation and
+  explicit unknowns, and seals one deterministic scope per reviewer lens.
+  Defect submissions require an in-scope path/line or mechanical check ID;
+  model-supplied evidence levels are capped at observed static evidence.
+- [x] Implement the manager-gated Learning Commit Protocol across Session,
+  Context Graph, AI Memory, KB, and accepted task outcomes. The manager-only
+  MCP operation verifies the canonical accepted request and its
+  `fixed_and_verified` receipt before promotion. A task-database receipt/outbox
+  records exact payload identity and per-authority projection state; retries
+  resume only failed projections. Worker prose is never promoted implicitly,
+  and accepted causal edges survive deterministic Context Graph rebuilds.
+- [x] Add assurance-as-code checks for claim-to-evidence, public tool surfaces,
   policy projections, Source Graph freshness/retrieval goldens, and dormant
-  quality capabilities.
+  quality capabilities. The repository-owned release-assurance manifest pins
+  claim artifacts by SHA-256, checks public caveats and required MCP tools,
+  validates non-empty retrieval cases and quality-policy IDs, and requires
+  exact policy/freshness/negative-fixture/quality-adapter test selectors. CI
+  and both release jobs run the fail-closed checker. This is static release
+  assurance, not runtime or causal proof.
+- [x] Expand the Source Graph retrieval golden corpus from three to ten checked
+  cases and make recall@k, MRR, success@k, returned bytes, latency, and
+  accepted-outcome coverage machine-readable. The evaluator bypasses compact
+  cache receipts internally so repeated measurements still inspect complete
+  ranked paths, while normal model-facing queries retain compact replay. The
+  current checked corpus passes its structural quality minimums; accepted-
+  outcome coverage remains zero and a vector candidate remains blocked on a
+  matched A/B rather than assumed benefit.
 - [ ] Normalize validation failure classes and measure diagnostic delta-rework
   against blind retry before enabling automation.
-- [ ] Produce a replayable release evidence pack, residual-risk register, and
-  adapter/route parity matrix.
-- [ ] Publish an UltrafastSecp256k1 case study only after every public adoption,
-  benchmark, and assurance claim is pinned to a current public source.
-- [ ] Close route-local circuit isolation, atomic callback/terminal persistence,
-  and measured cost-per-accepted-outcome advisory routing.
+- [x] Produce a replayable release evidence pack, residual-risk register, and
+  adapter/route parity matrix. The deterministic pack binds the existing
+  release-assurance verdict, evidence-pinned open risks, and explicitly
+  environment-scoped Linux/Windows route observations behind one content hash.
+  CI and both release jobs replay the join fail-closed. This is not release
+  approval, a risk waiver, or a cross-platform runtime guarantee.
+- [x] Publish a bounded UltrafastSecp256k1 evidence-first case study. Every
+  cited source is pinned to public commit `2d6de776` with a recorded SHA-256;
+  the study explicitly excludes independent performance, adoption, causal, and
+  external-audit claims. It is a reusable control-design reference, not an
+  AIWorkHub benchmark or production-safety claim.
+- [ ] Close route-local circuit isolation and measured
+  cost-per-accepted-outcome advisory routing. Atomic callback/terminal
+  persistence is locally complete: the terminal-review state/event and
+  callback outbox/event now commit in one SQLite transaction, with rollback
+  regression coverage for a callback-row insertion failure. The local
+  advisory foundation now joins exact single-model, single-route usage cost
+  to canonical manager decisions, preserves `UNKNOWN`/`UNMEASURED`, and never
+  changes the selected worker. Live values are computed from the durable
+  ledger rather than copied into this roadmap, so they cannot silently drift.
+  They remain association evidence, not a causal savings claim. Shadow/canary
+  activation stays open until an uncapped matched benchmark is partitioned by
+  task family and persisted risk evidence.
+- [ ] Validate manager-assisted task decomposition against matched sequential
+  execution. The local preview foundation is implemented: it requires a
+  canonical hash-verified Source Graph `impact`/`deps` receipt, validates a
+  collision-free child DAG, returns a deterministic proposal digest, and
+  performs no task creation or launch. Automatic spawning and throughput
+  claims remain blocked on matched accepted-outcome evidence.
+- [ ] Measure the session-level context delta protocol on repeated live worker
+  queries. The local foundation now returns a hash reference for unchanged
+  Session Manager state and a bounded row delta for changed state, scoped by
+  exact task/request/repository/topic/limit/authority identity. Full canonical
+  state and authenticated audit hashes remain durable, cache state is bounded
+  and restart-safe, and deterministic tests cover unchanged, changed, and
+  cross-request isolation. Provider-token, latency, cost, and quality claims
+  remain blocked on a matched live benchmark.
 
 Evidence policy: ratings and estimated percentages in review records are expert
 judgment. Structural byte ratios are not provider-token savings; projected
@@ -142,6 +233,14 @@ artifact establishes them.
   when the canonical index generation changes.
 - Safe repository worktree, terminal-run and extension-runtime retention with
   preview, quarantine, restore and separately confirmed expired purge.
+- Repository-aware worker execution now defaults to the git-ignored and
+  Source-Graph-excluded `.aiworkhub/runtime` boundary: isolated worktrees and
+  request-private homes live under `runtime/worktrees`, validation scratch is
+  probed under `runtime/validation`, and the retention/registration tools use
+  the same root. Explicit external runtime/worktree/scratch overrides remain
+  available. Arbitrary nested checkout paths and symlinked runtime boundaries
+  fail closed, while the exact legacy temp layout remains eligible only for
+  upgrade-time GC.
 - Safe archived-task retention with age-based preview, callback-backlog
   protection, digest-bound quarantine, a seven-day undo window, collision-safe
   restore, separately confirmed purge and a surviving compact audit trail.
@@ -439,6 +538,14 @@ with 3 reference positives and 23 targeted negatives. It reports expected
 blocker observability, false-green/false-red rates and uncalibrated case IDs;
 the same test is required in Linux, Windows, macOS and Remote-SSH CI.
 
+Reviewer recovery preserves the same authority boundary. A blocked
+`quality_review` card cannot use the generic rework transition or generic task
+launch, because those paths do not carry the immutable target request/task and
+packet body. The manager must launch a replacement through the dedicated
+quality-review entry point, which rebuilds and verifies the packet against the
+retained target before claim. This prevents an unbound read-only model response
+from becoming apparent review evidence.
+
 Manager acceptance now materializes a fresh `aiworkhub.combined_tree.v1`
 workspace for medium-and-higher risk. It overlays the current canonical
 tracked/untracked delta (including deletions) and then the exact retained
@@ -545,6 +652,16 @@ Graph generations and obsolete runtime packages remain the next adapters.
 Stale Git registrations are separately inventoried and pruned only when every
 candidate is attributable to the exact AIWorkHub worktree layout; any stale
 foreign registration blocks the repository-wide Git prune operation.
+
+**Locally validated runtime-root closure (2026-08-10):** repository-aware
+launch no longer defaults to a global temporary directory. The canonical
+default is `.aiworkhub/runtime/worktrees`, with executable validation scratch
+under `.aiworkhub/runtime/validation`; Git and Source Graph already exclude the
+entire `.aiworkhub` runtime boundary. Storage preview/quarantine/restore/purge
+and registration scans resolve that same root. Explicit external overrides are
+preserved, non-repository callers retain the historical temporary fallback,
+and GC accepts only the exact old temporary layout during migration. This is a
+local qualification statement until the next release is published.
 
 - Ship inventory-only storage accounting first, then preview, quarantine,
   restore, and finally opt-in purge after cross-platform adversarial tests.

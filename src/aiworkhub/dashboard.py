@@ -48,6 +48,7 @@ MAX_KPI_HISTORY_LOG_BYTES = 16 * 1024 * 1024
 # denominator and the interpretation label alongside the alert count.
 SOURCE_GRAPH_LONG_CALL_GAP_SECONDS = 15 * 60
 NEEDFIX_SNAPSHOT_LIMIT = 200
+ROADMAP_SNAPSHOT_LIMIT = 200
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
@@ -105,6 +106,72 @@ def _portable_text(value: Any, limit: int) -> str:
     text = _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
     text = _HOST_PATH_IN_TEXT_RE.sub("<host-path>", text)
     return text[: max(0, int(limit))]
+
+
+def _canonical_quality_review_summary(
+    terminal_evidence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project authenticated reviewer findings instead of model prose."""
+
+    receipt = terminal_evidence.get("quality_review_receipt")
+    if not isinstance(receipt, Mapping):
+        return None
+    authority = receipt.get("authority")
+    report = receipt.get("report")
+    if (
+        receipt.get("schema_id") != "aiworkhub.quality_reviewer_receipt.v1"
+        or not isinstance(authority, Mapping)
+        or authority.get("process_identity_verified") is not True
+        or authority.get("audit_verified") is not True
+        or authority.get("terminal_state") != "review_ready"
+        or not isinstance(report, Mapping)
+    ):
+        return None
+    lens = str(report.get("lens") or "").strip()
+    findings = report.get("findings")
+    if lens not in {"correctness", "security", "code_quality"} or not isinstance(
+        findings, list
+    ):
+        return None
+    severity_counts = {
+        severity: sum(
+            1
+            for finding in findings
+            if isinstance(finding, Mapping)
+            and str(finding.get("severity") or "") == severity
+        )
+        for severity in ("critical", "high", "medium", "low")
+    }
+    recognized_count = sum(severity_counts.values())
+    if recognized_count != len(findings):
+        return None
+    severity_text = ", ".join(
+        f"{severity}: {count}"
+        for severity, count in severity_counts.items()
+        if count
+    )
+    finding_word = "finding" if recognized_count == 1 else "findings"
+    text = f"Verified {lens.replace('_', ' ')} review: {recognized_count} {finding_word}"
+    if severity_text:
+        text += f" ({severity_text})"
+    text += "."
+    refinement_required = bool(recognized_count and lens in {"correctness", "security"})
+    blocking_finding_count = severity_counts["critical"] + severity_counts["high"]
+    if refinement_required:
+        text += " Refinement required."
+    elif blocking_finding_count:
+        text += " Blocking findings recorded."
+    else:
+        text += " No blocking findings recorded."
+    return {
+        "source": "verified_quality_review_receipt",
+        "text": text,
+        "lens": lens,
+        "finding_count": recognized_count,
+        "severity_counts": severity_counts,
+        "refinement_required": refinement_required,
+        "blocking_finding_count": blocking_finding_count,
+    }
 
 
 def _portable_path(value: Any, limit: int = 500) -> str:
@@ -457,10 +524,21 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         "usage": {
             "input_tokens": _bounded_int(usage.get("input_tokens")),
             "output_tokens": _bounded_int(usage.get("output_tokens")),
+            "visible_output_tokens": _bounded_int(
+                usage.get("visible_output_tokens")
+            ),
+            "reasoning_output_tokens": _bounded_int(
+                usage.get("reasoning_output_tokens")
+            ),
             "cached_input_tokens": _bounded_int(usage.get("cached_input_tokens")),
             "cache_creation_input_tokens": _bounded_int(
                 usage.get("cache_creation_input_tokens")
             ),
+            "cache_write_input_tokens": _bounded_int(
+                usage.get("cache_write_input_tokens")
+            ),
+            "observed_model": str(usage.get("observed_model") or "")[:256],
+            "model_observed": bool(usage.get("model_observed")),
             "usage_observed": bool(usage.get("usage_observed")),
             "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
             "cost_usd": max(0.0, float(usage.get("cost_usd") or 0.0)),
@@ -1577,13 +1655,15 @@ class DashboardProvider:
     def get_workforce_catalog(self) -> dict[str, Any]:
         """Configured workforce joined to bounded canonical process evidence."""
         process_report = read_process_runs(limit=DEFAULT_PROCESS_LIMIT)
+        ledger = cost_ledger.build_cost_ledger(
+            repo_root=self.repo_root, include_tasks=True
+        )
         return workforce_catalog.build_catalog(
             self.repo_root,
             cards=task_store.list_task_cards(self.repo_root, limit=5000),
             process_rows=process_report.get("processes") or [],
-            usage_rows=cost_ledger.build_cost_ledger(
-                repo_root=self.repo_root, include_tasks=True
-            ).get("tasks") or [],
+            usage_rows=ledger.get("tasks") or [],
+            cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
         )
 
     def get_callback_bridge_health(self) -> dict[str, Any]:
@@ -1803,6 +1883,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
             "callback_bridge_health": {},
             "task_plan": {},
             "needfix": _needfix_unavailable(),
+            "roadmap": _roadmap_unavailable(),
             "warnings": {"stale": [], "collisions": [], "runner_mismatches": []},
             "errors": [],
         }
@@ -2076,6 +2157,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
     needfix_snapshot = _build_needfix_snapshot(
         provider_root or _default_repo_root()
     )
+    roadmap_snapshot = _build_roadmap_snapshot()
 
     return {
         "schema_version": 1,
@@ -2116,6 +2198,7 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
         "callback_bridge_health": dict(callback_bridge_health),
         "task_plan": dict(task_plan_snapshot),
         "needfix": needfix_snapshot,
+        "roadmap": roadmap_snapshot,
         "warnings": {
             "stale": stale_tasks,
             "collisions": collision_warnings,
@@ -2196,6 +2279,27 @@ def _build_needfix_snapshot(repo_root: Path) -> dict[str, Any]:
         "limit": NEEDFIX_SNAPSHOT_LIMIT,
         "truncated": truncated,
     }
+
+
+def _roadmap_unavailable(error: str = "roadmap_store_unavailable") -> dict[str, Any]:
+    return {
+        "schema_id": "aiworkhub.roadmap_snapshot.v1",
+        "available": False,
+        "error": error,
+        "active": 0,
+        "total": 0,
+        "status_counts": {},
+        "items": [],
+        "truncated": False,
+    }
+
+
+def _build_roadmap_snapshot() -> dict[str, Any]:
+    """Bounded Roadmap + Task-DAG projection from the canonical core API."""
+    try:
+        return core.roadmap_snapshot(limit=ROADMAP_SNAPSHOT_LIMIT)
+    except Exception as exc:
+        return _roadmap_unavailable(str(exc)[:500])
 
 
 def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, Any] | None:
@@ -2387,6 +2491,7 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
                 ),
             }
         )
+    canonical_review_summary = _canonical_quality_review_summary(terminal_evidence)
     result["task"]["review_evidence_bundle"] = {
         "schema_id": "aiworkhub.review_evidence_bundle.v1",
         "task_id": task_id,
@@ -2433,8 +2538,19 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
         "required_outputs": required_output_summary,
         "logs": {
             "result_summary": _portable_text(
-                card.get("completion_summary") or card.get("review_summary"), 2000
+                (
+                    canonical_review_summary["text"]
+                    if canonical_review_summary is not None
+                    else card.get("completion_summary") or card.get("review_summary")
+                ),
+                2000,
             ),
+            "result_summary_source": (
+                canonical_review_summary["source"]
+                if canonical_review_summary is not None
+                else "task_prose"
+            ),
+            "quality_review": canonical_review_summary or {},
             "usage": {
                 str(key)[:80]: value
                 for key, value in list((selected_process.get("usage") or {}).items())[:80]

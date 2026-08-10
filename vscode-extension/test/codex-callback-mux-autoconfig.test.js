@@ -372,6 +372,113 @@ test("packaged Windows host installs a native shell-free launcher with an exact 
   );
 });
 
+test("native launcher EPERM falls back to exact binary-safe read write rename", () => {
+  const home = path.join(temp, "windows-native-eperm-home");
+  const native = path.join(temp, "packaged-eperm", "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(native), { recursive: true });
+  const expected = Buffer.from([0x4d, 0x5a, 0x00, 0xff, 0x10, 0x0a]);
+  fs.writeFileSync(native, expected);
+  const originalCopy = fs.copyFileSync;
+  fs.copyFileSync = (source, destination) => {
+    if (source === native) {
+      const error = new Error(`EPERM: copyfile '${source}' -> '${destination}'`);
+      error.code = "EPERM";
+      throw error;
+    }
+    return originalCopy(source, destination);
+  };
+  try {
+    const shim = __testInternals.materializePathMuxShim(launcher, {
+      platform: "win32",
+      home,
+      env: { PATH: "" },
+      windowsNativeLauncher: native,
+    });
+    assert.deepEqual(fs.readFileSync(shim), expected);
+    assert.equal(
+      fs.readdirSync(path.dirname(shim)).filter((name) => name.includes(".tmp-")).length,
+      0,
+    );
+  } finally {
+    fs.copyFileSync = originalCopy;
+  }
+});
+
+test("native launcher EPERM fallback fails closed when destination removal fails", () => {
+  const home = path.join(temp, "windows-native-remove-failure-home");
+  const native = path.join(temp, "packaged-remove-failure", "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(native), { recursive: true });
+  fs.writeFileSync(native, Buffer.from("MZ-original"));
+  const shim = __testInternals.materializePathMuxShim(launcher, {
+    platform: "win32",
+    home,
+    env: { PATH: "" },
+    windowsNativeLauncher: native,
+  });
+  const installedBefore = fs.readFileSync(shim);
+  fs.writeFileSync(native, Buffer.from("MZ-replacement"));
+
+  const originalCopy = fs.copyFileSync;
+  const originalRm = fs.rmSync;
+  fs.copyFileSync = () => {
+    const error = new Error("EPERM: injected copy failure");
+    error.code = "EPERM";
+    throw error;
+  };
+  fs.rmSync = (target, options) => {
+    if (target === shim) {
+      const error = new Error("EPERM: injected destination removal failure");
+      error.code = "EPERM";
+      throw error;
+    }
+    return originalRm(target, options);
+  };
+  try {
+    assert.throws(
+      () => __testInternals.materializePathMuxShim(launcher, {
+        platform: "win32",
+        home,
+        env: { PATH: "" },
+        windowsNativeLauncher: native,
+      }),
+      /destination removal failure/,
+    );
+    assert.deepEqual(fs.readFileSync(shim), installedBefore);
+    assert.equal(
+      fs.readdirSync(path.dirname(shim)).filter((name) => name.includes(".tmp-")).length,
+      0,
+    );
+  } finally {
+    fs.copyFileSync = originalCopy;
+    fs.rmSync = originalRm;
+  }
+});
+
+test("non-EPERM native launcher copy failures remain fail closed", () => {
+  const native = path.join(temp, "packaged-eio", "aiworkhub-app-server-mux.exe");
+  fs.mkdirSync(path.dirname(native), { recursive: true });
+  fs.writeFileSync(native, Buffer.from("MZ-eio"));
+  const originalCopy = fs.copyFileSync;
+  fs.copyFileSync = () => {
+    const error = new Error("EIO: injected copy failure");
+    error.code = "EIO";
+    throw error;
+  };
+  try {
+    assert.throws(
+      () => __testInternals.materializePathMuxShim(launcher, {
+        platform: "win32",
+        home: path.join(temp, "windows-native-eio-home"),
+        env: { PATH: "" },
+        windowsNativeLauncher: native,
+      }),
+      /EIO: injected copy failure/,
+    );
+  } finally {
+    fs.copyFileSync = originalCopy;
+  }
+});
+
 test("package never changes the Codex executable without explicit opt-in", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf8"));
   assert.equal(manifest.contributes.configurationDefaults, undefined);

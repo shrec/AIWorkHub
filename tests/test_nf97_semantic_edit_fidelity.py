@@ -293,6 +293,54 @@ def test_required_pyi_create_rejects_ellipsis_and_wrapped_empty_before_any_write
     assert not (tmp_path / "new.pyi").exists()
 
 
+def test_v3_required_create_range_rejects_ellipsis_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "new.py"
+    target.write_bytes(b"")
+    changed_paths: list[str] = []
+    real_write = worker._write_atomic
+
+    def recording_write(workspace: Path, relative: str, content: str) -> None:
+        changed_paths.append(relative)
+        real_write(workspace, relative, content)
+
+    monkeypatch.setattr(worker, "_write_atomic", recording_write)
+    with pytest.raises(
+        RuntimeError,
+        match=r"ellipsis_only:new\.py:v3_range:0$",
+    ):
+        worker._v3_planned_outputs(
+            tmp_path,
+            {
+                "edits": [{
+                    "path": "new.py",
+                    "current_sha256": _sha(""),
+                    "ranges": [{"start_line": 1, "end_line": 1, "new": "..."}],
+                }],
+                "creates": [],
+            },
+            ["new.py"],
+            {"new.py"},
+        )
+    assert changed_paths == []
+    assert target.read_bytes() == b""
+
+
+def test_retained_ellipsis_placeholder_cannot_validate_as_unchanged_stub() -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=r"ellipsis_only:new\.py:v3_range:0$",
+    ):
+        worker._check_edit_fidelity(
+            "...",
+            "...",
+            path="new.py",
+            operation="v3_range:0",
+        )
+
+
 def test_late_rejection_preflights_before_any_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -92,6 +92,18 @@ assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiwork
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_ai_memory_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_kb_write_intent"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
+assert.strictEqual(
+  internals.sanitizeWebviewPayload("failed at C:\\Users\\shrek\\secret.txt"),
+  "failed at <redacted-host-path>",
+);
+assert.strictEqual(
+  internals.sanitizeWebviewPayload("failed at /home/shrek/secret.txt"),
+  "failed at <redacted-host-path>",
+);
+assert.strictEqual(
+  internals.sanitizeWebviewPayload("failed at \\\\server\\share\\secret.txt"),
+  "failed at <redacted-host-path>",
+);
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", "research/*.json"), true);
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
@@ -105,6 +117,12 @@ assert.ok(nf97Prompt.includes("complete, substantive replacement"));
 assert.ok(nf97Prompt.includes("Every path_contract whose action is create MUST appear"));
 assert.ok(!nf97Prompt.includes('"summary":"..."'));
 assert.ok(!nf97Prompt.includes('"new":"replacement code only"'));
+const qualityReviewTextPrompt = internals.glmTextToolProtocolPrompt(
+  "bounded review", [], true, {}, "quality_review",
+);
+assert.ok(qualityReviewTextPrompt.includes("MUST finish by calling aiworkhub_manager_quality_review_submit"));
+assert.ok(!qualityReviewTextPrompt.includes("aiworkhub_manager_semantic_edit_apply"));
+assert.ok(!qualityReviewTextPrompt.includes("Output ONLY one final aiworkhub.vscode_lm.edit_response"));
 assert.strictEqual(
   internals.validateVscodeLmFinalEnvelope({
     schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
@@ -406,13 +424,8 @@ async function textProtocolChecks() {
     name: "aiworkhub_manager_quality_review_submit",
     input: { packet_sha256: "a".repeat(64), lens: "correctness", findings: [] },
   });
-  const readonlyFinal = JSON.stringify({
-    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
-    summary: "review submitted",
-    edits: [],
-    creates: [],
-  });
-  const reviewQueued = [reviewSubmit, readonlyFinal];
+  const reviewSubmissionId = "b".repeat(64);
+  const reviewQueued = [reviewSubmit];
   const reviewCalls = [];
   const reviewModel = {
     capabilities: { toolCalling: false },
@@ -424,12 +437,39 @@ async function textProtocolChecks() {
     reviewModel,
     { prompt: "bounded review", request_kind: "quality_review", allowedWrites: [] },
     undefined,
-    async (call) => { reviewCalls.push(call); return { ok: true }; },
+    async (call) => {
+      reviewCalls.push(call);
+      return { ok: true, durable: true, submission_id: reviewSubmissionId };
+    },
   );
-  assert.strictEqual(reviewResult, readonlyFinal);
+  assert.deepStrictEqual(JSON.parse(reviewResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${reviewSubmissionId}`,
+    edits: [],
+    creates: [],
+  });
   assert.deepStrictEqual(reviewCalls.map((call) => call.name), [
     "aiworkhub_manager_quality_review_submit",
   ]);
+
+  let proseOnlyTurns = 0;
+  const proseOnlyReview = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => {
+      proseOnlyTurns += 1;
+      return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      proseOnlyReview,
+      { prompt: "bounded review", request_kind: "quality_review", allowedWrites: [] },
+      undefined,
+      async () => ({ ok: true }),
+    ),
+    /vscode_lm_quality_review_submit_required/,
+  );
+  assert.strictEqual(proseOnlyTurns, 1);
 
   const premature = {
     capabilities: { toolCalling: false },
@@ -1008,12 +1048,7 @@ async function nativeProtocolChecks() {
   assert.ok(v2HashMessages[1].includes("final_hash_stale:src/app.py"));
 
   let reviewTurn = 0;
-  const readOnlyNativeFinal = JSON.stringify({
-    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
-    summary: "review submitted",
-    edits: [],
-    creates: [],
-  });
+  const nativeReviewSubmissionId = "c".repeat(64);
   const nativeReviewCalls = [];
   const nativeReviewOptions = [];
   const nativeReviewModel = {
@@ -1032,7 +1067,7 @@ async function nativeProtocolChecks() {
           }()),
         };
       }
-      return { stream: (async function* stream() { yield { value: readOnlyNativeFinal }; }()) };
+      throw new Error("durable review submit must end without another provider turn");
     },
   };
   const nativeReview = await internals.runVscodeLmAgent(
@@ -1045,11 +1080,53 @@ async function nativeProtocolChecks() {
       path_contracts: {},
     },
     undefined,
-    async (call) => { nativeReviewCalls.push(call); return { ok: true }; },
+    async (call) => {
+      nativeReviewCalls.push(call);
+      return { ok: true, durable: true, submission_id: nativeReviewSubmissionId };
+    },
   );
-  assert.strictEqual(nativeReview, readOnlyNativeFinal);
+  assert.deepStrictEqual(JSON.parse(nativeReview), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${nativeReviewSubmissionId}`,
+    edits: [],
+    creates: [],
+  });
+  assert.strictEqual(reviewTurn, 1);
   assert.strictEqual(nativeReviewCalls[0].name, "aiworkhub_manager_quality_review_submit");
-  assert.strictEqual(nativeReviewOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
+  assert.strictEqual(nativeReviewOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Required);
+  assert.deepStrictEqual(
+    nativeReviewOptions[0].tools.map((tool) => tool.name),
+    ["aiworkhub_manager_source_graph_query", "aiworkhub_manager_quality_review_submit"],
+  );
+
+  let nativeProseOnlyTurns = 0;
+  const nativeProseOnlyReview = {
+    capabilities: { toolCalling: true },
+    sendRequest: async () => {
+      nativeProseOnlyTurns += 1;
+      return {
+        stream: (async function* stream() {
+          yield { value: finalResponse };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      nativeProseOnlyReview,
+      {
+        requestId: "9".repeat(32),
+        request_kind: "quality_review",
+        prompt: "bounded review",
+        allowedWrites: [],
+        path_contracts: {},
+      },
+      undefined,
+      async () => ({ ok: true }),
+    ),
+    /vscode_lm_quality_review_submit_required/,
+  );
+  assert.strictEqual(nativeProseOnlyTurns, 1);
 
   let boundedTurns = 0;
   const boundedOptions = [];
@@ -1299,7 +1376,7 @@ async function cancellationToolBoundaryChecks() {
   const ignoredToolStarted = new Promise((resolve) => { ignoredToolStartedResolve = resolve; });
   let ignoredToolResolve;
   const ignoredTool = new Promise((resolve) => { ignoredToolResolve = resolve; });
-  let ignoredToolTurns = 0;
+  const ignoredToolTurns = [];
   const ignoredToolModel = {
     capabilities: { toolCalling: false },
     sendRequest: async () => ({
@@ -1314,14 +1391,18 @@ async function cancellationToolBoundaryChecks() {
       ignoredToolStartedResolve();
       return ignoredTool;
     },
-    () => { ignoredToolTurns += 1; },
+    (_toolName, detail) => { ignoredToolTurns.push(detail && detail.tool_state); },
   );
   await ignoredToolStarted;
   ignoredToolSource.cancel();
   await assert.rejects(ignoredRun, /vscode_lm_request_cancelled/);
   ignoredToolResolve({ ok: true });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.strictEqual(ignoredToolTurns, 0, "late tool result must not emit a tool-turn side effect");
+  assert.deepStrictEqual(
+    ignoredToolTurns,
+    ["started"],
+    "cancellation may retain the pre-call liveness receipt but must not emit a late completion",
+  );
 }
 
 function bridgeRequestFixture(root, repoInfo, requestId, cancelToken) {

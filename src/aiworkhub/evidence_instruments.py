@@ -238,7 +238,7 @@ def source_graph_retrieval_eval(
     query_fn: Callable[..., Mapping[str, Any]],
     registry_path: str = ".aiworkhub/source-graph-retrieval-eval.json",
 ) -> dict[str, Any]:
-    """Measure precision@k and reciprocal rank through a supplied wrapper."""
+    """Measure bounded retrieval quality, payload bytes, and wrapper latency."""
 
     root = Path(repo_root).resolve()
     candidate = _regular(root, registry_path, must_exist=False)
@@ -256,6 +256,17 @@ def source_graph_retrieval_eval(
         cases = document.get("cases") if isinstance(document, Mapping) else None
         if not isinstance(cases, list) or not cases:
             raise EvidenceInstrumentError("retrieval_cases_missing")
+        raw_minimums = document.get("minimums") or {}
+        if not isinstance(raw_minimums, Mapping):
+            raise EvidenceInstrumentError("retrieval_minimums_invalid")
+        minimums: dict[str, float] = {}
+        for metric in ("recall_at_k", "mrr", "success_at_k"):
+            if metric not in raw_minimums:
+                continue
+            value = float(raw_minimums[metric])
+            if not 0.0 <= value <= 1.0:
+                raise EvidenceInstrumentError(f"retrieval_minimum_invalid:{metric}")
+            minimums[metric] = value
     except (OSError, UnicodeError, json.JSONDecodeError, EvidenceInstrumentError) as exc:
         return {
             "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
@@ -277,8 +288,15 @@ def source_graph_retrieval_eval(
         expected = {_relative(value) for value in case.get("expected_paths") or []}
         mode = str(case.get("mode") or "focus")
         budget = max(1, min(int(case.get("k") or 10), 64))
+        started_ns = time.perf_counter_ns()
         result = dict(query_fn(mode=mode, query=query, budget=budget, workflow_stage="validation"))
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
         content = result.get("content")
+        returned_bytes = len(
+            content.encode("utf-8")
+            if isinstance(content, str)
+            else json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        )
         try:
             payload = json.loads(content) if isinstance(content, str) else result
         except json.JSONDecodeError:
@@ -286,6 +304,7 @@ def source_graph_retrieval_eval(
         ranked = _ranked_paths(payload)[:budget]
         relevant_ranks = [position for position, path in enumerate(ranked, 1) if path in expected]
         precision = len(relevant_ranks) / budget
+        recall = len(relevant_ranks) / len(expected) if expected else 0.0
         reciprocal = 1.0 / min(relevant_ranks) if relevant_ranks else 0.0
         rows.append({
             "id": str(case.get("id") or f"case-{index}"),
@@ -294,17 +313,48 @@ def source_graph_retrieval_eval(
             "returned_count": len(ranked),
             "relevant_count": len(relevant_ranks),
             "precision_at_k": round(precision, 6),
+            "recall_at_k": round(recall, 6),
             "reciprocal_rank": round(reciprocal, 6),
+            "success_at_k": bool(relevant_ranks),
+            "returned_bytes": returned_bytes,
+            "latency_ms": round(elapsed_ms, 3),
+            "accepted_outcome_observed": False,
         })
     measured = bool(rows)
+    ordered_latencies = sorted(row["latency_ms"] for row in rows)
+    p95_index = max(0, math.ceil(len(ordered_latencies) * 0.95) - 1)
+    precision_at_k = round(sum(row["precision_at_k"] for row in rows) / len(rows), 6) if rows else None
+    recall_at_k = round(sum(row["recall_at_k"] for row in rows) / len(rows), 6) if rows else None
+    mrr = round(sum(row["reciprocal_rank"] for row in rows) / len(rows), 6) if rows else None
+    success_at_k = round(sum(bool(row["success_at_k"]) for row in rows) / len(rows), 6) if rows else None
+    observed_metrics = {
+        "recall_at_k": recall_at_k,
+        "mrr": mrr,
+        "success_at_k": success_at_k,
+    }
+    gate_failures = [
+        f"{metric}:{observed_metrics[metric]}<{minimum}"
+        for metric, minimum in minimums.items()
+        if observed_metrics[metric] is None or observed_metrics[metric] < minimum
+    ]
     return {
         "schema_id": "aiworkhub.source_graph_retrieval_eval.v1",
-        "status": "measured" if measured else "inconclusive",
+        "status": "below_gate" if gate_failures else ("measured" if measured else "inconclusive"),
         "configured": True,
         "measured": measured,
+        "blocking": bool(gate_failures),
         "case_count": len(rows),
-        "precision_at_k": round(sum(row["precision_at_k"] for row in rows) / len(rows), 6) if rows else None,
-        "mrr": round(sum(row["reciprocal_rank"] for row in rows) / len(rows), 6) if rows else None,
+        "precision_at_k": precision_at_k,
+        "recall_at_k": recall_at_k,
+        "mrr": mrr,
+        "success_at_k": success_at_k,
+        "mean_returned_bytes": round(sum(row["returned_bytes"] for row in rows) / len(rows), 3) if rows else None,
+        "mean_latency_ms": round(sum(row["latency_ms"] for row in rows) / len(rows), 3) if rows else None,
+        "p95_latency_ms": ordered_latencies[p95_index] if rows else None,
+        "accepted_outcome_coverage": 0.0 if rows else None,
+        "accepted_outcome_measurement_pending": measured,
+        "minimums": minimums,
+        "gate_failures": gate_failures,
         "cases": rows,
         "causal_token_savings_claimed": False,
     }
@@ -350,7 +400,7 @@ def session_token_profile(repo_root: Path | str, *, task_id: str | None = None) 
         for key in (
             "input_tokens", "output_tokens", "visible_output_tokens",
             "reasoning_output_tokens", "total_tokens", "cached_input_tokens",
-            "cache_creation_input_tokens",
+            "cache_creation_input_tokens", "cache_write_input_tokens",
         )
     }
     prompt_sections: Counter[str] = Counter()

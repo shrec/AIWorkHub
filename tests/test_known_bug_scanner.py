@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from aiworkhub import known_bug_scanner, quality_evidence
+import pytest
+
+from aiworkhub import attempt_artifacts, known_bug_scanner, quality_evidence
 
 
 def test_cuda_intrinsic_mismatch_is_error(tmp_path: Path):
@@ -165,3 +167,143 @@ def test_sarif_export_is_stable_and_does_not_upgrade_evidence(tmp_path: Path):
     assert result["properties"]["runtimeValidated"] is False
     assert len(result["partialFingerprints"]["aiworkhubRootCauseFingerprint"]) == 64
     assert run["properties"]["claimBoundary"] == "static_pattern_not_runtime_reproduction"
+
+
+def _runtime_bundle(tmp_path: Path, *, returncode: int = 1) -> Path:
+    bundle = tmp_path / "attempt-artifacts" / "request-1"
+    attempt_artifacts.persist_json_bundle(
+        bundle,
+        attempt_id="request-1",
+        payloads={
+            "metadata": {"request_identity": {"request_id": "request-1"}},
+            "diff": {"changed_paths": ["runner.py"]},
+            "validation": {
+                "checks": [{
+                    "check_id": "reproduce:python.shell_true",
+                    "command": ["python", "tests/reproduce_shell_true.py"],
+                    "returncode": returncode,
+                    "duration_seconds": 0.25,
+                }],
+            },
+            "usage": {"usage_observed": False},
+            "review": {"target_state": "review_ready"},
+        },
+    )
+    return bundle
+
+
+def test_manager_sealed_runtime_receipt_upgrades_exact_finding(tmp_path: Path):
+    (tmp_path / "runner.py").write_text(
+        "subprocess.run(value, shell=True)\n", encoding="utf-8"
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    finding = report["findings"][0]
+    key = b"manager-owned-test-key"
+    receipt = known_bug_scanner.issue_runtime_reproduction_receipt(
+        report,
+        bundle_dir=_runtime_bundle(tmp_path),
+        root_cause_fingerprint=finding["root_cause_fingerprint"],
+        check_id="reproduce:python.shell_true",
+        expected_returncodes=[1],
+        verified_by="codex-manager",
+        coordinator_key=key,
+    )
+
+    bound = known_bug_scanner.bind_runtime_reproduction_receipts(
+        report, [receipt], coordinator_key=key
+    )
+
+    upgraded = bound["findings"][0]
+    assert upgraded["verification_state"] == "runtime_validated"
+    assert upgraded["runtime_validated"] is True
+    assert upgraded["runtime_reproduction_receipt"]["command"] == [
+        "python", "tests/reproduce_shell_true.py"
+    ]
+    assert bound["evidence_summary"]["runtime_validated"] == 1
+    assert bound["evidence_summary"]["unvalidated_static_candidates"] == 0
+    sarif_result = known_bug_scanner.to_sarif(bound)["runs"][0]
+    assert sarif_result["properties"]["runtimeValidated"] == 1
+    assert sarif_result["results"][0]["properties"]["runtimeReproduction"][
+        "attemptId"
+    ] == "request-1"
+
+
+def test_runtime_receipt_rejects_model_style_unsigned_or_tampered_claim(tmp_path: Path):
+    (tmp_path / "runner.py").write_text(
+        "subprocess.run(value, shell=True)\n", encoding="utf-8"
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    finding = report["findings"][0]
+    key = b"manager-owned-test-key"
+    receipt = known_bug_scanner.issue_runtime_reproduction_receipt(
+        report,
+        bundle_dir=_runtime_bundle(tmp_path),
+        root_cause_fingerprint=finding["root_cause_fingerprint"],
+        check_id="reproduce:python.shell_true",
+        expected_returncodes=[1],
+        verified_by="codex-manager",
+        coordinator_key=key,
+    )
+    receipt["returncode"] = 0
+
+    with pytest.raises(ValueError, match="signature"):
+        known_bug_scanner.bind_runtime_reproduction_receipts(
+            report, [receipt], coordinator_key=key
+        )
+
+
+def test_runtime_receipt_rejects_revision_drift(tmp_path: Path):
+    path = tmp_path / "runner.py"
+    path.write_text("subprocess.run(value, shell=True)\n", encoding="utf-8")
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    finding = report["findings"][0]
+    key = b"manager-owned-test-key"
+    receipt = known_bug_scanner.issue_runtime_reproduction_receipt(
+        report,
+        bundle_dir=_runtime_bundle(tmp_path),
+        root_cause_fingerprint=finding["root_cause_fingerprint"],
+        check_id="reproduce:python.shell_true",
+        expected_returncodes=[1],
+        verified_by="codex-manager",
+        coordinator_key=key,
+    )
+    path.write_text(
+        "prefix = True\nsubprocess.run(value, shell=True)\n", encoding="utf-8"
+    )
+    changed_report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+
+    with pytest.raises(ValueError, match="revision mismatch"):
+        known_bug_scanner.bind_runtime_reproduction_receipts(
+            changed_report, [receipt], coordinator_key=key
+        )
+
+
+def test_runtime_receipt_requires_matching_exit_semantics(tmp_path: Path):
+    (tmp_path / "runner.py").write_text(
+        "subprocess.run(value, shell=True)\n", encoding="utf-8"
+    )
+    report = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    finding = report["findings"][0]
+
+    with pytest.raises(ValueError, match="exit semantics"):
+        known_bug_scanner.issue_runtime_reproduction_receipt(
+            report,
+            bundle_dir=_runtime_bundle(tmp_path, returncode=0),
+            root_cause_fingerprint=finding["root_cause_fingerprint"],
+            check_id="reproduce:python.shell_true",
+            expected_returncodes=[1],
+            verified_by="codex-manager",
+            coordinator_key=b"manager-owned-test-key",
+        )
+
+
+def test_source_revision_changes_with_exact_scanned_bytes(tmp_path: Path):
+    path = tmp_path / "runner.py"
+    path.write_text("subprocess.run(value, shell=True)\n", encoding="utf-8")
+    first = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    path.write_text(
+        "subprocess.run(other, shell=True)\n", encoding="utf-8"
+    )
+    second = known_bug_scanner.scan_changed_paths(tmp_path, ["runner.py"])
+    assert first["source_revision_sha256"] != second["source_revision_sha256"]
+    assert first["source_revision_scope"] == "exact_paths_and_bytes"

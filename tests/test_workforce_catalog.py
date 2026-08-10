@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiworkhub import workforce_catalog, workforce_router
@@ -187,6 +188,124 @@ def test_rank_task_uses_manager_adjustment_without_fabricating_outcomes(tmp_path
     assert by_id["b"]["score_components"]["manager_adjusted_success_rate"] > by_id["a"]["score_components"]["manager_adjusted_success_rate"]
 
 
+def test_economic_advisory_never_changes_selected_worker(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    workers = [
+        {
+            "worker_id": "selected-by-existing-policy",
+            "adapter_id": "codex_cli",
+            "model": "model-a",
+            "provider": "openai",
+            "enabled": True,
+            "supports": ["code"],
+            "tools": ["filesystem"],
+            "max_context_tokens": 1000,
+            "max_risk": "high",
+            "quality_ceiling": 1.0,
+            "manager_score_adjustment": 0.0,
+            "available": True,
+            "outcomes": {
+                "sample_count": 5,
+                "accepted_rate": 1.0,
+                "review_ready_rate": 1.0,
+                "validation_failure_rate": 0.0,
+                "cost_usd_per_1k_tokens": 0.1,
+                "estimated_tokens_per_attempt": 1000,
+            },
+            "cost_per_accepted_outcome": {"code": {"medium": {
+                "state": "MEASURED",
+                "matched_decided_tasks": 5,
+                "accepted_outcomes": 5,
+                "cost_coverage": 1.0,
+                "cost_per_accepted_outcome_usd": 5.0,
+            }}},
+        },
+        {
+            "worker_id": "economic-advisory-only",
+            "adapter_id": "codex_cli",
+            "model": "model-b",
+            "provider": "openai",
+            "enabled": True,
+            "supports": ["code"],
+            "tools": ["filesystem"],
+            "max_context_tokens": 1000,
+            "max_risk": "high",
+            "quality_ceiling": 1.0,
+            "manager_score_adjustment": 0.0,
+            "available": True,
+            "outcomes": {
+                "sample_count": 5,
+                "accepted_rate": 1.0,
+                "review_ready_rate": 1.0,
+                "validation_failure_rate": 0.0,
+                "cost_usd_per_1k_tokens": 0.2,
+                "estimated_tokens_per_attempt": 1000,
+            },
+            "cost_per_accepted_outcome": {"code": {"medium": {
+                "state": "MEASURED",
+                "matched_decided_tasks": 5,
+                "accepted_outcomes": 5,
+                "cost_coverage": 1.0,
+                "cost_per_accepted_outcome_usd": 1.0,
+            }}},
+        },
+    ]
+    task = workforce_router.TaskRequirements.build(
+        task_id="economic-advisory",
+        repo_id="repo",
+        kinds=["code"],
+        tool_needs=["filesystem"],
+    )
+
+    decision = workforce_catalog.rank_task(
+        root, task, catalog={"workers": workers}
+    )
+
+    assert decision["selected_worker_id"] == "selected-by-existing-policy"
+    assert decision["economic_advisory"]["recommended_worker_id"] == "economic-advisory-only"
+    assert decision["economic_advisory"]["automatic_selection_changed"] is False
+    assert decision["economic_advisory"]["shadow_eligible"] is False
+
+
+def test_economic_advisory_excludes_unknown_cost(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    workers = [{
+        "worker_id": "unknown-cost",
+        "adapter_id": "codex_cli",
+        "model": "unknown-model",
+        "provider": "openai",
+        "enabled": True,
+        "supports": ["code"],
+        "tools": ["filesystem"],
+        "max_context_tokens": 1000,
+        "max_risk": "high",
+        "quality_ceiling": 1.0,
+        "manager_score_adjustment": 0.0,
+        "available": True,
+        "outcomes": {"sample_count": 1},
+        "cost_per_accepted_outcome": {"code": {"medium": {
+            "state": "UNKNOWN",
+            "matched_decided_tasks": 1,
+            "accepted_outcomes": 1,
+            "cost_coverage": 0.0,
+            "cost_per_accepted_outcome_usd": None,
+        }}},
+    }]
+    task = workforce_router.TaskRequirements.build(
+        task_id="unknown-advisory",
+        repo_id="repo",
+        kinds=["code"],
+        tool_needs=["filesystem"],
+    )
+
+    decision = workforce_catalog.rank_task(
+        root, task, catalog={"workers": workers}
+    )
+
+    assert decision["economic_advisory"]["recommended_worker_id"] is None
+    assert decision["economic_advisory"]["comparable_candidates"] == 0
+
+
 def test_execution_runner_is_stable_and_never_uses_manager_identity() -> None:
     assert workforce_catalog.execution_runner("glm-5.2", "glm_vscode_lm") == "glm_5.2"
     assert workforce_catalog.execution_runner("deepseek-v4-pro", "deepseek_vscode_lm") == "deepseek_v4-pro"
@@ -316,6 +435,85 @@ def test_successful_attributed_outcome_establishes_access_observation(tmp_path: 
     assert worker["availability_observed"] is True
 
 
+def test_codex_historical_success_cannot_override_unverified_current_model_access(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[{
+            "task_id": "T1",
+            "status": "finished",
+            "terminal_substatus": "review_ready",
+        }],
+        process_rows=[{
+            "request_id": "r1",
+            "task_id": "T1",
+            "adapter_id": "codex_cli",
+            "model": "gpt-5.3-codex",
+        }],
+        preflight={
+            "providers": [{
+                "adapter_id": "codex_cli",
+                "launchable": True,
+                "access_observed": False,
+                "status": "installed_unverified_access",
+            }]
+        },
+    )
+
+    worker = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "gpt-5.3-codex"
+    )
+    assert worker["outcomes"]["sample_count"] == 1
+    assert worker["availability_observed"] is True
+    assert worker["available"] is False
+    assert worker["readiness_status"] == "model_access_unverified"
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="T-codex-unverified",
+        repo_id="repo",
+        kinds=["code"],
+        risk="high",
+        owner_model_pin="gpt-5.3-codex",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] is None
+    assert decision["launch_contract"] is None
+
+
+def test_codex_worker_requires_current_exact_model_capability_receipt(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    snapshot = workforce_catalog.build_catalog(
+        root,
+        cards=[],
+        process_rows=[],
+        preflight={
+            "providers": [{
+                "adapter_id": "codex_cli",
+                "launchable": True,
+                "access_observed": True,
+                "observed_models": ["gpt-5.5"],
+                "status": "ready",
+            }]
+        },
+    )
+
+    supported = next(
+        row for row in snapshot["workers"] if row["worker_id"] == "gpt-5.5"
+    )
+    unsupported = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "gpt-5.3-codex"
+    )
+    assert supported["available"] is True
+    assert unsupported["available"] is False
+
+
 def test_canonical_usage_rows_supply_tokens_and_labeled_unknown_cost(tmp_path: Path) -> None:
     root = _root(tmp_path)
     snapshot = workforce_catalog.build_catalog(
@@ -406,3 +604,132 @@ def test_missing_process_identity_is_recovered_only_from_canonical_terminal_evid
     assert worker["outcomes"]["sample_count"] == 1
     assert snapshot["summary"]["process_identity_recovered_rows"] == 1
     assert snapshot["summary"]["unattributed_process_rows"] == 0
+
+
+def _route_failure_row(
+    *, request_id: str, model: str, state: str, error: str, epoch: float,
+) -> dict:
+    return {
+        "request_id": request_id,
+        "task_id": f"task-{request_id}",
+        "adapter_id": "deepseek_vscode_lm",
+        "model": model,
+        "state": state,
+        "error": error,
+        "finished_at": datetime.fromtimestamp(
+            epoch, tz=timezone.utc
+        ).isoformat(),
+    }
+
+
+def _deepseek_preflight() -> dict:
+    return {"providers": [{
+        "adapter_id": "deepseek_vscode_lm",
+        "launchable": True,
+        "status": "ready",
+        "observed_models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+    }]}
+
+
+def test_route_circuit_is_exact_adapter_model_and_never_shared_mcp(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    failures = [
+        _route_failure_row(
+            request_id="failure-1", model="deepseek-v4-pro",
+            state="worker_failed", error="mcp_request_timeout",
+            epoch=now - 20,
+        ),
+        _route_failure_row(
+            request_id="failure-2", model="deepseek-v4-pro",
+            state="worker_failed", error="no_terminal_event",
+            epoch=now - 10,
+        ),
+    ]
+
+    snapshot = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=failures,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "deepseek-v4-pro"
+    )
+    flash = next(
+        row for row in snapshot["workers"]
+        if row["worker_id"] == "deepseek-v4-flash"
+    )
+
+    assert pro["available"] is False
+    assert pro["readiness_status"] == "route_circuit_open"
+    assert pro["route_health"]["state"] == "open"
+    assert pro["route_health"]["consecutive_failures"] == 2
+    assert pro["route_health"]["scope"] == "exact_adapter_and_model"
+    assert pro["route_health"]["mcp_control_plane_affected"] is False
+    assert flash["available"] is True
+    assert flash["route_health"]["state"] == "closed"
+
+    task = workforce_router.TaskRequirements.build(
+        task_id="route-local-fallback",
+        repo_id="repo",
+        kinds=["mechanical", "code"],
+        risk="medium",
+        tool_needs=["source-graph"],
+    )
+    decision = workforce_catalog.rank_task(root, task, catalog=snapshot)
+    assert decision["selected_worker_id"] == "deepseek-v4-flash"
+    assert decision["launch_contract"]["model"] == "deepseek-v4-flash"
+
+
+def test_route_success_resets_transient_circuit_and_auth_circuit_half_opens(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = 2_000_000_000.0
+    rows = [
+        _route_failure_row(
+            request_id="old-1", model="deepseek-v4-pro",
+            state="worker_failed", error="mcp_request_timeout",
+            epoch=now - 30,
+        ),
+        _route_failure_row(
+            request_id="old-2", model="deepseek-v4-pro",
+            state="timed_out", error="provider_timeout",
+            epoch=now - 20,
+        ),
+        _route_failure_row(
+            request_id="success", model="deepseek-v4-pro",
+            state="validation_failed", error="downstream test failed",
+            epoch=now - 10,
+        ),
+    ]
+    reset = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=rows,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in reset["workers"]
+        if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["route_health"]["state"] == "closed"
+    assert pro["route_health"]["consecutive_failures"] == 0
+
+    auth_failure = [_route_failure_row(
+        request_id="auth", model="deepseek-v4-pro",
+        state="worker_failed", error="authentication_failed:http_status=401",
+        epoch=now - 700,
+    )]
+    cooled = workforce_catalog.build_catalog(
+        root, cards=[], process_rows=auth_failure,
+        preflight=_deepseek_preflight(), now_epoch=now,
+    )
+    pro = next(
+        row for row in cooled["workers"]
+        if row["worker_id"] == "deepseek-v4-pro"
+    )
+    assert pro["available"] is True
+    assert pro["route_health"]["state"] == "half_open"
+    assert pro["route_health"]["failure_kind"] == "auth"

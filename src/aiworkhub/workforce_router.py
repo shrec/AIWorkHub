@@ -174,6 +174,11 @@ class OutcomeEvidence:
     cost_usd_per_1k_tokens: float | None = None
     estimated_tokens: int | None = None
     tool_discipline_score: float | None = None
+    cost_per_accepted_outcome_usd: float | None = None
+    economic_evidence_state: str = "UNMEASURED"
+    economic_matched_tasks: int = 0
+    economic_accepted_outcomes: int = 0
+    economic_cost_coverage: float | None = None
     sample_count: int = 0
 
     def normalized(self) -> tuple[dict[str, float | None], dict[str, str]]:
@@ -233,6 +238,11 @@ class OutcomeEvidence:
             "cost_usd_per_1k_tokens": self.cost_usd_per_1k_tokens,
             "estimated_tokens": self.estimated_tokens,
             "tool_discipline_score": self.tool_discipline_score,
+            "cost_per_accepted_outcome_usd": self.cost_per_accepted_outcome_usd,
+            "economic_evidence_state": self.economic_evidence_state,
+            "economic_matched_tasks": self.economic_matched_tasks,
+            "economic_accepted_outcomes": self.economic_accepted_outcomes,
+            "economic_cost_coverage": self.economic_cost_coverage,
             "sample_count": self.sample_count,
         }
 
@@ -433,6 +443,15 @@ def _score_components(task: TaskRequirements, worker: WorkerCapability) -> dict[
         "tool_discipline_score": values["tool_discipline_score"],
         "estimated_cost_usd": estimated_cost,
         "cost_known": cost_rate is not None,
+        "cost_per_accepted_outcome_usd": (
+            round(float(worker.evidence.cost_per_accepted_outcome_usd), 6)
+            if worker.evidence.cost_per_accepted_outcome_usd is not None
+            else None
+        ),
+        "economic_evidence_state": worker.evidence.economic_evidence_state,
+        "economic_matched_tasks": worker.evidence.economic_matched_tasks,
+        "economic_accepted_outcomes": worker.evidence.economic_accepted_outcomes,
+        "economic_cost_coverage": worker.evidence.economic_cost_coverage,
         "quality_floor": task.quality_floor,
         "meets_quality_floor": effective_success >= task.quality_floor,
         "deadline_penalty": deadline_penalty,
@@ -523,6 +542,56 @@ def rank_workforce(
     )
 
 
+def economic_advisory(decision: WorkforceDecision) -> dict[str, Any]:
+    """Rank only complete matched outcome economics without changing routing."""
+
+    comparable: list[CandidateRecord] = []
+    for candidate in decision.candidates:
+        components = candidate.score_components
+        if candidate.excluded:
+            continue
+        if components.get("economic_evidence_state") != "MEASURED":
+            continue
+        if components.get("cost_per_accepted_outcome_usd") is None:
+            continue
+        comparable.append(candidate)
+    ranked = sorted(
+        comparable,
+        key=lambda candidate: (
+            float(candidate.score_components["cost_per_accepted_outcome_usd"]),
+            -float(candidate.score_components.get("manager_adjusted_success_rate") or 0.0),
+            candidate.provider,
+            candidate.model,
+            candidate.worker_id,
+        ),
+    )
+    return {
+        "schema_id": "aiworkhub.economic_routing_advisory.v1",
+        "stage": "advisory",
+        "automatic_selection_changed": False,
+        "recommended_worker_id": ranked[0].worker_id if ranked else None,
+        "ranked_worker_ids": [item.worker_id for item in ranked],
+        "comparable_candidates": len(ranked),
+        "shadow_eligible": False,
+        "bounded_canary_eligible": False,
+        "activation_blockers": [
+            "matched_uncapped_parity_evidence_required",
+            "task_family_and_risk_partition_required",
+            "rollback_thresholds_not_yet_satisfied",
+        ],
+        "rollback_triggers": [
+            "acceptance_regression",
+            "validation_regression",
+            "evidence_coverage_regression",
+            "risk_regression",
+        ],
+        "claim_boundary": (
+            "This ranking is advisory association evidence only and does not "
+            "alter the selected worker or claim causal savings."
+        ),
+    }
+
+
 def select_worker(
     task: TaskRequirements,
     workers: Sequence[WorkerCapability],
@@ -598,6 +667,7 @@ __all__ = [
     "WorkerCapability",
     "WorkforceDecision",
     "plan_parallel_shards",
+    "economic_advisory",
     "rank_workforce",
     "select_worker",
 ]

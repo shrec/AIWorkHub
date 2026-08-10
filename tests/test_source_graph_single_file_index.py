@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,54 @@ def test_remove_file_basic(tmp_path):
         assert _edge_count_for_file(conn, "lib/farewell.py") == 0
     finally:
         conn.close()
+
+
+def test_private_db_override_does_not_leak_across_threads(tmp_path):
+    canonical_repo = _new_repo(tmp_path, "canonical_thread")
+    overlay_repo = _new_repo(tmp_path, "overlay_thread")
+    canonical_source = "def canonical_thread_symbol():\n    return 1\n"
+    overlay_source = "def overlay_thread_symbol():\n    return 2\n"
+    _write(canonical_repo / "canonical.py", canonical_source)
+    _write(overlay_repo / "overlay.py", overlay_source)
+    overlay_db = tmp_path / "private" / "overlay.sqlite"
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def overlay_writer() -> None:
+        try:
+            with sg.database_path_override(overlay_db):
+                entered.set()
+                assert release.wait(timeout=5)
+                sg.index_file(
+                    overlay_repo, "overlay.py", _sha256(overlay_source)
+                )
+        except BaseException as exc:  # preserve thread failure for assertion
+            errors.append(exc)
+
+    thread = threading.Thread(target=overlay_writer)
+    thread.start()
+    assert entered.wait(timeout=5)
+    # This call runs while another thread owns a private overlay context. It
+    # must still resolve the canonical repository database.
+    sg.index_file(
+        canonical_repo, "canonical.py", _sha256(canonical_source)
+    )
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+
+    canonical_conn = sg.connect(sg.resolve_db_path(canonical_repo), read_only=True)
+    overlay_conn = sg.connect(overlay_db, read_only=True)
+    try:
+        assert _entity_count_for_file(canonical_conn, "canonical.py") >= 1
+        assert _entity_count_for_file(canonical_conn, "overlay.py") == 0
+        assert _entity_count_for_file(overlay_conn, "overlay.py") >= 1
+        assert _entity_count_for_file(overlay_conn, "canonical.py") == 0
+    finally:
+        canonical_conn.close()
+        overlay_conn.close()
 
 
 # ---------------------------------------------------------------------------

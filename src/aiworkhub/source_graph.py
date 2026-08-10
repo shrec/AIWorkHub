@@ -29,8 +29,10 @@ Design constraints (see task card B849):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fnmatch
 import json
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -38,7 +40,9 @@ import stat
 import sys
 import time
 from collections import deque
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -78,6 +82,11 @@ MAX_COMPONENT_NODES = 500
 MAX_PATH_VISITS = 5000
 SOURCE_GRAPH_COMPACT_MIN_BYTES = 64 * 1024 * 1024
 SOURCE_GRAPH_COMPACT_MIN_FREELIST_RATIO = 0.20
+SOURCE_GRAPH_EXTRACT_WORKERS_ENV = "AIWORKHUB_SOURCE_GRAPH_EXTRACT_WORKERS"
+DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS = 2
+MAX_SOURCE_GRAPH_EXTRACT_WORKERS = 8
+MIN_PARALLEL_EXTRACTION_FILES = 8
+MIN_PARALLEL_EXTRACTION_BYTES = 256 * 1024
 _INDEXED_EXTENSION_SET = frozenset(
     suffix.casefold() for suffix in sglanguages.INDEXED_EXTENSIONS
 )
@@ -203,6 +212,28 @@ class SourceGraphBuildInProgressError(SourceGraphError):
 # Repository / database resolution -- identity-bound, never a fixed path
 # ---------------------------------------------------------------------------
 
+_DB_PATH_OVERRIDE: ContextVar[Path | None] = ContextVar(
+    "aiworkhub_source_graph_db_path_override", default=None
+)
+
+
+@contextmanager
+def database_path_override(db_path: Path):
+    """Bind one private graph DB to the current execution context only.
+
+    Reviewer/rework overlays must not replace the module-level resolver:
+    another thread may concurrently index a different repository. ContextVar
+    scoping keeps nested calls such as ``index_write_lease`` on the same DB
+    without leaking that authority into other threads or async tasks.
+    """
+
+    resolved = Path(db_path).resolve()
+    token = _DB_PATH_OVERRIDE.set(resolved)
+    try:
+        yield resolved
+    finally:
+        _DB_PATH_OVERRIDE.reset(token)
+
 def resolve_db_path(repo_root: Path) -> Path:
     """Resolve the canonical Source Graph database for ``repo_root``.
 
@@ -210,6 +241,11 @@ def resolve_db_path(repo_root: Path) -> Path:
     the repository-bound storage registry -- never a fixed project-specific
     path and never influenced by process ``cwd``.
     """
+
+    override = _DB_PATH_OVERRIDE.get()
+    if override is not None:
+        override.parent.mkdir(parents=True, exist_ok=True)
+        return override
 
     try:
         registry = load_storage_registry(repo_root)
@@ -321,7 +357,7 @@ def index_write_lease(repo_root: Path):
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         handle.close()
 
@@ -603,6 +639,10 @@ class BuildReport:
     compaction_error: str = ""
     compaction_recommended: bool = False
     compaction_deferred_reason: str = ""
+    extraction_workers: int = 1
+    extraction_seconds: float = 0.0
+    extraction_backend: str = "sequential"
+    extraction_fallback_reason: str = ""
     index_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -615,6 +655,10 @@ class BuildReport:
             "build_revision": self.build_revision, "finished_at": self.finished_at,
             "compaction_performed": self.compaction_performed,
             "database_bytes_before_compaction": self.database_bytes_before_compaction,
+            "extraction_workers": self.extraction_workers,
+            "extraction_seconds": self.extraction_seconds,
+            "extraction_backend": self.extraction_backend,
+            "extraction_fallback_reason": self.extraction_fallback_reason,
             "database_bytes_after_compaction": self.database_bytes_after_compaction,
             "freelist_ratio_before_compaction": self.freelist_ratio_before_compaction,
             "compaction_error": self.compaction_error,
@@ -622,6 +666,49 @@ class BuildReport:
             "compaction_deferred_reason": self.compaction_deferred_reason,
             "index_quality": self.index_quality,
         }
+
+
+def _source_graph_extract_workers(
+    candidate_count: int, candidate_bytes: int = 0,
+) -> int:
+    """Return a bounded extraction width for one repository build.
+
+    Extraction is the read/parse phase only; SQLite invalidation, merge and
+    cross-file resolution remain single-writer and deterministic.  A value of
+    ``1`` is used for zero/one candidate so small incremental refreshes do not
+    pay executor startup cost.  The environment override is intentionally
+    bounded and cannot create an unbounded process fan-out.
+    """
+
+    configured = os.environ.get(SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "").strip()
+    if configured:
+        try:
+            requested = int(configured)
+        except ValueError:
+            requested = 1
+    else:
+        if (
+            candidate_count < MIN_PARALLEL_EXTRACTION_FILES
+            or candidate_bytes < MIN_PARALLEL_EXTRACTION_BYTES
+        ):
+            return 1
+        requested = min(
+            DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS,
+            max(1, int(os.cpu_count() or 1)),
+        )
+    return min(candidate_count, max(1, min(requested, MAX_SOURCE_GRAPH_EXTRACT_WORKERS)))
+
+
+def _extract_source_graph_candidate(
+    candidate: tuple[str, str, str, int, int, str],
+) -> tuple[sgast.FileExtraction, str, int, int]:
+    """Spawn-safe pure extraction worker; it never opens the graph DB."""
+
+    repo_root, path, rel, file_size, mtime_ns, build_revision = candidate
+    extraction = sgast.extract_file(
+        Path(repo_root), Path(path), build_revision=build_revision
+    )
+    return extraction, rel, file_size, mtime_ns
 
 
 def _index_quality_scorecard(
@@ -1054,6 +1141,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     seen_rel: set[str] = set()
     changed = unchanged = removed = entities_written = edges_written = 0
     errors: list[dict[str, str]] = []
+    extraction_workers = 1
+    extraction_seconds = 0.0
+    extraction_backend = "sequential"
+    extraction_fallback_reason = ""
     compaction_performed = False
     compaction_error = ""
     bytes_before_compaction = 0
@@ -1085,6 +1176,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 str(row["extractor"])
             )
         pending_extractions: list[tuple[sgast.FileExtraction, int, int]] = []
+        extraction_candidates: list[tuple[Path, str, int, int]] = []
         pending_stat_updates: list[tuple[int, int, str]] = []
         expected_extractors_by_suffix: dict[str, frozenset[str]] = {}
         for path in files_on_disk:
@@ -1112,7 +1204,61 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
             ):
                 unchanged += 1
                 continue
-            extraction = sgast.extract_file(repo_root, path, build_revision=BUILD_REVISION)
+            extraction_candidates.append((path, rel, file_size, mtime_ns))
+
+        extraction_workers = _source_graph_extract_workers(
+            len(extraction_candidates),
+            sum(max(0, candidate[2]) for candidate in extraction_candidates),
+        )
+        extraction_started = time.monotonic()
+        process_candidates = [
+            (
+                str(repo_root), str(path), rel, file_size, mtime_ns,
+                BUILD_REVISION,
+            )
+            for path, rel, file_size, mtime_ns in extraction_candidates
+        ]
+        if extraction_workers > 1:
+            try:
+                # Spawn is used on every OS.  It avoids forking the live MCP
+                # server (which may already own threads/SQLite handles) and
+                # keeps the worker contract identical on Linux, Windows and
+                # macOS.  Workers only read source and return immutable
+                # extraction records; the parent remains the sole DB writer.
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=extraction_workers,
+                    mp_context=multiprocessing.get_context("spawn"),
+                ) as executor:
+                    extracted_candidates = list(
+                        executor.map(
+                            _extract_source_graph_candidate,
+                            process_candidates,
+                            chunksize=1,
+                        )
+                    )
+                extraction_backend = "process_pool"
+            except (OSError, BrokenProcessPool) as exc:
+                # Sandboxes may deny process creation.  No extraction mutates
+                # canonical state, so an all-candidate sequential replay is
+                # safe and the fallback stays visible in the build receipt.
+                extraction_workers = 1
+                extraction_backend = "sequential_fallback"
+                extraction_fallback_reason = type(exc).__name__
+                extracted_candidates = [
+                    _extract_source_graph_candidate(candidate)
+                    for candidate in process_candidates
+                ]
+        else:
+            extracted_candidates = [
+                _extract_source_graph_candidate(candidate)
+                for candidate in process_candidates
+            ]
+        extraction_seconds = max(0.0, time.monotonic() - extraction_started)
+
+        # ``Executor.map`` preserves candidate order.  The SQLite merge stays
+        # single-threaded so parallel extraction cannot change row authority,
+        # invalidate a file twice, or make query results schedule-dependent.
+        for extraction, rel, file_size, mtime_ns in extracted_candidates:
             seen_rel.discard(rel)
             seen_rel.add(extraction.file_path)
             prior = existing.get(extraction.file_path)
@@ -1237,6 +1383,10 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         compaction_error=compaction_error,
         compaction_recommended=compaction_recommended,
         compaction_deferred_reason=compaction_deferred_reason,
+        extraction_workers=extraction_workers,
+        extraction_seconds=extraction_seconds,
+        extraction_backend=extraction_backend,
+        extraction_fallback_reason=extraction_fallback_reason,
         index_quality=index_quality,
     )
 

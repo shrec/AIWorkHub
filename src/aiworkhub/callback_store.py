@@ -339,7 +339,14 @@ def enqueue_callback(
             return False
         conn.commit()
     except sqlite3.IntegrityError:
+        conn.rollback()
         return False
+    except sqlite3.Error:
+        # The caller owns the connection, but this function owns the
+        # transaction it started. Never return/raise with that shared
+        # connection still holding an aborted or open write transaction.
+        conn.rollback()
+        raise
     append_event(conn, task_id, "callback_enqueued", "", {"transition": transition, "episode_id": resolved_episode, "provider": validated_provider})
     return True
 

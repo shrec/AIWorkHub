@@ -33,15 +33,18 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from . import core
 from . import agent_tool_instructions
+from . import attempt_artifacts
 from . import claude_auth
 from . import context_write_intents
 from . import context_writes
+from . import evidence_levels
 from .platform_io import chmod_fd, chmod_path, lock_fd, unlock_fd
 from . import quality_evidence
+from . import quality_review_scope
 from . import process_event_ledger
 from . import provider_usage
 from . import repo_policy
@@ -86,6 +89,7 @@ from .worker_workspace import (
     create_quality_review_workspace,
     create_workspace,
     enforce_scope,
+    materialize_rework_overlay,
     promote,
     provision_worker_mcp_runtime,
     run_validations,
@@ -348,6 +352,21 @@ def _declared_validation_commands(authority: Mapping[str, Any]) -> list[str]:
     return commands
 
 
+def _requires_bridge_cancellation(metadata: Mapping[str, Any]) -> bool:
+    """Return whether finalization must publish a provider bridge decision.
+
+    Coordinator-authorized validation-only replay never launches a provider
+    or creates a fresh VS Code LM bridge receipt.  Skip bridge cancellation
+    only when both durable facts agree; every other editor-hosted lifecycle
+    remains fail-closed.
+    """
+    return not (
+        str(metadata.get("execution_mode") or "").strip()
+        == "validation_only_replay"
+        and metadata.get("provider_launched") is False
+    )
+
+
 def _run_declared_validations(
     workspace: WorkerWorkspace,
     authority: Mapping[str, Any],
@@ -356,11 +375,46 @@ def _run_declared_validations(
     commands = _declared_validation_commands(authority)
     if not commands:
         return []
-    return run_validations(
-        workspace,
-        commands,
-        **_validation_route_kwargs(route_metadata),
-    )
+    try:
+        _work_kind, roles = quality_evidence.normalize_behavioral_contract(
+            authority.get("work_kind"),
+            commands,
+            authority.get("validation_roles"),
+        )
+    except ValueError as exc:
+        raise WorkspaceError(str(exc)) from exc
+
+    def with_roles(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        materialized = [dict(row) for row in rows]
+        if len(materialized) != len(roles):
+            raise WorkspaceError("validation_receipt_count_mismatch")
+        for row, role in zip(materialized, roles, strict=True):
+            row["behavioral_role"] = role
+        return materialized
+
+    try:
+        results = run_validations(
+            workspace,
+            commands,
+            **_validation_route_kwargs(route_metadata),
+        )
+    except ValidationRunError as exc:
+        raise ValidationRunError(str(exc), with_roles(exc.results)) from exc
+    return with_roles(results)
+
+
+def _enforce_behavioral_gate(
+    authority: Mapping[str, Any],
+    validations: Iterable[Mapping[str, Any]],
+    quality_gate: dict[str, Any],
+) -> dict[str, Any]:
+    gate = quality_evidence.evaluate_behavioral_gate(authority, validations)
+    quality_gate["behavioral_gate"] = gate
+    if gate.get("applicable") and not gate.get("passed"):
+        raise WorkspaceError(
+            "behavioral_gate_failed:" + str(gate.get("reason") or "unknown")[:300]
+        )
+    return gate
 
 
 def _is_operational_validation_failure(terminal_state: str, error: str) -> bool:
@@ -1906,7 +1960,7 @@ def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
         # "PROJECT_CONTEXT_RECEIPT: {json} | evidence". Strip only the
         # authenticated JSON prefix; the same-line suffix is the deliverable.
         without_receipts = _strip_project_context_receipt_prefix(text)
-        if not without_receipts:
+        if not _research_result_text_is_meaningful(without_receipts):
             continue
         result_count += 1
         result_chars += len(without_receipts)
@@ -1922,6 +1976,47 @@ def _readonly_research_result_evidence(path: Path) -> dict[str, Any]:
         "result_chars": result_chars,
         "reason": "" if meaningful else "research_result_missing",
     }
+
+
+_RESEARCH_PLACEHOLDER_RESULTS = frozenset(
+    {
+        "complete",
+        "completed",
+        "done",
+        "n/a",
+        "no findings",
+        "no result",
+        "no results",
+        "none",
+        "null",
+        "ok",
+        "placeholder",
+        "research completed",
+        "success",
+        "successful",
+        "task completed",
+        "tbd",
+        "todo",
+    }
+)
+
+
+def _research_result_text_is_meaningful(value: str) -> bool:
+    """Reject bounded content-free finals without judging research quality.
+
+    This is deliberately a narrow anti-collapse gate. Detailed correctness is
+    still manager/reviewer work, while punctuation-only output and common
+    completion placeholders cannot become research evidence merely because a
+    provider emitted them in a successful final event.
+    """
+
+    compact = " ".join(str(value or "").split()).strip()
+    if not compact:
+        return False
+    folded = compact.casefold().strip(" .,…!?:;\\/-_*#`~()[]{}<>'\"")
+    if not folded or folded in _RESEARCH_PLACEHOLDER_RESULTS:
+        return False
+    return any(character.isalnum() for character in compact)
 
 
 # Sections the launcher can inject and that the worker MCP gate also accepts as
@@ -2421,6 +2516,7 @@ def _provision_worker_mcp_runtime_for_authority(
     session_topic: str,
     allowed_writes: list[str] | None = None,
     quality_review_packet_path: Path | None = None,
+    rework_overlay_path: Path | None = None,
 ) -> worker_ai_tools_mcp.WorkerMcpRuntime:
     kwargs: dict[str, Any] = {
         "request_id": request_id,
@@ -2434,6 +2530,8 @@ def _provision_worker_mcp_runtime_for_authority(
     }
     if quality_review_packet_path is not None:
         kwargs["quality_review_packet_path"] = quality_review_packet_path
+    if rework_overlay_path is not None:
+        kwargs["rework_overlay_path"] = rework_overlay_path
     try:
         signature = inspect.signature(provision_worker_mcp_runtime)
     except (TypeError, ValueError):
@@ -2446,6 +2544,226 @@ def _provision_worker_mcp_runtime_for_authority(
     except TypeError:
         pass
     return provision_worker_mcp_runtime(workspace, **kwargs)
+
+
+def _materialize_worker_rework_overlay(
+    workspace: WorkerWorkspace,
+    *,
+    task_id: str,
+    card: Mapping[str, Any],
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Seal inherited predecessor bytes for this request's Source Graph.
+
+    ``create_workspace`` already performed the strong predecessor workspace,
+    repository and hash verification.  This helper serializes exactly those
+    verified paths into the request-private HOME before the provider starts;
+    it never scans beyond ``inherited_rework_paths``.
+    """
+
+    if not workspace.inherited_rework_paths:
+        return None, None
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, Mapping):
+        raise WorkspaceError("rework_overlay_predecessor_missing")
+    predecessor_request_id = str(predecessor.get("request_id") or "").strip()
+    predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
+    hashes = predecessor.get("changed_path_hashes")
+    if not predecessor_request_id or not predecessor_task_id or not isinstance(hashes, Mapping):
+        raise WorkspaceError("rework_overlay_predecessor_invalid")
+
+    entries: list[tuple[str, str | None, bytes | None]] = []
+    for relative in workspace.inherited_rework_paths:
+        if relative not in hashes:
+            raise WorkspaceError(f"rework_overlay_hash_missing:{relative}")
+        expected = hashes.get(relative)
+        candidate = workspace.path / relative
+        if expected is None:
+            if candidate.exists() or candidate.is_symlink():
+                raise WorkspaceError(
+                    f"rework_overlay_deleted_path_present:{relative}"
+                )
+            entries.append((relative, None, None))
+            continue
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise WorkspaceError(f"rework_overlay_hash_invalid:{relative}")
+        if candidate.is_symlink() or not candidate.is_file():
+            raise WorkspaceError(f"rework_overlay_file_missing:{relative}")
+        content = candidate.read_bytes()
+        if hashlib.sha256(content).hexdigest() != expected:
+            raise WorkspaceError(f"rework_overlay_hash_mismatch:{relative}")
+        entries.append((relative, expected, content))
+
+    try:
+        packet_bytes = materialize_rework_overlay(
+            workspace.request_id,
+            task_id,
+            predecessor_request_id,
+            predecessor_task_id,
+            workspace.repo,
+            entries,
+        )
+        packet = json.loads(packet_bytes.decode("utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceError(f"rework_overlay_materialization_failed:{exc}") from exc
+    path = workspace.home / "task_mcp_worker_runtime" / "rework_overlay.json"
+    write_json_0600(path, packet)
+    return path, packet
+
+
+def _materialize_crash_retry_packet(
+    process_dir: Path,
+    workspace: WorkerWorkspace,
+    *,
+    task_id: str,
+    card: Mapping[str, Any],
+    rework_overlay_packet: Mapping[str, Any] | None,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    """Bind bounded failed-stream evidence to one verified rework overlay.
+
+    The predecessor workspace bytes remain authoritative through the overlay;
+    this packet only salvages diagnostics that would otherwise be reread from
+    old process logs. Missing, successful, cross-task, cross-repository, or
+    oversized predecessor metadata fails closed by omitting the packet.
+    """
+
+    predecessor = card.get("rework_predecessor")
+    if not isinstance(predecessor, Mapping) or not isinstance(
+        rework_overlay_packet, Mapping
+    ):
+        return None, None
+    request_id = str(predecessor.get("request_id") or "").strip()
+    predecessor_task_id = str(predecessor.get("task_id") or task_id).strip()
+    if (
+        not request_id
+        or predecessor_task_id != task_id
+        or str(rework_overlay_packet.get("predecessor_request_id") or "")
+        != request_id
+        or str(rework_overlay_packet.get("predecessor_task_id") or "")
+        != task_id
+    ):
+        raise WorkspaceError("crash_retry_predecessor_identity_mismatch")
+
+    metadata_path = process_dir / f"{request_id}.request.json"
+    status_path = process_dir / f"{request_id}.supervisor.json"
+    try:
+        if (
+            metadata_path.is_symlink()
+            or status_path.is_symlink()
+            or metadata_path.stat().st_size > 1024 * 1024
+            or status_path.stat().st_size > 1024 * 1024
+        ):
+            raise WorkspaceError("crash_retry_predecessor_artifact_unsafe")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkspaceError(f"crash_retry_predecessor_artifact_invalid:{exc}") from exc
+    if not isinstance(metadata, dict) or not isinstance(status, dict):
+        raise WorkspaceError("crash_retry_predecessor_artifact_shape_invalid")
+    predecessor_workspace = metadata.get("workspace")
+    if (
+        str(metadata.get("request_id") or "") != request_id
+        or str(metadata.get("task_id") or "") != task_id
+        or not isinstance(predecessor_workspace, dict)
+    ):
+        raise WorkspaceError("crash_retry_predecessor_metadata_identity_mismatch")
+    try:
+        predecessor_repo = Path(str(predecessor_workspace.get("repo") or "")).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkspaceError("crash_retry_predecessor_repo_invalid") from exc
+    if predecessor_repo != workspace.repo.resolve():
+        raise WorkspaceError("crash_retry_predecessor_repo_mismatch")
+
+    state = str(status.get("state") or "")
+    returncode = status.get("exit_code")
+    if state == "exited" and returncode == 0:
+        return None, None
+    stdout_path = process_dir / f"{request_id}.stdout.log"
+    stderr_path = process_dir / f"{request_id}.stderr.log"
+    stdout_raw = _safe_tail(stdout_path, MAX_CRASH_RETRY_STREAM_BYTES)
+    stderr_raw = _safe_tail(stderr_path, MAX_CRASH_RETRY_STREAM_BYTES)
+    stdout_tail = _sanitize_live_output_text(stdout_raw)
+    stderr_tail = _sanitize_live_output_text(stderr_raw)
+    error = str(status.get("error") or "")[:500]
+    if not (stdout_tail or stderr_tail or error or state):
+        return None, None
+    validation_delta: dict[str, Any] | None = None
+    validation_manifest_sha256 = ""
+    bundle_dir = process_dir / "attempt-artifacts" / request_id
+    if bundle_dir.exists():
+        try:
+            attempt_artifacts.verify_json_bundle(bundle_dir)
+            manifest_path = bundle_dir / attempt_artifacts.MANIFEST_FILENAME
+            manifest = attempt_artifacts.parse_manifest_json(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            validation_entry = next(
+                (entry for entry in manifest.artifacts if entry.role == "validation"),
+                None,
+            )
+            if validation_entry is not None:
+                validation_payload = json.loads(
+                    (bundle_dir / validation_entry.path).read_text(encoding="utf-8")
+                )
+                checks = (
+                    validation_payload.get("checks")
+                    if isinstance(validation_payload, dict)
+                    else None
+                )
+                if isinstance(checks, list):
+                    validation_delta = _worker_workspace.validation_failure_delta_packet(
+                        row for row in checks if isinstance(row, Mapping)
+                    )
+                    validation_manifest_sha256 = hashlib.sha256(
+                        manifest_path.read_bytes()
+                    ).hexdigest()
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            attempt_artifacts.InvalidArtifactError,
+            attempt_artifacts.InvalidManifestError,
+        ) as exc:
+            raise WorkspaceError(
+                f"crash_retry_validation_artifact_invalid:{exc}"
+            ) from exc
+
+    packet: dict[str, Any] = {
+        "schema_id": "aiworkhub.crash_retry_packet.v1",
+        "successor_request_id": workspace.request_id,
+        "successor_task_id": task_id,
+        "predecessor_request_id": request_id,
+        "predecessor_task_id": task_id,
+        "predecessor_state": state,
+        "predecessor_exit_code": returncode,
+        "predecessor_error": error,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "stdout_tail_sha256": hashlib.sha256(stdout_raw.encode("utf-8")).hexdigest(),
+        "stderr_tail_sha256": hashlib.sha256(stderr_raw.encode("utf-8")).hexdigest(),
+        "rework_overlay_sha256": str(
+            rework_overlay_packet.get("canonical_digest") or ""
+        ),
+        "inherited_paths": list(workspace.inherited_rework_paths),
+        "validation_failure_delta": validation_delta,
+        "validation_manifest_sha256": validation_manifest_sha256,
+        "stale_worktree_bytes_authoritative": False,
+        "canonical_reread_savings_claimed": False,
+    }
+    canonical = json.dumps(
+        packet,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(canonical) > MAX_CRASH_RETRY_PACKET_BYTES:
+        raise WorkspaceError("crash_retry_packet_too_large")
+    packet["packet_sha256"] = hashlib.sha256(canonical).hexdigest()
+    path = workspace.home / "task_mcp_worker_runtime" / "crash_retry_packet.json"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_json_0600(path, packet)
+    return path, packet
 
 
 def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -2694,10 +3012,113 @@ def _verified_quality_review_receipt(
         binding.get("lens") or ""
     ):
         raise WorkspaceError("quality_review_lens_mismatch")
+    verified["submission_id"] = hashlib.sha256(
+        json.dumps(
+            receipt_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    verified["physical_submission_count"] = len(payloads)
+    verified["logical_submission_count"] = 1
     return verified
 
 
+def _verified_accepted_quality_review_receipt(
+    latest: dict[str, Any],
+    card: dict[str, Any],
+    reviewer_request_id: str,
+    target_request_id: str,
+    target_task_id: str,
+) -> dict[str, Any]:
+    """Reuse a reviewer receipt only after canonical standalone acceptance.
+
+    Standalone acceptance removes the reviewer's read-only workspace, so the
+    original packet/audit files are no longer available.  The receipt remains
+    consumable only when the immutable process event and both task-card copies
+    agree exactly and retain the authority established during acceptance.
+    """
+
+    if str(latest.get("state") or "") != "accepted" or latest.get("accepted") is not True:
+        raise WorkspaceError("quality_reviewer_accepted_event_invalid")
+    reviewer_task_id = str(latest.get("task_id") or "")
+    if not reviewer_task_id or str(card.get("task_id") or "") != reviewer_task_id:
+        raise WorkspaceError("quality_reviewer_accepted_task_identity_mismatch")
+    if _canonical_task_status(card) != "finished":
+        raise WorkspaceError("quality_reviewer_accepted_task_not_finished")
+    if str(card.get("accepted_request_id") or "") != reviewer_request_id:
+        raise WorkspaceError("quality_reviewer_accepted_request_mismatch")
+    if str(card.get("topic") or "") != "quality_review":
+        raise WorkspaceError("quality_reviewer_accepted_topic_mismatch")
+
+    terminal_evidence = ((card.get("terminal_review") or {}).get("evidence") or {})
+    accept_evidence = card.get("accept_evidence") or {}
+    event_receipt = latest.get("quality_review_receipt")
+    terminal_receipt = terminal_evidence.get("quality_review_receipt")
+    accepted_receipt = accept_evidence.get("quality_review_receipt")
+    if not all(
+        isinstance(value, dict)
+        for value in (event_receipt, terminal_receipt, accepted_receipt)
+    ):
+        raise WorkspaceError("quality_reviewer_accepted_receipt_missing")
+    if event_receipt != terminal_receipt or event_receipt != accepted_receipt:
+        raise WorkspaceError("quality_reviewer_accepted_receipt_mismatch")
+
+    receipt = json.loads(json.dumps(event_receipt, ensure_ascii=False))
+    target = receipt.get("target")
+    reviewer = receipt.get("reviewer")
+    report = receipt.get("report")
+    authority = receipt.get("authority")
+    if receipt.get("schema_id") != quality_reviewer.RECEIPT_SCHEMA_ID or not all(
+        isinstance(value, dict)
+        for value in (target, reviewer, report, authority)
+    ):
+        raise WorkspaceError("quality_reviewer_accepted_receipt_shape_invalid")
+    if (
+        str(target.get("request_id") or "") != target_request_id
+        or str(target.get("task_id") or "") != target_task_id
+    ):
+        raise WorkspaceError("quality_reviewer_accepted_target_mismatch")
+    if (
+        str(reviewer.get("request_id") or "") != reviewer_request_id
+        or str(reviewer.get("task_id") or "") != reviewer_task_id
+    ):
+        raise WorkspaceError("quality_reviewer_accepted_identity_mismatch")
+    observed_provider = str(latest.get("adapter_id") or "")
+    if not observed_provider or str(reviewer.get("provider") or "") != observed_provider:
+        raise WorkspaceError("quality_reviewer_accepted_provider_mismatch")
+    if (
+        authority.get("process_identity_verified") is not True
+        or authority.get("audit_verified") is not True
+        or str(authority.get("terminal_state") or "") != "review_ready"
+        or report.get("read_only") is not True
+        or report.get("can_mutate_repo") is not False
+    ):
+        raise WorkspaceError("quality_reviewer_accepted_authority_invalid")
+    return receipt
+
+
+def _enforce_quality_review_launch_binding(
+    topic: str, quality_review_binding: dict[str, Any] | None
+) -> None:
+    """Keep reviewer launches on the packet-bound authority path.
+
+    A blocked reviewer must be relaunched through ``launch_quality_reviewer``
+    against the still-retained target request.  Treating it as an ordinary
+    recovered read-only task drops the immutable target packet and can turn an
+    ungrounded prose response into apparent review work.
+    """
+
+    if topic == "quality_review" and quality_review_binding is None:
+        raise LaunchRejected("quality_review_binding_required")
+    if topic != "quality_review" and quality_review_binding is not None:
+        raise LaunchRejected("quality_review_binding_topic_mismatch")
+
+
 MAX_OWNER_PROMPT_BYTES = 16 * 1024
+MAX_CRASH_RETRY_PACKET_BYTES = 12 * 1024
+MAX_CRASH_RETRY_STREAM_BYTES = 2 * 1024
 MAX_TASK_CONTRACT_BYTES = 96 * 1024
 MAX_REWORK_TASK_CONTRACT_BYTES = 48 * 1024
 MAX_WORKER_PROMPT_BYTES = 160 * 1024
@@ -2712,6 +3133,7 @@ def build_worker_prompt(
     card: dict[str, Any] | None = None,
     owner_prompt: str = "",
     project_context_bundle: str = "",
+    crash_retry_packet: dict[str, Any] | None = None,
     _budget_report: dict[str, Any] | None = None,
 ) -> str:
     extra = owner_prompt.strip()
@@ -2788,6 +3210,24 @@ def build_worker_prompt(
         if project_context_bundle.strip()
         else ""
     )
+    retry_json = ""
+    if crash_retry_packet is not None:
+        retry_json = json.dumps(
+            crash_retry_packet,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(retry_json.encode("utf-8")) > MAX_CRASH_RETRY_PACKET_BYTES:
+            raise ValueError("crash_retry_packet_too_large")
+    retry_block = (
+        "\n\nTrusted predecessor crash evidence (bounded and coordinator-bound; "
+        "do not infer current files from this text):\nCRASH_RETRY_PACKET_JSON:\n"
+        + retry_json
+        + "\nEND_CRASH_RETRY_PACKET_JSON"
+        if retry_json
+        else ""
+    )
     # Keep every invariant instruction before the first task-specific byte.
     # Provider prefix caches can then reuse this complete policy block across
     # unrelated tasks; the task contract, context receipt, and owner text stay
@@ -2800,6 +3240,7 @@ def build_worker_prompt(
         + contract_json
         + "\nEND_TASK_CONTRACT_JSON"
         + context_block
+        + retry_block
         + suffix
     )
     prompt_bytes = len(prompt.encode("utf-8"))
@@ -2808,7 +3249,11 @@ def build_worker_prompt(
         raise ValueError("worker_prompt_too_large")
     if _budget_report is not None:
         context_bytes = len(project_context_bundle.encode("utf-8"))
-        static_bytes = max(0, prompt_bytes - contract_bytes - context_bytes - owner_bytes)
+        retry_bytes = len(retry_json.encode("utf-8"))
+        static_bytes = max(
+            0,
+            prompt_bytes - contract_bytes - context_bytes - owner_bytes - retry_bytes,
+        )
         _budget_report.update({
             "schema_id": "aiworkhub.worker_prompt_budget.v1",
             "mode": "rework_delta" if rework else "initial",
@@ -2820,6 +3265,7 @@ def build_worker_prompt(
                 "task_contract_bytes": contract_bytes,
                 "project_context_bytes": context_bytes,
                 "owner_context_bytes": owner_bytes,
+                "crash_retry_evidence_bytes": retry_bytes,
                 "runtime_instructions_bytes": static_bytes,
             },
             "stable_prefix_bytes": len(stable_prefix.encode("utf-8")),
@@ -3432,6 +3878,8 @@ class ProcessManager:
                     "worker_mcp": {},
                     "sandbox_backend": "deterministic_validation",
                     "validation": list(card.get("validation") or []),
+                    "validation_roles": list(card.get("validation_roles") or []),
+                    "work_kind": str(card.get("work_kind") or "generic"),
                     "required_outputs": list(card.get("required_outputs") or []),
                     "read_only": card.get("read_only") is True,
                     "allow_empty_required_outputs": list(
@@ -3602,10 +4050,6 @@ class ProcessManager:
                 "segments": [],
             }
             evidence[path] = row
-            if remaining <= 0:
-                row["omission_reason"] = "source_evidence_total_budget_exhausted"
-                row["truncated"] = True
-                continue
             try:
                 if candidate.is_symlink():
                     raise WorkspaceError(
@@ -3659,6 +4103,19 @@ class ProcessManager:
                 if limit <= header_bytes:
                     omitted_hunks += 1
                     row["truncated"] = True
+                    row["segments"].append(
+                        {
+                            "kind": tag,
+                            "candidate_start_line": start_line,
+                            "candidate_end_line": end_line,
+                            "changed_start_line": new_start + 1,
+                            "changed_end_line": max(new_start + 1, new_end),
+                            "baseline_start_line": old_start + 1,
+                            "baseline_end_line": max(old_start + 1, old_end),
+                            "excerpt_bytes": 0,
+                            "truncated": True,
+                        }
+                    )
                     continue
                 excerpt, excerpt_bytes, truncated = segment_excerpt(
                     candidate_lines, start_line, end_line, limit - header_bytes
@@ -3736,6 +4193,26 @@ class ProcessManager:
                 workspace, current_hashes
             )
             initial_gate = evidence.get("quality_gate") or {}
+            scoped_audits = quality_review_scope.build_scoped_audits(
+                authority_repo=Path(self.repo),
+                candidate_repo=workspace.path,
+                task_id=target_task_id,
+                packet_seed=target_request_id,
+                created_at=str(
+                    latest.get("at")
+                    or latest.get("updated_at")
+                    or latest.get("finished_at")
+                    or target_request_id
+                ),
+                changed_path_hashes=current_hashes,
+                source_evidence=source_evidence,
+                acceptance=card.get("acceptance") or [],
+                forbidden_changes=card.get("forbidden") or [],
+                required_outputs=card.get("required_outputs") or [],
+                validation=card.get("validation") or [],
+                terminal_validation=evidence.get("validation") or [],
+                lenses=quality_evidence.JUDGMENT_LENSES,
+            )
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,
                 task_id=target_task_id,
@@ -3749,6 +4226,7 @@ class ProcessManager:
                 terminal_validation=evidence.get("validation") or [],
                 mechanical_checks=initial_gate.get("checks") or [],
                 source_evidence=source_evidence,
+                scoped_audits=scoped_audits,
             )
         except (
             KeyError,
@@ -3757,6 +4235,7 @@ class ProcessManager:
             LaunchRejected,
             WorkspaceError,
             quality_reviewer.ReviewerEvidenceError,
+            quality_review_scope.ReviewScopeBuildError,
         ) as exc:
             return {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
 
@@ -3898,6 +4377,7 @@ class ProcessManager:
             # B919 input-drift snapshot see the card.
             card = self._preflight_card(task_id, runner, topic, adapter_id)
             claimed = core._lifecycle_state(card) == "processing"
+            _enforce_quality_review_launch_binding(topic, quality_review_binding)
             card = self._with_dependency_inputs(card)
             replay_authorization = _validation_only_replay_authorization(
                 card, task_id
@@ -3952,6 +4432,10 @@ class ProcessManager:
 
                 review_packet_path: Path | None = None
                 review_workspace_evidence: dict[str, Any] | None = None
+                rework_overlay_path: Path | None = None
+                rework_overlay_packet: dict[str, Any] | None = None
+                crash_retry_packet_path: Path | None = None
+                crash_retry_packet: dict[str, Any] | None = None
                 if quality_review_binding is not None:
                     source_workspace = WorkerWorkspace.from_metadata(
                         dict(quality_review_binding["source_workspace"])
@@ -3976,6 +4460,24 @@ class ProcessManager:
                     residual_contract_manifest = build_residual_contract_manifest(
                         workspace, card
                     )
+                    (
+                        rework_overlay_path,
+                        rework_overlay_packet,
+                    ) = _materialize_worker_rework_overlay(
+                        workspace,
+                        task_id=task_id,
+                        card=card,
+                    )
+                    (
+                        crash_retry_packet_path,
+                        crash_retry_packet,
+                    ) = _materialize_crash_retry_packet(
+                        self.process_dir,
+                        workspace,
+                        task_id=task_id,
+                        card=card,
+                        rework_overlay_packet=rework_overlay_packet,
+                    )
                 worker_source_graph_targets = _worker_mcp_source_graph_targets(context_result)
                 worker_session_topic = _worker_mcp_session_topic(context_result, topic)
                 worker_mcp_runtime = _provision_worker_mcp_runtime_for_authority(
@@ -3990,6 +4492,7 @@ class ProcessManager:
                     allowed_writes=[str(value) for value in card.get("allowed_writes") or []],
                     session_topic=worker_session_topic,
                     quality_review_packet_path=review_packet_path,
+                    rework_overlay_path=rework_overlay_path,
                 )
                 vscode_source_graph_request = _launch_source_graph_request(
                     card, quality_review_binding
@@ -4035,6 +4538,8 @@ class ProcessManager:
                         audit_ledger_path=worker_mcp_runtime.audit_ledger_path,
                         audit_hmac_key_path=worker_mcp_runtime.audit_hmac_key_path,
                         quality_review_packet_path=review_packet_path,
+                        rework_overlay_packet=rework_overlay_packet,
+                        rework_overlay_packet_path=rework_overlay_path,
                     )
                     vscode_source_graph_result = worker_ai_tools_mcp.source_graph_query(
                         prefetch_ctx,
@@ -4084,8 +4589,14 @@ class ProcessManager:
                         project_context_bundle=(
                             context_result.prompt_bundle if context_result is not None else ""
                         ),
+                        crash_retry_packet=crash_retry_packet,
                         _budget_report=prompt_budget,
                     )
+                include_partial_messages = (
+                    adapter_id == "claude_cli"
+                    and isinstance(card.get("token_budget"), dict)
+                    and bool(card["token_budget"])
+                )
                 if adapter_id in _VSCODE_LM_IN_PROCESS_ADAPTERS:
                     bridge_request = vscode_lm_bridge.create_request(
                         repo=self.repo,
@@ -4127,6 +4638,7 @@ class ProcessManager:
                         model=model,
                         outer_sandbox_backend=sandbox_backend,
                         additional_readonly_dirs=external_readonly_dirs,
+                        include_partial_messages=include_partial_messages,
                     )
                 if not getattr(plan, "launchable", False):
                     reason = getattr(plan, "reason", "adapter_not_launchable")
@@ -4193,6 +4705,11 @@ class ProcessManager:
                     ),
                     "adapter_id": adapter_id,
                     "model": model,
+                    "provider_stream_mode": (
+                        "partial_messages_for_explicit_live_budget"
+                        if include_partial_messages
+                        else "terminal_events"
+                    ),
                     "timeout_seconds": timeout_seconds,
                     "token_budget": (
                         dict(card.get("token_budget"))
@@ -4245,14 +4762,38 @@ class ProcessManager:
                                 ),
                             }
                             if quality_review_binding is not None
-                            else {
+                            else (
+                                {
+                                    "authority_source": "rework_overlay",
+                                    "authority_state": "request_scoped_predecessor",
+                                    "target_request_id": str(
+                                        rework_overlay_packet.get(
+                                            "predecessor_request_id"
+                                        )
+                                    ),
+                                    "target_task_id": str(
+                                        rework_overlay_packet.get(
+                                            "predecessor_task_id"
+                                        )
+                                    ),
+                                    "packet_sha256": str(
+                                        rework_overlay_packet.get(
+                                            "canonical_digest"
+                                        )
+                                    ),
+                                }
+                                if rework_overlay_packet is not None
+                                else {
                                 "authority_source": "canonical",
                                 "authority_state": "sole_authority",
-                            }
+                                }
+                            )
                         ),
                     },
                     "sandbox_backend": sandbox_backend,
                     "validation": list(card.get("validation") or []),
+                    "validation_roles": list(card.get("validation_roles") or []),
+                    "work_kind": str(card.get("work_kind") or "generic"),
                     "required_outputs": list(card.get("required_outputs") or []),
                     "read_only": card.get("read_only") is True,
                     "allow_empty_required_outputs": list(
@@ -4264,6 +4805,19 @@ class ProcessManager:
                     "immutable_inputs": declared_immutable_inputs,
                     "immutable_input_manifest": immutable_input_manifest,
                     "residual_contract_manifest": residual_contract_manifest,
+                    "crash_retry_packet": (
+                        {
+                            "path": str(crash_retry_packet_path),
+                            "packet_sha256": str(
+                                crash_retry_packet.get("packet_sha256") or ""
+                            ),
+                            "predecessor_request_id": str(
+                                crash_retry_packet.get("predecessor_request_id") or ""
+                            ),
+                        }
+                        if crash_retry_packet is not None
+                        else None
+                    ),
                     "external_readonly_dirs": external_readonly_dirs,
                     "workspace": workspace.as_metadata(),
                     "quality_review": (
@@ -5061,6 +5615,7 @@ class ProcessManager:
             "--total-tokens", str(total_input + total_output),
             "--cached-input-tokens", str(usage["cached_input_tokens"]),
             "--cache-creation-input-tokens", str(usage["cache_creation_input_tokens"]),
+            "--cache-write-input-tokens", str(usage["cache_write_input_tokens"]),
             "--telemetry-reason", str(usage["telemetry_reason"]),
             "--cost-usd", str(
                 float(usage["cost_usd"] or 0.0)
@@ -5088,6 +5643,179 @@ class ProcessManager:
         except Exception as exc:
             usage_error = str(exc)[:300]
         return usage, usage_recorded, usage_error
+
+    def _persist_attempt_artifacts(
+        self,
+        request_id: str,
+        metadata: dict[str, Any],
+        workspace: WorkerWorkspace,
+        *,
+        target_state: str,
+        changed_paths: list[str],
+        changed_path_hashes: dict[str, Any] | None = None,
+        required_outputs: list[dict[str, Any]] | None = None,
+        validations: list[dict[str, Any]] | None = None,
+        review: dict[str, Any] | None = None,
+        quality_gate: dict[str, Any] | None = None,
+        worker_mcp_gate: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> dict[str, Any]:
+        """Seal one bounded, replay-verifiable bundle before task transition.
+
+        The bundle intentionally stores structured receipts rather than raw
+        prompts, provider output, environment variables, or credentials.
+        Request identity and exact candidate hashes are enough to bind later
+        replay/review to this attempt without copying sensitive runtime data.
+        """
+
+        stdout_path = Path(str(metadata.get("stdout_path") or ""))
+        usage = _usage_from_output(stdout_path, include_samples=True)
+        usage.update({
+            "requested_model": str(
+                metadata.get("model") or metadata.get("adapter_id") or ""
+            ),
+            "execution_mode": str(
+                metadata.get("execution_mode") or "provider_worker"
+            ),
+            "provider_launched": metadata.get("provider_launched") is not False,
+        })
+        request_identity = {
+            "request_id": request_id,
+            "task_id": str(metadata.get("task_id") or ""),
+            "runner": str(metadata.get("runner") or ""),
+            "topic": str(metadata.get("topic") or ""),
+        }
+        payloads: dict[str, Any] = {
+            "metadata": {
+                "schema_id": "aiworkhub.attempt_metadata.v1",
+                "request_identity": request_identity,
+                "adapter_id": str(metadata.get("adapter_id") or ""),
+                "model": str(metadata.get("model") or ""),
+                "execution_mode": str(
+                    metadata.get("execution_mode") or "provider_worker"
+                ),
+                "sandbox_backend": str(metadata.get("sandbox_backend") or ""),
+                "provider_stream_mode": str(
+                    metadata.get("provider_stream_mode") or "terminal_events"
+                ),
+                "workspace": workspace.as_metadata(),
+            },
+            "diff": {
+                "schema_id": "aiworkhub.attempt_diff_index.v1",
+                "changed_paths": sorted(set(changed_paths)),
+                "changed_path_hashes": changed_path_hashes or {},
+                "required_outputs": required_outputs or [],
+            },
+            "validation": {
+                "schema_id": "aiworkhub.attempt_validation.v1",
+                "checks": validations or [],
+                "quality_gate": quality_gate,
+                "worker_mcp_gate": worker_mcp_gate,
+            },
+            "usage": {
+                "schema_id": "aiworkhub.attempt_usage.v1",
+                **usage,
+            },
+            "review": {
+                "schema_id": "aiworkhub.attempt_review.v1",
+                "target_state": target_state,
+                "error": error[:500],
+                **(review or {}),
+            },
+        }
+        return attempt_artifacts.persist_json_bundle(
+            self.process_dir / "attempt-artifacts" / request_id,
+            attempt_id=request_id,
+            payloads=payloads,
+        )
+
+    def _attempt_evidence_reference(
+        self,
+        request_id: str,
+        receipt: dict[str, Any],
+    ) -> str:
+        manifest_path = Path(str(receipt.get("manifest_path") or ""))
+        try:
+            relative = manifest_path.resolve().relative_to(self.repo.resolve())
+            return "file:" + relative.as_posix()
+        except (OSError, ValueError):
+            return f"file:attempt-artifacts/{request_id}/manifest.json"
+
+    def _verify_attempt_artifact_receipt(
+        self,
+        request_id: str,
+        raw: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise WorkspaceError("attempt_artifact_manifest_missing")
+        if (
+            raw.get("schema_id")
+            != "aiworkhub.attempt_artifact_bundle_receipt.v1"
+            or str(raw.get("attempt_id") or "") != request_id
+            or raw.get("verified") is not True
+        ):
+            raise WorkspaceError("attempt_artifact_manifest_receipt_invalid")
+        expected = (
+            self.process_dir
+            / "attempt-artifacts"
+            / request_id
+            / attempt_artifacts.MANIFEST_FILENAME
+        )
+        observed = Path(str(raw.get("manifest_path") or ""))
+        if observed != expected:
+            raise WorkspaceError("attempt_artifact_manifest_path_mismatch")
+        try:
+            verification = attempt_artifacts.verify_json_bundle(expected.parent)
+            manifest_sha256 = hashlib.sha256(expected.read_bytes()).hexdigest()
+        except (
+            OSError,
+            attempt_artifacts.InvalidArtifactError,
+            attempt_artifacts.InvalidManifestError,
+        ) as exc:
+            raise WorkspaceError(
+                f"attempt_artifact_manifest_verification_failed:{exc}"
+            ) from exc
+        if (
+            verification.get("verified") is not True
+            or str(verification.get("attempt_id") or "") != request_id
+            or manifest_sha256 != str(raw.get("manifest_sha256") or "")
+        ):
+            raise WorkspaceError("attempt_artifact_manifest_identity_mismatch")
+        return dict(raw)
+
+    def _canonical_outcome_evidence(
+        self,
+        request_id: str,
+        receipt: dict[str, Any],
+        *,
+        level: evidence_levels.EvidenceLevel,
+        message: str,
+        verified_by: str | None = None,
+    ) -> dict[str, Any]:
+        record = evidence_levels.EvidenceRecord(
+            evidence_level=level,
+            severity="NONE",
+            confidence="HIGH",
+            reference=self._attempt_evidence_reference(request_id, receipt),
+            verified_by=verified_by,
+            message=message[:1000],
+        )
+        return record.to_dict()
+
+    @staticmethod
+    def _minimum_acceptance_evidence_level(
+        card: dict[str, Any],
+        *,
+        readonly_quality_review: bool,
+        readonly_research: bool,
+    ) -> evidence_levels.EvidenceLevel:
+        if readonly_research:
+            return evidence_levels.EvidenceLevel.OBSERVATION
+        if readonly_quality_review:
+            return evidence_levels.EvidenceLevel.STATIC_EVIDENCE
+        if list(card.get("validation") or []):
+            return evidence_levels.EvidenceLevel.TESTED
+        return evidence_levels.EvidenceLevel.STATIC_EVIDENCE
 
     def _request_events(self, request_id: str) -> list[dict[str, Any]]:
         return [event for event in self._events() if event.get("request_id") == request_id]
@@ -5543,6 +6271,57 @@ class ProcessManager:
             return False, "current_review_request"
         return True, f"superseded_review_request:{current_request_id}"
 
+    def _retained_review_workspace_integrity(
+        self,
+        card: dict[str, Any],
+        request_id: str,
+        metadata_workspace: WorkerWorkspace,
+    ) -> tuple[bool, str]:
+        """Verify that one current review still has actionable exact bytes."""
+
+        terminal = card.get("terminal_review")
+        evidence = terminal.get("evidence") if isinstance(terminal, dict) else None
+        identity = evidence.get("request_identity") if isinstance(evidence, dict) else None
+        workspace_payload = evidence.get("workspace") if isinstance(evidence, dict) else None
+        if not isinstance(identity, dict) or str(identity.get("request_id") or "") != request_id:
+            return False, "review_request_identity_missing"
+        if not isinstance(workspace_payload, dict):
+            return False, "review_workspace_evidence_missing"
+        try:
+            review_workspace = WorkerWorkspace.from_metadata(workspace_payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            return False, f"review_workspace_evidence_invalid:{exc}"[:200]
+        if (
+            review_workspace.repo != self.repo
+            or review_workspace.request_id != request_id
+            or review_workspace.path != metadata_workspace.path
+            or review_workspace.home != metadata_workspace.home
+        ):
+            return False, "review_workspace_identity_mismatch"
+        if (
+            review_workspace.path.is_symlink()
+            or review_workspace.home.is_symlink()
+            or not review_workspace.path.is_dir()
+            or not review_workspace.home.is_dir()
+        ):
+            return False, "review_workspace_missing"
+
+        stored_hashes = evidence.get("changed_path_hashes")
+        changed_paths = evidence.get("changed_paths")
+        if not isinstance(stored_hashes, dict):
+            return False, "review_workspace_hashes_missing"
+        if not stored_hashes and isinstance(changed_paths, list) and changed_paths:
+            return False, "review_workspace_hashes_missing"
+        try:
+            observed_hashes = _changed_path_hashes(
+                review_workspace, [str(path) for path in stored_hashes]
+            )
+        except OSError as exc:
+            return False, f"review_workspace_unreadable:{type(exc).__name__}"
+        if observed_hashes != stored_hashes:
+            return False, "review_workspace_hash_mismatch"
+        return True, "review_workspace_verified"
+
     def _gc_finalized_workspace(
         self, request_id: str, event: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -5597,10 +6376,98 @@ class ProcessManager:
                 }
             eligible, disposition = self._gc_disposition(card, request_id)
             if not eligible:
+                if disposition != "current_review_request":
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": disposition,
+                    }
+                pid = int(latest.get("pid") or 0)
+                ticks = latest.get("pid_start_ticks")
+                if not _process_proven_dead(pid, ticks):
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": "process_not_proven_dead",
+                    }
+                try:
+                    workspace = WorkerWorkspace.from_metadata(dict(workspace_meta))
+                    assert_gc_safe_workspace_shape(meta_request_id, path, home)
+                except (KeyError, TypeError, ValueError, WorkspaceError) as exc:
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": f"unsafe_workspace_shape:{exc}"[:200],
+                    }
+                intact, integrity_reason = self._retained_review_workspace_integrity(
+                    card, request_id, workspace
+                )
+                if intact:
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": disposition,
+                    }
+                transition = task_engine.mark_review_workspace_missing(
+                    self.repo,
+                    task_id,
+                    runner,
+                    request_id,
+                    reason=integrity_reason,
+                )
+                if not transition.get("ok"):
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": (
+                            "review_workspace_reconcile_failed:"
+                            + str(transition.get("stderr") or "unknown")
+                        )[:200],
+                    }
+                try:
+                    cleanup_workspace(repo, path, home)
+                except (OSError, WorkspaceError) as exc:
+                    self._append_event({
+                        "request_id": request_id,
+                        "task_id": task_id,
+                        "runner": runner,
+                        "topic": latest.get("topic"),
+                        "adapter_id": latest.get("adapter_id"),
+                        "state": "finalize_failed",
+                        "error": f"retained_workspace_cleanup_failed:{exc}"[:500],
+                        "workspace_retained": True,
+                        "workspace_gc": False,
+                        "workspace_gc_at": _utcnow(),
+                        "workspace_gc_reason": integrity_reason,
+                        "review_transition_ok": True,
+                        "callback_enqueued": bool(
+                            transition.get("callback_enqueued")
+                        ),
+                    })
+                    return {
+                        "request_id": request_id,
+                        "gc": False,
+                        "reason": f"cleanup_failed:{exc}"[:200],
+                    }
+                self._append_event({
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "runner": runner,
+                    "topic": latest.get("topic"),
+                    "adapter_id": latest.get("adapter_id"),
+                    "state": "finalize_failed",
+                    "error": f"retained_workspace_unavailable:{integrity_reason}"[:500],
+                    "workspace_retained": False,
+                    "workspace_gc": True,
+                    "workspace_gc_at": _utcnow(),
+                    "workspace_gc_reason": integrity_reason,
+                    "review_transition_ok": True,
+                    "callback_enqueued": bool(transition.get("callback_enqueued")),
+                })
                 return {
                     "request_id": request_id,
-                    "gc": False,
-                    "reason": disposition,
+                    "gc": True,
+                    "reason": integrity_reason,
                 }
 
             pid = int(latest.get("pid") or 0)
@@ -5774,10 +6641,11 @@ class ProcessManager:
                     terminate_supervisor = recheck.verdict is PidIdentityVerdict.MATCH
                     supervisor_alive = False
 
-            self._publish_bridge_cancellation_before_finalization(
-                request_id,
-                live,
-            )
+            if _requires_bridge_cancellation(metadata):
+                self._publish_bridge_cancellation_before_finalization(
+                    request_id,
+                    live,
+                )
             if (
                 lock_blocking
                 and latest.get("state") not in {"finalizing", "cancel_requested"}
@@ -5908,6 +6776,9 @@ class ProcessManager:
             quality_gate: dict[str, Any] | None = None
             research_result: dict[str, Any] | None = None
             residual_contract_result: list[dict[str, Any]] = []
+            attempt_artifact_receipt: dict[str, Any] | None = None
+            attempt_artifact_error = ""
+            outcome_evidence_record: dict[str, Any] | None = None
             cleanup = True
             try:
                 if terminal_state != "exited":
@@ -6011,6 +6882,24 @@ class ProcessManager:
                             verified_receipt = _verified_quality_review_receipt(
                                 metadata, workspace, request_id
                             )
+                            attempt_artifact_receipt = self._persist_attempt_artifacts(
+                                request_id,
+                                metadata,
+                                workspace,
+                                target_state="review_ready",
+                                changed_paths=[],
+                                review={
+                                    "kind": "quality_review",
+                                    "quality_review_receipt": verified_receipt,
+                                    "quality_review": metadata["quality_review"],
+                                },
+                            )
+                            outcome_evidence_record = self._canonical_outcome_evidence(
+                                request_id,
+                                attempt_artifact_receipt,
+                                level=evidence_levels.EvidenceLevel.STATIC_EVIDENCE,
+                                message="Quality reviewer produced a sealed read-only report.",
+                            )
                             cleanup = False
                             terminal_state = "review_ready"
                             review_result = {"ok": True, "idempotent_noop": True}
@@ -6021,6 +6910,10 @@ class ProcessManager:
                                 evidence={
                                     "quality_review_receipt": verified_receipt,
                                     "quality_review": metadata["quality_review"],
+                                    "attempt_artifact_manifest": (
+                                        attempt_artifact_receipt
+                                    ),
+                                    "evidence_record": outcome_evidence_record,
                                     "claim_state": claim_state,
                                     "workspace": workspace.as_metadata(),
                                     "request_identity": {
@@ -6139,6 +7032,11 @@ class ProcessManager:
                                 raise WorkspaceError(
                                     "quality_gate_failed:" + str(reason)[:400]
                                 )
+                        _enforce_behavioral_gate(
+                            metadata,
+                            validations,
+                            quality_gate,
+                        )
                         # Phase 1 review-first reconcile: a successful worker
                         # exit no longer promotes into the canonical repo nor
                         # marks review via core.mark_review directly. The
@@ -6149,6 +7047,44 @@ class ProcessManager:
                         # identity) so a later coordinator-accept step is the
                         # only path that can ever touch the canonical repo.
                         changed_path_hashes = _changed_path_hashes(workspace, changed)
+                        attempt_artifact_receipt = self._persist_attempt_artifacts(
+                            request_id,
+                            metadata,
+                            workspace,
+                            target_state="review_ready",
+                            changed_paths=changed,
+                            changed_path_hashes=changed_path_hashes,
+                            required_outputs=required_output_records,
+                            validations=validations,
+                            review={
+                                "kind": "worker_candidate",
+                                "research_result": research_result,
+                                "residual_contract": residual_contract_result,
+                            },
+                            quality_gate=quality_gate,
+                            worker_mcp_gate=worker_mcp_gate,
+                        )
+                        if research_result is not None:
+                            outcome_level = evidence_levels.EvidenceLevel.OBSERVATION
+                            outcome_message = (
+                                "Read-only research produced a meaningful, hash-bound result."
+                            )
+                        elif validations:
+                            outcome_level = evidence_levels.EvidenceLevel.TESTED
+                            outcome_message = (
+                                "Candidate passed its declared deterministic validations."
+                            )
+                        else:
+                            outcome_level = evidence_levels.EvidenceLevel.STATIC_EVIDENCE
+                            outcome_message = (
+                                "Candidate passed scope, hash, and static quality gates."
+                            )
+                        outcome_evidence_record = self._canonical_outcome_evidence(
+                            request_id,
+                            attempt_artifact_receipt,
+                            level=outcome_level,
+                            message=outcome_message,
+                        )
                         cleanup = False
                         terminal_state = "review_ready"
                         review_result = {"ok": True, "idempotent_noop": True}
@@ -6171,6 +7107,10 @@ class ProcessManager:
                                     metadata.get("immutable_input_manifest") or {}
                                 ),
                                 "residual_contract": residual_contract_result,
+                                "attempt_artifact_manifest": (
+                                    attempt_artifact_receipt
+                                ),
+                                "evidence_record": outcome_evidence_record,
                                 "workspace": workspace.as_metadata(),
                                 "request_identity": {
                                     "request_id": request_id,
@@ -6197,7 +7137,7 @@ class ProcessManager:
                 if error.startswith("scope_violation") or error.startswith("symlink_output"):
                     terminal_state = "scope_rejected"
                 elif error.startswith((
-                    "validation", "required_output", "quality_gate", "residual_contract",
+                    "validation", "required_output", "quality_gate", "behavioral_gate", "residual_contract",
                     "research_result",
                 )):
                     terminal_state = "validation_failed"
@@ -6310,6 +7250,46 @@ class ProcessManager:
                     if not release_result.get("ok"):
                         cleanup = False
                         terminal_state = "release_pending"
+
+            if attempt_artifact_receipt is None:
+                try:
+                    failure_hashes = (
+                        _changed_path_hashes(workspace, changed) if changed else {}
+                    )
+                    attempt_artifact_receipt = self._persist_attempt_artifacts(
+                        request_id,
+                        metadata,
+                        workspace,
+                        target_state=terminal_state,
+                        changed_paths=changed,
+                        changed_path_hashes=failure_hashes,
+                        required_outputs=required_output_records,
+                        validations=validations,
+                        review={
+                            "kind": "terminal_outcome",
+                            "release_transition_ok": bool(
+                                release_result and release_result.get("ok")
+                            ),
+                        },
+                        quality_gate=quality_gate,
+                        worker_mcp_gate=worker_mcp_gate,
+                        error=error,
+                    )
+                except Exception as exc:  # preserve the truthful terminal outcome
+                    attempt_artifact_error = (
+                        f"attempt_artifact_persist_failed:{type(exc).__name__}:{exc}"
+                    )[:500]
+
+            if (
+                outcome_evidence_record is None
+                and attempt_artifact_receipt is not None
+            ):
+                outcome_evidence_record = self._canonical_outcome_evidence(
+                    request_id,
+                    attempt_artifact_receipt,
+                    level=evidence_levels.EvidenceLevel.INCONCLUSIVE,
+                    message=(error or f"Attempt ended in {terminal_state}.")[:1000],
+                )
 
             stdout_path = Path(str(metadata["stdout_path"]))
             usage: dict[str, Any] = {}
@@ -6429,6 +7409,9 @@ class ProcessManager:
                 "quality_gate": quality_gate,
                 "research_result": research_result,
                 "residual_contract": residual_contract_result,
+                "attempt_artifact_manifest": attempt_artifact_receipt,
+                "attempt_artifact_error": attempt_artifact_error,
+                "evidence_record": outcome_evidence_record,
                 "finalization_duration_ms": round(
                     (time.monotonic() - finalization_started) * 1000.0, 3
                 ),
@@ -7625,6 +8608,45 @@ class ProcessManager:
                 _card_is_readonly_research(card) and not readonly_quality_review
             )
             readonly_no_change = readonly_research or readonly_quality_review
+            try:
+                attempt_artifact_receipt = self._verify_attempt_artifact_receipt(
+                    request_id,
+                    evidence.get("attempt_artifact_manifest"),
+                )
+                terminal_evidence_record = evidence_levels.validate_evidence_record(
+                    evidence.get("evidence_record")
+                )
+                minimum_evidence_level = self._minimum_acceptance_evidence_level(
+                    card,
+                    readonly_quality_review=readonly_quality_review,
+                    readonly_research=readonly_research,
+                )
+                if not evidence_levels.meets_evidence_level(
+                    terminal_evidence_record.evidence_level,
+                    minimum_evidence_level,
+                ):
+                    raise WorkspaceError(
+                        "evidence_level_below_minimum:"
+                        f"observed={terminal_evidence_record}:"
+                        f"required={minimum_evidence_level}"
+                    )
+                expected_reference = self._attempt_evidence_reference(
+                    request_id,
+                    attempt_artifact_receipt,
+                )
+                if terminal_evidence_record.reference != expected_reference:
+                    raise WorkspaceError("evidence_record_reference_mismatch")
+            except (
+                WorkspaceError,
+                evidence_levels.EvidenceValidationError,
+                TypeError,
+            ) as exc:
+                return {
+                    "ok": False,
+                    "error": f"evidence_level_gate_failed:{exc}",
+                    "request_id": request_id,
+                    "task_id": task_id,
+                }
             if readonly_lock_path and not readonly_no_change:
                 return {
                     "ok": False,
@@ -7795,6 +8817,15 @@ class ProcessManager:
                     "checks": [],
                     "blocking_checks": [],
                 }
+                acceptance_evidence_record = self._canonical_outcome_evidence(
+                    request_id,
+                    attempt_artifact_receipt,
+                    level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+                    verified_by=core.CODEX_RUNNER,
+                    message=(
+                        "Manager reverified and accepted the sealed quality-review outcome."
+                    ),
+                )
                 accept_result = task_engine.accept_review(
                     self.repo,
                     task_id,
@@ -7807,6 +8838,9 @@ class ProcessManager:
                         "required_outputs": required_output_records,
                         "quality_gate": quality_gate,
                         "quality_review_receipt": verified_receipt,
+                        "source_evidence_record": terminal_evidence_record.to_dict(),
+                        "acceptance_evidence_record": acceptance_evidence_record,
+                        "attempt_artifact_manifest": attempt_artifact_receipt,
                     },
                 )
                 if not accept_result.get("ok"):
@@ -7841,6 +8875,7 @@ class ProcessManager:
                     "workspace_retained": bool(cleanup_error),
                     "cleanup_error": cleanup_error,
                     "quality_review_receipt": verified_receipt,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
                     "finished_at": _utcnow(),
@@ -7852,6 +8887,7 @@ class ProcessManager:
                     "promoted_paths": [],
                     "cleanup_error": cleanup_error,
                     "quality_review_receipt": verified_receipt,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
                 }
@@ -7936,6 +8972,15 @@ class ProcessManager:
                     "checks": [],
                     "blocking_checks": [],
                 }
+                acceptance_evidence_record = self._canonical_outcome_evidence(
+                    request_id,
+                    attempt_artifact_receipt,
+                    level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+                    verified_by=core.CODEX_RUNNER,
+                    message=(
+                        "Manager reverified and accepted the sealed research outcome."
+                    ),
+                )
                 accept_result = task_engine.accept_review(
                     self.repo,
                     task_id,
@@ -7948,6 +8993,9 @@ class ProcessManager:
                         "required_outputs": required_output_records,
                         "quality_gate": quality_gate,
                         "research_result": current_result,
+                        "source_evidence_record": terminal_evidence_record.to_dict(),
+                        "acceptance_evidence_record": acceptance_evidence_record,
+                        "attempt_artifact_manifest": attempt_artifact_receipt,
                     },
                 )
                 if not accept_result.get("ok"):
@@ -7982,6 +9030,7 @@ class ProcessManager:
                     "workspace_retained": bool(cleanup_error),
                     "cleanup_error": cleanup_error,
                     "research_result": current_result,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "finished_at": _utcnow(),
                 })
@@ -7992,6 +9041,7 @@ class ProcessManager:
                     "promoted_paths": [],
                     "cleanup_error": cleanup_error,
                     "research_result": current_result,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                     "reviewer_finalization": [],
                     "acceptance_lock_scope": "request",
                 }
@@ -8109,7 +9159,9 @@ class ProcessManager:
                 if len(set(reviewer_ids)) != len(reviewer_ids):
                     raise WorkspaceError("quality_reviewer_request_duplicate")
                 verified_reviewer_reports: list[dict[str, Any]] = []
-                verified_reviewer_tasks: list[tuple[str, WorkerWorkspace]] = []
+                verified_reviewer_tasks: list[
+                    tuple[str, WorkerWorkspace | None, bool]
+                ] = []
                 for reviewer_request_id in reviewer_ids:
                     reviewer_events = self._request_events(reviewer_request_id)
                     if not reviewer_events:
@@ -8117,7 +9169,30 @@ class ProcessManager:
                             f"quality_reviewer_request_not_found:{reviewer_request_id}"
                         )
                     reviewer_latest = reviewer_events[-1]
-                    if str(reviewer_latest.get("state") or "") != "review_ready":
+                    reviewer_state = str(reviewer_latest.get("state") or "")
+                    if reviewer_state == "accepted":
+                        reviewer_task_id = str(reviewer_latest.get("task_id") or "")
+                        try:
+                            reviewer_card = _parse_card(
+                                self._show_task(reviewer_task_id), reviewer_task_id
+                            )
+                            receipt = _verified_accepted_quality_review_receipt(
+                                reviewer_latest,
+                                reviewer_card,
+                                reviewer_request_id,
+                                request_id,
+                                task_id,
+                            )
+                        except (LaunchRejected, WorkspaceError) as exc:
+                            raise WorkspaceError(
+                                f"quality_reviewer_accepted_invalid:{reviewer_request_id}:{exc}"
+                            ) from exc
+                        verified_reviewer_reports.append(dict(receipt["report"]))
+                        verified_reviewer_tasks.append(
+                            (reviewer_task_id, None, True)
+                        )
+                        continue
+                    if reviewer_state != "review_ready":
                         raise WorkspaceError(
                             f"quality_reviewer_not_review_ready:{reviewer_request_id}"
                         )
@@ -8166,7 +9241,11 @@ class ProcessManager:
                     )
                     verified_reviewer_reports.append(dict(receipt["report"]))
                     verified_reviewer_tasks.append(
-                        (str(reviewer_metadata.get("task_id") or ""), reviewer_workspace)
+                        (
+                            str(reviewer_metadata.get("task_id") or ""),
+                            reviewer_workspace,
+                            False,
+                        )
                     )
                 quality_gate = quality_evidence.run_completion_quality_gate(
                     workspace.path,
@@ -8191,6 +9270,7 @@ class ProcessManager:
                 validations = _run_declared_validations(
                     workspace, card, latest
                 )
+                _enforce_behavioral_gate(card, validations, quality_gate)
                 current_hashes = _changed_path_hashes(workspace, changed)
                 if set(current_hashes) != set(stored_hashes) or any(
                     current_hashes[relative] != stored_hashes.get(relative)
@@ -8207,6 +9287,16 @@ class ProcessManager:
 
             promoted = promote(workspace, changed)
 
+            acceptance_evidence_record = self._canonical_outcome_evidence(
+                request_id,
+                attempt_artifact_receipt,
+                level=evidence_levels.EvidenceLevel.FIXED_AND_VERIFIED,
+                verified_by=core.CODEX_RUNNER,
+                message=(
+                    "Manager revalidated, promoted, and accepted the exact sealed candidate."
+                ),
+            )
+
             accept_result = task_engine.accept_review(
                 self.repo,
                 task_id,
@@ -8218,6 +9308,9 @@ class ProcessManager:
                     "validation": validations,
                     "required_outputs": required_output_records,
                     "quality_gate": quality_gate,
+                    "source_evidence_record": terminal_evidence_record.to_dict(),
+                    "acceptance_evidence_record": acceptance_evidence_record,
+                    "attempt_artifact_manifest": attempt_artifact_receipt,
                 },
             )
             if not accept_result.get("ok"):
@@ -8233,7 +9326,7 @@ class ProcessManager:
                 }
 
             verified_reviewer_ids = [
-                tid for tid, _ws in verified_reviewer_tasks
+                tid for tid, _ws, _accepted in verified_reviewer_tasks
             ]
             disposition_result = task_engine.disposition_reviewer_children(
                 self.repo,
@@ -8250,12 +9343,15 @@ class ProcessManager:
                 disposition_payload = {}
             finalized_set = set(disposition_payload.get("finalized") or [])
             reviewer_finalization: list[dict[str, Any]] = []
-            for reviewer_task_id, reviewer_workspace in verified_reviewer_tasks:
+            for reviewer_task_id, reviewer_workspace, already_accepted in verified_reviewer_tasks:
                 row = {
                     "task_id": reviewer_task_id,
-                    "finished": reviewer_task_id in finalized_set,
+                    "finished": already_accepted or reviewer_task_id in finalized_set,
                     "cleanup_error": "",
                 }
+                if reviewer_workspace is None:
+                    reviewer_finalization.append(row)
+                    continue
                 try:
                     cleanup_workspace(
                         reviewer_workspace.repo,
@@ -8281,6 +9377,7 @@ class ProcessManager:
                     "workspace_retained": True,
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                     "finished_at": _utcnow(),
                 })
                 return {
@@ -8290,6 +9387,7 @@ class ProcessManager:
                     "promoted_paths": promoted,
                     "cleanup_error": str(exc)[:500],
                     "reviewer_finalization": reviewer_finalization,
+                    "acceptance_evidence_record": acceptance_evidence_record,
                 }
 
             self._append_event({
@@ -8303,6 +9401,7 @@ class ProcessManager:
                 "promoted_paths": promoted,
                 "workspace_retained": False,
                 "reviewer_finalization": reviewer_finalization,
+                "acceptance_evidence_record": acceptance_evidence_record,
                 "finished_at": _utcnow(),
             })
             return {
@@ -8311,6 +9410,7 @@ class ProcessManager:
                 "task_id": task_id,
                 "promoted_paths": promoted,
                 "reviewer_finalization": reviewer_finalization,
+                "acceptance_evidence_record": acceptance_evidence_record,
             }
 
     def list_processes(self, limit: int = 100) -> dict[str, Any]:

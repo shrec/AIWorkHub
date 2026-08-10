@@ -37,12 +37,25 @@ function treeSize(root) {
   let bytes = 0;
   let files = 0;
   function visit(directory) {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (err) {
+      if (err && err.code === "ENOENT") return;
+      throw err;
+    }
+    for (const entry of entries) {
       const full = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) visit(full);
       else if (entry.isFile()) {
-        const info = fs.statSync(full);
+        let info;
+        try {
+          info = fs.statSync(full);
+        } catch (err) {
+          if (err && err.code === "ENOENT") continue;
+          throw err;
+        }
         bytes += info.size;
         files += 1;
       }
@@ -71,8 +84,13 @@ function currentGeneration(storageRoot) {
 function quarantineRoot(storageRoot, create = false) {
   const root = path.join(path.resolve(storageRoot), "runtime", "quarantine");
   if (create) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  if (!fs.existsSync(root)) return null;
-  const info = fs.lstatSync(root);
+  let info;
+  try {
+    info = fs.lstatSync(root);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    throw err;
+  }
   if (!info.isDirectory() || info.isSymbolicLink()) {
     throw new Error("runtime_quarantine_root_invalid");
   }

@@ -149,6 +149,30 @@ def test_accept_review_promotes_and_finishes(tmp_path: Path) -> None:
     assert events[0]["event"] == "accept_review"
 
 
+def test_missing_review_workspace_enqueues_finalize_failed_callback(tmp_path: Path) -> None:
+    request_id = "req-review-workspace-gone"
+    repo = _repo_with_review_ready_task(tmp_path, request_id=request_id)
+
+    result = task_engine.mark_review_workspace_missing(
+        repo,
+        "TASK_B891",
+        "codex_worker_b891",
+        request_id,
+        reason="review_workspace_missing",
+    )
+
+    assert result["ok"] is True
+    assert result["callback_enqueued"] is True
+    card = task_store.get_task(repo, "TASK_B891")
+    assert card is not None
+    assert card["status"] == "blocked"
+    assert card["worker_status"] == "finalize_failed"
+    assert card["claimed_by"] is None
+    events = [row["event"] for row in task_store.get_task_events(repo, "TASK_B891")]
+    assert "review_workspace_missing" in events
+    assert "callback_enqueued" in events
+
+
 def test_accept_review_idempotent_retry_returns_already_accepted(tmp_path: Path) -> None:
     repo = _repo_with_review_ready_task(tmp_path)
     first = task_engine.accept_review(

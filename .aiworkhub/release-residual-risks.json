@@ -1,0 +1,45 @@
+{
+  "schema_id": "aiworkhub.release_residual_risks.v1",
+  "risks": [
+    {
+      "id": "NF-2026-00059",
+      "status": "accepted",
+      "severity": "medium",
+      "summary": "Transient MCP health and window-local runtime recovery still require live qualification.",
+      "evidence_refs": [
+        "docs/PRODUCT_ROADMAP.md",
+        "tests/test_dashboard.py"
+      ]
+    },
+    {
+      "id": "NF-2026-00102",
+      "status": "accepted",
+      "severity": "high",
+      "summary": "Windows packaged-runtime finalization recovery remains owner-machine gated.",
+      "evidence_refs": [
+        "docs/PRODUCT_ROADMAP.md",
+        "tests/test_process_launcher.py"
+      ]
+    },
+    {
+      "id": "NF-2026-00105",
+      "status": "accepted",
+      "severity": "high",
+      "summary": "Windows validation-only replay still requires live owner-machine confirmation.",
+      "evidence_refs": [
+        "docs/PRODUCT_ROADMAP.md",
+        "tests/test_worker_workspace.py"
+      ]
+    },
+    {
+      "id": "NF-2026-00106",
+      "status": "triaged",
+      "severity": "medium",
+      "summary": "Intermittent Python 3.13/3.14 Source Graph behavior has no verified root cause.",
+      "evidence_refs": [
+        "docs/PRODUCT_ROADMAP.md",
+        "tests/test_cross_platform_runtime.py"
+      ]
+    }
+  ]
+}

@@ -25,6 +25,7 @@ whose canonical SQLite row always wins over any stale ``card_json`` copy.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -340,47 +341,22 @@ def mark_terminal_review(
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     command = ["terminal-review", task_id, "--runner", runner, "--substatus", substatus]
+    card = task_store.get_task(repo, task_id) or {}
+    provider = str(card.get("coordinator_provider") or "").strip().lower()
+    transition = callback_store.resolve_callback_transition(substatus)
     try:
-        ok, state = task_store.mark_terminal_review(
+        ok, state, callback_enqueued = task_store.mark_terminal_review_with_callback(
             repo,
             task_id,
             runner=runner,
             substatus=substatus,
             evidence=evidence or {},
+            callback_transition=transition,
+            callback_provider=provider,
+            callback_request_id=str((evidence or {}).get("request_id") or ""),
         )
-    except task_store.TaskStoreError as exc:
+    except (task_store.TaskStoreError, sqlite3.Error) as exc:
         return {"ok": False, "returncode": 1, "command": command, "stdout": "", "stderr": str(exc)}
-    callback_enqueued = False
-    if ok:
-        card = task_store.get_task(repo, task_id) or {}
-        # Callback delivery is a lifecycle invariant, not a per-card option:
-        # every task that entered review gets an outbox row.  The terminal
-        # substatus only determines the compact payload state.
-        try:
-            _readiness, db_path = task_store._require_ready(repo)
-            conn = task_store._connect(db_path)
-            try:
-                callback_store.init_db(conn)
-                origin_thread_id = (
-                    callback_store.read_origin_thread(conn, task_id)
-                    or str(card.get("origin_thread_id") or "").strip()
-                )
-                provider = str(card.get("coordinator_provider") or "").strip().lower()
-                transition = callback_store.resolve_callback_transition(substatus)
-                callback_enqueued = callback_store.enqueue_callback(
-                    conn,
-                    task_id,
-                    origin_thread_id,
-                    transition,
-                    provider=provider,
-                    episode_id=str(card.get("claim_epoch") or 0),
-                    request_id=str((evidence or {}).get("request_id") or ""),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-        except task_store.TaskStoreError:
-            callback_enqueued = False
     return {
         "ok": ok,
         "returncode": 0 if ok else 1,
@@ -502,6 +478,71 @@ def mark_terminal_failure(
                     task_id,
                     origin_thread_id,
                     callback_store.resolve_callback_transition(substatus),
+                    provider=provider,
+                    episode_id=str(card.get("claim_epoch") or 0),
+                    request_id=request_id,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except task_store.TaskStoreError:
+            callback_enqueued = False
+    return {
+        "ok": ok,
+        "returncode": 0 if ok else 1,
+        "command": command,
+        "stdout": json.dumps({"task_id": task_id, "status": state}, ensure_ascii=False),
+        "stderr": "" if ok else state,
+        "callback_enqueued": callback_enqueued,
+    }
+
+
+def mark_review_workspace_missing(
+    repo: Path,
+    task_id: str,
+    runner: str,
+    request_id: str,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Block an exact unusable review and notify its canonical manager."""
+
+    command = ["review-workspace-missing", task_id, "--request-id", request_id]
+    try:
+        ok, state = task_store.mark_review_workspace_missing(
+            repo,
+            task_id,
+            runner=runner,
+            request_id=request_id,
+            reason=reason,
+        )
+    except task_store.TaskStoreError as exc:
+        return {
+            "ok": False,
+            "returncode": 1,
+            "command": command,
+            "stdout": "",
+            "stderr": str(exc),
+            "callback_enqueued": False,
+        }
+    callback_enqueued = False
+    if ok:
+        card = task_store.get_task(repo, task_id) or {}
+        try:
+            _readiness, db_path = task_store._require_ready(repo)
+            conn = task_store._connect(db_path)
+            try:
+                callback_store.init_db(conn)
+                origin_thread_id = (
+                    callback_store.read_origin_thread(conn, task_id)
+                    or str(card.get("origin_thread_id") or "").strip()
+                )
+                provider = str(card.get("coordinator_provider") or "").strip().lower()
+                callback_enqueued = callback_store.enqueue_callback(
+                    conn,
+                    task_id,
+                    origin_thread_id,
+                    callback_store.resolve_callback_transition("finalize_failed"),
                     provider=provider,
                     episode_id=str(card.get("claim_epoch") or 0),
                     request_id=request_id,

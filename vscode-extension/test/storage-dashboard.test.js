@@ -44,6 +44,8 @@ for (const token of [
   "elements.headerSessionManagerValue",
   "elements.headerAiMemoryValue",
   "elements.headerKbValue",
+  "context matches",
+  "matches · ${formatBytes(bytes)} returned",
   "elements.headerPreflightValue",
   "snapshot.environment_preflight",
   'coverageStatus === "degraded"',

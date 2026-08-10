@@ -1,4 +1,4 @@
-"""Pure Learning Commit contract for manager-adjudicated outcomes.
+"""Learning Commit value contract for manager-adjudicated outcomes.
 
 Defines a bounded distillation record containing task identity, repository area,
 outcome, evidence identities, verified root cause/invariant/lesson candidates,
@@ -36,12 +36,11 @@ class EdgeCandidate:
     relation: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, str) or not self.source.strip():
-            raise ValueError("EdgeCandidate.source must be a non-empty string")
-        if not isinstance(self.target, str) or not self.target.strip():
-            raise ValueError("EdgeCandidate.target must be a non-empty string")
-        if not isinstance(self.relation, str) or not self.relation.strip():
-            raise ValueError("EdgeCandidate.relation must be a non-empty string")
+        _bounded_text(self.source, "EdgeCandidate.source", maximum=256)
+        _bounded_text(self.target, "EdgeCandidate.target", maximum=256)
+        _bounded_text(self.relation, "EdgeCandidate.relation", maximum=64)
+        if not _RELATION_PATTERN.fullmatch(self.relation):
+            raise ValueError("EdgeCandidate.relation has an invalid format")
         # Prevent self-loops (unbounded edges)
         if self.source == self.target:
             raise ValueError("EdgeCandidate source and target must differ")
@@ -49,6 +48,7 @@ class EdgeCandidate:
 
 ALLOWED_COMMIT_FIELDS: FrozenSet[str] = frozenset({
     "task_id",
+    "repository_id",
     "repo_area",
     "outcome",
     "evidence_ids",
@@ -58,11 +58,23 @@ ALLOWED_COMMIT_FIELDS: FrozenSet[str] = frozenset({
     "edge_candidates",
     "promotion_eligible_ai_memory",
     "promotion_eligible_context_graph",
+    "promotion_eligible_kb",
 })
 
 _MAX_REF_LEN = 1024
 _ALLOWED_SCHEMES: FrozenSet[str] = frozenset({ "file", "http", "https" })
 _SCHEME_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*$')
+_RELATION_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+_MAX_EVIDENCE_IDS = 32
+_MAX_EDGE_CANDIDATES = 16
+_MAX_TEXT_BYTES = 16 * 1024
+
+
+def _bounded_text(value: str, field_name: str, *, maximum: int = _MAX_TEXT_BYTES) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    if "\x00" in value or len(value.encode("utf-8")) > maximum:
+        raise ValueError(f"{field_name} is invalid or too large")
 
 
 def _validate_evidence_id(ref: str) -> None:
@@ -122,18 +134,22 @@ class LearningCommit:
     edge_candidates: Tuple[EdgeCandidate, ...] = field(default_factory=tuple)
     promotion_eligible_ai_memory: bool = False
     promotion_eligible_context_graph: bool = False
+    promotion_eligible_kb: bool = False
+    repository_id: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.task_id, str) or not self.task_id.strip():
-            raise ValueError("task_id must be a non-empty string")
-        if not isinstance(self.repo_area, str) or not self.repo_area.strip():
-            raise ValueError("repo_area must be a non-empty string")
+        _bounded_text(self.task_id, "task_id", maximum=256)
+        _bounded_text(self.repo_area, "repo_area", maximum=256)
+        if self.repository_id is not None:
+            _bounded_text(self.repository_id, "repository_id", maximum=256)
         if not isinstance(self.outcome, Outcome):
             raise ValueError(f"outcome must be an Outcome, got {type(self.outcome).__name__}")
 
         evidence_ids = self.evidence_ids
         if not isinstance(evidence_ids, (list, tuple)):
             raise ValueError("evidence_ids must be a list or tuple")
+        if len(evidence_ids) > _MAX_EVIDENCE_IDS:
+            raise ValueError("too many evidence_ids")
         validated_evidence: list[str] = []
         for idx, eid in enumerate(evidence_ids):
             if not isinstance(eid, str):
@@ -148,14 +164,14 @@ class LearningCommit:
             "root_cause_candidate", "invariant_candidate", "lesson_candidate"
         ):
             val = getattr(self, attr_name)
-            if val is not None and (
-                not isinstance(val, str) or not val.strip()
-            ):
-                raise ValueError(f"{attr_name} must be None or a non-empty string")
+            if val is not None:
+                _bounded_text(val, attr_name)
 
         edge_candidates = self.edge_candidates
         if not isinstance(edge_candidates, (list, tuple)):
             raise ValueError("edge_candidates must be a list or tuple")
+        if len(edge_candidates) > _MAX_EDGE_CANDIDATES:
+            raise ValueError("too many edge_candidates")
         validated_edges: list[EdgeCandidate] = []
         for idx, edge in enumerate(edge_candidates):
             if not isinstance(edge, EdgeCandidate):
@@ -176,15 +192,21 @@ class LearningCommit:
                 raise ValueError("promotion_eligible_context_graph requires outcome ACCEPTED")
             if not self.evidence_ids:
                 raise ValueError("promotion_eligible_context_graph requires at least one evidence_id")
+        if self.promotion_eligible_kb:
+            if self.outcome != Outcome.ACCEPTED:
+                raise ValueError("promotion_eligible_kb requires outcome ACCEPTED")
+            if not self.evidence_ids:
+                raise ValueError("promotion_eligible_kb requires at least one evidence_id")
 
 
 def validate_repo_match(commit: LearningCommit, repository_id: str) -> None:
     """Reject cross-repository commits."""
     if not isinstance(repository_id, str):
         raise TypeError("repository_id must be a string")
-    if commit.repo_area != repository_id:
+    asserted_repository_id = commit.repository_id or commit.repo_area
+    if asserted_repository_id != repository_id:
         raise ValueError(
-            f"Cross-repository commit: repo_area={commit.repo_area!r} "
+            f"Cross-repository commit: repository_id={asserted_repository_id!r} "
             f"does not match repository_id={repository_id!r}"
         )
 
@@ -243,6 +265,7 @@ def learning_commit_from_dict(data: Dict[str, Any]) -> LearningCommit:
         task_id=data["task_id"],
         repo_area=data["repo_area"],
         outcome=outcome,
+        repository_id=data.get("repository_id"),
         evidence_ids=data.get("evidence_ids", []),
         root_cause_candidate=data.get("root_cause_candidate"),
         invariant_candidate=data.get("invariant_candidate"),
@@ -250,4 +273,5 @@ def learning_commit_from_dict(data: Dict[str, Any]) -> LearningCommit:
         edge_candidates=tuple(edges),
         promotion_eligible_ai_memory=data.get("promotion_eligible_ai_memory", False),
         promotion_eligible_context_graph=data.get("promotion_eligible_context_graph", False),
+        promotion_eligible_kb=data.get("promotion_eligible_kb", False),
     )

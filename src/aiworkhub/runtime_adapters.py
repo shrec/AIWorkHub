@@ -384,6 +384,7 @@ def build_runtime_command(
     executable_overrides: ExecutableOverrides | None = None,
     outer_sandbox_backend: str | None = None,
     additional_readonly_dirs: Sequence[PathValue] | None = None,
+    include_partial_messages: bool = False,
 ) -> RuntimeAdapterPlan:
     """Build a validated argv/cwd plan for one supported adapter.
 
@@ -470,7 +471,6 @@ def build_runtime_command(
             "--output-format",
             "stream-json",
             "--verbose",
-            "--include-partial-messages",
             "--permission-mode",
             "dontAsk",
             "--allowedTools",
@@ -496,6 +496,13 @@ def build_runtime_command(
             "--disallowedTools",
             *CLAUDE_RAW_DISCOVERY_DENIES,
         ]
+        # Partial-message mode emits a JSON event for nearly every provider
+        # delta and can turn a small task into a multi-megabyte stdout log.
+        # Terminal stream-json messages retain final text, tool receipts,
+        # usage and exit evidence. Enable deltas only when an explicit owner
+        # token budget needs live cumulative-usage enforcement.
+        if include_partial_messages:
+            argv.insert(argv.index("--permission-mode"), "--include-partial-messages")
         if model is not None:
             argv.extend(("--model", model))
     elif adapter_id == "codex_cli":
@@ -639,6 +646,7 @@ def build_adapter_command(
     executable_overrides: ExecutableOverrides | None = None,
     outer_sandbox_backend: str | None = None,
     additional_readonly_dirs: Sequence[PathValue] | None = None,
+    include_partial_messages: bool = False,
 ) -> RuntimeAdapterPlan:
     """Compatibility name for callers that describe commands by adapter."""
 
@@ -650,6 +658,7 @@ def build_adapter_command(
         executable_overrides=executable_overrides,
         outer_sandbox_backend=outer_sandbox_backend,
         additional_readonly_dirs=additional_readonly_dirs,
+        include_partial_messages=include_partial_messages,
     )
 
 

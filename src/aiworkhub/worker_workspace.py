@@ -77,6 +77,7 @@ def bubblewrap_home_env_value() -> str:
 
 
 WORKTREE_ROOT_ENV = "AIWORKHUB_WORKTREE_ROOT"
+RUNTIME_ROOT_ENV = "AIWORKHUB_RUNTIME_ROOT"
 BWRAP_ENV = "AIWORKHUB_BWRAP"
 SANDBOX_BACKEND_ENV = "AIWORKHUB_SANDBOX_BACKEND"
 VSCODE_LM_IN_PROCESS_BACKEND = "vscode_lm_in_process"
@@ -102,6 +103,8 @@ SANDBOX_AUTHORITY_REPO = "/authority-repo"
 # than being expressed as an offset inside the authority_repo alias.
 SANDBOX_PACKAGE_IMPORT_ROOT = "/aiworkhub-package-root"
 MAX_SEED_FILES = 20_000
+MAX_REWORK_OVERLAY_FILES = 512
+MAX_REWORK_OVERLAY_CONTENT_BYTES = 8 * 1024 * 1024
 MAX_VALIDATION_COMMANDS = 32
 MAX_VALIDATION_SECONDS = 1_800
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -1030,6 +1033,7 @@ def provision_worker_mcp_runtime(
     session_topic: str,
     allowed_writes: list[str] | tuple[str, ...] = (),
     quality_review_packet_path: Path | None = None,
+    rework_overlay_path: Path | None = None,
 ) -> Any:
     """B834: provision this request's isolated worker MCP config + audit ledger.
 
@@ -1101,6 +1105,20 @@ def provision_worker_mcp_runtime(
             else host_packet
         )
 
+    worker_rework_overlay_path: Path | None = None
+    if rework_overlay_path is not None:
+        host_overlay = rework_overlay_path.resolve()
+        _require_beneath(workspace.home, host_overlay)
+        if host_overlay.is_symlink() or not host_overlay.is_file():
+            raise WorkspaceError("rework_overlay_packet_invalid")
+        relative_overlay = host_overlay.relative_to(workspace.home)
+        worker_rework_overlay_path = (
+            PurePosixPath(bubblewrap_home_env_value())
+            / PurePosixPath(*relative_overlay.parts)
+            if backend == "bubblewrap"
+            else host_overlay
+        )
+
     try:
         return worker_ai_tools_mcp.generate_worker_mcp_runtime(
             home=workspace.home,
@@ -1115,6 +1133,7 @@ def provision_worker_mcp_runtime(
             session_topic=session_topic,
             package_import_root=package_import_root,
             quality_review_packet_path=worker_review_packet_path,
+            rework_overlay_path=worker_rework_overlay_path,
         )
     except worker_ai_tools_mcp.WorkerToolError as exc:
         # Provisioning/config-injection failure must reject the launch, not
@@ -1124,14 +1143,58 @@ def provision_worker_mcp_runtime(
         raise WorkspaceError(f"worker_mcp_runtime_provisioning_failed:{exc}") from exc
 
 
-def configured_worktree_root() -> Path:
-    """Return the single configured root for isolated worker workspaces."""
-    return Path(
-        os.environ.get(
-            WORKTREE_ROOT_ENV,
-            str(Path(tempfile.gettempdir()) / "aiworkhub-worktrees"),
+def configured_runtime_root(repo: Path | None = None) -> Path:
+    """Return the runtime root without creating it.
+
+    An explicit runtime root may live on a system/ephemeral volume.  With an
+    exact repository, the default is the repository-owned, git-ignored
+    ``.aiworkhub/runtime`` boundary.  Callers without repository identity keep
+    the historical system-temp fallback rather than guessing authority.
+    """
+    override = os.environ.get(RUNTIME_ROOT_ENV, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    selected_repo = Path(repo).resolve() if repo is not None else None
+    if selected_repo is None:
+        env_repo = (
+            os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+            or os.environ.get("AIWORKHUB_REPO", "").strip()
         )
-    ).expanduser().resolve()
+        if env_repo:
+            candidate = Path(env_repo).expanduser().resolve()
+            if (candidate / ".aiworkhub" / "project.json").is_file():
+                selected_repo = candidate
+        else:
+            candidate = Path.cwd().resolve()
+            if (candidate / ".aiworkhub" / "project.json").is_file():
+                selected_repo = candidate
+    if selected_repo is not None:
+        hub = selected_repo / ".aiworkhub"
+        runtime = hub / "runtime"
+        if hub.is_symlink() or runtime.is_symlink():
+            raise WorkspaceError("repo_runtime_symlink_forbidden")
+        return runtime.resolve(strict=False)
+    return (Path(tempfile.gettempdir()) / "aiworkhub-runtime").resolve()
+
+
+def configured_worktree_root(repo: Path | None = None) -> Path:
+    """Return the single configured root for isolated worker workspaces."""
+    override = os.environ.get(WORKTREE_ROOT_ENV, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if repo is None and not os.environ.get(RUNTIME_ROOT_ENV, "").strip():
+        env_repo = (
+            os.environ.get("AIWORKHUB_REPO_ROOT", "").strip()
+            or os.environ.get("AIWORKHUB_REPO", "").strip()
+        )
+        if not env_repo and not (Path.cwd() / ".aiworkhub" / "project.json").is_file():
+            return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
+    return (configured_runtime_root(repo) / "worktrees").resolve()
+
+
+def _legacy_worktree_root() -> Path:
+    """Exact pre-repo-runtime root retained only for upgrade-time GC."""
+    return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
 
 
 def create_workspace(
@@ -1154,14 +1217,17 @@ def create_workspace(
         raise WorkspaceError("allowed_writes_empty")
     if any(PurePosixPath(pattern).parts[0] == ".git" for pattern in allowed):
         raise WorkspaceError("git_metadata_write_forbidden")
-    root = configured_worktree_root()
-    if root == repo or repo in root.parents:
+    root = configured_worktree_root(repo)
+    canonical_repo_root = (repo / ".aiworkhub" / "runtime" / "worktrees").resolve(
+        strict=False
+    )
+    if (root == repo or repo in root.parents) and root != canonical_repo_root:
         raise WorkspaceError(f"worktree_root_inside_parent_repo:{root}")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     chmod_path(root, 0o700)
     path = root / request_id / "worktree"
     home = root / request_id / "home"
-    if path == repo or repo in path.parents:
+    if (path == repo or repo in path.parents) and root != canonical_repo_root:
         raise WorkspaceError("worker_path_is_parent_worktree")
     if path.exists() or home.exists():
         raise WorkspaceError(f"workspace_exists:{request_id}")
@@ -1230,15 +1296,29 @@ def cleanup_workspace(repo: Path, path: Path, home: Path) -> None:
     repo = repo.resolve()
     path = path.resolve()
     home = home.resolve()
-    if path == repo or repo in path.parents:
-        raise WorkspaceError("refusing_to_cleanup_parent_worktree")
     if path.name != "worktree" or home.name != "home" or path.parent != home.parent:
         raise WorkspaceError("refusing_unsafe_workspace_cleanup")
-    if path.exists():
-        _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
+    canonical_repo_root = (repo / ".aiworkhub" / "runtime" / "worktrees").resolve(
+        strict=False
+    )
+    workspace_root = path.parent.parent
+    if (
+        path == repo or repo in path.parents
+    ) and workspace_root != canonical_repo_root:
+        raise WorkspaceError("refusing_to_cleanup_parent_worktree")
+    # Ask Git to unregister the exact worktree even when its directory has
+    # already disappeared.  ``git worktree remove --force`` is intentionally
+    # idempotent for a registered-but-missing path; gating this call on
+    # ``path.exists()`` left prunable entries in ``.git/worktrees`` forever.
+    _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
     shutil.rmtree(path.parent, ignore_errors=True)
-    if home.exists():
-        shutil.rmtree(home, ignore_errors=True)
+    # A failed first remove (for example, because Windows still had a handle
+    # open) may become removable after the directory cleanup.  Prune only
+    # administratively stale registrations; Git never deletes a live
+    # worktree through this command.
+    _run(["git", "worktree", "prune", "--expire", "now"], cwd=repo)
+    if path.exists() or home.exists():
+        raise WorkspaceError("workspace_cleanup_incomplete")
 
 
 def _canonical_worktree_delta_paths(repo: Path) -> list[str]:
@@ -1423,14 +1503,18 @@ def assert_gc_safe_workspace_shape(request_id: str, path: Path, home: Path) -> P
     """Fail closed unless this is the request's exact configured workspace."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"gc_invalid_request_id:{request_id}")
-    root = configured_worktree_root()
-    expected_path = (root / request_id / "worktree").resolve(strict=False)
-    expected_home = (root / request_id / "home").resolve(strict=False)
-    if path.resolve(strict=False) != expected_path or home.resolve(strict=False) != expected_home:
-        raise WorkspaceError(
-            f"gc_workspace_shape_mismatch:{request_id}:path={path}:home={home}"
-        )
-    return root
+    candidates = (configured_worktree_root(), _legacy_worktree_root())
+    for root in dict.fromkeys(candidates):
+        expected_path = (root / request_id / "worktree").resolve(strict=False)
+        expected_home = (root / request_id / "home").resolve(strict=False)
+        if (
+            path.resolve(strict=False) == expected_path
+            and home.resolve(strict=False) == expected_home
+        ):
+            return root
+    raise WorkspaceError(
+        f"gc_workspace_shape_mismatch:{request_id}:path={path}:home={home}"
+    )
 
 
 def changed_paths(workspace: WorkerWorkspace) -> list[str]:
@@ -1974,6 +2058,20 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     name = f"{_EXEC_SCRATCH_NAME_PREFIX}{workspace.request_id}"
     tried: list[str] = []
     candidate_roots = list(_exec_scratch_candidate_roots())
+    workspace_repo = getattr(workspace, "repo", None)
+    if (
+        workspace_repo is not None
+        and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
+    ):
+        repo_runtime_validation = configured_runtime_root(
+            Path(workspace_repo)
+        ) / "validation"
+        try:
+            repo_runtime_validation.mkdir(parents=True, exist_ok=True, mode=0o700)
+            chmod_path(repo_runtime_validation, 0o700)
+        except OSError:
+            pass
+        candidate_roots.insert(0, repo_runtime_validation)
     if (
         sys.platform == "win32"
         and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
@@ -3765,6 +3863,120 @@ def _validation_pythonpath_readonly_dirs(components: tuple[str, ...]) -> tuple[P
     return tuple(rows)
 
 
+_VALIDATION_LONG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9_./+=-]{32,}")
+
+
+def _validation_failure_class(record: Mapping[str, Any]) -> str:
+    if record.get("timed_out") is True:
+        return "timeout"
+    returncode = record.get("returncode")
+    if returncode == 0:
+        return "passed"
+    command = " ".join(
+        str(value) for value in (
+            record.get("executed_argv")
+            or record.get("argv")
+            or [record.get("command") or ""]
+        )
+    ).lower()
+    diagnostic = (
+        str(record.get("stderr_tail") or "")
+        + "\n"
+        + str(record.get("stdout_tail") or "")
+    ).lower()
+    if "permission denied" in diagnostic or "access is denied" in diagnostic:
+        return "permission_denied"
+    if returncode in {126, 127} or "not found" in diagnostic:
+        return "executable_unavailable"
+    if "syntaxerror" in diagnostic or "syntax error" in diagnostic:
+        return "syntax_error"
+    if "mypy" in command or "type error" in diagnostic:
+        return "type_check_failure"
+    if "ruff" in command:
+        return "lint_failure"
+    if "pytest" in command or "unittest" in command or "assertionerror" in diagnostic:
+        return "test_failure"
+    return "nonzero_exit"
+
+
+def _validation_failure_receipt(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    failure_class = _validation_failure_class(record)
+    if failure_class == "passed":
+        return None
+    argv = record.get("executed_argv") or record.get("argv") or []
+    if not isinstance(argv, (list, tuple)):
+        argv = []
+    exact_argv = [str(value) for value in argv]
+    raw_diagnostic = (
+        str(record.get("stderr_tail") or "")
+        or str(record.get("stdout_tail") or "")
+    )[-4096:]
+    diagnostic = "".join(
+        character for character in raw_diagnostic
+        if character in "\n\r\t" or ord(character) >= 0x20
+    )
+    diagnostic = _VALIDATION_LONG_TOKEN_RE.sub("<redacted>", diagnostic)[-2048:]
+    identity = {
+        "failure_class": failure_class,
+        "argv": exact_argv,
+        "returncode": record.get("returncode"),
+        "timed_out": record.get("timed_out") is True,
+        "diagnostic_sha256": hashlib.sha256(
+            raw_diagnostic.encode("utf-8", errors="replace")
+        ).hexdigest(),
+    }
+    return {
+        "schema_id": "aiworkhub.validation_failure_receipt.v1",
+        **identity,
+        "command_sha256": hashlib.sha256(
+            json.dumps(exact_argv, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+        "diagnostic_tail": diagnostic,
+        "receipt_sha256": hashlib.sha256(
+            json.dumps(identity, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    }
+
+
+def validation_failure_delta_packet(
+    results: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return only normalized failed-command evidence for one rework turn."""
+
+    receipts = []
+    for row in results:
+        receipt = row.get("failure_receipt")
+        if not isinstance(receipt, dict):
+            receipt = _validation_failure_receipt(row)
+        if receipt is not None:
+            receipts.append(receipt)
+    observed_count = len(receipts)
+    while True:
+        packet = {
+            "schema_id": "aiworkhub.validation_failure_delta.v1",
+            "observed_failure_count": observed_count,
+            "failure_count": len(receipts),
+            "receipts": receipts,
+            "truncated": len(receipts) < observed_count,
+            "automatic_repair_authorized": False,
+        }
+        encoded = json.dumps(
+            packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        if len(encoded) <= 6 * 1024:
+            break
+        if not receipts:
+            raise WorkspaceError("validation_failure_delta_too_large")
+        receipts.pop()
+    packet["packet_sha256"] = hashlib.sha256(encoded).hexdigest()
+    packet["packet_bytes"] = len(encoded)
+    return packet
+
+
 def run_validations(
     workspace: WorkerWorkspace,
     commands: Iterable[str],
@@ -3938,8 +4150,7 @@ def run_validations(
                     if isinstance(exc.stderr, bytes)
                     else str(exc.stderr or "")
                 )
-                results.append(
-                    {
+                timeout_record = {
                         "command": command,
                         "argv": tokens,
                         "declared_command": command,
@@ -3959,8 +4170,11 @@ def run_validations(
                         "stderr_head": stderr[:4_096],
                         "stderr_tail": stderr[-4_096:],
                         "stderr_truncated": len(stderr) > 8_192,
-                    }
+                }
+                timeout_record["failure_receipt"] = _validation_failure_receipt(
+                    timeout_record
                 )
+                results.append(timeout_record)
                 continue
             stdout = result.stdout or ""
             stderr = result.stderr or ""
@@ -3984,6 +4198,8 @@ def run_validations(
                 "stderr_tail": stderr[-4_096:],
                 "stderr_truncated": len(stderr) > 8_192,
             }
+            if result.returncode != 0:
+                record["failure_receipt"] = _validation_failure_receipt(record)
             results.append(record)
         failed = [
             row
@@ -4111,7 +4327,7 @@ def materialize_rework_overlay(
     authority_repo: Path,
     file_entries: list[tuple[str, str | None, bytes | None]],
 ) -> bytes:
-    """Emit canonical-digest-bound overlay packet with distinct successor/predecessor identities.
+    """Emit a bounded, canonical-digest-bound retained-rework overlay.
 
     Each file entry is (repo_relative_path, sha256_or_None, content_bytes_or_None).
     sha256=None means delete; content=None with sha256 indicates a hash-only reference.
@@ -4123,21 +4339,46 @@ def materialize_rework_overlay(
         raise ValueError(f"invalid predecessor_request_id: {predecessor_request_id!r}")
     if successor_request_id == predecessor_request_id:
         raise ValueError("successor and predecessor request_ids must be distinct")
-    if successor_task_id == predecessor_task_id:
-        raise ValueError("successor and predecessor task_ids must be distinct")
+    # Rework intentionally reuses the canonical task ID.  The immutable claim
+    # attempt is identified by a new request ID, so requiring a distinct task
+    # ID made the packet impossible to wire into the real recovery path.
+    if not successor_task_id or not predecessor_task_id:
+        raise ValueError("successor and predecessor task_ids are required")
     authority_repo = authority_repo.resolve()
     if not authority_repo.is_dir():
         raise FileNotFoundError(f"authority_repo not found: {authority_repo}")
+    if len(file_entries) > MAX_REWORK_OVERLAY_FILES:
+        raise ValueError("rework overlay file count exceeds limit")
     normalized_files: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    total_content_bytes = 0
     for rel_path, file_sha, content in file_entries:
-        if not rel_path or ".." in rel_path or rel_path.startswith("/"):
+        normalized_path = PurePosixPath(str(rel_path)).as_posix()
+        if (
+            not rel_path
+            or "\\" in str(rel_path)
+            or PurePosixPath(str(rel_path)).is_absolute()
+            or any(part in {"", ".", ".."} for part in PurePosixPath(str(rel_path)).parts)
+        ):
             raise ValueError(f"invalid repo-relative path: {rel_path!r}")
-        entry: dict[str, Any] = {"path": rel_path}
+        if normalized_path in seen_paths:
+            raise ValueError(f"duplicate rework overlay path: {normalized_path}")
+        seen_paths.add(normalized_path)
+        entry: dict[str, Any] = {"path": normalized_path}
         if file_sha is None:
+            if content is not None:
+                raise ValueError(f"deleted overlay path carries content: {normalized_path}")
             entry["deleted"] = True
         else:
+            if not re.fullmatch(r"[0-9a-f]{64}", str(file_sha)):
+                raise ValueError(f"invalid rework overlay hash: {normalized_path}")
             entry["sha256"] = file_sha
         if content is not None:
+            if hashlib.sha256(content).hexdigest() != file_sha:
+                raise ValueError(f"rework overlay content hash mismatch: {normalized_path}")
+            total_content_bytes += len(content)
+            if total_content_bytes > MAX_REWORK_OVERLAY_CONTENT_BYTES:
+                raise ValueError("rework overlay content exceeds limit")
             entry["content_base64"] = base64.b64encode(content).decode("ascii")
         normalized_files.append(entry)
     normalized_files.sort(key=lambda e: e["path"])

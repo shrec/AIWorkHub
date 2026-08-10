@@ -1306,6 +1306,54 @@ def test_incremental_build_skips_unchanged_without_reparsing(tmp_path, monkeypat
     assert extracted == ["pkg/a.py"]
 
 
+def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
+    tmp_path, monkeypatch,
+):
+    repo = _new_repo(tmp_path, "parallel_extract")
+    names = ["a.py", "b.py", "c.py", "d.py"]
+    for name in names:
+        _write(repo / "pkg" / name, f"def {name[0]}():\n    return 1\n")
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "2")
+    original_write = sg._write_extraction
+    write_order: list[str] = []
+
+    def tracked_write(conn, extraction, *, file_size, mtime_ns):
+        write_order.append(extraction.file_path)
+        return original_write(
+            conn, extraction, file_size=file_size, mtime_ns=mtime_ns
+        )
+
+    monkeypatch.setattr(sg, "_write_extraction", tracked_write)
+
+    report = sg.build_index(repo, incremental=False)
+
+    assert report.extraction_workers == 2
+    assert report.extraction_backend == "process_pool"
+    assert report.extraction_fallback_reason == ""
+    assert report.extraction_seconds > 0
+    assert report.files_changed == 4
+    assert write_order == [f"pkg/{name}" for name in names]
+
+
+def test_multicore_extraction_worker_configuration_is_bounded(monkeypatch):
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "999999")
+    assert sg._source_graph_extract_workers(100) == sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "invalid")
+    assert sg._source_graph_extract_workers(5) == 1
+
+    monkeypatch.setenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "8")
+    assert sg._source_graph_extract_workers(1) == 1
+
+    monkeypatch.delenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV)
+    assert sg._source_graph_extract_workers(8, 255 * 1024) == 1
+    assert sg._source_graph_extract_workers(8, 256 * 1024) == min(
+        sg.DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS,
+        max(1, sg.os.cpu_count() or 1),
+    )
+
+
 def test_rename_regression_no_stale_edge_survives(tmp_path):
     """The exact regression this card guards against: renaming or deleting a
     file must never leave its old entities/edges queryable afterward."""
@@ -1907,7 +1955,8 @@ def _sample_packet(successor_req="req-abc", successor_task="task-1",
     if authority_repo is None:
         authority_repo = Path("/tmp/authority")
     if files is None:
-        files = [{"path": "src/mod.py", "sha256": "abc123", "content_base64": base64.b64encode(b"# overlay\n").decode()},
+        overlay_content = b"# overlay\n"
+        files = [{"path": "src/mod.py", "sha256": hashlib.sha256(overlay_content).hexdigest(), "content_base64": base64.b64encode(overlay_content).decode()},
                  {"path": "deleted.py", "deleted": True}]
     payload = {
         "successor_request_id": successor_req,
@@ -1926,7 +1975,7 @@ def test_materializer_emits_canonical_digest(tmp_path):
     authority.mkdir()
     data = materialize_rework_overlay(
         "req-s", "task-s", "req-p", "task-p", authority,
-        [("src/a.py", "sha1", b"content")],
+        [("src/a.py", hashlib.sha256(b"content").hexdigest(), b"content")],
     )
     packet = json.loads(data)
     assert packet["successor_request_id"] == "req-s"
@@ -1939,8 +1988,11 @@ def test_materializer_emits_canonical_digest(tmp_path):
 def test_materializer_identity_distinct_fails():
     with pytest.raises(ValueError):
         materialize_rework_overlay("same", "tsk", "same", "tsk2", Path("/tmp"), [])
-    with pytest.raises(ValueError):
+    # Rework keeps the canonical task ID and distinguishes attempts by request.
+    packet = json.loads(
         materialize_rework_overlay("r1", "same", "r2", "same", Path("/tmp"), [])
+    )
+    assert packet["successor_task_id"] == packet["predecessor_task_id"] == "same"
 
 
 def test_consumer_verifies_identities():
@@ -1966,7 +2018,7 @@ def test_consumer_fails_closed_on_foreign_identity():
 def test_overlay_map_and_delete():
     packet = _sample_packet()
     overlay = _build_rework_overlay_map(packet)
-    assert overlay["src/mod.py"]["sha256"] == "abc123"
+    assert overlay["src/mod.py"]["sha256"] == hashlib.sha256(b"# overlay\n").hexdigest()
     assert overlay["deleted.py"]["deleted"] is True
 
 
@@ -2018,11 +2070,11 @@ def test_threaded_isolation_no_cross_contamination(tmp_path):
     auth.mkdir()
     packet_a = _sample_packet(successor_req="ra", successor_task="ta",
                               predecessor_req="pa", predecessor_task="pta",
-                              authority_repo=auth, files=[{"path": "a.py", "sha256": "shaA",
+                              authority_repo=auth, files=[{"path": "a.py", "sha256": hashlib.sha256(b"A").hexdigest(),
                                                            "content_base64": base64.b64encode(b"A").decode()}])
     packet_b = _sample_packet(successor_req="rb", successor_task="tb",
                               predecessor_req="pb", predecessor_task="ptb",
-                              authority_repo=auth, files=[{"path": "b.py", "sha256": "shaB",
+                              authority_repo=auth, files=[{"path": "b.py", "sha256": hashlib.sha256(b"B").hexdigest(),
                                                            "content_base64": base64.b64encode(b"B").decode()}])
     results = []
     def query_ctx(packet, target):
@@ -2071,3 +2123,81 @@ def test_cleanup_does_not_leak(tmp_path):
     )
     res2 = _apply_rework_overlay_query(ctx2, "body", "x", "src/mod.py", 64)
     assert res2 is None
+
+
+def test_rework_overlay_is_wired_into_production_source_graph_query(tmp_path):
+    authority = _new_repo(tmp_path, "rework_authority")
+    workspace = _new_repo(tmp_path, "rework_workspace")
+    _write(
+        authority / "src" / "mod.py",
+        "def canonical_only():\n    return 'old'\n",
+    )
+    sg.build_index(authority, incremental=False)
+
+    updated = b"def retained_rework_symbol():\n    return 'new'\n"
+    target = workspace / "src" / "mod.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(updated)
+    packet = json.loads(
+        materialize_rework_overlay(
+            "successor-request",
+            "same-task",
+            "predecessor-request",
+            "same-task",
+            authority,
+            [("src/mod.py", hashlib.sha256(updated).hexdigest(), updated)],
+        )
+    )
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    packet_path = runtime / "rework_overlay.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    _verify_rework_overlay_packet(
+        packet, "same-task", "successor-request", "runner", authority
+    )
+    ctx = WorkerToolContext(
+        task_id="same-task",
+        runner="runner",
+        topic="task_mcp",
+        request_id="successor-request",
+        repo=workspace,
+        authority_repo=authority,
+        source_graph_targets=("src/mod.py",),
+        allowed_writes=("src/mod.py",),
+        session_topic="task_mcp",
+        audit_ledger_path=None,
+        audit_hmac_key_path=None,
+        rework_overlay_packet=packet,
+        rework_overlay_packet_path=packet_path,
+    )
+
+    first = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="retained_rework_symbol",
+        target="src/mod.py",
+        workflow_stage="rework",
+    )
+    assert first["ok"] is True
+    assert first["hit_count"] >= 1
+    assert first["authority_source"] == "rework_overlay"
+    assert "retained_rework_symbol" in first["content"]
+
+    # A later worker edit of the packet-bound path invalidates the private
+    # overlay cache and is visible on the next query without touching the
+    # canonical repository index.
+    later = b"def later_rework_symbol():\n    return 'later'\n"
+    target.write_bytes(later)
+    second = w.source_graph_query(
+        ctx,
+        mode="body",
+        query="later_rework_symbol",
+        target="src/mod.py",
+        workflow_stage="implementation",
+    )
+    assert second["ok"] is True
+    assert second["hit_count"] >= 1
+    assert "later_rework_symbol" in second["content"]
+
+    canonical = sg.body_query(authority, "later_rework_symbol", 16)
+    assert canonical["matches"] == []

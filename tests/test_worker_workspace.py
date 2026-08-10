@@ -29,6 +29,31 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def test_cleanup_unregisters_a_registered_worktree_whose_directory_is_missing(
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    request_id = "req-missing-registration"
+    root = tmp_path / "worktrees" / request_id
+    path = root / "worktree"
+    home = root / "home"
+    assert _git(repo, "worktree", "add", "--detach", str(path), "HEAD").returncode == 0
+    home.mkdir(parents=True)
+    # Model the externally removed/crashed workspace that originally left a
+    # prunable Git administrative record behind.
+    import shutil
+
+    shutil.rmtree(path)
+    before = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert str(path) in before
+
+    worker_workspace.cleanup_workspace(repo, path, home)
+
+    after = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert str(path) not in after
+    assert not root.exists()
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "parent"
@@ -74,6 +99,68 @@ def _workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repo: Path, requ
         },
         "validation",
     )
+
+
+def test_default_workspace_root_is_repo_local_runtime_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+
+    assert worker_workspace.configured_runtime_root(repo) == (
+        repo / ".aiworkhub" / "runtime"
+    ).resolve()
+    assert worker_workspace.configured_worktree_root(repo) == (
+        repo / ".aiworkhub" / "runtime" / "worktrees"
+    ).resolve()
+
+
+def test_workspace_can_use_exact_repo_local_runtime_root(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+
+    workspace = worker_workspace.create_workspace(
+        repo,
+        "repo-local-runtime",
+        {"allowed_writes": ["out/result.txt"]},
+        "validation",
+    )
+    try:
+        assert workspace.path == (
+            repo
+            / ".aiworkhub"
+            / "runtime"
+            / "worktrees"
+            / "repo-local-runtime"
+            / "worktree"
+        ).resolve()
+        assert repo in workspace.path.parents
+        assert worker_workspace.enforce_scope(workspace) == []
+    finally:
+        worker_workspace.cleanup_workspace(repo, workspace.path, workspace.home)
+
+
+def test_workspace_rejects_noncanonical_root_inside_parent_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+) -> None:
+    monkeypatch.setenv(
+        worker_workspace.WORKTREE_ROOT_ENV, str(repo / "unsafe-worktrees")
+    )
+
+    with pytest.raises(
+        worker_workspace.WorkspaceError, match="worktree_root_inside_parent_repo"
+    ):
+        worker_workspace.create_workspace(
+            repo,
+            "unsafe-repo-root",
+            {"allowed_writes": ["out/result.txt"]},
+            "validation",
+        )
 
 
 def test_workspace_is_detached_and_seeded_parent_changes_are_not_worker_changes(
@@ -1462,6 +1549,66 @@ def test_validation_batch_retains_each_failed_command_and_bounded_streams(
     assert len(rows[0]["stdout_head"]) == 4_096
     assert len(rows[0]["stdout_tail"]) == 4_096
     assert rows[1]["stderr_truncated"] is True
+    assert rows[0]["failure_receipt"]["failure_class"] == "nonzero_exit"
+    delta = worker_workspace.validation_failure_delta_packet(rows)
+    assert delta["failure_count"] == 2
+    assert delta["automatic_repair_authorized"] is False
+    assert delta["packet_bytes"] <= 6 * 1024
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"timed_out": True, "argv": ["pytest"]}, "timeout"),
+        (
+            {"returncode": 1, "argv": ["python"], "stderr_tail": "SyntaxError: bad"},
+            "syntax_error",
+        ),
+        (
+            {"returncode": 1, "argv": ["ruff", "check"], "stderr_tail": "bad"},
+            "lint_failure",
+        ),
+        (
+            {"returncode": 1, "argv": ["pytest"], "stdout_tail": "1 failed"},
+            "test_failure",
+        ),
+        (
+            {"returncode": 126, "argv": ["tool"], "stderr_tail": "permission denied"},
+            "permission_denied",
+        ),
+    ],
+)
+def test_validation_failure_receipt_classifies_stable_categories(
+    record: dict, expected: str
+) -> None:
+    receipt = worker_workspace._validation_failure_receipt(record)
+    assert receipt is not None
+    assert receipt["schema_id"] == "aiworkhub.validation_failure_receipt.v1"
+    assert receipt["failure_class"] == expected
+    assert len(receipt["command_sha256"]) == 64
+    assert len(receipt["receipt_sha256"]) == 64
+
+
+def test_validation_failure_delta_redacts_long_tokens_and_bounds_population() -> None:
+    secret = "s" * 80
+    rows = [
+        {
+            "returncode": 1,
+            "argv": ["pytest", f"tests/test_{index}.py"],
+            "stderr_tail": (
+                f"failure {index} " + ("shorttoken " * 300) + f" token={secret}"
+            ),
+        }
+        for index in range(12)
+    ]
+    packet = worker_workspace.validation_failure_delta_packet(rows)
+    serialized = json.dumps(packet, sort_keys=True)
+    assert packet["observed_failure_count"] == 12
+    assert packet["failure_count"] < 12
+    assert packet["truncated"] is True
+    assert packet["packet_bytes"] <= 6 * 1024
+    assert secret not in serialized
+    assert "<redacted>" in serialized
 
 
 # ── validation sandbox portability regression (request cfaa21da...) ──────────
@@ -1691,6 +1838,7 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
     hostile.mkdir()
     portable.mkdir()
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(hostile))
     monkeypatch.setattr(
         worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (hostile, portable)
     )
@@ -1712,7 +1860,10 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
             scratch.resolve(), hostile.resolve()
         )
         # The rejected candidate leaves no scratch directory behind.
-        assert list(hostile.iterdir()) == []
+        assert not any(
+            path.name.startswith(worker_workspace._EXEC_SCRATCH_NAME_PREFIX)
+            for path in hostile.rglob("*")
+        )
     finally:
         worker_workspace.cleanup_validation_exec_scratch(scratch)
 

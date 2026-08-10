@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from aiworkhub import process_launcher, worker_workspace
 
 
@@ -108,6 +110,39 @@ def _result_log(path: Path, text: str = "independent evidence trace") -> dict:
     return process_launcher._readonly_research_result_evidence(path)
 
 
+def _attach_attempt_evidence(
+    manager: process_launcher.ProcessManager,
+    card: dict,
+    workspace: worker_workspace.WorkerWorkspace,
+    *,
+    level: process_launcher.evidence_levels.EvidenceLevel,
+) -> None:
+    evidence = card["terminal_review"]["evidence"]
+    receipt = manager._persist_attempt_artifacts(
+        REQUEST_ID,
+        {
+            "task_id": TASK_ID,
+            "runner": RUNNER,
+            "topic": str(card.get("topic") or TOPIC),
+            "adapter_id": "codex_cli",
+            "model": "codex_cli",
+            "stdout_path": str(manager.process_dir / f"{REQUEST_ID}.stdout.log"),
+            "workspace": workspace.as_metadata(),
+        },
+        workspace,
+        target_state="review_ready",
+        changed_paths=[],
+        review={"kind": "test_fixture"},
+    )
+    evidence["attempt_artifact_manifest"] = receipt
+    evidence["evidence_record"] = manager._canonical_outcome_evidence(
+        REQUEST_ID,
+        receipt,
+        level=level,
+        message="Canonical test fixture evidence.",
+    )
+
+
 def test_result_event_after_receipt_prefix_preserves_same_line_suffix(
     tmp_path: Path,
 ) -> None:
@@ -206,6 +241,38 @@ def test_research_result_requires_supported_non_receipt_output(tmp_path: Path) -
     assert evidence["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize(
+    "placeholder",
+    ["...", "…", "placeholder", "TODO", "done", "research completed", "---"],
+)
+def test_research_result_rejects_content_free_success_placeholders(
+    tmp_path: Path,
+    placeholder: str,
+) -> None:
+    output = tmp_path / "research.stdout.log"
+    evidence = _result_log(output, placeholder)
+
+    assert evidence["meaningful_output"] is False
+    assert evidence["result_event_count"] == 0
+    assert evidence["result_chars"] == 0
+    assert evidence["reason"] == "research_result_missing"
+
+
+def test_research_result_accepts_evidence_backed_inconclusive_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "research.stdout.log"
+    text = (
+        "inconclusive: exact Source Graph query returned zero candidates; "
+        "receipt sha256=0123456789abcdef"
+    )
+    evidence = _result_log(output, text)
+
+    assert evidence["meaningful_output"] is True
+    assert evidence["result_event_count"] == 1
+    assert evidence["result_chars"] == len(text)
+
+
 def test_no_write_no_output_contract_is_readonly_for_code_inspection(
     tmp_path: Path,
 ) -> None:
@@ -257,6 +324,19 @@ def test_successful_readonly_research_reaches_review_ready(
         parent_baseline={},
         workspace_baseline={},
     )
+    bridge = process_launcher.vscode_lm_bridge
+    bridge_root = tmp_path / "bridge"
+    repo_id = "repo_" + "b" * 32
+    monkeypatch.setenv(bridge.BRIDGE_ROOT_ENV, str(bridge_root))
+    bridge_request = bridge.BridgeRequest(
+        request_id=REQUEST_ID,
+        repo_id=repo_id,
+        request_path=bridge_root / "requests" / repo_id / f"{REQUEST_ID}.json",
+        response_path=home / ".aiworkhub_vscode_lm_response.json",
+        worker_spec_path=home / ".aiworkhub_vscode_lm_worker.json",
+        cancel_path=home / ".aiworkhub_vscode_lm_response.json",
+        cancel_token="c" * 64,
+    )
     card = _research_card(workspace)
     card.update(status="processing", worker_status="claimed")
     process_dir = tmp_path / "processes"
@@ -291,6 +371,7 @@ def test_successful_readonly_research_reaches_review_ready(
             "validation": [],
             "residual_contract_manifest": [],
             "workspace": workspace.as_metadata(),
+            "vscode_lm_bridge": bridge.bridge_request_metadata(bridge_request),
         },
     )
     captured: list[dict] = []
@@ -303,15 +384,6 @@ def test_successful_readonly_research_reaches_review_ready(
         or {"ok": True},
     )
     monkeypatch.setattr(manager, "_record_usage", lambda *_a, **_k: ({}, False, ""))
-    # This test owns the read-only result/finalization contract, not the
-    # separately covered VS Code LM cancellation transport. Production launch
-    # metadata always carries a token-bound bridge receipt; this synthetic
-    # fixture intentionally does not construct one.
-    monkeypatch.setattr(
-        manager,
-        "_publish_bridge_cancellation_before_finalization",
-        lambda *_args, **_kwargs: "",
-    )
     manager._append_event(
         {
             "request_id": REQUEST_ID,
@@ -338,6 +410,13 @@ def test_successful_readonly_research_reaches_review_ready(
     evidence = captured[0]["evidence"]
     assert evidence["changed_path_hashes"] == {}
     assert evidence["research_result"]["meaningful_output"] is True
+    decision = bridge.read_terminal_decision(
+        bridge_request.cancel_path,
+        request_id=REQUEST_ID,
+        repo_id=repo_id,
+        cancel_token=bridge_request.cancel_token,
+    )
+    assert decision is not None and decision[1] == "cancel"
 
 
 def test_accept_revalidates_exact_readonly_research_stdout(
@@ -368,6 +447,12 @@ def test_accept_revalidates_exact_readonly_research_stdout(
     result_evidence = _result_log(stdout_path)
     card["terminal_review"]["evidence"]["research_result"] = result_evidence
     manager = _manager(repo, process_dir, card)
+    _attach_attempt_evidence(
+        manager,
+        card,
+        workspace,
+        level=process_launcher.evidence_levels.EvidenceLevel.OBSERVATION,
+    )
     manager._append_event(
         {
             "request_id": REQUEST_ID,
@@ -399,6 +484,22 @@ def test_accept_revalidates_exact_readonly_research_stdout(
     assert result["promoted_paths"] == []
     assert result["research_result"] == result_evidence
     assert accepted[0]["evidence"]["quality_gate"]["applicable"] is False
+    assert accepted[0]["evidence"]["source_evidence_record"][
+        "evidence_level"
+    ] == "observation"
+    assert accepted[0]["evidence"]["acceptance_evidence_record"][
+        "evidence_level"
+    ] == "fixed_and_verified"
+
+    card["terminal_review"]["evidence"]["evidence_record"][
+        "evidence_level"
+    ] = "claimed"
+    below_minimum = manager.accept_review(REQUEST_ID, TASK_ID)
+    assert below_minimum["ok"] is False
+    assert "evidence_level_below_minimum" in below_minimum["error"]
+    card["terminal_review"]["evidence"]["evidence_record"][
+        "evidence_level"
+    ] = "observation"
 
     stdout_path.write_text(
         stdout_path.read_text(encoding="utf-8") + "tamper\n", encoding="utf-8"
@@ -476,6 +577,12 @@ def test_accepts_authenticated_readonly_quality_review_without_changed_hashes(
         },
     )
     manager = _manager(repo, process_dir, card)
+    _attach_attempt_evidence(
+        manager,
+        card,
+        workspace,
+        level=process_launcher.evidence_levels.EvidenceLevel.STATIC_EVIDENCE,
+    )
     manager._append_event(
         {
             "request_id": REQUEST_ID,
@@ -510,6 +617,12 @@ def test_accepts_authenticated_readonly_quality_review_without_changed_hashes(
     assert final_evidence["quality_gate"]["reason"] == (
         "quality_review_no_repository_change"
     )
+    assert final_evidence["source_evidence_record"]["evidence_level"] == (
+        "static_evidence"
+    )
+    assert final_evidence["acceptance_evidence_record"]["evidence_level"] == (
+        "fixed_and_verified"
+    )
 
 
 def test_readonly_quality_review_requires_canonical_receipt(
@@ -541,6 +654,12 @@ def test_readonly_quality_review_requires_canonical_receipt(
     process_dir = tmp_path / "processes"
     process_dir.mkdir()
     manager = _manager(repo, process_dir, card)
+    _attach_attempt_evidence(
+        manager,
+        card,
+        workspace,
+        level=process_launcher.evidence_levels.EvidenceLevel.STATIC_EVIDENCE,
+    )
     manager._append_event(
         {
             "request_id": REQUEST_ID,

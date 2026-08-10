@@ -1277,6 +1277,12 @@ def _progress_payload(*, sequence: int = 1) -> dict[str, object]:
         "sequence": sequence,
         "phase": "tool_turn",
         "updated_at": "2026-08-06T08:00:00+00:00",
+        "tool_name": "aiworkhub_worker_quality_review_submit",
+        "tool_state": "failed",
+        "elapsed_ms": 120001,
+        "error_code": "mcp_request_timeout",
+        "timeout_phase": "request_wait",
+        "timeout_ms": 120000,
     }
 
 
@@ -1304,6 +1310,8 @@ def test_progress_receipt_is_owner_private_identity_bound_and_monotonic(tmp_path
         previous_sequence=1,
     )
     assert receipt["sequence"] == 2
+    assert receipt["tool_name"] == "aiworkhub_worker_quality_review_submit"
+    assert receipt["timeout_phase"] == "request_wait"
     with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_progress_non_monotonic"):
         vscode_lm_bridge.read_progress_receipt(
             progress, "a" * 32, "repo_test", previous_sequence=2,
@@ -1380,6 +1388,29 @@ def test_progress_receipt_open_handle_rejects_aba_swapped_bytes(
         )
 
     assert json.loads(progress.read_text(encoding="utf-8"))["sequence"] == 1
+
+
+def test_progress_security_failure_receipt_is_structured_and_path_free(
+    tmp_path: Path,
+) -> None:
+    progress = tmp_path / "sensitive-parent" / "progress.json"
+    progress.parent.mkdir()
+    vscode_lm_bridge._atomic_json(progress, _progress_payload(sequence=7))
+
+    with pytest.raises(vscode_lm_bridge.ProgressReceiptSecurityError) as captured:
+        vscode_lm_bridge.read_progress_receipt(
+            progress,
+            "a" * 32,
+            "different_repo",
+        )
+
+    assert captured.value.receipt == {
+        "schema_id": "aiworkhub.vscode_lm.progress_security_failure.v1",
+        "validation_phase": "repository_identity",
+        "invariant": "bridge_progress_repo_mismatch",
+        "observed_sequence": 7,
+    }
+    assert str(progress) not in json.dumps(captured.value.receipt)
 
 
 def test_worker_streams_monotonic_progress_before_response(

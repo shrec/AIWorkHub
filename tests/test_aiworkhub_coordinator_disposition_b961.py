@@ -302,6 +302,7 @@ def test_archive_task_sets_archived_at_and_event(coord):
 
 
 def test_supersede_task_records_replacement(coord):
+    _insert(coord, "T_NEW", worker_status="unclaimed", status="pending")
     _insert(coord, "T_S", worker_status="unclaimed", status="pending")
     res = core.supersede_task("T_S", reason="stale", by="T_NEW")
     assert res["ok"] is True, res

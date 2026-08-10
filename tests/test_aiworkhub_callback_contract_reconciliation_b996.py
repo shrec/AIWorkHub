@@ -5,12 +5,48 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from aiworkhub import callback_store  # noqa: E402
+
+
+def test_enqueue_callback_rolls_back_owned_transaction_on_commit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Cursor:
+        rowcount = 1
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.rollbacks = 0
+
+        def execute(self, *_args, **_kwargs):
+            return _Cursor()
+
+        def commit(self) -> None:
+            raise sqlite3.OperationalError("disk busy")
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+    connection = _Connection()
+    monkeypatch.setattr(callback_store, "_ensure_callback_outbox_table", lambda _conn: None)
+    monkeypatch.setattr(callback_store, "current_claim_episode", lambda _conn, _task: "1")
+
+    with pytest.raises(sqlite3.OperationalError, match="disk busy"):
+        callback_store.enqueue_callback(
+            connection,  # type: ignore[arg-type]
+            "TASK_CALLBACK_ROLLBACK",
+            "thread-1",
+            "review_ready",
+            provider="codex",
+        )
+    assert connection.rollbacks == 1
 
 
 def _review_row(

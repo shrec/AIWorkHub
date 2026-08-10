@@ -125,7 +125,17 @@ def test_retrieval_eval_measures_wrapper_rank(tmp_path: Path) -> None:
 
     report = evidence.source_graph_retrieval_eval(tmp_path, query_fn=query_fn)
     assert report["precision_at_k"] == 0.5
+    assert report["recall_at_k"] == 1.0
     assert report["mrr"] == 0.5
+    assert report["success_at_k"] == 1.0
+    assert report["mean_returned_bytes"] > 0
+    assert report["mean_latency_ms"] >= 0
+    assert report["p95_latency_ms"] >= 0
+    assert report["accepted_outcome_coverage"] == 0.0
+    assert report["accepted_outcome_measurement_pending"] is True
+    assert report["blocking"] is False
+    assert report["cases"][0]["returned_bytes"] > 0
+    assert report["cases"][0]["accepted_outcome_observed"] is False
 
 
 def test_retrieval_eval_distinguishes_missing_from_invalid_registry(tmp_path: Path) -> None:
@@ -149,6 +159,30 @@ def test_retrieval_eval_distinguishes_missing_from_invalid_registry(tmp_path: Pa
     assert invalid["repair_hint"]
 
 
+def test_retrieval_eval_fails_declared_quality_minimum(tmp_path: Path) -> None:
+    config = tmp_path / ".aiworkhub/source-graph-retrieval-eval.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "minimums": {"recall_at_k": 1.0},
+        "cases": [{
+            "id": "one", "query": "symbol", "mode": "focus", "k": 2,
+            "expected_paths": ["src/right.py"],
+        }],
+    }), encoding="utf-8")
+
+    report = evidence.source_graph_retrieval_eval(
+        tmp_path,
+        query_fn=lambda **_kwargs: {
+            "ok": True,
+            "content": json.dumps({"candidate_files": ["src/wrong.py"]}),
+        },
+    )
+
+    assert report["status"] == "below_gate"
+    assert report["blocking"] is True
+    assert report["gate_failures"] == ["recall_at_k:0.0<1.0"]
+
+
 def test_ab_report_excludes_unobserved_and_measures_complete_pair(tmp_path: Path) -> None:
     path = tmp_path / ".aiworkhub/prompt-ab-canary.jsonl"
     path.parent.mkdir()
@@ -163,6 +197,62 @@ def test_ab_report_excludes_unobserved_and_measures_complete_pair(tmp_path: Path
     assert report["pair_count"] == 1
     assert report["pairs"][0]["metrics"]["output_tokens"]["delta_percent"] == -50.0
     assert report["excluded"] == [{"pair_id": "q", "reason": "usage_unobserved"}]
+
+
+def test_risk_mode_precision_uses_only_explicit_adjudicated_predictions(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".aiworkhub/risk-mode-adjudication.jsonl"
+    path.parent.mkdir()
+    rows = [
+        {
+            "mode": "crashes",
+            "language": "cpp",
+            "predicted": True,
+            "adjudicated": True,
+            "correct": True,
+        },
+        {
+            "mode": "crashes",
+            "language": "cpp",
+            "predicted": True,
+            "adjudicated": True,
+            "correct": False,
+        },
+        {
+            "mode": "crashes",
+            "language": "cpp",
+            "predicted": False,
+            "adjudicated": True,
+            "correct": True,
+        },
+        {
+            "mode": "crashes",
+            "language": "python",
+            "predicted": True,
+            "adjudicated": False,
+            "correct": True,
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    report = evidence.risk_mode_precision_bench(tmp_path)
+
+    assert report["status"] == "measured"
+    assert report["measured"] is True
+    assert report["buckets"] == [
+        {
+            "mode": "crashes",
+            "language": "cpp",
+            "tp": 1,
+            "fp": 1,
+            "adjudicated": 2,
+            "precision": 0.5,
+        }
+    ]
 
 
 def test_quality_ratchet_and_coverage_projection(tmp_path: Path) -> None:

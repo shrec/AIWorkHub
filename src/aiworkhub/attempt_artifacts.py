@@ -1,8 +1,14 @@
-"""Deterministic attempt artifact manifest contract."""
+"""Deterministic, replay-verifiable attempt artifact bundles."""
 from __future__ import annotations
-import json, posixpath, re
+import hashlib
+import json
+import posixpath
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
+
+from .worker_workspace import write_json_0600
 
 _ABSENT_SHA256_SENTINEL = "0000000000000000000000000000000000000000000000000000000000000000"
 _EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -14,6 +20,19 @@ _TOP_LEVEL_FIELDS: frozenset[str] = frozenset({"attempt_id","artifacts"})
 _ARTIFACT_FIELDS: frozenset[str] = frozenset({"path","sha256","byte_count","media_type","role","present","required"})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _DRIVE_COMPONENT = re.compile(r"^[A-Za-z]:")
+MANIFEST_FILENAME = "manifest.json"
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+ROLE_FILENAMES: dict[str, str] = {
+    "metadata": "metadata.json",
+    "diff": "diff.json",
+    "validation": "validation.json",
+    "usage": "usage.json",
+    "review": "review.json",
+    "sarif": "findings.sarif.json",
+}
+REQUIRED_BUNDLE_ROLES: frozenset[str] = frozenset(
+    {"metadata", "diff", "validation", "usage", "review"}
+)
 
 class InvalidArtifactError(ValueError):
     """Raised when a single artifact entry fails structural validation."""
@@ -210,3 +229,140 @@ def parse_manifest_json(json_str: str) -> AttemptArtifactManifest:
 def validate_artifact_path(path: str) -> bool:
     _validate_safe_relative_path(path)
     return True
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    try:
+        data = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise InvalidArtifactError(
+            f"artifact payload is not deterministic JSON: {type(exc).__name__}"
+        ) from exc
+    if len(data) > MAX_ARTIFACT_BYTES:
+        raise InvalidArtifactError("artifact payload exceeds bounded size")
+    return data
+
+
+def persist_json_bundle(
+    bundle_dir: Path,
+    *,
+    attempt_id: str,
+    payloads: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist and immediately verify one attempt bundle.
+
+    Required roles are always present. SARIF is optional. Paths are fixed by
+    role, never caller-controlled, and every manifest digest is computed from
+    the exact bytes subsequently verified from disk.
+    """
+
+    extra_roles = set(payloads) - set(ROLE_FILENAMES)
+    if extra_roles:
+        raise InvalidManifestError(
+            f"unknown artifact roles: {sorted(extra_roles)!r}"
+        )
+    missing = REQUIRED_BUNDLE_ROLES - set(payloads)
+    if missing:
+        raise InvalidManifestError(
+            f"missing required artifact roles: {sorted(missing)!r}"
+        )
+    if bundle_dir.is_symlink():
+        raise InvalidManifestError("attempt artifact bundle root is a symlink")
+    bundle_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not bundle_dir.is_dir() or bundle_dir.is_symlink():
+        raise InvalidManifestError("attempt artifact bundle root is not a directory")
+
+    entries: list[ArtifactEntry] = []
+    for role in sorted(payloads):
+        filename = ROLE_FILENAMES[role]
+        data = _canonical_json_bytes(payloads[role])
+        # Reuse the cross-platform owner-only atomic JSON writer, then hash the
+        # exact committed bytes rather than the pre-write Python object.
+        write_json_0600(bundle_dir / filename, payloads[role])
+        committed = (bundle_dir / filename).read_bytes()
+        if committed != data:
+            raise InvalidArtifactError(
+                f"artifact byte fidelity mismatch for role {role!r}"
+            )
+        entries.append(
+            ArtifactEntry(
+                path=filename,
+                sha256=hashlib.sha256(committed).hexdigest(),
+                byte_count=len(committed),
+                media_type=(
+                    "application/sarif+json"
+                    if role == "sarif"
+                    else "application/json"
+                ),
+                role=role,
+                present=True,
+                required=role in REQUIRED_BUNDLE_ROLES,
+            )
+        )
+
+    manifest = AttemptArtifactManifest(attempt_id=attempt_id, artifacts=entries)
+    write_json_0600(bundle_dir / MANIFEST_FILENAME, manifest.to_dict())
+    verified = verify_json_bundle(bundle_dir)
+    return {
+        "schema_id": "aiworkhub.attempt_artifact_bundle_receipt.v1",
+        "attempt_id": attempt_id,
+        "manifest_path": str(bundle_dir / MANIFEST_FILENAME),
+        "manifest_sha256": hashlib.sha256(
+            (bundle_dir / MANIFEST_FILENAME).read_bytes()
+        ).hexdigest(),
+        "artifact_count": len(entries),
+        "roles": [entry.role for entry in manifest.artifacts],
+        "verified": verified["verified"],
+    }
+
+
+def verify_json_bundle(bundle_dir: Path) -> dict[str, Any]:
+    """Re-read and hash every manifest-bound artifact without following links."""
+
+    manifest_path = bundle_dir / MANIFEST_FILENAME
+    if bundle_dir.is_symlink() or manifest_path.is_symlink():
+        raise InvalidManifestError("attempt artifact bundle identity is unsafe")
+    try:
+        raw_manifest = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InvalidManifestError("attempt artifact manifest is unavailable") from exc
+    manifest = parse_manifest_json(raw_manifest)
+    observed_roles: set[str] = set()
+    for entry in manifest.artifacts:
+        artifact_path = bundle_dir / entry.path
+        if artifact_path.parent != bundle_dir or artifact_path.is_symlink():
+            raise InvalidArtifactError("artifact path escaped or became a symlink")
+        try:
+            data = artifact_path.read_bytes()
+        except OSError as exc:
+            raise InvalidArtifactError(
+                f"artifact is unavailable for role {entry.role!r}"
+            ) from exc
+        if len(data) != entry.byte_count:
+            raise InvalidArtifactError(
+                f"artifact byte count mismatch for role {entry.role!r}"
+            )
+        if hashlib.sha256(data).hexdigest() != entry.sha256:
+            raise InvalidArtifactError(
+                f"artifact digest mismatch for role {entry.role!r}"
+            )
+        observed_roles.add(entry.role)
+    missing = REQUIRED_BUNDLE_ROLES - observed_roles
+    if missing:
+        raise InvalidManifestError(
+            f"manifest omits required roles: {sorted(missing)!r}"
+        )
+    return {
+        "schema_id": "aiworkhub.attempt_artifact_bundle_verification.v1",
+        "attempt_id": manifest.attempt_id,
+        "artifact_count": len(manifest.artifacts),
+        "roles": sorted(observed_roles),
+        "verified": True,
+    }

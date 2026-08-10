@@ -60,6 +60,17 @@ A matched, uncapped, multi-task benchmark partitioned by task family and risk,
 recording provider input/output tokens, cost, elapsed time, retries,
 validation, and manager acceptance.
 
+**Implemented local advisory foundation (2026-08-10)**
+
+- The cost ledger now computes a single-model, single-route, matched-decision
+  cost per accepted outcome and fails closed as `UNKNOWN` or `UNMEASURED`.
+- Workforce ranking exposes a deterministic economic advisory while preserving
+  the pre-existing capability/quality/cost selection result.
+- Unknown cost never ranks as free; mixed-model tasks are excluded from model
+  attribution; reviewer cost is not assigned to the worker model.
+- Advisory-to-shadow/canary promotion remains disabled pending the required
+  matched, uncapped, family-and-risk parity evidence above.
+
 ### P0 — Meaningful research-output validation
 
 The current research gate accepted a literal `"..."` as meaningful output.
@@ -92,6 +103,18 @@ and accepted-outcome benchmarks exist.
 Measure wall-clock time, total attempts, collisions, retries, and accepted
 outcomes against the same tasks executed sequentially. No throughput
 multiplier is claimed today.
+
+**Implemented advisory foundation (2026-08-10)**
+
+- `aiworkhub_manager_task_decomposition_preview` accepts only a canonical,
+  hash-verified Source Graph `impact`/`deps` receipt from the active repo.
+- Every child has bounded task identity, objective, write/output scope,
+  dependency edges and exact evidence refs present in that receipt.
+- Cycles, external dependencies, unverified refs and cross-child write
+  collisions fail closed.
+- The result is a deterministic proposal digest with
+  `manager_approval_required=true`; it never creates, claims or launches a
+  task. Automatic spawning remains deferred pending the matched benchmark.
 
 ### P1 — Diagnostic delta-rework loop
 
@@ -126,7 +149,9 @@ fixture; it is not a provider-token claim.
 
 **Gaps**
 
-- Natural-language retrieval quality has too little golden-query evidence.
+- The checked retrieval corpus now covers ten non-empty cases and enforces
+  recall@k, MRR and success@k minimums, but accepted-task outcome coverage is
+  still zero and broad free-form query coverage remains small.
 - Freshness should be event-triggered where safe and retain a deterministic
   fallback refresh.
 - Vector retrieval has no measured marginal benefit over current structural
@@ -134,10 +159,12 @@ fixture; it is not a provider-token claim.
 
 **Next step**
 
-First expand the checked retrieval corpus and measure precision@k, recall@k,
-MRR, bytes returned, latency, and accepted-task outcomes. Only then evaluate a
-small local vector candidate in an A/B lane. Do not add embeddings or publish
-quality targets before that comparison.
+Continue adding task-derived checked queries and bind retrieval receipts to
+manager-accepted outcomes. The evaluator already records precision@k,
+recall@k, MRR, success@k, returned bytes and latency, but those structural
+measurements are not causal product savings. Only after accepted-outcome
+coverage exists should a small local vector candidate enter a matched A/B
+lane. Do not add embeddings or claim vector benefit before that comparison.
 
 ### P2 — Optional OCI worker sandbox
 

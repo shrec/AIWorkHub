@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 from aiworkhub import context_writes, storage_registry, task_store
@@ -107,3 +108,93 @@ def test_session_current_state_same_topic_rows_are_current_with_provenance(
     assert {item["source"] for item in payload["evidence"]} == {"aiworkhub"}
     assert {item["speaker"] for item in payload["evidence"]} == {"manager"}
     assert all(":thread-topic:target-topic" in item["source_id"] for item in payload["evidence"])
+
+
+def test_session_current_state_replays_hash_reference_within_same_session(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    context_writes.session_write(
+        repo,
+        actor=_actor(),
+        action="checkpoint",
+        topic="target-topic",
+        content="durable evidence that is long enough to make a delta useful " * 8,
+        idempotency_key="session:delta:same:0001",
+        provenance="session delta regression",
+    )
+    ctx = _ctx(repo, "target-topic")
+
+    first = worker_tools.session_current_state(ctx, limit=5)
+    second = worker_tools.session_current_state(ctx, limit=5)
+    receipt = json.loads(second["content"])
+
+    assert first["delta_receipt"] is False
+    assert second["delta_receipt"] is True
+    assert second["cache_hit"] is True
+    assert second["unchanged_reference"] is True
+    assert second["content_sha256"] == first["content_sha256"]
+    assert second["replay_bytes_avoided"] > 0
+    assert second["bytes"] < first["bytes"]
+    assert receipt["schema_id"] == "aiworkhub.session_context_delta.v1"
+    assert receipt["unchanged"] is True
+    assert receipt["added_or_changed"] == []
+    assert receipt["canonical_audit_retained"] is True
+    assert second["provider_token_savings_measured"] is False
+
+
+def test_session_current_state_returns_only_changed_rows_within_session(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    ctx = _ctx(repo, "target-topic")
+    context_writes.session_write(
+        repo,
+        actor=_actor(),
+        action="checkpoint",
+        topic="target-topic",
+        content="first durable evidence " * 10,
+        idempotency_key="session:delta:changed:0001",
+        provenance="session delta regression",
+    )
+    first = worker_tools.session_current_state(ctx, limit=5)
+    context_writes.session_write(
+        repo,
+        actor=_actor(),
+        action="checkpoint",
+        topic="target-topic",
+        content="second durable evidence " * 10,
+        idempotency_key="session:delta:changed:0002",
+        provenance="session delta regression",
+    )
+
+    second = worker_tools.session_current_state(ctx, limit=5)
+    delta = json.loads(second["content"])
+
+    assert second["delta_receipt"] is True
+    assert second["unchanged_reference"] is False
+    assert second["base_content_sha256"] == first["content_sha256"]
+    assert second["content_sha256"] != first["content_sha256"]
+    assert len(delta["added_or_changed"]) == 1
+    assert "second durable evidence" in delta["added_or_changed"][0]["snippet"]
+
+
+def test_session_delta_does_not_cross_request_identity(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    context_writes.session_write(
+        repo,
+        actor=_actor(),
+        action="checkpoint",
+        topic="target-topic",
+        content="request isolated durable evidence " * 10,
+        idempotency_key="session:delta:request:0001",
+        provenance="session delta regression",
+    )
+    first_ctx = _ctx(repo, "target-topic")
+    other_ctx = replace(first_ctx, request_id="different-request")
+
+    worker_tools.session_current_state(first_ctx, limit=5)
+    other = worker_tools.session_current_state(other_ctx, limit=5)
+
+    assert other["delta_receipt"] is False
+    assert json.loads(other["content"])["evidence_count"] == 1

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import json
 import ast
 import fnmatch
+import importlib.util
+import json
+import math
 import os
 import shutil
 import stat
@@ -13,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
-from . import eval_artifact_gate, known_bug_scanner
+from . import eval_artifact_gate, evidence_levels, known_bug_scanner
 
 # ---------------------------------------------------------------------------
 # 0.6.30 Quality Evidence Engine foundation.
@@ -29,6 +31,7 @@ from . import eval_artifact_gate, known_bug_scanner
 
 SCHEMA_ID = "aiworkhub.quality_evidence.v1"
 VERDICT_SCHEMA_ID = "aiworkhub.quality_verdict.v2"
+BEHAVIORAL_GATE_SCHEMA_ID = "aiworkhub.behavioral_quality_gate.v1"
 
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
@@ -60,6 +63,67 @@ VALID_SEVERITIES = frozenset(
     {SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 )
 BLOCKING_SEVERITIES = frozenset({SEVERITY_CRITICAL, SEVERITY_HIGH})
+FINDING_DISPOSITION_DEFECT = "defect"
+FINDING_DISPOSITION_OBSERVATION = "observation"
+FINDING_DISPOSITION_PROCESS_LIMIT = "process_limit"
+VALID_FINDING_DISPOSITIONS = frozenset({
+    FINDING_DISPOSITION_DEFECT,
+    FINDING_DISPOSITION_OBSERVATION,
+    FINDING_DISPOSITION_PROCESS_LIMIT,
+})
+
+WORK_KIND_GENERIC = "generic"
+WORK_KIND_BUGFIX = "bugfix"
+WORK_KIND_REFACTOR = "refactor"
+WORK_KIND_PERFORMANCE = "performance"
+WORK_KIND_SECURITY = "security"
+WORK_KIND_DATA_ML = "data_ml"
+WORK_KINDS = (
+    WORK_KIND_GENERIC,
+    WORK_KIND_BUGFIX,
+    WORK_KIND_REFACTOR,
+    WORK_KIND_PERFORMANCE,
+    WORK_KIND_SECURITY,
+    WORK_KIND_DATA_ML,
+)
+
+VALIDATION_ROLE_GENERIC = "generic"
+VALIDATION_ROLE_REPRODUCTION = "reproduction"
+VALIDATION_ROLE_REGRESSION = "regression"
+VALIDATION_ROLE_PARITY = "parity"
+VALIDATION_ROLE_BASELINE = "baseline"
+VALIDATION_ROLE_DELTA = "delta"
+VALIDATION_ROLE_NEGATIVE_FIXTURE = "negative_fixture"
+VALIDATION_ROLE_SCHEMA = "schema"
+VALIDATION_ROLE_DISTRIBUTION = "distribution"
+VALIDATION_ROLES = (
+    VALIDATION_ROLE_GENERIC,
+    VALIDATION_ROLE_REPRODUCTION,
+    VALIDATION_ROLE_REGRESSION,
+    VALIDATION_ROLE_PARITY,
+    VALIDATION_ROLE_BASELINE,
+    VALIDATION_ROLE_DELTA,
+    VALIDATION_ROLE_NEGATIVE_FIXTURE,
+    VALIDATION_ROLE_SCHEMA,
+    VALIDATION_ROLE_DISTRIBUTION,
+)
+_REQUIRED_BEHAVIORAL_ROLES: dict[str, tuple[str, ...]] = {
+    WORK_KIND_BUGFIX: (
+        VALIDATION_ROLE_REPRODUCTION,
+        VALIDATION_ROLE_REGRESSION,
+    ),
+    WORK_KIND_REFACTOR: (VALIDATION_ROLE_PARITY,),
+    WORK_KIND_PERFORMANCE: (
+        VALIDATION_ROLE_BASELINE,
+        VALIDATION_ROLE_DELTA,
+    ),
+    WORK_KIND_SECURITY: (VALIDATION_ROLE_NEGATIVE_FIXTURE,),
+    WORK_KIND_DATA_ML: (
+        VALIDATION_ROLE_SCHEMA,
+        VALIDATION_ROLE_DISTRIBUTION,
+    ),
+}
+_PERFORMANCE_METRIC_PREFIX = "AIWORKHUB_METRIC:"
 
 RISK_LOW = "low"
 RISK_MEDIUM = "medium"
@@ -85,6 +149,263 @@ _SOURCE_CODE_SUFFIXES = frozenset({
     ".jsx", ".kt", ".php", ".py", ".pyi", ".rb", ".rs", ".swift",
     ".ts", ".tsx",
 })
+
+
+def normalize_behavioral_contract(
+    work_kind: Any,
+    validation_commands: Iterable[Any],
+    validation_roles: Iterable[Any] | None,
+) -> tuple[str, list[str]]:
+    """Validate the manager-declared behavioral evidence contract.
+
+    The task title, objective, and worker prose are deliberately ignored.
+    Specialized work must declare exact evidence roles aligned one-to-one
+    with the already-authorized validation commands.  This lets task creation
+    fail before provider spend and keeps the eventual completion verdict tied
+    to deterministic command receipts rather than a model's self-assessment.
+    """
+
+    kind = str(work_kind or WORK_KIND_GENERIC).strip().lower()
+    if kind not in WORK_KINDS:
+        raise ValueError("invalid_work_kind")
+    commands = list(validation_commands)
+    raw_roles = [] if validation_roles is None else list(validation_roles)
+    if not raw_roles:
+        roles = [VALIDATION_ROLE_GENERIC for _ in commands]
+    else:
+        if len(raw_roles) != len(commands):
+            raise ValueError("validation_roles_length_mismatch")
+        roles = []
+        for value in raw_roles:
+            role = str(value or "").strip().lower()
+            if role not in VALIDATION_ROLES:
+                raise ValueError("invalid_validation_role")
+            roles.append(role)
+    required = _REQUIRED_BEHAVIORAL_ROLES.get(kind, ())
+    missing = [role for role in required if role not in roles]
+    if missing:
+        raise ValueError("behavioral_validation_roles_missing:" + ",".join(missing))
+    return kind, roles
+
+
+def _validation_receipt_passed(receipt: Mapping[str, Any]) -> bool:
+    return (
+        receipt.get("timed_out") is not True
+        and receipt.get("returncode") == 0
+    )
+
+
+def _performance_metric(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract one bounded machine-readable metric from validation stdout."""
+
+    if receipt.get("stdout_truncated"):
+        raise ValueError("performance_metric_stdout_truncated")
+    head = str(receipt.get("stdout_head") or "")
+    tail = str(receipt.get("stdout_tail") or "")
+    text = head if head == tail else head + "\n" + tail
+    candidates = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith(_PERFORMANCE_METRIC_PREFIX):
+            candidates.append(line[len(_PERFORMANCE_METRIC_PREFIX):].strip())
+    if len(candidates) != 1 or len(candidates[0].encode("utf-8")) > 2048:
+        raise ValueError("performance_metric_receipt_invalid")
+    try:
+        payload = json.loads(candidates[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError("performance_metric_json_invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("performance_metric_object_required")
+    metric = str(payload.get("metric") or "").strip()
+    unit = str(payload.get("unit") or "").strip()
+    value = payload.get("value")
+    if not metric or len(metric.encode("utf-8")) > 128:
+        raise ValueError("performance_metric_name_invalid")
+    if not unit or len(unit.encode("utf-8")) > 64:
+        raise ValueError("performance_metric_unit_invalid")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("performance_metric_value_invalid")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError("performance_metric_value_invalid")
+    return {**payload, "metric": metric, "unit": unit, "value": numeric}
+
+
+def evaluate_behavioral_gate(
+    authority: Mapping[str, Any],
+    validation_receipts: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate task-type behavior from observed validation receipts.
+
+    Generic work remains backward compatible. Specialized work fails closed
+    on missing, failed, duplicated, or malformed role evidence. Performance
+    work additionally requires two numeric, same-metric receipts and computes
+    the direction/threshold verdict itself.
+    """
+
+    commands = list(authority.get("validation") or [])
+    try:
+        kind, declared_roles = normalize_behavioral_contract(
+            authority.get("work_kind"),
+            commands,
+            authority.get("validation_roles"),
+        )
+    except ValueError as exc:
+        return {
+            "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+            "applicable": True,
+            "passed": False,
+            "work_kind": str(authority.get("work_kind") or WORK_KIND_GENERIC),
+            "reason": str(exc),
+            "required_roles": [],
+            "observed_roles": [],
+            "checks": [],
+        }
+    receipts = [dict(row) for row in validation_receipts]
+    if len(receipts) != len(commands):
+        applicable = kind != WORK_KIND_GENERIC
+        return {
+            "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+            "applicable": applicable,
+            "passed": False if applicable else None,
+            "work_kind": kind,
+            "reason": "behavioral_validation_receipt_count_mismatch",
+            "required_roles": list(_REQUIRED_BEHAVIORAL_ROLES.get(kind, ())),
+            "observed_roles": [],
+            "checks": [],
+        }
+
+    checks: list[dict[str, Any]] = []
+    by_role: dict[str, list[dict[str, Any]]] = {}
+    for index, (command, role, receipt) in enumerate(
+        zip(commands, declared_roles, receipts, strict=True)
+    ):
+        observed_role = str(receipt.get("behavioral_role") or role).strip().lower()
+        command_matches = str(receipt.get("declared_command") or receipt.get("command") or "") == str(command)
+        passed = (
+            observed_role == role
+            and command_matches
+            and _validation_receipt_passed(receipt)
+        )
+        check = {
+            "index": index,
+            "role": role,
+            "command": str(command),
+            "passed": passed,
+            "returncode": receipt.get("returncode"),
+            "timed_out": bool(receipt.get("timed_out")),
+        }
+        checks.append(check)
+        by_role.setdefault(role, []).append(receipt)
+
+    applicable = kind != WORK_KIND_GENERIC
+    required = list(_REQUIRED_BEHAVIORAL_ROLES.get(kind, ()))
+    if not applicable:
+        return {
+            "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+            "applicable": False,
+            "passed": None,
+            "work_kind": kind,
+            "reason": "generic_work_kind",
+            "required_roles": [],
+            "observed_roles": sorted(by_role),
+            "checks": checks,
+        }
+    missing = [role for role in required if role not in by_role]
+    failed = [check["role"] for check in checks if not check["passed"]]
+    if missing or failed:
+        reason = (
+            "behavioral_evidence_missing:" + ",".join(missing)
+            if missing
+            else "behavioral_evidence_failed:" + ",".join(sorted(set(failed)))
+        )
+        return {
+            "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+            "applicable": True,
+            "passed": False,
+            "work_kind": kind,
+            "reason": reason,
+            "required_roles": required,
+            "observed_roles": sorted(by_role),
+            "checks": checks,
+        }
+
+    measurements: dict[str, Any] | None = None
+    if kind == WORK_KIND_PERFORMANCE:
+        if len(by_role[VALIDATION_ROLE_BASELINE]) != 1 or len(by_role[VALIDATION_ROLE_DELTA]) != 1:
+            return {
+                "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+                "applicable": True,
+                "passed": False,
+                "work_kind": kind,
+                "reason": "performance_metric_role_duplicate",
+                "required_roles": required,
+                "observed_roles": sorted(by_role),
+                "checks": checks,
+            }
+        try:
+            baseline = _performance_metric(by_role[VALIDATION_ROLE_BASELINE][0])
+            candidate = _performance_metric(by_role[VALIDATION_ROLE_DELTA][0])
+            if baseline["metric"] != candidate["metric"] or baseline["unit"] != candidate["unit"]:
+                raise ValueError("performance_metric_identity_mismatch")
+            direction = str(candidate.get("direction") or "").strip().lower()
+            if direction not in {"lower", "higher"}:
+                raise ValueError("performance_metric_direction_invalid")
+            tolerance = candidate.get("max_regression_percent", 0)
+            if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+                raise ValueError("performance_metric_tolerance_invalid")
+            tolerance = float(tolerance)
+            if not math.isfinite(tolerance) or not 0 <= tolerance <= 100:
+                raise ValueError("performance_metric_tolerance_invalid")
+            baseline_value = float(baseline["value"])
+            candidate_value = float(candidate["value"])
+            threshold = (
+                baseline_value * (1 + tolerance / 100)
+                if direction == "lower"
+                else baseline_value * (1 - tolerance / 100)
+            )
+            metric_passed = (
+                candidate_value <= threshold
+                if direction == "lower"
+                else candidate_value >= threshold
+            )
+            measurements = {
+                "metric": baseline["metric"],
+                "unit": baseline["unit"],
+                "baseline": baseline_value,
+                "candidate": candidate_value,
+                "direction": direction,
+                "max_regression_percent": tolerance,
+                "threshold": threshold,
+            }
+            if not metric_passed:
+                raise ValueError("performance_regression_exceeds_threshold")
+        except ValueError as exc:
+            return {
+                "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+                "applicable": True,
+                "passed": False,
+                "work_kind": kind,
+                "reason": str(exc),
+                "required_roles": required,
+                "observed_roles": sorted(by_role),
+                "checks": checks,
+                "measurements": measurements,
+            }
+
+    result = {
+        "schema_id": BEHAVIORAL_GATE_SCHEMA_ID,
+        "applicable": True,
+        "passed": True,
+        "work_kind": kind,
+        "reason": "",
+        "required_roles": required,
+        "observed_roles": sorted(by_role),
+        "checks": checks,
+    }
+    if measurements is not None:
+        result["measurements"] = measurements
+    return result
 
 
 def derive_risk_signals(
@@ -282,6 +603,8 @@ class EvidenceCheck:
     kind: str
     status: str
     command: tuple[str, ...] = field(default_factory=tuple)
+    executed_command: tuple[str, ...] = field(default_factory=tuple)
+    command_resolution: str = "declared"
     duration_seconds: float = 0.0
     affected_paths: tuple[str, ...] = field(default_factory=tuple)
     summary: str = ""
@@ -300,6 +623,11 @@ class EvidenceCheck:
             "status": self.status,
             "command": list(self.command),
             "command_identity": " ".join(self.command) if self.command else "",
+            "executed_command": list(self.executed_command),
+            "executed_command_identity": (
+                " ".join(self.executed_command) if self.executed_command else ""
+            ),
+            "command_resolution": self.command_resolution,
             "duration_seconds": round(self.duration_seconds, 6),
             "affected_paths": list(self.affected_paths[:MAX_AFFECTED_PATHS]),
             "summary": self.summary[:MAX_SUMMARY_CHARS],
@@ -401,7 +729,7 @@ def normalize_reviewer_reports(
         if not isinstance(findings, list) or len(findings) > MAX_REVIEW_FINDINGS:
             errors.append(f"reviewer_schema:{index}:findings_invalid")
             continue
-        clean_findings: list[dict[str, str]] = []
+        clean_findings: list[dict[str, Any]] = []
         malformed = False
         for finding_index, finding in enumerate(findings):
             if not isinstance(finding, Mapping):
@@ -412,6 +740,9 @@ def normalize_reviewer_reports(
             finding_id = finding.get("id")
             summary = finding.get("summary")
             evidence = finding.get("evidence")
+            disposition = finding.get(
+                "disposition", FINDING_DISPOSITION_DEFECT
+            )
             if severity not in VALID_SEVERITIES:
                 errors.append(f"reviewer_schema:{index}:{finding_index}:invalid_severity")
                 malformed = True
@@ -428,14 +759,83 @@ def normalize_reviewer_reports(
                 errors.append(f"reviewer_schema:{index}:{finding_index}:evidence_missing")
                 malformed = True
                 continue
-            clean_findings.append(
-                {
-                    "id": finding_id[:200],
-                    "severity": str(severity),
-                    "summary": summary[:MAX_SUMMARY_CHARS],
-                    "evidence": evidence[:MAX_SUMMARY_CHARS],
-                }
+            if disposition not in VALID_FINDING_DISPOSITIONS:
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:invalid_disposition"
+                )
+                malformed = True
+                continue
+            if (
+                disposition != FINDING_DISPOSITION_DEFECT
+                and severity != SEVERITY_LOW
+            ):
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:"
+                    "nondefect_severity_must_be_low"
+                )
+                malformed = True
+                continue
+            normalized_finding: dict[str, Any] = {
+                "id": finding_id[:200],
+                "severity": str(severity),
+                "disposition": str(disposition),
+                "actionable": disposition == FINDING_DISPOSITION_DEFECT,
+                "summary": summary[:MAX_SUMMARY_CHARS],
+                "evidence": evidence[:MAX_SUMMARY_CHARS],
+            }
+            structured_text = (
+                "confidence",
+                "evidence_level",
+                "symbol",
+                "claim",
+                "reproduction",
+                "required_validation",
             )
+            invalid_structured = False
+            for field_name in structured_text:
+                if field_name not in finding:
+                    continue
+                field_value = finding.get(field_name)
+                if not isinstance(field_value, str):
+                    errors.append(
+                        f"reviewer_schema:{index}:{finding_index}:"
+                        f"{field_name}_invalid"
+                    )
+                    malformed = True
+                    invalid_structured = True
+                    break
+                normalized_finding[field_name] = field_value[:MAX_SUMMARY_CHARS]
+            if invalid_structured:
+                continue
+            if "confidence" in normalized_finding and normalized_finding[
+                "confidence"
+            ] not in {"low", "medium", "high"}:
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:confidence_invalid"
+                )
+                malformed = True
+                continue
+            if "evidence_level" in normalized_finding and normalized_finding[
+                "evidence_level"
+            ] not in {level.name.lower() for level in evidence_levels.EvidenceLevel}:
+                errors.append(
+                    f"reviewer_schema:{index}:{finding_index}:evidence_level_invalid"
+                )
+                malformed = True
+                continue
+            evidence_reference = finding.get("evidence_reference")
+            if evidence_reference is not None:
+                if not isinstance(evidence_reference, Mapping) or str(
+                    evidence_reference.get("kind") or ""
+                ) not in {"source", "test_target", "check"}:
+                    errors.append(
+                        f"reviewer_schema:{index}:{finding_index}:"
+                        "evidence_reference_invalid"
+                    )
+                    malformed = True
+                    continue
+                normalized_finding["evidence_reference"] = dict(evidence_reference)
+            clean_findings.append(normalized_finding)
         if malformed:
             continue
         normalized.append(
@@ -475,8 +875,14 @@ def fold_quality_verdict(
     if any(lens not in JUDGMENT_LENSES for lens in required_lenses):
         raise MalformedConfigError("risk profile contains invalid reviewer lens")
 
-    lens_rows = {
-        lens: {"lens": lens, "status": STATUS_SKIPPED, "evidence_ids": [], "finding_ids": []}
+    lens_rows: dict[str, dict[str, Any]] = {
+        lens: {
+            "lens": lens,
+            "status": STATUS_SKIPPED,
+            "evidence_ids": [],
+            "finding_ids": [],
+            "observation_ids": [],
+        }
         for lens in QUALITY_LENSES
     }
     blockers: list[str] = []
@@ -511,6 +917,9 @@ def fold_quality_verdict(
             row["status"] = STATUS_PASSED
         for finding in report["findings"]:
             finding_id = f"reviewer:{lens}:{finding['id']}"
+            if finding["actionable"] is not True:
+                row["observation_ids"].append(finding_id)
+                continue
             row["finding_ids"].append(finding_id)
             if finding["severity"] in BLOCKING_SEVERITIES:
                 blockers.append(finding_id)
@@ -928,10 +1337,30 @@ def _run_command_array(
     *,
     cwd: Path,
     timeout_seconds: int,
+    execution_receipt: dict[str, Any] | None = None,
 ) -> tuple[str, str, str, float]:
     """Run one exact argv array, shell=False. Returns (status, stdout, stderr, duration)."""
 
-    argv = [sys.executable if part == "{python}" else part for part in command]
+    declared_argv = list(command)
+    argv = [sys.executable if part == "{python}" else part for part in declared_argv]
+    resolution = "declared"
+    if (
+        len(declared_argv) >= 3
+        and declared_argv[0] == "{python}"
+        and declared_argv[1] == "-m"
+        and declared_argv[2] in {"mypy", "ruff"}
+        and importlib.util.find_spec(declared_argv[2]) is None
+    ):
+        # The MCP runtime may intentionally use a minimal system interpreter
+        # while repository quality tools are installed as trusted PATH
+        # entrypoints. Preserve the declared semantic command, but execute the
+        # exact installed CLI when that interpreter cannot import the module.
+        # The allowlist prevents an arbitrary ``-m`` name from becoming a PATH
+        # lookup, and Windows still passes through the native-executable guard.
+        module_entrypoint = _which(declared_argv[2])
+        if module_entrypoint is not None:
+            argv = [module_entrypoint, *declared_argv[3:]]
+            resolution = "python_module_path_entrypoint"
     if os.name == "nt" and argv and argv[0] in {"python", "python3"}:
         # Repository quality manifests are shared across hosts. Windows does
         # not consistently install the POSIX ``python3`` launcher alias, so
@@ -948,6 +1377,14 @@ def _run_command_array(
                 time.monotonic() - start,
             )
         argv = native_argv
+    if execution_receipt is not None:
+        execution_receipt.update(
+            {
+                "declared_command": declared_argv,
+                "executed_command": list(argv),
+                "command_resolution": resolution,
+            }
+        )
     try:
         completed = subprocess.run(
             argv,
@@ -1044,8 +1481,12 @@ def run_declared_checks(
                 provenance=f"repo_config:{CONFIG_RELATIVE_PATH}:applicability",
             ))
             continue
+        execution_receipt: dict[str, Any] = {}
         status, stdout, stderr, duration = _run_command_array(
-            command, cwd=root, timeout_seconds=timeout_seconds
+            command,
+            cwd=root,
+            timeout_seconds=timeout_seconds,
+            execution_receipt=execution_receipt,
         )
         summary = (stdout or "") + (("\n" + stderr) if stderr else "")
         results.append(
@@ -1054,6 +1495,10 @@ def run_declared_checks(
                 kind=kind,
                 status=status,
                 command=command,
+                executed_command=tuple(execution_receipt.get("executed_command") or ()),
+                command_resolution=str(
+                    execution_receipt.get("command_resolution") or "declared"
+                ),
                 duration_seconds=duration,
                 affected_paths=affected,
                 summary=summary.strip(),
@@ -1274,6 +1719,8 @@ def run_builtin_static_checks(
             "findings": bug_report["findings"][:20], "truncated": bug_report["truncated"],
             "evidence_summary": bug_report["evidence_summary"],
             "dedupe_summary": bug_report["dedupe_summary"],
+            "source_revision_sha256": bug_report["source_revision_sha256"],
+            "source_revision_scope": bug_report["source_revision_scope"],
         }, sort_keys=True)[:MAX_SUMMARY_CHARS],
         provenance="builtin:diff_scoped_known_bug_registry.v1",
         error="" if bug_report["passed"] else "high_confidence_known_bug_pattern",

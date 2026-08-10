@@ -597,6 +597,80 @@ def test_posix_declared_command_keeps_executable_token(tmp_path, monkeypatch) ->
     assert observed["kwargs"]["shell"] is False
 
 
+@pytest.mark.parametrize("module", ["ruff", "mypy"])
+def test_python_quality_module_uses_path_entrypoint_when_runtime_lacks_module(
+    tmp_path, monkeypatch, module
+) -> None:
+    entrypoint = tmp_path / module
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+    observed: dict[str, object] = {}
+    receipt: dict[str, object] = {}
+
+    monkeypatch.setattr(quality_evidence, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(
+        quality_evidence.importlib.util,
+        "find_spec",
+        lambda name: None if name == module else object(),
+    )
+    monkeypatch.setattr(
+        quality_evidence,
+        "_which",
+        lambda name: str(entrypoint) if name == module else None,
+    )
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    monkeypatch.setattr(quality_evidence.subprocess, "run", fake_run)
+
+    status, _stdout, _stderr, _duration = quality_evidence._run_command_array(
+        ("{python}", "-m", module, "check", "."),
+        cwd=tmp_path,
+        timeout_seconds=10,
+        execution_receipt=receipt,
+    )
+
+    assert status == "passed"
+    assert observed["argv"] == [str(entrypoint), "check", "."]
+    assert observed["kwargs"]["shell"] is False
+    assert receipt == {
+        "declared_command": ["{python}", "-m", module, "check", "."],
+        "executed_command": [str(entrypoint), "check", "."],
+        "command_resolution": "python_module_path_entrypoint",
+    }
+
+
+def test_python_module_path_fallback_is_allowlisted(tmp_path, monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(quality_evidence, "os", SimpleNamespace(name="posix"))
+
+    def unexpected_which(executable: str) -> str | None:
+        raise AssertionError(f"untrusted module unexpectedly resolved: {executable}")
+
+    def fake_run(argv, **_kwargs):
+        observed["argv"] = argv
+        return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+
+    monkeypatch.setattr(quality_evidence, "_which", unexpected_which)
+    monkeypatch.setattr(quality_evidence.subprocess, "run", fake_run)
+
+    status, _stdout, _stderr, _duration = quality_evidence._run_command_array(
+        ("{python}", "-m", "untrusted_quality_module"),
+        cwd=tmp_path,
+        timeout_seconds=10,
+    )
+
+    assert status == "failed"
+    assert observed["argv"] == [
+        quality_evidence.sys.executable,
+        "-m",
+        "untrusted_quality_module",
+    ]
+
+
 def test_completion_quality_gate_accepts_codeql_like_static_analysis_kind(tmp_path) -> None:
     config = tmp_path / ".aiworkhub" / "quality.json"
     config.parent.mkdir()

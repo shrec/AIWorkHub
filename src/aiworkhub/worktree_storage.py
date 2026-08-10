@@ -3,8 +3,9 @@
 Background
 ----------
 AIWorkHub isolates each task in a git worktree under
-``configured_worktree_root()`` (``$AIWORKHUB_WORKTREE_ROOT`` or
-``$TMPDIR/aiworkhub-worktrees``), laid out as
+``configured_worktree_root()`` (``$AIWORKHUB_WORKTREE_ROOT``,
+``$AIWORKHUB_RUNTIME_ROOT/worktrees``, or the repository-local
+``.aiworkhub/runtime/worktrees``), laid out as
 ``<root>/<request_id>/{worktree,home}``, and RETAINS it while the task is in
 review (B914) so the reviewer can inspect the exact validated state. The
 finalized-workspace GC (``process_launcher._gc_finalized_workspaces``) reclaims
@@ -157,7 +158,7 @@ def scan_worktree_registrations(
     """
 
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     rc, raw = _git(root, "worktree", "list", "--porcelain", "-z")
     if rc != 0:
         return {
@@ -278,7 +279,7 @@ def scan_worktrees(
     mutates nothing. ``with_sizes=False`` skips the (potentially slow) disk-usage
     walk for a fast listing.
     """
-    base = (base or configured_worktree_root()).resolve()
+    base = (base or configured_worktree_root(repo_root)).resolve()
     repo_common_dir = _git_common_dir(Path(repo_root).resolve()) if repo_root else ""
     worktrees: list[dict[str, Any]] = []
     if base.is_dir():

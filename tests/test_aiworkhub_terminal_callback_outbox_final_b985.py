@@ -5,6 +5,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -69,6 +71,58 @@ def test_legacy_callback_required_false_still_enqueues_terminal_review(tmp_path:
     assert rows[0]["transition"] == "validation_failed"
     card = task_store.get_task(repo, "TASK_B985")
     assert card["terminal_review"]["evidence"]["transient_error"] is True
+
+
+def test_terminal_review_and_callback_roll_back_together_on_outbox_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path, callback_required=True)
+
+    def fail_outbox(*_args: object, **_kwargs: object) -> bool:
+        raise sqlite3.OperationalError("injected callback write failure")
+
+    monkeypatch.setattr(task_store, "_enqueue_terminal_callback_row", fail_outbox)
+    result = task_engine.mark_terminal_review(
+        repo,
+        "TASK_B985",
+        "codex_b985",
+        "review_ready",
+        evidence={"request_id": "req-atomic-b985"},
+    )
+
+    assert result["ok"] is False
+    assert "injected callback write failure" in result["stderr"]
+    card = task_store.get_task(repo, "TASK_B985")
+    assert card is not None
+    assert card["status"] == "processing"
+    assert card["worker_status"] == "claimed"
+    assert "terminal_review" not in card
+    assert task_store.get_task_events(repo, "TASK_B985") == []
+    assert _rows(repo) == []
+
+
+def test_terminal_review_state_event_and_callback_share_one_commit(tmp_path: Path) -> None:
+    repo = _repo(tmp_path, callback_required=True, episode=7)
+    result = task_engine.mark_terminal_review(
+        repo,
+        "TASK_B985",
+        "codex_b985",
+        "validation_failed",
+        evidence={"request_id": "req-atomic-commit"},
+    )
+
+    assert result["ok"] is True
+    assert result["callback_enqueued"] is True
+    rows = _rows(repo)
+    assert len(rows) == 1
+    assert rows[0]["provider"] == "codex"
+    assert rows[0]["episode_id"] == "7"
+    assert rows[0]["request_id"] == "req-atomic-commit"
+    events = task_store.get_task_events(repo, "TASK_B985")
+    assert {event["event"] for event in events} == {
+        "terminal_review",
+        "callback_enqueued",
+    }
 
 
 def test_unknown_terminal_state_is_rejected_from_outbox(tmp_path: Path) -> None:

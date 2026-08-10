@@ -169,6 +169,9 @@ def test_main_mcp_exposes_complete_manager_ai_tool_surface():
         "aiworkhub_manager_session_write",
         "aiworkhub_manager_ai_memory_write",
         "aiworkhub_manager_kb_write",
+        "aiworkhub_manager_learning_commit",
+        "aiworkhub_manager_needfix_markdown_preview",
+        "aiworkhub_manager_needfix_markdown_commit",
         "aiworkhub_manager_context_write_intents",
         "aiworkhub_manager_context_write_intent_dispose",
         "aiworkhub_manager_context_import",
@@ -524,6 +527,7 @@ def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
         allowed_writes=["research/context_default.json"],
         required_outputs=["research/context_default.json"],
         validation=["python3 -m json.tool research/context_default.json"],
+        risk_tier="high",
     )
     assert result["ok"] is True, result
     card = json.loads(result["stdout"])
@@ -538,9 +542,43 @@ def test_task_create_persists_required_project_context(tmp_path, monkeypatch):
     assert context["session"]["topic"] == "Strict task context"
     assert context["ai_memory"]["query"]
     assert context["kb"]["query"]
+    assert card["risk_tier"] == "high"
     stored = task_store.get_task(root, "TASK_CONTEXT_DEFAULT")
     assert stored is not None
     assert stored["project_context"] == context
+    assert stored["risk_tier"] == "high"
+
+
+def test_task_create_rejects_invalid_explicit_risk_tier(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert task_store.initialize_repository(root)["ok"]
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+    monkeypatch.setenv("AIWORKHUB_ALLOW_WRITES", "1")
+    monkeypatch.setattr(core, "_claude_manager_identity", lambda: None)
+    monkeypatch.setattr(core, "_codex_manager_identity", lambda: {
+        "provider": "codex",
+        "session_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+        "thread_id": "019f5097-6dbe-7172-870a-945afc5f3bfa",
+    })
+    monkeypatch.setattr(
+        core, "_verify_coordinator_capability", lambda runner: (True, "ok")
+    )
+
+    result = core.create_task(
+        task_id="TASK_INVALID_RISK",
+        title="Invalid risk",
+        runner="claude_invalid_risk",
+        topic="task_mcp",
+        objective="Reject invented risk categories.",
+        acceptance=["Rejected."],
+        allowed_writes=[],
+        read_only=True,
+        risk_tier="probably-safe",
+    )
+
+    assert result["ok"] is False
+    assert result["stderr"] == "invalid_risk_tier"
 
 
 def test_callback_origin_requires_real_uuid_not_window_alias():

@@ -1930,6 +1930,7 @@ def run_taskctl(
                 total_tokens=_int_value("--total-tokens", 0),
                 cached_input_tokens=_int_value("--cached-input-tokens", 0),
                 cache_creation_input_tokens=_int_value("--cache-creation-input-tokens", 0),
+                cache_write_input_tokens=_int_value("--cache-write-input-tokens", 0),
                 usage_observed=True if "--usage-observed" in args else None,
                 telemetry_reason=_value("--telemetry-reason", ""),
                 cache_metrics_observed="--cache-metrics-observed" in args,
@@ -3117,6 +3118,9 @@ def create_task(
     immutable_inputs: list[str] | None = None,
     read_only: bool = False,
     max_live_tokens: int | None = None,
+    work_kind: str = "generic",
+    validation_roles: list[str] | None = None,
+    risk_tier: str | None = None,
 ) -> dict[str, Any]:
     """Create one new canonical task card for the verified manager chat.
 
@@ -3151,6 +3155,12 @@ def create_task(
     objective = str(objective or "").strip()
     priority = str(priority or "normal").strip().lower()
     task_type = str(task_type or "code").strip().lower()
+    work_kind = str(work_kind or "generic").strip().lower()
+    risk_tier = (
+        str(risk_tier).strip().lower()
+        if risk_tier is not None
+        else None
+    )
     if not _TASK_ID_RE.fullmatch(task_id):
         return _lifecycle_error("invalid_task_id", 2)
     if not _TASK_IDENTITY_RE.fullmatch(runner) or not _TASK_IDENTITY_RE.fullmatch(topic):
@@ -3160,6 +3170,10 @@ def create_task(
         return _lifecycle_error("invalid_title_or_objective", 2)
     if priority not in ("low", "normal", "high", "critical"):
         return _lifecycle_error("invalid_priority", 2)
+    if risk_tier is not None and risk_tier not in (
+        "low", "medium", "high", "critical"
+    ):
+        return _lifecycle_error("invalid_risk_tier", 2)
     allowed_task_types = ("code", "data_classification", "research")
     if task_type not in allowed_task_types:
         result = _lifecycle_error("invalid_task_type", 2)
@@ -3203,6 +3217,9 @@ def create_task(
             "allow_unchanged_required_outputs",
         )
         validation2 = bounded_strings(validation or [], "validation")
+        validation_roles2 = bounded_strings(
+            validation_roles or [], "validation_roles"
+        )
         read_first2 = bounded_strings(read_first or [], "read_first")
         immutable_inputs2 = bounded_strings(immutable_inputs or [], "immutable_inputs")
     except ValueError as exc:
@@ -3223,6 +3240,21 @@ def create_task(
         return _lifecycle_error("required_outputs_invalid", 2)
     if task_type == "code" and (writes2 or outputs2) and not validation2:
         return _lifecycle_error("code_task_validation_required", 2)
+    from . import quality_evidence
+
+    try:
+        work_kind, validation_roles2 = quality_evidence.normalize_behavioral_contract(
+            work_kind,
+            validation2,
+            validation_roles2,
+        )
+    except ValueError as exc:
+        result = _lifecycle_error(str(exc), 2)
+        result["allowed_work_kinds"] = list(quality_evidence.WORK_KINDS)
+        result["allowed_validation_roles"] = list(
+            quality_evidence.VALIDATION_ROLES
+        )
+        return result
     # Parse every validation command before persisting the card.  The worker
     # uses this exact fail-closed parser later, so accepting syntax here that
     # can never reach execution only burns a provider run before ending in
@@ -3450,6 +3482,9 @@ def create_task(
         "read_first": read_first2,
         "immutable_inputs": immutable_inputs2,
         "validation": validation2,
+        "validation_roles": validation_roles2,
+        "work_kind": work_kind,
+        **({"risk_tier": risk_tier} if risk_tier is not None else {}),
         "depends_on": depends_on2,
         "token_budget": (
             {
@@ -3493,6 +3528,9 @@ def create_task(
         "allow_empty_required_outputs": allow_empty_outputs2,
         "allow_unchanged_required_outputs": allow_unchanged_outputs2,
         "validation": validation2,
+        "validation_roles": validation_roles2,
+        "work_kind": work_kind,
+        "risk_tier": risk_tier,
         "priority": priority,
         "task_type": task_type,
         "depends_on": depends_on2,
@@ -3528,6 +3566,18 @@ def create_task(
                 existing_card.get("allow_unchanged_required_outputs") or []
             ),
             "validation": existing_card.get("validation") or [],
+            "validation_roles": existing_card.get("validation_roles") or [
+                quality_evidence.VALIDATION_ROLE_GENERIC
+                for _ in (existing_card.get("validation") or [])
+            ],
+            "work_kind": str(
+                existing_card.get("work_kind")
+                or quality_evidence.WORK_KIND_GENERIC
+            ),
+            "risk_tier": (
+                str(existing_card.get("risk_tier") or "").strip().lower()
+                or None
+            ),
             "priority": str(existing_card.get("priority") or "normal"),
             "task_type": str(existing_context.get("task_type") or "code"),
             "depends_on": existing_card.get("depends_on") or [],
@@ -3600,13 +3650,18 @@ def create_task(
             return result
         if depends_on2:
             existing_cards: dict[str, dict[str, Any]] = {}
-            for row in conn.execute("SELECT task_id, card_json FROM tasks"):
+            for row in conn.execute(
+                "SELECT task_id, card_json, archived_at FROM tasks"
+            ):
                 try:
                     existing_card = json.loads(row["card_json"] or "{}")
                 except (TypeError, json.JSONDecodeError):
                     existing_card = {}
                 if not isinstance(existing_card, dict):
                     existing_card = {}
+                if str(row["archived_at"] or "").strip():
+                    existing_card["archived_at"] = str(row["archived_at"])
+                    existing_card["status"] = "archived"
                 existing_cards[row["task_id"]] = existing_card
             existing_edges, invalid_ids = task_plan.existing_edges_from_cards(existing_cards)
             try:
@@ -4559,6 +4614,40 @@ def supersede_task(
     command = ["supersede", task_id, "--runner", CODEX_RUNNER, "--reason", reason]
     if by:
         command += ["--by", by]
+        try:
+            task_plan.normalize_depends_on([by])
+        except task_plan.TaskPlanError as exc:
+            return _lifecycle_error(str(exc), 2)
+        if by == task_id:
+            return _lifecycle_error("superseded_replacement_self_reference", 2)
+        try:
+            cards = {str(item["task_id"]): item for item in _full_cards_for_plan()}
+        except task_store.TaskStoreError as exc:
+            return _lifecycle_error(str(exc), 1)
+        if by not in cards:
+            return _lifecycle_error(
+                f"superseded_replacement_task_not_found:{by}",
+                2,
+            )
+        probe_cards = dict(cards)
+        probe_cards[task_id] = {
+            **card,
+            "status": "archived",
+            "archived_at": "pending-supersede",
+            "archive_operation": "superseded",
+            "superseded_by": by,
+        }
+        before_snapshot = task_plan.build_snapshot(list(cards.values()))
+        after_snapshot = task_plan.build_snapshot(list(probe_cards.values()))
+        new_cycle_nodes = sorted(
+            set(after_snapshot["cycle_nodes"]) - set(before_snapshot["cycle_nodes"])
+        )
+        if new_cycle_nodes:
+            return _lifecycle_error(
+                "superseded_replacement_cycle_detected:"
+                + ",".join(new_cycle_nodes),
+                2,
+            )
     gate = _canonical_write_gate(
         "archive", runner=CODEX_RUNNER, topic=live_topic, coordinator_capability=True
     )
@@ -4567,7 +4656,7 @@ def supersede_task(
     full_reason = (f"superseded_by:{by}; {reason}" if by else str(reason))[:200]
     ok, state = task_store.archive_task(
         repo_root(), task_id, actor=CODEX_RUNNER, reason=full_reason,
-        allow_processing=True, operation="superseded",
+        allow_processing=True, operation="superseded", superseded_by=by,
     )
     if not ok:
         return _canonical_result(ok=False, returncode=1, stderr=f"supersede_failed:{state}", command=command)
@@ -4931,6 +5020,7 @@ def record_usage(
     total_tokens: int = 0,
     cached_input_tokens: int = 0,
     cache_creation_input_tokens: int = 0,
+    cache_write_input_tokens: int = 0,
     usage_observed: bool | None = None,
     telemetry_reason: str | None = None,
     cache_metrics_observed: bool = False,
@@ -4967,6 +5057,7 @@ def record_usage(
             or total_tokens
             or cached_input_tokens
             or cache_creation_input_tokens
+            or cache_write_input_tokens
             or cache_metrics_observed
             or cost_observed
         )
@@ -5000,6 +5091,7 @@ def record_usage(
         "total_tokens": int(total_tokens or (int(input_tokens or 0) + int(output_tokens or 0))),
         "cached_input_tokens": int(cached_input_tokens or 0),
         "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),
+        "cache_write_input_tokens": int(cache_write_input_tokens or 0),
         "usage_observed": measured_usage,
         "telemetry_reason": str(telemetry_reason or "")[:160],
         "cache_metrics_observed": bool(cache_metrics_observed),
@@ -5058,7 +5150,11 @@ def usage_report(runner: str | None = None, topic: str | None = None, status: st
             rec["usage_observed"] = bool(
                 rec.get("input_tokens")
                 or rec.get("output_tokens")
+                or rec.get("reasoning_output_tokens")
                 or rec.get("total_tokens")
+                or rec.get("cached_input_tokens")
+                or rec.get("cache_creation_input_tokens")
+                or rec.get("cache_write_input_tokens")
                 or rec.get("cache_metrics_observed")
                 or rec.get("cost_observed")
             )
@@ -6433,3 +6529,196 @@ def needfix_link_existing_task(needfix_id: str, existing_task_id: str) -> dict[s
         _get_task_fn,
         task_store.canonical_status,
     )
+
+
+def needfix_reopen_superseded_task_link(
+    needfix_id: str, reason: str
+) -> dict[str, Any]:
+    """Manager-only reconciliation of an archived superseded task link."""
+    ns = _needfix_store_module()
+
+    def _get_task_fn(task_id: str) -> dict[str, Any] | None:
+        return task_store.get_task(repo_root(), task_id)
+
+    return ns.reopen_superseded_task_link(
+        repo_root(),
+        needfix_id,
+        get_task_fn=_get_task_fn,
+        canonical_status_fn=task_store.canonical_status,
+        reason=reason,
+    )
+
+
+# --- Roadmap manager API (durable layer between NeedFix and Task DAG) ---
+
+
+def _roadmap_store_module():
+    from . import roadmap_store
+
+    return roadmap_store
+
+
+def roadmap_list(
+    status: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    return _roadmap_store_module().list_items(
+        repo_root(),
+        status=status,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def roadmap_show(roadmap_id: str) -> dict[str, Any]:
+    return _roadmap_store_module().get_item(repo_root(), roadmap_id)
+
+
+def roadmap_events(roadmap_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    return _roadmap_store_module().list_events(
+        repo_root(), roadmap_id, limit=limit
+    )
+
+
+def roadmap_add(
+    title: str,
+    outcome: str,
+    *,
+    priority: str = "medium",
+    milestone: str = "",
+    acceptance: list[str] | None = None,
+    needfix_ids: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    provenance: dict[str, Any] | None = None,
+    evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create a proposed roadmap outcome without creating or launching tasks.
+
+    Any linked NeedFix must already be manager-accepted or further along its
+    audited lifecycle. Captured hypotheses cannot silently become roadmap
+    commitments.
+    """
+    roadmap_ns = _roadmap_store_module()
+    needfix_ns = _needfix_store_module()
+    normalized_needfix = list(dict.fromkeys(needfix_ids or []))
+    allowed_needfix_statuses = {
+        "accepted",
+        "task_planned",
+        "task_created",
+        "resolved",
+    }
+    for needfix_id in normalized_needfix:
+        item = needfix_ns.get_needfix(repo_root(), needfix_id)
+        if item["status"] not in allowed_needfix_statuses:
+            raise roadmap_ns.RoadmapConflictError(
+                f"roadmap requires accepted NeedFix authority: "
+                f"{needfix_id} status={item['status']!r}"
+            )
+    manager_provenance = dict(provenance or {})
+    manager_provenance.setdefault("origin", "manager_roadmap_add")
+    manager_provenance["verified"] = True
+    return roadmap_ns.add_item(
+        repo_root(),
+        title=title,
+        outcome=outcome,
+        priority=priority,
+        milestone=milestone,
+        acceptance=acceptance,
+        needfix_ids=normalized_needfix,
+        depends_on=depends_on,
+        provenance=manager_provenance,
+        evidence_refs=evidence_refs,
+    )
+
+
+def roadmap_transition(
+    roadmap_id: str, target_status: str, *, reason: str
+) -> dict[str, Any]:
+    roadmap_ns = _roadmap_store_module()
+    current = roadmap_ns.get_item(repo_root(), roadmap_id)
+    if target_status == "completed":
+        if not current["acceptance"]:
+            raise roadmap_ns.RoadmapConflictError(
+                "roadmap completion requires explicit acceptance criteria"
+            )
+        unfinished: list[str] = []
+        missing: list[str] = []
+        for task_id in current["task_ids"]:
+            card = task_store.get_task(repo_root(), task_id)
+            if card is None:
+                missing.append(task_id)
+            elif task_store.canonical_status(card) != "finished":
+                unfinished.append(task_id)
+        if missing or unfinished:
+            raise roadmap_ns.RoadmapConflictError(
+                "roadmap completion blocked by task authority: "
+                f"missing={missing!r} unfinished={unfinished!r}"
+            )
+        if not current["task_ids"] and not current["evidence_refs"]:
+            raise roadmap_ns.RoadmapConflictError(
+                "roadmap completion requires linked task evidence or evidence_refs"
+            )
+    return roadmap_ns.transition_item(
+        repo_root(), roadmap_id, target_status, reason=reason
+    )
+
+
+def roadmap_link_task(roadmap_id: str, task_id: str) -> dict[str, Any]:
+    roadmap_ns = _roadmap_store_module()
+    if task_store.get_task(repo_root(), task_id) is None:
+        raise roadmap_ns.RoadmapNotFoundError(f"task not found: {task_id}")
+    return roadmap_ns.link_task(repo_root(), roadmap_id, task_id)
+
+
+def roadmap_snapshot(
+    *, limit: int = 200, include_archived: bool = False
+) -> dict[str, Any]:
+    """Return bounded roadmap truth joined to canonical task lifecycle."""
+    items = roadmap_list(include_archived=include_archived, limit=limit)
+    status_counts = _roadmap_store_module().count_items_by_status(
+        repo_root(), include_archived=include_archived
+    )
+    total = sum(status_counts.values())
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        tasks: list[dict[str, str]] = []
+        for task_id in item["task_ids"]:
+            card = task_store.get_task(repo_root(), task_id)
+            tasks.append(
+                {
+                    "task_id": task_id,
+                    "status": task_store.canonical_status(card)
+                    if card is not None
+                    else "missing",
+                }
+            )
+        dependency_blockers = [
+            dependency
+            for dependency in item["depends_on"]
+            if _roadmap_store_module().get_item(repo_root(), dependency)["status"]
+            != "completed"
+        ]
+        rows.append(
+            {
+                **item,
+                "tasks": tasks,
+                "dependency_blockers": dependency_blockers,
+                "dependency_ready": not dependency_blockers,
+            }
+        )
+    return {
+        "schema_id": "aiworkhub.roadmap_snapshot.v1",
+        "available": True,
+        "total": total,
+        "active": sum(
+            count
+            for status, count in status_counts.items()
+            if status not in {"completed", "archived"}
+        ),
+        "status_counts": status_counts,
+        "items": rows,
+        "truncated": total > len(rows),
+    }

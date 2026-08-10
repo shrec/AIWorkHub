@@ -49,6 +49,8 @@ const state = {
   needfixEntries: [],
   needfixDetail: null,
   needfixConversionPreview: null,
+  roadmapEntries: [],
+  roadmapDetail: null,
   featureSettings: null,
   settingsTab: "features",
   returnPage: 0,
@@ -110,6 +112,9 @@ const elements = {
   headerNeedfix: document.querySelector("#header-needfix"),
   headerNeedfixValue: document.querySelector("#header-needfix-value"),
   headerNeedfixDetail: document.querySelector("#header-needfix-detail"),
+  headerRoadmap: document.querySelector("#header-roadmap"),
+  headerRoadmapValue: document.querySelector("#header-roadmap-value"),
+  headerRoadmapDetail: document.querySelector("#header-roadmap-detail"),
   headerPreflight: document.querySelector("#header-preflight"),
   headerPreflightValue: document.querySelector("#header-preflight-value"),
   headerPreflightDetail: document.querySelector("#header-preflight-detail"),
@@ -127,7 +132,19 @@ const elements = {
   initializeButton: document.querySelector("#initialize-button"),
   identityAlert: document.querySelector("#identity-alert"),
   identityAlertTitle: document.querySelector("#identity-alert-title"),
-  identityAlertMessage: document.querySelector("#identity-alert-message"),
+  identityManagerCheck: document.querySelector("#identity-manager-check"),
+  identityRouteCheck: document.querySelector("#identity-route-check"),
+  identityCallbackCheck: document.querySelector("#identity-callback-check"),
+  identityRoleBadge: document.querySelector("#identity-role-badge"),
+  identityProviderBadge: document.querySelector("#identity-provider-badge"),
+  identityInfo: document.querySelector("#identity-info"),
+  identityWindowId: document.querySelector("#identity-window-id"),
+  identityThreadId: document.querySelector("#identity-thread-id"),
+  identitySessionId: document.querySelector("#identity-session-id"),
+  identityRouteState: document.querySelector("#identity-route-state"),
+  identityCallbackState: document.querySelector("#identity-callback-state"),
+  identityRepoId: document.querySelector("#identity-repo-id"),
+  identityDiagnostics: document.querySelector("#identity-diagnostics"),
   callbackObservability: document.querySelector("#callback-observability"),
   callbackBacklog: document.querySelector("#callback-backlog"),
   callbackDelivery: document.querySelector("#callback-delivery"),
@@ -194,10 +211,20 @@ const elements = {
   needfixStatusFilter: document.querySelector("#needfix-status-filter"),
   needfixKindFilter: document.querySelector("#needfix-kind-filter"),
   needfixSeverityFilter: document.querySelector("#needfix-severity-filter"),
+  needfixSort: document.querySelector("#needfix-sort"),
   needfixIncludeArchived: document.querySelector("#needfix-include-archived"),
   needfixRefresh: document.querySelector("#needfix-refresh"),
   needfixList: document.querySelector("#needfix-list"),
   needfixDetailPanel: document.querySelector("#needfix-detail"),
+  openRoadmap: document.querySelector("#open-roadmap"),
+  roadmapDialog: document.querySelector("#roadmap-dialog"),
+  roadmapSummary: document.querySelector("#roadmap-summary"),
+  roadmapSearch: document.querySelector("#roadmap-search"),
+  roadmapStatusFilter: document.querySelector("#roadmap-status-filter"),
+  roadmapIncludeArchived: document.querySelector("#roadmap-include-archived"),
+  roadmapRefresh: document.querySelector("#roadmap-refresh"),
+  roadmapList: document.querySelector("#roadmap-list"),
+  roadmapDetailPanel: document.querySelector("#roadmap-detail-panel"),
   openSettings: document.querySelector("#open-settings"),
   settingsDialog: document.querySelector("#settings-dialog"),
   settingsSummary: document.querySelector("#settings-summary"),
@@ -431,10 +458,11 @@ function renderSummary(snapshot) {
     const hits = telemetry ? numberValue(telemetry.hit_count) : 0;
     const bytes = telemetry ? numberValue(telemetry.bytes) : 0;
     const degraded = telemetry ? numberValue(telemetry.degraded_tasks) : 0;
-    value.textContent = telemetry ? `${formatCount(hits)} hits` : "No sample";
-    detail.textContent = telemetry ? `${formatCount(executed)} runs · ${formatBytes(bytes)}` : "No evidence";
+    const requested = telemetry ? numberValue(telemetry.requested_tasks) : 0;
+    value.textContent = telemetry ? `${formatCount(executed)}/${formatCount(requested)} runs` : "No sample";
+    detail.textContent = telemetry ? `${formatCount(hits)} matches · ${formatBytes(bytes)} returned` : "No evidence";
     if (card) card.title = telemetry
-      ? `${formatCount(telemetry.requested_tasks)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} hits · ${degraded} degraded`
+      ? `${formatCount(requested)} requested · ${formatCount(executed)} executed · ${formatCount(hits)} context matches · ${formatBytes(bytes)} returned · ${degraded} degraded`
       : "Context telemetry unavailable";
   }
   const needfix = snapshot && snapshot.needfix && typeof snapshot.needfix === "object"
@@ -452,6 +480,23 @@ function renderSummary(snapshot) {
       elements.headerNeedfix.title = needfix && needfix.available !== false
         ? `${numberValue(needfix.open)} open NeedFix entries · ${numberValue(needfix.total)} visible`
         : `NeedFix unavailable: ${String((needfix && needfix.error) || "unknown")}`;
+    }
+  }
+  const roadmap = snapshot && snapshot.roadmap && typeof snapshot.roadmap === "object"
+    ? snapshot.roadmap
+    : null;
+  if (elements.headerRoadmapValue && elements.headerRoadmapDetail) {
+    if (!roadmap || roadmap.available === false) {
+      elements.headerRoadmapValue.textContent = "Unavailable";
+      elements.headerRoadmapDetail.textContent = roadmap && roadmap.error ? String(roadmap.error) : "No evidence";
+    } else {
+      elements.headerRoadmapValue.textContent = `${formatCount(roadmap.active)} active`;
+      elements.headerRoadmapDetail.textContent = `${formatCount(roadmap.total)} outcomes${roadmap.truncated ? " · partial" : ""}`;
+    }
+    if (elements.headerRoadmap) {
+      elements.headerRoadmap.title = roadmap && roadmap.available !== false
+        ? `${numberValue(roadmap.active)} active Roadmap outcomes · ${numberValue(roadmap.total)} visible`
+        : `Roadmap unavailable: ${String((roadmap && roadmap.error) || "unknown")}`;
     }
   }
   const preflight = snapshot && snapshot.environment_preflight
@@ -520,22 +565,12 @@ function renderSourceHealth(snapshot) {
   setConnection("degraded", "Degraded");
 }
 
-function compactManagerIdentityReason(identity) {
-  const payload = identity && typeof identity === "object" ? identity : {};
-  const provider = String(payload.provider || "unknown");
-  const role = String(payload.role || "unknown");
-  const route = payload.manager_route && typeof payload.manager_route === "object" ? payload.manager_route : {};
-  const pieces = [`role=${role}`, `provider=${provider}`];
-  if (payload.reason) {
-    pieces.push(`reason=${payload.reason}`);
-  }
-  if (route.window_id) {
-    pieces.push(`window=${route.window_id}`);
-  }
-  if (route.thread_id) {
-    pieces.push(`thread=${route.thread_id}`);
-  }
-  return pieces.join(" · ");
+function setIdentityCheck(element, ready, label) {
+  if (!element) return;
+  element.classList.toggle("identity-check-ok", ready);
+  element.classList.toggle("identity-check-warn", !ready);
+  element.textContent = `${ready ? "✓" : "!"} ${label}`;
+  element.setAttribute("aria-label", `${label}: ${ready ? "verified" : "attention required"}`);
 }
 
 function renderManagerIdentity(snapshot) {
@@ -571,22 +606,21 @@ function renderManagerIdentity(snapshot) {
   elements.identityAlert.hidden = false;
   elements.identityAlert.classList.toggle("identity-ok", fullyReady);
   elements.identityAlert.classList.toggle("identity-warn", !fullyReady);
-  if (!isManager) {
-    elements.identityAlertTitle.textContent = "Manager identity unverified";
-  } else if (!routeReady) {
-    elements.identityAlertTitle.textContent = "Manager verified · callback route pending";
-  } else if (!callbackReady) {
-    elements.identityAlertTitle.textContent = "Manager verified · callback unavailable";
-  } else {
-    elements.identityAlertTitle.textContent = "Manager identity, route and callback verified";
-  }
-  const identityReason = compactManagerIdentityReason(identity);
+  elements.identityAlertTitle.textContent = fullyReady ? "Manager coordination" : "Manager coordination needs attention";
+  setIdentityCheck(elements.identityManagerCheck, isManager, "Manager");
+  setIdentityCheck(elements.identityRouteCheck, routeReady, "Route");
+  setIdentityCheck(elements.identityCallbackCheck, callbackReady, "Callback");
+  elements.identityRoleBadge.textContent = `role: ${role}`;
+  elements.identityProviderBadge.textContent = `provider: ${String(identity.provider || "unknown")}`;
   const deliveryProblems = Array.isArray(delivery.problems) ? delivery.problems.filter(Boolean) : [];
-  const deliveryReason = callbackReady
-    ? `callback=${String(delivery.status || "ready")}`
-    : `callback=${String(delivery.status || "unknown")}${deliveryProblems.length ? ` · ${deliveryProblems.join(",")}` : ""}`;
-  const routeStatus = `route=${routeState}${routeReason ? ` · route_reason=${routeReason}` : ""}`;
-  elements.identityAlertMessage.textContent = `${identityReason} · ${routeStatus} · ${deliveryReason}`;
+  elements.identityWindowId.textContent = String(route.window_id || "Not available");
+  elements.identityThreadId.textContent = String(route.thread_id || "Not available");
+  elements.identitySessionId.textContent = String(route.session_id || "Not available");
+  elements.identityRouteState.textContent = routeState;
+  elements.identityCallbackState.textContent = String(delivery.status || "unknown");
+  elements.identityRepoId.textContent = String(delivery.repo_id || identity.repo_id || "Not available");
+  const diagnostics = [identity.reason, routeReason, ...deliveryProblems].filter(Boolean);
+  elements.identityDiagnostics.textContent = diagnostics.length ? diagnostics.join(" · ") : "none";
 }
 
 function renderCallbackObservability(snapshot) {
@@ -605,16 +639,26 @@ function renderCallbackObservability(snapshot) {
   const retries = numberValue(health.retry_count);
   const problems = asArray(delivery.problems).filter(Boolean);
   const deadLetters = numberValue(states.dead_letter);
-  const degradedReason = health.last_dead_letter_error || delivery.last_deferral_reason || problems.join(", ") || "none";
+  const currentDeliveryError = String(health.current_delivery_error || "");
+  const degradedReason = currentDeliveryError || delivery.last_deferral_reason || problems.join(", ") || "none";
+  const currentlyDegraded = Boolean(currentDeliveryError || delivery.last_deferral_reason || problems.length);
   elements.callbackBacklog.textContent = formatCount(backlog);
   elements.callbackBacklog.title = `pending=${numberValue(states.pending)}, inflight=${numberValue(states.inflight)}`;
   elements.callbackDelivery.textContent = lastDelivery ? formatRelativeTime(lastDelivery) : "Never";
   elements.callbackDelivery.title = lastDelivery || "No delivered callback recorded";
   elements.callbackRetries.textContent = formatCount(retries);
   elements.callbackRetries.title = `max attempts=${numberValue(health.max_attempts)}`;
-  elements.callbackDegraded.textContent = deadLetters || problems.length ? degradedReason : "Healthy";
-  elements.callbackDegraded.title = degradedReason;
-  elements.callbackObservability.classList.toggle("is-degraded", Boolean(deadLetters || problems.length));
+  elements.callbackDegraded.textContent = currentlyDegraded
+    ? degradedReason
+    : deadLetters
+      ? `Healthy · ${formatCount(deadLetters)} historical`
+      : "Healthy";
+  elements.callbackDegraded.title = currentlyDegraded
+    ? degradedReason
+    : deadLetters
+      ? `${formatCount(deadLetters)} historical dead letters; latest terminal delivery recovered`
+      : "No current callback delivery failure";
+  elements.callbackObservability.classList.toggle("is-degraded", currentlyDegraded);
 }
 
 function replaceSelectOptions(select, values, allLabel, currentValue) {
@@ -2087,17 +2131,91 @@ function requestNeedfixList() {
   vscode.postMessage({ type: "requestNeedfix", ...needfixFilters() });
 }
 
+const NEEDFIX_CLOSED_STATUSES = new Set(["resolved", "archived", "rejected", "duplicate"]);
+
+function needfixDifficulty(entry) {
+  const manual = asArray(entry.tags)
+    .map((tag) => String(tag || "").trim().toLocaleLowerCase())
+    .find((tag) => /^difficulty:(easy|moderate|hard|very-hard)$/.test(tag));
+  if (manual) {
+    const label = manual.slice("difficulty:".length);
+    return {
+      score: { easy: 15, moderate: 40, hard: 65, "very-hard": 90 }[label],
+      label: label.replace("-", " "),
+      source: "manager tag",
+    };
+  }
+
+  const kindBase = {
+    docs: 10,
+    documentation_drift: 12,
+    bug: 24,
+    benchmark_gap: 30,
+    improvement: 34,
+    optimization: 38,
+    other: 40,
+    idea: 44,
+    investigation: 48,
+    feature: 52,
+    technical_debt: 56,
+    roadmap_candidate: 58,
+    security_risk: 62,
+    refactor: 66,
+  };
+  const kind = String(entry.kind || "other").toLocaleLowerCase();
+  const readiness = Math.max(0, Math.min(100, numberValue(entry.readiness_score)));
+  const fileCount = asArray(entry.scope_files).length;
+  const symbolCount = asArray(entry.scope_symbols).length;
+  const referenceCount = asArray(entry.evidence_refs).length;
+  let score = kindBase[kind] ?? kindBase.other;
+  score += Math.min(24, (fileCount * 4) + (symbolCount * 2));
+  score += Math.round((100 - readiness) / 5);
+  if (!entry.scope && fileCount === 0 && symbolCount === 0) score += 8;
+  if (referenceCount > 0) score -= Math.min(6, referenceCount);
+  if (entry.converted_task_id) score -= 6;
+  if (entry.status === "accepted") score -= 4;
+  score = Math.max(0, Math.min(100, score));
+  return {
+    score,
+    label: score <= 25 ? "easy" : score <= 50 ? "moderate" : score <= 75 ? "hard" : "very hard",
+    source: "estimated from kind, scope and readiness",
+  };
+}
+
+function compareNeedfixEntries(left, right, sortMode) {
+  const leftClosed = NEEDFIX_CLOSED_STATUSES.has(String(left.status || ""));
+  const rightClosed = NEEDFIX_CLOSED_STATUSES.has(String(right.status || ""));
+  if (leftClosed !== rightClosed) return leftClosed ? 1 : -1;
+  if (sortMode === "newest") return String(right.created_at || "").localeCompare(String(left.created_at || ""));
+  if (sortMode === "oldest") return String(left.created_at || "").localeCompare(String(right.created_at || ""));
+  if (sortMode === "readiness") {
+    const delta = numberValue(right.readiness_score) - numberValue(left.readiness_score);
+    if (delta) return delta;
+  } else if (sortMode === "severity") {
+    const weight = { critical: 0, high: 1, medium: 2, low: 3 };
+    const delta = (weight[String(left.severity || "medium")] ?? 2) - (weight[String(right.severity || "medium")] ?? 2);
+    if (delta) return delta;
+  } else {
+    const delta = needfixDifficulty(left).score - needfixDifficulty(right).score;
+    if (delta) return delta;
+  }
+  return String(left.id || "").localeCompare(String(right.id || ""));
+}
+
 function renderNeedfixList() {
   const query = String(elements.needfixSearch.value || "").trim().toLocaleLowerCase();
+  const sortMode = String((elements.needfixSort && elements.needfixSort.value) || "difficulty");
   const rows = state.needfixEntries.filter((entry) => !query || [
     entry.id, entry.title, entry.status, entry.kind, entry.severity, asArray(entry.tags).join(" "),
-  ].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+  ].some((value) => String(value || "").toLocaleLowerCase().includes(query)))
+    .sort((left, right) => compareNeedfixEntries(left, right, sortMode));
   if (!rows.length) {
     elements.needfixList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching NeedFix entries" : "NeedFix inbox is empty"));
     return;
   }
   const fragment = document.createDocumentFragment();
   for (const entry of rows) {
+    const difficulty = needfixDifficulty(entry);
     const button = createElement("button", "needfix-list-item");
     button.type = "button";
     button.dataset.needfixId = String(entry.id || "");
@@ -2108,8 +2226,9 @@ function renderNeedfixList() {
     );
     button.append(
       heading,
-      createElement("span", "needfix-list-meta", `${String(entry.id || "")} · ${String(entry.kind || "other")} · ${String(entry.severity || "medium")} · readiness ${numberValue(entry.readiness_score)}`),
+      createElement("span", "needfix-list-meta", `${String(entry.id || "")} · ${String(entry.kind || "other")} · ${String(entry.severity || "medium")} impact · ${difficulty.label} difficulty (${difficulty.score}) · readiness ${numberValue(entry.readiness_score)}`),
     );
+    button.title = `Difficulty: ${difficulty.label} (${difficulty.score}/100), ${difficulty.source}. Severity remains impact, not effort.`;
     fragment.appendChild(button);
   }
   elements.needfixList.replaceChildren(fragment);
@@ -2320,6 +2439,88 @@ function renderNeedfixAction(payload) {
   showToast("NeedFix updated");
   if (payload.item) renderNeedfixDetail({ ok: true, item: payload.item, events: [] });
   requestNeedfixList();
+}
+
+function requestRoadmapList() {
+  vscode.postMessage({
+    type: "requestRoadmap",
+    status: String(elements.roadmapStatusFilter.value || ""),
+    includeArchived: Boolean(elements.roadmapIncludeArchived.checked),
+  });
+}
+
+function renderRoadmapList() {
+  const query = String(elements.roadmapSearch.value || "").trim().toLocaleLowerCase();
+  const rows = state.roadmapEntries.filter((entry) => !query || [
+    entry.id, entry.title, entry.status, entry.priority, entry.milestone,
+    asArray(entry.needfix_ids).join(" "), asArray(entry.task_ids).join(" "),
+  ].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+  if (!rows.length) {
+    elements.roadmapList.replaceChildren(createElement("div", "panel-list-empty", query ? "No matching Roadmap outcomes" : "Roadmap is empty"));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of rows) {
+    const button = createElement("button", "needfix-list-item");
+    button.type = "button";
+    button.dataset.roadmapId = String(entry.id || "");
+    const heading = createElement("span", "needfix-list-heading");
+    heading.append(
+      createElement("strong", "", String(entry.title || entry.id || "Untitled")),
+      createElement("span", `status-badge status-${String(entry.status || "proposed")}`, String(entry.status || "proposed")),
+    );
+    button.append(
+      heading,
+      createElement("span", "needfix-list-meta", `${String(entry.id || "")} · ${String(entry.priority || "medium")} · ${String(entry.milestone || "No milestone")} · ${asArray(entry.task_ids).length} tasks · ${asArray(entry.dependency_blockers).length} blockers`),
+    );
+    fragment.appendChild(button);
+  }
+  elements.roadmapList.replaceChildren(fragment);
+}
+
+function renderRoadmap(payload) {
+  if (!payload || payload.ok === false) {
+    state.roadmapEntries = [];
+    elements.roadmapSummary.textContent = (payload && payload.error) || "Roadmap unavailable";
+    renderRoadmapList();
+    return;
+  }
+  state.roadmapEntries = asArray(payload.entries);
+  elements.roadmapSummary.textContent = `${formatCount(payload.active)} active · ${formatCount(payload.total)} outcomes`;
+  renderRoadmapList();
+}
+
+function renderRoadmapDetail(payload) {
+  if (!payload || payload.ok === false || !payload.item) {
+    state.roadmapDetail = null;
+    elements.roadmapDetailPanel.replaceChildren(createElement("div", "panel-list-empty", (payload && payload.error) || "Roadmap detail unavailable"));
+    return;
+  }
+  const item = payload.item;
+  state.roadmapDetail = item;
+  const fragment = document.createDocumentFragment();
+  const heading = createElement("div", "needfix-detail-heading");
+  heading.append(
+    createElement("div", "", String(item.id || "")),
+    createElement("h3", "", String(item.title || "Untitled")),
+    createElement("span", `status-badge status-${String(item.status || "proposed")}`, String(item.status || "proposed")),
+  );
+  fragment.appendChild(heading);
+  fragment.appendChild(createElement("p", "needfix-description", String(item.outcome || "No outcome stated")));
+  const metadata = createElement("dl", "metadata-grid needfix-metadata");
+  for (const [label, value] of [
+    ["Priority", item.priority], ["Milestone", item.milestone || "—"],
+    ["Dependency ready", item.dependency_ready ? "Yes" : "No"], ["Updated", item.updated_at],
+  ]) metadata.append(createElement("dt", "", label), createElement("dd", "", String(value || "—")));
+  fragment.appendChild(metadata);
+  appendNeedfixObject(fragment, "Acceptance criteria", item.acceptance, true);
+  appendNeedfixObject(fragment, "NeedFix links", item.needfix_ids, true);
+  appendNeedfixObject(fragment, "Task DAG links", item.tasks || item.task_ids, true);
+  appendNeedfixObject(fragment, "Dependencies", { depends_on: item.depends_on, blockers: item.dependency_blockers }, true);
+  appendNeedfixObject(fragment, "Provenance", item.provenance, false);
+  appendNeedfixObject(fragment, "Evidence references", item.evidence_refs, false);
+  appendNeedfixEvents(fragment, asArray(payload.events));
+  elements.roadmapDetailPanel.replaceChildren(fragment);
 }
 
 function taskSignalRow(task, badgeText, badgeClass) {
@@ -3835,6 +4036,12 @@ window.addEventListener("message", (event) => {
     case "needfixAction":
       renderNeedfixAction(message.payload);
       break;
+    case "roadmap":
+      renderRoadmap(message.payload);
+      break;
+    case "roadmapDetail":
+      renderRoadmapDetail(message.payload);
+      break;
     case "settings":
       renderSettings(message.payload);
       break;
@@ -3956,6 +4163,9 @@ elements.returnNext.addEventListener("click", () => {
 });
 
 document.addEventListener("click", (event) => {
+  if (elements.identityInfo && elements.identityInfo.open && !elements.identityInfo.contains(event.target)) {
+    elements.identityInfo.open = false;
+  }
   const target = event.target.closest("[data-task-id]");
   if (target && target.dataset.taskId) {
     requestTaskDetail(String(target.dataset.taskId));
@@ -4126,6 +4336,7 @@ elements.openNeedfix.addEventListener("click", openNeedfixDialog);
 elements.headerNeedfix.addEventListener("click", openNeedfixDialog);
 elements.needfixRefresh.addEventListener("click", requestNeedfixList);
 elements.needfixSearch.addEventListener("input", renderNeedfixList);
+elements.needfixSort.addEventListener("change", renderNeedfixList);
 for (const filter of [elements.needfixStatusFilter, elements.needfixKindFilter, elements.needfixSeverityFilter, elements.needfixIncludeArchived]) {
   filter.addEventListener("change", requestNeedfixList);
 }
@@ -4203,6 +4414,29 @@ elements.needfixDetailPanel.addEventListener("click", (event) => {
     return;
   }
   vscode.postMessage({ type: "needfixTransition", needfixId, action, reason, duplicateParentId, confirm: true });
+});
+
+function openRoadmapDialog() {
+  if (!elements.roadmapDialog.open) elements.roadmapDialog.showModal();
+  elements.roadmapSummary.textContent = "Loading repository Roadmap";
+  requestRoadmapList();
+}
+
+elements.openRoadmap.addEventListener("click", openRoadmapDialog);
+elements.headerRoadmap.addEventListener("click", openRoadmapDialog);
+elements.roadmapRefresh.addEventListener("click", requestRoadmapList);
+elements.roadmapSearch.addEventListener("input", renderRoadmapList);
+elements.roadmapStatusFilter.addEventListener("change", requestRoadmapList);
+elements.roadmapIncludeArchived.addEventListener("change", requestRoadmapList);
+elements.roadmapList.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-roadmap-id]");
+  if (target) vscode.postMessage({ type: "requestRoadmapDetail", roadmapId: target.dataset.roadmapId });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && elements.identityInfo && elements.identityInfo.open) {
+    elements.identityInfo.open = false;
+  }
 });
 
 elements.openOperations.addEventListener("click", () => {

@@ -28,6 +28,7 @@ from aiworkhub import (
     feature_settings,
     needfix_store,
     process_launcher,
+    roadmap_store,
     repo_policy,
     repository_bootstrap,
     shared_router,
@@ -991,6 +992,108 @@ def needfix_detail_view(needfix_id: str, event_limit: int = 50) -> dict[str, Any
     return _needfix_response(response, "aiworkhub_dashboard_needfix_detail")
 
 
+def _bounded_roadmap_row(
+    row: Mapping[str, Any], *, include_detail: bool = False
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": str(row.get("id") or "")[:32],
+        "title": str(row.get("title") or "")[:240],
+        "status": str(row.get("status") or "")[:40],
+        "priority": str(row.get("priority") or "")[:24],
+        "milestone": str(row.get("milestone") or "")[:500],
+        "needfix_ids": [str(value)[:32] for value in list(row.get("needfix_ids") or [])[:100]],
+        "task_ids": [str(value)[:256] for value in list(row.get("task_ids") or [])[:100]],
+        "depends_on": [str(value)[:32] for value in list(row.get("depends_on") or [])[:100]],
+        "dependency_blockers": [
+            str(value)[:32] for value in list(row.get("dependency_blockers") or [])[:100]
+        ],
+        "dependency_ready": bool(row.get("dependency_ready", True)),
+        "created_at": str(row.get("created_at") or "")[:64],
+        "updated_at": str(row.get("updated_at") or "")[:64],
+    }
+    if include_detail:
+        result.update(
+            {
+                "outcome": str(row.get("outcome") or "")[:100_000],
+                "acceptance": [
+                    str(value)[:1000] for value in list(row.get("acceptance") or [])[:100]
+                ],
+                "provenance": dict(list((row.get("provenance") or {}).items())[:32])
+                if isinstance(row.get("provenance"), Mapping)
+                else {},
+                "evidence_refs": [
+                    str(value)[:1000] for value in list(row.get("evidence_refs") or [])[:200]
+                ],
+                "tasks": [dict(list(task.items())[:8]) for task in list(row.get("tasks") or [])[:100]],
+            }
+        )
+    return result
+
+
+def roadmap_list_view(
+    status: str | None = None,
+    include_archived: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """READ-ONLY: bounded Roadmap outcomes joined to Task-DAG truth."""
+    try:
+        snapshot = core.roadmap_snapshot(
+            limit=max(1, min(int(limit or 100), 200)),
+            include_archived=include_archived is True,
+        )
+        rows = list(snapshot.get("items") or [])
+        if status:
+            rows = [row for row in rows if row.get("status") == str(status)[:40]]
+        if not include_archived:
+            rows = [row for row in rows if row.get("status") != "archived"]
+        bounded_offset = max(0, int(offset or 0))
+        rows = rows[bounded_offset : bounded_offset + max(1, min(int(limit or 100), 200))]
+        response = {
+            "ok": True,
+            "entries": [_bounded_roadmap_row(row) for row in rows],
+            "count": len(rows),
+            "active": int(snapshot.get("active") or 0),
+            "total": int(snapshot.get("total") or 0),
+            "status_counts": dict(snapshot.get("status_counts") or {}),
+            "truncated": bool(snapshot.get("truncated")),
+        }
+    except (roadmap_store.RoadmapError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240], "entries": []}
+    return _needfix_response(response, "aiworkhub_dashboard_roadmap_list")
+
+
+def roadmap_detail_view(roadmap_id: str, event_limit: int = 50) -> dict[str, Any]:
+    """READ-ONLY: one Roadmap outcome with task/dependency and audit truth."""
+    candidate = str(roadmap_id or "")
+    if not roadmap_store.ROADMAP_ID_RE.fullmatch(candidate):
+        return _needfix_response(
+            {"ok": False, "error": "invalid_roadmap_id"},
+            "aiworkhub_dashboard_roadmap_detail",
+        )
+    try:
+        snapshot = core.roadmap_snapshot(limit=200)
+        row = next(
+            (item for item in snapshot.get("items") or [] if item.get("id") == candidate),
+            None,
+        )
+        if row is None:
+            row = core.roadmap_show(candidate)
+        response = {
+            "ok": True,
+            "item": _bounded_roadmap_row(row, include_detail=True),
+            "events": [
+                dict(list(event.items())[:24])
+                for event in core.roadmap_events(
+                    candidate, limit=max(1, min(int(event_limit or 50), 100))
+                )[:100]
+            ],
+        }
+    except (roadmap_store.RoadmapError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(response, "aiworkhub_dashboard_roadmap_detail")
+
+
 def needfix_capture_view(
     title: str,
     description: str,
@@ -1192,6 +1295,32 @@ def needfix_link_existing_task_view(
         except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
             response = {"ok": False, "error": str(exc)[:240]}
     return _needfix_response(response, "aiworkhub_dashboard_needfix_link_existing_task", write=True)
+
+
+def needfix_reopen_superseded_task_link_view(
+    needfix_id: str, reason: str, confirm: bool = False
+) -> dict[str, Any]:
+    """USER WRITE: reopen only an exact archived/superseded converted-task link."""
+    if confirm is not True:
+        response = {
+            "ok": False,
+            "error": "needfix_reopen_superseded_task_link_confirmation_required",
+        }
+    else:
+        try:
+            response = dict(
+                core.needfix_reopen_superseded_task_link(
+                    str(needfix_id or ""), str(reason or "")
+                )
+            )
+            response.setdefault("ok", True)
+        except (needfix_store.NeedFixError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            response = {"ok": False, "error": str(exc)[:240]}
+    return _needfix_response(
+        response,
+        "aiworkhub_dashboard_needfix_reopen_superseded_task_link",
+        write=True,
+    )
 
 
 def task_quarantine_view(
@@ -1492,6 +1621,11 @@ NEEDFIX_WRITE_TOOLS: dict[str, Any] = {
     "aiworkhub_dashboard_needfix_purge": needfix_purge_view,
     "aiworkhub_dashboard_needfix_convert_commit": needfix_convert_commit_view,
     "aiworkhub_dashboard_needfix_link_existing_task": needfix_link_existing_task_view,
+    "aiworkhub_dashboard_needfix_reopen_superseded_task_link": needfix_reopen_superseded_task_link_view,
+}
+ROADMAP_READ_TOOLS: dict[str, Any] = {
+    "aiworkhub_dashboard_roadmap_list": roadmap_list_view,
+    "aiworkhub_dashboard_roadmap_detail": roadmap_detail_view,
 }
 SETTINGS_TOOL_NAME = "aiworkhub_dashboard_settings"
 SETTINGS_TOOLS: dict[str, Any] = {SETTINGS_TOOL_NAME: settings_view}
@@ -1561,6 +1695,8 @@ def register(mcp: Any) -> tuple[str, ...]:
         mcp.tool(name=name)(fn)
     for name, fn in NEEDFIX_WRITE_TOOLS.items():
         mcp.tool(name=name)(fn)
+    for name, fn in ROADMAP_READ_TOOLS.items():
+        mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_TOOLS.items():
         mcp.tool(name=name)(fn)
     for name, fn in SETTINGS_UPDATE_TOOLS.items():
@@ -1596,6 +1732,7 @@ def register(mcp: Any) -> tuple[str, ...]:
         + tuple(TASK_RETENTION_WRITE_TOOLS)
         + tuple(NEEDFIX_READ_TOOLS)
         + tuple(NEEDFIX_WRITE_TOOLS)
+        + tuple(ROADMAP_READ_TOOLS)
         + tuple(SETTINGS_UPDATE_TOOLS)
         + tuple(SOURCE_GRAPH_SETTINGS_UPDATE_TOOLS)
         + (INITIALIZE_TOOL_NAME,)

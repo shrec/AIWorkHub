@@ -82,6 +82,62 @@ def test_task_plan_snapshot_unblocks_after_dependency_finishes(tmp_path):
     assert "t2" in snapshot["ready"]
 
 
+def test_supersede_task_persists_replacement_and_unblocks_successor(monkeypatch):
+    repo = core.repo_root()
+    _insert_card(repo, "old", status="pending")
+    _insert_card(
+        repo, "replacement", status="finished", worker_status="done"
+    )
+    _insert_card(repo, "successor", depends_on=["old"])
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+
+    result = core.supersede_task(
+        "old", reason="replaced by accepted implementation", by="replacement"
+    )
+
+    assert result["ok"] is True
+    archived = task_store.get_task(repo, "old")
+    assert archived is not None
+    assert archived["archive_operation"] == "superseded"
+    assert archived["superseded_by"] == "replacement"
+    snapshot = core.task_plan_snapshot()
+    assert snapshot["dependencies"]["successor"] == ["replacement"]
+    assert "successor" in snapshot["ready"]
+
+
+def test_supersede_task_rejects_replacement_cycle(monkeypatch):
+    repo = core.repo_root()
+    _insert_card(repo, "old", status="pending")
+    _insert_card(repo, "replacement", depends_on=["old"])
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+
+    result = core.supersede_task("old", by="replacement")
+
+    assert result["ok"] is False
+    assert "superseded_replacement_cycle_detected" in result["stderr"]
+    old = task_store.get_task(repo, "old")
+    assert old is not None
+    assert old["status"] == "pending"
+
+
+def test_supersede_task_rejects_missing_replacement_before_archive(monkeypatch):
+    repo = core.repo_root()
+    _insert_card(repo, "old", status="pending")
+    monkeypatch.setattr(core, "_canonical_write_gate", lambda *args, **kwargs: None)
+
+    result = core.supersede_task("old", by="replacement-does-not-exist")
+
+    assert result["ok"] is False
+    assert result["returncode"] == 2
+    assert result["stderr"] == (
+        "superseded_replacement_task_not_found:replacement-does-not-exist"
+    )
+    old = task_store.get_task(repo, "old")
+    assert old is not None
+    assert old["status"] == "pending"
+    assert not old.get("archived_at")
+
+
 def test_eligible_dryrun_candidates_excludes_dag_blocked_task():
     rows = [
         {"task_id": "t1", "runner": "codex_a", "topic": "coding", "worker_status": "unclaimed",

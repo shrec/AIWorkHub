@@ -698,6 +698,23 @@ def test_assert_gc_safe_workspace_shape_rejects_a_home_worktree_swap(tmp_path, m
         worker_workspace.assert_gc_safe_workspace_shape(request_id, home, path)
 
 
+def test_assert_gc_safe_workspace_shape_accepts_legacy_temp_root_for_upgrade_gc(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(worker_workspace.tempfile, "gettempdir", lambda: str(tmp_path))
+    request_id = "req-legacy-upgrade"
+    legacy_root = tmp_path / "aiworkhub-worktrees"
+    path = legacy_root / request_id / "worktree"
+    home = legacy_root / request_id / "home"
+
+    assert (
+        worker_workspace.assert_gc_safe_workspace_shape(request_id, path, home)
+        == legacy_root.resolve()
+    )
+
+
 # --- missing directory idempotence -------------------------------------------
 
 
@@ -724,6 +741,126 @@ def test_missing_workspace_directories_are_idempotent_gc_success(tmp_path, monke
     # Calling it again must remain a pure no-op (workspace_retained is False now).
     result2 = manager._gc_finalized_workspaces()
     assert result2 == {"gc_scanned": 0, "gc_cleaned": 0, "gc_skipped": 0}
+
+
+def test_missing_current_review_workspace_is_blocked_and_no_longer_claimed_retained(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-current-review-gone"
+    card = _card()
+    card.update({"status": "review", "worker_status": "review"})
+    manager = _build_manager(tmp_path, card)
+    path, home, metadata_path = _seed_gc_candidate(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        pid=2_147_483_077,
+        pid_start_ticks=999_999_927,
+        state="review_ready",
+        create_dirs=False,
+    )
+    workspace_payload = json.loads(metadata_path.read_text(encoding="utf-8"))["workspace"]
+    card["terminal_review"] = {
+        "substatus": "review_ready",
+        "evidence": {
+            "request_identity": {
+                "request_id": request_id,
+                "task_id": card["task_id"],
+                "runner": card["runner"],
+            },
+            "workspace": workspace_payload,
+            "changed_paths": [],
+            "changed_path_hashes": {},
+        },
+    }
+    transitions: list[dict] = []
+
+    def mark_missing(repo, task_id, runner, exact_request_id, *, reason):
+        transitions.append({
+            "repo": repo,
+            "task_id": task_id,
+            "runner": runner,
+            "request_id": exact_request_id,
+            "reason": reason,
+        })
+        card.update(status="blocked", worker_status="finalize_failed", claimed_by=None)
+        return {"ok": True, "callback_enqueued": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_review_workspace_missing", mark_missing
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 1, "gc_skipped": 0}
+    assert transitions == [{
+        "repo": (tmp_path / "repo").resolve(),
+        "task_id": card["task_id"],
+        "runner": card["runner"],
+        "request_id": request_id,
+        "reason": "review_workspace_missing",
+    }]
+    latest = manager._request_events(request_id)[-1]
+    assert latest["state"] == "finalize_failed"
+    assert latest["workspace_retained"] is False
+    assert latest["workspace_gc_reason"] == "review_workspace_missing"
+    assert not path.exists() and not home.exists()
+
+
+def test_missing_current_review_cleanup_failure_stays_truthfully_retained_for_retry(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(worker_workspace.WORKTREE_ROOT_ENV, str(tmp_path / "wtroot"))
+    request_id = "req-current-review-cleanup-retry"
+    card = _card()
+    card.update({"status": "review", "worker_status": "review"})
+    manager = _build_manager(tmp_path, card)
+    _, _, metadata_path = _seed_gc_candidate(
+        manager,
+        tmp_path,
+        card,
+        request_id=request_id,
+        pid=2_147_483_078,
+        pid_start_ticks=999_999_928,
+        state="review_ready",
+        create_dirs=False,
+    )
+    workspace_payload = json.loads(metadata_path.read_text(encoding="utf-8"))["workspace"]
+    card["terminal_review"] = {
+        "substatus": "review_ready",
+        "evidence": {
+            "request_identity": {"request_id": request_id},
+            "workspace": workspace_payload,
+            "changed_paths": [],
+            "changed_path_hashes": {},
+        },
+    }
+
+    def mark_missing(*_args, **_kwargs):
+        card.update(status="blocked", worker_status="finalize_failed", claimed_by=None)
+        return {"ok": True, "callback_enqueued": True}
+
+    monkeypatch.setattr(
+        process_launcher.task_engine, "mark_review_workspace_missing", mark_missing
+    )
+    monkeypatch.setattr(
+        process_launcher,
+        "cleanup_workspace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            worker_workspace.WorkspaceError("busy")
+        ),
+    )
+
+    result = manager._gc_finalized_workspaces()
+
+    assert result == {"gc_scanned": 1, "gc_cleaned": 0, "gc_skipped": 1}
+    latest = manager._request_events(request_id)[-1]
+    assert latest["state"] == "finalize_failed"
+    assert latest["workspace_retained"] is True
+    assert latest["workspace_gc"] is False
+    assert latest["error"] == "retained_workspace_cleanup_failed:busy"
 
 
 # --- fail-closed on ambiguity -------------------------------------------------

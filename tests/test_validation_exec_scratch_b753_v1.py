@@ -411,6 +411,40 @@ def test_fails_closed_when_every_candidate_is_noexec(
     assert list(root_b.iterdir()) == []
 
 
+def test_repo_runtime_validation_root_is_preferred_and_cleaned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    home = repo / ".aiworkhub" / "runtime" / "worktrees" / "request" / "home"
+    home.mkdir(parents=True)
+    monkeypatch.delenv(
+        worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False
+    )
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.setattr(
+        worker_workspace, "_exec_scratch_candidate_roots", lambda: ()
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_exec_capable_dir", lambda _path: True
+    )
+    monkeypatch.setattr(
+        worker_workspace, "_probe_metadata_capable_dir", lambda _path: True
+    )
+
+    workspace = type("Workspace", (), {})()
+    workspace.request_id = "repo-runtime-validation"
+    workspace.home = home
+    workspace.repo = repo
+
+    scratch = worker_workspace.provision_validation_exec_scratch(workspace)
+    expected_parent = repo / ".aiworkhub" / "runtime" / "validation"
+    assert scratch.parent == expected_parent.resolve()
+    assert scratch.is_dir()
+
+    worker_workspace.cleanup_validation_exec_scratch(scratch)
+    assert not scratch.exists()
+
+
 def test_reproduces_b751_permission_denied_signature_distinct_from_product_rc(
     tmp_path: Path,
 ) -> None:

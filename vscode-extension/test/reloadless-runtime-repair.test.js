@@ -310,6 +310,65 @@ async function testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence
   }
 }
 
+async function testExplicitRetryAlwaysReplacesWindowOwnedChild(tmp) {
+  const repoRoot = path.join(tmp, "explicit-window-replace");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_explicitreplace00000000000000007", "explicit-window-replace");
+  const fake = installSpawnFake(new Map([[repoRoot, [
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+    { version: EXPECTED_VERSION, missingTools: [], dieBeforeInitialize: false },
+  ]]]));
+  try {
+    const host = loadExtensionHost(repoRoot);
+    await host.extension.activate(host.context);
+    const client = host.extension.__testInternals.getMcpClient(host.context);
+    await client.ensureStarted();
+    const firstChild = client.lifecycleChild;
+    const result = await client.replaceForExplicitRecovery();
+
+    assert.strictEqual(fake.spawns.length, 2);
+    assert.notStrictEqual(client.lifecycleChild, firstChild);
+    assert.strictEqual(firstChild.killed, true);
+    assert.strictEqual(result.replaced, true);
+    assert.strictEqual(result.phase, "ready");
+    assert.strictEqual(client.running, true);
+    assert.strictEqual(client.initialized, true);
+    await host.extension.deactivate();
+  } finally {
+    fake.restore();
+  }
+}
+
+async function testHandshakeFailuresExposeExactPhase(tmp) {
+  const repoRoot = path.join(tmp, "phase-diagnostics");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_phasediagnostics000000000000000008", "phase-diagnostics");
+  const host = loadExtensionHost(repoRoot);
+  const client = new host.extension.__testInternals.McpStdioClient(
+    repoRoot,
+    { appendLine: () => {} },
+    { repoId: "repo_phasediagnostics000000000000000008" },
+    "claim-phase",
+  );
+  client.request = async () => { throw new Error("mcp_request_timeout"); };
+  await assert.rejects(client._handshake(), /mcp_initialize_failed:mcp_request_timeout/);
+
+  client.request = async (method) => {
+    if (method === "tools/list") return { tools: [] };
+    throw new Error("mcp_request_timeout");
+  };
+  await assert.rejects(
+    client._assertRuntimeVersionBeforeServices(),
+    /mcp_dashboard_health_failed:mcp_request_timeout/,
+  );
+
+  client.request = async () => { throw new Error("mcp_request_timeout"); };
+  await assert.rejects(
+    client._assertRuntimeVersionBeforeServices(),
+    /mcp_tools_list_failed:mcp_request_timeout/,
+  );
+}
+
 async function testBoundedRetryOnPersistentMismatch(tmp) {
   const repoRoot = path.join(tmp, "persistent-mismatch");
   fs.mkdirSync(repoRoot);
@@ -555,6 +614,8 @@ function testPlatformPythonResolution(tmp) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
   await testSelfHealsAndReconnectsWithoutReload(tmp);
   await testRuntimeInfoReusesHandshakeEvidenceDuringBackgroundConvergence(tmp);
+  await testExplicitRetryAlwaysReplacesWindowOwnedChild(tmp);
+  await testHandshakeFailuresExposeExactPhase(tmp);
   await testBoundedRetryOnPersistentMismatch(tmp);
   await testFailedRestartDegradesWithoutCrossRepoFallback(tmp);
   await testTwoWorkspacesRepairInIsolation(tmp);

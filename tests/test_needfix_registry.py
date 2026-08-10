@@ -637,6 +637,28 @@ class TestNeedFixConversionPublicPlanContract:
         assert pv["task_plan"]["required_outputs"] == ["src/aiworkhub/foo.py"]
         assert pv["plan_digest"] == needfix_store.plan_digest(pv["task_plan"])
 
+    def test_writable_preview_without_required_outputs_fails_before_task_creation(
+        self, init_store: Path
+    ):
+        """NF-62: preview must reject the same card launch would reject."""
+
+        r = self._accepted_with_scope(init_store, ["src/aiworkhub/foo.py"])
+        with pytest.raises(
+            needfix_store.NeedFixValidationError,
+            match="writable needfix conversion requires explicit non-empty",
+        ):
+            needfix_store.preview_convert(
+                init_store,
+                r["id"],
+                {
+                    "runner": "deepseek_v4-pro",
+                    "topic": "needfix_fix",
+                },
+            )
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "accepted"
+        assert unchanged["converted_task_id"] is None
+
     def test_preview_reflects_caller_supplied_task_plan_overrides(self, init_store: Path):
         r = self._accepted_with_scope(init_store)
         plan = {
@@ -1021,6 +1043,74 @@ class TestLinkExistingTask:
         resolved = needfix_store.resolve_needfix(init_store, r["id"])
         assert resolved["status"] == "resolved"
 
+    def test_reopen_superseded_task_link_is_atomic_and_audited(self, init_store: Path):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        archived_get, archived_status = self._tasks(
+            **{
+                "task-1": {
+                    "status": "archived",
+                    "archive_operation": "superseded",
+                }
+            }
+        )
+
+        reopened = needfix_store.reopen_superseded_task_link(
+            init_store,
+            r["id"],
+            get_task_fn=archived_get,
+            canonical_status_fn=archived_status,
+            reason="Replacement task will be planned from the rebased residual.",
+        )
+
+        assert reopened["status"] == "accepted"
+        assert reopened["converted_task_id"] is None
+        event = needfix_store.list_events(init_store, r["id"], limit=1)[0]
+        assert event["event"] == "superseded_task_link_reopened"
+        assert event["detail"]["prior_converted_task_id"] == "task-1"
+
+    @pytest.mark.parametrize(
+        ("status", "archive_operation"),
+        [
+            ("processing", ""),
+            ("review", ""),
+            ("finished", ""),
+            ("archived", "quarantined"),
+        ],
+    )
+    def test_reopen_superseded_task_link_rejects_non_superseded_authority(
+        self, init_store: Path, status: str, archive_operation: str
+    ):
+        r = self._accepted_needfix(init_store)
+        finished_get, status_fn = self._tasks(**{"task-1": {"status": "finished"}})
+        needfix_store.link_existing_task(
+            init_store, r["id"], "task-1", finished_get, status_fn
+        )
+        current_get, current_status = self._tasks(
+            **{
+                "task-1": {
+                    "status": status,
+                    "archive_operation": archive_operation,
+                }
+            }
+        )
+
+        with pytest.raises(needfix_store.NeedFixConflictError):
+            needfix_store.reopen_superseded_task_link(
+                init_store,
+                r["id"],
+                get_task_fn=current_get,
+                canonical_status_fn=current_status,
+                reason="Attempted reconciliation.",
+            )
+
+        unchanged = needfix_store.get_needfix(init_store, r["id"])
+        assert unchanged["status"] == "task_created"
+        assert unchanged["converted_task_id"] == "task-1"
+
 
 class TestManagerVerifiedResolution:
     def _accepted(self, init_store: Path, *, readiness_score: int = 100, evidence=None, refs=None):
@@ -1153,6 +1243,30 @@ class TestExistingTaskLinkCanonicalDelegation:
         result = dashboard_mcp_app.needfix_link_existing_task_view("NF-2026-00001", "task-1")
         assert result["ok"] is False
 
+    def test_server_reopen_superseded_delegates_to_core(self, monkeypatch):
+        from aiworkhub import core, server
+
+        calls = []
+
+        def fake(needfix_id, reason):
+            calls.append((needfix_id, reason))
+            return {"status": "accepted"}
+
+        monkeypatch.setattr(core, "needfix_reopen_superseded_task_link", fake)
+        result = server.needfix_reopen_superseded_task_link(
+            "NF-2026-00001", "Superseded task archived."
+        )
+        assert result["status"] == "accepted"
+        assert calls == [("NF-2026-00001", "Superseded task archived.")]
+
+    def test_dashboard_reopen_superseded_requires_confirmation(self):
+        from aiworkhub import dashboard_mcp_app
+
+        result = dashboard_mcp_app.needfix_reopen_superseded_task_link_view(
+            "NF-2026-00001", "Superseded task archived."
+        )
+        assert result["ok"] is False
+
 
 class TestManagerVsWorkerAuthority:
     """Manager mutation vs worker proposal authority."""
@@ -1228,6 +1342,7 @@ class TestServerRegistration:
         "needfix_preview_convert",
         "needfix_convert",
         "needfix_link_existing_task",
+        "needfix_reopen_superseded_task_link",
     )
 
     def test_required_functions_callable(self):

@@ -198,7 +198,7 @@ def _public_preview(value: Mapping[str, Any]) -> dict[str, Any]:
 
 def preview(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     return _public_preview(_preview_payload(root, worktree_base))
 
 
@@ -272,7 +272,7 @@ def quarantine(
     if not confirm:
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     current = _preview_payload(root, worktree_base)
     if preview_digest != current["preview_digest"]:
         raise StorageRetentionError("retention_preview_stale")
@@ -371,7 +371,7 @@ def prune_stale_registrations(
     if not confirm:
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     current = worktree_storage.scan_worktree_registrations(root, worktree_base)
     if not current.get("ok"):
         raise StorageRetentionError(str(current.get("error") or "registration_preview_failed"))
@@ -415,7 +415,7 @@ def prune_stale_registrations(
 
 def list_batches(repo_root: Path | str, *, base: Path | None = None) -> dict[str, Any]:
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     repo_id = _repo_id(root)
     qroot = _read_quarantine_root(root, worktree_base)
     rows: list[dict[str, Any]] = []
@@ -461,7 +461,7 @@ def restore(
     if not confirm:
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     batch = _verified_batch(root, worktree_base, batch_id)
     manifest_path = batch / MANIFEST_NAME
     manifest = _load_manifest(manifest_path, _repo_id(root))
@@ -504,7 +504,7 @@ def purge(
     if not confirm:
         raise StorageRetentionError("explicit_confirmation_required")
     root = Path(repo_root).resolve()
-    worktree_base = (base or configured_worktree_root()).resolve()
+    worktree_base = (base or configured_worktree_root(root)).resolve()
     batch = _verified_batch(root, worktree_base, batch_id)
     manifest = _load_manifest(batch / MANIFEST_NAME, _repo_id(root))
     try:

@@ -6,6 +6,45 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- Integrated PR #16: authenticated VS Code LM read-only finalization now
+  exercises its durable token-bound cancel decision instead of bypassing the
+  bridge contract, while required-create range edits are revalidated as
+  assembled create content and report truthful create/whole-file metrics.
+- Coordinator-authorized validation-only replay now skips VS Code bridge
+  cancellation only when durable metadata proves that no provider was
+  launched; ordinary editor-hosted finalization remains fail-closed.
+
+### Tests
+
+- Added required-create placeholder, `.pyi` ellipsis, bridge-lifecycle and
+  provider-free replay regressions.
+
+## [0.9.40] - 2026-08-10
+
+### Fixed
+
+- Semantic-edit fidelity now rejects literal ellipsis placeholders when a
+  required file is created through a range edit and when retained rework
+  attempts to preserve an existing placeholder unchanged.
+- Repository quality checks declared as `{python} -m ruff` or
+  `{python} -m mypy` now use their trusted PATH entrypoint when the active MCP
+  interpreter cannot import that module. Receipts preserve both the declared
+  command and the exact executable that actually ran.
+- Quality-verdict lens aggregation now has an explicit typed mutable shape,
+  keeping strict mypy validation green as structured observation evidence is
+  accumulated.
+- Task supersession now fails before archiving when its replacement task ID
+  does not exist in the same repository, preventing a transient broken
+  replacement edge in the Plan DAG.
+
+### Tests
+
+- Added focused placeholder-fidelity and quality-tool-resolution regressions.
+  Local qualification passes 3,450 Python tests with 35 platform-dependent
+  skips, the complete extension suite, Ruff and strict mypy.
+
 ## [0.9.39] - 2026-08-09
 
 ### Added

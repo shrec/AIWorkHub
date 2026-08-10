@@ -238,6 +238,38 @@ def _project_row(con: sqlite3.Connection, row: sqlite3.Row) -> None:
         task_node = f"task:{row['task_id']}"
         _node(con, task_node, "task", str(row["task_id"]), event_id, timestamp)
         _edge(con, event_node, "FOR_TASK", task_node, event_id, timestamp)
+    if row["event_type"] == "learning_commit":
+        try:
+            learning_metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            learning_metadata = {}
+        learning_edges = learning_metadata.get("learning_edges")
+        if isinstance(learning_edges, list):
+            for edge in learning_edges[:16]:
+                if not isinstance(edge, dict):
+                    continue
+                source = str(edge.get("source") or "").strip()
+                target = str(edge.get("target") or "").strip()
+                relation = str(edge.get("relation") or "").strip()
+                if not source or not target or not relation or source == target:
+                    continue
+                source_node = "learning:" + hashlib.sha256(
+                    source.encode("utf-8")
+                ).hexdigest()[:32]
+                target_node = "learning:" + hashlib.sha256(
+                    target.encode("utf-8")
+                ).hexdigest()[:32]
+                node_metadata = _metadata({"learning_commit": True})
+                _node(
+                    con, source_node, "learning_concept", source,
+                    event_id, timestamp, node_metadata,
+                )
+                _node(
+                    con, target_node, "learning_concept", target,
+                    event_id, timestamp, node_metadata,
+                )
+                _edge(con, event_node, "ASSERTS_RELATION", source_node, event_id, timestamp)
+                _edge(con, source_node, relation, target_node, event_id, timestamp)
     previous = con.execute(
         "SELECT event_uid FROM conversation_events WHERE thread_id=? AND event_id<? "
         "ORDER BY event_id DESC LIMIT 1",

@@ -20,8 +20,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Any, Callable, TypeVar
+
+from .evidence_levels import EvidenceLevel
 
 __all__ = [
     "ALLOWED_CHANGE_KINDS",
@@ -52,18 +53,6 @@ __all__ = [
     "canonical_json",
     "packet_fingerprint",
 ]
-
-
-class EvidenceLevel(IntEnum):
-    """Ordered evidence levels, weakest to strongest."""
-
-    INCONCLUSIVE = 0
-    CLAIMED = 1
-    OBSERVATION = 2
-    STATIC_EVIDENCE = 3
-    TESTED = 4
-    REPRODUCED = 5
-    FIXED_AND_VERIFIED = 6
 
 
 ALLOWED_REVIEW_LENSES: frozenset[str] = frozenset(
@@ -115,7 +104,7 @@ MAX_PATH_LENGTH = 512
 MAX_TEXT_LENGTH = 1024
 MAX_COLLECTION_SIZE = 64
 MAX_RATIONALE_LENGTH = 256
-MAX_IDENTITY_LENGTH = 128
+MAX_IDENTITY_LENGTH = 200
 
 BLOCKER_MIN_EVIDENCE_LEVEL: EvidenceLevel = EvidenceLevel.STATIC_EVIDENCE
 

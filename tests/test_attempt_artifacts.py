@@ -5,7 +5,8 @@ import pytest
 from aiworkhub.attempt_artifacts import (
     _ABSENT_SHA256_SENTINEL, _EMPTY_FILE_SHA256, ArtifactEntry,
     AttemptArtifactManifest, InvalidArtifactError, InvalidManifestError,
-    parse_manifest_json, validate_artifact_path,
+    parse_manifest_json, persist_json_bundle, validate_artifact_path,
+    verify_json_bundle,
 )
 
 VALID_SHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -205,6 +206,76 @@ def test_manifest_with_multiple_artifacts_ordered() -> None:
     e1 = _make_entry(path="z.py"); e2 = _make_entry(path="a.py"); e3 = _make_entry(path="m.py")
     m = AttemptArtifactManifest("multi", [e1, e2, e3])
     assert [a.path for a in m.artifacts] == ["a.py","m.py","z.py"]
+
+
+def _bundle_payloads() -> dict[str, dict[str, object]]:
+    return {
+        "metadata": {"request_id": "request-1"},
+        "diff": {"changed_paths": ["src/example.py"]},
+        "validation": {"checks": [], "passed": True},
+        "usage": {"usage_observed": False},
+        "review": {"target_state": "review_ready"},
+    }
+
+
+def test_persist_and_verify_json_bundle_roundtrip(tmp_path) -> None:
+    bundle_dir = tmp_path / "attempt-1"
+
+    receipt = persist_json_bundle(
+        bundle_dir,
+        attempt_id="attempt-1",
+        payloads=_bundle_payloads(),
+    )
+
+    assert receipt["verified"] is True
+    assert receipt["artifact_count"] == 5
+    assert receipt["roles"] == ["diff", "metadata", "review", "usage", "validation"]
+    assert verify_json_bundle(bundle_dir)["attempt_id"] == "attempt-1"
+
+
+def test_verify_json_bundle_rejects_tampering(tmp_path) -> None:
+    bundle_dir = tmp_path / "attempt-1"
+    persist_json_bundle(
+        bundle_dir,
+        attempt_id="attempt-1",
+        payloads=_bundle_payloads(),
+    )
+    (bundle_dir / "usage.json").write_text('{"usage_observed":true}\n', encoding="utf-8")
+
+    with pytest.raises(InvalidArtifactError, match="mismatch"):
+        verify_json_bundle(bundle_dir)
+
+
+def test_persist_json_bundle_requires_core_roles(tmp_path) -> None:
+    payloads = _bundle_payloads()
+    payloads.pop("review")
+
+    with pytest.raises(InvalidManifestError, match="missing required"):
+        persist_json_bundle(
+            tmp_path / "attempt-1",
+            attempt_id="attempt-1",
+            payloads=payloads,
+        )
+
+
+def test_verify_json_bundle_rejects_symlinked_artifact(tmp_path) -> None:
+    bundle_dir = tmp_path / "attempt-1"
+    persist_json_bundle(
+        bundle_dir,
+        attempt_id="attempt-1",
+        payloads=_bundle_payloads(),
+    )
+    usage_path = bundle_dir / "usage.json"
+    target = tmp_path / "outside.json"
+    target.write_text("{}\n", encoding="utf-8")
+    usage_path.unlink()
+    try:
+        usage_path.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    with pytest.raises(InvalidArtifactError, match="symlink"):
+        verify_json_bundle(bundle_dir)
 
 def test_to_dict_keys_sorted() -> None:
     d = _make_entry().to_dict()

@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
+import json
 import re
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 SCHEMA_ID = "aiworkhub.known_bug_scan.v1"
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_PATHS = 500
 MAX_FINDINGS = 200
+RUNTIME_RECEIPT_SCHEMA = "aiworkhub.known_bug_runtime_reproduction_receipt.v1"
 
 CWE_BY_CATEGORY = {
     "memory_safety": "CWE-119",
@@ -157,6 +160,211 @@ def _finding(rule: Rule, path: str, line: int, column: int, snippet: str) -> dic
             "required_next_evidence": "targeted_test_or_reproduction"}
 
 
+def _source_revision_sha256(root: Path, paths: Iterable[str]) -> str:
+    """Hash the exact bounded path set and bytes inspected by the scanner."""
+
+    revision_rows: list[dict[str, Any]] = []
+    for relative in paths:
+        path = (root / relative).resolve(strict=False)
+        safe_regular = (
+            (path == root or root in path.parents)
+            and not path.is_symlink()
+            and path.is_file()
+        )
+        revision_rows.append({
+            "path": relative,
+            "sha256": (
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                if safe_regular
+                else None
+            ),
+        })
+    encoded = json.dumps(
+        revision_rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_receipt_bytes(receipt: dict[str, Any]) -> bytes:
+    unsigned = {key: value for key, value in receipt.items() if key != "hmac_sha256"}
+    return json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def issue_runtime_reproduction_receipt(
+    report: dict[str, Any],
+    *,
+    bundle_dir: Path,
+    root_cause_fingerprint: str,
+    check_id: str,
+    expected_returncodes: Iterable[int],
+    verified_by: str,
+    coordinator_key: bytes,
+) -> dict[str, Any]:
+    """Issue a manager-owned receipt from an already sealed attempt bundle.
+
+    The validation command and exit semantics are read from the manifest-bound
+    artifact, not accepted from worker prose.  The private coordinator key is
+    required again when the receipt is applied to a scanner report.
+    """
+
+    from . import attempt_artifacts
+
+    if not coordinator_key:
+        raise ValueError("coordinator_key must be non-empty")
+    if not verified_by or not verified_by.strip():
+        raise ValueError("verified_by must be non-empty")
+    source_revision = str(report.get("source_revision_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_revision):
+        raise ValueError("report source revision is unavailable")
+    finding_fingerprints = {
+        str(row.get("root_cause_fingerprint") or "")
+        for row in report.get("findings") or []
+        if isinstance(row, dict)
+    }
+    if root_cause_fingerprint not in finding_fingerprints:
+        raise ValueError("root cause fingerprint is not present in report")
+
+    verification = attempt_artifacts.verify_json_bundle(bundle_dir)
+    manifest_path = bundle_dir / attempt_artifacts.MANIFEST_FILENAME
+    manifest = attempt_artifacts.parse_manifest_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    validation_entry = next(
+        (entry for entry in manifest.artifacts if entry.role == "validation"),
+        None,
+    )
+    if validation_entry is None:
+        raise ValueError("attempt bundle has no validation artifact")
+    validation = json.loads(
+        (bundle_dir / validation_entry.path).read_text(encoding="utf-8")
+    )
+    checks = validation.get("checks") if isinstance(validation, dict) else None
+    if not isinstance(checks, list):
+        raise ValueError("attempt validation checks are unavailable")
+    matching = [
+        row for row in checks
+        if isinstance(row, dict) and str(row.get("check_id") or "") == check_id
+    ]
+    if len(matching) != 1:
+        raise ValueError("runtime reproduction check identity is ambiguous or missing")
+    check = matching[0]
+    command = check.get("executed_argv") or check.get("argv") or check.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        raise ValueError("runtime reproduction command must be exact argv")
+    returncode = check.get("returncode")
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise ValueError("runtime reproduction returncode is unavailable")
+    allowed_returncodes = tuple(expected_returncodes)
+    if (
+        not allowed_returncodes
+        or any(isinstance(code, bool) or not isinstance(code, int) for code in allowed_returncodes)
+        or returncode not in allowed_returncodes
+    ):
+        raise ValueError("runtime reproduction exit semantics did not match")
+
+    receipt: dict[str, Any] = {
+        "schema_id": RUNTIME_RECEIPT_SCHEMA,
+        "attempt_id": str(verification["attempt_id"]),
+        "root_cause_fingerprint": root_cause_fingerprint,
+        "source_revision_sha256": source_revision,
+        "check_id": check_id,
+        "command": command,
+        "command_sha256": hashlib.sha256(
+            json.dumps(command, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+        "returncode": returncode,
+        "expected_returncodes": list(allowed_returncodes),
+        "duration_seconds": check.get("duration_seconds"),
+        "artifact_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "artifact_roles": list(verification["roles"]),
+        "artifact_verified": verification.get("verified") is True,
+        "runtime_reproduced": True,
+        "verified_by": verified_by.strip(),
+    }
+    receipt["hmac_sha256"] = hmac.new(
+        coordinator_key,
+        _canonical_receipt_bytes(receipt),
+        hashlib.sha256,
+    ).hexdigest()
+    return receipt
+
+
+def bind_runtime_reproduction_receipts(
+    report: dict[str, Any],
+    receipts: Iterable[dict[str, Any]],
+    *,
+    coordinator_key: bytes,
+) -> dict[str, Any]:
+    """Return a report whose exact matching findings carry verified receipts."""
+
+    if not coordinator_key:
+        raise ValueError("coordinator_key must be non-empty")
+    revision = str(report.get("source_revision_sha256") or "")
+    verified: dict[str, dict[str, Any]] = {}
+    for raw in receipts:
+        if not isinstance(raw, dict) or raw.get("schema_id") != RUNTIME_RECEIPT_SCHEMA:
+            raise ValueError("runtime reproduction receipt schema is invalid")
+        signature = raw.get("hmac_sha256")
+        expected = hmac.new(
+            coordinator_key,
+            _canonical_receipt_bytes(raw),
+            hashlib.sha256,
+        ).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+            raise ValueError("runtime reproduction receipt signature is invalid")
+        fingerprint = str(raw.get("root_cause_fingerprint") or "")
+        if raw.get("source_revision_sha256") != revision:
+            raise ValueError("runtime reproduction receipt revision mismatch")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            or raw.get("artifact_verified") is not True
+            or raw.get("runtime_reproduced") is not True
+            or not raw.get("verified_by")
+        ):
+            raise ValueError("runtime reproduction receipt evidence is incomplete")
+        verified[fingerprint] = dict(raw)
+
+    bound_findings: list[dict[str, Any]] = []
+    runtime_validated = 0
+    for finding in report.get("findings") or []:
+        row = dict(finding)
+        receipt = verified.get(str(row.get("root_cause_fingerprint") or ""))
+        if receipt is not None:
+            row.update({
+                "verification_state": "runtime_validated",
+                "runtime_validated": True,
+                "required_next_evidence": "",
+                "runtime_reproduction_receipt": receipt,
+            })
+            runtime_validated += 1
+        bound_findings.append(row)
+
+    result = dict(report)
+    result["findings"] = bound_findings
+    summary = dict(result.get("evidence_summary") or {})
+    summary["runtime_validated"] = runtime_validated
+    summary["unvalidated_static_candidates"] = len(bound_findings) - runtime_validated
+    summary["claim_boundary"] = (
+        "runtime_receipt_bound_and_static_candidates_distinguished"
+        if runtime_validated
+        else "static_pattern_not_runtime_reproduction"
+    )
+    result["evidence_summary"] = summary
+    return result
+
+
 def _python_code_lines(text: str) -> list[str]:
     """Mask Python comments and literals while preserving line/column offsets."""
 
@@ -263,6 +471,8 @@ def scan_changed_paths(repo_root: Path | str, changed_paths: Iterable[str]) -> d
     return {"schema_id": SCHEMA_ID, "passed": errors == 0, "errors": errors,
             "warnings": sum(row["severity"] == "warning" for row in findings),
             "paths_considered": len(paths), "findings": retained,
+            "source_revision_sha256": _source_revision_sha256(root, paths),
+            "source_revision_scope": "exact_paths_and_bytes",
             "truncated": len(findings) > MAX_FINDINGS,
             "dedupe_summary": {
                 "candidate_count": len(retained),
@@ -304,6 +514,28 @@ def to_sarif(report: dict) -> dict:
         line = max(1, int(finding.get("line") or 1))
         column = max(1, int(finding.get("column") or 1))
         severity = str(finding.get("severity") or "warning")
+        properties: dict[str, Any] = {
+            "category": category,
+            "cwe": cwe,
+            "verificationState": str(
+                finding.get("verification_state") or "static_candidate"
+            ),
+            "runtimeValidated": bool(finding.get("runtime_validated")),
+            "requiredNextEvidence": str(
+                finding.get("required_next_evidence") or ""
+            ),
+        }
+        reproduction = finding.get("runtime_reproduction_receipt")
+        if isinstance(reproduction, dict) and finding.get("runtime_validated") is True:
+            properties["runtimeReproduction"] = {
+                "attemptId": str(reproduction.get("attempt_id") or ""),
+                "manifestSha256": str(
+                    reproduction.get("artifact_manifest_sha256") or ""
+                ),
+                "commandSha256": str(reproduction.get("command_sha256") or ""),
+                "returncode": reproduction.get("returncode"),
+                "verifiedBy": str(reproduction.get("verified_by") or ""),
+            }
         results.append({
             "ruleId": rule_id,
             "level": "error" if severity == "error" else "warning",
@@ -320,18 +552,11 @@ def to_sarif(report: dict) -> dict:
                     finding.get("root_cause_fingerprint") or ""
                 ),
             },
-            "properties": {
-                "category": category,
-                "cwe": cwe,
-                "verificationState": str(
-                    finding.get("verification_state") or "static_candidate"
-                ),
-                "runtimeValidated": bool(finding.get("runtime_validated")),
-                "requiredNextEvidence": str(
-                    finding.get("required_next_evidence") or "targeted_test_or_reproduction"
-                ),
-            },
+            "properties": properties,
         })
+    runtime_validated = sum(
+        result["properties"].get("runtimeValidated") is True for result in results
+    )
     return {
         "$schema": SARIF_SCHEMA,
         "version": "2.1.0",
@@ -344,7 +569,12 @@ def to_sarif(report: dict) -> dict:
             "results": results,
             "properties": {
                 "sourceSchema": str(report.get("schema_id") or SCHEMA_ID),
-                "claimBoundary": "static_pattern_not_runtime_reproduction",
+                "claimBoundary": (
+                    "runtime_receipt_bound_and_static_candidates_distinguished"
+                    if runtime_validated
+                    else "static_pattern_not_runtime_reproduction"
+                ),
+                "runtimeValidated": runtime_validated,
                 "truncated": bool(report.get("truncated")),
             },
         }],

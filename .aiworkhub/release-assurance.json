@@ -1,0 +1,106 @@
+{
+  "schema_id": "aiworkhub.release_assurance.v1",
+  "claims": [
+    {
+      "id": "semantic-edit-historical-cap-boundary",
+      "verdict": "historical_not_claim_eligible",
+      "evidence": [
+        {
+          "path": "benchmarks/semantic-edit-pilot-v1.json",
+          "sha256": "a0f268e4d727d5362b73e412fe39306ecb6eff6a1995c57f35903deeffdbc8ae"
+        },
+        {
+          "path": "benchmarks/system-benefit-snapshot-v1.json",
+          "sha256": "1c005cee9f2d78d85f5e7521331775af921c8da97096cd05d7eea317d57107a7"
+        }
+      ],
+      "surfaces": [
+        {
+          "path": "README.md",
+          "required_tokens": ["historical capped a/b observation", "20k", "200k", "not eligible"]
+        },
+        {
+          "path": "site/index.html",
+          "required_tokens": ["historical capped a/b observation", "20k", "200k", "not eligible"]
+        },
+        {
+          "path": "site/benchmarks/index.html",
+          "required_tokens": ["historical capped a/b observation", "20k", "200k", "not eligible"]
+        }
+      ]
+    },
+    {
+      "id": "context-bundle-v2-structural-only",
+      "verdict": "verified_structural",
+      "evidence": [
+        {
+          "path": "benchmarks/system-benefit-snapshot-v1.json",
+          "sha256": "1c005cee9f2d78d85f5e7521331775af921c8da97096cd05d7eea317d57107a7"
+        }
+      ],
+      "surfaces": [
+        {
+          "path": "README.md",
+          "required_tokens": ["29.329%", "live fleet remeasurement pending"]
+        },
+        {
+          "path": "site/index.html",
+          "required_tokens": ["29.329%", "live remeasurement"]
+        }
+      ]
+    },
+    {
+      "id": "source-graph-exact-slice-structural-ratio",
+      "verdict": "verified_structural",
+      "evidence": [
+        {
+          "path": "benchmarks/system-benefit-snapshot-v1.json",
+          "sha256": "1c005cee9f2d78d85f5e7521331775af921c8da97096cd05d7eea317d57107a7"
+        }
+      ],
+      "surfaces": [
+        {
+          "path": "docs/BENCHMARKS.md",
+          "required_tokens": ["98.736%", "79.14×", "structural ratio"]
+        }
+      ]
+    }
+  ],
+  "required_tools": [
+    "aiworkhub_manager_source_graph_query",
+    "aiworkhub_manager_learning_commit",
+    "aiworkhub_manager_needfix_markdown_preview",
+    "aiworkhub_manager_needfix_markdown_commit",
+    "aiworkhub_contract_consistency_check",
+    "aiworkhub_source_graph_retrieval_eval"
+  ],
+  "policy_projection_tests": [
+    "tests/test_aiworkhub_agent_tool_instruction_generator_b816_v2.py::test_three_provider_projections_derive_from_same_policy_and_stay_bounded"
+  ],
+  "source_graph_contract_tests": [
+    "tests/test_evidence_instruments.py::test_retrieval_eval_measures_wrapper_rank",
+    "tests/test_evidence_instruments.py::test_retrieval_eval_distinguishes_missing_from_invalid_registry",
+    "tests/test_aiworkhub_source_graph_b849.py::test_index_quality_scorecard_is_generation_bound_and_recomputable",
+    "tests/test_aiworkhub_source_graph_b849.py::test_committed_generation_remains_queryable_during_next_build_extraction"
+  ],
+  "negative_fixture_tests": [
+    "tests/test_readonly_research_lifecycle_b1463.py::test_research_result_rejects_content_free_success_placeholders",
+    "tests/test_quality_reviewer_contract.py::test_missing_quality_review_submission_cannot_finalize_review_ready",
+    "tests/test_quality_reviewer_contract.py::test_conflicting_quality_review_retries_fail_closed"
+  ],
+  "quality_adapter_tests": [
+    "tests/test_aiworkhub_quality_evidence_b906.py::test_adapt_sarif_no_results_is_passed",
+    "tests/test_aiworkhub_quality_evidence_b906.py::test_adapt_sarif_with_results_is_failed",
+    "tests/test_aiworkhub_quality_evidence_b906.py::test_adapt_junit_xml_with_failure",
+    "tests/test_aiworkhub_quality_evidence_b906.py::test_adapt_coverage_summary_below_threshold_fails"
+  ],
+  "source_graph_retrieval_registry": ".aiworkhub/source-graph-retrieval-eval.json",
+  "quality_policy": ".aiworkhub/quality.json",
+  "required_quality_check_ids": [
+    "quality-gate-regression",
+    "python-critical-lint",
+    "typed-kernel",
+    "extension-regression",
+    "release-metadata"
+  ]
+}

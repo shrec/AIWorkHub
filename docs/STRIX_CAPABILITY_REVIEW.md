@@ -43,13 +43,17 @@ offensive-security runtime or product semantics.
 
 ## Evidence still required before further adoption
 
-Two ideas remain candidates rather than shipped claims:
+The two original follow-up ideas now have bounded local implementations:
 
-1. Crash-stream salvage into a retry packet, after a paired failure/retry test
-   proves it reduces repeated reads without leaking stale worktree state.
-2. Runtime-validated scanner findings, after a coordinator-owned reproduction
-   receipt can bind the exact finding fingerprint, revision, command, exit
-   semantics and artifacts without accepting model self-attestation.
+1. Crash-stream salvage creates one request-private retry packet bound to the
+   verified rework overlay. It carries bounded/redacted stdout and stderr tails,
+   exact tail hashes, predecessor exit state and overlay identity. Tests prove
+   the successor reuses the sealed packet and cannot observe later mutations of
+   the old log. No provider-token saving is claimed without a live paired run.
+2. Runtime-validated scanner findings require a coordinator-HMAC receipt bound
+   to the exact scanned-byte revision, finding fingerprint, manifest-verified
+   command, exit semantics and artifact hashes. Unsigned, tampered and
+   revision-drifted claims fail closed and the distinction survives SARIF.
 
 This review follows AIWorkHub's donor rule: preserve useful invariants, avoid a
 parallel database or lifecycle, and measure the result before advertising a

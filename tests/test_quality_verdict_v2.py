@@ -43,13 +43,17 @@ def _finding(
     finding_id: str = "bug-1",
     *,
     severity: str = qe.SEVERITY_HIGH,
+    disposition: str | None = None,
 ) -> dict[str, str]:
-    return {
+    finding = {
         "id": finding_id,
         "severity": severity,
         "summary": "boundary behavior is incorrect",
         "evidence": "tests/test_boundary.py::test_empty does not exercise the changed branch",
     }
+    if disposition is not None:
+        finding["disposition"] = disposition
+    return finding
 
 
 def test_low_risk_good_mechanical_evidence_is_verified() -> None:
@@ -229,6 +233,56 @@ def test_nonblocking_correctness_finding_still_requires_refinement() -> None:
     assert verdict["refine_required"] is True
     assert verdict["blocking_evidence"] == [
         "refinement_required:reviewer:correctness:bug-1"
+    ]
+
+
+@pytest.mark.parametrize("disposition", ["observation", "process_limit"])
+def test_low_nonactionable_reviewer_item_is_retained_without_blocking(
+    disposition: str,
+) -> None:
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        reviewer_reports=[
+            _report(
+                qe.LENS_CORRECTNESS,
+                findings=[_finding(
+                    severity=qe.SEVERITY_LOW,
+                    disposition=disposition,
+                )],
+            )
+        ],
+    )
+
+    assert verdict["passed"] is True
+    assert verdict["refine_required"] is False
+    assert verdict["blocking_evidence"] == []
+    correctness = next(
+        row for row in verdict["lenses"] if row["lens"] == qe.LENS_CORRECTNESS
+    )
+    assert correctness["finding_ids"] == []
+    assert correctness["observation_ids"] == ["reviewer:correctness:bug-1"]
+    finding = verdict["reviewer_reports"][0]["findings"][0]
+    assert finding["disposition"] == disposition
+    assert finding["actionable"] is False
+
+
+def test_nondefect_reviewer_item_cannot_hide_medium_or_higher_severity() -> None:
+    verdict = qe.fold_quality_verdict(
+        [_check()],
+        reviewer_reports=[
+            _report(
+                qe.LENS_SECURITY,
+                findings=[_finding(
+                    severity=qe.SEVERITY_MEDIUM,
+                    disposition="observation",
+                )],
+            )
+        ],
+    )
+
+    assert verdict["passed"] is False
+    assert verdict["blocking_evidence"] == [
+        "reviewer_schema:0:0:nondefect_severity_must_be_low"
     ]
 
 

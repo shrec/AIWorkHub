@@ -30,13 +30,13 @@ jobs:
           - { name: macos, os: macos-latest, mode: local }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -44,6 +44,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
+
+      - name: Verify release assurance manifest
+        run: python scripts/check_release_assurance.py
+
+      - name: Verify replayable release evidence pack
+        run: python scripts/check_release_evidence_pack.py
 
       - name: Install and qualify cross-platform Python runtime
         env:
@@ -55,12 +61,12 @@ jobs:
           python -m pytest tests/test_platform_io.py tests/test_cross_platform_runtime.py tests/test_release_qualification_e2e.py -q --tb=short --junitxml=qualification-${{ matrix.name }}.xml
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.24.x"
           cache: false
@@ -78,7 +84,7 @@ jobs:
         working-directory: vscode-extension
 
       - name: Upload qualification evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-qualification-${{ matrix.name }}
           path: |
@@ -92,13 +98,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -106,6 +112,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: python scripts/release_metadata.py check --tag "$RELEASE_TAG"
+
+      - name: Verify release assurance manifest
+        run: python scripts/check_release_assurance.py
+
+      - name: Verify replayable release evidence pack
+        run: python scripts/check_release_evidence_pack.py
 
       - name: Install Python test and build dependencies
         run: |
@@ -136,7 +148,7 @@ jobs:
           python -m twine check dist/*
 
       - name: Upload Python distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: aiworkhub-python-dist
           path: |
@@ -145,12 +157,12 @@ jobs:
           if-no-files-found: error
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Set up Go for native Windows callback launchers
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.24.x"
           cache: false
@@ -182,7 +194,7 @@ jobs:
           test -s "${vsix[0]}"
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: aiworkhub-vsix
           path: vscode-extension/dist/aiworkhub-*.vsix
@@ -196,19 +208,19 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 1
 
       - name: Download Python distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiworkhub-python-dist
           path: release-assets/python/
 
       - name: Download VSIX
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: release-assets/vscode/
@@ -233,7 +245,7 @@ jobs:
           release-assets/python/* release-assets/vscode/*
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           name: AIWorkHub ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -278,7 +290,7 @@ jobs:
           }
 
       - name: Download VSIX
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: registry-assets/
@@ -308,7 +320,7 @@ jobs:
           }
 
       - name: Download VSIX
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiworkhub-vsix
           path: registry-assets/
@@ -334,7 +346,7 @@ jobs:
 
     steps:
       - name: Download Python distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: aiworkhub-python-dist
           path: dist/

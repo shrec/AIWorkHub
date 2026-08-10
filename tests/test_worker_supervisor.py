@@ -108,6 +108,34 @@ def test_latest_progress_event_is_bounded_and_uses_newest_sequence(tmp_path: Pat
     }
 
 
+def test_latest_progress_event_preserves_bounded_tool_timeout_diagnostic(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "stdout.log"
+    output.write_text(json.dumps({
+        "type": "aiworkhub_progress",
+        "sequence": 3,
+        "phase": "tool_turn",
+        "tool_name": "aiworkhub_worker_quality_review_submit",
+        "tool_state": "failed",
+        "elapsed_ms": 120001,
+        "error_code": "mcp_request_timeout",
+        "timeout_phase": "request_wait",
+        "timeout_ms": 120000,
+    }) + "\n", encoding="utf-8")
+
+    assert worker_supervisor._latest_progress_event(output) == {
+        "sequence": 3,
+        "phase": "tool_turn",
+        "tool_name": "aiworkhub_worker_quality_review_submit",
+        "tool_state": "failed",
+        "elapsed_ms": 120001,
+        "error_code": "mcp_request_timeout",
+        "timeout_phase": "request_wait",
+        "timeout_ms": 120000,
+    }
+
+
 def test_progress_tail_preserves_meaningful_event_before_newer_liveness(tmp_path: Path) -> None:
     output = tmp_path / "stdout.log"
     events = [

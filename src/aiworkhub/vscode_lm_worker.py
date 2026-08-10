@@ -14,7 +14,7 @@ import textwrap
 import time
 import unicodedata
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from . import semantic_edit
 from .vscode_lm_bridge import (
@@ -23,6 +23,7 @@ from .vscode_lm_bridge import (
     EDIT_RESPONSE_SCHEMA_ID_V2,
     ProgressFileSignature,
     ProgressReadTransientError,
+    ProgressReceiptSecurityError,
     RESPONSE_SCHEMA_ID,
     progress_file_signature,
     read_progress_receipt_snapshot,
@@ -359,6 +360,9 @@ def _check_edit_fidelity(
     normalized, wrapped, unicode_ellipsis, compatibility_changed = (
         _classification_payload(new_text)
     )
+    old_normalized, _old_wrapped, _old_unicode_ellipsis, _old_compatibility_changed = (
+        _classification_payload(old_text)
+    )
     if create and not normalized:
         _fidelity_reject("empty_required_create", path, operation)
     if normalized == "..." and (
@@ -366,6 +370,7 @@ def _check_edit_fidelity(
         or unicode_ellipsis
         or compatibility_changed
         or wrapped
+        or old_normalized == "..."
         or not _stub_context(old_text, path)
     ):
         _fidelity_reject("ellipsis_only", path, operation)
@@ -769,8 +774,9 @@ def _v3_planned_outputs(
             raise RuntimeError(
                 f"vscode_lm_edit_response_edit_target_invalid:{relative}"
             )
+        required_create = relative in required_creates
         current_bytes = target.read_bytes()
-        if relative in required_creates and current_bytes:
+        if required_create and current_bytes:
             raise RuntimeError(f"vscode_lm_edit_response_create_exists:{relative}")
         actual_hash = hashlib.sha256(current_bytes).hexdigest()
         if actual_hash != expected_hash:
@@ -810,20 +816,35 @@ def _v3_planned_outputs(
         next_bytes = next_text.encode("utf-8")
         if len(next_bytes) > MAX_V2_FILE_BYTES:
             raise RuntimeError(f"vscode_lm_edit_response_file_too_large:{relative}")
-        if relative in required_creates:
+        if required_create:
             # The bridge stages declared new outputs as empty placeholders so
             # v3 can fill them with a bounded virtual-line edit.  That is a
             # create for contract/fidelity purposes even though the protocol
             # represents it in ``edits`` rather than ``creates``.
+            _check_edit_fidelity(
+                "",
+                next_text,
+                path=relative,
+                operation="v3_create",
+                create=True,
+            )
             create_contents[relative] = next_text
         planned.append((relative, next_text))
-        metrics.append({
+        metric = {
             "path": relative,
             "file_bytes": len(current_bytes),
             "entry_index1": group["first_idx"],
             "entry_count": group["entry_count"],
             **edit_metrics,
-        })
+        }
+        if required_create:
+            metric.update({
+                "create": True,
+                "replacement_bytes": len(next_bytes),
+                "whole_file_output_required": True,
+                "token_savings_claimed": False,
+            })
+        metrics.append(metric)
 
     for item in creates:
         if not isinstance(item, dict) or not isinstance(item.get("content"), str):
@@ -879,12 +900,15 @@ def _read_progress_with_retry(
 ) -> tuple[dict[str, Any], ProgressFileSignature | None]:
     for attempt in range(1, PROGRESS_READ_MAX_ATTEMPTS + 1):
         try:
-            return read_progress_receipt_snapshot(
-                path,
-                request_id,
-                repo_id,
-                owner_uid=owner_uid,
-                previous_sequence=previous_sequence,
+            return cast(
+                tuple[dict[str, Any], ProgressFileSignature | None],
+                read_progress_receipt_snapshot(
+                    path,
+                    request_id,
+                    repo_id,
+                    owner_uid=owner_uid,
+                    previous_sequence=previous_sequence,
+                ),
             )
         except ProgressReadTransientError as exc:
             if attempt >= PROGRESS_READ_MAX_ATTEMPTS:
@@ -949,14 +973,21 @@ def run(spec_path: Path) -> dict[str, Any]:
                 )
                 if progress:
                     last_progress_sequence = int(progress["sequence"])
+                    progress_event = {
+                        "type": "aiworkhub_progress",
+                        "sequence": last_progress_sequence,
+                        "phase": str(progress["phase"]),
+                        "updated_at": str(progress["updated_at"]),
+                    }
+                    for key in (
+                        "tool_name", "tool_state", "elapsed_ms", "error_code",
+                        "timeout_phase", "timeout_ms",
+                    ):
+                        if key in progress:
+                            progress_event[key] = progress[key]
                     print(
                         json.dumps(
-                            {
-                                "type": "aiworkhub_progress",
-                                "sequence": last_progress_sequence,
-                                "phase": str(progress["phase"]),
-                                "updated_at": str(progress["updated_at"]),
-                            },
+                            progress_event,
                             ensure_ascii=True,
                             sort_keys=True,
                         ),
@@ -1088,7 +1119,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run(Path(args.spec))
     except Exception as exc:  # noqa: BLE001
-        print(json.dumps({"type": "result", "subtype": "error", "is_error": True, "error": str(exc)}))
+        failure = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": str(exc),
+        }
+        if isinstance(exc, ProgressReceiptSecurityError):
+            failure["diagnostics"] = {"progress_security": exc.receipt}
+        print(json.dumps(failure, ensure_ascii=True, sort_keys=True))
         return 1
     receipt = str(result.pop("project_context_receipt", "") or "").strip()
     if receipt:

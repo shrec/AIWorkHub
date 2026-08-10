@@ -18,7 +18,10 @@ from . import context_importer
 from . import context_graph
 from . import cost_ledger
 from . import feature_settings
+from . import learning_commit_store
+from . import needfix_ingest
 from . import storage_registry
+from . import task_decomposition
 from . import workforce_catalog
 from . import workforce_router
 from . import worker_ai_tools_mcp as worker_tools
@@ -61,6 +64,7 @@ def _invoke(call: Callable[[worker_tools.WorkerToolContext], dict[str, Any]], *,
 
 def _write_invoke(
     call: Callable[[Path, dict[str, str]], dict[str, Any]], *, topic: str = "management",
+    task_id: str = "",
 ) -> dict[str, Any]:
     context, manager = _manager_context(topic=topic)
     if context is None:
@@ -70,13 +74,18 @@ def _write_invoke(
     actor = {
         "role": "manager",
         "actor_id": manager["session_id"],
-        "task_id": "",
+        "task_id": str(task_id or "")[:256],
         "provider": manager["provider"],
         "session_id": manager["session_id"],
     }
     try:
         result = dict(call(context.authority_repo, actor))
-    except (context_writes.ContextWriteError, workforce_catalog.WorkforceCatalogError) as exc:
+    except (
+        context_writes.ContextWriteError,
+        learning_commit_store.LearningCommitStoreError,
+        needfix_ingest.NeedFixIngestError,
+        workforce_catalog.WorkforceCatalogError,
+    ) as exc:
         result = {"ok": False, "error": str(exc)[:240]}
     except sqlite3.IntegrityError as exc:
         result = {
@@ -101,11 +110,13 @@ def source_graph_query(
     target: str | None = None,
     bundle_type: worker_tools.SourceGraphBundleType = "explore",
     workflow_stage: worker_tools.WorkflowStage = "unspecified",
+    compact_replay: bool = True,
 ) -> dict[str, Any]:
     return _invoke(
         lambda ctx: worker_tools.source_graph_query(
             ctx, mode=mode, query=query, budget=budget,
             target=target, bundle_type=bundle_type, workflow_stage=workflow_stage,
+            compact_replay=compact_replay,
         ),
         target=target,
     )
@@ -241,12 +252,14 @@ def _workforce_process_rows(repo: Path) -> list[dict[str, Any]]:
 
 def workforce_catalog_read() -> dict[str, Any]:
     def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        ledger = cost_ledger.build_cost_ledger(
+            repo_root=ctx.authority_repo, include_tasks=True
+        )
         return workforce_catalog.build_catalog(
             ctx.authority_repo,
             process_rows=_workforce_process_rows(ctx.authority_repo),
-            usage_rows=cost_ledger.build_cost_ledger(
-                repo_root=ctx.authority_repo, include_tasks=True
-            ).get("tasks") or [],
+            usage_rows=ledger.get("tasks") or [],
+            cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
         )
 
     return _invoke(
@@ -273,16 +286,42 @@ def workforce_rank(
             tool_needs=tool_needs or [],
             quality_floor=quality_floor,
         )
+        ledger = cost_ledger.build_cost_ledger(
+            repo_root=ctx.authority_repo, include_tasks=True
+        )
         snapshot = workforce_catalog.build_catalog(
             ctx.authority_repo,
             process_rows=_workforce_process_rows(ctx.authority_repo),
-            usage_rows=cost_ledger.build_cost_ledger(
-                repo_root=ctx.authority_repo, include_tasks=True
-            ).get("tasks") or [],
+            usage_rows=ledger.get("tasks") or [],
+            cost_per_accepted_outcome=ledger.get("cost_per_accepted_outcome") or {},
         )
         return workforce_catalog.rank_task(ctx.authority_repo, task, catalog=snapshot)
 
     return _invoke(call)
+
+
+def task_decomposition_preview(
+    *,
+    parent_task_id: str,
+    objective: str,
+    source_graph_receipt: dict[str, Any],
+    children: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a pure Source Graph-grounded child-DAG proposal."""
+
+    def call(ctx: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        try:
+            return task_decomposition.build_proposal(
+                ctx.authority_repo,
+                parent_task_id=parent_task_id,
+                objective=objective,
+                source_graph_receipt=source_graph_receipt,
+                children=children,
+            )
+        except task_decomposition.TaskDecompositionError as exc:
+            return {"ok": False, "error": str(exc)[:500]}
+
+    return _invoke(call, topic="task_decomposition")
 
 
 def workforce_upsert(*, worker: dict[str, Any]) -> dict[str, Any]:
@@ -342,6 +381,81 @@ def kb_write(
     )
 
 
+def learning_commit(
+    *,
+    task_id: str,
+    request_id: str,
+    repo_area: str,
+    outcome: str,
+    evidence_ids: list[str],
+    idempotency_key: str,
+    provenance: str,
+    root_cause_candidate: str = "",
+    invariant_candidate: str = "",
+    lesson_candidate: str = "",
+    edge_candidates: list[dict[str, str]] | None = None,
+    promote_ai_memory: bool = False,
+    promote_context_graph: bool = False,
+    promote_kb: bool = False,
+) -> dict[str, Any]:
+    """Commit one explicit manager learning decision after adjudication."""
+    data = {
+        "task_id": task_id,
+        "repo_area": repo_area,
+        "outcome": outcome,
+        "evidence_ids": evidence_ids,
+        "root_cause_candidate": root_cause_candidate or None,
+        "invariant_candidate": invariant_candidate or None,
+        "lesson_candidate": lesson_candidate or None,
+        "edge_candidates": edge_candidates or [],
+        "promotion_eligible_ai_memory": bool(promote_ai_memory),
+        "promotion_eligible_context_graph": bool(promote_context_graph),
+        "promotion_eligible_kb": bool(promote_kb),
+    }
+    return _write_invoke(
+        lambda repo, actor: learning_commit_store.commit_learning(
+            repo,
+            actor=actor,
+            request_id=request_id,
+            data=data,
+            idempotency_key=idempotency_key,
+            provenance=provenance,
+        ),
+        topic="learning_commit",
+        task_id=task_id,
+    )
+
+
+def needfix_markdown_preview(
+    *, source_paths: list[str] | None = None, follow_links: bool = True,
+) -> dict[str, Any]:
+    def call(context: worker_tools.WorkerToolContext) -> dict[str, Any]:
+        try:
+            return needfix_ingest.preview(
+                context.authority_repo,
+                source_paths=source_paths,
+                follow_links=follow_links,
+            )
+        except needfix_ingest.NeedFixIngestError as exc:
+            return {"ok": False, "error": str(exc)[:240]}
+
+    return _invoke(call, topic="needfix_markdown_intake")
+
+
+def needfix_markdown_commit(
+    *, source_paths: list[str] | None, preview_id: str, follow_links: bool = True,
+) -> dict[str, Any]:
+    return _write_invoke(
+        lambda repo, _actor: needfix_ingest.commit(
+            repo,
+            source_paths=source_paths,
+            preview_id=preview_id,
+            follow_links=follow_links,
+        ),
+        topic="needfix_markdown_intake",
+    )
+
+
 def context_import(
     *, component: context_importer.Component, operation: context_importer.Operation,
     source_path: str = "", idempotency_key: str = "", import_id: str = "",
@@ -392,6 +506,9 @@ __all__ = [
     "kb_related",
     "kb_search",
     "kb_write",
+    "learning_commit",
+    "needfix_markdown_commit",
+    "needfix_markdown_preview",
     "session_current_state",
     "session_write",
     "source_graph_query",

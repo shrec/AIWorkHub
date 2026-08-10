@@ -1,5 +1,23 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.40 — 2026-08-10
+
+### Fixed
+
+- Reject literal ellipsis placeholders in required semantic-edit creates and
+  retained rework.
+- Resolve Ruff and mypy through a trusted PATH entrypoint when the active MCP
+  interpreter cannot import the declared module, without losing executed-command
+  provenance.
+- Verify supersession replacement tasks before archiving the original card.
+- Keep quality-verdict lens aggregation strictly typed.
+
+### Validation
+
+- Added focused placeholder-fidelity, quality-tool-resolution and replacement
+  edge regressions; complete Python and extension qualification remains the
+  release gate.
+
 ## 0.9.39 — 2026-08-09
 
 ### Added

@@ -50,6 +50,28 @@ def test_main_stdout_is_safe_for_legacy_windows_code_pages(
     assert json.loads(output)["result"] == "Move → 測試"
 
 
+def test_main_emits_structured_progress_security_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    failure = vscode_lm_bridge.ProgressReceiptSecurityError(
+        "bridge_progress_non_monotonic",
+        "sequence",
+        observed_sequence=4,
+    )
+
+    def fail(_path: Path) -> dict[str, object]:
+        raise failure
+
+    monkeypatch.setattr(vscode_lm_worker, "run", fail)
+
+    assert vscode_lm_worker.main(["--spec", str(tmp_path / "unused.json")]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "bridge_progress_non_monotonic"
+    assert result["diagnostics"]["progress_security"] == failure.receipt
+
+
 def test_root_and_nested_existing_files_preserve_mode_bits(
     tmp_path: Path,
 ) -> None:

@@ -471,6 +471,61 @@ def test_callback_bridge_health_batch_stats_never_expose_full_thread_id(tmp_path
     assert snapshot["callback_bridge_health"]["batches"]["inflight_batch_member_count"] == 3
 
 
+def test_callback_bridge_health_does_not_project_historical_dead_letter_as_current(tmp_path):
+    root = _init_canonical_repo(tmp_path, "callback-current-truth")
+    conn = sqlite3.connect(_canonical_db(root))
+    conn.row_factory = sqlite3.Row
+    _insert_canonical_task(conn, "OLD_FAILURE", status="blocked")
+    _insert_canonical_task(conn, "NEW_SUCCESS", status="finished")
+    conn.execute(
+        "INSERT INTO callback_outbox "
+        "(task_id, origin_thread_id, transition, episode_id, state, "
+        "created_at, updated_at, last_error) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "OLD_FAILURE", "019f-old", "validation_failed", "1",
+            "dead_letter", "2026-08-06T00:00:00+00:00",
+            "2026-08-06T00:00:00+00:00", "direct app-server input is not allowed",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO callback_outbox "
+        "(task_id, origin_thread_id, transition, episode_id, state, "
+        "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+        (
+            "NEW_SUCCESS", "019f-current", "review_ready", "1",
+            "delivered", "2026-08-09T00:00:00+00:00", "2026-08-09T00:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    health = task_store.callback_bridge_health(root)
+    assert health["by_state"]["dead_letter"] == 1
+    assert health["last_dead_letter_error"] == "direct app-server input is not allowed"
+    assert health["current_delivery_status"] == "healthy"
+    assert health["current_delivery_error"] == ""
+    assert health["recovered_after_last_dead_letter"] is True
+
+    conn = sqlite3.connect(_canonical_db(root))
+    conn.execute(
+        "INSERT INTO callback_outbox "
+        "(task_id, origin_thread_id, transition, episode_id, state, "
+        "created_at, updated_at, last_error) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "OLD_FAILURE", "019f-current", "validation_failed", "2",
+            "dead_letter", "2026-08-10T00:00:00+00:00",
+            "2026-08-10T00:00:00+00:00", "new current failure",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    degraded = task_store.callback_bridge_health(root)
+    assert degraded["current_delivery_status"] == "degraded"
+    assert degraded["current_delivery_error"] == "new current failure"
+    assert degraded["recovered_after_last_dead_letter"] is False
+
+
 def test_exact_status_counts_reports_totals_past_default_task_limit(tmp_path, monkeypatch):
     """B455: authoritative finished cards can exceed DEFAULT_TASK_LIMIT
     (500). exact_status_counts must report the true total via one narrow
@@ -1160,3 +1215,64 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
     assert "hunter2" not in serialized
     assert "stdout_path" not in serialized
     assert "stderr_path" not in serialized
+
+
+def test_task_detail_prefers_verified_reviewer_findings_over_terminal_prose():
+    class ReviewerEvidenceProvider:
+        def get_task(self, task_id):
+            assert task_id == "REVIEW_TASK_TRUTH_B13_V1"
+            return {
+                "task_id": task_id,
+                "status": "review",
+                "worker_status": "review",
+                "completion_summary": (
+                    "Security review completed. No code changes required."
+                ),
+                "terminal_review": {
+                    "substatus": "review_ready",
+                    "evidence": {
+                        "quality_review_receipt": {
+                            "schema_id": "aiworkhub.quality_reviewer_receipt.v1",
+                            "authority": {
+                                "process_identity_verified": True,
+                                "audit_verified": True,
+                                "terminal_state": "review_ready",
+                            },
+                            "report": {
+                                "lens": "security",
+                                "read_only": True,
+                                "can_mutate_repo": False,
+                                "findings": [
+                                    {"severity": "low"},
+                                    {"severity": "low"},
+                                ],
+                            },
+                        }
+                    },
+                },
+            }
+
+        def get_agent_processes(self):
+            return {"ok": True, "processes": []}
+
+        def get_task_events(self, task_id):
+            return []
+
+    detail = dashboard.build_task_detail(
+        "REVIEW_TASK_TRUTH_B13_V1", ReviewerEvidenceProvider()
+    )
+    assert detail is not None
+    logs = detail["task"]["review_evidence_bundle"]["logs"]
+    assert logs["result_summary_source"] == "verified_quality_review_receipt"
+    expected = "Verified security review: 2 findings (low: 2). Refinement required."
+    assert logs["result_summary"] == expected
+    assert logs["quality_review"] == {
+        "source": "verified_quality_review_receipt",
+        "text": expected,
+        "lens": "security",
+        "finding_count": 2,
+        "severity_counts": {"critical": 0, "high": 0, "medium": 0, "low": 2},
+        "refinement_required": True,
+        "blocking_finding_count": 0,
+    }
+    assert "No code changes required" not in json.dumps(logs)

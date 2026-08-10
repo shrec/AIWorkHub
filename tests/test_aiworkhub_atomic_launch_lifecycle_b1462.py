@@ -284,6 +284,72 @@ def test_plan_surfaces_pending_preclaim_launch_blocker():
     assert snapshot["explicit_retry_count"] == 1
 
 
+def test_plan_rechecks_historical_collision_blocker_from_current_cards():
+    snapshot = task_plan.build_snapshot(
+        [
+            {
+                "task_id": "TASK_STALE_COLLISION",
+                "runner": RUNNER,
+                "topic": TOPIC,
+                "status": "pending",
+                "worker_status": "unclaimed",
+                "allowed_writes": ["src/module.py"],
+                "depends_on": [],
+                "created_at": NOW,
+                "operational_blocker": {
+                    "kind": "launch_blocked",
+                    "adapter_id": "vscode_lm",
+                    "reason": "collision_guard_failed",
+                },
+            }
+        ]
+    )
+
+    assert snapshot["ready"] == ["TASK_STALE_COLLISION"]
+    assert snapshot["ready_capacity"] == 1
+    assert snapshot["operational_blockers"] == {}
+    assert snapshot["operational_blocked_count"] == 0
+
+
+def test_plan_keeps_current_overlap_after_historical_collision_recheck():
+    snapshot = task_plan.build_snapshot(
+        [
+            {
+                "task_id": "TASK_ACTIVE_OWNER",
+                "runner": RUNNER,
+                "topic": TOPIC,
+                "status": "processing",
+                "worker_status": "claimed",
+                "launch_request_id": "request-active",
+                "allowed_writes": ["src/module.py"],
+                "depends_on": [],
+                "created_at": NOW,
+            },
+            {
+                "task_id": "TASK_STILL_COLLIDING",
+                "runner": RUNNER,
+                "topic": TOPIC,
+                "status": "pending",
+                "worker_status": "unclaimed",
+                "allowed_writes": ["src/module.py"],
+                "depends_on": [],
+                "created_at": NOW,
+                "operational_blocker": {
+                    "kind": "launch_blocked",
+                    "adapter_id": "vscode_lm",
+                    "reason": "collision_guard_failed",
+                },
+            },
+        ]
+    )
+
+    assert snapshot["ready"] == []
+    assert snapshot["write_scope_overlaps"] == {
+        "TASK_STILL_COLLIDING": ["src/module.py"]
+    }
+    assert snapshot["operational_blockers"] == {}
+
+
 def test_preclaim_launch_blocker_is_persisted_and_cleared_by_exact_claim(tmp_path, monkeypatch):
     repo = _repo(tmp_path, monkeypatch)
     _insert(repo, "TASK_RETRYABLE_BLOCKER")

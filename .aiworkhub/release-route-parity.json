@@ -1,0 +1,19 @@
+{
+  "schema_id": "aiworkhub.release_route_parity.v1",
+  "observations": [
+    {
+      "platform": "linux",
+      "available_routes": 6,
+      "total_routes": 7,
+      "evidence_kind": "external_live_observation",
+      "claim_scope": "environment_specific_not_cross_platform_guarantee"
+    },
+    {
+      "platform": "windows",
+      "available_routes": 3,
+      "total_routes": 7,
+      "evidence_kind": "external_live_observation",
+      "claim_scope": "environment_specific_not_cross_platform_guarantee"
+    }
+  ]
+}

@@ -146,6 +146,25 @@ def progress_file_signature(metadata: os.stat_result) -> ProgressFileSignature:
     )
 
 
+class ProgressReceiptSecurityError(BridgeError):
+    """Fail-closed progress validation with a bounded, path-free receipt."""
+
+    def __init__(
+        self,
+        invariant: str,
+        validation_phase: str,
+        *,
+        observed_sequence: int | None = None,
+    ) -> None:
+        super().__init__(invariant)
+        self.receipt = {
+            "schema_id": "aiworkhub.vscode_lm.progress_security_failure.v1",
+            "validation_phase": validation_phase,
+            "invariant": invariant,
+            "observed_sequence": observed_sequence,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class BridgeRequest:
     request_id: str
@@ -1099,15 +1118,25 @@ def _validate_progress_metadata(
 ) -> None:
     """Fail closed for a progress file that is not a private regular file."""
     if stat.S_ISLNK(metadata.st_mode):
-        raise BridgeError("bridge_progress_symlink")
+        raise ProgressReceiptSecurityError(
+            "bridge_progress_symlink", "filesystem_identity"
+        )
     if not stat.S_ISREG(metadata.st_mode):
-        raise BridgeError("bridge_progress_not_file")
+        raise ProgressReceiptSecurityError(
+            "bridge_progress_not_file", "filesystem_shape"
+        )
     if metadata.st_size > MAX_PROGRESS_BYTES:
-        raise BridgeError("bridge_progress_too_large")
+        raise ProgressReceiptSecurityError(
+            "bridge_progress_too_large", "filesystem_size"
+        )
     if owner_uid is not None and metadata.st_uid != owner_uid:
-        raise BridgeError("bridge_progress_foreign_owner")
+        raise ProgressReceiptSecurityError(
+            "bridge_progress_foreign_owner", "filesystem_owner"
+        )
     if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise BridgeError("bridge_progress_insecure_mode")
+        raise ProgressReceiptSecurityError(
+            "bridge_progress_insecure_mode", "filesystem_mode"
+        )
 
 
 def _validate_progress_receipt(
@@ -1118,48 +1147,116 @@ def _validate_progress_receipt(
     previous_sequence: int | None = None,
 ) -> dict[str, Any]:
     """Validate one bounded progress snapshot without treating it as completion."""
+    def fail(
+        invariant: str,
+        validation_phase: str,
+        *,
+        observed_sequence: int | None = None,
+    ) -> None:
+        raise ProgressReceiptSecurityError(
+            invariant,
+            validation_phase,
+            observed_sequence=observed_sequence,
+        )
+
     if not _REQUEST_ID_RE.fullmatch(request_id):
-        raise BridgeError("bridge_progress_request_id_invalid")
+        fail("bridge_progress_request_id_invalid", "request_identity")
     if len(raw_payload) > MAX_PROGRESS_BYTES:
-        raise BridgeError("bridge_progress_too_large")
+        fail("bridge_progress_too_large", "filesystem_size")
     payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
     try:
         payload_text = raw_payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise BridgeError(
+        fail(
             "bridge_progress_invalid_json:"
-            f"utf8_offset={exc.start}:bytes={len(raw_payload)}:sha256={payload_sha256}"
-        ) from None
+            f"utf8_offset={exc.start}:bytes={len(raw_payload)}:sha256={payload_sha256}",
+            "json_decode",
+        )
     try:
         payload = json.loads(payload_text)
     except json.JSONDecodeError as exc:
-        raise BridgeError(
+        fail(
             "bridge_progress_invalid_json:"
             f"line={exc.lineno}:column={exc.colno}:"
-            f"bytes={len(raw_payload)}:sha256={payload_sha256}"
-        ) from None
+            f"bytes={len(raw_payload)}:sha256={payload_sha256}",
+            "json_decode",
+        )
     if not isinstance(payload, dict):
-        raise BridgeError("bridge_progress_not_object")
-    if payload.get("schema_id") != PROGRESS_RECEIPT_SCHEMA_ID:
-        raise BridgeError("bridge_progress_schema_mismatch")
-    if payload.get("request_id") != request_id:
-        raise BridgeError("bridge_progress_identity_mismatch")
-    if payload.get("repo_id") != repo_id:
-        raise BridgeError("bridge_progress_repo_mismatch")
+        fail("bridge_progress_not_object", "payload_shape")
     sequence = payload.get("sequence")
+    observed_sequence = (
+        sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else None
+    )
+    if payload.get("schema_id") != PROGRESS_RECEIPT_SCHEMA_ID:
+        fail(
+            "bridge_progress_schema_mismatch",
+            "schema_identity",
+            observed_sequence=observed_sequence,
+        )
+    if payload.get("request_id") != request_id:
+        fail(
+            "bridge_progress_identity_mismatch",
+            "request_identity",
+            observed_sequence=observed_sequence,
+        )
+    if payload.get("repo_id") != repo_id:
+        fail(
+            "bridge_progress_repo_mismatch",
+            "repository_identity",
+            observed_sequence=observed_sequence,
+        )
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
-        raise BridgeError("bridge_progress_sequence_invalid")
+        fail("bridge_progress_sequence_invalid", "sequence")
     if previous_sequence is not None and sequence <= previous_sequence:
-        raise BridgeError("bridge_progress_non_monotonic")
+        fail(
+            "bridge_progress_non_monotonic",
+            "sequence",
+            observed_sequence=sequence,
+        )
     if payload.get("phase") not in PROGRESS_PHASES:
-        raise BridgeError("bridge_progress_phase_invalid")
+        fail(
+            "bridge_progress_phase_invalid",
+            "progress_phase",
+            observed_sequence=sequence,
+        )
+    tool_name = payload.get("tool_name")
+    if tool_name is not None and (
+        not isinstance(tool_name, str) or len(tool_name) > 200
+    ):
+        fail("bridge_progress_tool_name_invalid", "tool_diagnostic", observed_sequence=sequence)
+    tool_state = payload.get("tool_state")
+    if tool_state is not None and tool_state not in {"started", "completed", "failed"}:
+        fail("bridge_progress_tool_state_invalid", "tool_diagnostic", observed_sequence=sequence)
+    for key, maximum in (("elapsed_ms", 86_400_000), ("timeout_ms", 86_400_000)):
+        value = payload.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value < 0
+            or value > maximum
+        ):
+            fail(f"bridge_progress_{key}_invalid", "tool_diagnostic", observed_sequence=sequence)
+    for key, maximum in (("error_code", 256), ("timeout_phase", 80)):
+        value = payload.get(key)
+        if value is not None and (
+            not isinstance(value, str) or len(value) > maximum
+        ):
+            fail(f"bridge_progress_{key}_invalid", "tool_diagnostic", observed_sequence=sequence)
     updated_at = payload.get("updated_at")
     if not isinstance(updated_at, str) or not updated_at.strip():
-        raise BridgeError("bridge_progress_timestamp_missing")
+        fail(
+            "bridge_progress_timestamp_missing",
+            "timestamp",
+            observed_sequence=sequence,
+        )
     try:
         datetime.fromisoformat(updated_at)
     except (TypeError, ValueError):
-        raise BridgeError("bridge_progress_timestamp_invalid") from None
+        fail(
+            "bridge_progress_timestamp_invalid",
+            "timestamp",
+            observed_sequence=sequence,
+        )
     return payload
 
 
