@@ -252,8 +252,17 @@ def build_review_prompt(
     *,
     lens: str,
     submit_tool_name: str = "aiworkhub_worker_quality_review_submit",
+    packet_file: str | None = None,
+    max_inline_bytes: int = 96 * 1024,
 ) -> str:
-    """Render a bounded independent-review prompt from packet facts only."""
+    """Render a bounded independent-review prompt from packet facts only.
+
+    When *packet_file* is provided the serialised packet is written to that
+    path and the prompt references it via a worker-scoped file read instead of
+    embedding the full JSON inline.  This avoids E2BIG on native CLI adapters
+    where large quality-review payloads would otherwise be passed through argv.
+    *max_inline_bytes* guards the inline fallback when *packet_file* is None.
+    """
 
     if lens not in {"correctness", "security", "code_quality"}:
         raise ReviewerEvidenceError("invalid_reviewer_lens")
@@ -276,6 +285,21 @@ def build_review_prompt(
         if active_scope is not None
         else ""
     )
+    use_file_transport = (
+        packet_file is not None and len(encoded.encode("utf-8")) > max_inline_bytes
+    )
+    if use_file_transport:
+        import os as _os
+        if not _os.path.isfile(packet_file):
+            raise ReviewerEvidenceError("review_packet_file_missing")
+    packet_evidence = (
+        f"QUALITY_REVIEW_PACKET_FILE: {packet_file}\n"
+        f"PACKET_SHA256: {packet_digest}\n"
+        "Read the packet file first with a worker file-read tool; its "
+        f"contents are the authoritative evidence for this review.\n"
+        if use_file_transport
+        else f"QUALITY_REVIEW_PACKET: {encoded}\n"
+    )
     return (
         "You are an independent, strictly read-only quality reviewer.\n"
         f"Review lens: {lens}.\n"
@@ -296,7 +320,7 @@ def build_review_prompt(
         f"Before finishing, call {submit_tool_name} exactly once with "
         f'packet_sha256="{packet_digest}", lens="{lens}", and your findings array.\n'
         "The tool call is the authoritative submission; prose is not evidence.\n"
-        f"QUALITY_REVIEW_PACKET: {encoded}\n"
+        f"{packet_evidence}"
     )
 
 

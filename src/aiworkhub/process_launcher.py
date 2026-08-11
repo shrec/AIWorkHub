@@ -4564,20 +4564,14 @@ class ProcessManager:
                         )
                 launch_phase = "prompt_and_adapter_plan"
                 if quality_review_binding is not None:
-                    private_tool_name = (
-                        "aiworkhub_manager_quality_review_submit"
-                        if adapter_id
-                        in {
-                            runtime_adapters.VSCODE_LM_ADAPTER,
-                            runtime_adapters.GLM_VSCODE_LM_ADAPTER,
-                            runtime_adapters.DEEPSEEK_VSCODE_LM_ADAPTER,
-                        }
-                        else "aiworkhub_worker_quality_review_submit"
-                    )
+                    private_tool_name = "aiworkhub_worker_quality_review_submit"
                     prompt = quality_reviewer.build_review_prompt(
                         quality_review_binding["packet"],
                         lens=str(quality_review_binding["lens"]),
                         submit_tool_name=private_tool_name,
+                        packet_file=(
+                            str(review_packet_path) if review_packet_path is not None else None
+                        ),
                     )
                     prompt_budget = {
                         "schema_id": "aiworkhub.worker_prompt_budget.v1",
@@ -7828,7 +7822,7 @@ class ProcessManager:
                 idempotency_key=tool_input.get("idempotency_key", ""),
                 provenance=tool_input.get("provenance", ""),
             )
-        if tool_name == "aiworkhub_manager_quality_review_submit":
+        if tool_name == "aiworkhub_worker_quality_review_submit":
             findings = tool_input.get("findings", [])
             if not isinstance(findings, list):
                 return {"ok": False, "reason": "worker_bridge_findings_invalid"}

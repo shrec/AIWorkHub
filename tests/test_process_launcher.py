@@ -163,7 +163,7 @@ def test_rework_overlay_materialization_uses_same_task_distinct_request(
     candidate.write_bytes(b"def repaired():\n    return True\n")
     digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
     workspace = process_launcher.WorkerWorkspace(
-        request_id="successor-request",
+        request_id="5" * 32,
         repo=repo,
         path=worktree,
         home=home,
@@ -178,7 +178,7 @@ def test_rework_overlay_materialization_uses_same_task_distinct_request(
         task_id="TASK_SAME",
         card={
             "rework_predecessor": {
-                "request_id": "predecessor-request",
+                "request_id": "6" * 32,
                 "changed_path_hashes": {"src/service.py": digest},
             }
         },
@@ -188,8 +188,8 @@ def test_rework_overlay_materialization_uses_same_task_distinct_request(
     assert packet is not None
     assert packet["successor_task_id"] == "TASK_SAME"
     assert packet["predecessor_task_id"] == "TASK_SAME"
-    assert packet["successor_request_id"] == "successor-request"
-    assert packet["predecessor_request_id"] == "predecessor-request"
+    assert packet["successor_request_id"] == "5" * 32
+    assert packet["predecessor_request_id"] == "6" * 32
     assert json.loads(path.read_text(encoding="utf-8")) == packet
 
 
@@ -205,7 +205,7 @@ def test_crash_retry_packet_reuses_bounded_failure_evidence_without_stale_tree(
     worktree.mkdir(parents=True)
     home.mkdir(parents=True)
     workspace = process_launcher.WorkerWorkspace(
-        request_id="successor-request",
+        request_id="5" * 32,
         repo=repo,
         path=worktree,
         home=home,
@@ -214,7 +214,7 @@ def test_crash_retry_packet_reuses_bounded_failure_evidence_without_stale_tree(
         workspace_baseline={"src/service.py": "a" * 64},
         inherited_rework_paths=("src/service.py",),
     )
-    predecessor = "predecessor-request"
+    predecessor = "6" * 32
     process_launcher.write_json_0600(
         process_dir / f"{predecessor}.request.json",
         {
@@ -302,7 +302,7 @@ def test_crash_retry_packet_rejects_cross_task_predecessor(tmp_path: Path) -> No
     for directory in (repo, process_dir, worktree, home):
         directory.mkdir(parents=True)
     workspace = process_launcher.WorkerWorkspace(
-        request_id="successor-request",
+        request_id="5" * 32,
         repo=repo,
         path=worktree,
         home=home,
@@ -322,12 +322,12 @@ def test_crash_retry_packet_rejects_cross_task_predecessor(tmp_path: Path) -> No
             task_id="TASK_SAME",
             card={
                 "rework_predecessor": {
-                    "request_id": "predecessor-request",
+                    "request_id": "6" * 32,
                     "task_id": "OTHER_TASK",
                 }
             },
             rework_overlay_packet={
-                "predecessor_request_id": "predecessor-request",
+                "predecessor_request_id": "6" * 32,
                 "predecessor_task_id": "OTHER_TASK",
             },
         )
@@ -2985,3 +2985,306 @@ def test_rework_overlay_authority_label_remains_distinct(tmp_path: Path) -> None
     assert "source_graph:candidate_overlay:quality_review_readonly:/test/repo" in authority
     # Three distinct labels, no conflation
     assert len(authority) == 3
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00118 / NF-2026-00131: quality-review lifecycle bootstrap regressions
+# ---------------------------------------------------------------------------
+
+
+def _sealed_reviewer_receipt(
+    packet_sha256: str | None = None,
+    reviewer_request_id: str = "rev-req-001",
+    reviewer_task_id: str = "rev-task-001",
+    target_request_id: str = "tgt-req-001",
+    target_task_id: str = "tgt-task-001",
+    provider: str = "deepseek_vscode_lm",
+) -> dict:
+    if packet_sha256 is None:
+        packet_sha256 = hashlib.sha256(b"packet-body").hexdigest()
+    from aiworkhub import quality_reviewer as _qr
+
+    return {
+        "schema_id": _qr.RECEIPT_SCHEMA_ID,
+        "packet_sha256": packet_sha256,
+        "target": {
+            "request_id": target_request_id,
+            "task_id": target_task_id,
+            "claim_epoch": 1,
+        },
+        "reviewer": {
+            "request_id": reviewer_request_id,
+            "task_id": reviewer_task_id,
+            "provider": provider,
+        },
+        "report": {
+            "lens": "correctness",
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings_count": 0,
+        },
+        "authority": {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+    }
+
+
+def _accepted_latest_event(
+    receipt: dict, reviewer_task_id: str = "rev-task-001", adapter_id: str = "deepseek_vscode_lm",
+) -> dict:
+    return {
+        "state": "accepted",
+        "accepted": True,
+        "task_id": reviewer_task_id,
+        "adapter_id": adapter_id,
+        "quality_review_receipt": receipt,
+    }
+
+
+def _accepted_card(
+    receipt: dict,
+    reviewer_request_id: str = "rev-req-001",
+    reviewer_task_id: str = "rev-task-001",
+    topic: str = "quality_review",
+) -> dict:
+    return {
+        "task_id": reviewer_task_id,
+        "accepted_request_id": reviewer_request_id,
+        "topic": topic,
+        "status": "finished",
+        "terminal_review": {
+            "evidence": {"quality_review_receipt": receipt},
+        },
+        "accept_evidence": {"quality_review_receipt": receipt},
+    }
+
+
+def test_sealed_reviewer_receipt_survives_empty_workspace_hashes() -> None:
+    """A sealed read-only reviewer receipt remains consumable after workspace
+    cleanup when changed_paths=[] and canonical_delta_paths=[] because the
+    receipt identity is self-contained in the event/card/receipt triple and
+    does not depend on workspace-side hash files."""
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    result = process_launcher._verified_accepted_quality_review_receipt(
+        latest=latest,
+        card=card,
+        reviewer_request_id="rev-req-001",
+        target_request_id="tgt-req-001",
+        target_task_id="tgt-task-001",
+    )
+
+    assert result["schema_id"] == receipt["schema_id"]
+    assert result["packet_sha256"] == receipt["packet_sha256"]
+    assert result["report"]["read_only"] is True
+    assert result["report"]["can_mutate_repo"] is False
+    assert result["authority"]["process_identity_verified"] is True
+    # The receipt is valid with no workspace hashes — the canonical_delta_paths
+    # and changed_paths are [] for a read-only sealed receipt.
+    assert result["target"]["request_id"] == "tgt-req-001"
+    assert result["target"]["task_id"] == "tgt-task-001"
+
+
+def test_sealed_reviewer_receipt_rejects_event_not_accepted() -> None:
+    """A reviewer event that was never accepted must be rejected even when the
+    receipt payload is otherwise well-formed."""
+    receipt = _sealed_reviewer_receipt()
+    latest = {
+        "state": "review_ready",
+        "accepted": False,
+        "task_id": "rev-task-001",
+        "quality_review_receipt": receipt,
+    }
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_reviewer_accepted_event_invalid",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_identity_mismatch() -> None:
+    """A receipt whose task/request identity doesn't match the card must be
+    rejected — sealed does not mean unverified."""
+    receipt = _sealed_reviewer_receipt(
+        reviewer_request_id="rev-req-001",
+        target_request_id="tgt-req-001",
+    )
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+    # Card has a different request_id than what we pass as target
+    card["accepted_request_id"] = "rev-req-001"
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_reviewer_accepted_target_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="wrong-target-req",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_wrong_topic() -> None:
+    """A card marked with a non-quality_review topic cannot satisfy the sealed
+    receipt acceptance check."""
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt, topic="task_mcp")
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_reviewer_accepted_topic_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
+    tmp_path: Path,
+) -> None:
+    """Large quality-review packets (≥ 150 KB serialised) must be routed
+    through file/stdin transport, never through argv, to avoid E2BIG on
+    native CLI adapters."""
+    from aiworkhub import quality_reviewer as _qr
+
+    large_changed_path_hashes = {
+        f"src/large_module_{i:04d}.py": hashlib.sha256(
+            f"content-{i}".encode("utf-8")
+        ).hexdigest()
+        for i in range(500)
+    }
+    packet = _qr.build_review_packet(
+        request_id="req-e2big-001",
+        task_id="task-e2big-001",
+        claim_epoch=1,
+        worker_provider="deepseek_vscode_lm",
+        changed_path_hashes=large_changed_path_hashes,
+        acceptance=["Packets >= 150 KB must avoid argv."],
+    )
+    encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    assert len(encoded.encode("utf-8")) > 150_000, (
+        f"Packet must be > 150 KB to trigger E2BIG gate; got {len(encoded.encode('utf-8'))} bytes"
+    )
+
+    packet_file = tmp_path / "large_packet.json"
+    packet_file.write_text(encoded, encoding="utf-8")
+
+    prompt = _qr.build_review_prompt(
+        packet,
+        lens="correctness",
+        submit_tool_name="aiworkhub_worker_quality_review_submit",
+        packet_file=str(packet_file),
+        max_inline_bytes=96 * 1024,
+    )
+    assert "QUALITY_REVIEW_PACKET_FILE:" in prompt
+    assert "QUALITY_REVIEW_PACKET:" not in prompt
+    assert "Read the packet file first" in prompt
+
+
+def test_bounded_review_submit_fails_closed_without_receipt_schema() -> None:
+    """A receipt payload missing the schema_id or with a wrong schema must be
+    rejected — the protocol fails closed rather than fabricating findings."""
+    from aiworkhub import quality_reviewer as _qr
+
+    packet = _qr.build_review_packet(
+        request_id="req-bounded-001",
+        task_id="task-bounded-001",
+        claim_epoch=1,
+        worker_provider="deepseek_vscode_lm",
+        changed_path_hashes={"src/module.py": "a" * 64},
+    )
+    # No schema_id at all
+    with pytest.raises(_qr.ReviewerEvidenceError):
+        _qr.verify_reviewer_receipt(
+            receipt={"report": {"lens": "correctness", "findings": []}},
+            packet=packet,
+            expected_reviewer_request_id="rev-req-001",
+            expected_reviewer_task_id="rev-task-001",
+            observed_provider="deepseek_vscode_lm",
+            observed_terminal_state="review_ready",
+            audit_verified=True,
+        )
+
+    # Wrong schema
+    with pytest.raises(_qr.ReviewerEvidenceError):
+        _qr.verify_reviewer_receipt(
+            receipt={"schema_id": "aiworkhub.wrong_schema.v1", "report": {}},
+            packet=packet,
+            expected_reviewer_request_id="rev-req-001",
+            expected_reviewer_task_id="rev-task-001",
+            observed_provider="deepseek_vscode_lm",
+            observed_terminal_state="review_ready",
+            audit_verified=True,
+        )
+
+
+def test_bounded_review_submit_rejects_provider_spoof_in_receipt() -> None:
+    """A receipt's self-reported provider must match the process-observed
+    provider. A provider string in JSON proves nothing — the launcher
+    independently records the actual adapter_id."""
+    from aiworkhub import quality_reviewer as _qr
+
+    receipt = _sealed_reviewer_receipt(provider="attacker_provider")
+    packet = _qr.build_review_packet(
+        request_id="req-provider-001",
+        task_id="task-provider-001",
+        claim_epoch=1,
+        worker_provider="deepseek_vscode_lm",
+        changed_path_hashes={"src/module.py": "a" * 64},
+    )
+    # Build a receipt with the right shape but spoofed provider
+    shaped_receipt = {
+        "schema_id": _qr.RECEIPT_SCHEMA_ID,
+        "packet_sha256": packet["packet_sha256"],
+        "target": {
+            "request_id": "req-provider-001",
+            "task_id": "task-provider-001",
+            "claim_epoch": 1,
+        },
+        "reviewer": {
+            "request_id": "rev-req-001",
+            "task_id": "rev-task-001",
+            "provider": "attacker_provider",
+        },
+        "report": {
+            "lens": "correctness",
+            "read_only": True,
+            "can_mutate_repo": False,
+            "findings": [],
+        },
+        "authority": {
+            "process_identity_verified": True,
+            "audit_verified": True,
+            "terminal_state": "review_ready",
+        },
+    }
+    with pytest.raises(
+        _qr.ReviewerEvidenceError,
+        match="reviewer_provider_spoofed",
+    ):
+        _qr.verify_reviewer_receipt(
+            receipt=shaped_receipt,
+            packet=packet,
+            expected_reviewer_request_id="rev-req-001",
+            expected_reviewer_task_id="rev-task-001",
+            observed_provider="deepseek_vscode_lm",
+            observed_terminal_state="review_ready",
+            audit_verified=True,
+        )

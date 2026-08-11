@@ -1659,3 +1659,141 @@ def test_worker_terminal_progress_read_persistent_error_fails_closed(
         "type=PermissionError:errno=13"
     )
     assert progress_read_attempts == vscode_lm_worker.PROGRESS_READ_MAX_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# NF-2026-00118 / NF-2026-00131: quality-review bridge transport regressions
+# ---------------------------------------------------------------------------
+
+
+def test_quality_review_bridge_request_includes_request_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quality_review bridge request must carry request_kind=quality_review
+    in the public request document so the extension can enforce the correct
+    tool set and submission lifecycle."""
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "a" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Quality review of candidate workspace.",
+        model="deepseek-v4-pro",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+    )
+
+    assert request.request_id == request_id
+    public_doc = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert public_doc["request_kind"] == "quality_review"
+
+
+def test_quality_review_bridge_rejects_invalid_request_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bridge must reject request_kind values other than worker or
+    quality_review, failing closed rather than accepting a fabricated kind."""
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "b" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    with pytest.raises(vscode_lm_bridge.BridgeError, match="bridge_request_kind_invalid"):
+        vscode_lm_bridge.create_request(
+            repo=repo,
+            request_id=request_id,
+            workspace_path=workspace,
+            workspace_home=home,
+            prompt="Invalid kind.",
+            model="deepseek-v4-pro",
+            allowed_writes=[],
+            timeout_seconds=30,
+            request_kind="manager",
+        )
+
+
+def test_quality_review_bridge_worker_spec_excludes_manager_tool_prefixes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private worker spec for a quality_review request must not contain
+    manager-scoped tool references; the extension uses the spec identity to
+    select the worker-only tool menu."""
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "c" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt="Review candidate.",
+        model="deepseek-v4-pro",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+    )
+
+    worker_spec = json.loads(request.worker_spec_path.read_text(encoding="utf-8"))
+    spec_json = json.dumps(worker_spec, ensure_ascii=False)
+    # Manager-scoped tool names must not appear in the worker spec
+    assert "aiworkhub_manager_semantic_edit_prepare" not in spec_json
+    assert "aiworkhub_manager_session_write_intent" not in spec_json
+    assert "aiworkhub_manager_ai_memory_write_intent" not in spec_json
+    assert "aiworkhub_manager_kb_write_intent" not in spec_json
+    assert "aiworkhub_manager_context_graph_search" not in spec_json
+
+
+def test_quality_review_bridge_preserves_large_prompt_without_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quality_review prompt must be transmitted in full through the bridge
+    request document — the bridge must not silently truncate a prompt that
+    fits within MAX_PROMPT_BYTES."""
+    root = tmp_path / "bridge"
+    monkeypatch.setenv(vscode_lm_bridge.BRIDGE_ROOT_ENV, str(root))
+    repo = _repo(tmp_path)
+    request_id = "d" * 32
+    workspace = tmp_path / request_id / "worktree"
+    home = tmp_path / request_id / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+
+    # Build a prompt near but under MAX_PROMPT_BYTES
+    large_prompt = "You are an independent quality reviewer.\n" + "VERIFY: " * 8192
+    assert len(large_prompt.encode("utf-8")) < vscode_lm_bridge.MAX_PROMPT_BYTES
+
+    request = vscode_lm_bridge.create_request(
+        repo=repo,
+        request_id=request_id,
+        workspace_path=workspace,
+        workspace_home=home,
+        prompt=large_prompt,
+        model="deepseek-v4-pro",
+        allowed_writes=[],
+        timeout_seconds=30,
+        request_kind="quality_review",
+    )
+
+    public_doc = json.loads(request.request_path.read_text(encoding="utf-8"))
+    assert public_doc["prompt"] == large_prompt
+    assert len(public_doc["prompt"].encode("utf-8")) == len(large_prompt.encode("utf-8"))

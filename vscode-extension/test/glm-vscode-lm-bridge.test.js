@@ -86,18 +86,33 @@ fakeVscode.lm = {};
 assert.strictEqual(internals.vscodeLmAccessState(exact), "unknown");
 assert.strictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vscodeLmPermissionStorageKey(exact));
 assert.notStrictEqual(internals.vscodeLmPermissionStorageKey(exact), internals.vscodeLmPermissionStorageKey(deepseek));
+// NF134: Verify both manager-scoped and worker-scoped aliases exist in the central registry.
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_source_graph_query"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
-assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_session_write_intent"));
-assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_ai_memory_write_intent"));
-assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_kb_write_intent"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_ai_memory_search"));
+assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_worker_kb_search"));
+// Worker routes must expose only worker-scoped MCP tools (plus bridge-internal stage/finalize).
 const workerVisibleTools = internals.vscodeLmToolsForRequest({ request_kind: "worker" }, true);
 assert.ok(!workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
+assert.ok(!workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
+assert.ok(!workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_session_current_state"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_source_graph_query"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_ai_memory_search"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_kb_search"));
 assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
 assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
-assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
+assert.ok(!workerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_quality_review_submit"));
+// Manager routes expose manager-scoped MCP tools.
+const managerVisibleTools = internals.vscodeLmToolsForRequest({ request_kind: "manager" }, true);
+assert.ok(managerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
+assert.ok(managerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_session_current_state"));
+assert.ok(!managerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_source_graph_query"));
+assert.ok(!managerVisibleTools.some((tool) => tool.name === "aiworkhub_worker_session_current_state"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
 assert.strictEqual(
   internals.sanitizeWebviewPayload("failed at C:\\Users\\shrek\\secret.txt"),
@@ -130,7 +145,7 @@ assert.ok(!nf97Prompt.includes('"new":"replacement code only"'));
 const qualityReviewTextPrompt = internals.glmTextToolProtocolPrompt(
   "bounded review", [], true, {}, "quality_review",
 );
-assert.ok(qualityReviewTextPrompt.includes("MUST finish by calling aiworkhub_manager_quality_review_submit"));
+assert.ok(qualityReviewTextPrompt.includes("MUST finish by calling aiworkhub_worker_quality_review_submit"));
 assert.ok(!qualityReviewTextPrompt.includes("aiworkhub_manager_semantic_edit_apply"));
 assert.ok(!qualityReviewTextPrompt.includes("Output ONLY one final aiworkhub.vscode_lm.edit_response"));
 assert.strictEqual(
@@ -431,7 +446,7 @@ async function textProtocolChecks() {
 
   const reviewSubmit = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
-    name: "aiworkhub_manager_quality_review_submit",
+    name: "aiworkhub_worker_quality_review_submit",
     input: { packet_sha256: "a".repeat(64), lens: "correctness", findings: [] },
   });
   const reviewSubmissionId = "b".repeat(64);
@@ -459,7 +474,7 @@ async function textProtocolChecks() {
     creates: [],
   });
   assert.deepStrictEqual(reviewCalls.map((call) => call.name), [
-    "aiworkhub_manager_quality_review_submit",
+    "aiworkhub_worker_quality_review_submit",
   ]);
 
   let proseOnlyTurns = 0;
@@ -1239,7 +1254,7 @@ async function nativeProtocolChecks() {
           stream: (async function* stream() {
             yield {
               callId: "review-submit-1",
-              name: "aiworkhub_manager_quality_review_submit",
+              name: "aiworkhub_worker_quality_review_submit",
               input: { packet_sha256: "a".repeat(64), lens: "security", findings: [] },
             };
           }()),
@@ -1270,11 +1285,11 @@ async function nativeProtocolChecks() {
     creates: [],
   });
   assert.strictEqual(reviewTurn, 1);
-  assert.strictEqual(nativeReviewCalls[0].name, "aiworkhub_manager_quality_review_submit");
+  assert.strictEqual(nativeReviewCalls[0].name, "aiworkhub_worker_quality_review_submit");
   assert.strictEqual(nativeReviewOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Required);
   assert.deepStrictEqual(
     nativeReviewOptions[0].tools.map((tool) => tool.name),
-    ["aiworkhub_manager_source_graph_query", "aiworkhub_manager_quality_review_submit"],
+    ["aiworkhub_worker_source_graph_query", "aiworkhub_worker_quality_review_submit"],
   );
 
   let nativeProseOnlyTurns = 0;
@@ -1547,7 +1562,7 @@ async function main() {
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
-    name: "aiworkhub_manager_session_current_state",
+    name: "aiworkhub_worker_session_current_state",
     input: { limit: 1 },
   });
   const request = {
@@ -1769,7 +1784,8 @@ async function claimedCancellationChecks() {
     assert.deepStrictEqual(fs.readdirSync(path.dirname(cancelled.requestPath)), []);
 
     const forgedReceipt = path.join(path.dirname(cancelled.responsePath), "forged-response.json");
-    fs.copyFileSync(cancelled.responsePath, forgedReceipt);
+    const forgedBytes = fs.readFileSync(cancelled.responsePath);
+    fs.writeFileSync(forgedReceipt, forgedBytes, { mode: 0o600 });
     const originalOpenSync = fs.openSync;
     fs.openSync = (filePath, flags, ...args) => (
       path.resolve(String(filePath)) === path.resolve(cancelled.responsePath)

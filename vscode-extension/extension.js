@@ -2751,6 +2751,23 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     },
   },
   {
+    name: "aiworkhub_worker_source_graph_query",
+    description: "Mandatory repository-bound Source Graph query. Use instead of grep, rg, find, tree, or broad file reads.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["mode", "query"],
+      properties: {
+        mode: { type: "string", enum: ["focus", "slice", "context", "file", "function", "class", "body", "bodygrep", "impact", "trace", "deps", "bundle", "tags", "hotspots", "coverage", "churn", "reviewqueue", "ownership", "testmap", "calls", "symbols", "bottlenecks", "auditmap", "complexity", "stats", "summarize", "pipeline", "todo", "leaks", "nullrisks", "rawptrs", "casts", "crashes", "looprisks", "deadmethods", "duplicates", "gaps"] },
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        budget: { type: "integer", minimum: 8, maximum: 160 },
+        target: { type: ["string", "null"], maxLength: 256 },
+        bundle_type: { type: "string", enum: ["bugfix", "feature", "refactor", "audit", "optimize", "explore"] },
+        workflow_stage: { type: "string", enum: ["orientation", "implementation", "validation", "review", "rework", "unspecified"] },
+      },
+    },
+  },
+  {
     name: "aiworkhub_manager_semantic_edit_prepare",
     description: "Bind one Source Graph-selected line range in the isolated worktree. Returns only that old fragment plus full-file/fragment hashes for replacement-only output.",
     inputSchema: {
@@ -2800,7 +2817,17 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     inputSchema: { type: "object", additionalProperties: false, properties: { topic: { type: "string", maxLength: 128 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
   },
   {
+    name: "aiworkhub_worker_session_current_state",
+    description: "Recover bounded current project session state before non-trivial assumptions.",
+    inputSchema: { type: "object", additionalProperties: false, properties: { topic: { type: "string", maxLength: 128 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
     name: "aiworkhub_manager_ai_memory_search",
+    description: "Search durable repository AI Memory for task-specific decisions and lessons.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
+    name: "aiworkhub_worker_ai_memory_search",
     description: "Search durable repository AI Memory for task-specific decisions and lessons.",
     inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
   },
@@ -2810,12 +2837,27 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
   },
   {
+    name: "aiworkhub_worker_kb_search",
+    description: "Search authoritative repository knowledge-base contracts and documentation.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", minLength: 1, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 20 } } },
+  },
+  {
     name: "aiworkhub_manager_kb_get",
     description: "Fetch one exact authoritative KB entry after search.",
     inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
   },
   {
+    name: "aiworkhub_worker_kb_get",
+    description: "Fetch one exact authoritative KB entry after search.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
+  },
+  {
     name: "aiworkhub_manager_kb_related",
+    description: "Fetch bounded related authoritative KB entries.",
+    inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
+  },
+  {
+    name: "aiworkhub_worker_kb_related",
     description: "Fetch bounded related authoritative KB entries.",
     inputSchema: { type: "object", additionalProperties: false, required: ["key"], properties: { key: { type: "string", minLength: 1, maxLength: 256 } } },
   },
@@ -2834,7 +2876,38 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     },
   },
   {
+    name: "aiworkhub_worker_session_write_intent",
+    description: "Propose a bounded Session event for explicit verified-manager disposition; never writes canonical context directly.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "content", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["start", "event", "checkpoint", "state", "handoff", "close"] },
+        content: { type: "string", minLength: 1, maxLength: 32768 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
+  {
     name: "aiworkhub_manager_ai_memory_write_intent",
+    description: "Propose a bounded AI Memory mutation for explicit verified-manager disposition.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "key", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["remember", "update", "supersede", "archive"] },
+        key: { type: "string", minLength: 1, maxLength: 256 },
+        value: { type: "string", maxLength: 32768 },
+        tags: { type: "string", maxLength: 1024 },
+        scope: { type: "string", maxLength: 64 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_worker_ai_memory_write_intent",
     description: "Propose a bounded AI Memory mutation for explicit verified-manager disposition.",
     inputSchema: {
       type: "object", additionalProperties: false,
@@ -2871,8 +2944,28 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
     },
   },
   {
-    name: "aiworkhub_manager_quality_review_submit",
-    description: "Submit findings for the exact launcher-bound, read-only quality-review packet.",
+    name: "aiworkhub_worker_kb_write_intent",
+    description: "Propose a bounded KB mutation for explicit verified-manager disposition.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      required: ["action", "key", "idempotency_key", "provenance"],
+      properties: {
+        action: { type: "string", enum: ["upsert", "ingest", "supersede", "archive"] },
+        key: { type: "string", minLength: 1, maxLength: 256 },
+        title: { type: "string", maxLength: 1024 },
+        body: { type: "string", maxLength: 32768 },
+        category: { type: "string", maxLength: 128 },
+        tags: { type: "string", maxLength: 1024 },
+        source_refs: { type: "string", maxLength: 2048 },
+        replacement_key: { type: "string", maxLength: 256 },
+        idempotency_key: { type: "string", minLength: 8, maxLength: 192 },
+        provenance: { type: "string", minLength: 1, maxLength: 2048 },
+      },
+    },
+  },
+  {
+    name: "aiworkhub_worker_quality_review_submit",
+    description: "Submit findings for the exact bounded anti-anchored packet.",
     inputSchema: {
       type: "object", additionalProperties: false,
       required: ["packet_sha256", "lens", "findings"],
@@ -2898,30 +2991,63 @@ const VSCODE_LM_PRIVATE_TOOLS = Object.freeze([
 ]);
 
 const VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES = Object.freeze(new Set([
-  "aiworkhub_manager_source_graph_query",
-  "aiworkhub_manager_quality_review_submit",
+  "aiworkhub_worker_source_graph_query",
+  "aiworkhub_worker_quality_review_submit",
 ]));
 
 const VSCODE_LM_INTERNAL_ONLY_TOOL_NAMES = Object.freeze(new Set([
   "aiworkhub_manager_semantic_edit_prepare",
 ]));
 
+// NF134 worker/manager tool authority boundary: worker-scoped tool names are
+// exact `aiworkhub_worker_` prefixed aliases; manager-scoped use `aiworkhub_manager_`.
+const VSCODE_LM_MANAGER_PREFIX = "aiworkhub_manager_";
+const VSCODE_LM_WORKER_PREFIX = "aiworkhub_worker_";
+
+function _vscodeLmToolScopedName(toolName, requestKind) {
+  if (requestKind === "worker" || requestKind === "quality_review") {
+    if (toolName.startsWith(VSCODE_LM_MANAGER_PREFIX) &&
+        !toolName.startsWith(VSCODE_LM_MANAGER_PREFIX + "semantic_edit_")) {
+      return VSCODE_LM_WORKER_PREFIX + toolName.slice(VSCODE_LM_MANAGER_PREFIX.length);
+    }
+  }
+  return toolName;
+}
+
 function vscodeLmToolsForRequest(request, sourceGraphAcknowledged, stageOnly = false) {
-  const available = sourceGraphAcknowledged
+  const requestKind = request && request.request_kind ? String(request.request_kind) : "manager";
+  const all = sourceGraphAcknowledged
     ? VSCODE_LM_PRIVATE_TOOLS
-    : [VSCODE_LM_PRIVATE_TOOLS[0]];
+    : [VSCODE_LM_PRIVATE_TOOLS[0], VSCODE_LM_PRIVATE_TOOLS[1]];
   if (stageOnly) {
-    return available.filter((tool) => tool.name === VSCODE_LM_STAGE_EDIT_TOOL);
+    return all.filter((tool) => tool.name === VSCODE_LM_STAGE_EDIT_TOOL);
   }
-  if (request && request.request_kind === "quality_review") {
-    return available.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
+  if (requestKind === "quality_review") {
+    return all.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
   }
-  return available.filter((tool) => !VSCODE_LM_INTERNAL_ONLY_TOOL_NAMES.has(tool.name));
+  // Worker routes: expose only worker-scoped MCP tools plus bridge-internal
+  // stage/finalize (which are offline). Manager routes: expose manager-scoped.
+  if (requestKind === "worker") {
+    return all.filter((tool) => {
+      const name = tool.name;
+      if (name === VSCODE_LM_STAGE_EDIT_TOOL || name === VSCODE_LM_FINALIZE_EDIT_TOOL) return true;
+      if (name === "aiworkhub_worker_quality_review_submit") return false;
+      return name.startsWith(VSCODE_LM_WORKER_PREFIX);
+    });
+  }
+  // Manager route: expose manager-scoped MCP tools plus bridge-internal tools.
+  return all.filter((tool) => {
+    const name = tool.name;
+    if (name === VSCODE_LM_STAGE_EDIT_TOOL || name === VSCODE_LM_FINALIZE_EDIT_TOOL) return true;
+    if (name === "aiworkhub_worker_quality_review_submit") return false;
+    if (VSCODE_LM_INTERNAL_ONLY_TOOL_NAMES.has(name)) return false;
+    return !name.startsWith(VSCODE_LM_WORKER_PREFIX) || name === "aiworkhub_worker_quality_review_submit";
+  });
 }
 
 function completedQualityReviewResponse(request, toolName, result) {
   if (!request || request.request_kind !== "quality_review" ||
-      toolName !== "aiworkhub_manager_quality_review_submit" ||
+      toolName !== "aiworkhub_worker_quality_review_submit" ||
       !result || result.ok !== true || result.durable !== true ||
       typeof result.submission_id !== "string" || !/^[0-9a-f]{64}$/.test(result.submission_id)) {
     return null;
@@ -2948,16 +3074,22 @@ function isLanguageModelToolCallPart(part) {
 }
 
 async function invokeVscodeLmPrivateTool(call, requestId = "") {
-  const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === call.name);
+  const toolName = String(call && call.name || "");
+  const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === toolName);
   if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(call.name || "")}`);
   if (!mcpClient || !activeRepoIdentity) throw new Error("vscode_lm_mcp_unavailable");
   if (mcpClient.repositoryRoot !== activeRepoIdentity.root) throw new Error("vscode_lm_mcp_repo_mismatch");
   if (!VSCODE_LM_REQUEST_ID_RE.test(String(requestId || ""))) {
     throw new Error("vscode_lm_worker_request_id_invalid");
   }
+  // NF134: normalize worker-scoped tool names to manager-scoped for the MCP
+  // backend which uses the canonical manager tool namespace.
+  const normalizedName = toolName.startsWith(VSCODE_LM_WORKER_PREFIX) && toolName !== "aiworkhub_worker_quality_review_submit"
+    ? VSCODE_LM_MANAGER_PREFIX + toolName.slice(VSCODE_LM_WORKER_PREFIX.length)
+    : toolName;
   return mcpClient.callTool("aiworkhub_vscode_lm_worker_tool", {
     request_id: requestId,
-    tool_name: permitted.name,
+    tool_name: normalizedName,
     tool_input: call.input || {},
   }, VSCODE_LM_WORKER_TOOL_TIMEOUT_MS);
 }
@@ -3364,12 +3496,16 @@ function vscodeLmProtocolToolTransport(toolName) {
 
 function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false, pathContracts = {}, requestKind = "worker") {
   const qualityReview = requestKind === "quality_review";
+  const isWorker = requestKind === "worker" || qualityReview;
   const toolNames = vscodeLmToolsForRequest(
     { request_kind: requestKind }, true,
   ).map((tool) => tool.name);
+  const sourceGraphToolName = isWorker ? "aiworkhub_worker_source_graph_query" : "aiworkhub_manager_source_graph_query";
+  const editStageName = VSCODE_LM_STAGE_EDIT_TOOL;
+  const editFinalizeName = VSCODE_LM_FINALIZE_EDIT_TOOL;
   const basePrompt = qualityReview
     ? `${prompt}\n\nAIWorkHub quality-review contract:\n` +
-      `- You MUST finish by calling aiworkhub_manager_quality_review_submit exactly once.\n` +
+      `- You MUST finish by calling aiworkhub_worker_quality_review_submit exactly once.\n` +
       `- Do not output a coding edit envelope, prose-only verdict, or simulated tool receipt.\n`
     : glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts);
   return `${basePrompt}\n` +
@@ -3378,9 +3514,9 @@ function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched 
     (sourceGraphPrefetched
       ? `- The bridge has already executed the mandatory initial Source Graph request and supplies its result below. Request more tools only when needed.\n`
       : `- Your FIRST response MUST be a Source Graph request and nothing else.\n`) +
-    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"aiworkhub_manager_source_graph_query","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
+    `- For every tool call output ONLY: {"schema_id":"${VSCODE_LM_TOOL_REQUEST_SCHEMA}","name":"${sourceGraphToolName}","input":{"mode":"focus","query":"...","workflow_stage":"orientation"}}\n` +
     (qualityReview
-      ? `- The only successful terminal action is an authenticated aiworkhub_manager_quality_review_submit request.\n`
+      ? `- The only successful terminal action is an authenticated aiworkhub_worker_quality_review_submit request.\n`
       : `- After each tool result, either request another allowlisted tool or output the final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} object.\n`) +
     `- Allowed tool names: ${JSON.stringify(toolNames)}.\n` +
     `- Never wrap JSON in Markdown or add prose.`;
@@ -3635,8 +3771,11 @@ async function runVscodeLmTextProtocol(
     if (!initialSourceGraphResult) {
       try {
         assertRequestActive();
+        const prefetchToolName = (request.request_kind === "worker" || request.request_kind === "quality_review")
+          ? "aiworkhub_worker_source_graph_query"
+          : "aiworkhub_manager_source_graph_query";
         initialSourceGraphResult = await raceVscodeLmCancellation(invokeTool({
-          name: "aiworkhub_manager_source_graph_query",
+          name: prefetchToolName,
           input: request.initial_source_graph_request,
         }, request.requestId), cancellationToken);
         assertRequestActive();
@@ -3961,7 +4100,7 @@ async function runVscodeLmAgent(
   const qualityReview = request.request_kind === "quality_review";
   const agentPrompt = qualityReview
     ? `${request.prompt}\n\nAIWorkHub quality-review contract:\n` +
-      `- You MUST finish by calling aiworkhub_manager_quality_review_submit exactly once.\n` +
+      `- You MUST finish by calling aiworkhub_worker_quality_review_submit exactly once.\n` +
       `- Do not output a coding edit envelope, prose-only verdict, or simulated tool receipt.`
     : glmAgentProtocolPrompt(request.prompt, request.allowedWrites, request.path_contracts);
   const messages = [vscode.LanguageModelChatMessage.User(
