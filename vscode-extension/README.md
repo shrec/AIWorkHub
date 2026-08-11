@@ -12,21 +12,18 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.42
+## What's new in 0.9.43
 
-- VS Code LM workers can stage small hash-bound replacements and new files one
-  at a time, then finalize with a short summary; AIWorkHub assembles the full
-  edit envelope offline instead of asking the model to regenerate it.
-- Text-only GLM/DeepSeek and native tool-calling providers share the same
-  fail-closed staged-edit contract, including overlap and stale-hash checks.
-- Validation-only replay no longer cancels an editor bridge when durable
-  evidence proves that no provider was launched.
-- Bounded dashboard event-stream primitives now cover gaps, overflow,
-  reconnect and authoritative resync; live server/webview wiring remains a
-  tracked follow-up.
-- Extension-host receipts expose the exact loaded extension version and
-  staged-edit transport, so a stale in-memory host cannot be mistaken for the
-  newly installed worker bridge during live validation.
+- VS Code LM workers and quality-review calls are now exposed under
+  worker-scoped names and dispatched exclusively through the authenticated
+  worker MCP bridge, not through manager authority.
+- Read-only reviewer completion is sealed into a durable, verifiable receipt;
+  result and retry paths converge on that receipt instead of diverging.
+- Quality-evidence packets above the bounded argv threshold use file transport,
+  avoiding E2BIG on platforms with small argument limits while preserving the
+  packet-size contract.
+- The large-packet regression fixture stays within production packet limits
+  and exercises the file-transport path it was designed to validate.
 
 See the packaged **Changelog** for the complete release summary.
 

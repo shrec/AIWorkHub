@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.43] - 2026-08-11
+
+### Fixed
+
+- VS Code LM worker and quality-review tool calls are exposed under
+  worker-scoped names and dispatched through the authenticated worker bridge,
+  never through manager authority (NF118).
+- Read-only reviewer completion is sealed into a durable receipt; result and
+  retry paths converge on the same verified receipt instead of diverging
+  (NF131).
+- Reviewer quality-evidence packets above the bounded argv threshold use file
+  transport, avoiding E2BIG on platforms with small argument limits while
+  preserving the packet-size contract (NF134).
+- The large-packet regression fixture stays within production packet limits
+  and exercises the file-transport path that it was meant to validate (NF134).
+
 ## [0.9.42] - 2026-08-10
 
 ### Fixed
