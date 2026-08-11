@@ -15,7 +15,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import process_launcher  # noqa: E402
+from aiworkhub import process_launcher, worker_ai_tools_mcp  # noqa: E402
 
 
 def _card(task_id: str = "TASK_B1", state: str = "pending") -> dict:
@@ -2765,3 +2765,223 @@ def test_unknown_duplicate_recovery_allows_direct_launch_after_mismatch(
     assert recovered["ok"] is True
     _wait_terminal(manager, recovered["request_id"])
     assert manager._request_events(persisted_id) == before
+
+
+# ---------------------------------------------------------------------------
+# NF129: rework_overlay / request_scoped_predecessor live Source Graph gate
+# ---------------------------------------------------------------------------
+
+import hmac as _hmac_mod  # noqa: E402
+
+
+def _sign_entry(entry: dict, key: bytes) -> str:
+    """HMAC-sign a ledger entry dict, returning the complete JSON line."""
+    canonical = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+    digest = _hmac_mod.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    signed = {**entry, "hmac_sha256": digest}
+    return json.dumps(signed, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+_ENTRY_SCHEMA = worker_ai_tools_mcp.AUDIT_ENTRY_SCHEMA_ID
+
+
+def _rework_entry(**overrides: object) -> dict:
+    defaults: dict[str, object] = {
+        "schema_id": _ENTRY_SCHEMA,
+        "timestamp": "2026-08-11T01:00:00+00:00",
+        "task_id": "TASK_NF129",
+        "runner": "test_runner",
+        "topic": "nf129_topic",
+        "request_id": "req-nf129",
+        "tool": "source_graph",
+        "ok": True,
+        "cache_hit": False,
+        "hit_count": 3,
+        "bytes_returned": 500,
+        "violation": "",
+        "authority_source": "rework_overlay",
+        "authority_state": "request_scoped_predecessor",
+        "authority_repo": "/test/repo",
+    }
+    return {**defaults, **overrides}
+
+
+def test_rework_overlay_counts_as_live_source_graph_call(tmp_path: Path) -> None:
+    """authority_source=rework_overlay + authority_state=request_scoped_predecessor
+    must be counted as an authoritative live Source Graph call after HMAC +
+    identity checks pass."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry()
+    line = _sign_entry(entry, key)
+
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(line, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["entries_verified"] == 1
+    assert result["entries_tampered"] == 0
+    assert result["live_source_graph_calls"] == 1
+    assert result["fresh_source_graph_calls"] == 1
+    assert (
+        "source_graph:rework_overlay:request_scoped_predecessor:/test/repo"
+        in result["authority_index_identity"]
+    )
+
+
+def test_rework_overlay_rejected_with_wrong_hmac(tmp_path: Path) -> None:
+    """A rework_overlay entry with a tampered/forged HMAC must be dropped,
+    not counted as live."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry()
+    line = _sign_entry(entry, key)
+
+    # Forge: sign with a different key
+    wrong_key = os.urandom(32)
+    forged_line = _sign_entry(entry, wrong_key)
+
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(forged_line, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["entries_verified"] == 0
+    assert result["entries_tampered"] == 1
+    assert result["live_source_graph_calls"] == 0
+
+
+def test_rework_overlay_rejected_with_wrong_identity(tmp_path: Path) -> None:
+    """A rework_overlay entry with a mismatched task_id/runner/topic/request_id
+    must not count as live."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry(task_id="TASK_OTHER")
+    line = _sign_entry(entry, key)
+
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(line, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["entries_verified"] == 0
+    assert result["live_source_graph_calls"] == 0
+
+
+def test_rework_overlay_not_live_when_cache_hit(tmp_path: Path) -> None:
+    """A cached rework_overlay source_graph call is fresh telemetry but not
+    live -- the completion gate requires a non-cached hit."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry(cache_hit=True)
+    line = _sign_entry(entry, key)
+
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(line, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["live_source_graph_calls"] == 0
+    assert result["fresh_source_graph_calls"] == 0
+
+
+def test_rework_overlay_not_live_when_zero_hits(tmp_path: Path) -> None:
+    """A fresh but zero-hit rework_overlay call is fresh telemetry but not
+    live -- the gate requires at least one result row."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    entry = _rework_entry(hit_count=0)
+    line = _sign_entry(entry, key)
+
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(line, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["live_source_graph_calls"] == 0
+    assert result["fresh_source_graph_calls"] == 1
+
+
+def test_rework_overlay_authority_label_remains_distinct(tmp_path: Path) -> None:
+    """rework_overlay must appear under its own authority label in the index,
+    never conflated with canonical or candidate_overlay."""
+    key = os.urandom(32)
+    key_path = tmp_path / "audit.key"
+    key_path.write_bytes(key)
+
+    rework = _rework_entry()
+    canonical = _rework_entry(
+        authority_source="canonical",
+        authority_state="sole_authority",
+    )
+    candidate = _rework_entry(
+        authority_source="candidate_overlay",
+        authority_state="quality_review_readonly",
+    )
+
+    lines = "".join(_sign_entry(e, key) for e in (rework, canonical, candidate))
+    ledger_path = tmp_path / "audit.jsonl"
+    ledger_path.write_text(lines, encoding="utf-8")
+
+    result = worker_ai_tools_mcp.verify_audit_ledger(
+        ledger_path,
+        key_path,
+        task_id="TASK_NF129",
+        runner="test_runner",
+        topic="nf129_topic",
+        request_id="req-nf129",
+    )
+    assert result["ok"] is True
+    assert result["live_source_graph_calls"] == 3
+    authority = set(result["authority_index_identity"])
+    assert "source_graph:rework_overlay:request_scoped_predecessor:/test/repo" in authority
+    assert "source_graph:canonical:sole_authority:/test/repo" in authority
+    assert "source_graph:candidate_overlay:quality_review_readonly:/test/repo" in authority
+    # Three distinct labels, no conflation
+    assert len(authority) == 3

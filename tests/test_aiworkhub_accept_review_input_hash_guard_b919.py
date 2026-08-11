@@ -400,7 +400,7 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(
         process_launcher,
         "assert_gc_safe_workspace_shape",
-        lambda _request_id, _path, _home: None,
+        lambda _request_id, _path, _home, **_kwargs: None,
     )
     monkeypatch.setattr(process_launcher, "enforce_scope", lambda _ws: [output_relative])
     monkeypatch.setattr(

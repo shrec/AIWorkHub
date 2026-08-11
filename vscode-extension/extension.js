@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.41";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.42";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -2902,12 +2902,21 @@ const VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES = Object.freeze(new Set([
   "aiworkhub_manager_quality_review_submit",
 ]));
 
-function vscodeLmToolsForRequest(request, sourceGraphAcknowledged) {
+const VSCODE_LM_INTERNAL_ONLY_TOOL_NAMES = Object.freeze(new Set([
+  "aiworkhub_manager_semantic_edit_prepare",
+]));
+
+function vscodeLmToolsForRequest(request, sourceGraphAcknowledged, stageOnly = false) {
   const available = sourceGraphAcknowledged
     ? VSCODE_LM_PRIVATE_TOOLS
     : [VSCODE_LM_PRIVATE_TOOLS[0]];
-  if (!request || request.request_kind !== "quality_review") return available;
-  return available.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
+  if (stageOnly) {
+    return available.filter((tool) => tool.name === VSCODE_LM_STAGE_EDIT_TOOL);
+  }
+  if (request && request.request_kind === "quality_review") {
+    return available.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name));
+  }
+  return available.filter((tool) => !VSCODE_LM_INTERNAL_ONLY_TOOL_NAMES.has(tool.name));
 }
 
 function completedQualityReviewResponse(request, toolName, result) {
@@ -2964,13 +2973,12 @@ function glmAgentProtocolPrompt(prompt, allowedWrites, pathContracts = {}) {
     `- Never read or emit a complete existing file. Use Source Graph body mode for the smallest exact symbol, then return only its replacement in a line range.\n` +
     `- Preferred delivery: after body discovery call ${VSCODE_LM_STAGE_EDIT_TOOL} once per smallest replacement or complete new file. The bridge performs hash-bound prepare internally and retains the fragment without writing it.\n` +
     `- After every intended fragment is staged, call ${VSCODE_LM_FINALIZE_EDIT_TOOL} with only a short truthful summary. Do not resend staged code; the bridge assembles the final envelope offline.\n` +
-    `- Compatibility fallback: aiworkhub_manager_semantic_edit_prepare still returns the selected old fragment and current_sha256 for a direct final envelope.\n` +
-    `- The prepare tool input is exactly {"file_path":"repo/relative/path","start_line":1,"end_line":1}; use file_path, not path, in that tool request.\n` +
-    `- Semantic edits must name an allowed path, copy current_sha256 from path_contracts, and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
+    `- Semantic-edit prepare is an internal bridge primitive and is not provider-callable. Stage each replacement with file_path, start_line, end_line, and new; the bridge resolves and binds current_sha256 internally.\n` +
+    `- Semantic edits must name an allowed path and use non-overlapping 1-based inclusive start_line/end_line values from Source Graph evidence.\n` +
     `- Each new value must contain the complete, substantive replacement for its declared range; it may be empty only for an intentional deletion. Do not echo old code. preserve_trailing_newline defaults true.\n` +
     `- creates must name an allowed path and contain complete, nonempty UTF-8 content. Every path_contract whose action is create MUST appear exactly once in creates.\n` +
     `- The final object is executable edit data, not a template. Sentinel-only values, prose placeholder labels, TODO/FIXME-only text, and omitted-code notices are rejected.\n` +
-    `- For action=edit, copy current_sha256 exactly from semantic-edit prepare (or the identical exact path_contract); do not infer or recompute it.\n` +
+    `- For action=edit, the bridge copies current_sha256 from the exact path contract during staging; do not infer or recompute it.\n` +
     `- allowed_writes=${JSON.stringify(allowedWrites)}\n` +
     `- path_contracts=${JSON.stringify(pathContracts || {})}\n` +
     `- Required fields are schema_id=${VSCODE_LM_EDIT_RESPONSE_SCHEMA}, an actual summary, an edits array of hash-bound line ranges, and a creates array of complete new files. Do not copy instructional metasyntax into any field.`;
@@ -3236,7 +3244,7 @@ function createVscodeLmStagedEditCollector(request) {
 
   const reject = (reason) => ({ ok: false, reason: `semantic_edit_stage_rejected:${reason}` });
 
-  const stage = async (input, prepare) => {
+  const stage = async (input) => {
     if (!input || typeof input !== "object" || Array.isArray(input)) return reject("input_invalid");
     const operation = String(input.operation || "");
     const filePath = vscodeLmNormalizedPath(input.file_path);
@@ -3269,17 +3277,15 @@ function createVscodeLmStagedEditCollector(request) {
     const fidelity = vscodeLmFidelityError(input.new, filePath, "staged_range");
     if (fidelity) return reject(fidelity);
     if (creates.has(filePath)) return reject(`path_conflict:${filePath}`);
-    const prepared = await prepare({
-      file_path: filePath,
-      start_line: input.start_line,
-      end_line: input.end_line,
-    });
-    if (!prepared || prepared.ok !== true) {
-      return reject(`prepare_failed:${sanitizeErrorMessage(prepared && (prepared.reason || prepared.error) || "unknown")}`);
-    }
-    const currentSha256 = String(prepared.current_sha256 || "");
-    if (!/^[0-9a-f]{64}$/.test(currentSha256) || currentSha256 !== String(contract.current_sha256 || "")) {
-      return reject(`hash_stale:${filePath}`);
+    // The immutable path contract was computed from this isolated workspace
+    // immediately before launch. No write occurs until the final envelope is
+    // accepted, so staging can bind directly to that canonical hash without a
+    // second MCP round-trip. This keeps the offline editor available even if
+    // the coordinator MCP transport restarts while a provider response is in
+    // flight; final application still revalidates the exact hash and range.
+    const currentSha256 = String(contract.current_sha256 || "");
+    if (!/^[0-9a-f]{64}$/.test(currentSha256)) {
+      return reject(`contract_hash_invalid:${filePath}`);
     }
     const entry = edits.get(filePath) || { path: filePath, current_sha256: currentSha256, ranges: [] };
     if (entry.current_sha256 !== currentSha256) return reject(`hash_conflict:${filePath}`);
@@ -3339,23 +3345,28 @@ function createVscodeLmStagedEditCollector(request) {
 }
 
 async function invokeVscodeLmProtocolTool(call, requestId, invokeTool, stagedEdits) {
-  if (call.name === VSCODE_LM_STAGE_EDIT_TOOL) {
-    return stagedEdits.stage(call.input, (prepareInput) => invokeTool({
-      name: "aiworkhub_manager_semantic_edit_prepare",
-      input: prepareInput,
-    }, requestId));
+  const toolName = String(call && call.name || "").trim();
+  if (toolName === VSCODE_LM_STAGE_EDIT_TOOL) {
+    return stagedEdits.stage(call.input);
   }
-  if (call.name === VSCODE_LM_FINALIZE_EDIT_TOOL) {
+  if (toolName === VSCODE_LM_FINALIZE_EDIT_TOOL) {
     return stagedEdits.finalize(call.input && call.input.summary);
   }
-  return invokeTool(call, requestId);
+  return invokeTool({ ...call, name: toolName }, requestId);
+}
+
+function vscodeLmProtocolToolTransport(toolName) {
+  const normalized = String(toolName || "").trim();
+  return normalized === VSCODE_LM_STAGE_EDIT_TOOL || normalized === VSCODE_LM_FINALIZE_EDIT_TOOL
+    ? "offline_staged"
+    : "mcp";
 }
 
 function glmTextToolProtocolPrompt(prompt, allowedWrites, sourceGraphPrefetched = false, pathContracts = {}, requestKind = "worker") {
   const qualityReview = requestKind === "quality_review";
-  const toolNames = (qualityReview
-    ? VSCODE_LM_PRIVATE_TOOLS.filter((tool) => VSCODE_LM_QUALITY_REVIEW_TOOL_NAMES.has(tool.name))
-    : VSCODE_LM_PRIVATE_TOOLS).map((tool) => tool.name);
+  const toolNames = vscodeLmToolsForRequest(
+    { request_kind: requestKind }, true,
+  ).map((tool) => tool.name);
   const basePrompt = qualityReview
     ? `${prompt}\n\nAIWorkHub quality-review contract:\n` +
       `- You MUST finish by calling aiworkhub_manager_quality_review_submit exactly once.\n` +
@@ -3679,9 +3690,13 @@ async function runVscodeLmTextProtocol(
   let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
+  let forceStagedEdit = false;
+  let stagedEditInstructionSent = false;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
+  const writableTask = request.request_kind !== "quality_review" &&
+    Array.isArray(request.allowedWrites) && request.allowedWrites.length > 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
     if (request.request_kind === "quality_review" &&
@@ -3694,15 +3709,27 @@ async function runVscodeLmTextProtocol(
     }
     if (request.request_kind !== "quality_review" &&
         sourceGraphAcknowledged && postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) {
+      if (writableTask && !stagedEdits.hasChanges()) forceStagedEdit = true;
+      else forceFinal = true;
+    }
+    if (forceStagedEdit && stagedEdits.hasChanges()) {
+      forceStagedEdit = false;
       forceFinal = true;
     }
+    if (forceStagedEdit && !stagedEditInstructionSent) {
+      stagedEditInstructionSent = true;
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
+        `Output ONLY one ${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
+      ));
+    }
     if (forceFinal) {
+      if (stagedEdits.hasChanges()) {
+        const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
+        if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
+        protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
+      }
       if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
-        if (stagedEdits.hasChanges()) {
-          const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
-          if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
-          protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
-        }
         throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
       }
       finalizationTurns += 1;
@@ -3776,6 +3803,15 @@ async function runVscodeLmTextProtocol(
           text,
         );
       }
+      if (forceStagedEdit) {
+        protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "full_envelope_rejected" });
+        messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `Full-file/final envelopes are disabled after bounded discovery. Output ONLY one ` +
+          `${VSCODE_LM_TOOL_REQUEST_SCHEMA} request for ${VSCODE_LM_STAGE_EDIT_TOOL}.`,
+        ));
+        continue;
+      }
       const finalError = validateVscodeLmFinalEnvelope(envelope, request.allowedWrites, request.path_contracts);
       if (finalError) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: finalError });
@@ -3802,7 +3838,9 @@ async function runVscodeLmTextProtocol(
     if (envelope.schema_id !== VSCODE_LM_TOOL_REQUEST_SCHEMA) {
       throw new Error("vscode_lm_text_protocol_schema_mismatch");
     }
-    const availableTools = vscodeLmToolsForRequest(request, sourceGraphAcknowledged);
+    const availableTools = vscodeLmToolsForRequest(
+      request, sourceGraphAcknowledged, forceStagedEdit,
+    );
     const permitted = availableTools.find((tool) => tool.name === envelope.name);
     if (!permitted) throw new Error(`vscode_lm_tool_not_allowed:${String(envelope.name || "")}`);
     if (!envelope.input || typeof envelope.input !== "object" || Array.isArray(envelope.input)) {
@@ -3937,9 +3975,13 @@ async function runVscodeLmAgent(
   let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
+  let forceStagedEdit = false;
+  let stagedEditInstructionSent = false;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
+  const writableTask = !qualityReview && Array.isArray(request.allowedWrites) &&
+    request.allowedWrites.length > 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
     if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
@@ -3952,32 +3994,45 @@ async function runVscodeLmAgent(
     if (sourceGraphAcknowledged &&
         (toolTurns >= VSCODE_LM_MAX_TOOL_TURNS || postSourceTurns >= VSCODE_LM_MAX_POST_SOURCE_TURNS) &&
         !forceFinal) {
+      if (writableTask && !stagedEdits.hasChanges()) {
+        forceStagedEdit = true;
+      } else {
+        forceFinal = true;
+      }
+      if (forceStagedEdit && !stagedEditInstructionSent) {
+        stagedEditInstructionSent = true;
+        messages.push(vscode.LanguageModelChatMessage.User(
+          `The bounded discovery phase is complete. Do not regenerate a full file or final edit envelope. ` +
+          `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
+        ));
+      }
+    }
+    if (forceStagedEdit && stagedEdits.hasChanges()) {
+      forceStagedEdit = false;
       forceFinal = true;
-      messages.push(vscode.LanguageModelChatMessage.User(
-        `The bounded tool phase is complete. Do not request more tools. ` +
-        `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
-        `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
-      ));
     }
     if (forceFinal) {
+      if (stagedEdits.hasChanges()) {
+        const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
+        if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
+        protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
+      }
       if (finalizationTurns >= VSCODE_LM_MAX_FINALIZATION_TURNS) {
-        if (stagedEdits.hasChanges()) {
-          const offline = stagedEdits.finalize("Applied validated staged semantic edits.");
-          if (offline.ok) return JSON.stringify(offline.__finalEnvelope);
-          protocolTrace.push({ turn, phase: "offline_finalization", outcome: offline.reason });
-        }
         throw vscodeLmProtocolFailure("vscode_lm_finalization_limit", protocolTrace, lastProtocolPreview);
       }
       finalizationTurns += 1;
     }
     const startedWithSourceGraph = sourceGraphAcknowledged;
-    const availableTools = vscodeLmToolsForRequest(request, sourceGraphAcknowledged);
+    const availableTools = vscodeLmToolsForRequest(
+      request, sourceGraphAcknowledged, forceStagedEdit,
+    );
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
     };
     if (!forceFinal) {
       options.tools = availableTools;
-      options.toolMode = qualityReview
+      options.toolMode = qualityReview || forceStagedEdit ||
+        (writableTask && !stagedEdits.hasChanges())
         ? vscode.LanguageModelChatToolMode.Required
         : sourceGraphAcknowledged
           ? vscode.LanguageModelChatToolMode.Auto
@@ -4025,9 +4080,12 @@ async function runVscodeLmAgent(
       if (!text) {
         protocolTrace.push({ turn, phase: forceFinal ? "final" : "work", outcome: "empty" });
         messages.push(vscode.LanguageModelChatMessage.User(
-          `The previous provider turn contained neither a tool call nor text. ` +
-          `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
-          `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
+          forceStagedEdit
+            ? `The previous provider turn contained neither a tool call nor text. ` +
+              `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`
+            : `The previous provider turn contained neither a tool call nor text. ` +
+              `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
+              `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
         ));
         continue;
       }
@@ -4264,6 +4322,9 @@ class VscodeLmBridgeHost {
       permission_granted: modelMetadata.some((entry) => entry.access_state.startsWith("granted")),
       max_parallel_requests: this.maxParallelRequests,
       active_request_count: this.activeClaims.size,
+      extension_version: String(this.context.extension && this.context.extension.packageJSON &&
+        this.context.extension.packageJSON.version || ""),
+      bridge_capabilities: ["offline_staged_semantic_edit_v1", "tool_transport_receipts_v1"],
       updated_at: new Date().toISOString(),
     };
     const hostPath = path.join(vscodeLmBridgeRoot(), "hosts", this.repoInfo.repoId, `${WINDOW_SCOPE_ID}.json`);
@@ -4442,6 +4503,7 @@ class VscodeLmBridgeHost {
       writeProgress("request_accepted");
       const onToolTurn = (toolName, details = {}) => writeProgress("tool_turn", {
         tool_name: String(toolName || "").slice(0, 200),
+        tool_transport: vscodeLmProtocolToolTransport(toolName),
         tool_state: ["started", "completed", "failed"].includes(String(details.tool_state || ""))
           ? String(details.tool_state)
           : "started",
@@ -8657,7 +8719,9 @@ module.exports = {
     parseVscodeLmJsonEnvelope,
     validateVscodeLmFinalEnvelope,
     createVscodeLmStagedEditCollector,
+    vscodeLmProtocolToolTransport,
     vscodeLmPathMatchesPattern,
+    vscodeLmToolsForRequest,
     glmTextToolProtocolPrompt,
     atomicWriteOwnerJson,
     ownerOnlyRegularFile,

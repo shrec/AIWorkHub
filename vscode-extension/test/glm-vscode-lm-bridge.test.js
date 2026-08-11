@@ -93,6 +93,11 @@ assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiwork
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_session_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_ai_memory_write_intent"));
 assert.ok(internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => tool.name === "aiworkhub_manager_kb_write_intent"));
+const workerVisibleTools = internals.vscodeLmToolsForRequest({ request_kind: "worker" }, true);
+assert.ok(!workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_prepare"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_stage"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_semantic_edit_finalize"));
+assert.ok(workerVisibleTools.some((tool) => tool.name === "aiworkhub_manager_source_graph_query"));
 assert.ok(!internals.VSCODE_LM_PRIVATE_TOOLS.some((tool) => /grep|find|shell/.test(tool.name)));
 assert.strictEqual(
   internals.sanitizeWebviewPayload("failed at C:\\Users\\shrek\\secret.txt"),
@@ -110,10 +115,11 @@ assert.strictEqual(internals.vscodeLmPathMatchesPattern("research/result.json", 
 assert.strictEqual(internals.vscodeLmPathMatchesPattern("../escape.json", "research/*.json"), false);
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=file with query and target both equal"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("mode=body with query equal to the exact indexed symbol name"));
-assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_prepare"));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("prepare is an internal bridge primitive"));
+assert.ok(!internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"aiworkhub_manager_semantic_edit_prepare"'));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("semantic_edit_stage"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("assembles the final envelope offline"));
-assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes('"file_path":"repo/relative/path"'));
+assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("file_path, start_line, end_line, and new"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("absence of native toolCalling does not mean tools are unavailable"));
 assert.ok(internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]).includes("never report that MCP/callable tools are missing"));
 const nf97Prompt = internals.glmTextToolProtocolPrompt("bounded", ["src/app.py"]);
@@ -761,11 +767,10 @@ async function textProtocolChecks() {
     undefined,
     async (call) => {
       stagedTextCalls.push(call);
-      assert.strictEqual(call.name, "aiworkhub_manager_semantic_edit_prepare");
-      return { ok: true, path: "src/app.py", current_sha256: "a".repeat(64) };
+      throw new Error("staged edits must not require an MCP round-trip");
     },
   ));
-  assert.strictEqual(stagedTextCalls.length, 1);
+  assert.strictEqual(stagedTextCalls.length, 0);
   assert.strictEqual(stagedTextResult.summary, "Updated app and added its focused test.");
   assert.deepStrictEqual(stagedTextResult.edits, [{
     path: "src/app.py",
@@ -782,14 +787,18 @@ async function textProtocolChecks() {
     content: "def test_app():\n    assert True\n",
   }]);
 
+  assert.strictEqual(
+    internals.vscodeLmProtocolToolTransport(" aiworkhub_manager_semantic_edit_stage "),
+    "offline_staged",
+  );
+  assert.strictEqual(
+    internals.vscodeLmProtocolToolTransport("aiworkhub_manager_source_graph_query"),
+    "mcp",
+  );
+
   const atomicCollector = internals.createVscodeLmStagedEditCollector({
     allowedWrites: ["src/app.py"],
     path_contracts: editContract,
-  });
-  const prepareAtomic = async () => ({
-    ok: true,
-    path: "src/app.py",
-    current_sha256: "a".repeat(64),
   });
   assert.strictEqual((await atomicCollector.stage({
     operation: "replace_range",
@@ -797,14 +806,14 @@ async function textProtocolChecks() {
     start_line: 2,
     end_line: 2,
     new: "return 4",
-  }, prepareAtomic)).ok, true);
+  })).ok, true);
   const rejectedOverlap = await atomicCollector.stage({
     operation: "replace_range",
     file_path: "src/app.py",
     start_line: 1,
     end_line: 2,
     new: "corrupt overlap",
-  }, prepareAtomic);
+  });
   assert.strictEqual(rejectedOverlap.ok, false);
   assert.match(rejectedOverlap.reason, /range_overlap/);
   const atomicFinal = atomicCollector.finalize("Kept only the verified staged range.");
@@ -1128,11 +1137,10 @@ async function nativeProtocolChecks() {
     undefined,
     async (call) => {
       stagedNativeCalls.push(call);
-      assert.strictEqual(call.name, "aiworkhub_manager_semantic_edit_prepare");
-      return { ok: true, path: "src/app.py", current_sha256: "a".repeat(64) };
+      throw new Error("staged edits must not require an MCP round-trip");
     },
   ));
-  assert.strictEqual(stagedNativeCalls.length, 1);
+  assert.strictEqual(stagedNativeCalls.length, 0);
   assert.strictEqual(stagedNativeResult.summary, "Applied one staged native edit.");
   assert.strictEqual(stagedNativeResult.edits[0].ranges[0].new, "return 3");
 
@@ -1168,7 +1176,13 @@ async function nativeProtocolChecks() {
   assert.strictEqual(nativePrefetched, finalResponse);
   assert.strictEqual(nativePrefetchCalls.length, 0);
   assert.ok(String(nativePrefetchMessages[0][0].content).includes("INITIAL_SOURCE_GRAPH_RESULT"));
-  assert.strictEqual(nativePrefetchOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Auto);
+  assert.strictEqual(nativePrefetchOptions[0].toolMode, fakeVscode.LanguageModelChatToolMode.Required);
+  assert.deepStrictEqual(
+    internals.vscodeLmToolsForRequest(
+      { request_kind: "code" }, true, true,
+    ).map((tool) => tool.name),
+    ["aiworkhub_manager_semantic_edit_stage"],
+  );
 
   const editContract = {
     "src/app.py": { action: "edit", current_sha256: "a".repeat(64), line_count: 2, parent_existed: true },
@@ -1302,6 +1316,19 @@ async function nativeProtocolChecks() {
       if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
         return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
       }
+      const availableNames = options.tools.map((tool) => tool.name);
+      if (availableNames.length === 1 &&
+          availableNames[0] === "aiworkhub_manager_semantic_edit_stage") {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: `stage-${boundedTurns}`,
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
       return {
         stream: (async function* stream() {
           yield {
@@ -1315,13 +1342,37 @@ async function nativeProtocolChecks() {
   };
   const forcedFinal = await internals.runVscodeLmAgent(
     loopingModel,
-    { requestId: "b".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    {
+      requestId: "b".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
     undefined,
     async () => ({ ok: true, content: "graph" }),
   );
-  assert.strictEqual(forcedFinal, finalResponse);
+  assert.deepStrictEqual(JSON.parse(forcedFinal), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
   assert.strictEqual(boundedTurns, 14);
-  assert.ok(!Object.prototype.hasOwnProperty.call(boundedOptions[13], "tools"));
+  assert.deepStrictEqual(
+    boundedOptions[13].tools.map((tool) => tool.name),
+    ["aiworkhub_manager_semantic_edit_stage"],
+  );
+  assert.strictEqual(
+    boundedOptions[13].toolMode,
+    fakeVscode.LanguageModelChatToolMode.Required,
+  );
 
   let emptyTurns = 0;
   const emptyOptions = [];
@@ -1337,6 +1388,23 @@ async function nativeProtocolChecks() {
           }()),
         };
       }
+      if (Array.isArray(options.tools) &&
+          options.tools.length === 1 &&
+          options.tools[0].name === "aiworkhub_manager_semantic_edit_stage") {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: {
+                operation: "create",
+                file_path: "out/result.json",
+                content: "{}\n",
+              },
+            };
+          }()),
+        };
+      }
       if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
         return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
       }
@@ -1345,13 +1413,37 @@ async function nativeProtocolChecks() {
   };
   const emptyForcedFinal = await internals.runVscodeLmAgent(
     emptyLoopModel,
-    { requestId: "c".repeat(32), prompt: "bounded", allowedWrites: ["out/result.json"] },
+    {
+      requestId: "c".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
     undefined,
     async () => ({ ok: true, content: "graph" }),
   );
-  assert.strictEqual(emptyForcedFinal, finalResponse);
+  assert.deepStrictEqual(JSON.parse(emptyForcedFinal), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
   assert.strictEqual(emptyTurns, 14);
-  assert.ok(!Object.prototype.hasOwnProperty.call(emptyOptions[13], "tools"));
+  assert.deepStrictEqual(
+    emptyOptions[13].tools.map((tool) => tool.name),
+    ["aiworkhub_manager_semantic_edit_stage"],
+  );
+  assert.strictEqual(
+    emptyOptions[13].toolMode,
+    fakeVscode.LanguageModelChatToolMode.Required,
+  );
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));

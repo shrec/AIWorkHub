@@ -715,6 +715,31 @@ def test_assert_gc_safe_workspace_shape_accepts_legacy_temp_root_for_upgrade_gc(
     )
 
 
+def test_assert_gc_safe_workspace_shape_uses_explicit_repo_not_foreign_cwd(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(worker_workspace.WORKTREE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(worker_workspace.RUNTIME_ROOT_ENV, raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO_ROOT", raising=False)
+    monkeypatch.delenv("AIWORKHUB_REPO", raising=False)
+    repo = tmp_path / "current-repo"
+    foreign = tmp_path / "foreign-repo"
+    (repo / ".aiworkhub").mkdir(parents=True)
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+    request_id = "req-explicit-repo"
+    root = worker_workspace.configured_worktree_root(repo)
+    path = root / request_id / "worktree"
+    home = root / request_id / "home"
+
+    assert (
+        worker_workspace.assert_gc_safe_workspace_shape(
+            request_id, path, home, repo=repo
+        )
+        == root
+    )
+
+
 # --- missing directory idempotence -------------------------------------------
 
 

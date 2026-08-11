@@ -1295,6 +1295,9 @@ def verify_audit_ledger(
         ) or (
             authority_source == "candidate_overlay"
             and authority_state == "quality_review_readonly"
+        ) or (
+            authority_source == "rework_overlay"
+            and authority_state == "request_scoped_predecessor"
         )
         # A fresh call is real tool-use telemetry even when its bounded query
         # returns zero rows.  Keep it distinct from the non-empty "live" count

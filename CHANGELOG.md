@@ -6,6 +6,16 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.42] - 2026-08-10
+
+### Fixed
+
+- Versioned the local staged-edit bridge generation after live evidence showed
+  that an older in-memory Extension Host could keep routing semantic-edit stage
+  calls through MCP even though the installed 0.9.41 files already contained
+  the offline collector. Host receipts now expose exact extension version and
+  tool transport so the same stale-runtime condition fails visibly.
+
 ## [0.9.41] - 2026-08-10
 
 ### Added

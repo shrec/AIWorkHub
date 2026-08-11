@@ -589,6 +589,66 @@ def test_snapshot_isolates_provider_failures_without_hiding_healthy_groups():
     }
 
 
+class _TransientExactCountsProvider(FakeProvider):
+    """exact_status_counts fails once, then succeeds on retry."""
+
+    def __init__(self):
+        super().__init__()
+        self._attempt = 0
+
+    def get_exact_status_counts(self) -> dict[str, int]:
+        self._attempt += 1
+        if self._attempt == 1:
+            raise OSError("database is locked (transient)")
+        return {"pending": 3, "processing": 0, "review": 0,
+                "blocked": 1, "finished": 0, "archived": 0,
+                "superseded": 0, "stale": 0}
+
+
+def test_exact_status_counts_recovers_from_transient_read_source_failure():
+    """exact_status_counts retries once: transient lock/timeout
+    should not degrade the snapshot or produce partial counts."""
+    snapshot = dashboard.build_snapshot(_TransientExactCountsProvider())
+
+    assert snapshot["health"]["degraded"] is False
+    assert not snapshot["errors"]
+    # Counts come from the successful retry, not bounded list_tasks.
+    assert snapshot["status_counts"]["pending"] == 3
+    assert snapshot["status_counts"]["blocked"] == 1
+    assert snapshot["status_counts"]["finished"] == 0
+    # Verify row_counts reflect exact source totals, not bounded list fallback.
+    assert snapshot["row_counts"]["pending"]["exact"] == 3
+    assert snapshot["row_counts"]["blocked"]["exact"] == 1
+
+
+class _PersistentExactCountsProvider(FakeProvider):
+    """exact_status_counts fails on both attempts."""
+
+    def __init__(self):
+        super().__init__()
+        self._attempt = 0
+
+    def get_exact_status_counts(self) -> dict[str, int]:
+        self._attempt += 1
+        raise RuntimeError("persistent storage unavailable")
+
+
+def test_exact_status_counts_persistent_failure_stays_degraded():
+    """Persistent exact_status_counts failure degrades truthfully
+    and falls back to bounded task_limit counts."""
+    snapshot = dashboard.build_snapshot(_PersistentExactCountsProvider())
+
+    assert snapshot["health"]["degraded"] is True
+    assert any(
+        e["source"] == "exact_status_counts"
+        for e in snapshot["errors"]
+    )
+    # Bounded counts from list_tasks, not fabricated.
+    assert snapshot["status_counts"]["pending"] == 1
+    assert snapshot["status_counts"]["blocked"] == 1
+    assert snapshot["status_counts"]["finished"] == 0
+
+
 def test_read_efficiency_telemetry_separates_observed_from_unobserved_tasks():
     process_report = {
         "processes": [

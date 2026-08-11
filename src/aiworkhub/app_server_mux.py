@@ -219,6 +219,9 @@ def extension_host_parent_pid() -> int:
 APP_SERVER_ARG = "app-server"
 
 SIDEBAND_ALLOWED_METHODS = frozenset({"thread/resume", "turn/steer", "turn/start"})
+REPOSITORY_CONTEXT_METHODS = frozenset(
+    {"thread/start", "thread/resume", "thread/fork", "turn/start"}
+)
 
 
 def _create_manager_transcript_capture(repo_id: str, extension_host_pid: int) -> Any | None:
@@ -450,6 +453,75 @@ def resolve_repo_id_for_mux() -> str:
         return _validate_repo_id(matches[0])
     except ValueError:
         return ""
+
+
+def resolve_repo_root_for_mux(repo_id: str) -> Path | None:
+    """Resolve one live, exact-parent repository root for ``repo_id``.
+
+    Roots are accepted only from ``shared_router`` records that already
+    validated the on-disk repository manifest.  The extension-host PID match
+    prevents another window's selected repository from becoming this chat's
+    cwd in a multi-window or multi-root session.
+    """
+
+    if shared_router is None:
+        return None
+    try:
+        validated = _validate_repo_id(repo_id)
+        registry = shared_router.list_known_repositories(limit=64)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not isinstance(registry, dict) or not registry.get("ok"):
+        return None
+    parent_pid = extension_host_parent_pid()
+    matches = [
+        record
+        for record in registry.get("repositories", [])
+        if isinstance(record, dict)
+        and str(record.get("repo_id") or "") == validated
+        and int(record.get("extension_host_pid") or 0) == parent_pid
+        and bool(record.get("extension_host_alive"))
+        and not bool(record.get("stale"))
+        and str(record.get("selected_provider") or "").strip().lower() == "codex"
+    ]
+    if len(matches) != 1:
+        return None
+    raw_root = str(matches[0].get("repo_root") or "").strip()
+    if not raw_root:
+        return None
+    try:
+        root = Path(raw_root).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return root if root.is_dir() else None
+
+
+def bind_request_repository_context(raw_line: bytes, repo_root: Path | None) -> bytes:
+    """Bind one chat lifecycle request to the verified current repository.
+
+    Non-context requests remain byte-transparent.  For thread creation,
+    resume/fork and each new turn, only ``params.cwd`` is replaced.  The root
+    must already come from the exact-parent shared route above; malformed
+    messages fail open to the original bytes instead of being reconstructed.
+    """
+
+    if repo_root is None:
+        return raw_line
+    message = _try_parse_json_object(raw_line)
+    if message is None or message.get("method") not in REPOSITORY_CONTEXT_METHODS:
+        return raw_line
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return raw_line
+    root_text = str(repo_root)
+    if params.get("cwd") == root_text:
+        return raw_line
+    updated = dict(message)
+    updated["params"] = {**params, "cwd": root_text}
+    newline = b"\r\n" if raw_line.endswith(b"\r\n") else b"\n"
+    return json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    ) + newline
 
 
 def wait_for_repo_id_for_mux() -> str:
@@ -1108,6 +1180,7 @@ class AppServerMux:
         argv: list[str],
         *,
         repo_id: str | None,
+        repo_root: Path | str | None = None,
         deferred_repo_binding: bool = False,
         real_executable: str | list[str] | None = None,
         extension_stdin: BinaryIO | None = None,
@@ -1126,6 +1199,11 @@ class AppServerMux:
             self._repo_id = ""
         else:
             self._repo_id = _validate_repo_id(repo_id)
+        self._repo_root = (
+            Path(repo_root).expanduser().resolve(strict=False)
+            if repo_root is not None
+            else resolve_repo_root_for_mux(self._repo_id) if self._repo_id else None
+        )
         self._argv = list(argv)
         self._real_executable: str | list[str] = real_executable or resolve_real_executable()
         self._extension_stdin: BinaryIO = extension_stdin if extension_stdin is not None else sys.stdin.buffer
@@ -1236,6 +1314,7 @@ class AppServerMux:
             stdout=subprocess.PIPE,
             stderr=None,  # inherited -- transparent stderr proxy, no active pumping needed
             bufsize=0,
+            cwd=str(self._repo_root) if self._repo_root is not None else None,
         )
         self._child_job_handle = _bind_child_lifetime_to_this_process(self._child)
         self._start_thread(self._pump_extension_to_child)
@@ -1273,6 +1352,8 @@ class AppServerMux:
             if self._stop_event.is_set():
                 return False
             self._repo_id = validated
+            if self._repo_root is None:
+                self._repo_root = resolve_repo_root_for_mux(validated)
             try:
                 if self._transcript_capture is None:
                     self._transcript_capture = _create_manager_transcript_capture(
@@ -1382,6 +1463,11 @@ class AppServerMux:
                 raw_line = self._extension_stdin.readline()
                 if not raw_line:
                     break
+                if self._repo_root is None:
+                    repo_id = self._repo_id or resolve_repo_id_for_mux()
+                    if repo_id:
+                        self._repo_root = resolve_repo_root_for_mux(repo_id)
+                raw_line = bind_request_repository_context(raw_line, self._repo_root)
                 self._observe_extension_message(raw_line)
                 self._write_to_child(raw_line)
         except (OSError, ValueError):
@@ -1758,11 +1844,13 @@ def run_mux(
     argv: list[str],
     *,
     repo_id: str | None,
+    repo_root: Path | str | None = None,
     deferred_repo_binding: bool = False,
 ) -> int:
     mux = AppServerMux(
         argv,
         repo_id=repo_id,
+        repo_root=repo_root,
         deferred_repo_binding=deferred_repo_binding,
     )
     mux.start()
@@ -1813,9 +1901,11 @@ def main(argv: list[str] | None = None) -> int:
     # begins as a byte-transparent proxy and attaches its repo-scoped sideband
     # later.  No unbound registry or callback authority is ever exposed.
     repo_id = resolve_repo_id_for_mux()
+    repo_root = resolve_repo_root_for_mux(repo_id) if repo_id else None
     return run_mux(
         raw_argv,
         repo_id=repo_id or None,
+        repo_root=repo_root,
         deferred_repo_binding=not bool(repo_id),
     )
 
@@ -1830,6 +1920,7 @@ __all__ = [
     "ENV_EXTENSION_HOST_PID",
     "ENV_ROUTE_WAIT_SECONDS",
     "ENV_SIDEBAND_DIR",
+    "REPOSITORY_CONTEXT_METHODS",
     "SIDEBAND_ALLOWED_METHODS",
     "SIDEBAND_ALLOWED_REQUEST_KEYS",
     "SIDEBAND_DEDUP_MAX_ENTRIES",
@@ -1849,6 +1940,7 @@ __all__ = [
     "SidebandInstance",
     "SidebandNotReady",
     "SidebandRejected",
+    "bind_request_repository_context",
     "bind_sideband_listener",
     "connect_sideband_socket",
     "default_sideband_dir",
@@ -1860,6 +1952,7 @@ __all__ = [
     "main",
     "_passthrough_real_executable",
     "resolve_real_executable",
+    "resolve_repo_root_for_mux",
     "run_mux",
     "sideband_instances_dir",
     "sideband_uses_unix_socket",

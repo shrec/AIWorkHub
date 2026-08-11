@@ -2033,3 +2033,556 @@ class TestCopyOne:
         worker_workspace._copy_one(src, dst)
         assert dst.read_bytes() == b"x" * 8192
         assert call_count[0] >= 2  # at least one retry
+
+
+# ---------------------------------------------------------------------------
+# NF128: candidate pytest wrapper helpers and run_validations integration
+# ---------------------------------------------------------------------------
+
+
+class TestCandidatePytestWrapperCommand:
+    @staticmethod
+    def test_exact_candidate_pytest_wrapper_is_recognized() -> None:
+        """python3 tools/candidate_pytest.py tests/ -- exact match"""
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3", "tools/candidate_pytest.py", "tests/"]
+        ) is True
+
+    @staticmethod
+    def test_candidate_pytest_wrapper_with_extra_args() -> None:
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3", "tools/candidate_pytest.py", "-v", "-k", "test_x"]
+        ) is True
+
+
+class TestCandidatePytestWrapperNearMatchesFailClosed:
+    @staticmethod
+    def test_python_not_python3_rejected() -> None:
+        """python (not python3) fails closed"""
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python", "tools/candidate_pytest.py", "tests/"]
+        ) is False
+
+    @staticmethod
+    def test_python3_11_rejected() -> None:
+        """python3.11 fails closed -- only exact python3"""
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3.11", "tools/candidate_pytest.py", "tests/"]
+        ) is False
+
+    @staticmethod
+    def test_absolute_wrapper_path_rejected() -> None:
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3", "/abs/tools/candidate_pytest.py"]
+        ) is False
+
+    @staticmethod
+    def test_relative_with_extra_components_rejected() -> None:
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3", "scripts/tools/candidate_pytest.py"]
+        ) is False
+
+    @staticmethod
+    def test_short_argv_rejected() -> None:
+        assert worker_workspace._is_candidate_pytest_wrapper_command([]) is False
+        assert worker_workspace._is_candidate_pytest_wrapper_command(["python3"]) is False
+
+    @staticmethod
+    def test_pytest_plain_not_misclassified() -> None:
+        """Ordinary pytest is never classified as candidate"""
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["pytest", "tests/"]
+        ) is False
+
+    @staticmethod
+    def test_python3_m_pytest_not_misclassified() -> None:
+        """python3 -m pytest is never classified as candidate"""
+        assert worker_workspace._is_candidate_pytest_wrapper_command(
+            ["python3", "-m", "pytest"]
+        ) is False
+
+
+class TestResolveCandidatePytestWrapper:
+    @staticmethod
+    def test_resolves_valid_regular_wrapper_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("# candidate wrapper\nimport pytest\n", encoding="utf-8")
+        resolved, entry = worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+        assert resolved == wrapper.resolve()
+        assert entry["name"] == "aiworkhub_candidate_pytest_wrapper"
+        assert entry["spec"] is not None
+
+    @staticmethod
+    def test_missing_wrapper_raises(tmp_path: Path) -> None:
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_unavailable",
+        ):
+            worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+
+    @staticmethod
+    def test_symlink_wrapper_rejected(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if not hasattr(os, "symlink"):
+            pytest.skip("os.symlink not available")
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        real_wrapper = tmp_path / "real_candidate_pytest.py"
+        real_wrapper.write_text("# real wrapper\n", encoding="utf-8")
+        symlink_wrapper = tools_dir / "candidate_pytest.py"
+        os.symlink(real_wrapper, symlink_wrapper)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_symlink_forbidden",
+        ):
+            worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+
+    @staticmethod
+    def test_directory_not_regular_file_rejected(tmp_path: Path) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        dir_wrapper = tools_dir / "candidate_pytest.py"
+        dir_wrapper.mkdir()
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_not_regular",
+        ):
+            worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+
+    @staticmethod
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX owner/mode semantics")
+    def test_world_writable_wrapper_rejected(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("# wrapper\n", encoding="utf-8")
+        wrapper.chmod(0o666)  # world-writable
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_world_writable",
+        ):
+            worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+
+    @staticmethod
+    def test_wrong_owner_rejected_posix(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if os.name == "nt":
+            pytest.skip("POSIX owner semantics")
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("# wrapper\n", encoding="utf-8")
+        # Capture the real uid and original function before monkeypatching
+        # so the lambda does not recursively call the patched os.getuid.
+        _real_getuid = os.getuid
+        real_uid = _real_getuid()
+        monkeypatch.setattr(os, "getuid", lambda _real=_real_getuid: _real() + 1)
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_untrusted_owner",
+        ):
+            worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+
+
+class TestCandidatePytestWrapperModuleInstallUninstall:
+    @staticmethod
+    def test_install_and_uninstall_restores_sys_modules(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("# wrapper\n", encoding="utf-8")
+        _resolved, entry = worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+        module_name = entry["name"]
+        # Ensure not already present
+        assert module_name not in sys.modules
+        worker_workspace._install_candidate_pytest_wrapper_module(entry)
+        assert module_name in sys.modules
+        worker_workspace._uninstall_candidate_pytest_wrapper_module(entry)
+        assert module_name not in sys.modules
+
+    @staticmethod
+    def test_uninstall_none_is_noop() -> None:
+        """_uninstall_candidate_pytest_wrapper_module(None) does not raise"""
+        worker_workspace._uninstall_candidate_pytest_wrapper_module(None)
+
+    @staticmethod
+    def test_double_install_raises(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("# wrapper\n", encoding="utf-8")
+        _resolved, entry = worker_workspace._resolve_candidate_pytest_wrapper(tmp_path)
+        try:
+            worker_workspace._install_candidate_pytest_wrapper_module(entry)
+            with pytest.raises(
+                worker_workspace.WorkspaceError,
+                match="candidate_pytest_wrapper_module_conflict",
+            ):
+                worker_workspace._install_candidate_pytest_wrapper_module(entry)
+        finally:
+            worker_workspace._uninstall_candidate_pytest_wrapper_module(entry)
+
+
+class TestFocusedRegressionExercisesCandidate:
+    """Integration tests for run_validations with candidate pytest wrapper."""
+
+    @staticmethod
+    def test_candidate_wrapper_gets_candidate_first_pythonpath(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """NF128: exact candidate wrapper PYTHONPATH = declared first, pytest last."""
+        # 1. Create workspace BEFORE monkeypatching subprocess
+        workspace = worker_workspace.WorkerWorkspace(
+            request_id="nf128-candidate-py-order",
+            repo=tmp_path,
+            path=tmp_path,
+            home=tmp_path,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={},
+        )
+
+        # 2. Create the wrapper file and a declared PYTHONPATH component
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        wrapper = tools_dir / "candidate_pytest.py"
+        wrapper.write_text("import pytest\n", encoding="utf-8")
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+
+        # 3. Pre-create a tmp scratch
+        scratch_dir = tmp_path / "scratch"
+        scratch_dir.mkdir(mode=0o700)
+
+        # 4. Mock provision/cleanup to use the pre-created scratch
+        monkeypatch.setattr(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            lambda _ws: scratch_dir,
+        )
+        cleanup_called = [False]
+
+        def _fake_cleanup(p: Path | None) -> None:
+            cleanup_called[0] = True
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "cleanup_validation_exec_scratch",
+            _fake_cleanup,
+        )
+
+        # 5. Mock resolve_trusted_pytest_runtime_root to a real tmp_path
+        pytest_root = tmp_path / "pytest_site"
+        pytest_root.mkdir()
+        monkeypatch.setattr(
+            worker_workspace,
+            "resolve_trusted_pytest_runtime_root",
+            lambda: pytest_root,
+        )
+
+        # 6. Mock _approved_pythonpath_site to accept only that exact root
+        def _approved_site(component: str) -> Path:
+            c = Path(component)
+            if c == pytest_root:
+                return pytest_root
+            raise worker_workspace.WorkspaceError(
+                f"validation_pythonpath_absolute_component_forbidden:{component}"
+            )
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "_approved_pythonpath_site",
+            _approved_site,
+        )
+
+        # 7. Mock resolve_validation_pythonpath to capture effective_components
+        #    order without asserting sandbox-virtualized values.
+        captured_components: tuple[str, ...] | None = None
+
+        from collections.abc import Callable as _Callable
+        _orig_resolve = worker_workspace.resolve_validation_pythonpath
+
+        def _capture_resolve(
+            ws: worker_workspace.WorkerWorkspace,
+            backend: str,
+            components: tuple[str, ...],
+        ) -> str:
+            nonlocal captured_components
+            captured_components = components
+            return _orig_resolve(ws, backend, components)
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "resolve_validation_pythonpath",
+            _capture_resolve,
+        )
+
+        # 8. Capture subprocess.run only around run_validations
+        captured_env: dict[str, str] | None = None
+
+        orig_run = worker_workspace.subprocess.run
+
+        def _capture_run(argv, **kwargs):
+            nonlocal captured_env
+            captured_env = dict(kwargs.get("env", {}))
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+        try:
+            results = worker_workspace.run_validations(
+                workspace,
+                ["PYTHONPATH=src python3 tools/candidate_pytest.py tests/"],
+            )
+            assert len(results) == 1
+            assert results[0]["returncode"] == 0
+            assert captured_components is not None, (
+                "resolve_validation_pythonpath was not called"
+            )
+            # Candidate: declared components first, trusted pytest last.
+            assert len(captured_components) >= 2
+            assert captured_components[0] == 'src', (
+                f"declared 'src' expected first, got {captured_components}"
+            )
+            assert captured_components[-1] == str(pytest_root), (
+                f"pytest root expected last, got {captured_components}"
+            )
+        finally:
+            # Restore subprocess.run before cleanup
+            monkeypatch.setattr(worker_workspace.subprocess, "run", orig_run)
+            assert cleanup_called[0] is True
+
+    @staticmethod
+    def test_ordinary_pytest_keeps_trusted_first_pythonpath(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Ordinary pytest keeps trusted-root-first PYTHONPATH."""
+        workspace = worker_workspace.WorkerWorkspace(
+            request_id="nf128-ordinary-py-order",
+            repo=tmp_path,
+            path=tmp_path,
+            home=tmp_path,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={},
+        )
+
+        # Create a declared PYTHONPATH component
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+
+        scratch_dir = tmp_path / "scratch"
+        scratch_dir.mkdir(mode=0o700)
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            lambda _ws: scratch_dir,
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "cleanup_validation_exec_scratch",
+            lambda _p: None,
+        )
+
+        pytest_root = tmp_path / "pytest_site"
+        pytest_root.mkdir()
+        monkeypatch.setattr(
+            worker_workspace,
+            "resolve_trusted_pytest_runtime_root",
+            lambda: pytest_root,
+        )
+
+        def _approved_site(component: str) -> Path:
+            c = Path(component)
+            if c == pytest_root:
+                return pytest_root
+            raise worker_workspace.WorkspaceError(
+                f"validation_pythonpath_absolute_component_forbidden:{component}"
+            )
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "_approved_pythonpath_site",
+            _approved_site,
+        )
+
+        # Mock resolve_validation_pythonpath to capture effective_components
+        # order without asserting sandbox-virtualized values.
+        captured_components: tuple[str, ...] | None = None
+
+        _orig_resolve = worker_workspace.resolve_validation_pythonpath
+
+        def _capture_resolve(
+            ws: worker_workspace.WorkerWorkspace,
+            backend: str,
+            components: tuple[str, ...],
+        ) -> str:
+            nonlocal captured_components
+            captured_components = components
+            return _orig_resolve(ws, backend, components)
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "resolve_validation_pythonpath",
+            _capture_resolve,
+        )
+
+        captured_env: dict[str, str] | None = None
+
+        orig_run = worker_workspace.subprocess.run
+
+        def _capture_run(argv, **kwargs):
+            nonlocal captured_env
+            captured_env = dict(kwargs.get("env", {}))
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+        try:
+            results = worker_workspace.run_validations(
+                workspace,
+                ["PYTHONPATH=src pytest tests/"],
+            )
+            assert len(results) == 1
+            assert results[0]["returncode"] == 0
+            assert captured_components is not None, (
+                "resolve_validation_pythonpath was not called"
+            )
+            # Ordinary pytest: trusted root FIRST, declared components after.
+            assert len(captured_components) >= 2
+            assert captured_components[0] == str(pytest_root), (
+                f"pytest root expected first, got {captured_components}"
+            )
+            assert captured_components[-1] == 'src', (
+                f"declared 'src' expected last, got {captured_components}"
+            )
+        finally:
+            monkeypatch.setattr(worker_workspace.subprocess, "run", orig_run)
+
+    @staticmethod
+    def test_near_match_candidate_falls_through_to_ordinary_pytest(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """python tools/candidate_pytest.py is NOT a candidate wrapper."""
+        workspace = worker_workspace.WorkerWorkspace(
+            request_id="nf128-near-fallthrough",
+            repo=tmp_path,
+            path=tmp_path,
+            home=tmp_path,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={},
+        )
+
+        scratch_dir = tmp_path / "scratch"
+        scratch_dir.mkdir(mode=0o700)
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            lambda _ws: scratch_dir,
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "cleanup_validation_exec_scratch",
+            lambda _p: None,
+        )
+
+        pytest_root = tmp_path / "pytest_site"
+        pytest_root.mkdir()
+        monkeypatch.setattr(
+            worker_workspace,
+            "resolve_trusted_pytest_runtime_root",
+            lambda: pytest_root,
+        )
+
+        def _approved_site(component: str) -> Path:
+            c = Path(component)
+            if c == pytest_root:
+                return pytest_root
+            raise worker_workspace.WorkspaceError(
+                f"validation_pythonpath_absolute_component_forbidden:{component}"
+            )
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "_approved_pythonpath_site",
+            _approved_site,
+        )
+
+        captured_env: dict[str, str] | None = None
+
+        orig_run = worker_workspace.subprocess.run
+
+        def _capture_run(argv, **kwargs):
+            nonlocal captured_env
+            captured_env = dict(kwargs.get("env", {}))
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+        try:
+            # "python" not "python3" -> not candidate, but also not "pytest" bare
+            # so _is_pytest_validation_command won't match either.  The command
+            # runs as-is with no PYTHONPATH overlay.
+            results = worker_workspace.run_validations(
+                workspace,
+                ["python tools/candidate_pytest.py tests/"],
+            )
+            assert len(results) == 1
+            # No PYTHONPATH because neither candidate nor pytest matched
+            assert captured_env is not None
+            assert "PYTHONPATH" not in captured_env
+        finally:
+            monkeypatch.setattr(worker_workspace.subprocess, "run", orig_run)
+
+    @staticmethod
+    def test_candidate_wrapper_missing_file_raises_before_execution(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When tools/candidate_pytest.py is missing, ValidationRunError."""
+        workspace = worker_workspace.WorkerWorkspace(
+            request_id="nf128-missing-wrapper",
+            repo=tmp_path,
+            path=tmp_path,
+            home=tmp_path,
+            allowed_writes=(),
+            parent_baseline={},
+            workspace_baseline={},
+        )
+
+        scratch_dir = tmp_path / "scratch"
+        scratch_dir.mkdir(mode=0o700)
+
+        monkeypatch.setattr(
+            worker_workspace,
+            "provision_validation_exec_scratch",
+            lambda _ws: scratch_dir,
+        )
+        monkeypatch.setattr(
+            worker_workspace,
+            "cleanup_validation_exec_scratch",
+            lambda _p: None,
+        )
+
+        with pytest.raises(
+            worker_workspace.WorkspaceError,
+            match="candidate_pytest_wrapper_unavailable",
+        ):
+            worker_workspace.run_validations(
+                workspace,
+                ["python3 tools/candidate_pytest.py tests/"],
+            )

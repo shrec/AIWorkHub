@@ -33,6 +33,7 @@ entirely so the exact source edited for this task is what gets exercised.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import time
@@ -267,15 +268,15 @@ def test_main_unbound_app_server_starts_deferred_mux_without_sideband_authority(
         "list_known_repositories",
         lambda **_kwargs: {"ok": True, "repositories": []},
     )
-    calls: list[tuple[list[str], str | None, bool]] = []
+    calls: list[tuple[list[str], str | None, Path | None, bool]] = []
 
-    def fake_run_mux(args, *, repo_id, deferred_repo_binding=False):
-        calls.append((list(args), repo_id, deferred_repo_binding))
+    def fake_run_mux(args, *, repo_id, repo_root=None, deferred_repo_binding=False):
+        calls.append((list(args), repo_id, repo_root, deferred_repo_binding))
         return 0
 
     monkeypatch.setattr(asm, "run_mux", fake_run_mux)
     assert asm.main(["app-server", "--listen", "stdio://"]) == 0
-    assert calls == [(["app-server", "--listen", "stdio://"], None, True)]
+    assert calls == [(["app-server", "--listen", "stdio://"], None, None, True)]
 
 
 def test_mux_waits_for_exact_parent_route_during_parallel_extension_start(monkeypatch):
@@ -366,6 +367,70 @@ def test_resolve_repo_id_for_mux_fails_closed_on_ambiguous_parent(monkeypatch):
     )
 
     assert asm.resolve_repo_id_for_mux() == ""
+
+
+def test_resolve_repo_root_for_mux_uses_same_exact_parent_route(tmp_path, monkeypatch):
+    repo = tmp_path / "current-repo"
+    repo.mkdir()
+    repo_id = "repo_0123456789abcdef0123456789abcdef"
+    monkeypatch.delenv(asm.ENV_EXTENSION_HOST_PID, raising=False)
+    monkeypatch.setattr(asm.os, "getppid", lambda: 4242)
+    monkeypatch.setattr(
+        asm.shared_router,
+        "list_known_repositories",
+        lambda **_kwargs: {
+            "ok": True,
+            "repositories": [
+                {
+                    "repo_id": repo_id,
+                    "repo_root": str(repo),
+                    "extension_host_pid": 4242,
+                    "extension_host_alive": True,
+                    "stale": False,
+                    "selected_provider": "codex",
+                }
+            ],
+        },
+    )
+
+    assert asm.resolve_repo_root_for_mux(repo_id) == repo.resolve()
+
+
+@pytest.mark.parametrize(
+    "method", ["thread/start", "thread/resume", "thread/fork", "turn/start"]
+)
+def test_chat_lifecycle_requests_bind_cwd_to_verified_repo(tmp_path, method):
+    repo = tmp_path / "current-repo"
+    repo.mkdir()
+    raw = (
+        json.dumps(
+            {
+                "id": 17,
+                "method": method,
+                "params": {"cwd": "/foreign/repo", "threadId": "thread-1"},
+            }
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    rewritten = json.loads(
+        asm.bind_request_repository_context(raw, repo.resolve()).decode("utf-8")
+    )
+
+    assert rewritten["id"] == 17
+    assert rewritten["method"] == method
+    assert rewritten["params"]["threadId"] == "thread-1"
+    assert rewritten["params"]["cwd"] == str(repo.resolve())
+
+
+def test_non_context_and_malformed_requests_remain_byte_transparent(tmp_path):
+    repo = tmp_path / "current-repo"
+    repo.mkdir()
+    initialize = b'{"id":1,"method":"initialize","params":{"cwd":"/foreign"}}\n'
+    malformed = b"not-json\n"
+
+    assert asm.bind_request_repository_context(initialize, repo) is initialize
+    assert asm.bind_request_repository_context(malformed, repo) is malformed
 
 
 def test_main_non_app_server_invocation_never_requires_repo_id(monkeypatch, tmp_path):

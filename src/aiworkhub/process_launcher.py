@@ -110,7 +110,9 @@ else:
         request_id: str,
         path: Path,
         home: Path,
-    ) -> None:
+        *,
+        repo: Path | None = None,
+    ) -> Path:
         for label, candidate in (("path", path), ("home", home)):
             if not str(candidate):
                 raise WorkspaceError(f"gc_workspace_{label}_missing")
@@ -118,9 +120,14 @@ else:
                 raise WorkspaceError(f"gc_workspace_{label}_symlink")
         if path == home or path in home.parents or home in path.parents:
             raise WorkspaceError("gc_workspace_path_home_overlap")
-        for raw in (path.name, home.name):
-            if request_id not in raw:
-                raise WorkspaceError("gc_workspace_request_id_mismatch")
+        if (
+            path.name != "worktree"
+            or home.name != "home"
+            or path.parent != home.parent
+            or path.parent.name != request_id
+        ):
+            raise WorkspaceError("gc_workspace_request_id_mismatch")
+        return path.parent.parent
 
 if hasattr(_worker_workspace, "validate_required_outputs"):
     validate_required_outputs = _worker_workspace.validate_required_outputs
@@ -4181,7 +4188,7 @@ class ProcessManager:
             if workspace.repo != self.repo or workspace.request_id != target_request_id:
                 raise WorkspaceError("quality_review_target_workspace_identity_mismatch")
             assert_gc_safe_workspace_shape(
-                target_request_id, workspace.path, workspace.home
+                target_request_id, workspace.path, workspace.home, repo=self.repo
             )
             changed_hashes = evidence.get("changed_path_hashes")
             if not isinstance(changed_hashes, dict) or not changed_hashes:
@@ -4766,6 +4773,7 @@ class ProcessManager:
                                 {
                                     "authority_source": "rework_overlay",
                                     "authority_state": "request_scoped_predecessor",
+                                    "packet_path": str(rework_overlay_path),
                                     "target_request_id": str(
                                         rework_overlay_packet.get(
                                             "predecessor_request_id"
@@ -6392,7 +6400,9 @@ class ProcessManager:
                     }
                 try:
                     workspace = WorkerWorkspace.from_metadata(dict(workspace_meta))
-                    assert_gc_safe_workspace_shape(meta_request_id, path, home)
+                    assert_gc_safe_workspace_shape(
+                        meta_request_id, path, home, repo=repo
+                    )
                 except (KeyError, TypeError, ValueError, WorkspaceError) as exc:
                     return {
                         "request_id": request_id,
@@ -6475,7 +6485,7 @@ class ProcessManager:
             if not _process_proven_dead(pid, ticks):
                 return {"request_id": request_id, "gc": False, "reason": "process_not_proven_dead"}
             try:
-                assert_gc_safe_workspace_shape(meta_request_id, path, home)
+                assert_gc_safe_workspace_shape(meta_request_id, path, home, repo=repo)
             except WorkspaceError as exc:
                 return {
                     "request_id": request_id,
@@ -7637,6 +7647,103 @@ class ProcessManager:
             return {"ok": False, "reason": "worker_bridge_metadata_identity_mismatch"}
         worker_meta = metadata.get("worker_mcp") or {}
         workspace_meta = metadata.get("workspace") or {}
+        rework_overlay_packet: dict[str, Any] | None = None
+        rework_overlay_packet_path: Path | None = None
+        source_graph_authority = worker_meta.get("source_graph_authority")
+        if (
+            isinstance(source_graph_authority, dict)
+            and source_graph_authority.get("authority_source") == "rework_overlay"
+        ):
+            try:
+                workspace_home = Path(str(workspace_meta["home"])).resolve()
+                expected_path = (
+                    workspace_home / "task_mcp_worker_runtime" / "rework_overlay.json"
+                )
+                declared_path = Path(str(source_graph_authority["packet_path"]))
+                if os.path.normcase(os.path.abspath(declared_path)) != os.path.normcase(
+                    os.path.abspath(expected_path)
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "worker_bridge_rework_overlay_path_mismatch",
+                    }
+                if declared_path.is_symlink():
+                    return {
+                        "ok": False,
+                        "reason": "worker_bridge_rework_overlay_symlink_forbidden",
+                    }
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(declared_path, flags)
+                try:
+                    file_stat = os.fstat(fd)
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        return {
+                            "ok": False,
+                            "reason": "worker_bridge_rework_overlay_not_regular",
+                        }
+                    if file_stat.st_size > worker_ai_tools_mcp.MAX_REWORK_OVERLAY_PACKET_BYTES:
+                        return {
+                            "ok": False,
+                            "reason": "worker_bridge_rework_overlay_too_large",
+                        }
+                    packet_buffer = bytearray()
+                    remaining = file_stat.st_size + 1
+                    while remaining > 0:
+                        chunk = os.read(fd, min(remaining, 64 * 1024))
+                        if not chunk:
+                            break
+                        packet_buffer.extend(chunk)
+                        remaining -= len(chunk)
+                finally:
+                    os.close(fd)
+                packet_bytes = bytes(packet_buffer)
+                if len(packet_bytes) != file_stat.st_size:
+                    return {
+                        "ok": False,
+                        "reason": "worker_bridge_rework_overlay_changed_during_read",
+                    }
+                rework_overlay_packet = json.loads(packet_bytes.decode("utf-8"))
+                if not isinstance(rework_overlay_packet, dict):
+                    return {
+                        "ok": False,
+                        "reason": "worker_bridge_rework_overlay_invalid",
+                    }
+                worker_ai_tools_mcp._verify_rework_overlay_packet(
+                    rework_overlay_packet,
+                    str(metadata["task_id"]),
+                    request_id,
+                    str(metadata["runner"]),
+                    Path(str(worker_meta["authority_repo"])).resolve(),
+                )
+                if (
+                    str(source_graph_authority.get("target_request_id") or "")
+                    != str(rework_overlay_packet.get("predecessor_request_id") or "")
+                    or str(source_graph_authority.get("target_task_id") or "")
+                    != str(rework_overlay_packet.get("predecessor_task_id") or "")
+                    or str(source_graph_authority.get("packet_sha256") or "")
+                    != str(rework_overlay_packet.get("canonical_digest") or "")
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "worker_bridge_rework_overlay_metadata_mismatch",
+                    }
+                rework_overlay_packet_path = declared_path
+            except KeyError:
+                return {
+                    "ok": False,
+                    "reason": "worker_bridge_rework_overlay_metadata_missing",
+                }
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return {
+                    "ok": False,
+                    "reason": "worker_bridge_rework_overlay_unreadable",
+                }
+            except worker_ai_tools_mcp.WorkerToolError as exc:
+                return {
+                    "ok": False,
+                    "reason": "worker_bridge_rework_overlay_verification_failed:"
+                    + str(exc)[:240],
+                }
         try:
             ctx = worker_ai_tools_mcp.WorkerToolContext(
                 task_id=str(metadata["task_id"]),
@@ -7655,6 +7762,8 @@ class ProcessManager:
                     if isinstance(metadata.get("quality_review"), dict)
                     else None
                 ),
+                rework_overlay_packet=rework_overlay_packet,
+                rework_overlay_packet_path=rework_overlay_packet_path,
             )
         except (KeyError, TypeError, ValueError):
             return {"ok": False, "reason": "worker_bridge_context_invalid"}
@@ -8244,7 +8353,9 @@ class ProcessManager:
                     "error": "finalization_retry_identity_mismatch",
                 }
             try:
-                assert_gc_safe_workspace_shape(request_id, workspace.path, workspace.home)
+                assert_gc_safe_workspace_shape(
+                    request_id, workspace.path, workspace.home, repo=self.repo
+                )
             except WorkspaceError as exc:
                 return {
                     "ok": False,
@@ -8587,7 +8698,9 @@ class ProcessManager:
                     "task_id": task_id,
                 }
             try:
-                assert_gc_safe_workspace_shape(request_id, workspace.path, workspace.home)
+                assert_gc_safe_workspace_shape(
+                    request_id, workspace.path, workspace.home, repo=self.repo
+                )
             except WorkspaceError as exc:
                 return {
                     "ok": False,

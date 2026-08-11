@@ -1172,6 +1172,20 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     key = home / "audit.key"
     ledger.write_text("", encoding="utf-8")
     key.write_bytes(b"k" * 32)
+    overlay_path = home / "task_mcp_worker_runtime" / "rework_overlay.json"
+    overlay_path.parent.mkdir()
+    overlay_payload = {
+        "successor_task_id": "GLM_BRIDGE_TEST",
+        "successor_request_id": request_id,
+        "predecessor_task_id": "GLM_BRIDGE_TEST",
+        "predecessor_request_id": "e" * 32,
+        "authority_repo": str(repo),
+        "files": [],
+    }
+    overlay_payload["canonical_digest"] = hashlib.sha256(
+        json.dumps(overlay_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    overlay_path.write_text(json.dumps(overlay_payload), encoding="utf-8")
     metadata_path = process_dir / f"{request_id}.request.json"
     metadata_path.write_text(json.dumps({
         "request_id": request_id,
@@ -1179,7 +1193,7 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
         "runner": "glm52_bridge_test",
         "topic": "bridge_test",
         "adapter_id": "glm_vscode_lm",
-        "workspace": {"path": str(workspace)},
+        "workspace": {"path": str(workspace), "home": str(home)},
         "worker_mcp": {
             "authority_repo": str(repo),
             "source_graph_targets": ["src/aiworkhub"],
@@ -1187,6 +1201,14 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
             "session_topic": "bounded bridge test",
             "audit_ledger_path": str(ledger),
             "audit_hmac_key_path": str(key),
+            "source_graph_authority": {
+                "authority_source": "rework_overlay",
+                "authority_state": "request_scoped_predecessor",
+                "packet_path": str(overlay_path),
+                "target_request_id": overlay_payload["predecessor_request_id"],
+                "target_task_id": overlay_payload["predecessor_task_id"],
+                "packet_sha256": overlay_payload["canonical_digest"],
+            },
         },
     }), encoding="utf-8")
     manager = process_launcher.ProcessManager(
@@ -1221,6 +1243,8 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
     assert ctx.task_id == "GLM_BRIDGE_TEST"
     assert ctx.authority_repo == repo.resolve()
     assert ctx.audit_ledger_path == ledger
+    assert ctx.rework_overlay_packet == overlay_payload
+    assert ctx.rework_overlay_packet_path == overlay_path
     assert observed["kwargs"] == {"mode": "focus", "query": "bridge", "budget": 16}
 
     prepared = manager.invoke_vscode_lm_worker_tool(
@@ -1267,6 +1291,59 @@ def test_glm_bridge_tool_runs_with_exact_worker_audit_context(
         "idempotency_key": "session:bridge:0001",
         "provenance": "bridge test",
     }
+
+    tampered = dict(overlay_payload)
+    tampered["files"] = [{"path": "src/app.py", "sha256": "0" * 64}]
+    overlay_path.write_text(json.dumps(tampered), encoding="utf-8")
+    rejected = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "bridge", "budget": 16},
+    )
+    assert rejected["ok"] is False
+    assert rejected["reason"].startswith(
+        "worker_bridge_rework_overlay_verification_failed:rework_packet_digest_mismatch"
+    )
+
+    with overlay_path.open("wb") as handle:
+        handle.truncate(worker_ai_tools_mcp.MAX_REWORK_OVERLAY_PACKET_BYTES + 1)
+    oversized = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "bridge", "budget": 16},
+    )
+    assert oversized == {
+        "ok": False,
+        "reason": "worker_bridge_rework_overlay_too_large",
+    }
+
+    overlay_path.unlink()
+    missing = manager.invoke_vscode_lm_worker_tool(
+        request_id,
+        "aiworkhub_manager_source_graph_query",
+        {"mode": "focus", "query": "bridge", "budget": 16},
+    )
+    assert missing == {
+        "ok": False,
+        "reason": "worker_bridge_rework_overlay_unreadable",
+    }
+
+    symlink_target = home / "overlay-target.json"
+    symlink_target.write_text(json.dumps(overlay_payload), encoding="utf-8")
+    try:
+        overlay_path.symlink_to(symlink_target)
+    except OSError:
+        pass  # Native Windows may deny unprivileged symlink creation.
+    else:
+        symlinked = manager.invoke_vscode_lm_worker_tool(
+            request_id,
+            "aiworkhub_manager_source_graph_query",
+            {"mode": "focus", "query": "bridge", "budget": 16},
+        )
+        assert symlinked == {
+            "ok": False,
+            "reason": "worker_bridge_rework_overlay_symlink_forbidden",
+        }
 
 
 def _progress_payload(*, sequence: int = 1) -> dict[str, object]:

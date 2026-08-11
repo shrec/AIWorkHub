@@ -12,7 +12,7 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.41
+## What's new in 0.9.42
 
 - VS Code LM workers can stage small hash-bound replacements and new files one
   at a time, then finalize with a short summary; AIWorkHub assembles the full
@@ -24,6 +24,9 @@ port, expose a LAN service or require an AIWorkHub cloud account.
 - Bounded dashboard event-stream primitives now cover gaps, overflow,
   reconnect and authoritative resync; live server/webview wiring remains a
   tracked follow-up.
+- Extension-host receipts expose the exact loaded extension version and
+  staged-edit transport, so a stale in-memory host cannot be mistaken for the
+  newly installed worker bridge during live validation.
 
 See the packaged **Changelog** for the complete release summary.
 

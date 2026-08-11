@@ -2079,14 +2079,27 @@ def build_snapshot(provider: Any | None = None) -> dict[str, Any]:
     exact_reader = getattr(data_provider, "get_exact_status_counts", None)
     exact_counts: Mapping[str, Any] | None = None
     if exact_reader is not None:
-        exact_counts = _safe_read("exact_status_counts", exact_reader, errors, None)
-        if not isinstance(exact_counts, Mapping):
-            if exact_counts is not None:
-                errors.append({
-                    "source": "exact_status_counts",
-                    "kind": "DashboardReadError",
-                    "message": "exact status counts provider returned a non-object",
-                })
+        # Retry once for read-source transients (e.g. SQLite lock timeout).
+        # A single transient failure does not degrade or log; persistent
+        # failure after the retry degrades truthfully and falls back to
+        # bounded task_limit counts.
+        for attempt in range(2):
+            try:
+                exact_counts = exact_reader()
+                break
+            except Exception as exc:
+                if attempt == 1:
+                    errors.append({
+                        "source": "exact_status_counts",
+                        "kind": type(exc).__name__,
+                        "message": _bounded_text(exc),
+                    })
+        if exact_counts is not None and not isinstance(exact_counts, Mapping):
+            errors.append({
+                "source": "exact_status_counts",
+                "kind": "DashboardReadError",
+                "message": "exact status counts provider returned a non-object",
+            })
             exact_counts = None
 
     if exact_counts is not None:

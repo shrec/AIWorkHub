@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.42 — 2026-08-10
+
+### Fixed
+
+- Give the staged-edit bridge a fresh extension/runtime generation and expose
+  exact loaded-version plus tool-transport receipts, preventing a stale
+  in-memory Extension Host from being accepted as live proof of the newly
+  installed offline staging path.
+
 ## 0.9.41 — 2026-08-10
 
 ### Added

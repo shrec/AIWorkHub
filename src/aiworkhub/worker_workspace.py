@@ -677,7 +677,7 @@ def _materialize_rework_predecessor(
     if source_workspace.repo != repo or source_workspace.request_id != request_id:
         raise WorkspaceError("rework_predecessor_identity_mismatch")
     assert_gc_safe_workspace_shape(
-        request_id, source_workspace.path, source_workspace.home
+        request_id, source_workspace.path, source_workspace.home, repo=repo
     )
     if source_workspace.path.is_symlink() or not source_workspace.path.is_dir():
         raise WorkspaceError("rework_predecessor_workspace_missing")
@@ -1499,11 +1499,17 @@ def create_quality_review_workspace(
         raise
 
 
-def assert_gc_safe_workspace_shape(request_id: str, path: Path, home: Path) -> Path:
+def assert_gc_safe_workspace_shape(
+    request_id: str,
+    path: Path,
+    home: Path,
+    *,
+    repo: Path | None = None,
+) -> Path:
     """Fail closed unless this is the request's exact configured workspace."""
     if not _REQUEST_ID_RE.fullmatch(request_id):
         raise WorkspaceError(f"gc_invalid_request_id:{request_id}")
-    candidates = (configured_worktree_root(), _legacy_worktree_root())
+    candidates = (configured_worktree_root(repo), _legacy_worktree_root())
     for root in dict.fromkeys(candidates):
         expected_path = (root / request_id / "worktree").resolve(strict=False)
         expected_home = (root / request_id / "home").resolve(strict=False)
@@ -3805,6 +3811,124 @@ def _normalize_pytest_validation_argv(argv: list[str]) -> list[str]:
     return list(argv)
 
 
+def _is_candidate_pytest_wrapper_command(argv: list[str]) -> bool:
+    """True when *argv* is exactly ``python3 tools/candidate_pytest.py ...``.
+
+    Only the exact repo-relative literal ``tools/candidate_pytest.py`` with
+    the exact interpreter name ``python3`` is recognized.  Near-matches
+    (``python``, ``python3.11``, absolute or relative variations with extra
+    path components) all fail closed and are never reclassified.
+    """
+    if len(argv) < 2:
+        return False
+    return argv[0] == "python3" and argv[1] == "tools/candidate_pytest.py"
+
+
+def _resolve_candidate_pytest_wrapper(repo_root: Path) -> tuple[Path, dict[str, Any]]:
+    """Resolve and validate the exact candidate pytest wrapper file.
+
+    Returns ``(resolved_wrapper_path, sys_modules_entry)`` where
+    *resolved_wrapper_path* is the absolute, validated, regular,
+    non-symlink file, and *sys_modules_entry* is a dict suitable for
+    temporary ``sys.modules`` registration so the wrapper can be safely
+    imported without polluting the module namespace.
+
+    Rejects:
+    * Missing file or symlink
+    * Wrong owner (POSIX only)
+    * World-writable mode bits (POSIX only)
+    * Any path that is not a regular file
+    """
+    wrapper_relative = "tools/candidate_pytest.py"
+    wrapper_path = repo_root / wrapper_relative
+    # Race-safe symlink gate before resolve: .resolve() dereferences, so
+    # a symlink at wrapper_path would never appear as is_symlink() on the
+    # resolved target.  Reject the original path first (fail-closed).
+    if wrapper_path.is_symlink():
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_symlink_forbidden:{wrapper_relative}"
+        )
+    try:
+        resolved = wrapper_path.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_unavailable:{wrapper_relative}"
+        ) from exc
+    if resolved.is_symlink():
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_symlink_forbidden:{wrapper_relative}"
+        )
+    if not resolved.is_file():
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_not_regular:{wrapper_relative}"
+        )
+    try:
+        info = resolved.stat()
+    except OSError as exc:
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_unavailable:{wrapper_relative}"
+        ) from exc
+    if os.name != "nt" and info.st_uid != os.getuid():
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_untrusted_owner:{wrapper_relative}"
+        )
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o002:
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_world_writable:{wrapper_relative}"
+        )
+    # Safe import: register the wrapper as a fake package under a stable,
+    # request-scoped name so ``import candidate_pytest`` resolves in the
+    # child process. The real source lives at *resolved*, not under any
+    # site-packages or PYTHONPATH directory; the spec-based loader is the
+    # only route.
+    module_name = "aiworkhub_candidate_pytest_wrapper"
+    safe_spec = importlib.util.spec_from_file_location(
+        module_name, str(resolved)
+    )
+    if safe_spec is None or safe_spec.loader is None:
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_import_failed:{wrapper_relative}"
+        )
+    sys_modules_entry: dict[str, Any] = {
+        "name": module_name,
+        "spec": safe_spec,
+    }
+    return resolved, sys_modules_entry
+
+
+def _install_candidate_pytest_wrapper_module(
+    sys_modules_entry: dict[str, Any],
+) -> None:
+    """Temporarily register the candidate wrapper in ``sys.modules``.
+
+    The entry is recorded so the caller can restore the original state after
+    the wrapped subprocess or import completes.  The module object is created
+    but NOT executed -- the child process's own Python interpreter will
+    execute the wrapper from the filesystem path baked into its PYTHONPATH.
+    """
+    module_name: str = sys_modules_entry["name"]
+    if module_name in sys.modules:
+        raise WorkspaceError(
+            f"candidate_pytest_wrapper_module_conflict:{module_name}"
+        )
+    spec: importlib.machinery.ModuleSpec = sys_modules_entry["spec"]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+
+
+def _uninstall_candidate_pytest_wrapper_module(
+    sys_modules_entry: dict[str, Any] | None,
+) -> None:
+    """Remove the temporary candidate wrapper registration from ``sys.modules``.
+
+    Safe to call when *sys_modules_entry* is None (no-op).
+    """
+    if sys_modules_entry is None:
+        return
+    module_name: str = sys_modules_entry["name"]
+    sys.modules.pop(module_name, None)
+
+
 def resolve_trusted_pytest_runtime_root() -> Path:
     """Resolve and validate the one canonical, read-only pytest package root
     used to repair ``pytest``/``python3 -m pytest`` validation commands under
@@ -4037,7 +4161,17 @@ def run_validations(
             ) = _parse_validation_command_detailed(command)
             declared_argv = list(tokens)
             effective_components = pythonpath_components
-            if _is_pytest_validation_command(tokens):
+            if _is_candidate_pytest_wrapper_command(tokens):
+                # NF128: the exact candidate wrapper gets declared
+                # candidate PYTHONPATH components first and the trusted
+                # pytest runtime root last so the wrapper's own
+                # dependencies are visible without shadowing the real
+                # pytest package.
+                _resolve_candidate_pytest_wrapper(workspace.repo)
+                pytest_root = resolve_trusted_pytest_runtime_root()
+                effective_components = pythonpath_components + (str(pytest_root),)
+                tokens = _normalize_pytest_validation_argv(tokens)
+            elif _is_pytest_validation_command(tokens):
                 # B755: bind and prepend the one trusted pytest package root
                 # ahead of whatever relative project PYTHONPATH the card
                 # already declared. Fails closed before this command ever
