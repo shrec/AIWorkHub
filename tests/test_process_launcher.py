@@ -3164,11 +3164,14 @@ def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
     native CLI adapters."""
     from aiworkhub import quality_reviewer as _qr
 
+    # Bounded path count (≤ MAX_PACKET_PATHS) with large mechanical_checks
+    # provenance strings to push the serialised packet above 150 KB without
+    # exceeding any production packet limit.
     large_changed_path_hashes = {
         f"src/large_module_{i:04d}.py": hashlib.sha256(
             f"content-{i}".encode("utf-8")
         ).hexdigest()
-        for i in range(500)
+        for i in range(150)
     }
     packet = _qr.build_review_packet(
         request_id="req-e2big-001",
@@ -3177,6 +3180,15 @@ def test_native_cli_large_packet_uses_file_transport_avoiding_argv_e2big(
         worker_provider="deepseek_vscode_lm",
         changed_path_hashes=large_changed_path_hashes,
         acceptance=["Packets >= 150 KB must avoid argv."],
+        mechanical_checks=[
+            {
+                "check_id": f"ck-{j:04d}",
+                "kind": "lint",
+                "status": "ok",
+                "provenance": "X" * 1900,
+            }
+            for j in range(70)
+        ],
     )
     encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     assert len(encoded.encode("utf-8")) > 150_000, (
