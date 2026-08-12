@@ -2235,6 +2235,14 @@ class TestCandidatePytestWrapperModuleInstallUninstall:
             worker_workspace._uninstall_candidate_pytest_wrapper_module(entry)
 
 
+def _preprovisioned_private_home(tmp_path: Path) -> Path:
+    """Return the owner-private home shape that real Landlock workspaces use."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    (home / "tmp").mkdir(mode=0o700)
+    return home
+
+
 class TestFocusedRegressionExercisesCandidate:
     """Integration tests for run_validations with candidate pytest wrapper."""
 
@@ -2248,7 +2256,7 @@ class TestFocusedRegressionExercisesCandidate:
             request_id="nf128-candidate-py-order",
             repo=tmp_path,
             path=tmp_path,
-            home=tmp_path,
+            home=_preprovisioned_private_home(tmp_path),
             allowed_writes=(),
             parent_baseline={},
             workspace_baseline={},
@@ -2373,7 +2381,7 @@ class TestFocusedRegressionExercisesCandidate:
             request_id="nf128-ordinary-py-order",
             repo=tmp_path,
             path=tmp_path,
-            home=tmp_path,
+            home=_preprovisioned_private_home(tmp_path),
             allowed_writes=(),
             parent_baseline={},
             workspace_baseline={},
@@ -2481,7 +2489,7 @@ class TestFocusedRegressionExercisesCandidate:
             request_id="nf128-near-fallthrough",
             repo=tmp_path,
             path=tmp_path,
-            home=tmp_path,
+            home=_preprovisioned_private_home(tmp_path),
             allowed_writes=(),
             parent_baseline={},
             workspace_baseline={},

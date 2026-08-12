@@ -158,6 +158,11 @@ def _claude_manager_identity() -> dict[str, str] | None:
     The parent process and Claude's per-PID session descriptor are both
     same-uid local runtime state. No credential is read or exposed.
     """
+    if os.name == "nt":
+        # Windows has no /proc: confirm the exact direct parent through a
+        # native Toolhelp snapshot plus process-token SIDs before trusting
+        # Claude's per-PID session descriptor.
+        return _claude_windows_manager_identity()
     parent_pid = os.getppid()
     try:
         cmdline = Path(f"/proc/{parent_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8")
@@ -166,6 +171,19 @@ def _claude_manager_identity() -> dict[str, str] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(descriptor, dict) or "/claude " not in cmdline:
+        return None
+    return _claude_descriptor_identity(parent_pid, descriptor)
+
+
+def _claude_descriptor_identity(
+    parent_pid: int, descriptor: object
+) -> dict[str, str] | None:
+    """Validate a Claude per-PID session descriptor and bind it to this repo.
+
+    Shared by the POSIX ``/proc`` path and the Windows-native path so both
+    fail closed on the same malformed, foreign or stale descriptor evidence.
+    """
+    if not isinstance(descriptor, dict):
         return None
     if int(descriptor.get("pid") or -1) != parent_pid:
         return None
@@ -185,6 +203,36 @@ def _claude_manager_identity() -> dict[str, str] | None:
         "session_id": session_id,
         "window_id": f"claude_vscode_{parent_pid}",
     }
+
+
+def _claude_windows_manager_identity() -> dict[str, str] | None:
+    """Windows-native Claude Code VS Code manager verification.
+
+    There is no ``/proc`` on Windows. Confirm the exact direct parent process
+    through a native Toolhelp snapshot (same-user SID and a live ``claude``
+    image name), then validate ``~/.claude/sessions/<pid>.json`` exactly like
+    the POSIX path. Missing, malformed, foreign, stale or unverifiable
+    evidence fails closed.
+    """
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        return None
+    current_sid = _windows_process_owner_sid(os.getpid())
+    parent_sid = _windows_process_owner_sid(parent_pid)
+    if current_sid is None or parent_sid is None or parent_sid != current_sid:
+        return None
+    image_names = _windows_process_image_names()
+    if image_names is None:
+        return None
+    parent_image = str(image_names.get(parent_pid) or "")
+    if not parent_image or "claude" not in parent_image.lower():
+        return None
+    try:
+        descriptor_path = Path.home() / ".claude" / "sessions" / f"{parent_pid}.json"
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _claude_descriptor_identity(parent_pid, descriptor)
 
 
 def _codex_manager_identity() -> dict[str, str] | None:
@@ -563,6 +611,63 @@ def _windows_process_parent_map() -> dict[int, int] | None:
         finally:
             close_handle(snapshot)
         return parents
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_image_names() -> dict[int, str] | None:
+    """Return a native Windows PID -> executable image name snapshot."""
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if snapshot == wintypes.HANDLE(-1).value:
+            return None
+        names: dict[int, str] = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                names[int(entry.th32ProcessID)] = str(entry.szExeFile)
+                if not process_next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            close_handle(snapshot)
+        return names
     except (AttributeError, OSError, TypeError, ValueError):
         return None
 

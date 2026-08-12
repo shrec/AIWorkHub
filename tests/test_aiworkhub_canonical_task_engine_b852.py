@@ -45,6 +45,200 @@ def test_manager_origin_identity_accepts_modern_uuid_versions():
     assert not core._UUID_RE.fullmatch("019f5097-6dbe-9172-870a-945afc5f3bfa")
 
 
+_CLAUDE_SESSION_UUID = "019f5097-6dbe-7172-870a-945afc5f3bfa"
+
+
+def _write_claude_descriptor(
+    home: Path,
+    pid: int,
+    *,
+    cwd: Path,
+    session_id: str = _CLAUDE_SESSION_UUID,
+    kind: str = "interactive",
+    entrypoint: str = "claude-vscode",
+    pid_field: int | None = None,
+) -> Path:
+    sessions = home / ".claude" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    descriptor = sessions / f"{pid}.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "pid": pid if pid_field is None else pid_field,
+                "kind": kind,
+                "entrypoint": entrypoint,
+                "sessionId": session_id,
+                "cwd": str(cwd),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return descriptor
+
+
+def _windows_claude_env(monkeypatch, tmp_path, *, pid, image="claude.exe"):
+    """Wire the Windows-native Claude helpers to deterministic fakes."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir(parents=True, exist_ok=True)
+    sid = "S-1-5-21-test"
+
+    def _owner(p: int) -> str | None:
+        return sid if p in (pid, os.getpid()) else None
+
+    monkeypatch.setattr(core, "_windows_process_owner_sid", _owner)
+    monkeypatch.setattr(core, "_windows_process_image_names", lambda: {pid: image})
+    monkeypatch.setattr(os, "getppid", lambda: pid)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    return fake_home, repo
+
+
+def test_claude_manager_identity_windows_never_reads_proc(monkeypatch):
+    sentinel = {
+        "provider": "claude",
+        "session_id": _CLAUDE_SESSION_UUID,
+        "window_id": "claude_vscode_4242",
+    }
+    calls: list[str] = []
+
+    def _windows_stub() -> dict[str, str]:
+        calls.append("windows")
+        return sentinel
+
+    def _no_file_read(self, *args, **kwargs):
+        raise AssertionError(f"windows path must not read files: {self}")
+
+    monkeypatch.setattr(core, "_claude_windows_manager_identity", _windows_stub)
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(Path, "read_bytes", _no_file_read)
+    monkeypatch.setattr(Path, "read_text", _no_file_read)
+
+    identity = core._claude_manager_identity()
+    assert identity is sentinel
+    assert calls == ["windows"]
+
+
+def test_claude_manager_identity_windows_verifies_exact_parent_and_descriptor(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo)
+    identity = core._claude_windows_manager_identity()
+    assert identity == {
+        "provider": "claude",
+        "session_id": _CLAUDE_SESSION_UUID,
+        "window_id": f"claude_vscode_{pid}",
+    }
+
+
+def test_claude_manager_identity_windows_fails_closed_on_missing_descriptor(
+    monkeypatch, tmp_path
+):
+    fake_home, _repo = _windows_claude_env(monkeypatch, tmp_path, pid=4242)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_wrong_pid(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo, pid_field=9999)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_invalid_uuid(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo, session_id="not-a-uuid")
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_foreign_repo(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, _repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    foreign = (tmp_path / "foreign").resolve()
+    foreign.mkdir(parents=True, exist_ok=True)
+    _write_claude_descriptor(fake_home, pid, cwd=foreign)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_wrong_entrypoint(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo, entrypoint="claude-cli")
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_non_claude_parent(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(
+        monkeypatch, tmp_path, pid=pid, image="node.exe"
+    )
+    _write_claude_descriptor(fake_home, pid, cwd=repo)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_unverifiable_process(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo)
+    monkeypatch.setattr(core, "_windows_process_image_names", lambda: None)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_manager_identity_windows_fails_closed_on_cross_user_parent(
+    monkeypatch, tmp_path
+):
+    pid = 4242
+    fake_home, repo = _windows_claude_env(monkeypatch, tmp_path, pid=pid)
+    _write_claude_descriptor(fake_home, pid, cwd=repo)
+
+    def _owner(p: int) -> str | None:
+        return "S-1-5-21-other" if p == pid else "S-1-5-21-test"
+
+    monkeypatch.setattr(core, "_windows_process_owner_sid", _owner)
+    assert core._claude_windows_manager_identity() is None
+
+
+def test_claude_descriptor_identity_preserves_strict_validation(monkeypatch, tmp_path):
+    pid = 4242
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "repo_root", lambda: repo)
+    valid = {
+        "pid": pid,
+        "kind": "interactive",
+        "entrypoint": "claude-vscode",
+        "sessionId": _CLAUDE_SESSION_UUID,
+        "cwd": str(repo),
+    }
+    assert core._claude_descriptor_identity(pid, valid) == {
+        "provider": "claude",
+        "session_id": _CLAUDE_SESSION_UUID,
+        "window_id": f"claude_vscode_{pid}",
+    }
+    assert core._claude_descriptor_identity(pid, "not-a-dict") is None
+    assert core._claude_descriptor_identity(pid, {**valid, "pid": pid + 1}) is None
+    assert core._claude_descriptor_identity(pid, {**valid, "kind": "headless"}) is None
+    assert core._claude_descriptor_identity(pid, {**valid, "sessionId": "bad"}) is None
+    foreign = (tmp_path / "elsewhere").resolve()
+    assert core._claude_descriptor_identity(pid, {**valid, "cwd": str(foreign)}) is None
+
+
 def test_task_context_query_prioritizes_declared_files_and_code_entities():
     query = core._task_context_query(
         title="Audit AIWorkHub database routing",
