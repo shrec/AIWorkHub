@@ -70,6 +70,18 @@ _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|authorization|credential|password|secret|token)"
     r"\s*([:=])\s*([^\s,;]+)"
 )
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)\b(authorization)\s*(:)\s*(bearer)\s+([^\s,;\"'`<>]+)"
+)
+
+
+def _redact_credentials(text: str) -> str:
+    """Strip Bearer tokens and secret assignments from portable text."""
+    text = _BEARER_TOKEN_RE.sub(r"\1\2 <redacted>", text)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
+    return text
+
+
 _PROCESS_RUN_FIELDS = {
     "request_id",
     "task_id",
@@ -103,7 +115,7 @@ def _portable_text(value: Any, limit: int) -> str:
     absolute paths or credential assignments copied from provider output.
     """
     text = _PORTABLE_CONTROL_RE.sub("", str(value or ""))
-    text = _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
+    text = _redact_credentials(text)
     text = _HOST_PATH_IN_TEXT_RE.sub("<host-path>", text)
     return text[: max(0, int(limit))]
 
@@ -176,6 +188,7 @@ def _canonical_quality_review_summary(
 
 def _portable_path(value: Any, limit: int = 500) -> str:
     text = _PORTABLE_CONTROL_RE.sub("", str(value or "")).strip()
+    text = _redact_credentials(text)
     if text.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", text):
         name = re.split(r"[\\/]", text.rstrip("/\\"))[-1]
         text = f"<host-path>/{name}" if name else "<host-path>"

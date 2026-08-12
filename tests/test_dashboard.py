@@ -1164,7 +1164,8 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
                 "status": "review",
                 "worker_status": "review",
                 "completion_summary": (
-                    "validated /home/shrek/private/result.json token=super-secret-value"
+                    "validated /home/shrek/private/result.json token=super-secret-value "
+                    "Authorization: Bearer sk-or-v1-abc123def456"
                 ),
                 "artifacts": [
                     "eval/evidence.json",
@@ -1189,7 +1190,17 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
                                 "path": "eval/evidence.json",
                                 "sha256": "b" * 64,
                                 "bytes": 42,
-                            }
+                            },
+                            {
+                                "path": "credential: nf167-secret-value-xyz123/result.json",
+                                "sha256": "c" * 64,
+                                "bytes": 99,
+                            },
+                            {
+                                "path": "Authorization: Bearer nf167-bearer-secret-token/result.json",
+                                "sha256": "d" * 64,
+                                "bytes": 101,
+                            },
                         ],
                         "quality_gate": {
                             "schema_id": "aiworkhub.completion_quality_gate.v1",
@@ -1302,7 +1313,10 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
     serialized = json.dumps(bundle, sort_keys=True)
     assert "/home/shrek" not in serialized
     assert "super-secret-value" not in serialized
+    assert "sk-or-v1-abc123def456" not in serialized
     assert "hunter2" not in serialized
+    assert "nf167-secret-value-xyz123" not in serialized
+    assert "nf167-bearer-secret-token" not in serialized
     assert "stdout_path" not in serialized
     assert "stderr_path" not in serialized
 
