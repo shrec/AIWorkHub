@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.45";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.46";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -3073,6 +3073,104 @@ function isLanguageModelToolCallPart(part) {
   return Boolean(part && typeof part.callId === "string" && typeof part.name === "string" && part.input && typeof part.input === "object");
 }
 
+// NF-2026-00168: strip tool-call parts from corrective retry assistant messages so
+// GLM/OpenAI-style provider history never contains unmatched tool-call parts that
+// would cause a 400 validation error.
+function filterOutToolCallParts(parts) {
+  if (!Array.isArray(parts)) return parts;
+  const filtered = parts.filter((part) => !isLanguageModelToolCallPart(part));
+  return filtered.length > 0 ? filtered : [languageModelTextPart("")];
+}
+
+// NF-2026-00168: strict fake-provider history validation. Verify that no assistant
+// message in the history has an unmatched tool-call part — every assistant tool-call
+// must be immediately followed by a user message with matching LanguageModelToolResultPart
+// results. Enforces exact toolCallId set equality; does not accept arbitrary user parts
+// sharing an ID. Returns an array of unmatched-index strings or empty if valid.
+function validateProviderHistory(messages) {
+  if (!Array.isArray(messages)) return ["messages_must_be_array"];
+  const unmatched = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (msg.role !== "assistant") continue;
+    const parts = Array.isArray(msg.content) ? msg.content : [];
+    const toolCallParts = parts.filter((p) => isLanguageModelToolCallPart(p));
+    if (toolCallParts.length === 0) continue;
+    const next = messages[i + 1];
+    if (!next || next.role !== "user" || !Array.isArray(next.content)) {
+      unmatched.push(`assistant[${i}]:no_user_result`);
+      continue;
+    }
+    // NF-2026-00168: recognize actual LanguageModelToolResultPart-compatible
+    // result parts (must have both callId and content). Do not accept arbitrary
+    // user text parts that happen to share a callId.
+    const resultParts = next.content.filter(
+      (p) => p && typeof p.callId === "string" && p.content !== undefined,
+    );
+    const toolCallIds = new Set(toolCallParts.map((tc) => tc.callId));
+    const resultCallIds = new Set(resultParts.map((rp) => rp.callId));
+    // Exact callId set equality: every tool-call must have a result and every
+    // result must match a tool-call (no orphaned results).
+    for (const cid of toolCallIds) {
+      if (!resultCallIds.has(cid)) {
+        unmatched.push(`assistant[${i}].callId=${String(cid || "").slice(0, 32)}:unmatched`);
+      }
+    }
+    for (const cid of resultCallIds) {
+      if (!toolCallIds.has(cid)) {
+        unmatched.push(`assistant[${i}].callId=${String(cid || "").slice(0, 32)}:orphaned_result`);
+      }
+    }
+  }
+  // NF-2026-00168: secondary pass — detect standalone orphan result-only
+  // histories. When the history has zero assistant tool-call parts but
+  // contains user messages with result-part-shaped objects (callId +
+  // content), those results are orphaned — no tool-call could have
+  // produced them.
+  let hasAnyToolCall = false;
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      if (isLanguageModelToolCallPart(part)) {
+        hasAnyToolCall = true;
+        break;
+      }
+    }
+    if (hasAnyToolCall) break;
+  }
+  if (!hasAnyToolCall) {
+    for (let i = 0; i < messages.length; i += 1) {
+      const msg = messages[i];
+      if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+      for (const part of msg.content) {
+        if (part && typeof part.callId === "string" && part.content !== undefined) {
+          unmatched.push(`user[${i}].callId=${String(part.callId).slice(0, 32)}:orphaned_no_tool_call`);
+        }
+      }
+    }
+  }
+  // NF-2026-00168: third pass — reject orphan result parts in user messages
+  // whose immediately preceding assistant turn has zero tool-call parts. The
+  // primary pass already covers assistant→user pairing when the assistant has
+  // tool calls; this pass catches orphan results preceded by non-assistant
+  // roles or assistants with text-only content.
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    const prevMsg = i > 0 ? messages[i - 1] : null;
+    if (!prevMsg || prevMsg.role !== "assistant" || !Array.isArray(prevMsg.content)) continue;
+    const prevToolCallParts = prevMsg.content.filter((p) => isLanguageModelToolCallPart(p));
+    if (prevToolCallParts.length > 0) continue;
+    for (const part of msg.content) {
+      if (part && typeof part.callId === "string" && part.content !== undefined) {
+        unmatched.push(`user[${i}].callId=${String(part.callId).slice(0, 32)}:orphaned_result`);
+      }
+    }
+  }
+  return unmatched;
+}
+
 async function invokeVscodeLmPrivateTool(call, requestId = "") {
   const toolName = String(call && call.name || "");
   const permitted = VSCODE_LM_PRIVATE_TOOLS.find((tool) => tool.name === toolName);
@@ -3647,6 +3745,22 @@ function parseVscodeLmJsonEnvelope(text, { preferFinal = false } = {}) {
     if (typeof candidate.summary === "string" && Array.isArray(candidate.files)) {
       return { ...candidate, schema_id: VSCODE_LM_EDIT_RESPONSE_SCHEMA_V1 };
     }
+    // NF-2026-00168 / NF166: a substantive GLM correctness-review response may
+    // omit the tool-request wrapper entirely and emit the review findings
+    // object directly (optionally alongside a summary/verdict). Re-wrap any
+    // such findings-bearing object as the single allowlisted worker
+    // quality-review submit request. Downstream role gates keep manager/worker
+    // authority fail-closed: only a quality_review request can invoke it.
+    if (!name && Array.isArray(candidate.findings)) {
+      const input = { findings: candidate.findings };
+      if (typeof candidate.packet_sha256 === "string") input.packet_sha256 = candidate.packet_sha256;
+      if (typeof candidate.lens === "string") input.lens = candidate.lens;
+      return {
+        schema_id: VSCODE_LM_TOOL_REQUEST_SCHEMA,
+        name: "aiworkhub_worker_quality_review_submit",
+        input,
+      };
+    }
     return null;
   };
   let payload;
@@ -3829,6 +3943,7 @@ async function runVscodeLmTextProtocol(
   let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
+  let forceFinalViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
   const protocolTrace = [];
@@ -3877,6 +3992,16 @@ async function runVscodeLmTextProtocol(
         `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object matching ` +
         `allowed_writes=${JSON.stringify(request.allowedWrites)}.`,
       ));
+    }
+    // NF-2026-00168: validate provider history before each turn to ensure
+    // no unmatched assistant tool-call parts remain in the accumulated history.
+    const historyErrors = validateProviderHistory(messages);
+    if (historyErrors.length > 0) {
+      throw vscodeLmProtocolFailure(
+        "vscode_lm_provider_history_invalid",
+        [...protocolTrace, { turn, phase: "history_validation", outcome: historyErrors.join(";") }],
+        lastProtocolPreview,
+      );
     }
     assertRequestActive();
     const response = await raceVscodeLmCancellation(model.sendRequest(messages, {
@@ -3966,8 +4091,16 @@ async function runVscodeLmTextProtocol(
       // the provider surrounded the envelope with prose or a Markdown fence.
       return JSON.stringify(envelope);
     }
+    // NF-2026-00168: force-final two-strikes in text protocol path.
+    // One corrective retry then a second violation fails structurally.
     if (forceFinal && envelope.name !== VSCODE_LM_FINALIZE_EDIT_TOOL) {
-      protocolTrace.push({ turn, phase: "final", outcome: "tool_request_rejected" });
+      protocolTrace.push({ turn, phase: "final", outcome: "tool_request_rejected", rejectedTool: envelope.name });
+      if (forceFinalViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_finalization_tool_violation", protocolTrace, lastProtocolPreview,
+        );
+      }
+      forceFinalViolations += 1;
       messages.push(vscode.LanguageModelChatMessage.Assistant([languageModelTextPart(text)]));
       messages.push(vscode.LanguageModelChatMessage.User(
         `Tool requests are no longer accepted. Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
@@ -4046,7 +4179,12 @@ async function runVscodeLmTextProtocol(
       }
       toolFailureReported = true;
     }
-    if (envelope.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
+    // NF-2026-00169: recognize ONLY the role-correct Source Graph tool as
+    // acknowledgement in the fallback text-protocol path.
+    const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
+      ? "aiworkhub_worker_source_graph_query"
+      : "aiworkhub_manager_source_graph_query";
+    if (envelope.name === expectedSgTool && result && result.ok === true) {
       sourceGraphAcknowledged = true;
     }
     if (typeof onToolTurn === "function" && !toolFailureReported) {
@@ -4114,13 +4252,16 @@ async function runVscodeLmAgent(
   let postSourceTurns = 0;
   let finalizationTurns = 0;
   let forceFinal = false;
+  let forceFinalViolations = 0;
   let forceStagedEdit = false;
   let stagedEditInstructionSent = false;
+  let stagedEditViolations = 0;
   const protocolTrace = [];
   let lastProtocolPreview = "";
   const stagedEdits = createVscodeLmStagedEditCollector(request);
   const writableTask = !qualityReview && Array.isArray(request.allowedWrites) &&
     request.allowedWrites.length > 0;
+  let wrongToolViolations = 0;
   for (let turn = 0; turn < VSCODE_LM_MAX_AGENT_TURNS; turn += 1) {
     assertRequestActive();
     if (qualityReview && postSourceTurns >= VSCODE_LM_MAX_QUALITY_REVIEW_TURNS) {
@@ -4163,7 +4304,7 @@ async function runVscodeLmAgent(
     }
     const startedWithSourceGraph = sourceGraphAcknowledged;
     const availableTools = vscodeLmToolsForRequest(
-      request, sourceGraphAcknowledged, forceStagedEdit,
+      request, sourceGraphAcknowledged, false,
     );
     const options = {
       justification: "Run this explicitly queued AIWorkHub repository task using the user's existing VS Code model authorization.",
@@ -4176,6 +4317,16 @@ async function runVscodeLmAgent(
         : sourceGraphAcknowledged
           ? vscode.LanguageModelChatToolMode.Auto
           : vscode.LanguageModelChatToolMode.Required;
+    }
+    // NF-2026-00168: validate provider history before each turn to ensure
+    // no unmatched assistant tool-call parts remain in the accumulated history.
+    const historyErrors = validateProviderHistory(messages);
+    if (historyErrors.length > 0) {
+      throw vscodeLmProtocolFailure(
+        "vscode_lm_provider_history_invalid",
+        [...protocolTrace, { turn, phase: "history_validation", outcome: historyErrors.join(";") }],
+        lastProtocolPreview,
+      );
     }
     assertRequestActive();
     const response = await raceVscodeLmCancellation(
@@ -4202,6 +4353,21 @@ async function runVscodeLmAgent(
       else if (typeof part === "string") textParts.push(part);
     }
     if (startedWithSourceGraph) postSourceTurns += 1;
+    if (forceStagedEdit && calls.some((call) => call.name !== VSCODE_LM_STAGE_EDIT_TOOL)) {
+      protocolTrace.push({ turn, phase: "semantic_edit_stage", outcome: "non_stage_tool_rejected" });
+      if (stagedEditViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_semantic_edit_stage_required", protocolTrace, lastProtocolPreview,
+        );
+      }
+      stagedEditViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `Only ${VSCODE_LM_STAGE_EDIT_TOOL} is accepted in the bounded semantic-edit stage. ` +
+        `Call ${VSCODE_LM_STAGE_EDIT_TOOL} now with only the smallest required replacement/create.`,
+      ));
+      continue;
+    }
     if (calls.length === 0) {
       if (!sourceGraphAcknowledged) throw new Error("vscode_lm_source_graph_not_acknowledged");
       const text = textParts.join("").trim();
@@ -4263,12 +4429,46 @@ async function runVscodeLmAgent(
       }
       return JSON.stringify(envelope);
     }
+    // NF-2026-00168: callId pairing validator for force-final. Each tool-call part
+    // must have a matching LanguageModelToolResultPart; one corrective turn then a
+    // structured second violation fails.
     if (forceFinal && calls.some((call) => call.name !== VSCODE_LM_FINALIZE_EDIT_TOOL)) {
-      protocolTrace.push({ turn, phase: "final", outcome: "tool_call_rejected" });
-      messages.push(vscode.LanguageModelChatMessage.Assistant(assistantParts));
+      protocolTrace.push({ turn, phase: "final", outcome: "tool_call_rejected", rejectedCallIds: calls.filter((c) => c.name !== VSCODE_LM_FINALIZE_EDIT_TOOL).map((c) => c.callId) });
+      if (forceFinalViolations >= 1) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_finalization_tool_violation", protocolTrace, lastProtocolPreview,
+        );
+      }
+      forceFinalViolations += 1;
+      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
       messages.push(vscode.LanguageModelChatMessage.User(
         `Tool calls are no longer available in the finalization phase. ` +
         `Output ONLY one final ${VSCODE_LM_EDIT_RESPONSE_SCHEMA} JSON object.`,
+      ));
+      continue;
+    }
+    // NF-2026-00168/NF-2026-00169: authority gate — build request-scoped
+    // permitted tool-name set from availableTools. A wrong-role/unoffered
+    // call must never reach onToolTurn or invokeVscodeLmProtocolTool.
+    const permittedToolNames = new Set(availableTools.map((tool) => tool.name));
+    const forbiddenCalls = calls.filter((call) => !permittedToolNames.has(call.name));
+    if (forbiddenCalls.length > 0) {
+      wrongToolViolations += 1;
+      protocolTrace.push({
+        turn,
+        phase: "authority_gate",
+        outcome: `forbidden_tools:${forbiddenCalls.map((c) => c.name).join(",")}`,
+      });
+      if (wrongToolViolations >= 2) {
+        throw vscodeLmProtocolFailure(
+          "vscode_lm_authority_gate_violation", protocolTrace, lastProtocolPreview,
+        );
+      }
+      messages.push(vscode.LanguageModelChatMessage.Assistant(filterOutToolCallParts(assistantParts)));
+      messages.push(vscode.LanguageModelChatMessage.User(
+        `The previous turn contained one or more tool calls that are not permitted for this request role. ` +
+        `Allowed tool names: ${JSON.stringify([...permittedToolNames])}. ` +
+        `Only call tools from this list.`,
       ));
       continue;
     }
@@ -4303,7 +4503,13 @@ async function runVscodeLmAgent(
         }
         toolFailureReported = true;
       }
-      if (call.name === "aiworkhub_manager_source_graph_query" && result && result.ok === true) {
+      // NF-2026-00169: recognize ONLY the role-correct Source Graph tool as
+      // acknowledgement. Worker native must never acknowledge manager SG;
+      // manager native must never acknowledge worker SG.
+      const expectedSgTool = (request.request_kind === "worker" || request.request_kind === "quality_review")
+        ? "aiworkhub_worker_source_graph_query"
+        : "aiworkhub_manager_source_graph_query";
+      if (call.name === expectedSgTool && result && result.ok === true) {
         sourceGraphAcknowledged = true;
       }
       if (typeof onToolTurn === "function" && !toolFailureReported) {
@@ -8868,6 +9074,9 @@ module.exports = {
     readVscodeLmCancelDecision,
     atomicWriteOwnerJsonExclusive,
     VSCODE_LM_PRIVATE_TOOLS,
+    filterOutToolCallParts,
+    isLanguageModelToolCallPart,
+    validateProviderHistory,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
       VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,

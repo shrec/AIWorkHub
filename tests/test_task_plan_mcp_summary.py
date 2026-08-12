@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from aiworkhub import server
+from aiworkhub import server, task_plan
 
 
 def _full_plan() -> dict[str, object]:
@@ -34,6 +34,14 @@ def _full_plan() -> dict[str, object]:
         "orphaned_processing_count": 0,
         "invalid_depends_on": [],
         "write_scope_overlaps": {},
+        "global_collision_free": False,
+        "global_collision_count": 1,
+        "global_collision_paths": ["src/shared.py"],
+        "global_collision_task_ids": ["READY", "BLOCKED"],
+        "global_collision_pairs": [["READY", "BLOCKED"]],
+        "card_collision_free": {"DONE": True, "READY": False, "BLOCKED": False},
+        "card_collision_task_ids": {"READY": ["BLOCKED"], "BLOCKED": ["READY"]},
+        "card_collision_paths": {"READY": ["src/shared.py"], "BLOCKED": ["src/shared.py"]},
         "edge_count": 1,
         "layers": [
             {"index": 0, "task_ids": ["DONE", "READY"]},
@@ -81,3 +89,43 @@ def test_task_plan_mcp_full_mode_preserves_complete_dag(monkeypatch):
         assert result[key] == value
     assert result["snapshot_mode"] == "full"
     assert result["full_snapshot_available"] is True
+
+
+def test_task_plan_summary_projection_retains_collision_truth():
+    cards = [
+        {
+            "task_id": "A",
+            "status": "pending",
+            "worker_status": "unclaimed",
+            "allowed_writes": ["src/shared.py"],
+            "depends_on": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "launch_request_id": "",
+        },
+        {
+            "task_id": "B",
+            "status": "pending",
+            "worker_status": "unclaimed",
+            "allowed_writes": ["src/shared.py"],
+            "depends_on": [],
+            "created_at": "2026-01-02T00:00:00Z",
+            "launch_request_id": "",
+        },
+    ]
+    full = task_plan.build_snapshot(cards)
+    summary = task_plan.summarize_task_plan_snapshot(full)
+
+    assert summary["global_collision_free"] is False
+    assert summary["global_collision_count"] == 1
+    assert summary["global_collision_pairs"] == [["A", "B"]]
+    assert summary["card_collision_free"] == {"A": False, "B": False}
+    assert summary["card_collision_task_ids"] == {"A": ["B"], "B": ["A"]}
+    assert summary["card_collision_paths"] == {"A": ["src/shared.py"], "B": ["src/shared.py"]}
+
+    # The bounded summary keeps current truth but drops the historical DAG.
+    assert "actionable_lifecycle" in summary
+    assert "dependencies" not in summary
+    assert "dependents" not in summary
+    assert "layers" not in summary
+    assert "lifecycle" not in summary
+    assert "task_ids" not in summary

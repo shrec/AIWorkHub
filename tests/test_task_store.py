@@ -188,6 +188,65 @@ def test_decoded_card_omits_recursive_storage_envelope_and_upgrade_compacts_it(
     assert len(json.dumps(compacted)) < 1_000
 
 
+def test_initialize_repository_survives_malformed_legacy_card_json(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_MALFORMED_CARD", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET topic='', card_json='{not-json' "
+            "WHERE task_id='TASK_MALFORMED_CARD'",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = task_store.initialize_repository(repo)
+    assert result["ok"] is True
+
+    conn = sqlite3.connect(db_path)
+    try:
+        topic = conn.execute(
+            "SELECT topic FROM tasks WHERE task_id='TASK_MALFORMED_CARD'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert topic == ""
+
+
+def test_initialize_repository_backfills_valid_card_json_topic_guarded_by_json_valid(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_VALID_CARD", status="pending")
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET topic='', card_json=? WHERE task_id='TASK_VALID_CARD'",
+            (json.dumps({"topic": "recovered_topic"}),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    task_store.initialize_repository(repo)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        topic = conn.execute(
+            "SELECT topic FROM tasks WHERE task_id='TASK_VALID_CARD'",
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert topic == "recovered_topic"
+
+
 def test_supersede_removes_processing_orphan_without_deleting_audit(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

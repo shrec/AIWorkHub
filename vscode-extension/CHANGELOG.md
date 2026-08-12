@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.46 — 2026-08-12
+
+### Fixed
+
+- Keep malformed legacy task JSON from aborting repository initialization.
+- Show global collision health separately from each task's exact launch
+  eligibility.
+- Preserve provider-valid GLM reviewer history and normalize substantive
+  correctness findings into the required durable review submission.
+- Remove complete Bearer credentials from portable dashboard evidence.
+
 ## 0.9.45 — 2026-08-12
 
 ### Fixed
