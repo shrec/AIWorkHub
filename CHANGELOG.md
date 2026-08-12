@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows Claude Code VS Code manager identity now verifies the exact direct
+  parent through a native Toolhelp snapshot plus process-token SIDs and the
+  per-PID `~/.claude/sessions/<pid>.json` descriptor instead of reading
+  `/proc`, which does not exist on Windows. POSIX verification, canonical
+  repository/UUID/process checks, and Codex identity behavior remain
+  fail-closed (#17).
+- Recognized Windows advisory-lock contention from a duplicate finalizer now
+  defers reconciliation without terminalizing the task; unexpected lock and
+  finalization errors retain the existing fail-closed path (#18, PR #19).
+
+### Thanks
+
+- Giorgi Khaburdzania ([@Ba1u1994](https://github.com/Ba1u1994)) for reporting
+  #17 and #18 and contributing the #18 fix in PR #19.
+
 ## [0.9.43] - 2026-08-11
 
 ### Fixed
