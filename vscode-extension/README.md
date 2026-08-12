@@ -12,14 +12,10 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.44
+## What's new in 0.9.45
 
-- Claude Code manager identity uses Windows-native exact-process and session
-  verification, while POSIX and Codex routes remain fail-closed.
-- Duplicate Windows finalizers defer on recognized request-lock contention
-  instead of terminalizing the healthy owner.
-- Deterministic validation isolates mypy, temporary and Ruff cache state per
-  request and retains bounded diagnostics for validator internal errors.
+- Persisted superseded tasks now remain visible in their own exact dashboard
+  bucket and no longer trigger a partial-data snapshot after reload.
 
 See the packaged **Changelog** for the complete release summary.
 
