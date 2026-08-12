@@ -1,5 +1,13 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.45 — 2026-08-12
+
+### Fixed
+
+- Keep persisted superseded tasks in a separate exact dashboard count instead
+  of degrading the snapshot with `KeyError('superseded')` (NF159, NF170,
+  PR #23).
+
 ## 0.9.44 — 2026-08-12
 
 ### Fixed

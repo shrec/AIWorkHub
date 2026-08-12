@@ -6,6 +6,15 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.45] - 2026-08-12
+
+### Fixed
+
+- Added `superseded` to the canonical exact-status taxonomy so persisted
+  superseded tasks remain visible as a separate non-active bucket instead of
+  raising `KeyError('superseded')` and degrading the dashboard snapshot
+  (NF159, NF170, PR #23).
+
 ## [0.9.44] - 2026-08-12
 
 ### Fixed
