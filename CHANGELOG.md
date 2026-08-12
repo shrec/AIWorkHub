@@ -6,6 +6,8 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.44] - 2026-08-12
+
 ### Fixed
 
 - Windows Claude Code VS Code manager identity now verifies the exact direct
@@ -17,6 +19,10 @@ noted by package/extension version and release tag.
 - Recognized Windows advisory-lock contention from a duplicate finalizer now
   defers reconciliation without terminalizing the task; unexpected lock and
   finalization errors retain the existing fail-closed path (#18, PR #19).
+- Deterministic validation now gives every request isolated writable mypy,
+  temporary and Ruff cache state, keeps stdin deterministic, and preserves a
+  bounded non-secret diagnostic packet for mypy internal errors (NF180,
+  PR #21).
 
 ### Thanks
 
