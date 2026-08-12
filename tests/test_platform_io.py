@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 from aiworkhub import platform_io
 
@@ -108,3 +111,63 @@ def test_windows_lock_backend_uses_one_byte_region(tmp_path, monkeypatch):
 
     assert [mode for _, mode, _ in calls] == [2, 3]
     assert all(count == 1 for _, _, count in calls)
+
+
+def test_windows_blocking_lock_timeout_is_classified_as_contention(
+    tmp_path, monkeypatch
+):
+    attempts: list[tuple[int, int, int]] = []
+
+    def contended(fd, mode, count):
+        attempts.append((fd, mode, count))
+        raise OSError(errno.EACCES, "lock is owned by another finalizer")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1,
+        LK_NBLCK=2,
+        LK_UNLCK=3,
+        locking=contended,
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(platform_io.time, "monotonic", lambda: 10.0)
+
+    path = tmp_path / "contended-windows-runtime.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(
+            platform_io.AdvisoryLockTimeout,
+            match="windows_advisory_lock_timeout",
+        ):
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+
+    assert len(attempts) == 1
+    assert attempts[0][1:] == (fake_msvcrt.LK_NBLCK, 1)
+
+
+def test_windows_blocking_lock_preserves_unexpected_os_error(tmp_path, monkeypatch):
+    def failed_lock(_fd, _mode, _count):
+        raise OSError(errno.EIO, "device failure")
+
+    fake_msvcrt = SimpleNamespace(
+        LK_LOCK=1,
+        LK_NBLCK=2,
+        LK_UNLCK=3,
+        locking=failed_lock,
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_io.os, "name", "nt")
+
+    path = tmp_path / "failed-windows-runtime.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with pytest.raises(OSError) as raised:
+            platform_io.lock_fd(fd, blocking=True)
+    finally:
+        os.close(fd)
+
+    assert raised.value.errno == errno.EIO
+    assert not isinstance(raised.value, platform_io.AdvisoryLockTimeout)

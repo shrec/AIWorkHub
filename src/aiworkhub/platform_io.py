@@ -35,6 +35,10 @@ def _deadlock_errno(errno_module: object = errno) -> int:
 _WINDOWS_LOCK_CONTENDED_ERRNOS = frozenset({_deadlock_errno(), errno.EACCES})
 
 
+class AdvisoryLockTimeout(TimeoutError):
+    """A recognized advisory-lock conflict outlived its bounded wait."""
+
+
 def windows_pid_is_alive(pid: int) -> bool:
     """Check Windows process liveness without ever signalling the process.
 
@@ -167,7 +171,7 @@ def lock_fd(fd: int, *, blocking: bool) -> None:
                 if exc.errno not in _WINDOWS_LOCK_CONTENDED_ERRNOS:
                     raise
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
+                    raise AdvisoryLockTimeout(
                         "windows_advisory_lock_timeout after "
                         f"{WINDOWS_LOCK_MAX_WAIT_SECONDS:g}s"
                     ) from exc

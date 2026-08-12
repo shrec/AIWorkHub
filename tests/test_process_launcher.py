@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from aiworkhub import process_launcher, worker_ai_tools_mcp  # noqa: E402
+from aiworkhub import platform_io, process_launcher, worker_ai_tools_mcp  # noqa: E402
 
 
 def _card(task_id: str = "TASK_B1", state: str = "pending") -> dict:
@@ -365,6 +366,89 @@ def test_finalize_after_process_exit_retries_transient_failure(monkeypatch, tmp_
 
     assert event == {"request_id": request_id, "state": "review_ready"}
     assert len(attempts) == 3
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock timeout regression")
+def test_duplicate_finalizer_lock_contention_defers_for_owner(
+    monkeypatch, tmp_path
+):
+    owner_manager = _manager(
+        tmp_path,
+        show_task=_show(lambda: _card(state="processing")),
+        argv=[sys.executable, "-c", "pass"],
+    )
+    duplicate_manager = process_launcher.ProcessManager(
+        repo=owner_manager.repo,
+        process_log_path=owner_manager.process_log_path,
+        process_dir=owner_manager.process_dir,
+        isolation_enabled=False,
+    )
+    request_id = "c" * 32
+    owner_manager._append_event({
+        "request_id": request_id,
+        "task_id": "TASK_B1",
+        "runner": "claude_worker_b1",
+        "topic": "task_mcp",
+        "state": "running",
+        "metadata_path": str(tmp_path / "metadata.json"),
+    })
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    review_calls: list[str] = []
+    owner_errors: list[BaseException] = []
+
+    def run_owner():
+        try:
+            # Hold the real request lock until the duplicate has exceeded the
+            # configured Windows contention timeout. This models validation
+            # and evidence work that legitimately takes longer than 20s
+            # without making the test wait 20 wall-clock seconds.
+            with owner_manager._request_lock(request_id):
+                owner_entered.set()
+                assert release_owner.wait(timeout=5.0)
+                review_calls.append(request_id)
+                owner_manager._append_event({
+                    "request_id": request_id,
+                    "task_id": "TASK_B1",
+                    "runner": "claude_worker_b1",
+                    "topic": "task_mcp",
+                    "state": "review_ready",
+                })
+        except BaseException as exc:  # surfaced on the main test thread below
+            owner_errors.append(exc)
+
+    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_MAX_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(platform_io, "WINDOWS_LOCK_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(
+        process_launcher.task_engine,
+        "mark_terminal_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lock contention must not terminalize the task")
+        ),
+    )
+
+    owner = threading.Thread(target=run_owner, name="finalizer-owner")
+    owner.start()
+    assert owner_entered.wait(timeout=5.0)
+    try:
+        duplicate = duplicate_manager._finalize_after_process_exit(request_id, 0)
+        assert duplicate is not None
+        assert duplicate["state"] == "running"
+        assert duplicate["reconciliation_deferred"] == "request_lock_busy"
+        assert duplicate["workspace_retained"] is True
+        assert owner_manager._request_events(request_id)[-1]["state"] == "running"
+    finally:
+        release_owner.set()
+        owner.join(timeout=5.0)
+
+    assert not owner.is_alive()
+    assert owner_errors == []
+    assert review_calls == [request_id]
+    states = [
+        event["state"] for event in owner_manager._request_events(request_id)
+    ]
+    assert states.count("review_ready") == 1
+    assert "finalize_failed" not in states
 
 
 def test_finalize_after_process_exit_emits_terminal_callback_fallback(
