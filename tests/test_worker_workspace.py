@@ -1576,6 +1576,25 @@ def test_validation_batch_retains_each_failed_command_and_bounded_streams(
             {"returncode": 126, "argv": ["tool"], "stderr_tail": "permission denied"},
             "permission_denied",
         ),
+        (
+            {
+                "returncode": 2,
+                "argv": ["mypy"],
+                "stderr_tail": (
+                    "Traceback (most recent call last):\n"
+                    "mypy: INTERNAL ERROR: boom"
+                ),
+            },
+            "type_check_internal_error",
+        ),
+        (
+            {"returncode": None, "argv": ["tool"], "launch_error": "PermissionError"},
+            "permission_denied",
+        ),
+        (
+            {"returncode": None, "argv": ["tool"], "launch_error": "FileNotFoundError"},
+            "executable_unavailable",
+        ),
     ],
 )
 def test_validation_failure_receipt_classifies_stable_categories(
@@ -2236,7 +2255,16 @@ class TestCandidatePytestWrapperModuleInstallUninstall:
 
 
 def _preprovisioned_private_home(tmp_path: Path) -> Path:
-    """Return the owner-private home shape that real Landlock workspaces use."""
+    """Truthful landlock-style home: owner-private, with a private ``tmp``.
+
+    Under the landlock backend ``run_validations`` verifies (fail-closed) that
+    ``workspace.home`` and ``workspace.home/tmp`` are already-provisioned,
+    owner-private directories. A real ``create_workspace`` provides them; the
+    regression fixtures below constructed ``WorkerWorkspace(home=tmp_path)``
+    directly and therefore passed only under bubblewrap. Preprovisioning the
+    directories here makes the fixtures backend-truthful without weakening the
+    production verification.
+    """
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     (home / "tmp").mkdir(mode=0o700)
@@ -2594,3 +2622,164 @@ class TestFocusedRegressionExercisesCandidate:
                 workspace,
                 ["python3 tools/candidate_pytest.py tests/"],
             )
+
+
+# ── NF180 mypy/temp/cache isolation and truthful failure reporting ─────────
+
+
+def _landlock_run_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scratch_dir: Path,
+) -> worker_workspace.WorkerWorkspace:
+    """Wire the landlock validation path to deterministic, in-process mocks."""
+    monkeypatch.setattr(worker_workspace, "select_sandbox_backend", lambda: "landlock")
+    monkeypatch.setattr(
+        worker_workspace,
+        "provision_validation_exec_scratch",
+        lambda _ws: scratch_dir,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "cleanup_validation_exec_scratch",
+        lambda _p: None,
+    )
+    monkeypatch.setattr(
+        worker_workspace,
+        "sandbox_argv",
+        lambda _ws, _adapter, argv, **_kwargs: list(argv),
+    )
+    return worker_workspace.WorkerWorkspace(
+        request_id="nf180-validation-harness",
+        repo=tmp_path,
+        path=tmp_path,
+        home=_preprovisioned_private_home(tmp_path),
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    )
+
+
+def test_validation_env_isolates_mypy_cache_and_temp_to_request_scratch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+    workspace = _landlock_run_harness(monkeypatch, tmp_path, scratch_dir)
+
+    captured_env: dict[str, str] = {}
+
+    def _capture_run(argv, **kwargs):
+        captured_env.update(kwargs.get("env", {}))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+    results = worker_workspace.run_validations(workspace, ["/usr/bin/mypy src"])
+
+    assert len(results) == 1
+    assert results[0]["returncode"] == 0
+    assert captured_env["MYPY_CACHE_DIR"] == str(scratch_dir)
+    assert captured_env["TMPDIR"] == str(scratch_dir)
+    assert captured_env["RUFF_CACHE_DIR"] == str(scratch_dir)
+
+
+def test_parallel_validation_requests_use_distinct_cache_and_temp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratch_a = tmp_path / "scratch-a"
+    scratch_b = tmp_path / "scratch-b"
+    scratch_a.mkdir(mode=0o700)
+    scratch_b.mkdir(mode=0o700)
+    workspace = _landlock_run_harness(monkeypatch, tmp_path, scratch_a)
+
+    scratch_sequence = iter([scratch_a, scratch_b])
+    monkeypatch.setattr(
+        worker_workspace,
+        "provision_validation_exec_scratch",
+        lambda _ws: next(scratch_sequence),
+    )
+
+    envs: list[dict[str, str]] = []
+
+    def _capture_run(argv, **kwargs):
+        envs.append(dict(kwargs.get("env", {})))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+    worker_workspace.run_validations(workspace, ["/usr/bin/mypy src"])
+    worker_workspace.run_validations(workspace, ["/usr/bin/mypy src"])
+
+    assert len(envs) == 2
+    assert envs[0]["MYPY_CACHE_DIR"] == str(scratch_a)
+    assert envs[1]["MYPY_CACHE_DIR"] == str(scratch_b)
+    assert envs[0]["MYPY_CACHE_DIR"] != envs[1]["MYPY_CACHE_DIR"]
+    assert envs[0]["TMPDIR"] != envs[1]["TMPDIR"]
+
+
+def test_mypy_internal_error_retains_bounded_traceback_and_environment_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+    workspace = _landlock_run_harness(monkeypatch, tmp_path, scratch_dir)
+
+    internal_stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/venv/bin/mypy", line 8, in <module>\n'
+        "    main()\n"
+        "OSError: [Errno 30] Read-only file system: '.mypy_cache'\n"
+        "mypy: INTERNAL ERROR: could not write cache\n"
+    )
+
+    def _capture_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 2, stdout="", stderr=internal_stderr)
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _capture_run)
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        worker_workspace.run_validations(workspace, ["/usr/bin/mypy src"])
+
+    record = caught.value.results[0]
+    assert record["returncode"] == 2
+    assert record["failure_receipt"]["failure_class"] == "type_check_internal_error"
+    assert "INTERNAL ERROR" in record["internal_error"]["traceback_tail"]
+    assert record["internal_error"]["environment"]["MYPY_CACHE_DIR"] == str(scratch_dir)
+    assert set(record["internal_error"]["environment"]) == {
+        "MYPY_CACHE_DIR",
+        "TMPDIR",
+        "RUFF_CACHE_DIR",
+        "python_version",
+    }
+
+
+def test_validation_permission_failure_does_not_obscure_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+    workspace = _landlock_run_harness(monkeypatch, tmp_path, scratch_dir)
+
+    calls = {"n": 0}
+
+    def _fake_run(argv, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="1 failed")
+
+    monkeypatch.setattr(worker_workspace.subprocess, "run", _fake_run)
+
+    with pytest.raises(worker_workspace.ValidationRunError) as caught:
+        worker_workspace.run_validations(
+            workspace,
+            ["/usr/bin/mypy src", "bash -c 'exit 1'"],
+        )
+
+    results = caught.value.results
+    assert len(results) == 2
+    assert results[0]["launch_error"] == "PermissionError"
+    assert results[0]["failure_receipt"]["failure_class"] == "permission_denied"
+    assert results[1]["returncode"] == 1
+    assert results[1]["failure_receipt"]["failure_class"] == "nonzero_exit"

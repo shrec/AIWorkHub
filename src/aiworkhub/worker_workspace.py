@@ -4008,10 +4008,21 @@ def _validation_failure_class(record: Mapping[str, Any]) -> str:
         + "\n"
         + str(record.get("stdout_tail") or "")
     ).lower()
+    launch_error = record.get("launch_error")
+    if launch_error == "PermissionError":
+        return "permission_denied"
+    if launch_error == "FileNotFoundError":
+        return "executable_unavailable"
+    if launch_error:
+        return "launch_failed"
     if "permission denied" in diagnostic or "access is denied" in diagnostic:
         return "permission_denied"
     if returncode in {126, 127} or "not found" in diagnostic:
         return "executable_unavailable"
+    if "mypy" in command and (
+        "internal error" in diagnostic or "traceback (most recent call last)" in diagnostic
+    ):
+        return "type_check_internal_error"
     if "syntaxerror" in diagnostic or "syntax error" in diagnostic:
         return "syntax_error"
     if "mypy" in command or "type error" in diagnostic:
@@ -4064,6 +4075,41 @@ def _validation_failure_receipt(record: Mapping[str, Any]) -> dict[str, Any] | N
             )
         ).hexdigest(),
     }
+
+
+_PROVENANCE_ENV_KEYS = ("MYPY_CACHE_DIR", "TMPDIR", "RUFF_CACHE_DIR")
+
+
+def _bounded_mypy_traceback(stderr: str) -> str:
+    """Bounded tail of a mypy INTERNAL ERROR traceback.
+
+    mypy prints the final ``Traceback (most recent call last):`` block ending
+    with the exception and the ``INTERNAL ERROR`` line.  Prefer that final
+    block (the most diagnostic part) but never retain more than 4096
+    characters.
+    """
+    text = (stderr or "").replace("\x00", "")
+    marker = text.rfind("Traceback (most recent call last):")
+    if marker != -1:
+        text = text[marker:]
+    return text[-4_096:]
+
+
+def _validation_environment_provenance(env: Mapping[str, str]) -> dict[str, str]:
+    """Bounded, non-secret validation environment provenance.
+
+    Copies only the fixed, non-secret keys needed to diagnose an internal
+    error (where the cache/temp dirs live), never the whole child env, so
+    credential-bearing passthrough values (proxies, adapter keys) are never
+    written into failure receipts.
+    """
+    provenance = {
+        key: env[key] for key in _PROVENANCE_ENV_KEYS if key in env and env[key]
+    }
+    provenance["python_version"] = ".".join(
+        str(part) for part in sys.version_info[:3]
+    )
+    return provenance
 
 
 def validation_failure_delta_packet(
@@ -4237,6 +4283,18 @@ def run_validations(
             # temporaries.  Setting this for every validation command is
             # harmless; only Ruff consumes it.
             env["RUFF_CACHE_DIR"] = scratch_env_value
+            # NF180: mypy writes its incremental cache into ``.mypy_cache``
+            # relative to the current directory by default. Validation
+            # worktrees are intentionally read-only, so that default either
+            # fails with a permission error or -- when two requests share a
+            # writable mount -- races another request's cache and surfaces as
+            # a spurious mypy INTERNAL ERROR. Point the cache at the same
+            # private, request-scoped scratch used for the other validation
+            # temporaries so identical candidate bytes and command yield
+            # identical results inside and outside the validator. Setting
+            # this for every validation command is harmless; only mypy
+            # consumes it.
+            env["MYPY_CACHE_DIR"] = scratch_env_value
             if _is_pytest_validation_command(tokens):
                 # Validation workspaces are intentionally read-only outside
                 # the declared task outputs.  Pytest's cache provider writes
@@ -4267,6 +4325,7 @@ def run_validations(
                     cwd=subprocess_cwd,
                     env=env,
                     text=True,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=bounded_timeout,
@@ -4310,6 +4369,40 @@ def run_validations(
                 )
                 results.append(timeout_record)
                 continue
+            except OSError as exc:
+                # A launch/setup failure (missing executable, EACCES, stdio
+                # fds unavailable, ...) must be reported truthfully as an
+                # environment failure and must never masquerade as a candidate
+                # test/type failure, nor abort the remaining commands.
+                launch_message = str(exc)
+                launch_record = {
+                    "command": command,
+                    "argv": tokens,
+                    "declared_command": command,
+                    "declared_argv": declared_argv,
+                    "executed_argv": tokens,
+                    "argv_rewritten": declared_argv != tokens,
+                    "cwd": cd_relative,
+                    "env_override": env_override_evidence,
+                    "sandbox_backend": selected_backend,
+                    "execution_boundary": execution_boundary,
+                    "returncode": None,
+                    "timed_out": False,
+                    "launch_error": type(exc).__name__,
+                    "launch_error_message": launch_message,
+                    "duration_seconds": round(time.monotonic() - started, 6),
+                    "stdout_head": "",
+                    "stdout_tail": "",
+                    "stdout_truncated": False,
+                    "stderr_head": launch_message[:4_096],
+                    "stderr_tail": launch_message[-4_096:],
+                    "stderr_truncated": len(launch_message) > 8_192,
+                }
+                launch_record["failure_receipt"] = _validation_failure_receipt(
+                    launch_record
+                )
+                results.append(launch_record)
+                continue
             stdout = result.stdout or ""
             stderr = result.stderr or ""
             record = {
@@ -4334,6 +4427,11 @@ def run_validations(
             }
             if result.returncode != 0:
                 record["failure_receipt"] = _validation_failure_receipt(record)
+                if record["failure_receipt"].get("failure_class") == "type_check_internal_error":
+                    record["internal_error"] = {
+                        "traceback_tail": _bounded_mypy_traceback(stderr),
+                        "environment": _validation_environment_provenance(env),
+                    }
             results.append(record)
         failed = [
             row
