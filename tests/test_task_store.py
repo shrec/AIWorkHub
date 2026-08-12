@@ -585,3 +585,36 @@ def test_mark_terminal_review_rejects_regression_from_archived(tmp_path: Path) -
     assert state2.startswith("illegal_transition:from=archived")
     card = task_store.get_task(repo, task_id)
     assert card["status"] == "archived"
+
+
+def test_exact_status_counts_includes_superseded_without_keyerror(tmp_path: Path) -> None:
+    """A persisted superseded row must be counted in its own exact bucket
+    without raising KeyError and without folding into pending or active."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _insert_task(repo, "TASK_SUPERSEDED_A", status="pending")
+    _insert_task(repo, "TASK_PROCESSING_A", status="processing")
+    _insert_task(repo, "TASK_FINISHED_A", status="finished")
+    _readiness, db_path = task_store._require_ready(repo)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='superseded', worker_status='superseded' "
+            "WHERE task_id='TASK_SUPERSEDED_A'"
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_status='done' WHERE task_id='TASK_FINISHED_A'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    counts = task_store.exact_status_counts(repo)
+    assert counts["superseded"] == 1
+    assert counts["pending"] == 0
+    assert counts["processing"] == 1
+    assert counts["finished"] == 1
+    assert "superseded" in counts
+    # Superseded must not be folded into pending or any active lifecycle bucket.
+    assert counts["pending"] == 0
+    assert counts["review"] == 0

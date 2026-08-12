@@ -621,6 +621,36 @@ def test_exact_status_counts_recovers_from_transient_read_source_failure():
     assert snapshot["row_counts"]["blocked"]["exact"] == 1
 
 
+def test_snapshot_health_healthy_when_superseded_rows_exist(tmp_path, monkeypatch):
+    """Dashboard snapshot health remains healthy when persisted superseded
+    rows exist, the superseded exact count is exposed as its own bucket, and
+    superseded is not folded into pending, active, processing, review, or
+    finished counts."""
+    root = _init_canonical_repo(tmp_path)
+    db_path = _canonical_db(root)
+    with sqlite3.connect(db_path) as conn:
+        _insert_canonical_task(
+            conn, "TASK_SUPERSEDED_NF159",
+            status="superseded", worker_status="superseded",
+        )
+
+    class SupersededSnapshotProvider(FakeProvider):
+        def get_exact_status_counts(self):
+            return dashboard.exact_status_counts(root)
+
+    snapshot = dashboard.build_snapshot(SupersededSnapshotProvider())
+
+    assert snapshot["health"] == {"ok": True, "degraded": False, "provider_error_count": 0}
+    assert not snapshot["errors"]
+    assert snapshot["status_counts"]["superseded"] == 1
+    # Superseded must not be folded into active or any lifecycle bucket.
+    assert snapshot["status_counts"]["pending"] == 0
+    assert snapshot["status_counts"]["processing"] == 0
+    assert snapshot["status_counts"]["review"] == 0
+    assert snapshot["status_counts"]["finished"] == 0
+    assert snapshot["status_counts"]["active"] == 0
+
+
 class _PersistentExactCountsProvider(FakeProvider):
     """exact_status_counts fails on both attempts."""
 
