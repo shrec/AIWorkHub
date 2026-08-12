@@ -15,6 +15,7 @@ FIFO order the rest of AIWorkHub's queue already implies.
 
 import fnmatch
 import re
+from collections.abc import Mapping
 from typing import Any
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -220,6 +221,40 @@ def paths_conflict(a: str, b: str) -> bool:
 
 def _paths_conflict_any(candidate: str, others: set[str]) -> bool:
     return any(paths_conflict(candidate, other) for other in others)
+
+
+def _active_write_collisions(
+    by_id: dict[str, dict[str, Any]],
+    lifecycle: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Pairwise write-scope collisions among ACTIVE cards.
+
+    Mirrors the canonical collision guard's active-card population: only
+    ``pending``, ``processing`` and ``review`` cards still own or can acquire
+    write authority, so finished/blocked/archived cards are excluded here and
+    can never hold the plan in a phantom collision.  Dependency-blocked
+    pending cards are still scanned because a write-scope overlap is a truth
+    about the active plan, not a launch-eligibility verdict.
+
+    Returns one record per unordered colliding card pair, each carrying the
+    pair's ``task_ids`` (sorted) and the ``paths`` (sorted union of both
+    cards' overlapping allowed_writes).
+    """
+    active_ids = sorted(
+        tid for tid, state in lifecycle.items() if state in ACTIVE_STATES
+    )
+    records: list[dict[str, Any]] = []
+    for index, tid_a in enumerate(active_ids):
+        writes_a = [str(p) for p in (by_id[tid_a].get("allowed_writes") or [])]
+        for tid_b in active_ids[index + 1:]:
+            writes_b = [str(p) for p in (by_id[tid_b].get("allowed_writes") or [])]
+            a_conflicts = [p for p in writes_a if _paths_conflict_any(p, set(writes_b))]
+            if not a_conflicts:
+                continue
+            b_conflicts = [p for p in writes_b if _paths_conflict_any(p, set(writes_a))]
+            paths = sorted(set(a_conflicts) | set(b_conflicts))
+            records.append({"task_ids": sorted([tid_a, tid_b]), "paths": paths})
+    return records
 
 
 def lifecycle_state(card: dict[str, Any]) -> str:
@@ -441,6 +476,42 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
         | set(operational_blocked_task_ids)
     )
 
+    # Global collision health is an observational truth about every active
+    # card's write scope, independent of claim order and launch eligibility.
+    # ``write_scope_overlaps`` above stays a claim-eligibility projection
+    # (which pending card is blocked by an already-owned scope), so an empty
+    # ``write_scope_overlaps`` must never be read as "collision free" -- e.g.
+    # two processing cards can overlap while no pending card is affected.
+    # ``global_collision_free`` below is the authoritative signal.
+    collision_records = _active_write_collisions(by_id, lifecycle)
+    global_collision_pairs = [rec["task_ids"] for rec in collision_records]
+    global_collision_paths = sorted(
+        {path for rec in collision_records for path in rec["paths"]}
+    )
+    global_collision_task_ids = sorted(
+        {tid for rec in collision_records for tid in rec["task_ids"]}
+    )
+    card_collision_free = {tid: True for tid in by_id}
+    card_collision_task_ids: dict[str, list[str]] = {}
+    card_collision_paths: dict[str, list[str]] = {}
+    for rec in collision_records:
+        for tid in rec["task_ids"]:
+            card_collision_free[tid] = False
+            peers = card_collision_task_ids.setdefault(tid, [])
+            for peer in rec["task_ids"]:
+                if peer != tid and peer not in peers:
+                    peers.append(peer)
+            paths = card_collision_paths.setdefault(tid, [])
+            for path in rec["paths"]:
+                if path not in paths:
+                    paths.append(path)
+    card_collision_task_ids = {
+        tid: sorted(peers) for tid, peers in card_collision_task_ids.items()
+    }
+    card_collision_paths = {
+        tid: sorted(paths) for tid, paths in card_collision_paths.items()
+    }
+
     return {
         "task_ids": sorted(by_id),
         "lifecycle": lifecycle,
@@ -480,7 +551,102 @@ def build_snapshot(cards: list[dict[str, Any]]) -> dict[str, Any]:
             and not dependency_resolution_errors
         ),
         "cycle_nodes": cycle_nodes,
+        "global_collision_free": not collision_records,
+        "global_collision_count": len(collision_records),
+        "global_collision_paths": global_collision_paths,
+        "global_collision_task_ids": global_collision_task_ids,
+        "global_collision_pairs": global_collision_pairs,
+        "card_collision_free": card_collision_free,
+        "card_collision_task_ids": card_collision_task_ids,
+        "card_collision_paths": card_collision_paths,
     }
+
+
+# Bounded current-state fields the Plan-DAG summary projection forwards
+# verbatim.  The historical DAG (dependencies/dependents/layers/lifecycle/
+# task_ids) is intentionally excluded -- those stay behind ``full=True`` at
+# the MCP boundary.  Collision truth is current-state, not graph history, so
+# it belongs here.  Kept at the pure plan boundary so the summary projection
+# and any future caller share one authoritative list.
+PLAN_SUMMARY_FIELDS = (
+    "ready",
+    "ready_capacity",
+    "active_count",
+    "blocked_count",
+    "blocked_task_ids",
+    "dependency_blocked_count",
+    "dependency_blocked_task_ids",
+    "lifecycle_blocked_count",
+    "lifecycle_blocked_task_ids",
+    "operational_blockers",
+    "operational_blocked_task_ids",
+    "operational_blocked_count",
+    "explicit_retry_task_ids",
+    "explicit_retry_count",
+    "orphaned_processing",
+    "orphaned_processing_count",
+    "invalid_depends_on",
+    "write_scope_overlaps",
+    "global_collision_free",
+    "global_collision_count",
+    "global_collision_paths",
+    "global_collision_task_ids",
+    "global_collision_pairs",
+    "card_collision_free",
+    "card_collision_task_ids",
+    "card_collision_paths",
+    "critical_path",
+    "critical_path_length",
+    "edge_count",
+    "dag_valid",
+    "cycle_nodes",
+)
+
+
+def summarize_task_plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Bounded summary projection of a full Plan-DAG snapshot.
+
+    Retains current planning truth -- ready work, live blockers, collision
+    health and malformed/orphaned state -- without replaying the historical
+    DAG (dependencies/dependents/layers/lifecycle/task_ids), which stays
+    behind ``full=True`` at the MCP boundary.  The global and exact per-card
+    collision fields are included because they are bounded current-state
+    facts, not historical graph structure.
+    """
+    lifecycle = snapshot.get("lifecycle")
+    lifecycle_map = dict(lifecycle) if isinstance(lifecycle, Mapping) else {}
+    actionable_lifecycle = {
+        str(task_id): str(state)
+        for task_id, state in lifecycle_map.items()
+        if str(state).strip().lower() not in {"finished", "archived"}
+    }
+    task_ids = snapshot.get("task_ids")
+    task_count = len(task_ids) if isinstance(task_ids, list) else len(lifecycle_map)
+    terminal_task_count = max(0, task_count - len(actionable_lifecycle))
+    layers = snapshot.get("layers")
+
+    result: dict[str, Any] = {
+        "ok": bool(snapshot.get("ok", True)),
+        "schema_id": snapshot.get("schema_id", "aiworkhub.task_plan_snapshot.v1"),
+        "snapshot_mode": "summary",
+        "full_snapshot_available": True,
+        "task_count": task_count,
+        "actionable_task_count": len(actionable_lifecycle),
+        "terminal_task_count": terminal_task_count,
+        "actionable_lifecycle": actionable_lifecycle,
+        "layer_count": len(layers) if isinstance(layers, list) else 0,
+    }
+    for field in PLAN_SUMMARY_FIELDS:
+        if field in snapshot:
+            result[field] = snapshot[field]
+    result["omitted_fields"] = [
+        "dependencies",
+        "dependents",
+        "layers",
+        "lifecycle",
+        "task_ids",
+    ]
+    return result
 
 
 def filter_claimable(

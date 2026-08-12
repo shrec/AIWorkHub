@@ -477,6 +477,99 @@ async function textProtocolChecks() {
     "aiworkhub_worker_quality_review_submit",
   ]);
 
+  // NF-2026-00168 / NF166: a substantive GLM correctness-review response may
+  // omit the tool-request wrapper and emit the findings object directly. Both
+  // failure shapes below previously threw vscode_lm_text_protocol_invalid_json;
+  // they must now normalize to aiworkhub_worker_quality_review_submit.
+  const substantiveFindings = [
+    {
+      id: "NF166-1",
+      severity: "high",
+      summary: "correctness reviewer dropped the mandatory submit call",
+      evidence: "extension.js parseVscodeLmJsonEnvelope",
+    },
+  ];
+  const substantiveReviewText = JSON.stringify({
+    packet_sha256: "c".repeat(64),
+    lens: "correctness",
+    findings: substantiveFindings,
+  });
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(substantiveReviewText, { preferFinal: true }),
+    {
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_worker_quality_review_submit",
+      input: {
+        packet_sha256: "c".repeat(64),
+        lens: "correctness",
+        findings: substantiveFindings,
+      },
+    },
+  );
+  assert.deepStrictEqual(
+    internals.parseVscodeLmJsonEnvelope(JSON.stringify({
+      summary: "Correctness review complete",
+      findings: substantiveFindings,
+    }), { preferFinal: true }),
+    {
+      schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+      name: "aiworkhub_worker_quality_review_submit",
+      input: { findings: substantiveFindings },
+    },
+  );
+
+  const substantiveSubmissionId = "d".repeat(64);
+  const substantiveQueued = [substantiveReviewText];
+  const substantiveReviewCalls = [];
+  const substantiveReviewModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: substantiveQueued.shift() }; }()),
+    }),
+  };
+  const substantiveReviewResult = await internals.runVscodeLmTextProtocol(
+    substantiveReviewModel,
+    { prompt: "bounded correctness review", request_kind: "quality_review", allowedWrites: [] },
+    undefined,
+    async (call) => {
+      substantiveReviewCalls.push(call);
+      return { ok: true, durable: true, submission_id: substantiveSubmissionId };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(substantiveReviewResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: `quality review submitted:${substantiveSubmissionId}`,
+    edits: [],
+    creates: [],
+  });
+  assert.deepStrictEqual(substantiveReviewCalls.map((call) => call.name), [
+    "aiworkhub_worker_quality_review_submit",
+  ]);
+  assert.deepStrictEqual(substantiveReviewCalls[0].input.findings, substantiveFindings);
+
+  // Manager/worker authority must remain fail-closed: a non-quality_review
+  // route emitting the same findings object is rejected before invocation.
+  const wrongRoleCalls = [];
+  const wrongRoleModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: substantiveReviewText }; }()),
+    }),
+  };
+  await assert.rejects(
+    internals.runVscodeLmTextProtocol(
+      wrongRoleModel,
+      { prompt: "worker edit", request_kind: "worker", allowedWrites: ["out/result.json"] },
+      undefined,
+      async (call) => {
+        wrongRoleCalls.push(call);
+        return { ok: true, durable: true, submission_id: "e".repeat(64) };
+      },
+    ),
+    /vscode_lm_tool_not_allowed:aiworkhub_worker_quality_review_submit/,
+  );
+  assert.strictEqual(wrongRoleCalls.length, 0);
+
   let proseOnlyTurns = 0;
   const proseOnlyReview = {
     capabilities: { toolCalling: false },
@@ -1331,9 +1424,10 @@ async function nativeProtocolChecks() {
       if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
         return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
       }
-      const availableNames = options.tools.map((tool) => tool.name);
-      if (availableNames.length === 1 &&
-          availableNames[0] === "aiworkhub_manager_semantic_edit_stage") {
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
         return {
           stream: (async function* stream() {
             yield {
@@ -1380,10 +1474,9 @@ async function nativeProtocolChecks() {
     creates: [{ path: "out/result.json", content: "{}\n" }],
   });
   assert.strictEqual(boundedTurns, 14);
-  assert.deepStrictEqual(
-    boundedOptions[13].tools.map((tool) => tool.name),
-    ["aiworkhub_manager_semantic_edit_stage"],
-  );
+  const boundedStageNames = boundedOptions[13].tools.map((tool) => tool.name);
+  assert.ok(boundedStageNames.includes("aiworkhub_manager_source_graph_query"));
+  assert.ok(boundedStageNames.includes("aiworkhub_manager_semantic_edit_stage"));
   assert.strictEqual(
     boundedOptions[13].toolMode,
     fakeVscode.LanguageModelChatToolMode.Required,
@@ -1403,9 +1496,10 @@ async function nativeProtocolChecks() {
           }()),
         };
       }
-      if (Array.isArray(options.tools) &&
-          options.tools.length === 1 &&
-          options.tools[0].name === "aiworkhub_manager_semantic_edit_stage") {
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
         return {
           stream: (async function* stream() {
             yield {
@@ -1451,14 +1545,279 @@ async function nativeProtocolChecks() {
     creates: [{ path: "out/result.json", content: "{}\n" }],
   });
   assert.strictEqual(emptyTurns, 14);
-  assert.deepStrictEqual(
-    emptyOptions[13].tools.map((tool) => tool.name),
-    ["aiworkhub_manager_semantic_edit_stage"],
-  );
+  const emptyStageNames = emptyOptions[13].tools.map((tool) => tool.name);
+  assert.ok(emptyStageNames.includes("aiworkhub_manager_source_graph_query"));
+  assert.ok(emptyStageNames.includes("aiworkhub_manager_semantic_edit_stage"));
   assert.strictEqual(
     emptyOptions[13].toolMode,
     fakeVscode.LanguageModelChatToolMode.Required,
   );
+
+  // NF164: Option A keeps request-kind tool definitions visible during the forced
+  // staged-edit transition so prior assistant/tool-result history remains valid.
+  let historyCompatTurns = 0;
+  const historyCompatModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      historyCompatTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
+        const availableNames = options.tools.map((tool) => tool.name);
+        if (!availableNames.includes("aiworkhub_manager_source_graph_query") ||
+            !availableNames.includes("aiworkhub_manager_semantic_edit_stage")) {
+          throw new Error("forced_stage_missing_historical_tools");
+        }
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-compat",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `history-${historyCompatTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${historyCompatTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  const historyCompatResult = await internals.runVscodeLmAgent(
+    historyCompatModel,
+    {
+      requestId: "d".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
+    undefined,
+    async () => ({ ok: true, content: "graph" }),
+  );
+  assert.deepStrictEqual(JSON.parse(historyCompatResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+
+  // NF164: one bounded corrective turn for a non-stage call, then the exact stage
+  // tool is accepted; the rejected call must never reach MCP.
+  let correctiveTurns = 0;
+  const correctiveExecutedCalls = [];
+  const correctiveModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      correctiveTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("bounded semantic-edit stage")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-after-correction",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "forbidden-non-stage",
+              name: "aiworkhub_manager_source_graph_query",
+              input: { mode: "focus", query: "forbidden-non-stage" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `pre-${correctiveTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${correctiveTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  const correctiveResult = await internals.runVscodeLmAgent(
+    correctiveModel,
+    {
+      requestId: "e".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
+    undefined,
+    async (call) => {
+      correctiveExecutedCalls.push(call.name + ":" + (call.input && call.input.query || ""));
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(correctiveResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  assert.strictEqual(correctiveTurns, 15);
+  assert.ok(!correctiveExecutedCalls.some((entry) => entry.includes("forbidden-non-stage")));
+
+  // NF164: a repeated non-stage call fails structurally with
+  // vscode_lm_semantic_edit_stage_required after one bounded corrective turn.
+  let repeatedViolationTurns = 0;
+  const repeatedViolationModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      repeatedViolationTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("bounded semantic-edit stage") ||
+          lastUserText.includes("The bounded discovery phase is complete")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: `bad-${repeatedViolationTurns}`,
+              name: "aiworkhub_manager_source_graph_query",
+              input: { mode: "focus", query: "again-non-stage" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `pre-${repeatedViolationTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${repeatedViolationTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  await assert.rejects(
+    internals.runVscodeLmAgent(
+      repeatedViolationModel,
+      {
+        requestId: "f".repeat(32),
+        prompt: "bounded",
+        allowedWrites: ["out/result.json"],
+        path_contracts: {
+          "out/result.json": {
+            action: "create",
+            current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            line_count: 0,
+            parent_existed: false,
+          },
+        },
+      },
+      undefined,
+      async () => ({ ok: true, content: "graph" }),
+    ),
+    /vscode_lm_semantic_edit_stage_required/,
+  );
+
+  // NF164: the exact stage tool is always handled offline; an MCP stub that
+  // throws mcp_unavailable must never be invoked for it.
+  let mcpUnavailableTurns = 0;
+  const mcpUnavailableCalls = [];
+  const mcpUnavailableModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      mcpUnavailableTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-offline",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `sg-${mcpUnavailableTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${mcpUnavailableTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  const mcpUnavailableResult = await internals.runVscodeLmAgent(
+    mcpUnavailableModel,
+    {
+      requestId: "g".repeat(32),
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
+    undefined,
+    async (call) => {
+      mcpUnavailableCalls.push(call.name);
+      if (call.name === "aiworkhub_manager_semantic_edit_stage") throw new Error("mcp_unavailable");
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(mcpUnavailableResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  assert.ok(!mcpUnavailableCalls.some((name) => name === "aiworkhub_manager_semantic_edit_stage"));
 }
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-glm-bridge-test-"));
@@ -1502,6 +1861,859 @@ try {
 } finally {
   fs.rmSync(temp, { recursive: true, force: true });
 }
+
+// NF-2026-00168: strict fake-provider history validation — verify that corrective
+// retry never leaves unmatched assistant tool-call parts in the provider history.
+async function nf168ProviderHistoryValidation() {
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+
+  // Track invokeCount for cross-role enforcement: manager request must not invoke
+  // worker-prefixed tools, and vice versa.
+  const invokeCalls = [];
+  const invokeCountByRole = { manager: 0, worker: 0 };
+
+  // Track the message history the fake model receives on the corrective retry turn.
+  // Retain raw message arrays from the actual corrective forced-stage sendRequest
+  // turn. Never reconstruct synthetic contentParts — the raw content is already
+  // in provider-compatible format (VS Code LanguageModelChatMessage content arrays).
+  let retryMessages = null;
+  let forceStagedViolationTurns = 0;
+  const historyValidatorModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      forceStagedViolationTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("bounded semantic-edit stage")) {
+        // This is the corrective retry turn — capture the full raw history for inspection.
+        // Shallow-clone each message but retain the original content arrays.
+        retryMessages = _messages.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+        }));
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-after-nf168",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "forbidden-non-stage-nf168",
+              name: "aiworkhub_manager_source_graph_query",
+              input: { mode: "focus", query: "forbidden-non-stage" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `pre-${forceStagedViolationTurns}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `model-${forceStagedViolationTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+
+  const nf168Result = await internals.runVscodeLmAgent(
+    historyValidatorModel,
+    {
+      requestId: "h".repeat(32),
+      request_kind: "manager",
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
+    undefined,
+    async (call) => {
+      invokeCalls.push({ name: call.name, input: call.input });
+      if (call.name.startsWith("aiworkhub_worker_")) invokeCountByRole.worker += 1;
+      if (call.name.startsWith("aiworkhub_manager_")) invokeCountByRole.manager += 1;
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(nf168Result), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  assert.ok(retryMessages !== null, "corrective retry must have been triggered");
+
+  // NF-2026-00168: invokeCount=0 cross-role. A manager request must never
+  // invoke worker-prefixed tools.
+  assert.strictEqual(invokeCountByRole.worker, 0,
+    "manager request must have zero worker tool invocations");
+  assert.ok(invokeCountByRole.manager > 0,
+    "manager request must have invoked manager tools");
+
+  // NF-2026-00168: directly validate raw message history with exact callId sets.
+  // The raw content arrays are VS Code LanguageModelChatMessage parts — already
+  // in provider-compatible format. Assistant content arrays contain tool-call
+  // parts ({callId, name, input}) and text parts ({value}). User result content
+  // arrays contain LanguageModelToolResultPart-compatible parts ({callId, content}).
+  // Verify exact adjacent assistant callId ↔ user result callId set equality.
+  let lastAssistantHadToolCalls = false;
+  for (let i = 0; i < retryMessages.length; i += 1) {
+    const msg = retryMessages[i];
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const toolCallParts = msg.content.filter(
+        (p) => typeof p === "object" && p !== null &&
+          Object.prototype.hasOwnProperty.call(p, "callId") &&
+          Object.prototype.hasOwnProperty.call(p, "name"),
+      );
+      if (toolCallParts.length > 0) {
+        if (lastAssistantHadToolCalls) {
+          assert.fail("consecutive assistant messages with tool-call parts — unmatched");
+        }
+        lastAssistantHadToolCalls = true;
+        const next = retryMessages[i + 1];
+        assert.ok(
+          next && next.role === "user" && Array.isArray(next.content),
+          `assistant[${i}] tool-calls must be followed by user with tool-result parts`,
+        );
+        const toolCallIds = new Set(toolCallParts.map((tc) => tc.callId));
+        // Detect LanguageModelToolResultPart-compatible parts: must have
+        // both callId (string) and content (not undefined).
+        const resultParts = next.content.filter(
+          (p) => p && typeof p.callId === "string" && p.content !== undefined,
+        );
+        const resultCallIds = new Set(resultParts.map((rp) => rp.callId));
+        // NF-2026-00168: exact callId set equality — every tool-call must have
+        // a matching LanguageModelToolResultPart-compatible result, and every
+        // result must match a tool-call (no orphaned results).
+        for (const cid of toolCallIds) {
+          assert.ok(resultCallIds.has(cid),
+            `assistant[${i}] callId=${cid}:unmatched — no result part in user[${i + 1}]`);
+        }
+        for (const cid of resultCallIds) {
+          assert.ok(toolCallIds.has(cid),
+            `user[${i + 1}] callId=${cid}:orphaned_result — no tool-call in assistant[${i}]`);
+        }
+        // NF-2026-00168: each result part must have concrete content (not undefined).
+        for (const rp of resultParts) {
+          assert.ok(rp.content !== undefined && rp.content !== null,
+            `user[${i + 1}] callId=${rp.callId} result content must be concrete`);
+        }
+      } else {
+        lastAssistantHadToolCalls = false;
+      }
+    } else if (msg.role === "user") {
+      lastAssistantHadToolCalls = false;
+    }
+  }
+  assert.strictEqual(lastAssistantHadToolCalls, false,
+    "final assistant message must not have unmatched tool-call parts");
+
+  // NF-2026-00168: direct validateProviderHistory call on the raw captured
+  // message history. The raw messages are already in provider-compatible format
+  // — no synthetic reconstruction needed.
+  const unmatched = internals.validateProviderHistory(retryMessages);
+  assert.deepStrictEqual(unmatched, [],
+    `validateProviderHistory found unmatched parts: ${unmatched.join("; ")}`);
+}
+
+// NF-2026-00168: validateProviderHistory unit test — direct validation of
+// the fake-provider history validator with known good and bad histories.
+async function nf168ValidateProviderHistoryUnit() {
+  const { validateProviderHistory } = internals;
+
+  // Valid: empty history, no tool calls.
+  assert.deepStrictEqual(validateProviderHistory([]), []);
+
+  // Valid: assistant text-only message (no unmatched parts).
+  assert.deepStrictEqual(validateProviderHistory([
+    { role: "assistant", content: [{ value: "hello" }] },
+    { role: "user", content: "reply" },
+  ]), []);
+
+  // Valid: assistant tool-call followed by user with matching callId + content
+  // (LanguageModelToolResultPart-compatible) result part.
+  assert.deepStrictEqual(validateProviderHistory([
+    { role: "assistant", content: [{ callId: "abc", name: "test", input: {} }] },
+    { role: "user", content: [{ callId: "abc", content: [{ type: "text", text: "ok" }] }] },
+  ]), []);
+
+  // Valid: consecutive assistants without tool-calls.
+  assert.deepStrictEqual(validateProviderHistory([
+    { role: "assistant", content: [{ value: "first" }] },
+    { role: "user", content: "middle" },
+    { role: "assistant", content: [{ value: "second" }] },
+  ]), []);
+
+  // Invalid: assistant tool-call with no subsequent user message.
+  const noUser = validateProviderHistory([
+    { role: "assistant", content: [{ callId: "orphan", name: "orphan", input: {} }] },
+  ]);
+  assert.strictEqual(noUser.length, 1);
+  assert.ok(noUser[0].includes("no_user_result"), `expected no_user_result, got ${noUser[0]}`);
+
+  // Invalid: assistant tool-call followed by non-user role.
+  const badRole = validateProviderHistory([
+    { role: "assistant", content: [{ callId: "abc", name: "t", input: {} }] },
+    { role: "assistant", content: [{ value: "oops" }] },
+  ]);
+  assert.strictEqual(badRole.length, 1);
+  assert.ok(badRole[0].includes("no_user_result"));
+
+  // Invalid: assistant tool-call with user that has no matching callId.
+  // NF-2026-00168: exact callId set equality — tool-call "abc" is unmatched
+  // AND result "xyz" is orphaned, producing two errors.
+  const unmatched = validateProviderHistory([
+    { role: "assistant", content: [{ callId: "abc", name: "t", input: {} }] },
+    { role: "user", content: [{ callId: "xyz", content: [{ type: "text", text: "ok" }] }] },
+  ]);
+  assert.strictEqual(unmatched.length, 2);
+  assert.ok(unmatched.some((e) => e.includes("unmatched")), `expected unmatched, got ${unmatched.join(";")}`);
+
+  // Invalid: user result part missing content (not LanguageModelToolResultPart-compatible).
+  const missingContent = validateProviderHistory([
+    { role: "assistant", content: [{ callId: "abc", name: "t", input: {} }] },
+    { role: "user", content: [{ callId: "abc", name: "result", value: "ok" }] },
+  ]);
+  assert.strictEqual(missingContent.length, 1);
+  assert.ok(missingContent[0].includes("unmatched"),
+    `expected unmatched (no content), got ${missingContent[0]}`);
+
+  // Invalid: standalone user result without preceding assistant — must fail.
+  // NF-2026-00168: validateProviderHistory rejects orphan result-only histories.
+  const orphanedResult = validateProviderHistory([
+    { role: "user", content: [{ callId: "ghost", content: [{ type: "text", text: "??" }] }] },
+  ]);
+  assert.strictEqual(orphanedResult.length, 1);
+  assert.ok(orphanedResult[0].includes("orphaned_no_tool_call"),
+    `expected orphaned_no_tool_call, got ${orphanedResult[0]}`);
+  // NF-2026-00168: third pass — orphan result part in a user message whose
+  // immediately preceding assistant turn lacks the exact matching callId,
+  // even when other valid call/result pairs exist in the same history.
+  const orphanWithValid = validateProviderHistory([
+    { role: "assistant", content: [{ callId: "callA", name: "good", input: {} }] },
+    { role: "user", content: [{ callId: "callA", content: [{ type: "text", text: "ok" }] },
+                              { callId: "callB", content: [{ type: "text", text: "orphan" }] }] },
+  ]);
+  assert.strictEqual(orphanWithValid.length, 1,
+    `expected 1 orphaned_result, got ${JSON.stringify(orphanWithValid)}`);
+  assert.ok(orphanWithValid[0].includes("orphaned_result"),
+    `expected orphaned_result, got ${orphanWithValid[0]}`);
+  // NF-2026-00168: result with non-assistant predecessor (e.g., system turns)
+  // is flagged by the secondary pass (no tool-call exists anywhere).
+  const orphanAfterSystem = validateProviderHistory([
+    { role: "system", content: "boot" },
+    { role: "user", content: [{ callId: "orphanSys", content: [{ type: "text", text: "?" }] }] },
+  ]);
+  assert.strictEqual(orphanAfterSystem.length, 1,
+    `expected 1 orphaned_no_tool_call after system, got ${JSON.stringify(orphanAfterSystem)}`);
+  assert.ok(orphanAfterSystem[0].includes("orphaned_no_tool_call"),
+    `expected orphaned_no_tool_call, got ${orphanAfterSystem[0]}`);
+  // Invalid: non-array messages.
+  const bad = validateProviderHistory({});
+  assert.deepStrictEqual(bad, ["messages_must_be_array"]);
+}
+
+// NF-2026-00169: worker Source Graph acknowledgement in both native and fallback
+// text protocol paths. A worker-scoped source graph tool must trigger
+// sourceGraphAcknowledged without accepting manager tools in worker authority.
+async function nf169WorkerSourceGraphAck() {
+  // Native protocol: worker source_graph_query tool call.
+  const nativeFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "native worker sg",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  let nativeWorkerSgTurns = 0;
+  const workerSgModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeWorkerSgTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: nativeFinal }; }()) };
+      }
+      const lastMessage = _messages[_messages.length - 1];
+      const lastUserText = lastMessage && lastMessage.role === "user" &&
+        typeof lastMessage.content === "string" ? lastMessage.content : "";
+      if (lastUserText.includes("The bounded discovery phase is complete")) {
+        return {
+          stream: (async function* stream() {
+            yield {
+              callId: "stage-nf169",
+              name: "aiworkhub_manager_semantic_edit_stage",
+              input: { operation: "create", file_path: "out/result.json", content: "{}\n" },
+            };
+          }()),
+        };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `wsg-${nativeWorkerSgTurns}`,
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: `worker-sg-${nativeWorkerSgTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  const workerNativeResult = await internals.runVscodeLmAgent(
+    workerSgModel,
+    {
+      requestId: "i".repeat(32),
+      request_kind: "worker",
+      prompt: "bounded",
+      allowedWrites: ["out/result.json"],
+      path_contracts: {
+        "out/result.json": {
+          action: "create",
+          current_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          line_count: 0,
+          parent_existed: false,
+        },
+      },
+    },
+    undefined,
+    async (call) => {
+      // NF-2026-00169: invokeCount=0 cross-role. Worker must never invoke
+      // manager-scoped tools; manager tools are rejected at the authority gate.
+      assert.ok(
+        call.name === "aiworkhub_worker_source_graph_query" ||
+        call.name === "aiworkhub_manager_semantic_edit_stage",
+        `worker invokeTool must only invoke worker or bridge tools, got: ${call.name}`,
+      );
+      assert.ok(
+        !call.name.startsWith("aiworkhub_manager_") ||
+        call.name === "aiworkhub_manager_semantic_edit_stage",
+        `worker must not invoke manager-scoped tools: ${call.name}`,
+      );
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.deepStrictEqual(JSON.parse(workerNativeResult), {
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "Applied validated staged semantic edits.",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+
+  // Text protocol fallback: worker source_graph_query in JSON envelope.
+  const workerToolRequest = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_worker_source_graph_query",
+    input: { mode: "focus", query: "worker-text", budget: 48 },
+  });
+  const textFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "text worker sg",
+    edits: [],
+    creates: [{ path: "out/result.json", content: "{}\n" }],
+  });
+  const textQueued = [workerToolRequest, textFinal];
+  const workerTextCalls = [];
+  const workerTextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: textQueued.shift() }; }()),
+    }),
+  };
+  const workerTextResult = await internals.runVscodeLmTextProtocol(
+    workerTextModel,
+    { prompt: "bounded", request_kind: "worker", allowedWrites: ["out/result.json"] },
+    undefined,
+    async (call) => {
+      workerTextCalls.push(call);
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.strictEqual(workerTextResult, textFinal);
+  assert.strictEqual(workerTextCalls.length, 1);
+  assert.strictEqual(workerTextCalls[0].name, "aiworkhub_worker_source_graph_query");
+
+  // Contextless worker fallback: a worker request with NO initial source graph
+  // context should still acknowledge the worker tool and not throw
+  // source_graph_not_acknowledged.
+  const contextlessFinal = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "contextless fallback",
+    edits: [],
+    creates: [],
+  });
+  const contextlessCalls = [];
+  const contextlessModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() {
+        yield { value: JSON.stringify({
+          schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+          name: "aiworkhub_worker_source_graph_query",
+          input: { mode: "focus", query: "contextless", budget: 48 },
+        }) };
+        yield { value: contextlessFinal };
+      }()),
+    }),
+  };
+  const contextlessResult = await internals.runVscodeLmTextProtocol(
+    contextlessModel,
+    { prompt: "contextless worker", request_kind: "worker", allowedWrites: [] },
+    undefined,
+    async (call) => {
+      contextlessCalls.push(call);
+      return { ok: true, content: "graph" };
+    },
+  );
+  assert.strictEqual(contextlessResult, contextlessFinal);
+  assert.strictEqual(contextlessCalls.length, 1);
+  assert.strictEqual(contextlessCalls[0].name, "aiworkhub_worker_source_graph_query");
+}
+
+// NF-2026-00169: contextless worker native protocol regression test.
+// A worker request with no initial source graph context (null prefetch)
+// must correctly acknowledge the worker SG tool on the native path,
+// without accepting manager tools in worker authority.
+async function nf169ContextlessWorkerNative() {
+  let nativeTurns = 0;
+  let acknowledged = false;
+  let wrongRoleSeen = false;
+  const invokeCalls = [];
+  const invokeCountByRole = { manager: 0, worker: 0 };
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "contextless native ok",
+    edits: [],
+    creates: [],
+  });
+  const model = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeTurns += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      // Contextless worker: first turn with tools — acknowledge worker SG.
+      acknowledged = true;
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `ctxless-native-${nativeTurns}`,
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: "contextless-native", budget: 48, workflow_stage: "orientation" },
+          };
+        }()),
+      };
+    },
+  };
+  // No initial_source_graph_result in request — truly contextless.
+  // invokeTool is a mock that returns ok for any tool call.
+  const result = await internals.runVscodeLmAgent(
+    model,
+    {
+      requestId: "m".repeat(32),
+      request_kind: "worker",
+      prompt: "contextless worker native",
+      allowedWrites: [],
+      path_contracts: {},
+    },
+    undefined,
+    async (call) => {
+      invokeCalls.push({ name: call.name, input: call.input });
+      if (call.name.startsWith("aiworkhub_worker_")) invokeCountByRole.worker += 1;
+      if (call.name.startsWith("aiworkhub_manager_")) invokeCountByRole.manager += 1;
+      // Acknowledge worker SG, reject manager SG (authority gate).
+      if (call.name === "aiworkhub_worker_source_graph_query") {
+        return { ok: true, content: "graph" };
+      }
+      if (call.name === "aiworkhub_manager_source_graph_query") {
+        wrongRoleSeen = true;
+        return { ok: false, error: "manager_sg_rejected_in_worker" };
+      }
+      return { ok: true, content: "done" };
+    },
+  );
+  const parsed = JSON.parse(result);
+  assert.strictEqual(parsed.summary, "contextless native ok");
+  assert.ok(acknowledged, "worker SG tool must have been acknowledged on contextless native path");
+  assert.strictEqual(wrongRoleSeen, false, "manager SG must not appear on contextless worker native path");
+  assert.ok(invokeCalls.length > 0, "must have at least one tool invocation");
+  assert.strictEqual(invokeCountByRole.manager, 0, "invokeCountByRole.manager must be 0 for worker request");
+  assert.ok(invokeCountByRole.worker > 0, "invokeCountByRole.worker must be > 0 for worker request");
+}
+
+// NF-2026-00168: force-final callId pairing two-strikes test.
+// First force-final violation gets one corrective retry; second violation
+// must throw vscode_lm_finalization_tool_violation structurally.
+async function nf168ForceFinalCallIdPairing() {
+  let forceFinalTurns = 0;
+  const invokeCountByRole = { manager: 0, worker: 0 };
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "ok",
+    edits: [],
+    creates: [],
+  });
+  let correctiveTurnMessages = null;
+  const violatorModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      forceFinalTurns += 1;
+      // Capture raw messages on the corrective-retry turn (when forceFinal is on).
+      if (!Object.prototype.hasOwnProperty.call(options, "tools") && forceFinalTurns > 1) {
+        correctiveTurnMessages = _messages.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+        }));
+      }
+      // Always return tool calls — this triggers the force-final violation path
+      // which produces tool_call_rejected protocolTrace entries.
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `fv-${forceFinalTurns}`,
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: `fv-sg-${forceFinalTurns}` },
+          };
+        }()),
+      };
+    },
+  };
+  try {
+    await internals.runVscodeLmAgent(
+      violatorModel,
+      {
+        requestId: "j".repeat(32),
+        request_kind: "worker",
+        prompt: "bounded finalization violator",
+        allowedWrites: [],
+        path_contracts: {},
+      },
+      undefined,
+      async (call) => {
+        if (call.name.startsWith("aiworkhub_manager_")) invokeCountByRole.manager += 1;
+        if (call.name.startsWith("aiworkhub_worker_")) invokeCountByRole.worker += 1;
+        return { ok: true, content: "graph" };
+      },
+    );
+    assert.fail("expected vscode_lm_finalization_tool_violation");
+  } catch (err) {
+    assert.match(String(err.message || err), /vscode_lm_finalization_tool_violation/,
+      "second force-final violation must throw");
+    assert.ok(forceFinalTurns >= 2, "must have had at least one turn before corrective retry");
+    assert.strictEqual(invokeCountByRole.manager, 0, "invokeCountByRole.manager must be 0 for worker requests");
+    // NF-2026-00168: protocolTrace must capture exact rejectedCallIds.
+    const traceEntries = err.protocolTrace || [];
+    const rejectedEntries = traceEntries.filter((e) => e.outcome === "tool_call_rejected");
+    assert.ok(rejectedEntries.length > 0,
+      `must have at least one tool_call_rejected trace entry, got ${JSON.stringify(traceEntries)}`);
+    const expectedRejectedIds = rejectedEntries.flatMap((e) => e.rejectedCallIds || []);
+    assert.ok(expectedRejectedIds.length > 0,
+      "rejectedCallIds must be nonempty");
+    assert.deepStrictEqual(expectedRejectedIds, ["fv-14", "fv-15"],
+      `exact rejectedCallIds must be ["fv-14","fv-15"], got ${JSON.stringify(expectedRejectedIds)}`);
+    // NF-2026-00168: verify corrective retry turn history is provider-valid.
+    assert.ok(correctiveTurnMessages !== null,
+      "correctiveTurnMessages must be non-null");
+    // Directly validate raw concrete result parts with exact callId+content
+    // and both directions of adjacent assistant-call/user-result ID-set equality.
+    for (let mi = 0; mi < correctiveTurnMessages.length; mi += 1) {
+      const msg = correctiveTurnMessages[mi];
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        const tcParts = msg.content.filter(
+          (p) => p && typeof p.callId === "string" && typeof p.name === "string",
+        );
+        if (tcParts.length > 0) {
+          const next = correctiveTurnMessages[mi + 1];
+          assert.ok(next && next.role === "user" && Array.isArray(next.content),
+            `assistant[${mi}] tool-calls must be followed by user with result parts`);
+          const tcIds = new Set(tcParts.map((tc) => tc.callId));
+          const rpParts = next.content.filter(
+            (p) => p && typeof p.callId === "string" && p.content !== undefined,
+          );
+          const rpIds = new Set(rpParts.map((rp) => rp.callId));
+          assert.deepStrictEqual([...tcIds].sort(), [...rpIds].sort(),
+            `assistant[${mi}]↔user[${mi + 1}] callId sets must match exactly`);
+          for (const rp of rpParts) {
+            assert.ok(rp.content !== undefined && rp.content !== null,
+              `user[${mi + 1}] callId=${rp.callId} result content must be concrete`);
+          }
+        }
+      }
+    }
+    const historyErrors = internals.validateProviderHistory(correctiveTurnMessages);
+    assert.deepStrictEqual(historyErrors, [],
+      `corrective retry history invalid: ${historyErrors.join("; ")}`);
+  }
+}
+
+// NF-2026-00168: force-final text protocol two-strikes regression test.
+// Verify text protocol force-final violation follows bounded two-strikes:
+// first violation gets corrective retry, second throws structurally.
+async function nf168ForceFinalTextProtocol() {
+  let textTurns = 0;
+  const invokeCountByRole = { manager: 0, worker: 0 };
+  let correctiveTurnMessages = null;
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "should not succeed",
+    edits: [],
+    creates: [],
+  });
+  // Model always returns tool requests (never finalizes) to trigger force-final.
+  const toolName = "aiworkhub_worker_source_graph_query";
+  const toolEnvelope = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: toolName,
+    input: { mode: "focus", query: "fv-text", budget: 48 },
+  });
+  const model = {
+    capabilities: { toolCalling: false },
+    sendRequest: async (_messages) => {
+      textTurns += 1;
+      if (textTurns > 1) {
+        correctiveTurnMessages = _messages.map((msg) => ({
+          role: msg.role,
+          content: msg.content,
+        }));
+      }
+      return {
+        stream: (async function* stream() {
+          yield { value: toolEnvelope };
+        }()),
+      };
+    },
+  };
+  try {
+    await internals.runVscodeLmTextProtocol(
+      model,
+      { prompt: "force final text violator", request_kind: "worker", allowedWrites: [] },
+      undefined,
+      async (call) => {
+        if (call.name.startsWith("aiworkhub_manager_")) invokeCountByRole.manager += 1;
+        if (call.name.startsWith("aiworkhub_worker_")) invokeCountByRole.worker += 1;
+        return { ok: true, content: "graph" };
+      },
+    );
+    assert.fail("text protocol force-final second violation must throw");
+  } catch (err) {
+    const msg = String(err.message || err);
+    assert.match(msg, /vscode_lm_finalization_tool_violation/,
+      "second force-final violation must throw in text protocol");
+    assert.ok(textTurns >= 2, `must have at least 2 turns (had ${textTurns})`);
+    assert.strictEqual(invokeCountByRole.manager, 0, "invokeCountByRole.manager must be 0 for worker text protocol");
+    // NF-2026-00168: protocolTrace must capture exact rejectedTool name.
+    const traceEntries = err.protocolTrace || [];
+    const rejectedEntries = traceEntries.filter((e) => e.outcome === "tool_request_rejected");
+    assert.ok(rejectedEntries.length > 0,
+      `must have at least one tool_request_rejected trace entry, got ${JSON.stringify(traceEntries)}`);
+    const expectedRejectedTools = rejectedEntries.map((e) => e.rejectedTool).filter(Boolean);
+    assert.ok(expectedRejectedTools.length > 0,
+      "rejectedTool must be nonempty");
+    assert.deepStrictEqual(expectedRejectedTools,
+      ["aiworkhub_worker_source_graph_query", "aiworkhub_worker_source_graph_query"],
+      `exact rejectedTools must be ["aiworkhub_worker_source_graph_query","aiworkhub_worker_source_graph_query"], got ${JSON.stringify(expectedRejectedTools)}`);
+    // NF-2026-00168: verify corrective retry turn history is provider-valid.
+    assert.ok(correctiveTurnMessages !== null,
+      "correctiveTurnMessages must be non-null");
+    // Directly validate raw concrete result parts with exact callId+content
+    // and both directions of adjacent assistant-call/user-result ID-set equality.
+    for (let mi = 0; mi < correctiveTurnMessages.length; mi += 1) {
+      const msg = correctiveTurnMessages[mi];
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        const tcParts = msg.content.filter(
+          (p) => p && typeof p.callId === "string" && typeof p.name === "string",
+        );
+        if (tcParts.length > 0) {
+          const next = correctiveTurnMessages[mi + 1];
+          assert.ok(next && next.role === "user" && Array.isArray(next.content),
+            `assistant[${mi}] tool-calls must be followed by user with result parts`);
+          const tcIds = new Set(tcParts.map((tc) => tc.callId));
+          const rpParts = next.content.filter(
+            (p) => p && typeof p.callId === "string" && p.content !== undefined,
+          );
+          const rpIds = new Set(rpParts.map((rp) => rp.callId));
+          assert.deepStrictEqual([...tcIds].sort(), [...rpIds].sort(),
+            `assistant[${mi}]↔user[${mi + 1}] callId sets must match exactly`);
+          for (const rp of rpParts) {
+            assert.ok(rp.content !== undefined && rp.content !== null,
+              `user[${mi + 1}] callId=${rp.callId} result content must be concrete`);
+          }
+        }
+      }
+    }
+    const historyErrors = internals.validateProviderHistory(correctiveTurnMessages);
+    assert.deepStrictEqual(historyErrors, [],
+      `corrective retry history invalid: ${historyErrors.join("; ")}`);
+  }
+}
+
+// NF-2026-00169: authority rejection — worker must not acknowledge manager SG,
+// manager must not acknowledge worker SG, in both native and text protocol paths.
+async function nf169AuthorityRejection() {
+  const finalResponse = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA,
+    summary: "should not reach",
+    edits: [],
+    creates: [],
+  });
+  // Native: worker request calling manager SG must fail with zero onToolTurn/invoke.
+  // NF-2026-00169: use invocation counters, assert exactly zero.
+  let nativeTurn = 0;
+  let nativeOnToolTurns = 0;
+  const nativeInvokeCalls = [];
+  const nativeWrongRoleModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      nativeTurn += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `wrong-${nativeTurn}`,
+            name: "aiworkhub_manager_source_graph_query",
+            input: { mode: "focus", query: `wrong-role-${nativeTurn}` },
+          };
+        }()),
+      };
+    },
+  };
+  try {
+    await internals.runVscodeLmAgent(
+      nativeWrongRoleModel,
+      {
+        requestId: "k".repeat(32),
+        request_kind: "worker",
+        prompt: "worker with manager SG",
+        allowedWrites: [],
+        path_contracts: {},
+      },
+      undefined,
+      async (call) => { nativeInvokeCalls.push(call); return { ok: true, content: "graph" }; },
+      (name, _state) => { nativeOnToolTurns += 1; },
+    );
+    assert.fail("worker must not acknowledge manager SG in native path");
+  } catch (err) {
+    // NF-2026-00169: authority gate rejects wrong-role calls before invocation.
+    // Zero onToolTurn/invoke calls for the worker→manager SG path.
+    assert.strictEqual(nativeOnToolTurns, 0,
+      "worker→manager SG must produce zero onToolTurn calls");
+    assert.strictEqual(nativeInvokeCalls.length, 0,
+      "worker→manager SG must produce zero invokeTool calls");
+    const msg = String(err.message || err);
+    assert.ok(
+      /vscode_lm_agent_turn_limit/.test(msg) || /source_graph_not_acknowledged/.test(msg) || /authority_gate/.test(msg),
+      `worker native must reject manager SG, got: ${msg}`,
+    );
+  }
+  // Text protocol: worker request with manager SG must also fail.
+  const managerSgRequest = JSON.stringify({
+    schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,
+    name: "aiworkhub_manager_source_graph_query",
+    input: { mode: "focus", query: "manager-in-worker", budget: 48 },
+  });
+  const textQueued = [managerSgRequest, finalResponse];
+  const wrongRoleTextInvokeCalls = [];
+  const wrongRoleTextModel = {
+    capabilities: { toolCalling: false },
+    sendRequest: async () => ({
+      stream: (async function* stream() { yield { value: textQueued.shift() }; }()),
+    }),
+  };
+  try {
+    await internals.runVscodeLmTextProtocol(
+      wrongRoleTextModel,
+      { prompt: "worker text wrong role", request_kind: "worker", allowedWrites: [] },
+      undefined,
+      async (call) => { wrongRoleTextInvokeCalls.push(call); return { ok: true, content: "graph" }; },
+    );
+    assert.fail("worker text must not acknowledge manager SG");
+  } catch (err) {
+    // NF-2026-00169: text protocol rejects wrong-role tools by name (not_allowed)
+    // before invocation. Zero invokeTool calls for worker→manager SG in text path.
+    assert.strictEqual(wrongRoleTextInvokeCalls.length, 0,
+      "worker→manager SG text path must produce zero invokeTool calls");
+    const msg = String(err.message || err);
+    assert.ok(
+      /source_graph_not_acknowledged/.test(msg) || /vscode_lm_tool_not_allowed/.test(msg),
+      `worker text protocol must reject manager SG, got: ${msg}`,
+    );
+  }
+
+  // Native: manager request calling worker SG must fail with zero onToolTurn/invoke.
+  // NF-2026-00169: use invocation counters, assert exactly zero.
+  let mgrNativeTurn = 0;
+  let mgrOnToolTurns = 0;
+  const mgrInvokeCalls = [];
+  const mgrWrongRoleModel = {
+    capabilities: { toolCalling: true },
+    sendRequest: async (_messages, options) => {
+      mgrNativeTurn += 1;
+      if (!Object.prototype.hasOwnProperty.call(options, "tools")) {
+        return { stream: (async function* stream() { yield { value: finalResponse }; }()) };
+      }
+      return {
+        stream: (async function* stream() {
+          yield {
+            callId: `mgr-wrong-${mgrNativeTurn}`,
+            name: "aiworkhub_worker_source_graph_query",
+            input: { mode: "focus", query: `worker-in-manager-${mgrNativeTurn}` },
+          };
+        }()),
+      };
+    },
+  };
+  try {
+    await internals.runVscodeLmAgent(
+      mgrWrongRoleModel,
+      {
+        requestId: "l".repeat(32),
+        request_kind: "manager",
+        prompt: "manager with worker SG",
+        allowedWrites: [],
+        path_contracts: {},
+      },
+      undefined,
+      async (call) => { mgrInvokeCalls.push(call); return { ok: true, content: "graph" }; },
+      (name, _state) => { mgrOnToolTurns += 1; },
+    );
+    assert.fail("manager must not acknowledge worker SG in native path");
+  } catch (err) {
+    // NF-2026-00169: authority gate rejects wrong-role calls before invocation.
+    // Zero onToolTurn/invoke calls for the manager→worker SG path.
+    assert.strictEqual(mgrOnToolTurns, 0,
+      "manager→worker SG must produce zero onToolTurn calls");
+    assert.strictEqual(mgrInvokeCalls.length, 0,
+      "manager→worker SG must produce zero invokeTool calls");
+    const msg = String(err.message || err);
+    assert.ok(
+      /vscode_lm_agent_turn_limit/.test(msg) || /source_graph_not_acknowledged/.test(msg) || /authority_gate/.test(msg),
+      `manager native must reject worker SG, got: ${msg}`,
+    );
+  }
+}
+
 
 async function main() {
   const schema = internals.constants.VSCODE_LM_EDIT_RESPONSE_SCHEMA;
@@ -1557,8 +2769,14 @@ async function main() {
   await progressReceiptChecks();
   await claimedCancellationChecks();
   await cancellationToolBoundaryChecks();
+  await nf168ProviderHistoryValidation();
+  await nf169WorkerSourceGraphAck();
+  await nf168ForceFinalCallIdPairing();
+  await nf169AuthorityRejection();
+  await nf168ValidateProviderHistoryUnit();
+  await nf168ForceFinalTextProtocol();
+  await nf169ContextlessWorkerNative();
 }
-
 async function cancellationToolBoundaryChecks() {
   const toolEnvelope = JSON.stringify({
     schema_id: internals.constants.VSCODE_LM_TOOL_REQUEST_SCHEMA,

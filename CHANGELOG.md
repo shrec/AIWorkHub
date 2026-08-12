@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.46] - 2026-08-12
+
+### Fixed
+
+- Guard initialization-time task topic migration with `json_valid`, so one
+  malformed legacy `card_json` row cannot abort repository startup while
+  valid topic backfill remains unchanged (NF166).
+- Separate global active-card collision health from exact per-card launch
+  eligibility, keeping unrelated collision-free work runnable and dashboard
+  summaries truthful (NF187).
+- Normalize substantive GLM correctness-review findings into the mandatory
+  quality-review submission path, preserve provider-valid tool-call/result
+  history, and keep manager/worker tool authority fail-closed (NF168, NF169).
+- Redact complete Bearer credentials from portable evidence text and paths
+  before dashboard serialization (NF167, PR #25).
+
 ## [0.9.45] - 2026-08-12
 
 ### Fixed

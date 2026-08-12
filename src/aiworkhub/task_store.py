@@ -521,10 +521,13 @@ def _upgrade_compatible_schema(path: Path) -> bool:
         # Older writers could persist the canonical topic in card_json while
         # leaving the indexed column empty.  Reconcile those rows on every
         # explicit initialize/upgrade; otherwise exact worker launch rejects
-        # a valid task with topic_mismatch.
+        # a valid task with topic_mismatch.  json_extract raises "malformed
+        # JSON" on a legacy row whose card_json is not valid JSON, so guard
+        # the extraction with json_valid to keep one bad row from aborting init.
         updated = conn.execute(
             "UPDATE tasks SET topic=COALESCE(json_extract(card_json, '$.topic'), '') "
-            "WHERE topic='' AND COALESCE(json_extract(card_json, '$.topic'), '')<>''"
+            "WHERE topic='' AND json_valid(card_json)=1 "
+            "AND COALESCE(json_extract(card_json, '$.topic'), '')<>''"
         ).rowcount
         changed = bool(changed or updated)
         # v0.8.38 and earlier could serialize ``task_store.get_task``'s full

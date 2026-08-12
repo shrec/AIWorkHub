@@ -12,10 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.45
+## What's new in 0.9.46
 
-- Persisted superseded tasks now remain visible in their own exact dashboard
-  bucket and no longer trigger a partial-data snapshot after reload.
+- Task migration tolerates malformed legacy JSON, collision health no longer
+  blocks unrelated cards, GLM correctness reviewers retain valid tool history,
+  and portable evidence redacts complete Bearer credentials.
 
 See the packaged **Changelog** for the complete release summary.
 

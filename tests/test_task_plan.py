@@ -351,6 +351,101 @@ def test_snapshot_disjoint_glob_writes_do_not_conflict():
     assert "t2" in snap["ready"]
 
 
+def test_snapshot_global_collision_truth_separates_independent_ready_card():
+    cards = [
+        _card("collide_a", allowed_writes=["src/shared.py"], created_at="2026-01-01T00:00:00Z"),
+        _card("collide_b", allowed_writes=["src/shared.py"], created_at="2026-01-02T00:00:00Z"),
+        _card("independent", allowed_writes=["src/own.py"], created_at="2026-01-03T00:00:00Z"),
+    ]
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["global_collision_free"] is False
+    assert snap["global_collision_count"] == 1
+    assert snap["global_collision_paths"] == ["src/shared.py"]
+    assert snap["global_collision_task_ids"] == ["collide_a", "collide_b"]
+    assert snap["global_collision_pairs"] == [["collide_a", "collide_b"]]
+
+    # Exact per-card truth: each colliding card only sees its own conflict.
+    assert snap["card_collision_free"]["collide_a"] is False
+    assert snap["card_collision_free"]["collide_b"] is False
+    assert snap["card_collision_free"]["independent"] is True
+    assert snap["card_collision_task_ids"]["collide_a"] == ["collide_b"]
+    assert snap["card_collision_task_ids"]["collide_b"] == ["collide_a"]
+    assert snap["card_collision_paths"]["collide_a"] == ["src/shared.py"]
+    assert "independent" not in snap["card_collision_task_ids"]
+    assert "independent" not in snap["card_collision_paths"]
+
+    # An unrelated global collision must never block the collision-free,
+    # dependency-ready card.
+    assert "independent" in snap["ready"]
+    assert snap["write_scope_overlaps"] == {"collide_b": ["src/shared.py"]}
+
+
+def test_snapshot_per_card_collision_truth_reports_only_involved_conflicts():
+    cards = [
+        _card("left", allowed_writes=["src/a.py"]),
+        _card("middle", allowed_writes=["src/a.py", "src/b.py"]),
+        _card("right", allowed_writes=["src/b.py"]),
+    ]
+    snap = task_plan.build_snapshot(cards)
+
+    # left <-> middle share src/a.py; middle <-> right share src/b.py;
+    # left and right never touch each other.
+    assert snap["global_collision_free"] is False
+    assert snap["global_collision_count"] == 2
+    assert snap["global_collision_pairs"] == [["left", "middle"], ["middle", "right"]]
+    assert snap["global_collision_paths"] == ["src/a.py", "src/b.py"]
+    assert snap["global_collision_task_ids"] == ["left", "middle", "right"]
+
+    assert snap["card_collision_free"]["left"] is False
+    assert snap["card_collision_free"]["middle"] is False
+    assert snap["card_collision_free"]["right"] is False
+    assert snap["card_collision_task_ids"]["left"] == ["middle"]
+    assert snap["card_collision_task_ids"]["middle"] == ["left", "right"]
+    assert snap["card_collision_task_ids"]["right"] == ["middle"]
+    assert snap["card_collision_paths"]["left"] == ["src/a.py"]
+    assert snap["card_collision_paths"]["middle"] == ["src/a.py", "src/b.py"]
+    assert snap["card_collision_paths"]["right"] == ["src/b.py"]
+
+
+def test_snapshot_empty_write_scope_overlaps_does_not_imply_global_collision_free():
+    cards = [
+        _card("p1", status="processing", worker_status="claimed", allowed_writes=["src/shared.py"]),
+        _card("p2", status="processing", worker_status="claimed", allowed_writes=["src/shared.py"]),
+    ]
+    snap = task_plan.build_snapshot(cards)
+
+    # No pending card is being gated, so the claim-eligibility projection is
+    # empty -- but two live workers overlap the same file.
+    assert snap["write_scope_overlaps"] == {}
+    assert snap["ready"] == []
+    assert snap["global_collision_free"] is False
+    assert snap["global_collision_count"] == 1
+    assert snap["global_collision_pairs"] == [["p1", "p2"]]
+    assert snap["card_collision_free"]["p1"] is False
+    assert snap["card_collision_free"]["p2"] is False
+
+
+def test_snapshot_collision_truth_ignores_finished_and_blocked_cards():
+    cards = [
+        _card("active", allowed_writes=["src/shared.py"]),
+        _card("done", status="finished", worker_status="done", allowed_writes=["src/shared.py"]),
+        _card("stuck", status="blocked", worker_status="blocked", allowed_writes=["src/shared.py"]),
+    ]
+    snap = task_plan.build_snapshot(cards)
+
+    assert snap["global_collision_free"] is True
+    assert snap["global_collision_count"] == 0
+    assert snap["global_collision_paths"] == []
+    assert snap["global_collision_task_ids"] == []
+    assert snap["global_collision_pairs"] == []
+    assert snap["card_collision_free"] == {
+        "active": True,
+        "done": True,
+        "stuck": True,
+    }
+
+
 def test_snapshot_reports_invalid_depends_on_as_blocked_not_ready():
     cards = [
         _card("t1", status="pending", depends_on=["../etc"]),
