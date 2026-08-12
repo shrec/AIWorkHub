@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.44 — 2026-08-12
+
+### Fixed
+
+- Verify the exact Claude Code manager process and session descriptor through
+  Windows-native process identity instead of relying on `/proc` (#17).
+- Defer duplicate finalizers on recognized Windows request-lock contention
+  without terminalizing a healthy owner (#18, PR #19).
+- Isolate deterministic mypy, temporary and Ruff cache state per validation
+  request and retain bounded diagnostics for internal validator failures
+  (NF180, PR #21).
+
 ## 0.9.43 — 2026-08-11
 
 ### Fixed
