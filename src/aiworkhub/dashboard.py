@@ -52,7 +52,7 @@ ROADMAP_SNAPSHOT_LIMIT = 200
 ACTIVE_STATUSES = ("pending", "processing", "review")
 # The full canonical-status taxonomy (AITools.taskdb.canonical_status), used
 # for exact whole-queue totals -- independent of any bounded row limit.
-ALL_CANONICAL_STATUSES = ("pending", "processing", "review", "blocked", "finished", "archived")
+ALL_CANONICAL_STATUSES = ("pending", "processing", "review", "blocked", "superseded", "finished", "archived")
 
 _LIST_LINE_RE = re.compile(
     r"^\s*\[(?P<status>[^\]]+)\]\s*"

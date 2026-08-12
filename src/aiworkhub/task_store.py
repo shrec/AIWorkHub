@@ -62,6 +62,7 @@ CANONICAL_STATUSES: tuple[str, ...] = (
     "processing",
     "review",
     "blocked",
+    "superseded",
     "finished",
     "archived",
 )
