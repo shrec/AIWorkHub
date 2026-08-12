@@ -42,7 +42,13 @@ from . import claude_auth
 from . import context_write_intents
 from . import context_writes
 from . import evidence_levels
-from .platform_io import chmod_fd, chmod_path, lock_fd, unlock_fd
+from .platform_io import (
+    AdvisoryLockTimeout,
+    chmod_fd,
+    chmod_path,
+    lock_fd,
+    unlock_fd,
+)
 from . import quality_evidence
 from . import quality_review_scope
 from . import process_event_ledger
@@ -6055,8 +6061,10 @@ class ProcessManager:
         callback boundaries.  A transient Windows file/SQLite race must not
         kill the daemon monitor thread and leave the canonical card forever
         in ``processing``.  Retry the exact idempotent reconciliation a small
-        bounded number of times.  If the implementation itself keeps
-        failing, convert the still-processing card into a truthful
+        bounded number of times. Request-lock contention is different: it
+        proves another finalizer currently owns the only writer boundary, so
+        defer without changing durable state. If the implementation itself
+        keeps failing, convert the still-processing card into a truthful
         ``finalize_failed`` terminal outcome and enqueue its manager callback.
         The isolated workspace remains retained for diagnosis.
         """
@@ -6099,6 +6107,15 @@ class ProcessManager:
                 return {
                     **deferred[-1],
                     "reconciliation_deferred": "pid_identity_unknown",
+                    "workspace_retained": True,
+                }
+            except AdvisoryLockTimeout:
+                deferred = self._request_events(request_id)
+                if not deferred:
+                    return None
+                return {
+                    **deferred[-1],
+                    "reconciliation_deferred": "request_lock_busy",
                     "workspace_retained": True,
                 }
             except OSError as exc:
