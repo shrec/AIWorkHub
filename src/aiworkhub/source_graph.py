@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from . import parallelism
 from . import source_graph_ast as sgast
 from . import source_graph_analytics as sganalytics
 from . import source_graph_insights as sginsights
@@ -643,6 +644,7 @@ class BuildReport:
     extraction_seconds: float = 0.0
     extraction_backend: str = "sequential"
     extraction_fallback_reason: str = ""
+    extraction_telemetry: dict[str, Any] = field(default_factory=dict)
     index_quality: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
@@ -659,6 +661,7 @@ class BuildReport:
             "extraction_seconds": self.extraction_seconds,
             "extraction_backend": self.extraction_backend,
             "extraction_fallback_reason": self.extraction_fallback_reason,
+            "extraction_telemetry": self.extraction_telemetry,
             "database_bytes_after_compaction": self.database_bytes_after_compaction,
             "freelist_ratio_before_compaction": self.freelist_ratio_before_compaction,
             "compaction_error": self.compaction_error,
@@ -686,17 +689,61 @@ def _source_graph_extract_workers(
             requested = int(configured)
         except ValueError:
             requested = 1
-    else:
-        if (
-            candidate_count < MIN_PARALLEL_EXTRACTION_FILES
-            or candidate_bytes < MIN_PARALLEL_EXTRACTION_BYTES
-        ):
-            return 1
-        requested = min(
-            DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS,
-            max(1, int(os.cpu_count() or 1)),
+        return min(
+            max(1, candidate_count),
+            max(1, min(requested, MAX_SOURCE_GRAPH_EXTRACT_WORKERS)),
         )
-    return min(candidate_count, max(1, min(requested, MAX_SOURCE_GRAPH_EXTRACT_WORKERS)))
+    if (
+        candidate_count < MIN_PARALLEL_EXTRACTION_FILES
+        or candidate_bytes < MIN_PARALLEL_EXTRACTION_BYTES
+    ):
+        return 1
+    workers, _ = parallelism.compute_worker_count(
+        candidate_count=candidate_count,
+        reserve=1,
+        ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        min_candidates=MIN_PARALLEL_EXTRACTION_FILES,
+    )
+    return workers
+
+
+def _source_graph_extraction_telemetry(
+    workers: int,
+    candidate_count: int,
+    candidate_bytes: int = 0,
+) -> dict[str, Any]:
+    """Describe the exact extraction-width decision without fabricating it."""
+
+    capacity = parallelism.get_cpu_capacity()
+    configured = os.environ.get(SOURCE_GRAPH_EXTRACT_WORKERS_ENV, "").strip()
+    if configured:
+        return parallelism.WorkerSelection(
+            available_cpus=capacity,
+            selected_workers=workers,
+            reserve=0,
+            ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+            nested=parallelism.pool_is_nested(),
+            reason="env_override",
+        ).to_dict()
+    if (
+        candidate_count < MIN_PARALLEL_EXTRACTION_FILES
+        or candidate_bytes < MIN_PARALLEL_EXTRACTION_BYTES
+    ):
+        return parallelism.WorkerSelection(
+            available_cpus=capacity,
+            selected_workers=workers,
+            reserve=1,
+            ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+            nested=parallelism.pool_is_nested(),
+            reason="below_threshold",
+        ).to_dict()
+    _, selection = parallelism.compute_worker_count(
+        candidate_count=candidate_count,
+        reserve=1,
+        ceiling=MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        min_candidates=MIN_PARALLEL_EXTRACTION_FILES,
+    )
+    return selection.to_dict()
 
 
 def _extract_source_graph_candidate(
@@ -1145,6 +1192,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
     extraction_seconds = 0.0
     extraction_backend = "sequential"
     extraction_fallback_reason = ""
+    extraction_telemetry: dict[str, Any] = {}
     compaction_performed = False
     compaction_error = ""
     bytes_before_compaction = 0
@@ -1206,9 +1254,15 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 continue
             extraction_candidates.append((path, rel, file_size, mtime_ns))
 
+        candidate_count = len(extraction_candidates)
+        candidate_bytes = sum(
+            max(0, candidate[2]) for candidate in extraction_candidates
+        )
         extraction_workers = _source_graph_extract_workers(
-            len(extraction_candidates),
-            sum(max(0, candidate[2]) for candidate in extraction_candidates),
+            candidate_count, candidate_bytes,
+        )
+        extraction_telemetry = _source_graph_extraction_telemetry(
+            extraction_workers, candidate_count, candidate_bytes,
         )
         extraction_started = time.monotonic()
         process_candidates = [
@@ -1225,17 +1279,18 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 # keeps the worker contract identical on Linux, Windows and
                 # macOS.  Workers only read source and return immutable
                 # extraction records; the parent remains the sole DB writer.
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=extraction_workers,
-                    mp_context=multiprocessing.get_context("spawn"),
-                ) as executor:
-                    extracted_candidates = list(
-                        executor.map(
-                            _extract_source_graph_candidate,
-                            process_candidates,
-                            chunksize=1,
+                with parallelism.worker_pool_scope():
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=extraction_workers,
+                        mp_context=multiprocessing.get_context("spawn"),
+                    ) as executor:
+                        extracted_candidates = list(
+                            executor.map(
+                                _extract_source_graph_candidate,
+                                process_candidates,
+                                chunksize=1,
+                            )
                         )
-                    )
                 extraction_backend = "process_pool"
             except (OSError, BrokenProcessPool) as exc:
                 # Sandboxes may deny process creation.  No extraction mutates
@@ -1244,6 +1299,11 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                 extraction_workers = 1
                 extraction_backend = "sequential_fallback"
                 extraction_fallback_reason = type(exc).__name__
+                extraction_telemetry = {
+                    **extraction_telemetry,
+                    "selected_workers": 1,
+                    "reason": f"fallback_{type(exc).__name__}",
+                }
                 extracted_candidates = [
                     _extract_source_graph_candidate(candidate)
                     for candidate in process_candidates
@@ -1387,6 +1447,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
         extraction_seconds=extraction_seconds,
         extraction_backend=extraction_backend,
         extraction_fallback_reason=extraction_fallback_reason,
+        extraction_telemetry=extraction_telemetry,
         index_quality=index_quality,
     )
 

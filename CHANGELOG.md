@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.49] - 2026-08-13
+
+### Fixed
+
+- Accept full `stat().st_mode` values for chmod/fchmod only inside the exact
+  request-owned validation boundary by stripping recognised file-type bits,
+  while continuing to reject setuid, setgid, sticky and out-of-scope metadata
+  mutations (NF155).
+- Size Source Graph extraction from process-visible CPU affinity with bounded
+  reserve and ceiling, keep nested pools serial, and preserve deterministic
+  single-writer SQLite merge ordering (NF154).
+- Expose truthful extraction selection and fallback telemetry in every Source
+  Graph build receipt (NF154).
+
+### Validation
+
+- The combined portability, parallelism and Source Graph suite passes: 185
+  tests, plus changed-file Ruff and `git diff --check`.
+
 ## [0.9.48] - 2026-08-13
 
 ### Fixed

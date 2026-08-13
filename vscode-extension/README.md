@@ -12,11 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.48
+## What's new in 0.9.49
 
-- Request-scoped worker and validation temporary data now lives under each
-  repository's own `.aiworkhub/temp` authority, with isolated ownership,
-  deterministic cleanup and retained review candidates (NF201).
+- Request-owned validation fixtures can safely restore ordinary permissions
+  from full file modes without weakening metadata isolation.
+- Source Graph extraction now uses process-visible CPU capacity, bounded
+  parallelism and deterministic single-writer merge ordering with truthful
+  telemetry (NF154/NF155).
 
 See the packaged **Changelog** for the complete release summary.
 

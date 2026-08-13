@@ -2951,10 +2951,18 @@ def _seccomp_notify_supported() -> bool:
 
 
 def _metadata_broker_verify_mode(mode: int) -> int:
-    """Permit only ordinary permission bits; never setuid/setgid/sticky."""
-    if mode < 0 or mode & ~0o777:
+    """Return safe permission bits from either chmod bits or full st_mode.
+
+    ``Path.chmod(path.stat().st_mode)`` includes the file-type bits that the
+    native syscall ignores.  Strip only those recognised type bits while
+    continuing to reject setuid, setgid, sticky, negative, and unknown bits.
+    """
+    if mode < 0:
         raise WorkspaceError(f"metadata_broker_unsafe_mode:{mode:o}")
-    return mode
+    permission_bits = mode & ~stat.S_IFMT(mode)
+    if permission_bits & ~0o777:
+        raise WorkspaceError(f"metadata_broker_unsafe_mode:{mode:o}")
+    return permission_bits
 
 
 def _metadata_broker_verify_flags(flags: int) -> int:

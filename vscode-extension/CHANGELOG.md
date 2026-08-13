@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.49 — 2026-08-13
+
+### Fixed
+
+- Keep chmod/fchmod metadata restoration inside the exact request-owned
+  validation boundary while accepting ordinary permission bits from full
+  `stat().st_mode` values.
+- Use process-visible CPU capacity for bounded Source Graph extraction,
+  prevent nested oversubscription and retain deterministic single-writer
+  database merges with explicit selection/fallback telemetry.
+
 ## 0.9.48 — 2026-08-13
 
 ### Fixed

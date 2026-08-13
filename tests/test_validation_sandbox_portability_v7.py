@@ -165,6 +165,32 @@ class TestModeAndFlagVerification:
         with pytest.raises(WorkspaceError):
             worker_workspace._metadata_broker_verify_mode(mode)
 
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            stat.S_IFDIR | 0o700,
+            stat.S_IFDIR | 0o755,
+            stat.S_IFREG | 0o600,
+            stat.S_IFREG | 0o644,
+            stat.S_IFLNK | 0o777,
+        ],
+    )
+    def test_full_st_mode_strips_only_file_type_bits(self, mode: int) -> None:
+        assert worker_workspace._metadata_broker_verify_mode(mode) == stat.S_IMODE(mode)
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            stat.S_IFDIR | stat.S_ISUID | 0o755,
+            stat.S_IFDIR | stat.S_ISGID | 0o755,
+            stat.S_IFDIR | stat.S_ISVTX | 0o777,
+            stat.S_IFREG | stat.S_ISUID | 0o755,
+        ],
+    )
+    def test_full_st_mode_still_rejects_special_bits(self, mode: int) -> None:
+        with pytest.raises(WorkspaceError):
+            worker_workspace._metadata_broker_verify_mode(mode)
+
     def test_zero_flags_allowed(self) -> None:
         assert worker_workspace._metadata_broker_verify_flags(0) == 0
 

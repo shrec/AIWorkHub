@@ -1334,6 +1334,8 @@ def test_multicore_extraction_is_bounded_and_merge_order_is_deterministic(
     assert report.extraction_seconds > 0
     assert report.files_changed == 4
     assert write_order == [f"pkg/{name}" for name in names]
+    assert report.extraction_telemetry["selected_workers"] == 2
+    assert report.extraction_telemetry["reason"] == "env_override"
 
 
 def test_multicore_extraction_worker_configuration_is_bounded(monkeypatch):
@@ -1348,10 +1350,31 @@ def test_multicore_extraction_worker_configuration_is_bounded(monkeypatch):
 
     monkeypatch.delenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV)
     assert sg._source_graph_extract_workers(8, 255 * 1024) == 1
-    assert sg._source_graph_extract_workers(8, 256 * 1024) == min(
-        sg.DEFAULT_SOURCE_GRAPH_EXTRACT_WORKERS,
-        max(1, sg.os.cpu_count() or 1),
-    )
+    with monkeypatch.context() as context:
+        context.setattr(sg.parallelism, "get_cpu_capacity", lambda: 6)
+        assert sg._source_graph_extract_workers(8, 256 * 1024) == 5
+
+
+def test_source_graph_multicore_is_serial_when_nested(monkeypatch):
+    monkeypatch.delenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, raising=False)
+    monkeypatch.setattr(sg.parallelism, "get_cpu_capacity", lambda: 16)
+    with sg.parallelism.worker_pool_scope():
+        assert sg._source_graph_extract_workers(20, 512 * 1024) == 1
+
+
+def test_source_graph_extraction_receipt_reports_capacity(monkeypatch):
+    monkeypatch.delenv(sg.SOURCE_GRAPH_EXTRACT_WORKERS_ENV, raising=False)
+    monkeypatch.setattr(sg.parallelism, "get_cpu_capacity", lambda: 8)
+    workers = sg._source_graph_extract_workers(20, 512 * 1024)
+    receipt = sg._source_graph_extraction_telemetry(workers, 20, 512 * 1024)
+    assert receipt == {
+        "available_cpus": 8,
+        "selected_workers": 7,
+        "reserve": 1,
+        "ceiling": sg.MAX_SOURCE_GRAPH_EXTRACT_WORKERS,
+        "nested": False,
+        "reason": "capacity_based",
+    }
 
 
 def test_rename_regression_no_stale_edge_survives(tmp_path):
