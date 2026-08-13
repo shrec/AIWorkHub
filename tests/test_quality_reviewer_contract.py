@@ -237,6 +237,12 @@ def _accepted_reviewer_state() -> tuple[dict[str, object], dict[str, object]]:
                     "runner": "claude_sonnet5",
                     "topic": "quality_review",
                 },
+                "changed_paths": [],
+                "changed_path_hashes": {},
+                "quality_review": {
+                    "target_claim_epoch": sealed["target"]["claim_epoch"],
+                    "adapter_id": "claude_sonnet5",
+                },
             },
         },
         "accept_evidence": {
