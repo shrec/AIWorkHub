@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.50 — 2026-08-13
+
+### Fixed
+
+- Preserve exact JSON-RPC request IDs and non-empty parameters by serializing
+  concurrent MCP request/notification frames through one child-owned FIFO.
+- Keep out-of-order response correlation independent and fence late callbacks
+  when the repository-scoped MCP child is replaced.
+- Repair a repeatedly poisoned bare `-32602 Invalid request parameters`
+  transport by replacing only the exact child without reloading the window or
+  changing repository/manager identity.
+
 ## 0.9.49 — 2026-08-13
 
 ### Fixed

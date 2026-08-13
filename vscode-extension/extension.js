@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.49";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.50";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -421,6 +421,22 @@ const MCP_RECOVERY_BACKOFF_MS = Object.freeze([100, 200, 400]);
 // forever. Repairing means restarting only THIS client's own child; it never
 // rebinds to a different repository.
 const MCP_MAX_RUNTIME_REPAIR_ATTEMPTS = 3;
+
+// A valid JSON-RPC child that subsequently returns repeated bare -32602
+// responses has lost request framing state.  Replace only that exact child;
+// detailed validation errors remain ordinary caller errors.
+const MCP_POISONED_TRANSPORT_THRESHOLD = 2;
+
+function isPoisonedInvalidParamsError(error) {
+  if (!error || error.code !== -32602) return false;
+  const detail = error.data;
+  const hasDetail = detail !== undefined && detail !== null
+    && !(typeof detail === "string" && detail.trim() === "")
+    && !(typeof detail === "object" && Object.keys(detail).length === 0);
+  if (hasDetail) return false;
+  const message = String(error.message || "").trim().toLowerCase();
+  return message === "" || message === "invalid request parameters" || message === "invalid params";
+}
 
 // ── Active repository resolution ──────────────────────────────────────────
 // Single-folder workspace: auto-bind to folders[0].
@@ -1568,6 +1584,15 @@ class McpStdioClient {
     // mismatch (e.g. a subsequent runtime repair) gets its own fresh budget.
     this.runtimeRepairAttempts = 0;
     this.runtimeRepairBlockedReason = "";
+    this._hadValidResponse = false;
+    this._consecutiveInvalidParams = 0;
+    this._poisonReplacementInFlight = false;
+    // One writer owns the child stdin. Concurrent requests keep independent
+    // ids/promises, while complete newline-delimited JSON-RPC frames are
+    // emitted FIFO. The epoch fences callbacks from a replaced child.
+    this._outbound = [];
+    this._outboundWriting = false;
+    this._outboundEpoch = 0;
     this.recovery = {
       category: "",
       reason: "",
@@ -1839,6 +1864,7 @@ class McpStdioClient {
     this.nextId = 1;
     this.pending.clear();
     this.pendingChildren.clear();
+    this._resetOutbound();
 
     debugTrace("mcp.spawn.begin", {
       command: path.basename(python.command),
@@ -2048,10 +2074,37 @@ class McpStdioClient {
     this.pendingChildren.delete(message.id);
     clearTimeout(pending.timer);
     if (message.error) {
+      if (this._hadValidResponse && isPoisonedInvalidParamsError(message.error)) {
+        this._consecutiveInvalidParams += 1;
+        if (this._consecutiveInvalidParams >= MCP_POISONED_TRANSPORT_THRESHOLD) {
+          this._notePoisonedTransport(emittingChild);
+        }
+      } else {
+        this._consecutiveInvalidParams = 0;
+      }
       pending.reject(new Error((message.error && message.error.message) || "mcp_error"));
     } else {
+      this._hadValidResponse = true;
+      this._consecutiveInvalidParams = 0;
       pending.resolve(message.result);
     }
+  }
+
+  _notePoisonedTransport(child) {
+    if (!this._ownsChild(child) || this._poisonReplacementInFlight) return;
+    this._poisonReplacementInFlight = true;
+    this._consecutiveInvalidParams = 0;
+    this.outputChannel.appendLine(
+      `[mcp] poisoned exact-child transport -- reloadless replacement pid=${this.lifecyclePid || 0}`,
+    );
+    Promise.resolve()
+      .then(() => this.replaceForExplicitRecovery())
+      .catch((err) => {
+        this.outputChannel.appendLine(
+          `[mcp] poisoned-transport replacement failed: ${sanitizeErrorMessage(err)}`,
+        );
+      })
+      .finally(() => { this._poisonReplacementInFlight = false; });
   }
 
   _onExit(exitedChild, code, signal, spawnError) {
@@ -2074,6 +2127,8 @@ class McpStdioClient {
     this.runtimePreflight = null;
     this.dispatcherEnsurePromise = null;
     this.backgroundConvergencePromise = null;
+    this._hadValidResponse = false;
+    this._consecutiveInvalidParams = 0;
     const failure = spawnError || new Error(`mcp_child_exited code=${code} signal=${signal}`);
     this._failPendingForChild(exitedChild, failure);
 
@@ -2145,6 +2200,53 @@ class McpStdioClient {
     }
   }
 
+  _resetOutbound() {
+    this._outbound = [];
+    this._outboundWriting = false;
+    this._outboundEpoch += 1;
+  }
+
+  _enqueueWrite(child, payload, callback) {
+    this._outbound.push({
+      child,
+      payload,
+      callback: typeof callback === "function" ? callback : null,
+    });
+    this._drainOutbound();
+  }
+
+  _drainOutbound() {
+    if (this._outboundWriting) return;
+    while (this._outbound.length > 0) {
+      const frame = this._outbound.shift();
+      if (frame.child !== this.child) continue;
+      this._outboundWriting = true;
+      const epoch = this._outboundEpoch;
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        if (epoch !== this._outboundEpoch) return;
+        this._outboundWriting = false;
+        if (frame.callback) {
+          try { frame.callback(err || null); } catch (_err) { /* caller-owned */ }
+        }
+        this._drainOutbound();
+      };
+      const stream = frame.child && frame.child.stdin;
+      if (!stream || typeof stream.write !== "function") {
+        done(new Error("mcp_stdin_unavailable"));
+        return;
+      }
+      try {
+        stream.write(frame.payload, done);
+      } catch (err) {
+        done(err);
+      }
+      return;
+    }
+  }
+
   request(method, params, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
     if (!this.child) {
       return Promise.reject(new Error("mcp_not_running"));
@@ -2185,9 +2287,9 @@ class McpStdioClient {
         };
         reject(error);
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method, tool });
       this.pendingChildren.set(id, requestChild);
-      requestChild.stdin.write(payload, (err) => {
+      this._enqueueWrite(requestChild, payload, (err) => {
         if (err) {
           this.pending.delete(id);
           this.pendingChildren.delete(id);
@@ -2212,7 +2314,7 @@ class McpStdioClient {
       return;
     }
     const payload = `${JSON.stringify({ jsonrpc: "2.0", method, params: params || {} })}\n`;
-    this.child.stdin.write(payload, () => {});
+    this._enqueueWrite(this.child, payload, () => {});
   }
 
   async callTool(name, args, timeoutMs = MCP_REQUEST_TIMEOUT_MS) {
@@ -2250,6 +2352,7 @@ class McpStdioClient {
     this.runtimePreflight = null;
     this.dispatcherEnsurePromise = null;
     this.backgroundConvergencePromise = null;
+    this._resetOutbound();
     this._failPendingForChild(child, new Error(restart ? "mcp_restarting" : "mcp_stopped"));
     this._terminateOwnedChild(child);
   }

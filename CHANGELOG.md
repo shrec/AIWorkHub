@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.50] - 2026-08-13
+
+### Fixed
+
+- Serialize every concurrent MCP request and notification through one
+  per-child FIFO writer so complete newline-delimited JSON-RPC frames preserve
+  their exact request ID and non-empty parameters under load (NF199).
+- Correlate out-of-order replies independently while fencing late write
+  callbacks from a replaced child, so one request cannot resume or corrupt the
+  replacement runtime's queue.
+- Detect repeated bare `-32602 Invalid request parameters` responses only after
+  a valid response and reloadlessly replace that exact poisoned child; detailed
+  caller validation errors remain non-fatal.
+
+### Validation
+
+- The shared-stdio regression proves three simultaneous parameterized requests
+  are framed FIFO and resolve correctly from out-of-order responses; the full
+  VS Code extension suite passes.
+
 ## [0.9.49] - 2026-08-13
 
 ### Fixed

@@ -610,6 +610,107 @@ function testPlatformPythonResolution(tmp) {
   }
 }
 
+async function testConcurrentRequestFramingAndCorrelation(tmp) {
+  const repoRoot = path.join(tmp, "concurrent-framing");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_concurrent0000000000000000009", "concurrent-framing");
+  const host = loadExtensionHost(repoRoot);
+  const client = new host.extension.__testInternals.McpStdioClient(
+    repoRoot,
+    { appendLine: () => {} },
+    { repoId: "repo_concurrent0000000000000000009", repoName: "concurrent-framing" },
+    "claim-concurrent",
+  );
+  const writes = [];
+  const child = {
+    pid: 24680,
+    stdin: { write: (payload, cb) => { writes.push({ payload, cb }); return true; } },
+  };
+  client.child = child;
+  client.lifecycleChild = child;
+  client.lifecyclePid = child.pid;
+
+  const p1 = client.request(
+    "tools/call",
+    { name: "aiworkhub_task_show", arguments: { task_id: "T-1" } },
+    5000,
+  );
+  const p2 = client.request(
+    "tools/call",
+    {
+      name: "aiworkhub_manager_source_graph_query",
+      arguments: { mode: "focus", query: "Q-2" },
+    },
+    5000,
+  );
+  const p3 = client.request(
+    "tools/call",
+    { name: "aiworkhub_task_show", arguments: { task_id: "T-3" } },
+    5000,
+  );
+
+  assert.strictEqual(writes.length, 1, "only one complete frame may be in flight");
+  writes[0].cb();
+  assert.strictEqual(writes.length, 2);
+  writes[1].cb();
+  assert.strictEqual(writes.length, 3);
+  writes[2].cb();
+  const frames = writes.map(({ payload }) => {
+    assert.ok(payload.endsWith("\n"));
+    assert.strictEqual(payload.indexOf("\n"), payload.length - 1);
+    return JSON.parse(payload);
+  });
+  assert.deepStrictEqual(frames.map(({ id }) => id), [1, 2, 3]);
+  assert.strictEqual(frames[0].params.arguments.task_id, "T-1");
+  assert.strictEqual(frames[1].params.arguments.query, "Q-2");
+  assert.strictEqual(frames[2].params.arguments.task_id, "T-3");
+
+  client._onMessage(child, JSON.stringify({ jsonrpc: "2.0", id: 3, result: { tag: "R-3" } }));
+  client._onMessage(child, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tag: "R-1" } }));
+  client._onMessage(child, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { tag: "R-2" } }));
+  const results = await Promise.all([p1, p2, p3]);
+  assert.deepStrictEqual(results.map(({ tag }) => tag), ["R-1", "R-2", "R-3"]);
+  assert.strictEqual(client.pending.size, 0);
+}
+
+async function testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp) {
+  const repoRoot = path.join(tmp, "poisoned-transport");
+  fs.mkdirSync(repoRoot);
+  writeRepo(repoRoot, "repo_poisoned000000000000000000009", "poisoned-transport");
+  const host = loadExtensionHost(repoRoot);
+  const client = new host.extension.__testInternals.McpStdioClient(
+    repoRoot,
+    { appendLine: () => {} },
+    { repoId: "repo_poisoned000000000000000000009", repoName: "poisoned-transport" },
+    "claim-poison",
+  );
+  const child = { pid: 4321 };
+  client.lifecycleChild = child;
+  client.lifecyclePid = child.pid;
+  let replacements = 0;
+  client.replaceForExplicitRecovery = async () => { replacements += 1; };
+  const deliver = async (id, body) => {
+    const settled = new Promise((resolve, reject) => {
+      client.pending.set(id, { resolve, reject, timer: setTimeout(() => {}, 5000) });
+      client.pendingChildren.set(id, child);
+    });
+    client._onMessage(child, JSON.stringify({ jsonrpc: "2.0", id, ...body }));
+    await settled.catch(() => {});
+  };
+  const invalid = { error: { code: -32602, message: "Invalid request parameters" } };
+  await deliver(1, invalid);
+  await deliver(2, { result: { ok: true } });
+  await deliver(3, invalid);
+  await deliver(4, invalid);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(replacements, 1);
+  await deliver(5, { result: { ok: true } });
+  await deliver(6, { error: { code: -32602, message: "missing request_id", data: { field: "request_id" } } });
+  await deliver(7, { error: { code: -32602, message: "missing request_id", data: { field: "request_id" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(replacements, 1, "detailed caller errors must not poison transport");
+}
+
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aiworkhub-reloadless-"));
   await testSelfHealsAndReconnectsWithoutReload(tmp);
@@ -620,6 +721,8 @@ function testPlatformPythonResolution(tmp) {
   await testFailedRestartDegradesWithoutCrossRepoFallback(tmp);
   await testTwoWorkspacesRepairInIsolation(tmp);
   testExplicitRetryPreservesPartialRuntimeRepairBudget(tmp);
+  await testConcurrentRequestFramingAndCorrelation(tmp);
+  await testPoisonedInvalidParamsRepairsOnlyOwnedChild(tmp);
   testPlatformPythonResolution(tmp);
   console.log("AIWorkHub reloadless runtime-repair regression passed");
 })().catch((err) => {

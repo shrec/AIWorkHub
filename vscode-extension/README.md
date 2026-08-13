@@ -12,13 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.49
+## What's new in 0.9.50
 
-- Request-owned validation fixtures can safely restore ordinary permissions
-  from full file modes without weakening metadata isolation.
-- Source Graph extraction now uses process-visible CPU capacity, bounded
-  parallelism and deterministic single-writer merge ordering with truthful
-  telemetry (NF154/NF155).
+- Concurrent dashboard, manager and model MCP calls now keep complete
+  child-owned FIFO JSON-RPC frames and independent out-of-order response
+  correlation.
+- Repeated bare `-32602 Invalid request parameters` transport corruption is
+  repaired reloadlessly by replacing only the exact repository/window child.
 
 See the packaged **Changelog** for the complete release summary.
 
