@@ -2947,6 +2947,123 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     return result
 
 
+_QUALITY_REVIEW_RECEIPT_TOP_KEYS = frozenset(
+    {
+        "schema_id",
+        "packet_sha256",
+        "target",
+        "reviewer",
+        "report",
+        "authority",
+        "submission_id",
+        "physical_submission_count",
+        "logical_submission_count",
+    }
+)
+_QUALITY_REVIEW_TARGET_KEYS = frozenset({"request_id", "task_id", "claim_epoch"})
+_QUALITY_REVIEW_REVIEWER_KEYS = frozenset({"request_id", "task_id", "provider"})
+_QUALITY_REVIEW_REPORT_KEYS = frozenset(
+    {"lens", "provider", "read_only", "can_mutate_repo", "findings"}
+)
+_QUALITY_REVIEW_AUTHORITY_KEYS = frozenset(
+    {"process_identity_verified", "audit_verified", "terminal_state"}
+)
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_bool_safe_int(value: object) -> bool:
+    """True only for a plain ``int`` -- ``bool`` is explicitly rejected."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value) is not None
+
+
+def _enforce_quality_review_receipt_schema(
+    receipt: dict[str, Any], observed_provider: str
+) -> dict[str, Any]:
+    """Reject any deviation from the exact production read-only receipt shape."""
+    if set(receipt) != _QUALITY_REVIEW_RECEIPT_TOP_KEYS:
+        raise WorkspaceError("quality_review_receipt_top_level_keys_invalid")
+    if receipt.get("schema_id") != quality_reviewer.RECEIPT_SCHEMA_ID:
+        raise WorkspaceError("quality_review_receipt_schema_mismatch")
+    packet_sha256 = receipt.get("packet_sha256")
+    submission_id = receipt.get("submission_id")
+    if not _is_sha256_hex(packet_sha256):
+        raise WorkspaceError("quality_review_packet_sha256_invalid")
+    if not _is_sha256_hex(submission_id):
+        raise WorkspaceError("quality_review_submission_id_invalid")
+    target = receipt.get("target")
+    reviewer = receipt.get("reviewer")
+    report = receipt.get("report")
+    authority = receipt.get("authority")
+    if not (
+        isinstance(target, dict)
+        and isinstance(reviewer, dict)
+        and isinstance(report, dict)
+        and isinstance(authority, dict)
+    ):
+        raise WorkspaceError("quality_review_receipt_shape_invalid")
+    if set(target) != _QUALITY_REVIEW_TARGET_KEYS:
+        raise WorkspaceError("quality_review_target_keys_invalid")
+    if set(reviewer) != _QUALITY_REVIEW_REVIEWER_KEYS:
+        raise WorkspaceError("quality_review_reviewer_keys_invalid")
+    if set(report) != _QUALITY_REVIEW_REPORT_KEYS:
+        raise WorkspaceError("quality_review_report_keys_invalid")
+    if set(authority) != _QUALITY_REVIEW_AUTHORITY_KEYS:
+        raise WorkspaceError("quality_review_authority_keys_invalid")
+    claim_epoch = target.get("claim_epoch")
+    if not _is_bool_safe_int(claim_epoch):
+        raise WorkspaceError("quality_review_claim_epoch_invalid")
+    if str(reviewer.get("provider") or "") != observed_provider:
+        raise WorkspaceError("quality_review_reviewer_provider_mismatch")
+    if str(report.get("provider") or "") != observed_provider:
+        raise WorkspaceError("quality_review_report_provider_mismatch")
+    if not isinstance(report.get("findings"), list):
+        raise WorkspaceError("quality_review_report_findings_invalid")
+    if authority.get("process_identity_verified") is not True:
+        raise WorkspaceError("quality_review_authority_process_identity_invalid")
+    if authority.get("audit_verified") is not True:
+        raise WorkspaceError("quality_review_authority_audit_invalid")
+    if authority.get("terminal_state") != "review_ready":
+        raise WorkspaceError("quality_review_authority_terminal_state_invalid")
+    if report.get("read_only") is not True or report.get("can_mutate_repo") is not False:
+        raise WorkspaceError("quality_review_report_not_read_only")
+    physical_submission_count = receipt.get("physical_submission_count")
+    logical_submission_count = receipt.get("logical_submission_count")
+    if (
+        not _is_bool_safe_int(physical_submission_count)
+        or physical_submission_count != 1
+    ):
+        raise WorkspaceError("quality_review_physical_submission_count_invalid")
+    if not _is_bool_safe_int(logical_submission_count) or logical_submission_count != 1:
+        raise WorkspaceError("quality_review_logical_submission_count_invalid")
+    return receipt
+
+
+def _enforce_readonly_retained_workspace(terminal_evidence: dict[str, Any]) -> None:
+    """Require a retained reviewer workspace to be provably read-only and empty."""
+    changed_paths = terminal_evidence.get("changed_paths")
+    changed_path_hashes = terminal_evidence.get("changed_path_hashes")
+    if not isinstance(changed_paths, list) or changed_paths:
+        raise WorkspaceError("quality_review_changed_paths_not_empty")
+    if not isinstance(changed_path_hashes, dict) or changed_path_hashes:
+        raise WorkspaceError("quality_review_changed_path_hashes_not_empty")
+    workspace_meta = terminal_evidence.get("workspace")
+    if not isinstance(workspace_meta, dict):
+        raise WorkspaceError("quality_review_workspace_metadata_missing")
+    allowed_writes = workspace_meta.get("allowed_writes")
+    if not isinstance(allowed_writes, list) or allowed_writes:
+        raise WorkspaceError("quality_review_workspace_allowed_writes_not_empty")
+    try:
+        reconstructed = WorkerWorkspace.from_metadata(dict(workspace_meta))
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise WorkspaceError("quality_review_workspace_reconstruction_failed") from exc
+    if reconstructed.allowed_writes:
+        raise WorkspaceError("quality_review_reconstructed_workspace_not_read_only")
+
+
 def _verified_quality_review_receipt(
     metadata: dict[str, Any],
     workspace: WorkerWorkspace,
@@ -2985,14 +3102,13 @@ def _verified_quality_review_receipt(
     payloads = verification.get("verified_payloads") or []
     if not payloads:
         raise WorkspaceError("quality_review_submission_count:0")
-    # A model may retry the tool after a lost/ambiguous acknowledgement. The
-    # HMAC ledger remains append-only, but identical authenticated retries are
-    # one logical receipt. Conflicting retries still fail closed.
+    # An immutable read-only receipt requires exactly one physical submission.
+    # Identical retries are deduplicated upstream; any additional authenticated
+    # payload here is a duplicate and must fail closed rather than collapse
+    # silently into a single logical receipt.
+    if len(payloads) != 1:
+        raise WorkspaceError(f"quality_review_submission_count:{len(payloads)}")
     receipt_payload = payloads[0]
-    if any(payload != receipt_payload for payload in payloads[1:]):
-        raise WorkspaceError(
-            f"quality_review_submission_conflict:{len(payloads)}"
-        )
     observed_provider = str(metadata.get("adapter_id") or "")
     target = packet.get("target") if isinstance(packet, dict) else None
     if not isinstance(target, dict):
@@ -3006,6 +3122,10 @@ def _verified_quality_review_receipt(
         raise WorkspaceError("quality_review_receipt_shape_invalid")
     reviewer["provider"] = observed_provider
     report["provider"] = observed_provider
+    entries_tampered = verification.get("entries_tampered")
+    if not _is_bool_safe_int(entries_tampered):
+        raise WorkspaceError("quality_review_audit_entries_tampered_invalid")
+    audit_verified = bool(verification.get("ok")) and entries_tampered == 0
     try:
         verified = quality_reviewer.verify_reviewer_receipt(
             receipt,
@@ -3014,10 +3134,7 @@ def _verified_quality_review_receipt(
             expected_reviewer_task_id=str(metadata.get("task_id") or ""),
             observed_provider=observed_provider,
             observed_terminal_state="review_ready",
-            audit_verified=(
-                bool(verification.get("ok"))
-                and int(verification.get("entries_tampered") or 0) == 0
-            ),
+            audit_verified=audit_verified,
         )
     except quality_reviewer.ReviewerEvidenceError as exc:
         raise WorkspaceError(f"quality_review_receipt_invalid:{exc}") from exc
@@ -3033,9 +3150,9 @@ def _verified_quality_review_receipt(
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
-    verified["physical_submission_count"] = len(payloads)
+    verified["physical_submission_count"] = 1
     verified["logical_submission_count"] = 1
-    return verified
+    return _enforce_quality_review_receipt_schema(verified, observed_provider)
 
 
 def _verified_accepted_quality_review_receipt(
@@ -3083,9 +3200,11 @@ def _verified_accepted_quality_review_receipt(
     reviewer = receipt.get("reviewer")
     report = receipt.get("report")
     authority = receipt.get("authority")
-    if receipt.get("schema_id") != quality_reviewer.RECEIPT_SCHEMA_ID or not all(
-        isinstance(value, dict)
-        for value in (target, reviewer, report, authority)
+    if not (
+        isinstance(target, dict)
+        and isinstance(reviewer, dict)
+        and isinstance(report, dict)
+        and isinstance(authority, dict)
     ):
         raise WorkspaceError("quality_reviewer_accepted_receipt_shape_invalid")
     if (
@@ -3099,16 +3218,34 @@ def _verified_accepted_quality_review_receipt(
     ):
         raise WorkspaceError("quality_reviewer_accepted_identity_mismatch")
     observed_provider = str(latest.get("adapter_id") or "")
-    if not observed_provider or str(reviewer.get("provider") or "") != observed_provider:
-        raise WorkspaceError("quality_reviewer_accepted_provider_mismatch")
+    if not observed_provider:
+        raise WorkspaceError("quality_reviewer_accepted_provider_missing")
+    # Enforce the exact production receipt schema (top-level/target/reviewer/
+    # report/authority key sets, lowercase 64-hex packet/submission hashes,
+    # bool-safe claim epoch and submission counts, provider and findings typing,
+    # verified authority, terminal review_ready). Malformed, unverified,
+    # duplicate, wrong-type/bool or identity-mismatched receipts fail closed
+    # here rather than falling through to generic empty-hash equality.
+    _enforce_quality_review_receipt_schema(receipt, observed_provider)
+    # The retained reviewer workspace must be provably read-only and empty.
+    _enforce_readonly_retained_workspace(terminal_evidence)
+    # The immutable quality-review binding must pin the exact bool-safe
+    # reviewed-parent claim epoch and the current reviewer adapter identity.
+    retained_binding = terminal_evidence.get("quality_review")
+    if not isinstance(retained_binding, dict):
+        raise WorkspaceError("quality_reviewer_retained_binding_missing")
+    bound_claim_epoch = retained_binding.get("target_claim_epoch")
     if (
-        authority.get("process_identity_verified") is not True
-        or authority.get("audit_verified") is not True
-        or str(authority.get("terminal_state") or "") != "review_ready"
-        or report.get("read_only") is not True
-        or report.get("can_mutate_repo") is not False
+        not _is_bool_safe_int(bound_claim_epoch)
+        or bound_claim_epoch != target.get("claim_epoch")
     ):
-        raise WorkspaceError("quality_reviewer_accepted_authority_invalid")
+        raise WorkspaceError("quality_reviewer_claim_epoch_binding_mismatch")
+    if str(retained_binding.get("adapter_id") or "") != observed_provider:
+        raise WorkspaceError("quality_reviewer_adapter_binding_mismatch")
+    # The reviewer's own card must carry an empty writable surface.
+    card_allowed_writes = card.get("allowed_writes")
+    if not isinstance(card_allowed_writes, list) or card_allowed_writes:
+        raise WorkspaceError("quality_reviewer_card_allowed_writes_not_empty")
     return receipt
 
 
@@ -4226,10 +4363,13 @@ class ProcessManager:
                 terminal_validation=evidence.get("validation") or [],
                 lenses=quality_evidence.JUDGMENT_LENSES,
             )
+            target_claim_epoch = card.get("claim_epoch")
+            if type(target_claim_epoch) is not int or target_claim_epoch < 1:
+                raise WorkspaceError("quality_review_target_claim_epoch_invalid")
             packet = quality_reviewer.build_review_packet(
                 request_id=target_request_id,
                 task_id=target_task_id,
-                claim_epoch=int(card.get("claim_epoch") or 0),
+                claim_epoch=target_claim_epoch,
                 worker_provider=str(latest.get("adapter_id") or latest.get("runner") or ""),
                 changed_path_hashes=current_hashes,
                 objective=str(card.get("objective") or ""),
@@ -4327,6 +4467,8 @@ class ProcessManager:
         binding = {
             "target_request_id": target_request_id,
             "target_task_id": target_task_id,
+            "target_claim_epoch": packet.get("target", {}).get("claim_epoch"),
+            "adapter_id": adapter_id,
             "source_workspace": workspace.as_metadata(),
             "candidate_paths": sorted(changed_hashes),
             "packet": packet,
@@ -4836,6 +4978,10 @@ class ProcessManager:
                             "target_task_id": str(
                                 quality_review_binding["target_task_id"]
                             ),
+                            "target_claim_epoch": quality_review_binding[
+                                "target_claim_epoch"
+                            ],
+                            "adapter_id": str(adapter_id),
                             "lens": str(quality_review_binding["lens"]),
                             "packet_sha256": str(
                                 quality_review_binding["packet"]["packet_sha256"]
@@ -6937,6 +7083,8 @@ class ProcessManager:
                                     "evidence_record": outcome_evidence_record,
                                     "claim_state": claim_state,
                                     "workspace": workspace.as_metadata(),
+                                    "changed_paths": [],
+                                    "changed_path_hashes": {},
                                     "request_identity": {
                                         "request_id": request_id,
                                         "task_id": str(metadata["task_id"]),

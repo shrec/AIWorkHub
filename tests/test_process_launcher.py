@@ -3083,6 +3083,7 @@ def _sealed_reviewer_receipt(
     target_request_id: str = "tgt-req-001",
     target_task_id: str = "tgt-task-001",
     provider: str = "deepseek_vscode_lm",
+    claim_epoch: int = 1,
 ) -> dict:
     if packet_sha256 is None:
         packet_sha256 = hashlib.sha256(b"packet-body").hexdigest()
@@ -3094,7 +3095,7 @@ def _sealed_reviewer_receipt(
         "target": {
             "request_id": target_request_id,
             "task_id": target_task_id,
-            "claim_epoch": 1,
+            "claim_epoch": claim_epoch,
         },
         "reviewer": {
             "request_id": reviewer_request_id,
@@ -3103,15 +3104,19 @@ def _sealed_reviewer_receipt(
         },
         "report": {
             "lens": "correctness",
+            "provider": provider,
             "read_only": True,
             "can_mutate_repo": False,
-            "findings_count": 0,
+            "findings": [],
         },
         "authority": {
             "process_identity_verified": True,
             "audit_verified": True,
             "terminal_state": "review_ready",
         },
+        "submission_id": hashlib.sha256(b"sealed-submission").hexdigest(),
+        "physical_submission_count": 1,
+        "logical_submission_count": 1,
     }
 
 
@@ -3127,19 +3132,43 @@ def _accepted_latest_event(
     }
 
 
+def _quality_review_workspace_metadata() -> dict:
+    return {
+        "request_id": "rev-req-001",
+        "repo": "/tmp/quality-review-repo",
+        "path": "/tmp/quality-review-workspace",
+        "home": "/tmp/quality-review-home",
+        "allowed_writes": [],
+        "parent_baseline": {},
+        "workspace_baseline": {},
+        "inherited_rework_paths": [],
+    }
+
+
 def _accepted_card(
     receipt: dict,
     reviewer_request_id: str = "rev-req-001",
     reviewer_task_id: str = "rev-task-001",
     topic: str = "quality_review",
+    claim_epoch: int = 1,
 ) -> dict:
     return {
         "task_id": reviewer_task_id,
         "accepted_request_id": reviewer_request_id,
         "topic": topic,
         "status": "finished",
+        "allowed_writes": [],
         "terminal_review": {
-            "evidence": {"quality_review_receipt": receipt},
+            "evidence": {
+                "quality_review_receipt": receipt,
+                "quality_review": {
+                    "target_claim_epoch": claim_epoch,
+                    "adapter_id": "deepseek_vscode_lm",
+                },
+                "changed_paths": [],
+                "changed_path_hashes": {},
+                "workspace": _quality_review_workspace_metadata(),
+            },
         },
         "accept_evidence": {"quality_review_receipt": receipt},
     }
@@ -3237,6 +3266,235 @@ def test_sealed_reviewer_receipt_rejects_wrong_topic() -> None:
             reviewer_request_id="rev-req-001",
             target_request_id="tgt-req-001",
             target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_readonly_no_paths_no_hashes_with_receipt() -> None:
+    """A retained read-only reviewer receipt with typed-empty changed_paths
+    (list), changed_path_hashes (dict) and empty allowed_writes remains
+    consumable after reload because its identity is self-contained."""
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    result = process_launcher._verified_accepted_quality_review_receipt(
+        latest=latest,
+        card=card,
+        reviewer_request_id="rev-req-001",
+        target_request_id="tgt-req-001",
+        target_task_id="tgt-task-001",
+    )
+
+    assert result["schema_id"] == receipt["schema_id"]
+    assert result["packet_sha256"] == receipt["packet_sha256"]
+    assert result["submission_id"] == receipt["submission_id"]
+    assert result["target"]["claim_epoch"] == 1
+    assert result["physical_submission_count"] == 1
+    assert result["logical_submission_count"] == 1
+
+
+def test_sealed_reviewer_receipt_rejects_nonempty_changed_paths() -> None:
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+    card["terminal_review"]["evidence"]["changed_paths"] = ["src/x.py"]
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_changed_paths_not_empty",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_nonempty_changed_path_hashes() -> None:
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+    card["terminal_review"]["evidence"]["changed_path_hashes"] = {
+        "src/x.py": hashlib.sha256(b"x").hexdigest()
+    }
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_changed_path_hashes_not_empty",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_nonempty_workspace_allowed_writes() -> None:
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+    card["terminal_review"]["evidence"]["workspace"]["allowed_writes"] = ["out/x.py"]
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_workspace_allowed_writes_not_empty",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_bool_claim_epoch() -> None:
+    receipt = _sealed_reviewer_receipt(claim_epoch=True)  # type: ignore[arg-type]
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_claim_epoch_invalid",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_bool_submission_count() -> None:
+    receipt = _sealed_reviewer_receipt()
+    receipt["physical_submission_count"] = True
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_physical_submission_count_invalid",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_uppercase_packet_sha256() -> None:
+    receipt = _sealed_reviewer_receipt()
+    receipt["packet_sha256"] = receipt["packet_sha256"].upper()
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_packet_sha256_invalid",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_provider_mismatch() -> None:
+    receipt = _sealed_reviewer_receipt(provider="other_provider")
+    latest = _accepted_latest_event(receipt, adapter_id="deepseek_vscode_lm")
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_reviewer_provider_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_claim_epoch_binding_mismatch() -> None:
+    receipt = _sealed_reviewer_receipt(claim_epoch=7)
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt, claim_epoch=8)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_reviewer_claim_epoch_binding_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_adapter_binding_mismatch() -> None:
+    receipt = _sealed_reviewer_receipt()
+    latest = _accepted_latest_event(receipt, adapter_id="deepseek_vscode_lm")
+    card = _accepted_card(receipt)
+    card["terminal_review"]["evidence"]["quality_review"]["adapter_id"] = "other_adapter"
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_reviewer_adapter_binding_mismatch",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_sealed_reviewer_receipt_rejects_missing_submission_counts() -> None:
+    receipt = _sealed_reviewer_receipt()
+    receipt.pop("submission_id")
+    latest = _accepted_latest_event(receipt)
+    card = _accepted_card(receipt)
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_receipt_top_level_keys_invalid",
+    ):
+        process_launcher._verified_accepted_quality_review_receipt(
+            latest=latest, card=card,
+            reviewer_request_id="rev-req-001",
+            target_request_id="tgt-req-001",
+            target_task_id="tgt-task-001",
+        )
+
+
+def test_quality_review_receipt_schema_rejects_string_claim_epoch() -> None:
+    receipt = _sealed_reviewer_receipt()
+    receipt["target"]["claim_epoch"] = "1"
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_claim_epoch_invalid",
+    ):
+        process_launcher._enforce_quality_review_receipt_schema(
+            receipt, "deepseek_vscode_lm"
+        )
+
+
+def test_quality_review_receipt_schema_rejects_missing_findings() -> None:
+    receipt = _sealed_reviewer_receipt()
+    receipt["report"].pop("findings")
+
+    with pytest.raises(
+        process_launcher.WorkspaceError,
+        match="quality_review_report_keys_invalid",
+    ):
+        process_launcher._enforce_quality_review_receipt_schema(
+            receipt, "deepseek_vscode_lm"
         )
 
 
