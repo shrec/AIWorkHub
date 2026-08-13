@@ -6,6 +6,24 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.51] - 2026-08-13
+
+### Fixed
+
+- Project `source_graph_ensure_started` and `source_graph_health` from one
+  canonical committed-generation snapshot instead of mixing process-local and
+  database metadata (NF148/NF149).
+- Give every coalesced Source Graph refresh wave a durable repository-local job
+  ID and observable queued/running/succeeded/failed receipt with bounded report
+  or error evidence.
+- Fail closed when the refresh receipt cannot be persisted, eliminating silent
+  `queued=true` plus stale/empty-diagnostic states.
+
+### Validation
+
+- Source Graph daemon lifecycle and indexing regressions pass: 130 tests plus
+  changed-file Ruff and `git diff --check`.
+
 ## [0.9.50] - 2026-08-13
 
 ### Fixed

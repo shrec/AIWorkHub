@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -153,6 +154,83 @@ class SourceGraphDaemon:
         self._recovery_error: str = ""
         self._last_known_good_generation: dict[str, Any] = {}
         self._recovery_started_at: float = 0.0
+        # One durable refresh job per coalesced request wave. The daemon thread
+        # is the sole consumer; callers only reserve/observe jobs.
+        self._pending_refresh_job: dict[str, Any] | None = None
+        self._active_refresh_job: dict[str, Any] | None = None
+        self._last_refresh_job: dict[str, Any] | None = None
+
+    def _refresh_job_path(self) -> Path:
+        return source_graph.resolve_db_path(self.repo_root).parent / "refresh-job.json"
+
+    def _persist_refresh_job(self, job: dict[str, Any]) -> tuple[bool, str]:
+        """Atomically persist one bounded refresh outcome beside the index."""
+
+        try:
+            path = self._refresh_job_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            payload = json.dumps(job, sort_keys=True, separators=(",", ":")) + "\n"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(tmp, path)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+            return True, ""
+        except (OSError, source_graph.SourceGraphError) as exc:
+            return False, f"refresh_job_persist:{type(exc).__name__}:{exc}"[:300]
+
+    def _begin_refresh_job(self) -> dict[str, Any] | None:
+        with self._state_lock:
+            if self._pending_refresh_job is None:
+                return None
+            job = dict(self._pending_refresh_job)
+            self._pending_refresh_job = None
+            job.update({"state": "running", "started_at": _utcnow()})
+            self._active_refresh_job = job
+            self._last_refresh_job = job
+        ok, error = self._persist_refresh_job(job)
+        if not ok:
+            self._finish_refresh_job(job, state="failed", error=error)
+            return None
+        return job
+
+    def _finish_refresh_job(
+        self,
+        job: dict[str, Any],
+        *,
+        state: str,
+        error: str = "",
+    ) -> None:
+        with self._state_lock:
+            finished = {
+                **job,
+                "state": state,
+                "finished_at": _utcnow(),
+                "error": str(error or "")[:500],
+                "report": dict(self._last_report) if self._last_report else None,
+            }
+            if (
+                self._active_refresh_job is not None
+                and self._active_refresh_job.get("job_id") == job.get("job_id")
+            ):
+                self._active_refresh_job = None
+            self._last_refresh_job = finished
+        persisted, persist_error = self._persist_refresh_job(finished)
+        if not persisted:
+            with self._state_lock:
+                self._last_refresh_job = {
+                    **finished,
+                    "state": "failed",
+                    "error": persist_error,
+                }
 
     def _terminate_build_process(self) -> None:
         with self._process_lock:
@@ -658,12 +736,37 @@ class SourceGraphDaemon:
             self._refresh_event.clear()
             if self._stop_event.is_set():
                 break
+            refresh_job = self._begin_refresh_job()
             # Retry recovery before any probe when journal/WAL persists.
             if self._has_pending_journal():
                 result = self._recover_database()
                 if not result.get("recovered"):
+                    if refresh_job is not None:
+                        self._finish_refresh_job(
+                            refresh_job,
+                            state="failed",
+                            error=str(result.get("error") or "recovery_failed"),
+                        )
                     continue
-            self._run_one_build()
+            triggered = self._run_one_build()
+            if refresh_job is None:
+                continue
+            if not triggered:
+                self._finish_refresh_job(
+                    refresh_job, state="failed", error="build_in_progress"
+                )
+                continue
+            with self._state_lock:
+                status = self._status
+                error = self._last_error
+            if status in {STATUS_READY, STATUS_EMPTY}:
+                self._finish_refresh_job(refresh_job, state="succeeded")
+            else:
+                self._finish_refresh_job(
+                    refresh_job,
+                    state="failed",
+                    error=error or f"refresh_terminal_status:{status}",
+                )
 
     def start(self) -> None:
         """Idempotent: a second call while already running is a no-op.
@@ -727,7 +830,47 @@ class SourceGraphDaemon:
 
         if not self.is_running():
             self.start()
-        already_queued = self._refresh_event.is_set()
+        with self._state_lock:
+            existing = self._pending_refresh_job or self._active_refresh_job
+            if existing is not None:
+                job = dict(existing)
+                coalesced = True
+            else:
+                job = {
+                    "schema_id": "aiworkhub.source_graph.refresh_job.v1",
+                    "job_id": uuid.uuid4().hex,
+                    "repo_root": str(self.repo_root),
+                    "state": "queued",
+                    "requested_at": _utcnow(),
+                    "started_at": "",
+                    "finished_at": "",
+                    "error": "",
+                    "report": None,
+                }
+                self._pending_refresh_job = job
+                self._last_refresh_job = job
+                coalesced = False
+        if not coalesced:
+            persisted, persist_error = self._persist_refresh_job(job)
+            if not persisted:
+                with self._state_lock:
+                    self._pending_refresh_job = None
+                    self._last_refresh_job = {
+                        **job,
+                        "state": "failed",
+                        "finished_at": _utcnow(),
+                        "error": persist_error,
+                    }
+                return {
+                    **self.health(),
+                    "ok": False,
+                    "triggered": False,
+                    "queued": False,
+                    "coalesced": False,
+                    "job_id": job["job_id"],
+                    "refresh_job": dict(self._last_refresh_job),
+                    "reason": "refresh_job_persist_failed",
+                }
         self._refresh_event.set()
         health = self.health()
         return {
@@ -735,7 +878,9 @@ class SourceGraphDaemon:
             "ok": True,
             "triggered": True,
             "queued": True,
-            "coalesced": already_queued,
+            "coalesced": coalesced,
+            "job_id": job["job_id"],
+            "refresh_job": job,
             "reason": "refresh_queued",
         }
 
@@ -788,6 +933,12 @@ class SourceGraphDaemon:
                 ),
             }
             lkg = dict(self._last_known_good_generation) if self._last_known_good_generation else {}
+            refresh_job = dict(
+                self._active_refresh_job
+                or self._pending_refresh_job
+                or self._last_refresh_job
+                or {}
+            )
             return {
                 "ok": reported_status not in {STATUS_DEGRADED, STATUS_STALE, STATUS_RECOVERY},
                 "status": reported_status,
@@ -809,6 +960,8 @@ class SourceGraphDaemon:
                 "indexed_extensions": list(source_graph.INDEXED_EXTENSIONS),
                 "recovery": recovery_info,
                 "last_known_good_generation": lkg,
+                "refresh_job_id": str(refresh_job.get("job_id") or ""),
+                "refresh_job": refresh_job or None,
             }
 
 

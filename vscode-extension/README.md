@@ -12,13 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.50
+## What's new in 0.9.51
 
-- Concurrent dashboard, manager and model MCP calls now keep complete
-  child-owned FIFO JSON-RPC frames and independent out-of-order response
-  correlation.
-- Repeated bare `-32602 Invalid request parameters` transport corruption is
-  repaired reloadlessly by replacing only the exact repository/window child.
+- Source Graph startup and health now expose the same canonical committed
+  generation identity.
+- Every refresh wave has a durable job ID and explicit
+  queued/running/succeeded/failed evidence instead of silently stale work.
 
 See the packaged **Changelog** for the complete release summary.
 

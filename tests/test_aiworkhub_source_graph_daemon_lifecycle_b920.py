@@ -380,6 +380,70 @@ def test_core_refresh_queues_without_blocking_mcp_caller(
     release_build.set()
 
 
+def test_refresh_job_has_durable_identity_and_terminal_success(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "durable_refresh")
+    cleanup_daemons.append(root)
+    daemon = source_graph_daemon.ensure_started(root)
+    assert daemon.wait_for_first_build(timeout=10)
+
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def controlled_build(repo_root, *, incremental=True, db_path=None):
+        build_started.set()
+        release_build.wait(timeout=5)
+        return source_graph.BuildReport(
+            repo_root=str(repo_root), db_path="fake.sqlite", incremental=incremental,
+            files_seen=1, files_changed=1, files_unchanged=0, files_removed=0,
+            entities_written=1, edges_written=0, errors=[],
+            build_revision="refresh-test", finished_at="2026-08-13T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(source_graph, "build_index", controlled_build)
+    queued = daemon.request_refresh()
+    assert queued["queued"] is True
+    assert queued["refresh_job"]["state"] == "queued"
+    assert len(queued["job_id"]) == 32
+    assert build_started.wait(timeout=5)
+    release_build.set()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = daemon.health()["refresh_job"]
+        if job and job["state"] == "succeeded":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("refresh job did not reach terminal success")
+    assert job["job_id"] == queued["job_id"]
+    assert job["error"] == ""
+    persisted = daemon._refresh_job_path()
+    assert persisted.is_file()
+    assert queued["job_id"] in persisted.read_text(encoding="utf-8")
+
+
+def test_ensure_started_and_health_share_canonical_generation(
+    tmp_path, monkeypatch, cleanup_daemons,
+):
+    root = _init_repo(tmp_path, "canonical_health")
+    (root / "fresh.py").write_text("def freshly_indexed():\n    return 1\n", encoding="utf-8")
+    cleanup_daemons.append(root)
+    monkeypatch.setenv("AIWORKHUB_REPO_ROOT", str(root))
+    monkeypatch.setenv("AIWORKHUB_REPO", str(root))
+
+    daemon = source_graph_daemon.ensure_started(root)
+    assert daemon.wait_for_first_build(timeout=10)
+    started = core.source_graph_ensure_started()
+    health = core.source_graph_health()
+
+    assert started["build_revision"] == health["build_revision"]
+    assert started["last_success_at"] == health["last_success_at"]
+    assert started["files_seen"] == health["files_seen"]
+    assert started["files_seen"] > 0
+
+
 def test_cross_process_writer_contention_is_healthy_standby(tmp_path, cleanup_daemons):
     root = _init_repo(tmp_path)
     cleanup_daemons.append(root)

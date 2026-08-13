@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.51 — 2026-08-13
+
+### Fixed
+
+- Show one canonical Source Graph generation identity across startup and health
+  instead of contradictory process-local metadata.
+- Track refresh requests with durable job IDs and explicit terminal outcomes,
+  so queued work cannot remain silently stale.
+
 ## 0.9.50 — 2026-08-13
 
 ### Fixed

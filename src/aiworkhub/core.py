@@ -5717,8 +5717,10 @@ def source_graph_ensure_started() -> dict[str, Any]:
             "repo": str(root),
         }
     module = _source_graph_daemon_module()
-    daemon = module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
-    health = daemon.health()
+    module.ensure_started(root, refresh_interval_seconds=_configured_source_graph_refresh_seconds())
+    # One canonical projection: ensure_started and source_graph_health must
+    # hydrate generation metadata from the same committed database snapshot.
+    health = module.daemon_health(root)
     return {
         "ok": True,
         "status": "started" if health.get("running") else "start_failed",
