@@ -6,6 +6,29 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.47] - 2026-08-13
+
+### Fixed
+
+- Retain the authenticated sealed read-only reviewer receipt after standalone
+  acceptance removes the reviewer's read-only workspace, so target acceptance
+  reuses it only when the immutable process event and both task-card receipt
+  copies agree exactly (NF131).
+- Bind each sealed receipt to the exact target, reviewer, provider, claim epoch
+  and deterministic lowercase 64-hex submission identity, and pin the retained
+  quality-review envelope to the reviewed-parent claim epoch and adapter
+  identity, rejecting epoch- or provider-mismatched reuse (NF131).
+- Fail closed on malformed, unverified, duplicate, wrong-type/bool or
+  identity-mismatched receipts through exact schema enforcement instead of
+  falling through to generic empty-hash equality, while preserving the writable
+  changed-path hash fallback for non-reviewer targets (NF131).
+
+### Validation
+
+- Extended the sealed accepted-reviewer receipt and reviewer-contract fixtures
+  to cover retention, exact binding, fail-closed schema rejection and the
+  preserved writable hash fallback (NF131).
+
 ## [0.9.46] - 2026-08-12
 
 ### Fixed

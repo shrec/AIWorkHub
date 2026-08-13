@@ -12,11 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.46
+## What's new in 0.9.47
 
-- Task migration tolerates malformed legacy JSON, collision health no longer
-  blocks unrelated cards, GLM correctness reviewers retain valid tool history,
-  and portable evidence redacts complete Bearer credentials.
+- Authenticated sealed read-only reviewer receipts are retained after reviewer
+  acceptance and bound to the exact target, reviewer, provider, claim epoch and
+  submission identity; malformed or mismatched receipts fail closed while the
+  writable changed-path hash fallback is preserved (NF131).
 
 See the packaged **Changelog** for the complete release summary.
 

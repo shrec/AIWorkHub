@@ -1,5 +1,22 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.47 — 2026-08-13
+
+### Fixed
+
+- Retain authenticated sealed read-only reviewer receipts after standalone
+  acceptance removes the reviewer workspace, and reuse them only when the
+  immutable process event and both task-card receipt copies agree exactly.
+- Bind receipts to the exact target, reviewer, provider, claim epoch and
+  deterministic lowercase 64-hex submission identity, and fail closed on
+  malformed, unverified, duplicate or identity-mismatched receipts while
+  preserving the writable changed-path hash fallback.
+
+### Validation
+
+- Added regression fixtures for sealed receipt retention, exact binding and
+  fail-closed schema enforcement (NF131).
+
 ## 0.9.46 — 2026-08-12
 
 ### Fixed
