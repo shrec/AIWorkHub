@@ -27,6 +27,25 @@ remains an isolated AI engineering workspace; no AIWorkHub cloud account or
 HTTP service is required. Visit the [AIWorkHub product site](https://shrec.github.io/AIWorkHub/)
 or follow the [getting-started guide](docs/GETTING_STARTED.md).
 
+## The whole system
+
+<div align="center">
+  <a href="site/assets/aiworkhub-system-architecture.png"><img src="site/assets/aiworkhub-system-architecture.png" alt="AIWorkHub autonomous development control plane architecture" width="100%"></a>
+</div>
+
+AIWorkHub follows one durable loop: **Observe → Decide → Delegate → Verify →
+Promote → Learn**. The map separates live foundations from the current
+hardening wave and planned capabilities. Live foundations include NeedFix and
+Roadmap intake, the Task DAG, Source Graph and durable context authorities,
+outcome-aware workforce routing, isolated worktrees, semantic edits, validation,
+sealed review receipts, provider-free replay and manager-controlled promotion.
+The active closure wave covers reviewer MCP delivery, exact liveness, finalizer
+leases, validation isolation, cross-platform parity, Source Graph refresh truth,
+storage retention and NeedFix lifecycle reconciliation. Planned capabilities
+include automatic NeedFix closure and TTL cleanup, provider controls, CPU-aware
+parallelism, richer evidence visualization and quality-calibrated release
+automation.
+
 ## What's new in 0.9.40
 
 - Required semantic-edit creates reject literal placeholder output, including
