@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -166,15 +167,57 @@ def _verify(receipt: dict[str, object], packet: dict[str, object]) -> dict[str, 
     )
 
 
+def _sealed_reviewer_receipt() -> dict[str, object]:
+    packet = _packet()
+    signed_receipt = _receipt(packet)
+    verified = _verify(signed_receipt, packet)
+    sealed = copy.deepcopy(verified)
+    # The coordinator seals the verified receipt with the adapter provider it
+    # observed in its own process registry plus the authenticated submission
+    # bookkeeping appended by _verified_quality_review_receipt.
+    sealed["report"]["provider"] = "claude_sonnet5"
+    sealed["submission_id"] = hashlib.sha256(
+        json.dumps(
+            signed_receipt,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    sealed["physical_submission_count"] = 1
+    sealed["logical_submission_count"] = 1
+    return sealed
+
+
+def _reviewer_workspace_metadata() -> dict[str, object]:
+    return worker_workspace.WorkerWorkspace(
+        request_id="review-request-1",
+        repo=Path("/var/aiworkhub/review-repo"),
+        path=Path("/var/aiworkhub/review-repo/workspace"),
+        home=Path("/var/aiworkhub/review-home"),
+        allowed_writes=(),
+        parent_baseline={},
+        workspace_baseline={},
+    ).as_metadata()
+
+
 def _accepted_reviewer_state() -> tuple[dict[str, object], dict[str, object]]:
-    verified = _verify(_receipt(_packet()), _packet())
+    sealed = _sealed_reviewer_receipt()
     latest = {
         "request_id": "review-request-1",
         "task_id": "REVIEW_TASK_1",
+        "runner": "claude_sonnet5",
+        "topic": "quality_review",
         "adapter_id": "claude_sonnet5",
         "state": "accepted",
         "accepted": True,
-        "quality_review_receipt": verified,
+        "promoted_paths": [],
+        "workspace_retained": False,
+        "cleanup_error": "",
+        "quality_review_receipt": sealed,
+        "reviewer_finalization": [],
+        "acceptance_lock_scope": "request",
+        "finished_at": "2026-08-10T00:00:00Z",
     }
     card = {
         "task_id": "REVIEW_TASK_1",
@@ -182,10 +225,26 @@ def _accepted_reviewer_state() -> tuple[dict[str, object], dict[str, object]]:
         "status": "finished",
         "worker_status": "done",
         "accepted_request_id": "review-request-1",
+        "allowed_writes": [],
+        "required_outputs": [],
         "terminal_review": {
-            "evidence": {"quality_review_receipt": copy.deepcopy(verified)}
+            "evidence": {
+                "quality_review_receipt": copy.deepcopy(sealed),
+                "workspace": _reviewer_workspace_metadata(),
+                "request_identity": {
+                    "request_id": "review-request-1",
+                    "task_id": "REVIEW_TASK_1",
+                    "runner": "claude_sonnet5",
+                    "topic": "quality_review",
+                },
+            },
         },
-        "accept_evidence": {"quality_review_receipt": copy.deepcopy(verified)},
+        "accept_evidence": {
+            "quality_review_receipt": copy.deepcopy(sealed),
+            "promoted_paths": [],
+            "changed_paths": [],
+            "changed_path_hashes": {},
+        },
     }
     return latest, card
 
@@ -203,6 +262,27 @@ def test_target_acceptance_reuses_canonically_accepted_reviewer_receipt() -> Non
 
     assert verified == latest["quality_review_receipt"]
     assert verified is not latest["quality_review_receipt"]
+
+    sealed = latest["quality_review_receipt"]
+    assert sealed["report"]["provider"] == "claude_sonnet5"
+    assert sealed["report"]["findings"] == []
+    assert sealed["physical_submission_count"] == 1
+    assert sealed["logical_submission_count"] == 1
+    submission_id = sealed["submission_id"]
+    assert isinstance(submission_id, str)
+    assert len(submission_id) == 64
+    assert submission_id == submission_id.lower()
+    assert sealed["target"]["claim_epoch"] == 3
+    assert latest["adapter_id"] == "claude_sonnet5"
+
+    workspace_metadata = card["terminal_review"]["evidence"]["workspace"]
+    assert workspace_metadata["allowed_writes"] == []
+    assert workspace_metadata["parent_baseline"] == {}
+    assert workspace_metadata["workspace_baseline"] == {}
+    reconstructed = worker_workspace.WorkerWorkspace.from_metadata(
+        dict(workspace_metadata)
+    )
+    assert reconstructed.as_metadata() == workspace_metadata
 
 
 def test_accepted_reviewer_receipt_must_match_all_durable_copies() -> None:
