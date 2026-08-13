@@ -2328,6 +2328,22 @@ def _build_roadmap_snapshot() -> dict[str, Any]:
         return _roadmap_unavailable(str(exc)[:500])
 
 
+def _review_validation_ok(item: Mapping[str, Any]) -> bool:
+    """Derive authoritative validation truth for one review evidence row.
+
+    Explicit ``ok``/``passed`` booleans are preserved exactly.  Otherwise the
+    executed result decides: a zero return code without a timeout is success;
+    any nonzero return code, timeout, or launch failure is failure.
+    """
+    ok = item.get("ok")
+    if isinstance(ok, bool):
+        return ok
+    passed = item.get("passed")
+    if isinstance(passed, bool):
+        return passed
+    return (item.get("returncode") == 0) and not bool(item.get("timed_out"))
+
+
 def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, Any] | None:
     data_provider = provider or DashboardProvider()
     readiness_reader = getattr(data_provider, "get_storage_readiness", None)
@@ -2411,6 +2427,10 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
                     ],
                 }
             result["task"]["quality_gate"] = quality_projection
+    request_identity = terminal_evidence.get("request_identity")
+    if not isinstance(request_identity, Mapping):
+        request_identity = {}
+    current_request_id = str(request_identity.get("request_id") or "").strip()
     process_reader = getattr(
         data_provider,
         "get_agent_processes",
@@ -2452,16 +2472,67 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
     validation_summary = [
         {
             "command": _portable_text(item.get("command") or item.get("check_id"), 500),
-            "ok": bool(item.get("ok", item.get("passed", False))),
+            "ok": _review_validation_ok(item),
             "returncode": item.get("returncode"),
             "summary": _portable_text(
                 item.get("summary") or item.get("stderr") or item.get("stdout") or "",
                 1000,
             ),
+            "history": False,
         }
         for item in validations[:200]
         if isinstance(item, Mapping)
     ]
+    validation_history: list[dict[str, Any]] = []
+    for item in events:
+        if str(item.get("event") or item.get("action") or "").strip() != "terminal_review":
+            continue
+        payload = item.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, Mapping):
+            continue
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, Mapping):
+            continue
+        identity = evidence.get("request_identity")
+        history_request_id = (
+            str(identity.get("request_id") or "").strip()
+            if isinstance(identity, Mapping)
+            else ""
+        )
+        if not history_request_id or history_request_id == current_request_id:
+            continue
+        history_checks = evidence.get("validation")
+        if not isinstance(history_checks, list):
+            continue
+        for check in history_checks[:200]:
+            if not isinstance(check, Mapping):
+                continue
+            validation_history.append(
+                {
+                    "command": _portable_text(
+                        check.get("command") or check.get("check_id"), 500
+                    ),
+                    "ok": _review_validation_ok(check),
+                    "returncode": check.get("returncode"),
+                    "summary": _portable_text(
+                        check.get("summary")
+                        or check.get("stderr")
+                        or check.get("stdout")
+                        or "",
+                        1000,
+                    ),
+                    "request_id": history_request_id[:120],
+                    "history": True,
+                }
+            )
+        if len(validation_history) >= 200:
+            break
+    validation_history = validation_history[:200]
     required_output_summary = [
         {
             "path": _portable_path(item.get("path")),
@@ -2522,6 +2593,12 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
         "schema_id": "aiworkhub.review_evidence_bundle.v1",
         "task_id": task_id,
         "generated_at": result["generated_at"],
+        "request_identity": {
+            "request_id": current_request_id[:120],
+            "task_id": str(request_identity.get("task_id") or "")[:120],
+            "runner": str(request_identity.get("runner") or "")[:120],
+            "topic": str(request_identity.get("topic") or "")[:120],
+        },
         "terminal": {
             "status": str(card.get("status") or "")[:80],
             "worker_status": str(card.get("worker_status") or "")[:80],
@@ -2561,6 +2638,7 @@ def build_task_detail(task_id: str, provider: Any | None = None) -> dict[str, An
             ],
         },
         "tests": validation_summary,
+        "validation_history": validation_history,
         "required_outputs": required_output_summary,
         "logs": {
             "result_summary": _portable_text(

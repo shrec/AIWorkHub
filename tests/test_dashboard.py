@@ -1321,6 +1321,121 @@ def test_task_detail_builds_bounded_portable_review_evidence_bundle():
     assert "stderr_path" not in serialized
 
 
+def test_task_detail_review_evidence_preserves_explicit_validation_truth():
+    class TruthProvider:
+        def get_task(self, task_id):
+            assert task_id == "TASK_TRUTH_B13_V1"
+            return {
+                "task_id": task_id,
+                "status": "review",
+                "worker_status": "review",
+                "terminal_review": {
+                    "substatus": "review_ready",
+                    "evidence": {
+                        "validation": [
+                            {"command": "ok-true", "ok": True, "returncode": 1},
+                            {"command": "ok-false", "ok": False, "returncode": 0},
+                            {"command": "passed-true", "passed": True, "returncode": 1},
+                            {"command": "passed-false", "passed": False, "returncode": 0},
+                            {"command": "rc-zero", "returncode": 0},
+                            {"command": "rc-nonzero", "returncode": 2},
+                            {"command": "timed-out", "returncode": None, "timed_out": True},
+                            {
+                                "command": "launch-failed",
+                                "returncode": None,
+                                "timed_out": False,
+                                "launch_error": "FileNotFoundError",
+                            },
+                        ],
+                    },
+                },
+            }
+
+        def get_agent_processes(self):
+            return {"ok": True, "processes": []}
+
+        def get_task_events(self, task_id):
+            return []
+
+    detail = dashboard.build_task_detail("TASK_TRUTH_B13_V1", TruthProvider())
+    assert detail is not None
+    tests = detail["task"]["review_evidence_bundle"]["tests"]
+    by_command = {row["command"]: row for row in tests}
+    assert by_command["ok-true"]["ok"] is True
+    assert by_command["ok-false"]["ok"] is False
+    assert by_command["passed-true"]["ok"] is True
+    assert by_command["passed-false"]["ok"] is False
+    assert by_command["rc-zero"]["ok"] is True
+    assert by_command["rc-nonzero"]["ok"] is False
+    assert by_command["timed-out"]["ok"] is False
+    assert by_command["launch-failed"]["ok"] is False
+    assert all(row["history"] is False for row in tests)
+
+
+def test_task_detail_review_evidence_binds_current_request_and_labels_history():
+    class HistoryProvider:
+        def get_task(self, task_id):
+            assert task_id == "TASK_HISTORY_B13_V1"
+            return {
+                "task_id": task_id,
+                "status": "review",
+                "worker_status": "review",
+                "terminal_review": {
+                    "substatus": "review_ready",
+                    "evidence": {
+                        "request_identity": {
+                            "request_id": "req-current",
+                            "task_id": task_id,
+                            "runner": "runner-current",
+                            "topic": "topic-current",
+                        },
+                        "validation": [{"command": "current-check", "returncode": 0}],
+                    },
+                },
+            }
+
+        def get_agent_processes(self):
+            return {"ok": True, "processes": []}
+
+        def get_task_events(self, task_id):
+            return [
+                {
+                    "event": "terminal_review",
+                    "runner": "runner-pred",
+                    "created_at": "2026-07-30T12:00:00+00:00",
+                    "payload": json.dumps(
+                        {
+                            "substatus": "validation_failed",
+                            "evidence": {
+                                "request_identity": {
+                                    "request_id": "req-pred",
+                                    "task_id": task_id,
+                                },
+                                "validation": [
+                                    {"command": "pred-check", "returncode": 1}
+                                ],
+                            },
+                        }
+                    ),
+                }
+            ]
+
+    detail = dashboard.build_task_detail("TASK_HISTORY_B13_V1", HistoryProvider())
+    assert detail is not None
+    bundle = detail["task"]["review_evidence_bundle"]
+    assert bundle["request_identity"]["request_id"] == "req-current"
+    assert bundle["request_identity"]["runner"] == "runner-current"
+    assert bundle["tests"][0]["ok"] is True
+    assert bundle["tests"][0]["history"] is False
+    assert len(bundle["tests"]) == 1
+    assert len(bundle["validation_history"]) == 1
+    history = bundle["validation_history"][0]
+    assert history["command"] == "pred-check"
+    assert history["ok"] is False
+    assert history["history"] is True
+    assert history["request_id"] == "req-pred"
+
+
 def test_task_detail_prefers_verified_reviewer_findings_over_terminal_prose():
     class ReviewerEvidenceProvider:
         def get_task(self, task_id):
