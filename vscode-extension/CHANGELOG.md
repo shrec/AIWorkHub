@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.52 — 2026-08-13
+
+### Fixed
+
+- Keep a slow full dashboard refresh in a truthful **Snapshot delayed** state
+  without marking the healthy MCP runtime Offline.
+- Use a dedicated full-snapshot aggregation budget and avoid immediate retry
+  storms while retaining the last successfully rendered dashboard data.
+
 ## 0.9.51 — 2026-08-13
 
 ### Fixed

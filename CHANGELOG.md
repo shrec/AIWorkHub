@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.52] - 2026-08-13
+
+### Fixed
+
+- Give full dashboard aggregation its own bounded request budget instead of
+  the lightweight control-plane RPC budget.
+- Classify a delayed dashboard snapshot as degraded while preserving the last
+  truthful data and the live MCP connection, rather than reporting Offline.
+- Stop immediate heavy-snapshot retries after a request deadline to prevent a
+  retry storm from amplifying repository-load latency.
+
+### Validation
+
+- The complete VS Code extension suite passes, including dynamic timeout
+  classification, transport/runtime failure separation and no-retry evidence.
+
 ## [0.9.51] - 2026-08-13
 
 ### Fixed

@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.51";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.52";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -222,6 +222,7 @@ const ALLOWED_INBOUND_MESSAGE_TYPES = new Set([
 // Outbound message types the extension host posts into the Webview.
 const OUTBOUND_TYPES = Object.freeze({
   snapshot: "snapshot",
+  snapshotDelayed: "snapshotDelayed",
   taskDetail: "taskDetail",
   offline: "offline",
   error: "error",
@@ -402,6 +403,10 @@ const REAL_REPO_ID_RE = /^repo_[a-f0-9]{32}$/;
 // ── One bounded repo-local Task MCP stdio child + one JSON-RPC session ─────
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 const MCP_REQUEST_TIMEOUT_MS = 20000;
+// A full dashboard snapshot aggregates several repository-local data sources
+// and is materially heavier than ordinary control-plane RPCs.  Give it its
+// own bounded budget without changing worker/provider liveness semantics.
+const MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS = 120000;
 // Worker-side Source Graph/context calls can legitimately take longer than a
 // lightweight dashboard read.  Keep the budget bounded, but do not force the
 // editor model through the dashboard's 20 second latency envelope.
@@ -6805,7 +6810,11 @@ async function pushSnapshotOnce(view) {
     try {
       debugTrace("snapshot.attempt.begin", { request_seq: requestSeq, attempt: attempt + 1 });
       refreshCoordinatorRouteBeforeSnapshot();
-      const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true });
+      const payload = await client.callTool(
+        DASHBOARD_TOOLS.snapshot,
+        { full: true },
+        MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
+      );
       debugTrace("snapshot.payload.received", {
         request_seq: requestSeq,
         attempt: attempt + 1,
@@ -6842,16 +6851,24 @@ async function pushSnapshotOnce(view) {
       snapshotRecovery.reason = sanitizeErrorMessage(err);
       snapshotRecovery.attempts = attempt + 1;
       snapshotRecovery.open = attempt + 1 >= MCP_SNAPSHOT_RECOVERY_ATTEMPTS;
+      // A single slow aggregation is not connection-loss evidence.  Avoid an
+      // immediate retry storm on the same serialized transport and preserve
+      // the last truthful snapshot in the Webview.
+      if (snapshotRecovery.reason === "mcp_request_timeout") break;
     }
   }
   if (requestSeq === view.snapshotRequestSeq) {
+    const delayed = snapshotRecovery.reason === "mcp_request_timeout";
     view.postMessage({
-      type: OUTBOUND_TYPES.offline,
+      type: delayed ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
       reason: sanitizeErrorMessage(lastError),
       recovery: snapshotRecovery,
     });
   }
-  debugTrace("snapshot.offline", { request_seq: requestSeq, ...debugErrorFields(lastError) });
+  debugTrace(
+    snapshotRecovery.reason === "mcp_request_timeout" ? "snapshot.delayed" : "snapshot.offline",
+    { request_seq: requestSeq, ...debugErrorFields(lastError) },
+  );
 }
 
 async function pushSnapshotNoRetry(view, options = {}) {
@@ -6862,7 +6879,11 @@ async function pushSnapshotNoRetry(view, options = {}) {
     const client = options.client || getMcpClient();
     view.bindClient(client);
     refreshCoordinatorRouteBeforeSnapshot();
-    const payload = await client.callTool(DASHBOARD_TOOLS.snapshot, { full: true });
+    const payload = await client.callTool(
+      DASHBOARD_TOOLS.snapshot,
+      { full: true },
+      MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
+    );
     if (payload && view.stillBoundTo(client) && (authoritative || requestSeq === view.snapshotRequestSeq)) {
       view.postMessage({
         type: OUTBOUND_TYPES.snapshot,
@@ -6879,7 +6900,11 @@ async function pushSnapshotNoRetry(view, options = {}) {
     }
   } catch (err) {
     if (authoritative || requestSeq === view.snapshotRequestSeq) {
-      view.postMessage({ type: OUTBOUND_TYPES.offline, reason: sanitizeErrorMessage(err) });
+      const reason = sanitizeErrorMessage(err);
+      view.postMessage({
+        type: reason === "mcp_request_timeout" ? OUTBOUND_TYPES.snapshotDelayed : OUTBOUND_TYPES.offline,
+        reason,
+      });
     }
   }
   return { posted: false, payload: null };
@@ -9182,6 +9207,7 @@ module.exports = {
     validateProviderHistory,
     constants: {
       MCP_REQUEST_TIMEOUT_MS,
+      MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS,
       VSCODE_LM_WORKER_TOOL_TIMEOUT_MS,
       MCP_SNAPSHOT_RECOVERY_ATTEMPTS,
       MCP_MAX_RUNTIME_REPAIR_ATTEMPTS,

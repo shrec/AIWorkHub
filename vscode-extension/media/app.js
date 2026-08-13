@@ -2761,6 +2761,14 @@ function showOffline(reason) {
   }
 }
 
+function showSnapshotDelayed(reason) {
+  elements.offlineAlert.hidden = false;
+  const detail = reason ? ` (${reason})` : "";
+  elements.offlineAlertMessage.textContent =
+    `Dashboard snapshot delayed${detail}; MCP connection remains available.`;
+  setConnection("degraded", "Snapshot delayed");
+}
+
 function renderRuntimeInfo(info) {
   const payload = info && typeof info === "object" ? info : {};
   const extensionVersion = String(payload.extensionVersion || "unknown");
@@ -3986,6 +3994,9 @@ window.addEventListener("message", (event) => {
     }
     case "offline":
       showOffline(message.reason);
+      break;
+    case "snapshotDelayed":
+      showSnapshotDelayed(message.reason);
       break;
     case "error":
       showToast(message.message || "Request failed");

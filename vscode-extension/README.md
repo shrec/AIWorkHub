@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.51
+## What's new in 0.9.52
 
-- Source Graph startup and health now expose the same canonical committed
-  generation identity.
-- Every refresh wave has a durable job ID and explicit
-  queued/running/succeeded/failed evidence instead of silently stale work.
+- Slow full dashboard aggregation now reports **Snapshot delayed** while the
+  MCP connection remains available and the last truthful data stays visible.
+- Full snapshots use a dedicated request budget and no longer trigger an
+  immediate retry storm under repository load.
 
 See the packaged **Changelog** for the complete release summary.
 

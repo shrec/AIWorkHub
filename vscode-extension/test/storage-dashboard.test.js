@@ -26,6 +26,8 @@ for (const token of [
   'id="terminal-log-cleanup-preview"',
   'id="runtime-cleanup-preview"',
   'id="reload-alert-title"',
+  'snapshotDelayed: "snapshotDelayed"',
+  "MCP_DASHBOARD_SNAPSHOT_TIMEOUT_MS",
 ]) {
   assert.ok(extension.includes(token), `missing dashboard storage UI token: ${token}`);
 }
@@ -74,6 +76,9 @@ for (const token of [
   "requestRuntimePurge",
   'elements.reloadAlertTitle.textContent = payload.repairAttempted',
   '"Runtime repair failed"',
+  'case "snapshotDelayed"',
+  'setConnection("degraded", "Snapshot delayed")',
+  "MCP connection remains available",
 ]) {
   assert.ok(app.includes(token), `missing storage renderer token: ${token}`);
 }
