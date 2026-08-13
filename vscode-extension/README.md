@@ -12,12 +12,11 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.47
+## What's new in 0.9.48
 
-- Authenticated sealed read-only reviewer receipts are retained after reviewer
-  acceptance and bound to the exact target, reviewer, provider, claim epoch and
-  submission identity; malformed or mismatched receipts fail closed while the
-  writable changed-path hash fallback is preserved (NF131).
+- Request-scoped worker and validation temporary data now lives under each
+  repository's own `.aiworkhub/temp` authority, with isolated ownership,
+  deterministic cleanup and retained review candidates (NF201).
 
 See the packaged **Changelog** for the complete release summary.
 

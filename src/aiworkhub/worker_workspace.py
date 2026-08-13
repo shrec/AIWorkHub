@@ -60,6 +60,46 @@ except ImportError:  # direct-script Landlock entrypoint
         return (platform_name or os.name) != "nt"
 
 
+def _load_runtime_temp():
+    """Resolve the runtime_temp authority module deterministically.
+
+    ``worker_workspace.py`` is both package-imported (``from aiworkhub import
+    worker_workspace``) and executed directly as the Landlock wrapper
+    (``<python> src/aiworkhub/worker_workspace.py --landlock-exec ...``). In the
+    direct-script case the package-relative import fails and the installed
+    ``aiworkhub.runtime_temp`` is not guaranteed to be importable inside the
+    retained workspace. Resolve the authenticated sibling file beside this
+    module first; fall back to the package import only when the sibling is not
+    a regular file (installed/bundled layouts). A missing, symlinked, or
+    unloadable sibling fails closed.
+    """
+    try:
+        from . import runtime_temp
+        return runtime_temp
+    except ImportError:
+        pass
+    sibling = Path(__file__).resolve().parent / "runtime_temp.py"
+    try:
+        is_regular = sibling.is_file() and not sibling.is_symlink()
+    except OSError as exc:
+        raise ImportError(f"runtime_temp sibling unreadable: {sibling}") from exc
+    if not is_regular:
+        raise ImportError(
+            "runtime_temp unavailable: no package import and no regular "
+            f"sibling at {sibling}"
+        )
+    spec = importlib.util.spec_from_file_location("aiworkhub.runtime_temp", sibling)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"runtime_temp sibling has no loader: {sibling}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["aiworkhub.runtime_temp"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+runtime_temp = _load_runtime_temp()
+
+
 def bubblewrap_home_env_value() -> str:
     """Single source of truth for the bubblewrap HOME string.
 
@@ -78,6 +118,7 @@ def bubblewrap_home_env_value() -> str:
 
 WORKTREE_ROOT_ENV = "AIWORKHUB_WORKTREE_ROOT"
 RUNTIME_ROOT_ENV = "AIWORKHUB_RUNTIME_ROOT"
+TEMP_ROOT_ENV = runtime_temp.TEMP_ROOT_ENV
 BWRAP_ENV = "AIWORKHUB_BWRAP"
 SANDBOX_BACKEND_ENV = "AIWORKHUB_SANDBOX_BACKEND"
 VSCODE_LM_IN_PROCESS_BACKEND = "vscode_lm_in_process"
@@ -1192,6 +1233,16 @@ def configured_worktree_root(repo: Path | None = None) -> Path:
     return (configured_runtime_root(repo) / "worktrees").resolve()
 
 
+def configured_temp_root(repo: Path | None = None) -> Path:
+    """Return the repository-owned disposable temp root (``.aiworkhub/temp``).
+
+    Validation exec scratch and per-request worker tmp live under this
+    authority.  Never a shared system temp location; symlink/escape fails
+    closed via :func:`aiworkhub.runtime_temp.temp_root`.
+    """
+    return runtime_temp.temp_root(repo)
+
+
 def _legacy_worktree_root() -> Path:
     """Exact pre-repo-runtime root retained only for upgrade-time GC."""
     return (Path(tempfile.gettempdir()) / "aiworkhub-worktrees").resolve()
@@ -2042,7 +2093,9 @@ def _probe_metadata_capable_dir(directory: Path) -> bool:
             os.replace(replacement_path, probe_path)
             return probe_path.read_bytes() == b"aiworkhub"
         os.chmod(probe_path, 0o600)
-        return stat.S_IMODE(os.stat(probe_path).st_mode) == 0o600
+        if stat.S_IMODE(os.stat(probe_path).st_mode) != 0o600:
+            return False
+        return stat.S_ISREG(os.stat(probe_path).st_mode) and probe_path.read_bytes() == b""
     except OSError:
         return False
     finally:
@@ -2065,19 +2118,26 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
     tried: list[str] = []
     candidate_roots = list(_exec_scratch_candidate_roots())
     workspace_repo = getattr(workspace, "repo", None)
+    repo_temp_validation: Path | None = None
     if (
         workspace_repo is not None
         and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
     ):
-        repo_runtime_validation = configured_runtime_root(
-            Path(workspace_repo)
-        ) / "validation"
+        # The repository-owned temp authority is the preferred validation
+        # scratch root.  Every validation run gets its own request-named
+        # 0700 directory under <repo>/.aiworkhub/temp/validation, so two
+        # repositories and concurrent instances share no mutable temp state.
         try:
-            repo_runtime_validation.mkdir(parents=True, exist_ok=True, mode=0o700)
-            chmod_path(repo_runtime_validation, 0o700)
-        except OSError:
-            pass
-        candidate_roots.insert(0, repo_runtime_validation)
+            repo_temp_root = configured_temp_root(Path(workspace_repo))
+            repo_temp_validation = repo_temp_root / "validation"
+            repo_temp_validation.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                chmod_path(repo_temp_validation, 0o700)
+            except OSError:
+                pass
+            candidate_roots.insert(0, repo_temp_validation)
+        except (OSError, RuntimeError):
+            repo_temp_validation = None
     if (
         sys.platform == "win32"
         and not os.environ.get(VALIDATION_EXEC_SCRATCH_ROOT_ENV, "").strip()
@@ -2125,6 +2185,21 @@ def provision_validation_exec_scratch(workspace: WorkerWorkspace) -> Path:
             tried.append(f"{root}:no_metadata")
             shutil.rmtree(scratch_dir, ignore_errors=True)
             continue
+        if (
+            repo_temp_validation is not None
+            and scratch_dir.parent == repo_temp_validation.resolve()
+        ):
+            # Stamp the exact PID/start-time owner identity so the terminal
+            # retention GC can later identify a dead-owner orphan left by a
+            # crashed worker -- and never a live or unknown owner.
+            try:
+                runtime_temp.write_owner_manifest(
+                    scratch_dir, workspace.request_id, Path(workspace_repo)
+                )
+            except (OSError, RuntimeError):
+                shutil.rmtree(scratch_dir, ignore_errors=True)
+                tried.append(f"{root}:owner_manifest_failed")
+                continue
         return scratch_dir
     raise WorkspaceError(
         "validation_exec_scratch_unavailable:" + ";".join(tried[:16])
@@ -4537,6 +4612,7 @@ if __name__ == "__main__":
         raise SystemExit(_landlock_exec(sys.argv[1:]))
     except (OSError, WorkspaceError) as exc:
         print(f"secure sandbox setup failed: {exc}", file=sys.stderr)
+        raise SystemExit(126)
 
 
 @dataclass

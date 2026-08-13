@@ -20,9 +20,9 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-from . import process_event_ledger, provider_usage, repo_policy, task_store
+from . import process_event_ledger, provider_usage, repo_policy, runtime_temp, task_store
 
 
 SCHEMA_ID = "aiworkhub.terminal_log_retention.v1"
@@ -61,6 +61,21 @@ _TERMINAL_STATES = frozenset({
 
 class TerminalLogRetentionError(RuntimeError):
     pass
+
+
+def _default_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# Injectable reference clock for retention-age/undo-window decisions. Tests
+# monkeypatch ``now_utc`` (or reassign ``_now_func``) to express age without
+# mutating filesystem mtimes. Production uses the real UTC clock.
+_now_func: Callable[[], datetime] = _default_now_utc
+
+
+def now_utc() -> datetime:
+    """Current UTC time via the injectable clock."""
+    return _now_func()
 
 
 def _repo_id(root: Path) -> str:
@@ -266,7 +281,7 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         info = process_root.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise TerminalLogRetentionError("terminal_log_root_invalid")
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_logs_days(root))
+    cutoff = now_utc() - timedelta(days=_logs_days(root))
     protected: list[dict[str, Any]] = []
     eligible_by_task: dict[str, list[dict[str, Any]]] = {}
     inventory: dict[str, list[dict[str, Any]]] = {}
@@ -448,6 +463,7 @@ def _candidate_payload(root: Path) -> dict[str, Any]:
         "candidate_count": len(candidates) + (1 if legacy_candidate else 0),
         "candidate_bytes": total_candidate_bytes,
         "protected_count": len(protected),
+        "protected": protected,
         "preview_digest": digest,
         "candidates": candidates,
     }
@@ -557,7 +573,7 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
         raise TerminalLogRetentionError("terminal_log_preview_stale")
     if not current["candidates"] and not current.get("legacy_candidate"):
         return {"ok": True, "quarantined": 0, "bytes": 0, "batch_id": "", "no_op": True}
-    now = datetime.now(timezone.utc)
+    now = now_utc()
     batch_id = f"l{now.strftime('%Y%m%dT%H%M%S')}-{preview_digest[:12]}"
     batch = _quarantine_root(root) / batch_id
     batch.mkdir(mode=0o700)
@@ -641,7 +657,7 @@ def quarantine(repo_root: Path | str, *, preview_digest: str, confirm: bool) -> 
     manifest["quarantined_files"] = moved_files
     manifest["quarantined_bytes"] = moved_bytes
     _atomic_json(manifest_path, manifest)
-    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": datetime.now(timezone.utc).isoformat(), "action": "quarantine_completed", "batch_id": batch_id, "files": moved_files, "bytes": moved_bytes})
+    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "quarantine_completed", "batch_id": batch_id, "files": moved_files, "bytes": moved_bytes})
     return {"ok": True, "batch_id": batch_id, "quarantined": moved_files, "bytes": moved_bytes, "no_op": False}
 
 
@@ -671,7 +687,7 @@ def list_batches(repo_root: Path | str) -> dict[str, Any]:
             "quarantined_count": states.count("quarantined"),
             "restored_count": states.count("restored"),
             "bytes": int(value.get("quarantined_bytes") or 0),
-            "purge_eligible": datetime.now(timezone.utc) >= deadline,
+            "purge_eligible": now_utc() >= deadline,
         })
     return {"ok": True, "batches": rows[:100], "count": len(rows[:100])}
 
@@ -716,7 +732,7 @@ def restore(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str,
         _atomic_json(manifest_path, manifest)
     manifest["status"] = "restored" if restored else manifest.get("status", "quarantined")
     _atomic_json(manifest_path, manifest)
-    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": datetime.now(timezone.utc).isoformat(), "action": "restore_completed", "batch_id": batch_id, "files": restored})
+    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "restore_completed", "batch_id": batch_id, "files": restored})
     return {"ok": True, "batch_id": batch_id, "restored": restored}
 
 
@@ -730,12 +746,46 @@ def purge(repo_root: Path | str, *, batch_id: str, confirm: bool) -> dict[str, A
         deadline = datetime.fromisoformat(str(manifest.get("restore_deadline") or ""))
     except ValueError as exc:
         raise TerminalLogRetentionError("terminal_log_deadline_invalid") from exc
-    if datetime.now(timezone.utc) < deadline:
+    if now_utc() < deadline:
         raise TerminalLogRetentionError("retention_undo_window_active")
     released = int(manifest.get("quarantined_bytes") or 0)
     shutil.rmtree(batch)
-    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": datetime.now(timezone.utc).isoformat(), "action": "purge_completed", "batch_id": batch_id, "bytes": released})
+    _append_audit(root, {"schema_id": AUDIT_SCHEMA_ID, "timestamp": now_utc().isoformat(), "action": "purge_completed", "batch_id": batch_id, "bytes": released})
     return {"ok": True, "batch_id": batch_id, "purged": True, "bytes": released}
+
+
+def _dead_owner_temp_gc(root: Path) -> tuple[int, int]:
+    """Remove only exact dead-owner request dirs under ``<repo>/.aiworkhub/temp``.
+
+    Identification (PID/start-time owner identity) is delegated to the
+    repository-local temp authority; this module performs the deletion as the
+    sole cleanup authority.  A live or unknown owner, a symlink, or any path
+    that escapes the temp root fails closed and is never touched.
+    """
+    count = 0
+    released = 0
+    try:
+        temp_root = runtime_temp.temp_root(root).resolve(strict=False)
+    except RuntimeError:
+        return 0, 0
+    for entry in runtime_temp.identify_dead_owner_dirs(root):
+        path = Path(entry.get("path") or "")
+        if not path.is_absolute():
+            continue
+        try:
+            resolved = path.resolve(strict=False)
+            if resolved.is_symlink() or not resolved.is_dir():
+                continue
+            resolved.relative_to(temp_root)
+        except (OSError, ValueError):
+            continue
+        try:
+            shutil.rmtree(resolved)
+        except OSError:
+            continue
+        count += 1
+        released += int(entry.get("bytes") or 0)
+    return count, released
 
 
 def enforce(repo_root: Path | str) -> dict[str, Any]:
@@ -743,6 +793,9 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
 
     Old active output enters reversible quarantine.  Permanent deletion is
     limited to batches whose independent seven-day undo window has expired.
+    The repository-local temp authority is reaped here too: this is the sole
+    cleanup authority, and only exact dead-owner request directories (never a
+    live or unknown owner) are removed.
     """
 
     root = Path(repo_root).resolve()
@@ -771,14 +824,18 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             quarantined_files = int(result.get("quarantined") or 0)
             quarantined_bytes = int(result.get("bytes") or 0)
             batch_id = str(result.get("batch_id") or "")
+
+        temp_gc_count, temp_gc_bytes = _dead_owner_temp_gc(root)
         _append_audit(root, {
             "schema_id": AUDIT_SCHEMA_ID,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now_utc().isoformat(),
             "action": "policy_enforcement_completed",
             "quarantined_files": quarantined_files,
             "quarantined_bytes": quarantined_bytes,
             "purged_batches": purged_batches,
             "purged_bytes": purged_bytes,
+            "temp_gc_count": temp_gc_count,
+            "temp_gc_bytes": temp_gc_bytes,
         })
         return {
             "ok": True,
@@ -789,6 +846,8 @@ def enforce(repo_root: Path | str) -> dict[str, Any]:
             "quarantined_bytes": quarantined_bytes,
             "purged_batches": purged_batches,
             "purged_bytes": purged_bytes,
+            "temp_gc_count": temp_gc_count,
+            "temp_gc_bytes": temp_gc_bytes,
         }
     finally:
         _enforcement_lock.release()
@@ -798,6 +857,7 @@ __all__ = [
     "TerminalLogRetentionError",
     "enforce",
     "list_batches",
+    "now_utc",
     "preview",
     "purge",
     "quarantine",

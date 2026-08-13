@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.48 — 2026-08-13
+
+### Fixed
+
+- Move request-scoped worker and validation temporary data under the current
+  repository's `.aiworkhub/temp` authority.
+- Keep concurrent repositories isolated and make retention distinguish pinned
+  review candidates from disposable or exact dead-owner artifacts.
+- Preserve fail-closed validation setup while making temporary HOME, caches
+  and executable scratch deterministic.
+
 ## 0.9.47 — 2026-08-13
 
 ### Fixed

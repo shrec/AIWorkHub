@@ -6,6 +6,26 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.48] - 2026-08-13
+
+### Fixed
+
+- Add a single repository-owned temporary-data authority under
+  `.aiworkhub/temp`, with request-scoped worker and validation directories,
+  exact owner identity, bounded retention and fail-closed path handling
+  (NF201).
+- Keep validation `HOME`, `TMPDIR`, Python caches and executable scratch
+  repository-local and isolated between concurrent repositories and requests
+  (NF201).
+- Preserve review/rework candidates until explicit disposition while exposing
+  protected retention rows and safely cleaning disposable or exact dead-owner
+  artifacts through the existing retention authority (NF201).
+
+### Validation
+
+- The complete NF201 focused suite passes from the checkpoint tree: 226 tests,
+  plus changed-file Ruff and `git diff --check`.
+
 ## [0.9.47] - 2026-08-13
 
 ### Fixed

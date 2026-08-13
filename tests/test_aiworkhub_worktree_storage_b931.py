@@ -12,10 +12,8 @@ state and prove the classification and the cleanup guarantees.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -167,10 +165,12 @@ def test_registration_scan_is_bounded_and_overflow_fails_closed(tmp_path, monkey
 
 
 def test_retention_age_policy_keeps_recent_safe_tree(worktrees) -> None:
-    safe = worktrees["base"] / "W_SAFE"
-    old = time.time() - 31 * 86400
-    os.utime(safe, (old, old))
     scan = ws.scan_worktrees(worktrees["base"])
+    # Express age directly on the scan record instead of mutating filesystem
+    # mtimes: the outer validation sandbox denies os.utime.
+    for wt in scan["worktrees"]:
+        if wt["id"] == "W_SAFE":
+            wt["age_seconds"] = 31 * 86400.0
 
     eligible = ws.plan_cleanup(scan, min_age_days=30)
     protected = ws.plan_cleanup(scan, min_age_days=32)

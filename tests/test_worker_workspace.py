@@ -1857,7 +1857,7 @@ def test_provision_validation_exec_scratch_skips_metadata_hostile_root(
     hostile.mkdir()
     portable.mkdir()
     monkeypatch.delenv(worker_workspace.VALIDATION_EXEC_SCRATCH_ROOT_ENV, raising=False)
-    monkeypatch.setenv(worker_workspace.RUNTIME_ROOT_ENV, str(hostile))
+    monkeypatch.setenv(worker_workspace.TEMP_ROOT_ENV, str(hostile))
     monkeypatch.setattr(
         worker_workspace, "_DEFAULT_EXEC_SCRATCH_ROOTS", (hostile, portable)
     )

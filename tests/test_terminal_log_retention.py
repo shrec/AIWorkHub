@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from aiworkhub import task_store, terminal_log_retention
+
+
+# A fixed far-future reference clock. Retention-age cutoffs derive from
+# ``terminal_log_retention.now_utc()``, so freezing it here makes every
+# just-written file (real mtime) already older than ``logs_days`` without ever
+# mutating filesystem timestamps (os.utime is denied in the outer validation
+# sandbox).
+_FROZEN_NOW = datetime(2035, 1, 1, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_retention_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(terminal_log_retention, "now_utc", lambda: _FROZEN_NOW)
 
 
 def _repo(tmp_path: Path) -> Path:
@@ -35,14 +47,12 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _run(repo: Path, request_id: str, task_id: str, *, age_days: int = 20) -> None:
+def _run(repo: Path, request_id: str, task_id: str) -> None:
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     process_root.mkdir(parents=True, exist_ok=True)
-    old = time.time() - age_days * 86400
     for suffix in terminal_log_retention._OWNED_SUFFIXES:
         path = process_root / f"{request_id}{suffix}"
         path.write_text(f"{request_id}\n", encoding="utf-8")
-        os.utime(path, (old, old))
     ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with ledger.open("a", encoding="utf-8") as handle:
@@ -72,8 +82,8 @@ def _run(repo: Path, request_id: str, task_id: str, *, age_days: int = 20) -> No
 def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):
-        _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20 + index)
-    _run(repo, "f" * 32, "TASK_REVIEW", age_days=100)
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
+    _run(repo, "f" * 32, "TASK_REVIEW")
 
     result = terminal_log_retention.preview(repo)
 
@@ -90,7 +100,7 @@ def test_preview_expires_all_old_finished_runs_and_protects_nonterminal_task(tmp
 def test_preview_is_paginated_but_digest_covers_full_candidate_set(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(75):
-        _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20)
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
 
     first = terminal_log_retention.preview(repo, limit=20)
     second = terminal_log_retention.preview(repo, cursor=20, limit=20)
@@ -110,7 +120,7 @@ def test_preview_is_paginated_but_digest_covers_full_candidate_set(tmp_path: Pat
 def test_policy_enforcement_automatically_quarantines_expired_output(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     request_id = "1" * 32
-    _run(repo, request_id, "TASK_DONE", age_days=20)
+    _run(repo, request_id, "TASK_DONE")
 
     result = terminal_log_retention.enforce(repo)
 
@@ -142,24 +152,34 @@ def test_preview_accounts_for_orphan_request_files_and_legacy_store(tmp_path: Pa
     assert result["protected_count"] == 2
 
 
-def test_preview_expires_aged_orphan_files_without_touching_recent_orphans(tmp_path: Path) -> None:
+def test_preview_expresses_orphan_age_without_mtime_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = _repo(tmp_path)
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     process_root.mkdir(parents=True, exist_ok=True)
-    old_id = "b" * 32
-    recent_id = "c" * 32
-    old_path = process_root / f"{old_id}.stdout.log"
-    recent_path = process_root / f"{recent_id}.stderr.log"
-    old_path.write_bytes(b"old")
-    recent_path.write_bytes(b"recent")
-    old = time.time() - 20 * 86400
-    os.utime(old_path, (old, old))
+    orphan_id = "b" * 32
+    orphan_path = process_root / f"{orphan_id}.stdout.log"
+    orphan_path.write_bytes(b"old")
 
-    result = terminal_log_retention.preview(repo)
+    # An aged orphan (mtime well before the frozen cutoff) is still protected,
+    # reported with the usage-capture-missing reason.
+    aged = terminal_log_retention.preview(repo)
+    assert aged["candidate_count"] == 0
+    assert {row["reason"] for row in aged["protected"]} == {
+        "usage_capture_receipt_missing"
+    }
 
-    assert result["candidate_count"] == 0
-    assert result["protected_count"] == 2
-    assert recent_id not in {row["request_id"] for row in result["candidates"]}
+    # A recent orphan (clock pinned at real write time) is protected with the
+    # retention-age-not-met reason instead.
+    monkeypatch.setattr(
+        terminal_log_retention, "now_utc", lambda: datetime.now(timezone.utc)
+    )
+    recent = terminal_log_retention.preview(repo)
+    assert recent["candidate_count"] == 0
+    assert {row["reason"] for row in recent["protected"]} == {
+        "orphan_retention_age_not_met"
+    }
 
 
 def test_aged_legacy_store_is_protected_without_usage_receipts(tmp_path: Path) -> None:
@@ -168,8 +188,6 @@ def test_aged_legacy_store_is_protected_without_usage_receipts(tmp_path: Path) -
     legacy.mkdir(parents=True)
     payload = legacy / "old.stdout.log"
     payload.write_bytes(b"legacy" * 1024)
-    old = time.time() - 20 * 86400
-    os.utime(payload, (old, old))
 
     preview = terminal_log_retention.preview(repo)
     assert preview["legacy_candidate"] is None
@@ -183,7 +201,6 @@ def test_usage_capture_backfill_is_idempotent_and_unblocks_retention(tmp_path: P
     request_id = "d" * 32
     process_root = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH
     process_root.mkdir(parents=True, exist_ok=True)
-    old = time.time() - 20 * 86400
     for suffix in terminal_log_retention._OWNED_SUFFIXES:
         path = process_root / f"{request_id}{suffix}"
         path.write_text(
@@ -191,7 +208,6 @@ def test_usage_capture_backfill_is_idempotent_and_unblocks_retention(tmp_path: P
             if suffix == ".stdout.log" else "run\n",
             encoding="utf-8",
         )
-        os.utime(path, (old, old))
     ledger = repo / terminal_log_retention.PROCESS_LOG_RELATIVE_PATH
     ledger.parent.mkdir(parents=True, exist_ok=True)
     ledger.write_text(json.dumps({
@@ -223,7 +239,7 @@ def test_usage_capture_backfill_is_idempotent_and_unblocks_retention(tmp_path: P
 def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):
-        _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20 + index)
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
     preview = terminal_log_retention.preview(repo)
 
     moved = terminal_log_retention.quarantine(
@@ -248,7 +264,7 @@ def test_terminal_log_quarantine_restore_and_explicit_purge_gate(tmp_path: Path)
 def test_stale_preview_and_symlink_swap_fail_closed(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     for index in range(11):
-        _run(repo, f"{index + 1:032x}", "TASK_DONE", age_days=20 + index)
+        _run(repo, f"{index + 1:032x}", "TASK_DONE")
     preview = terminal_log_retention.preview(repo)
     request_id = preview["candidates"][0]["request_id"]
     target = repo / terminal_log_retention.PROCESS_FILES_RELATIVE_PATH / f"{request_id}.stdout.log"
