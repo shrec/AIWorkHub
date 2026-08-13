@@ -644,6 +644,73 @@ def test_import_evidence_disambiguates_duplicate_cross_file_names(tmp_path):
         conn.close()
 
 
+def test_python_import_evidence_resolves_only_exact_function_calls(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(
+        repo / "pkg" / "helpers.py",
+        "def helper(value):\n    return value + 1\n\n"
+        "def unrelated(value):\n    return value - 1\n",
+    )
+    _write(
+        repo / "pkg" / "caller.py",
+        "import pkg.helpers as helpers\n"
+        "from pkg.helpers import unrelated\n\n"
+        "def run(value):\n"
+        "    helpers.helper(value)\n"
+        "    unrelated(value)\n"
+        "    obj.helper(value)\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        rows = conn.execute(
+            "SELECT line, dst_name, dst_qualname FROM edges "
+            "WHERE file_path='pkg/caller.py' AND kind='calls' ORDER BY line"
+        ).fetchall()
+        by_call: dict[tuple[int, str], set[str | None]] = {}
+        for row in rows:
+            by_call.setdefault(
+                (int(row["line"]), str(row["dst_name"])), set(),
+            ).add(row["dst_qualname"])
+        assert set(by_call) == {
+            (5, "helper"), (6, "unrelated"), (7, "helper"),
+        }
+        assert all(
+            target and target.endswith("pkg/helpers.py.helper")
+            for target in by_call[(5, "helper")]
+        )
+        assert all(
+            target and target.endswith("pkg/helpers.py.unrelated")
+            for target in by_call[(6, "unrelated")]
+        )
+        assert by_call[(7, "helper")] == {None}
+    finally:
+        conn.close()
+
+
+def test_python_import_resolution_stays_unresolved_when_target_is_ambiguous(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "a" / "helpers.py", "def helper():\n    return 1\n")
+    _write(repo / "b" / "helpers.py", "def helper():\n    return 2\n")
+    _write(
+        repo / "caller.py",
+        "import helpers\n\ndef run():\n    helpers.helper()\n",
+    )
+
+    sg.build_index(repo, incremental=False)
+    conn = sg.connect(sg.resolve_db_path(repo), read_only=True)
+    try:
+        row = conn.execute(
+            "SELECT dst_qualname FROM edges WHERE file_path='caller.py' "
+            "AND kind='calls' AND dst_name='helper'"
+        ).fetchone()
+        assert row is not None
+        assert row["dst_qualname"] is None
+    finally:
+        conn.close()
+
+
 def test_multi_term_find_and_indexed_body_modes_are_non_empty(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(

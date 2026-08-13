@@ -1138,6 +1138,109 @@ def _resolve_cpp_cross_file_edges(conn: sqlite3.Connection) -> int:
     return resolved
 
 
+def _resolve_python_imported_calls(
+    conn: sqlite3.Connection, repo_root: Path,
+) -> int:
+    """Bind Python calls only when imports and exact call syntax agree.
+
+    Python AST extraction intentionally leaves cross-file targets unresolved.
+    This pass resolves imported functions without guessing receiver types: a
+    direct call must name the imported symbol, while an attribute call must
+    use the exact local import alias on its recorded source line.  The target
+    must map to exactly one Python function in the imported module.
+    """
+
+    unresolved = conn.execute(
+        "SELECT e.id, e.file_path, e.line, e.dst_name, e.evidence_label "
+        "FROM edges e JOIN files f ON f.file_path=e.file_path "
+        "WHERE e.extractor=? AND f.language='python' AND e.kind='calls' "
+        "AND e.dst_qualname IS NULL AND e.evidence_label IN (?, ?) "
+        "ORDER BY e.id",
+        (sgast.EXTRACTOR_ID, sgast.EXTRACTED, sgast.INFERRED),
+    ).fetchall()
+    imports_by_file: dict[str, list[sqlite3.Row]] = {}
+    lines_by_file: dict[str, tuple[str, ...]] = {}
+    candidates_by_name: dict[str, list[sqlite3.Row]] = {}
+    resolved = 0
+
+    for edge in unresolved:
+        file_path = str(edge["file_path"])
+        imports = imports_by_file.get(file_path)
+        if imports is None:
+            imports = conn.execute(
+                "SELECT name, signature FROM entities WHERE file_path=? "
+                "AND kind='import' AND extractor=? ORDER BY id",
+                (file_path, sgast.EXTRACTOR_ID),
+            ).fetchall()
+            imports_by_file[file_path] = imports
+        if not imports:
+            continue
+
+        name = str(edge["dst_name"])
+        candidates = candidates_by_name.get(name)
+        if candidates is None:
+            candidates = conn.execute(
+                "SELECT e.file_path, e.qualname FROM entities e "
+                "JOIN files f ON f.file_path=e.file_path "
+                "WHERE e.name=? AND e.kind='function' AND f.language='python' "
+                "ORDER BY e.file_path, e.qualname",
+                (name,),
+            ).fetchall()
+            candidates_by_name[name] = candidates
+
+        matching_imports: list[str] = []
+        if str(edge["evidence_label"]) == sgast.EXTRACTED:
+            matching_imports = [
+                str(item["signature"])
+                for item in imports
+                if str(item["name"]) == name
+                and str(item["signature"]).lstrip(".").rsplit(".", 1)[-1] == name
+            ]
+        else:
+            lines = lines_by_file.get(file_path)
+            if lines is None:
+                try:
+                    lines = tuple(
+                        (repo_root / file_path).read_text(
+                            encoding="utf-8", errors="strict",
+                        ).splitlines()
+                    )
+                except (OSError, UnicodeError):
+                    lines = ()
+                lines_by_file[file_path] = lines
+            line_number = int(edge["line"] or 0)
+            source_line = lines[line_number - 1] if 0 < line_number <= len(lines) else ""
+            for item in imports:
+                alias = str(item["name"])
+                alias_call = re.compile(
+                    rf"\b{re.escape(alias)}(?:\s*\.\s*[A-Za-z_]\w*)*"
+                    rf"\s*\.\s*{re.escape(name)}\s*\("
+                )
+                if alias_call.search(source_line):
+                    matching_imports.append(str(item["signature"]))
+        if not matching_imports:
+            continue
+
+        matched_candidates = []
+        for candidate in candidates:
+            candidate_file = str(candidate["file_path"])
+            for target in matching_imports:
+                module_target = target
+                if target.lstrip(".").rsplit(".", 1)[-1] == name:
+                    module_target = target.rsplit(".", 1)[0]
+                if _import_target_matches_file(module_target, candidate_file):
+                    matched_candidates.append(candidate)
+                    break
+        if len(matched_candidates) != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE edges SET dst_qualname=? WHERE id=? AND dst_qualname IS NULL",
+            (matched_candidates[0]["qualname"], edge["id"]),
+        )
+        resolved += int(cur.rowcount or 0)
+    return resolved
+
+
 def _resolution_languages_compatible(source: str, target: str) -> bool:
     """Conservatively bound lexical resolution to interoperable families."""
 
@@ -1363,6 +1466,7 @@ def _build_index_locked(repo_root: Path, *, db_path: Path | None = None, increme
                     removed += 1
             if changed or removed:
                 _resolve_cpp_cross_file_edges(conn)
+                _resolve_python_imported_calls(conn, repo_root)
             sginsights.materialize_git_metrics(
                 conn, repo_root, sorted(seen_rel), limit=10000,
             )
