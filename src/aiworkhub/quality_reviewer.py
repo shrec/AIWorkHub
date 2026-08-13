@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
 
 from .evidence_levels import EvidenceLevel
@@ -178,6 +179,91 @@ def build_review_packet(
         "combined_tree_checks": checks(combined_tree_checks),
     }
     return {**body, "packet_sha256": _canonical_digest(body)}
+
+
+def _has_symlink_component(base: Path, relative: str) -> bool:
+    """Return True when any path component under ``base`` is a symlink.
+
+    ``Path.resolve`` follows symlinks, so a containment/is_file check run
+    after resolving can never reject a symlink whose target stays inside the
+    repository.  Each unresolved component is checked with ``lstat`` (via
+    ``Path.is_symlink``) before any resolution.
+    """
+
+    current = base
+    for part in relative.split("/"):
+        if not part:
+            continue
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def verify_review_packet_candidate(
+    packet_path: Path,
+    repo: Path,
+    *,
+    max_packet_bytes: int = 256 * 1024,
+) -> dict[str, Any]:
+    """Verify an on-disk review packet and its exact candidate file bytes.
+
+    This is the bounded, fail-closed verifier the reviewer Source Graph prewarm
+    consumes before any index build.  It re-checks the packet schema, canonical
+    digest, target identity, changed-path shape and containment, and re-hashes
+    every candidate file byte so a stale or tampered packet can never authorize
+    an index.  Raises ``ReviewerEvidenceError`` with a stable ``quality_review_*``
+    code on any mismatch.
+    """
+
+    try:
+        if packet_path.is_symlink() or not packet_path.is_file():
+            raise ReviewerEvidenceError("quality_review_packet_invalid")
+        if packet_path.stat().st_size > max_packet_bytes:
+            raise ReviewerEvidenceError("quality_review_packet_too_large")
+        packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    except ReviewerEvidenceError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewerEvidenceError("quality_review_packet_unreadable") from exc
+    if not isinstance(packet, dict) or packet.get("schema_id") != PACKET_SCHEMA_ID:
+        raise ReviewerEvidenceError("quality_review_packet_schema_mismatch")
+    packet_sha256 = str(packet.get("packet_sha256") or "")
+    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
+    if not _SHA256_RE.fullmatch(packet_sha256) or _canonical_digest(body) != packet_sha256:
+        raise ReviewerEvidenceError("quality_review_packet_digest_invalid")
+    target = packet.get("target") or {}
+    target_request_id = str(target.get("request_id") or "")
+    target_task_id = str(target.get("task_id") or "")
+    if not target_request_id or not target_task_id:
+        raise ReviewerEvidenceError("quality_review_packet_target_invalid")
+    rows = (packet.get("candidate") or {}).get("changed_paths") or []
+    if not isinstance(rows, list) or not rows:
+        raise ReviewerEvidenceError("quality_review_candidate_paths_missing")
+    resolved_repo = repo.resolve()
+    verified_paths: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ReviewerEvidenceError("quality_review_candidate_path_invalid")
+        relative = str(row.get("path") or "")
+        expected = str(row.get("sha256") or "")
+        if not relative or relative.startswith("/") or ".." in relative.split("/"):
+            raise ReviewerEvidenceError("quality_review_candidate_path_invalid")
+        candidate = resolved_repo / relative
+        if _has_symlink_component(resolved_repo, relative):
+            raise ReviewerEvidenceError("quality_review_candidate_path_symlink")
+        candidate = candidate.resolve()
+        if not candidate.is_relative_to(resolved_repo) or not candidate.is_file():
+            raise ReviewerEvidenceError("quality_review_candidate_path_missing")
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+            raise ReviewerEvidenceError("quality_review_candidate_hash_mismatch")
+        verified_paths.append({"path": relative, "sha256": expected})
+    return {
+        "packet_sha256": packet_sha256,
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "changed_paths": verified_paths,
+    }
 
 
 def verify_reviewer_receipt(
@@ -714,5 +800,6 @@ __all__ = [
     "build_review_packet",
     "build_review_prompt",
     "normalize_packet_findings",
+    "verify_review_packet_candidate",
     "verify_reviewer_receipt",
 ]

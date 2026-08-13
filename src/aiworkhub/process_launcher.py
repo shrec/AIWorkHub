@@ -4610,6 +4610,15 @@ class ProcessManager:
                         review_packet_path,
                         dict(quality_review_binding["packet"]),
                     )
+                    try:
+                        worker_ai_tools_mcp.prewarm_quality_review_source_graph(
+                            review_packet_path, repo=workspace.path,
+                        )
+                    except worker_ai_tools_mcp.WorkerToolError as exc:
+                        raise LaunchRejected(
+                            "quality_review_source_graph_prewarm_failed:"
+                            + str(exc)[:240]
+                        ) from exc
                 else:
                     workspace = create_workspace(self.repo, request_id, card, adapter_id)
                     residual_contract_manifest = build_residual_contract_manifest(

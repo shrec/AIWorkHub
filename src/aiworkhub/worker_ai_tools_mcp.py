@@ -92,7 +92,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 
 try:
     from .platform_io import chmod_fd
@@ -522,6 +522,7 @@ class AuthorityBinding:
 
 _STORAGE_REGISTRY_CACHE: dict[str, dict[str, Any]] = {}
 _SOURCE_GRAPH_DB_OVERRIDE_LOCK = threading.RLock()
+_CANDIDATE_SOURCE_GRAPH_META_KEY = "candidate_packet_binding"
 
 
 @contextmanager
@@ -543,70 +544,278 @@ def _with_source_graph_db(source_graph_module: Any, db_path: Path):
         yield
 
 
+def _verify_quality_review_packet_binding(
+    packet_path: Path,
+    repo: Path,
+) -> tuple[str, str, str, Path, list[dict[str, str]]]:
+    """Verify the packet digest, target identity and every changed-path byte.
+
+    Returns ``(packet_sha256, target_request_id, target_task_id, db_path,
+    changed_paths)`` where ``db_path`` is the packet-bound private overlay the
+    reviewer Source Graph reads from and ``changed_paths`` is the verified
+    ``[{"path": ..., "sha256": ...}]`` list.  The exact packet/candidate-byte
+    verification lives in
+    :func:`quality_reviewer.verify_review_packet_candidate` and is consumed
+    here by both the prewarm (build) path and the runtime (query-only) path,
+    so the two can never disagree about which bytes were authorized.
+    """
+
+    from . import quality_reviewer
+
+    try:
+        verified = quality_reviewer.verify_review_packet_candidate(
+            packet_path,
+            repo,
+            max_packet_bytes=MAX_QUALITY_REVIEW_PACKET_BYTES,
+        )
+    except quality_reviewer.ReviewerEvidenceError as exc:
+        raise WorkerToolError(str(exc)) from exc
+    packet_sha256 = verified["packet_sha256"]
+    target_request_id = verified["target_request_id"]
+    target_task_id = verified["target_task_id"]
+    changed_paths = verified["changed_paths"]
+    runtime_dir = packet_path.parent.resolve()
+    db_path = runtime_dir / f"candidate_source_graph_{packet_sha256[:16]}.sqlite"
+    return (
+        packet_sha256, target_request_id, target_task_id, db_path, changed_paths,
+    )
+
+
+def _candidate_db_marker_value(
+    packet_sha256: str, target_request_id: str, target_task_id: str,
+) -> str:
+    """Serialize the packet-bound marker stored in the overlay ``meta`` table."""
+
+    return json.dumps(
+        {
+            "packet_sha256": packet_sha256,
+            "target_request_id": target_request_id,
+            "target_task_id": target_task_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _read_candidate_db_marker(db_path: Path) -> dict[str, Any] | None:
+    """Read the packet-bound marker; ``None`` when missing or unreadable."""
+
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (_CANDIDATE_SOURCE_GRAPH_META_KEY,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_candidate_db_marker(
+    db_path: Path, packet_sha256: str, target_request_id: str, target_task_id: str,
+) -> None:
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                _CANDIDATE_SOURCE_GRAPH_META_KEY,
+                _candidate_db_marker_value(
+                    packet_sha256, target_request_id, target_task_id,
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES = (
+    "meta",
+    "files",
+    "entities",
+    "edges",
+    "entities_fts",
+)
+
+
+def _candidate_db_is_ready(
+    db_path: Path,
+    packet_sha256: str,
+    target_request_id: str,
+    target_task_id: str,
+    changed_paths: Sequence[Mapping[str, str]],
+) -> bool:
+    """True only when the overlay is schema-complete, non-empty and exactly
+    packet-bound for every changed path.
+
+    Marker-only readiness is insufficient: a partial, stale or tampered DB with
+    a correct marker must fail closed.  The database is opened read-only and
+    must (1) contain the Source Graph schema, (2) hold at least one indexed
+    ``files`` row, and (3) for every packet changed-path row the exact
+    ``file_path`` and ``source_hash`` must already be present.  This runs both
+    before ``os.replace`` and again on runtime binding, so publish and query
+    always agree on the same bytes.
+    """
+
+    try:
+        if not db_path.is_file() or db_path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    marker = _read_candidate_db_marker(db_path)
+    if marker is None:
+        return False
+    if (
+        str(marker.get("packet_sha256") or "") != packet_sha256
+        or str(marker.get("target_request_id") or "") != target_request_id
+        or str(marker.get("target_task_id") or "") != target_task_id
+    ):
+        return False
+    if not changed_paths:
+        return False
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+                )
+            }
+            if not set(_CANDIDATE_SOURCE_GRAPH_REQUIRED_TABLES).issubset(tables):
+                return False
+            count_row = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+            if count_row is None or int(count_row[0]) <= 0:
+                return False
+            for changed in changed_paths:
+                relative = str(changed.get("path") or "")
+                expected = str(changed.get("sha256") or "")
+                if not relative or not expected:
+                    return False
+                found = conn.execute(
+                    "SELECT source_hash FROM files WHERE file_path=?",
+                    (relative,),
+                ).fetchone()
+                if found is None or str(found[0]) != expected:
+                    return False
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return False
+    return True
+
+
+def prewarm_quality_review_source_graph(
+    packet_path: Path,
+    *,
+    repo: Path,
+) -> dict[str, Any]:
+    """Prebuild and atomically publish the packet-bound reviewer candidate index.
+
+    This is the only path that ever builds a reviewer candidate Source Graph
+    index.  The launcher calls it after the review packet is materialized and
+    before the reviewer provider is launched; runtime reviewer Source Graph
+    calls are query-only and never invoke ``build_index`` (the former
+    first-call wedge).  The overlay is built under the shared override lock to
+    a temporary sibling, verified non-empty and packet-bound, then published
+    atomically with ``os.replace``.
+    """
+
+    from . import source_graph as _source_graph_mod
+
+    packet_sha256, target_request_id, target_task_id, db_path, changed_paths = (
+        _verify_quality_review_packet_binding(packet_path, repo)
+    )
+    built = False
+    with _SOURCE_GRAPH_DB_OVERRIDE_LOCK:
+        if db_path.is_symlink():
+            raise WorkerToolError("quality_review_candidate_source_graph_symlink")
+        if not _candidate_db_is_ready(
+            db_path, packet_sha256, target_request_id, target_task_id,
+            changed_paths,
+        ):
+            temporary = db_path.parent / f".{db_path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                with _with_source_graph_db(_source_graph_mod, temporary):
+                    _source_graph_mod.build_index(
+                        repo, db_path=temporary, incremental=False,
+                    )
+                _write_candidate_db_marker(
+                    temporary, packet_sha256, target_request_id, target_task_id,
+                )
+                if not _candidate_db_is_ready(
+                    temporary, packet_sha256, target_request_id, target_task_id,
+                    changed_paths,
+                ):
+                    raise WorkerToolError(
+                        "quality_review_candidate_source_graph_empty"
+                    )
+                os.replace(temporary, db_path)
+                built = True
+            finally:
+                temporary.unlink(missing_ok=True)
+        if not _candidate_db_is_ready(
+            db_path, packet_sha256, target_request_id, target_task_id,
+            changed_paths,
+        ):
+            raise WorkerToolError("quality_review_candidate_source_graph_empty")
+    return {
+        "ok": True,
+        "built": built,
+        "db_path": str(db_path),
+        "authority_source": "candidate_overlay",
+        "authority_state": "quality_review_readonly",
+        "authority_repo": str(repo.resolve()),
+        "target_request_id": target_request_id,
+        "target_task_id": target_task_id,
+        "packet_sha256": packet_sha256,
+    }
+
+
 def _candidate_source_graph_binding(ctx: WorkerToolContext) -> AuthorityBinding | None:
-    """Build/return the exact packet-bound reviewer candidate index.
+    """Return the prebuilt packet-bound reviewer candidate index, query-only.
 
     Ordinary workers have no quality-review packet and return ``None``.  A
-    reviewer fails closed unless the packet digest, target identity and every
-    changed-path byte match the immutable combined worktree it was given.
-    Session Manager, AI Memory and KB deliberately remain canonical.
+    reviewer re-verifies the packet digest, target identity and every
+    changed-path byte against the immutable combined worktree, then reads the
+    overlay the launcher prewarmed with
+    :func:`prewarm_quality_review_source_graph`.  Missing, empty, mismatched or
+    corrupt overlays fail closed here -- this function never builds an index,
+    so a provider Source Graph call can never wedge on synchronous index
+    construction.
     """
 
     path = ctx.quality_review_packet_path
     if path is None:
         return None
-    from . import quality_reviewer, source_graph as _source_graph_mod
-
-    try:
-        if path.is_symlink() or not path.is_file():
-            raise WorkerToolError("quality_review_packet_invalid")
-        if path.stat().st_size > MAX_QUALITY_REVIEW_PACKET_BYTES:
-            raise WorkerToolError("quality_review_packet_too_large")
-        packet = json.loads(path.read_text(encoding="utf-8"))
-    except WorkerToolError:
-        raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WorkerToolError("quality_review_packet_unreadable") from exc
-    if not isinstance(packet, dict) or packet.get("schema_id") != quality_reviewer.PACKET_SCHEMA_ID:
-        raise WorkerToolError("quality_review_packet_schema_mismatch")
-    packet_sha256 = str(packet.get("packet_sha256") or "")
-    body = {key: value for key, value in packet.items() if key != "packet_sha256"}
-    if quality_reviewer._canonical_digest(body) != packet_sha256:
-        raise WorkerToolError("quality_review_packet_digest_invalid")
-    target = packet.get("target") or {}
-    target_request_id = str(target.get("request_id") or "")
-    target_task_id = str(target.get("task_id") or "")
-    if not target_request_id or not target_task_id:
-        raise WorkerToolError("quality_review_packet_target_invalid")
-    rows = (packet.get("candidate") or {}).get("changed_paths") or []
-    if not isinstance(rows, list) or not rows:
-        raise WorkerToolError("quality_review_candidate_paths_missing")
-    repo = ctx.repo.resolve()
-    for row in rows:
-        if not isinstance(row, dict):
-            raise WorkerToolError("quality_review_candidate_path_invalid")
-        relative = str(row.get("path") or "")
-        expected = str(row.get("sha256") or "")
-        if not relative or relative.startswith("/") or ".." in relative.split("/"):
-            raise WorkerToolError("quality_review_candidate_path_invalid")
-        candidate = (repo / relative).resolve()
-        if not candidate.is_relative_to(repo) or candidate.is_symlink() or not candidate.is_file():
-            raise WorkerToolError("quality_review_candidate_path_missing")
-        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
-            raise WorkerToolError("quality_review_candidate_hash_mismatch")
-
-    runtime_dir = path.parent.resolve()
-    db_path = runtime_dir / f"candidate_source_graph_{packet_sha256[:16]}.sqlite"
-    if not db_path.is_file() or db_path.stat().st_size <= 0:
-        with _with_source_graph_db(_source_graph_mod, db_path):
-            _source_graph_mod.build_index(repo, db_path=db_path, incremental=False)
-    if not db_path.is_file() or db_path.stat().st_size <= 0:
-        raise WorkerToolError("quality_review_candidate_source_graph_empty")
+    packet_sha256, target_request_id, target_task_id, db_path, changed_paths = (
+        _verify_quality_review_packet_binding(path, ctx.repo)
+    )
+    if db_path.is_symlink():
+        raise WorkerToolError("quality_review_candidate_source_graph_symlink")
+    if not _candidate_db_is_ready(
+        db_path, packet_sha256, target_request_id, target_task_id,
+        changed_paths,
+    ):
+        raise WorkerToolError("quality_review_candidate_source_graph_unavailable")
     return AuthorityBinding(
         db_path=db_path,
         authority_source="candidate_overlay",
         authority_state="quality_review_readonly",
-        authority_repo=repo,
+        authority_repo=ctx.repo.resolve(),
         target_request_id=target_request_id,
         target_task_id=target_task_id,
         packet_sha256=packet_sha256,

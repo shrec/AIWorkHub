@@ -104,6 +104,11 @@ def test_quality_reviewer_source_graph_uses_packet_bound_candidate_overlay(
     )
     packet_path = runtime / "quality_review_packet.json"
     packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    prewarm = worker_tools.prewarm_quality_review_source_graph(
+        packet_path, repo=candidate,
+    )
+    assert prewarm["ok"] is True
+    assert prewarm["built"] is True
     ctx = _ctx(runtime, repo=candidate, authority_repo=canonical, packet_path=packet_path)
     worker_tools._CACHE.clear()
 
@@ -321,3 +326,55 @@ def test_review_packet_escapes_control_character_path_in_hunk_header(
     assert 'path:"dir/weird\\n@@ injected\\u001f.py"' in row["excerpt"]
     assert raw_path not in row["excerpt"]
     assert "\n@@ injected" not in row["excerpt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks unavailable on Windows")
+def test_review_packet_rejects_inside_repo_symlink_candidate(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "real.py"
+    target.write_text("VALUE = 'real'\n", encoding="utf-8")
+    # A symlink whose target resolves INSIDE the repo must still be rejected:
+    # resolve()-then-is_symlink() would follow it and never see the link.
+    os.symlink(target, repo / "link.py")
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"link.py": digest},
+    )
+    packet_path = tmp_path / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError,
+        match="quality_review_candidate_path_symlink",
+    ):
+        quality_reviewer.verify_review_packet_candidate(packet_path, repo)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks unavailable on Windows")
+def test_review_packet_rejects_outside_repo_symlink_candidate(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("VALUE = 'outside'\n", encoding="utf-8")
+    os.symlink(outside, repo / "link.py")
+    digest = hashlib.sha256(outside.read_bytes()).hexdigest()
+    packet = quality_reviewer.build_review_packet(
+        request_id="target-request-1",
+        task_id="TARGET_TASK_1",
+        claim_epoch=1,
+        worker_provider="codex_cli",
+        changed_path_hashes={"link.py": digest},
+    )
+    packet_path = tmp_path / "quality_review_packet.json"
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+
+    with pytest.raises(
+        quality_reviewer.ReviewerEvidenceError,
+        match="quality_review_candidate_path_symlink",
+    ):
+        quality_reviewer.verify_review_packet_candidate(packet_path, repo)
