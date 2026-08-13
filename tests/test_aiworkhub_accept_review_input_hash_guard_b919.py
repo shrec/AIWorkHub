@@ -252,11 +252,19 @@ def test_path_manifest_missing_path_is_bounded_kind_missing(tmp_path: Path) -> N
 
 
 class _FakeWorkspace:
-    def __init__(self, repo: Path, request_id: str, path: Path, home: Path) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        request_id: str,
+        path: Path,
+        home: Path,
+        allowed_writes: object = (),
+    ) -> None:
         self.repo = repo
         self.request_id = request_id
         self.path = path
         self.home = home
+        self.allowed_writes = list(allowed_writes or ())
 
     @classmethod
     def from_metadata(cls, payload: dict) -> "_FakeWorkspace":
@@ -265,6 +273,7 @@ class _FakeWorkspace:
             request_id=str(payload["request_id"]),
             path=Path(payload["path"]),
             home=Path(payload["home"]),
+            allowed_writes=payload.get("allowed_writes", ()),
         )
 
     def as_metadata(self) -> dict:
@@ -273,6 +282,7 @@ class _FakeWorkspace:
             "request_id": self.request_id,
             "path": str(self.path),
             "home": str(self.home),
+            "allowed_writes": list(self.allowed_writes),
         }
 
 
@@ -679,22 +689,32 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
     ) = _fixture(monkeypatch, tmp_path)
     reviewer_request_id = "review-request-accepted"
     reviewer_task_id = "REVIEW_TASK_ACCEPTED"
-    receipt = {
+    reviewer_provider = "deepseek_v4pro"
+    reviewer_claim_epoch = 1
+
+    # The exact ProcessManager-sealed accepted-receipt contract enforced by
+    # NF131 (_enforce_quality_review_receipt_schema +
+    # _verified_accepted_quality_review_receipt): a positive bool-safe
+    # claim_epoch, a deterministic lowercase 64-hex submission_id, exactly-one
+    # physical/logical submission counts, exact target/reviewer/report/
+    # authority key sets with verified authority, and an empty read-only
+    # reviewer workspace whose card/binding are identically sealed.
+    signed_receipt = {
         "schema_id": process_launcher.quality_reviewer.RECEIPT_SCHEMA_ID,
         "packet_sha256": "a" * 64,
         "target": {
             "request_id": request_id,
             "task_id": task_id,
-            "claim_epoch": 0,
+            "claim_epoch": reviewer_claim_epoch,
         },
         "reviewer": {
             "request_id": reviewer_request_id,
             "task_id": reviewer_task_id,
-            "provider": "deepseek_v4pro",
+            "provider": reviewer_provider,
         },
         "report": {
             "lens": "correctness",
-            "provider": "deepseek_v4pro",
+            "provider": reviewer_provider,
             "read_only": True,
             "can_mutate_repo": False,
             "findings": [],
@@ -705,16 +725,58 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
             "terminal_state": "review_ready",
         },
     }
+    receipt = copy.deepcopy(signed_receipt)
+    receipt["submission_id"] = hashlib.sha256(
+        json.dumps(
+            signed_receipt,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt["physical_submission_count"] = 1
+    receipt["logical_submission_count"] = 1
+
+    reviewer_workspace = _FakeWorkspace(
+        repo=repo,
+        request_id=reviewer_request_id,
+        path=repo / "reviewer" / "workspace",
+        home=repo / "reviewer" / "home",
+        allowed_writes=(),
+    ).as_metadata()
+
     reviewer_card = {
         "task_id": reviewer_task_id,
         "topic": "quality_review",
         "status": "finished",
         "worker_status": "done",
         "accepted_request_id": reviewer_request_id,
+        "allowed_writes": [],
+        "required_outputs": [],
         "terminal_review": {
-            "evidence": {"quality_review_receipt": copy.deepcopy(receipt)}
+            "evidence": {
+                "quality_review_receipt": copy.deepcopy(receipt),
+                "workspace": reviewer_workspace,
+                "request_identity": {
+                    "request_id": reviewer_request_id,
+                    "task_id": reviewer_task_id,
+                    "runner": "reviewer",
+                    "topic": "quality_review",
+                },
+                "changed_paths": [],
+                "changed_path_hashes": {},
+                "quality_review": {
+                    "target_claim_epoch": reviewer_claim_epoch,
+                    "adapter_id": reviewer_provider,
+                },
+            },
         },
-        "accept_evidence": {"quality_review_receipt": copy.deepcopy(receipt)},
+        "accept_evidence": {
+            "quality_review_receipt": copy.deepcopy(receipt),
+            "promoted_paths": [],
+            "changed_paths": [],
+            "changed_path_hashes": {},
+        },
     }
 
     def show(task_id_arg: str) -> dict:
@@ -731,7 +793,7 @@ def test_target_acceptance_consumes_already_accepted_reviewer_receipt(
         "task_id": reviewer_task_id,
         "runner": "reviewer",
         "topic": "quality_review",
-        "adapter_id": "deepseek_v4pro",
+        "adapter_id": reviewer_provider,
         "state": "accepted",
         "accepted": True,
         "quality_review_receipt": receipt,
