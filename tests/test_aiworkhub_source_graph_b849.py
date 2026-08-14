@@ -711,6 +711,23 @@ def test_python_import_resolution_stays_unresolved_when_target_is_ambiguous(tmp_
         conn.close()
 
 
+def test_empty_relative_import_module_does_not_abort_index(tmp_path):
+    repo = _new_repo(tmp_path, "repo")
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "helper.py", "def helper():\n    return 1\n")
+    _write(
+        repo / "pkg" / "caller.py",
+        "from . import helper\n\ndef run():\n    return helper.helper()\n",
+    )
+
+    report = sg.build_index(repo, incremental=False)
+
+    assert report.files_seen == 3
+    assert sg._import_target_matches_file("", "pkg/helper.py") is False
+    assert sg._import_target_matches_file(".", "pkg/helper.py") is False
+    assert sg._import_target_matches_file("/", "pkg/helper.py") is False
+
+
 def test_multi_term_find_and_indexed_body_modes_are_non_empty(tmp_path):
     repo = _new_repo(tmp_path, "repo")
     _write(

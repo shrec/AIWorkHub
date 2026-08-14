@@ -1263,6 +1263,13 @@ def _import_target_matches_file(target: str, file_path: str) -> bool:
     normalized_file = str(file_path).strip().replace("\\", "/")
     target_path = Path(normalized_target)
     file_path_obj = Path(normalized_file)
+    # ``from . import symbol`` has an empty module component after the
+    # imported symbol is removed.  Converting that empty component through
+    # the generic dotted-target normalizer produces ``/``.  It carries no
+    # module identity, so fail closed instead of calling ``with_suffix`` on a
+    # filesystem root (which raises ``ValueError`` and aborts the full index).
+    if target_path.name in {"", ".", ".."} or file_path_obj.name in {"", ".", ".."}:
+        return False
     target_stem = target_path.stem.casefold()
     file_stem = file_path_obj.stem.casefold()
     # A bare include/module name may match by stem. Once the import carries a
