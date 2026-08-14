@@ -880,6 +880,126 @@ def test_sideband_rejects_wrong_uid_peer(harness, monkeypatch):
 # Duplicate suppression
 # ---------------------------------------------------------------------------
 
+
+class _LiveChildStub:
+    def poll(self):
+        return None
+
+
+def _dispatch_only_mux(tmp_path: Path) -> AppServerMux:
+    mux = AppServerMux(
+        ["app-server", "--listen", "stdio://"],
+        real_executable=[sys.executable, "unused"],
+        sideband_dir=tmp_path / "sideband",
+        repo_id=None,
+        deferred_repo_binding=True,
+    )
+    mux._child = _LiveChildStub()
+    mux._child_epoch = "epoch-1"
+    mux._ready_event.set()
+    return mux
+
+
+def test_concurrent_sideband_responses_route_out_of_order_to_exact_owner(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[dict] = []
+    lock = threading.Lock()
+
+    def write(raw: bytes) -> None:
+        with lock:
+            written.append(json.loads(raw))
+            if len(written) != 2:
+                return
+            first, second = written
+        for request in (second, first):
+            response = {
+                "id": request["id"],
+                "result": {"thread": {"id": request["params"]["threadId"]}},
+            }
+            assert mux._route_child_message(
+                (json.dumps(response) + "\n").encode("utf-8")
+            ) is True
+
+    mux._write_to_child = write
+    results: dict[str, dict] = {}
+    barrier = threading.Barrier(2)
+
+    def call(thread_id: str) -> None:
+        barrier.wait(timeout=5)
+        results[thread_id] = mux.dispatch_sideband(
+            "thread/resume", {"threadId": thread_id}
+        )
+
+    threads = [threading.Thread(target=call, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(written) == 2
+    assert {row["id"] for row in written} == {
+        f"{app_server_mux.SIDEBAND_ID_PREFIX}epoch-1-1",
+        f"{app_server_mux.SIDEBAND_ID_PREFIX}epoch-1-2",
+    }
+    assert results["a"]["result"]["thread"]["id"] == "a"
+    assert results["b"]["result"]["thread"]["id"] == "b"
+
+
+def test_late_sideband_response_is_consumed_not_forwarded(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    raw = json.dumps({
+        "id": f"{app_server_mux.SIDEBAND_ID_PREFIX}expired-9",
+        "result": {"ok": True},
+    }).encode("utf-8") + b"\n"
+
+    assert mux._route_child_message(raw) is True
+
+
+def test_concurrent_identical_sideband_calls_share_one_child_write(tmp_path):
+    mux = _dispatch_only_mux(tmp_path)
+    written: list[dict] = []
+    wrote = threading.Event()
+
+    def write(raw: bytes) -> None:
+        written.append(json.loads(raw))
+        wrote.set()
+
+    mux._write_to_child = write
+    results: list[dict] = []
+    barrier = threading.Barrier(2)
+
+    def call() -> None:
+        barrier.wait(timeout=5)
+        results.append(mux.dispatch_sideband(
+            "thread/resume", {"threadId": "same"}
+        ))
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert wrote.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if sum(thread.is_alive() for thread in threads) == 2:
+            break
+        time.sleep(0.001)
+    assert len(written) == 1
+    response = {
+        "id": written[0]["id"],
+        "result": {"thread": {"id": "same"}},
+    }
+    assert mux._route_child_message(
+        (json.dumps(response) + "\n").encode("utf-8")
+    ) is True
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(written) == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+
 def test_sideband_duplicate_request_is_suppressed_not_redelivered(harness, monkeypatch):
     harness.do_handshake()
     calls = {"n": 0}

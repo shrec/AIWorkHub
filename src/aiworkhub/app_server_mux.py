@@ -222,6 +222,7 @@ SIDEBAND_ALLOWED_METHODS = frozenset({"thread/resume", "turn/steer", "turn/start
 REPOSITORY_CONTEXT_METHODS = frozenset(
     {"thread/start", "thread/resume", "thread/fork", "turn/start"}
 )
+SIDEBAND_ID_PREFIX = "aiworkhub-sideband-"
 
 
 def _create_manager_transcript_capture(repo_id: str, extension_host_pid: int) -> Any | None:
@@ -1107,8 +1108,14 @@ def describe_sideband_owner_freshness(
     }
 
 
-def _dedup_key(method: str, params: dict[str, Any]) -> str:
-    raw = method + ":" + json.dumps(params, ensure_ascii=False, sort_keys=True)
+def _dedup_key(child_epoch: str, method: str, params: dict[str, Any]) -> str:
+    raw = (
+        child_epoch
+        + ":"
+        + method
+        + ":"
+        + json.dumps(params, ensure_ascii=False, sort_keys=True)
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -1213,6 +1220,7 @@ class AppServerMux:
         self._child: subprocess.Popen[bytes] | None = None
         self._child_job_handle: int | None = None
         self._child_write_lock = threading.Lock()
+        self._child_epoch = ""
 
         self._pending_by_id: dict[str, _PendingSidebandCall] = {}
         self._pending_lock = threading.Lock()
@@ -1254,6 +1262,8 @@ class AppServerMux:
 
         self._dedup_lock = threading.Lock()
         self._dedup_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._in_flight_lock = threading.Lock()
+        self._in_flight: dict[str, threading.Event] = {}
         self._transcript_capture = (
             _create_manager_transcript_capture(self._repo_id, self._parent_pid)
             if self._repo_id
@@ -1317,6 +1327,12 @@ class AppServerMux:
             cwd=str(self._repo_root) if self._repo_root is not None else None,
         )
         self._child_job_handle = _bind_child_lifetime_to_this_process(self._child)
+        child_start = _proc_start_time(self._child.pid)
+        self._child_epoch = (
+            f"{self._generation_id}-{self._child.pid}-{child_start}"
+            if child_start is not None
+            else f"{self._generation_id}-{self._child.pid}"
+        )
         self._start_thread(self._pump_extension_to_child)
         self._start_thread(self._pump_child_to_extension)
         if self._repo_id:
@@ -1592,6 +1608,11 @@ class AppServerMux:
             waiter.response = msg
             waiter.event.set()
             return True
+        if isinstance(msg_id, str) and msg_id.startswith(SIDEBAND_ID_PREFIX):
+            # A response from an expired/failed sideband flight belongs to no
+            # extension request.  Consuming it prevents a lost acknowledgement
+            # from poisoning the extension client's correlation state.
+            return True
         with self._handshake_lock:
             if msg_id == self._pending_initialize_id and "result" in msg:
                 self._seen_initialize_success = True
@@ -1633,7 +1654,7 @@ class AppServerMux:
         with self._pending_lock:
             self._next_sideband_seq += 1
             seq = self._next_sideband_seq
-        return f"aiworkhub-sideband-{uuid.uuid4().hex}-{seq}"
+        return f"{SIDEBAND_ID_PREFIX}{self._child_epoch}-{seq}"
 
     def dispatch_sideband(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method not in SIDEBAND_ALLOWED_METHODS:
@@ -1645,10 +1666,43 @@ class AppServerMux:
         if self._child is None or self._child.poll() is not None:
             raise SidebandNotReady("child_app_server_not_running")
 
-        key = _dedup_key(method, params)
+        key = _dedup_key(self._child_epoch, method, params)
         cached = self._dedup_lookup(key)
         if cached is not None:
             return cached
+
+        with self._in_flight_lock:
+            flight = self._in_flight.get(key)
+            if flight is None:
+                flight = threading.Event()
+                self._in_flight[key] = flight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            arrived = flight.wait(SIDEBAND_REQUEST_DEADLINE_SECONDS)
+            cached = self._dedup_lookup(key)
+            if cached is not None:
+                return cached
+            if not arrived:
+                raise SidebandNotReady("sideband_response_timeout")
+            raise SidebandNotReady("sideband_owner_failed")
+
+        try:
+            return self._dispatch_sideband_owner(method, params, key)
+        finally:
+            with self._in_flight_lock:
+                self._in_flight.pop(key, None)
+            flight.set()
+
+    def _dispatch_sideband_owner(
+        self,
+        method: str,
+        params: dict[str, Any],
+        key: str,
+    ) -> dict[str, Any]:
+        """Send exactly one owner flight; callers with the same key coalesce."""
 
         wire_id = self._next_sideband_id()
         waiter = _PendingSidebandCall()
