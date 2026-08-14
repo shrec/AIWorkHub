@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.53] - 2026-08-14
+
+### Added
+
+- Resolve Python cross-file function calls only when exact import alias,
+  source-line call syntax and one canonical Python target agree.
+- Expand balanced Rust `use` trees, including nested braces, visibility,
+  aliases, `self` and glob leaves while retaining lexical authority.
+
+### Safety
+
+- Unrelated Python receivers, ambiguous targets and malformed Rust use trees
+  remain explicitly unresolved instead of receiving guessed graph edges.
+
+### Validation
+
+- The combined Source Graph, adaptive parallelism and validation-portability
+  regression family passes: 314 passed and 5 skipped.
+
 ## [0.9.52] - 2026-08-13
 
 ### Fixed

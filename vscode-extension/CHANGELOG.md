@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.53 — 2026-08-14
+
+### Added
+
+- Bind Python imported-function calls only from exact, unambiguous evidence.
+- Expand nested Rust `use` trees without overstating lexical parser authority.
+
 ## 0.9.52 — 2026-08-13
 
 ### Fixed

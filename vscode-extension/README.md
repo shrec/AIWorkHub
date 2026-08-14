@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.52
+## What's new in 0.9.53
 
-- Slow full dashboard aggregation now reports **Snapshot delayed** while the
-  MCP connection remains available and the last truthful data stays visible.
-- Full snapshots use a dedicated request budget and no longer trigger an
-  immediate retry storm under repository load.
+- Python imported calls now receive cross-file targets only from exact,
+  unambiguous import and call-site evidence.
+- Rust Source Graph extraction now expands nested `use` trees, visibility,
+  aliases, `self` and glob imports while remaining truthfully lexical.
 
 See the packaged **Changelog** for the complete release summary.
 
