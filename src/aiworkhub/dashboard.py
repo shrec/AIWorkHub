@@ -10,6 +10,7 @@ owns only the pure, repository-bound snapshot/detail builders that
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -198,8 +199,19 @@ def _portable_path(value: Any, limit: int = 500) -> str:
 def _bounded_int(value: Any) -> int:
     try:
         return int(value or 0)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return 0
+
+
+def _bounded_nonnegative_float(value: Any) -> float | None:
+    """Parse one finite non-negative telemetry value without raising."""
+    try:
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
 
 
 def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -224,6 +236,11 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
         and not isinstance(usage, Mapping)
     ):
         return {}
+    usage_cost = (
+        _bounded_nonnegative_float(usage.get("cost_usd"))
+        if isinstance(usage, Mapping)
+        else None
+    )
 
     by_name: dict[str, dict[str, Any]] = {}
     if isinstance(context, Mapping):
@@ -554,8 +571,9 @@ def _compact_ai_infra(event: Mapping[str, Any]) -> dict[str, Any]:
             "model_observed": bool(usage.get("model_observed")),
             "usage_observed": bool(usage.get("usage_observed")),
             "cache_metrics_observed": bool(usage.get("cache_metrics_observed")),
-            "cost_usd": max(0.0, float(usage.get("cost_usd") or 0.0)),
-            "cost_observed": bool(usage.get("cost_observed")),
+            "cost_usd": usage_cost if usage_cost is not None else 0.0,
+            "cost_observed": bool(usage.get("cost_observed"))
+            and usage_cost is not None,
         } if isinstance(usage, Mapping) else {},
         "tool_use": tool_use,
     }
@@ -1811,19 +1829,27 @@ def _cost_totals(ledger: Mapping[str, Any] | None) -> dict[str, Any]:
     for bucket in by_runner.values():
         if not isinstance(bucket, Mapping):
             continue
-        totals["records"] += int(bucket.get("records") or 0)
-        totals["input_tokens"] += int(bucket.get("input_tokens") or 0)
-        totals["output_tokens"] += int(bucket.get("output_tokens") or 0)
-        totals["total_tokens"] += int(bucket.get("total_tokens") or 0)
-        totals["cost_usd"] += float(bucket.get("cost_usd") or 0.0)
-        totals["cost_known_records"] += int(bucket.get("cost_known_records") or 0)
-        totals["cost_unknown_records"] += int(bucket.get("cost_unknown_records") or 0)
-        totals["tokens_with_unknown_cost"] += int(bucket.get("tokens_with_unknown_cost") or 0)
-        totals["usage_observed_records"] += int(
-            bucket.get("usage_observed_records") or 0
+        totals["records"] += _bounded_int(bucket.get("records"))
+        totals["input_tokens"] += _bounded_int(bucket.get("input_tokens"))
+        totals["output_tokens"] += _bounded_int(bucket.get("output_tokens"))
+        totals["total_tokens"] += _bounded_int(bucket.get("total_tokens"))
+        cost = _bounded_nonnegative_float(bucket.get("cost_usd"))
+        if cost is not None:
+            totals["cost_usd"] += cost
+        totals["cost_known_records"] += _bounded_int(
+            bucket.get("cost_known_records")
         )
-        totals["usage_unknown_records"] += int(
-            bucket.get("usage_unknown_records") or 0
+        totals["cost_unknown_records"] += _bounded_int(
+            bucket.get("cost_unknown_records")
+        )
+        totals["tokens_with_unknown_cost"] += _bounded_int(
+            bucket.get("tokens_with_unknown_cost")
+        )
+        totals["usage_observed_records"] += _bounded_int(
+            bucket.get("usage_observed_records")
+        )
+        totals["usage_unknown_records"] += _bounded_int(
+            bucket.get("usage_unknown_records")
         )
     totals["cost_usd"] = round(totals["cost_usd"], 6)
     totals["cost_complete"] = totals["cost_unknown_records"] == 0

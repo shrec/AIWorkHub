@@ -395,6 +395,41 @@ def test_build_snapshot_combines_read_sources_and_operational_summaries():
     ]
 
 
+@pytest.mark.parametrize("malformed", ["n/a", "NaN", "Infinity", float("inf")])
+def test_malformed_numeric_telemetry_does_not_blank_healthy_fields(malformed):
+    compact = dashboard._compact_ai_infra({  # noqa: SLF001
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": "bad",
+            "observed_model": "provider/model",
+            "model_observed": True,
+            "usage_observed": True,
+            "cost_usd": malformed,
+            "cost_observed": True,
+        }
+    })
+
+    assert compact["usage"]["input_tokens"] == 12
+    assert compact["usage"]["output_tokens"] == 0
+    assert compact["usage"]["observed_model"] == "provider/model"
+    assert compact["usage"]["cost_usd"] == 0.0
+    assert compact["usage"]["cost_observed"] is False
+
+    totals = dashboard._cost_totals({  # noqa: SLF001
+        "aggregates": {"by_runner": {
+            "healthy": {"records": 1, "total_tokens": 12, "cost_usd": 0.25},
+            "malformed": {
+                "records": "bad",
+                "total_tokens": float("inf"),
+                "cost_usd": malformed,
+            },
+        }}
+    })
+    assert totals["records"] == 1
+    assert totals["total_tokens"] == 12
+    assert totals["cost_usd"] == 0.25
+
+
 def test_project_context_telemetry_uses_latest_run_per_task():
     report = {
         "processes": [
