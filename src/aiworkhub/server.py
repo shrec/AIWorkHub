@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import inspect
 import json
+import os
 import sys
 import threading
 import types
@@ -14,9 +17,11 @@ from typing import Any, Literal
 from . import roadmap_store, task_store
 from .tool_recovery import unknown_tool_message
 
+_MCP_SDK_AVAILABLE = True
 try:
     from mcp.server.fastmcp import FastMCP
 except ModuleNotFoundError:
+    _MCP_SDK_AVAILABLE = False
     # ------------------------------------------------------------------
     # Bounded, dependency-free MCP stdio fallback.
     #
@@ -238,67 +243,112 @@ except ModuleNotFoundError:
         # host locale (for example Windows cp1251 cannot encode Georgian).
         # Always emit explicit UTF-8 bytes and bypass locale transcoding.
         stdout = sys.stdout.buffer
-        while True:
-            line = stdin.readline(_FALLBACK_MAX_LINE_BYTES + 1)
-            if line == b"":
+        write_lock = threading.Lock()
+        transport_closed = threading.Event()
+
+        def write(message: dict[str, Any]) -> None:
+            if transport_closed.is_set():
                 return
-            oversized = len(line) > _FALLBACK_MAX_LINE_BYTES
-            if oversized and not line.endswith(b"\n"):
-                while True:
-                    remainder = stdin.readline(_FALLBACK_MAX_LINE_BYTES + 1)
-                    if remainder == b"" or remainder.endswith(b"\n"):
-                        break
-            if oversized:
-                _stdio_write_message(stdout, {
-                    "jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32600, "message": "request_too_large"},
-                })
-                continue
-            line = line.rstrip(b"\r\n")
-            if not line.strip():
-                continue
             try:
-                message = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                _stdio_write_message(stdout, {
-                    "jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32700, "message": "parse_error"},
-                })
-                continue
-            if not isinstance(message, dict):
-                _stdio_write_message(stdout, {
-                    "jsonrpc": "2.0", "id": None,
-                    "error": {"code": -32600, "message": "invalid_request"},
-                })
-                continue
-            has_id = "id" in message
+                with write_lock:
+                    _stdio_write_message(stdout, message)
+            except _StdioTransportClosed:
+                transport_closed.set()
+
+        def dispatch_request(message: dict[str, Any]) -> None:
             msg_id = message.get("id")
             method = message.get("method")
             params = message.get("params") if message.get("params") is not None else {}
             try:
                 result = _stdio_dispatch(name, tools, method, params, instructions)
             except _StdioProtocolError as exc:
-                if has_id:
-                    _stdio_write_message(stdout, {
-                        "jsonrpc": "2.0", "id": msg_id,
-                        "error": {"code": exc.code, "message": exc.message},
-                    })
-                continue
-            except Exception as exc:  # defensive: never let one bad request kill the loop
+                write({
+                    "jsonrpc": "2.0", "id": msg_id,
+                    "error": {"code": exc.code, "message": exc.message},
+                })
+                return
+            except Exception as exc:  # defensive: one request never kills the lane
                 _stdio_log(
                     "request_failed",
                     request_id=msg_id,
                     method=method,
                     error_type=type(exc).__name__,
                 )
-                if has_id:
-                    _stdio_write_message(stdout, {
-                        "jsonrpc": "2.0", "id": msg_id,
-                        "error": {"code": -32603, "message": f"internal_error:{type(exc).__name__}"},
+                write({
+                    "jsonrpc": "2.0", "id": msg_id,
+                    "error": {
+                        "code": -32603,
+                        "message": f"internal_error:{type(exc).__name__}",
+                    },
+                })
+                return
+            write({"jsonrpc": "2.0", "id": msg_id, "result": result})
+
+        # Tool calls may legitimately wait on providers or repository locks.
+        # Keep the reader and lightweight status calls serviceable while those
+        # calls run, with capacity derived from this host and a conservative
+        # upper bound. JSON-RPC permits responses to arrive out of order; the
+        # immutable request id remains the exact correlation authority.
+        max_workers = max(4, min(32, os.cpu_count() or 4))
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="aiworkhub-mcp-tool",
+        )
+        try:
+            while not transport_closed.is_set():
+                line = stdin.readline(_FALLBACK_MAX_LINE_BYTES + 1)
+                if line == b"":
+                    return
+                oversized = len(line) > _FALLBACK_MAX_LINE_BYTES
+                if oversized and not line.endswith(b"\n"):
+                    while True:
+                        remainder = stdin.readline(_FALLBACK_MAX_LINE_BYTES + 1)
+                        if remainder == b"" or remainder.endswith(b"\n"):
+                            break
+                if oversized:
+                    write({
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32600, "message": "request_too_large"},
                     })
-                continue
-            if has_id:
-                _stdio_write_message(stdout, {"jsonrpc": "2.0", "id": msg_id, "result": result})
+                    continue
+                line = line.rstrip(b"\r\n")
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    write({
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32700, "message": "parse_error"},
+                    })
+                    continue
+                if not isinstance(message, dict):
+                    write({
+                        "jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32600, "message": "invalid_request"},
+                    })
+                    continue
+                if "id" not in message:
+                    # Notifications have no response and are intentionally
+                    # cheap; preserve their input order before later calls.
+                    try:
+                        _stdio_dispatch(
+                            name,
+                            tools,
+                            message.get("method"),
+                            message.get("params") or {},
+                            instructions,
+                        )
+                    except Exception as exc:
+                        _stdio_log(
+                            "notification_failed",
+                            method=message.get("method"),
+                            error_type=type(exc).__name__,
+                        )
+                    continue
+                executor.submit(dispatch_request, message)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=False)
 
     class FastMCP:  # type: ignore[no-redef]
         """Bounded stdlib MCP stdio server, used when the `mcp` package is absent."""
@@ -362,6 +412,42 @@ except TypeError:
     # name-only constructor.  Keep startup fail-open; the identical mandatory
     # contract remains available through aiworkhub_manager_bootstrap.
     mcp = FastMCP("AIWorkHub MCP")
+
+
+if _MCP_SDK_AVAILABLE:
+    _sdk_tool_decorator = mcp.tool
+
+    def _nonblocking_mcp_tool(*decorator_args: Any, **decorator_kwargs: Any):
+        """Register sync MCP tools without blocking the SDK event loop.
+
+        MCP's FastMCP currently awaits async functions but invokes synchronous
+        functions inline. AIWorkHub tools are intentionally synchronous and a
+        launch/finalization call may take minutes, so inline invocation makes
+        unrelated status, dashboard and bootstrap requests time out behind it.
+        Register an async adapter while returning the original function to
+        preserve direct Python callers and tests.
+        """
+
+        register = _sdk_tool_decorator(*decorator_args, **decorator_kwargs)
+
+        def decorate(function: Any) -> Any:
+            if inspect.iscoroutinefunction(function):
+                register(function)
+                return function
+
+            @wraps(function)
+            async def run_in_worker_thread(*args: Any, **kwargs: Any) -> Any:
+                return await asyncio.to_thread(function, *args, **kwargs)
+
+            register(run_in_worker_thread)
+            return function
+
+        return decorate
+
+    # All following @mcp.tool registrations use the non-blocking adapter.
+    # The stdlib fallback has its own bounded executor above and keeps the
+    # original synchronous registration path.
+    mcp.tool = _nonblocking_mcp_tool  # type: ignore[method-assign]
 
 
 _TASK_LIFECYCLE_WRITE_LOCK = threading.RLock()
