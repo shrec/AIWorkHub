@@ -12,14 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.60
+## What's new in 0.9.61
 
-- Concurrent correctness, security and code-quality reviewers now share one
-  per-target packet preparation while retaining distinct launch identities.
-- Linux secure validation now uses a bounded, observable seccomp listener
-  handoff that fails closed without leaking or silently downgrading authority.
-- MCP stdio retains the bounded parallel backend introduced in 0.9.59, so
-  unrelated calls stay responsive while providers and reviewers run.
+- Reviewer packet preparation now publishes bounded progress phases and no
+  longer makes exact status reads wait behind a silent pid-null reservation.
+- A wedged pre-provider packet build terminalizes all single-flight waiters
+  truthfully; live model processes remain governed by provider/process terminal
+  evidence rather than elapsed time.
+- Concurrent correctness, security and code-quality reviews still reuse one
+  immutable target packet while retaining distinct launch identities.
 
 - Malformed empty-string/non-object MCP parameters are rejected before
   dispatch with a bounded redacted protocol alert.

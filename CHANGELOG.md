@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.61] - 2026-08-14
+
+### Fixed
+
+- Bound pre-provider quality-review packet preparation independently from
+  provider runtime, so a silent or wedged packet build terminalizes every
+  pid-null reservation truthfully without imposing a model timeout.
+- Publish exact preparation phases and heartbeats under the existing reviewer
+  request identity while keeping status reads bounded and non-blocking.
+- Preserve single-flight packet reuse, distinct reviewer launches and
+  exactly-once failure propagation across all three review lenses.
+
+### Validation
+
+- Reviewer reservation and related launcher/reviewer suites: 47 passed.
+- Ruff, mypy and whitespace checks pass.
+
 ## [0.9.60] - 2026-08-14
 
 ### Fixed

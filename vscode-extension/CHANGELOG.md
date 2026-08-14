@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.61 — 2026-08-14
+
+### Fixed
+
+- Surface live reviewer preparation phases without blocking independent status
+  reads while an expensive packet is built.
+- Bound only the pid-null pre-provider preparation stage and preserve the
+  no-elapsed-timeout contract once a model process exists.
+- Terminalize all single-flight waiters exactly once when packet preparation
+  cannot complete.
+
 ## 0.9.60 — 2026-08-14
 
 ### Fixed
