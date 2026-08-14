@@ -12,7 +12,13 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.58
+## What's new in 0.9.59
+
+- MCP stdio now uses AIWorkHub's bounded parallel backend across the dashboard
+  and stable Codex/Claude/Copilot registrations, keeping unrelated calls
+  responsive while providers or reviewers run.
+- Bare empty-parameter `-32602` episodes are rejected and recorded at the
+  protocol boundary instead of leaving the shared MCP lane poisoned.
 
 - Malformed empty-string/non-object MCP parameters are rejected before
   dispatch with a bounded redacted protocol alert.

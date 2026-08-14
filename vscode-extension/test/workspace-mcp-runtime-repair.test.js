@@ -51,6 +51,7 @@ const {
   assert.strictEqual(result.changed, true);
   assert.strictEqual(result.document.servers.AIWorkHub.command, "python3");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO, "/repo/fresh");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
 }
 
 {
@@ -60,6 +61,7 @@ const {
   );
   assert.strictEqual(result.changed, true);
   assert.deepStrictEqual(result.document.mcpServers.AIWorkHub.args, ["-m", "aiworkhub.server"]);
+  assert.strictEqual(result.document.mcpServers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
 }
 
 {
@@ -110,6 +112,7 @@ const {
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_REPO_ROOT, "/repo/current");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_WRITES, "1");
   assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_ALLOW_LAUNCH, "1");
+  assert.strictEqual(result.document.servers.AIWorkHub.env.AIWORKHUB_MCP_STDIO_BACKEND, "stdlib");
 }
 
 {
@@ -124,6 +127,7 @@ const {
           AIWORKHUB_REPO_ROOT: "C:\\src\\project",
           AIWORKHUB_ALLOW_WRITES: "1",
           AIWORKHUB_ALLOW_LAUNCH: "1",
+          AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
         },
         type: "stdio",
       },

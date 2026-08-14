@@ -4,6 +4,8 @@ import builtins
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,6 +14,25 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from aiworkhub import server  # noqa: E402
+
+
+def test_stdlib_backend_can_be_selected_even_when_sdk_is_installed() -> None:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_SRC)
+    env["AIWORKHUB_MCP_STDIO_BACKEND"] = "stdlib"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from aiworkhub import server; print(server._MCP_SDK_AVAILABLE)",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert completed.stdout.strip() == "False"
 
 
 def test_manager_archive_and_supersede_tools_are_write_gated(monkeypatch) -> None:

@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.59] - 2026-08-14
+
+### Fixed
+
+- Run all extension-owned and stable Codex/Claude/Copilot MCP stdio lanes on
+  the bounded parallel backend instead of the SDK lane that could remain
+  poisoned after a bare `-32602 Invalid request parameters("")` response.
+- Keep long-running tool calls isolated with per-request correlation and a
+  locked response writer, while malformed parameters fail before dispatch and
+  produce a bounded repository-local protocol alert.
+- Recognize the exact live empty-detail `Invalid request parameters("")`
+  shape in the dashboard client's owned-child recovery path.
+
+### Validation
+
+- MCP backend, packaged-runtime and protocol tests: 30 passed.
+- Workspace/Codex configuration and reloadless recovery Node tests pass.
+- Changed-file Ruff and whitespace checks pass.
+
 ## [0.9.58] - 2026-08-14
 
 ### Fixed

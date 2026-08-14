@@ -10,7 +10,7 @@ const EXT_ID = "aiworkhub";
 const DISPLAY_NAME = "AIWorkHub";
 const WSP_STATE_KEY_REPO_URI = "aiworkhub.repositoryUri";
 const PANEL_VIEW_TYPE = "aiworkhub.dashboard";
-const EXPECTED_MCP_PACKAGE_VERSION = "0.9.58";
+const EXPECTED_MCP_PACKAGE_VERSION = "0.9.59";
 const WINDOW_SCOPE_ID = `window_${crypto.randomBytes(12).toString("hex")}`;
 let extensionDebugTraceFile = "";
 let mcpDebugTraceFile = "";
@@ -440,7 +440,8 @@ function isPoisonedInvalidParamsError(error) {
     && !(typeof detail === "object" && Object.keys(detail).length === 0);
   if (hasDetail) return false;
   const message = String(error.message || "").trim().toLowerCase();
-  return message === "" || message === "invalid request parameters" || message === "invalid params";
+  return message === "" || message === "invalid request parameters" || message === "invalid params"
+    || message === 'invalid request parameters("")';
 }
 
 // ── Active repository resolution ──────────────────────────────────────────
@@ -1816,6 +1817,7 @@ class McpStdioClient {
     const env = {
       ...process.env,
       PYTHONIOENCODING: "utf-8",
+      AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
       AIWORKHUB_REPO_ROOT: root,
       AIWORKHUB_REPO: root,
       AIWORKHUB_REPO_ID: this.repositoryIdentity.repoId,
@@ -5587,6 +5589,7 @@ function ensureCodexMcpRegistrationTomlText(text, runtimeDir, python) {
     "",
     "[mcp_servers.aiworkhub.env]",
     `PYTHONPATH = ${tomlQuoted(runtimeDir)}`,
+    'AIWORKHUB_MCP_STDIO_BACKEND = "stdlib"',
     'AIWORKHUB_ALLOW_WRITES = "1"',
     'AIWORKHUB_ALLOW_LAUNCH = "1"',
     "",
@@ -5689,9 +5692,11 @@ function materializeStableMcpLauncher(context) {
   const launcher = path.join(binDir, "aiworkhub-mcp-server.py");
   const script = `#!/usr/bin/env python3
 import json
+import os
 import sys
 from pathlib import Path
 
+os.environ["AIWORKHUB_MCP_STDIO_BACKEND"] = "stdlib"
 root = Path(__file__).resolve().parents[1]
 current = json.loads((root / "runtime" / "current.json").read_text(encoding="utf-8"))
 runtime = Path(current["runtime_dir"])
@@ -6370,6 +6375,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
       PYTHONPATH: runtimeDir,
       AIWORKHUB_REPO: repoRoot,
       AIWORKHUB_REPO_ROOT: repoRoot,
+      AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
     };
     if (!Object.prototype.hasOwnProperty.call(nextEnv, "AIWORKHUB_ALLOW_WRITES")) {
       nextEnv.AIWORKHUB_ALLOW_WRITES = "1";
@@ -6391,6 +6397,7 @@ function repairMcpConfigObject(document, containerKey, runtimeDir, repoRoot, pyt
         PYTHONPATH: runtimeDir,
         AIWORKHUB_REPO: repoRoot,
         AIWORKHUB_REPO_ROOT: repoRoot,
+        AIWORKHUB_MCP_STDIO_BACKEND: "stdlib",
         AIWORKHUB_ALLOW_WRITES: "1",
         AIWORKHUB_ALLOW_LAUNCH: "1",
       },

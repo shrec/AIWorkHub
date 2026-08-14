@@ -1,5 +1,17 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.59 — 2026-08-14
+
+### Fixed
+
+- Use the bounded parallel stdio backend for dashboard, stable Codex and
+  repaired Claude/Copilot MCP registrations so one long request cannot block
+  independent status/read calls.
+- Reject malformed empty-string parameters before tool dispatch with durable
+  redacted telemetry, avoiding the persistent bare `-32602` connection state.
+- Recover the exact owned dashboard MCP child after the live
+  `Invalid request parameters("")` poison signature repeats.
+
 ## 0.9.58 — 2026-08-14
 
 ### Fixed
