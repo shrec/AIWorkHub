@@ -411,7 +411,7 @@ def test_fails_closed_when_every_candidate_is_noexec(
     assert list(root_b.iterdir()) == []
 
 
-def test_repo_runtime_validation_root_is_preferred_and_cleaned(
+def test_repo_temp_validation_root_is_preferred_and_cleaned(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     repo = tmp_path / "repo"
@@ -437,7 +437,7 @@ def test_repo_runtime_validation_root_is_preferred_and_cleaned(
     workspace.repo = repo
 
     scratch = worker_workspace.provision_validation_exec_scratch(workspace)
-    expected_parent = repo / ".aiworkhub" / "runtime" / "validation"
+    expected_parent = repo / ".aiworkhub" / "temp" / "validation"
     assert scratch.parent == expected_parent.resolve()
     assert scratch.is_dir()
 

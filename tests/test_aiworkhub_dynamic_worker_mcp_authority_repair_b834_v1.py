@@ -491,16 +491,34 @@ def test_target_scope_is_applied_before_large_payload_truncation(
         targets=("eval",),
     )
     out_of_scope_blob = "x" * (w.MAX_RAW_TOOL_OUTPUT_BYTES + 1024)
+    observed: dict[str, object] = {}
+
+    def _analytics_query(
+        repo_root: Path,
+        mode: str,
+        query: str,
+        budget: int = 64,
+        target: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
+        observed["target"] = target
+        observed["cursor"] = cursor
+        rows = [
+            {"file": "src/out_of_scope.py", "evidence": out_of_scope_blob},
+            {"file": "eval/in_scope.json", "evidence": "kept"},
+            {"file": "eval2/prefix_collision.json", "evidence": "drop"},
+        ]
+        if target == "eval":
+            rows = [rows[1]]
+        return {
+            "scope": "target" if target is not None else "global",
+            "rows": rows,
+        }
+
     monkeypatch.setattr(
         source_graph_mod,
         "analytics_query",
-        lambda repo_root, mode, query, budget=64: {
-            "rows": [
-                {"file": "src/out_of_scope.py", "evidence": out_of_scope_blob},
-                {"file": "eval/in_scope.json", "evidence": "kept"},
-                {"file": "eval2/prefix_collision.json", "evidence": "drop"},
-            ],
-        },
+        _analytics_query,
     )
 
     result = w.source_graph_query(
@@ -509,6 +527,8 @@ def test_target_scope_is_applied_before_large_payload_truncation(
 
     assert result["ok"] is True
     assert result["truncated"] is False
+    assert observed["target"] == "eval"
+    assert observed["cursor"] is None
     payload = json.loads(result["content"])
     assert payload["scope"] == "target"
     assert payload["rows"] == [
