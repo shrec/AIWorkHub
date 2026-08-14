@@ -747,6 +747,103 @@ class TestExitStatusMapping:
         assert worker_workspace._metadata_broker_exit_code(9) == 137
 
 
+class TestMetadataBrokerHandshake:
+    """Pure-userspace coverage of the bounded, observable listener handoff.
+
+    These drive ``socketpair``/``pipe`` directly, so they reproduce the
+    deterministic transfer-failure states (EOF without a listener, child error
+    report, timeout) and prove a real ``SCM_RIGHTS`` descriptor is received,
+    without requiring a live seccomp-notify listener or Landlock sandbox.
+    """
+
+    def test_successful_fd_receipt(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        probe_r, probe_w = os.pipe()
+        try:
+            worker_workspace._metadata_broker_handshake_send(child_sock, probe_w)
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+            assert listener_fd >= 0
+            assert error == ""
+            try:
+                # The received descriptor is a live, distinct duplicate of the
+                # sent pipe write end.
+                os.write(listener_fd, b"x")
+                assert os.read(probe_r, 1) == b"x"
+            finally:
+                os.close(listener_fd)
+        finally:
+            parent_sock.close()
+            os.close(probe_r)
+            os.close(probe_w)
+
+    def test_eof_without_listener_is_deterministic_failure(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        child_sock.close()  # child dies without delivering a listener fd
+        try:
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_eof"
+
+    def test_child_error_report_is_observable(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        try:
+            worker_workspace._metadata_broker_handshake_error(child_sock, b"boom")
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "boom"
+
+    def test_timeout_is_bounded_and_observable(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        started = time.monotonic()
+        try:
+            # Peer stays open but never sends: the parent must fail closed on
+            # a bounded deadline instead of blocking indefinitely.
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, started + 0.2
+            )
+        finally:
+            parent_sock.close()
+            child_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_timeout"
+        assert time.monotonic() - started < 5.0
+
+    def test_non_error_data_without_fd_is_protocol_violation(self) -> None:
+        import socket
+
+        parent_sock, child_sock = socket.socketpair()
+        try:
+            child_sock.sendall(b"garbage")
+            child_sock.close()
+            listener_fd, error = worker_workspace._metadata_broker_handshake_receive(
+                parent_sock, time.monotonic() + 5.0
+            )
+        finally:
+            parent_sock.close()
+        assert listener_fd < 0
+        assert error == "handshake_protocol_violation"
+
+
 class TestRunValidationsGitInitIntegration:
     def test_git_init_succeeds_beneath_validation_scratch(
         self, tmp_path: Path

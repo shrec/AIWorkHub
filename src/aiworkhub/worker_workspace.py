@@ -3511,8 +3511,88 @@ def _apply_metadata_seccomp() -> None:
         library.seccomp_release(context)
 
 
-def _landlock_exec(argv: list[str]) -> int:
+def _metadata_broker_handshake_send(sock: Any, listener_fd: int) -> None:
+    """Deliver the notification listener from the disposable child to the parent.
+
+    One atomic ``SCM_RIGHTS`` transfer (``b"1"`` plus the listener descriptor).
+    Every blocking operation is bounded by a socket timeout so a wedged or
+    slow-to-drain parent can never hold the child before ``exec``.
+    """
+    import socket
+
+    sock.settimeout(_METADATA_BROKER_HANDSHAKE_SECONDS)
+    socket.send_fds(sock, [b"1"], [listener_fd])
+
+
+def _metadata_broker_handshake_error(sock: Any, diagnostic: bytes) -> None:
+    """Best-effort, bounded child error report (data-only, never carries an fd)."""
+    try:
+        sock.settimeout(_METADATA_BROKER_HANDSHAKE_SECONDS)
+        sock.sendall(b"E" + diagnostic)
+    except OSError:
+        pass
+
+
+def _metadata_broker_handshake_receive(sock: Any, deadline: float) -> tuple[int, str]:
+    """Bounded, deterministic parent-side listener receipt.
+
+    Returns ``(listener_fd, diagnostic)`` where ``listener_fd`` is ``-1`` on any
+    failure and ``diagnostic`` names the exact terminal state (timeout, EOF,
+    I/O error, a protocol violation, or the child's bounded ``E``-prefixed
+    report). The caller fails closed with an observable cause instead of a
+    silent downgrade; no code path can block past ``deadline``.
+    """
     import select
+    import socket
+
+    sock.setblocking(False)
+    listener_fd = -1
+    error = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = "handshake_timeout"
+            break
+        try:
+            ready, _writable, _exceptional = select.select(
+                [sock], [], [], remaining
+            )
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            error = f"handshake_select_error:{type(exc).__name__}:{exc}"
+            break
+        if not ready:
+            error = "handshake_timeout"
+            break
+        try:
+            payload, fds, _flags, _addr = socket.recv_fds(
+                sock, _METADATA_BROKER_PATH_LIMIT, 1
+            )
+        except BlockingIOError:
+            # Spurious readiness from a partial drain: stay within the deadline.
+            continue
+        except OSError as exc:
+            error = f"handshake_recv_error:{type(exc).__name__}:{exc}"
+            break
+        if fds:
+            listener_fd = fds[0]
+            break
+        if payload.startswith(b"E"):
+            error = payload[1:].decode("utf-8", "replace")
+            break
+        if not payload:
+            # EOF: the child closed the socket without delivering a listener.
+            error = "handshake_eof"
+            break
+        # A non-empty data-only message with neither an fd nor an error marker
+        # violates the handshake protocol; never loop on a wedged peer.
+        error = "handshake_protocol_violation"
+        break
+    return listener_fd, error
+
+
+def _landlock_exec(argv: list[str]) -> int:
     import socket
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -3566,17 +3646,20 @@ def _landlock_exec(argv: list[str]) -> int:
                 os.setsid()
                 _set_pdeathsig_sigkill(broker_parent_pid)
                 listener = _install_metadata_notify_filter()
-                socket.send_fds(child_sock, [b"1"], [listener])
+                _metadata_broker_handshake_send(child_sock, listener)
                 os.close(listener)
                 child_sock.close()
             except BaseException as exc:
+                diagnostic = (
+                    f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
+                )
                 try:
-                    diagnostic = (
-                        f"{type(exc).__name__}:{exc}".encode("utf-8", "replace")[:1024]
-                    )
-                    child_sock.sendall(b"E" + diagnostic)
-                except BaseException:
-                    pass
+                    _metadata_broker_handshake_error(child_sock, diagnostic)
+                finally:
+                    try:
+                        child_sock.close()
+                    except OSError:
+                        pass
                 os._exit(126)
             try:
                 os.execvpe(command[0], command, os.environ.copy())
@@ -3592,21 +3675,11 @@ def _landlock_exec(argv: list[str]) -> int:
                     pass
             os._exit(126)
         child_sock.close()
-        listener_fd = -1
-        listener_error = ""
         try:
-            parent_sock.setblocking(False)
-            ready, _writable, _exceptional = select.select(
-                [parent_sock], [], [], _METADATA_BROKER_HANDSHAKE_SECONDS
+            listener_fd, listener_error = _metadata_broker_handshake_receive(
+                parent_sock,
+                time.monotonic() + _METADATA_BROKER_HANDSHAKE_SECONDS,
             )
-            if ready:
-                payload, fds, _flags, _addr = socket.recv_fds(parent_sock, 1025, 1)
-                if fds:
-                    listener_fd = fds[0]
-                elif payload.startswith(b"E"):
-                    listener_error = payload[1:].decode("utf-8", "replace")
-        except OSError:
-            listener_fd = -1
         finally:
             parent_sock.close()
         if listener_fd < 0:
