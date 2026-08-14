@@ -6,6 +6,25 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.60] - 2026-08-14
+
+### Fixed
+
+- Prepare one immutable quality-review packet per target with a per-target
+  single-flight, so correctness, security and code-quality lenses reuse one
+  heavy preparation while retaining distinct reviewer launches.
+- Propagate the preparation owner's exact success or failure to concurrent
+  reviewer waiters without applying elapsed-time death rules to providers.
+- Make the Linux seccomp metadata-broker listener handoff bounded and
+  observable across success, EOF, protocol violation, child error and timeout
+  paths while preserving fail-closed sandbox authority.
+
+### Validation
+
+- Reviewer reservation/process-launch regression suite: 134 passed, 1 skipped.
+- Validation sandbox portability suite: 80 passed.
+- Changed-file Ruff and whitespace checks pass.
+
 ## [0.9.59] - 2026-08-14
 
 ### Fixed

@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.60 — 2026-08-14
+
+### Fixed
+
+- Coalesce concurrent correctness, security and code-quality reviewer packet
+  preparation per exact target while keeping three distinct review launches.
+- Keep reviewer launch handlers responsive and propagate the single
+  preparation owner's truthful result to every waiting lens.
+- Harden the Linux validation metadata-broker listener handoff with bounded,
+  fail-closed diagnostics for hosted CI and local secure sandboxes.
+
 ## 0.9.59 — 2026-08-14
 
 ### Fixed
