@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.63] - 2026-08-14
+
+### Fixed
+
+- Publish one canonical quality-review finding contract across reviewer
+  instructions, the callable MCP JSON schema, normalization and sealed
+  receipts.
+- Require `severity`, `summary` and `evidence` in the generated reviewer
+  tool schema, reject undocumented aliases and report missing keys exactly.
+- Preserve exactly-once review submission counts for both clean reports and
+  authenticated non-empty findings.
+
+### Validation
+
+- 143 reviewer contract/launcher tests and 64 quality-evidence tests pass;
+  changed-file Ruff and diff checks pass.
+
 ## [0.9.62] - 2026-08-14
 
 ### Fixed

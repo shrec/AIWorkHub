@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.63 — 2026-08-14
+
+### Fixed
+
+- Unify reviewer prompts, callable MCP JSON schema, validation and durable
+  receipts around one canonical finding object.
+- Require `severity`, `summary` and `evidence`, reject undocumented aliases
+  and return exact missing-key errors instead of a guessing loop.
+- Keep clean and non-empty reviewer reports on the same exactly-once
+  finalization path.
+
 ## 0.9.62 — 2026-08-14
 
 ### Fixed

@@ -12,15 +12,14 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.62
+## What's new in 0.9.63
 
-- Reviewer spawn ownership is bound by an exact PID/start-ticks
-  compare-and-swap, so a recycled or stale process identity can never stand in
-  for the live reviewer launch.
-- Lost acknowledgements and extension-host reloads recover the spawn handoff
-  idempotently without leaking a reservation or double-launching.
-- Live model providers are terminalized only by process/terminal evidence;
-  elapsed or quiet time alone never kills a running provider.
+- Reviewer findings now use one canonical contract from prompt through the
+  callable MCP JSON schema, validation and sealed receipt.
+- The generated tool schema requires `severity`, `summary` and `evidence`;
+  malformed aliases and missing keys fail with exact bounded diagnostics.
+- Clean and non-empty reports share the same authenticated exactly-once
+  submission and finalization path.
 
 See the packaged **Changelog** for the complete release summary.
 
