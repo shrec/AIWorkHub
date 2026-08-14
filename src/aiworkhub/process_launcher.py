@@ -3451,6 +3451,22 @@ class _LiveProcess:
     bridge_request: vscode_lm_bridge.BridgeRequest | None = None
 
 
+class _QualityReviewPrepFlight:
+    """Single-flight guard for one ``(target_request_id, target_task_id)`` prep.
+
+    The elected owner runs the heavy packet build; every other concurrent
+    caller waits on ``condition`` and reuses the owner's ``result`` (success
+    or failure) instead of rebuilding independently.
+    """
+
+    __slots__ = ("condition", "done", "result")
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.done = False
+        self.result: dict[str, Any] | None = None
+
+
 class ProcessManager:
     """Thread-safe local process registry with append-only lifecycle events."""
 
@@ -4209,6 +4225,11 @@ class ProcessManager:
 
     _QUALITY_REVIEW_PREP_LOCK = threading.Lock()
     _QUALITY_REVIEW_PREP_MAX = 8
+    # Bounded waiter ceiling for single-flight preparation reuse. A waiter runs
+    # under its own per-lens background owner (never the MCP handler) and the
+    # elected owner always records a terminal result, so this bound only guards
+    # against a deadlocked owner; it never classifies a provider by elapsed time.
+    _QUALITY_REVIEW_PREP_WAIT_SECONDS = 600.0
     _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
     _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
     _QUALITY_REVIEW_SOURCE_CONTEXT_LINES = 3
@@ -4362,14 +4383,70 @@ class ProcessManager:
     def _prepared_quality_review(
         self, target_request_id: str, target_task_id: str
     ) -> dict[str, Any]:
-        """Prepare the packet once per exact target and reuse it for all lenses."""
+        """Prepare the packet once per exact target, single-flight across lenses.
+
+        Concurrent correctness/security/code_quality reviewers for one target
+        previously each observed the same cache miss and rebuilt the heavy
+        packet. A per-target single-flight now elects exactly one owner that
+        runs ``_build_quality_review_packet``; every other caller waits on a
+        bounded condition and reuses the owner's result. The owner's success
+        *and* failure propagate truthfully, so a waiter never masks a real
+        preparation error with an independent rebuild.
+        """
 
         key = (target_request_id, target_task_id)
         with self._QUALITY_REVIEW_PREP_LOCK:
             cache = self.__dict__.setdefault("_quality_review_prepared", {})
             prepared = cache.get(key)
-        if prepared is not None:
-            return {"ok": True, "prepared": prepared}
+            if prepared is not None:
+                return {"ok": True, "prepared": prepared}
+            flights = self.__dict__.setdefault("_quality_review_flights", {})
+            flight = flights.get(key)
+            if flight is None:
+                flight = _QualityReviewPrepFlight()
+                flights[key] = flight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            with flight.condition:
+                deadline = time.monotonic() + self._QUALITY_REVIEW_PREP_WAIT_SECONDS
+                while not flight.done:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    flight.condition.wait(timeout=remaining)
+                result = flight.result if flight.done else None
+            if result is None:
+                return {"ok": False, "error": "quality_review_preparation_timeout"}
+            return result
+
+        try:
+            result = self._build_quality_review_packet(
+                target_request_id, target_task_id
+            )
+        except Exception as exc:  # noqa: BLE001 -- propagate owner failure truthfully
+            result = {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
+        with self._QUALITY_REVIEW_PREP_LOCK:
+            if result.get("ok"):
+                cache = self.__dict__.setdefault("_quality_review_prepared", {})
+                cache[key] = result["prepared"]
+                while len(cache) > self._QUALITY_REVIEW_PREP_MAX:
+                    cache.pop(next(iter(cache)))
+        with flight.condition:
+            flight.result = result
+            flight.done = True
+            flight.condition.notify_all()
+        with self._QUALITY_REVIEW_PREP_LOCK:
+            flights.pop(key, None)
+        return result
+
+    def _build_quality_review_packet(
+        self, target_request_id: str, target_task_id: str
+    ) -> dict[str, Any]:
+        """Run the one heavy, uncached preparation for an exact target."""
+
         events = self._request_events(target_request_id)
         if not events:
             return {"ok": False, "error": "quality_review_target_request_not_found"}
@@ -4457,11 +4534,6 @@ class ProcessManager:
             "changed_hashes": dict(current_hashes),
             "packet": packet,
         }
-        with self._QUALITY_REVIEW_PREP_LOCK:
-            cache = self.__dict__.setdefault("_quality_review_prepared", {})
-            cache[key] = prepared
-            while len(cache) > self._QUALITY_REVIEW_PREP_MAX:
-                cache.pop(next(iter(cache)))
         return {"ok": True, "prepared": prepared}
 
     def _reviewer_receipt(self, request_id: str) -> dict[str, Any]:

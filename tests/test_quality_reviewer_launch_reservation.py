@@ -534,3 +534,87 @@ def test_parallel_same_task_race_yields_single_provider(tmp_path, monkeypatch):
     while not launch_calls and time.time() < deadline:
         time.sleep(0.01)
     assert len(launch_calls) == 1
+
+
+def test_three_lenses_share_one_preparation_and_launch_distinctly(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(
+        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
+    )
+
+    prep_calls: list = []
+    prep_started = threading.Event()
+    release = threading.Event()
+
+    def blocking_build(*args, **_kwargs):
+        prep_calls.append(args)
+        prep_started.set()
+        assert release.wait(timeout=10)
+        return _prepared_result()
+
+    monkeypatch.setattr(manager, "_build_quality_review_packet", blocking_build)
+
+    launch_calls: list = []
+    calls_lock = threading.Lock()
+
+    def spy_launch(**kwargs):
+        request_id = kwargs["reserved_request_id"]
+        manager._append_event({
+            "request_id": request_id,
+            "task_id": kwargs["task_id"],
+            "runner": kwargs["runner"],
+            "topic": "quality_review",
+            "adapter_id": kwargs["adapter_id"],
+            "state": "running",
+            "pid": os.getpid(),
+            "pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+        })
+        with calls_lock:
+            launch_calls.append(kwargs)
+        return {"ok": True, "request_id": request_id, "state": "running"}
+
+    monkeypatch.setattr(manager, "_launch_isolated", spy_launch)
+
+    lenses = ["correctness", "security", "code_quality"]
+    receipts = [
+        manager.launch_quality_reviewer(
+            target_request_id="target-req",
+            target_task_id="TARGET_TASK",
+            reviewer_task_id=f"REVIEWER_LENS_{idx}",
+            runner=RUNNER,
+            adapter_id=ADAPTER,
+            lens=lens,
+        )
+        for idx, lens in enumerate(lenses)
+    ]
+    assert [r["ok"] for r in receipts] == [True, True, True]
+    assert [r.get("deferred") for r in receipts] == [True, True, True]
+    assert len({r["request_id"] for r in receipts}) == 3
+
+    assert prep_started.wait(timeout=5)
+    # While the elected owner is blocked, only one heavy build has been entered;
+    # the other two reviewers are bounded waiters that reuse the owner result.
+    time.sleep(0.2)
+    assert len(prep_calls) == 1
+
+    release.set()
+    deadline = time.time() + 10
+    while len(launch_calls) < 3 and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert len(prep_calls) == 1
+    with calls_lock:
+        assert len(launch_calls) == 3
+    assert {c["task_id"] for c in launch_calls} == {
+        "REVIEWER_LENS_0",
+        "REVIEWER_LENS_1",
+        "REVIEWER_LENS_2",
+    }
+    assert {c["reserved_request_id"] for c in launch_calls} == {
+        r["request_id"] for r in receipts
+    }
+    assert {
+        c["quality_review_binding"]["lens"] for c in launch_calls
+    } == set(lenses)
