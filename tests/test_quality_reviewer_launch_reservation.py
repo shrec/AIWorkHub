@@ -618,3 +618,218 @@ def test_three_lenses_share_one_preparation_and_launch_distinctly(
     assert {
         c["quality_review_binding"]["lens"] for c in launch_calls
     } == set(lenses)
+
+
+def test_progress_event_preserves_reservation_identity_and_phases(tmp_path):
+    manager = _manager(tmp_path)
+    expires_at = time.time() + 120.0
+    manager._append_event(
+        _starting(
+            request_id="review-prog-1",
+            task_id="REVIEWER_PROG",
+            expires_at=expires_at,
+        )
+    )
+
+    manager._publish_reviewer_progress("review-prog-1", "packet_build_started")
+    manager._publish_reviewer_progress(
+        "review-prog-1", "scope_audits_started", "heavy"
+    )
+
+    latest = _latest(manager, "review-prog-1")
+    assert latest["state"] == "starting"
+    assert latest["preparation_phase"] == "scope_audits_started"
+    assert latest["preparation_detail"] == "heavy"
+    assert latest["reservation_expires_at_epoch"] == pytest.approx(
+        expires_at, rel=1e-9
+    )
+    assert latest["preparation_heartbeat_epoch"] > 0
+
+    # Progress never steals a live pid-null reservation.
+    assert manager._reconcile_expired_starting_reservations() == 0
+    receipt = manager._live_reviewer_receipt("REVIEWER_PROG")
+    assert receipt is not None
+    assert receipt["already_reserved"] is True
+    assert receipt["request_id"] == "review-prog-1"
+
+    # Once terminalized, a stale owner publishes no further progress.
+    manager._blocked(
+        "REVIEWER_PROG", RUNNER, TOPIC, ADAPTER, "test_done",
+        request_id="review-prog-1",
+    )
+    manager._publish_reviewer_progress("review-prog-1", "zombie_phase")
+    terminal = _latest(manager, "review-prog-1")
+    assert terminal["state"] == "blocked"
+    assert terminal.get("preparation_phase") is None
+
+
+def test_owner_preparation_timeout_terminalizes_each_reservation_once(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    manager._QUALITY_REVIEW_PREP_OWNER_SECONDS = 0.05
+    monkeypatch.setattr(
+        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
+    )
+
+    never = threading.Event()
+
+    def hanging_build(*_args, **_kwargs):
+        never.wait(timeout=30)
+        return _prepared_result()
+
+    monkeypatch.setattr(manager, "_build_quality_review_packet", hanging_build)
+
+    launch_calls: list = []
+
+    def record_launch(**_kwargs):
+        launch_calls.append(_kwargs)
+
+    monkeypatch.setattr(manager, "_launch_isolated", record_launch)
+
+    lenses = ["correctness", "security", "code_quality"]
+    receipts = [
+        manager.launch_quality_reviewer(
+            target_request_id="target-req",
+            target_task_id="TARGET_TASK",
+            reviewer_task_id=f"REVIEWER_TO_{idx}",
+            runner=RUNNER,
+            adapter_id=ADAPTER,
+            lens=lens,
+        )
+        for idx, lens in enumerate(lenses)
+    ]
+    assert [r["ok"] for r in receipts] == [True, True, True]
+    request_ids = [r["request_id"] for r in receipts]
+    assert len(set(request_ids)) == 3
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        states = [_latest(manager, rid).get("state") for rid in request_ids]
+        if all(state == "blocked" for state in states):
+            break
+        time.sleep(0.01)
+
+    for rid in request_ids:
+        latest = _latest(manager, rid)
+        assert latest["state"] == "blocked"
+        assert "preparation_timeout" in str(latest.get("blocked_reason"))
+        blocked = [
+            e for e in manager._request_events(rid) if e.get("state") == "blocked"
+        ]
+        assert len(blocked) == 1
+
+    assert launch_calls == []
+    for idx in range(3):
+        assert manager._live_reviewer_receipt(f"REVIEWER_TO_{idx}") is None
+    never.set()
+
+
+def test_status_read_bounded_and_reports_phase_while_prep_blocks(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(
+        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
+    )
+
+    prep_started = threading.Event()
+    release = threading.Event()
+
+    def blocked_build(*_args, **kwargs):
+        progress = kwargs.get("progress")
+        if progress:
+            progress("scope_audits_started")
+        prep_started.set()
+        assert release.wait(timeout=10)
+        return _prepared_result()
+
+    monkeypatch.setattr(manager, "_build_quality_review_packet", blocked_build)
+    monkeypatch.setattr(
+        manager,
+        "_show_task",
+        lambda *_a, **_k: pytest.fail(
+            "status must not read the task card for a pid-null starting reservation"
+        ),
+    )
+
+    launch_calls: list = []
+    monkeypatch.setattr(manager, "_launch_isolated", _running_spy(manager, launch_calls))
+
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req",
+        target_task_id="TARGET_TASK",
+        reviewer_task_id="REVIEWER_STATUS",
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        lens="correctness",
+    )
+    request_id = receipt["request_id"]
+    assert prep_started.wait(timeout=5)
+
+    status = manager.status(request_id)
+    assert status["ok"] is True
+    assert status["state"] == "starting"
+    assert status["preparation_phase"] == "scope_audits_started"
+    assert status.get("task_card") is None
+
+    release.set()
+    deadline = time.time() + 10
+    while not launch_calls and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(launch_calls) == 1
+
+
+def test_launch_publishes_phased_progress_under_same_reservation(
+    tmp_path, monkeypatch,
+):
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(
+        process_launcher.core, "create_task", lambda **_kwargs: {"ok": True},
+    )
+
+    def phased_build(*_args, **kwargs):
+        progress = kwargs.get("progress")
+        for phase in (
+            "packet_build_started",
+            "scope_audits_started",
+            "scope_audits_complete",
+            "packet_built",
+        ):
+            if progress:
+                progress(phase)
+        return _prepared_result()
+
+    monkeypatch.setattr(manager, "_build_quality_review_packet", phased_build)
+
+    launch_calls: list = []
+    monkeypatch.setattr(manager, "_launch_isolated", _running_spy(manager, launch_calls))
+
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req",
+        target_task_id="TARGET_TASK",
+        reviewer_task_id="REVIEWER_PHASE",
+        runner=RUNNER,
+        adapter_id=ADAPTER,
+        lens="correctness",
+    )
+    request_id = receipt["request_id"]
+
+    deadline = time.time() + 10
+    while not launch_calls and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(launch_calls) == 1
+
+    progress_events = [
+        e for e in manager._request_events(request_id)
+        if e.get("state") == "starting" and e.get("preparation_phase")
+    ]
+    assert [e["preparation_phase"] for e in progress_events] == [
+        "packet_build_started",
+        "scope_audits_started",
+        "scope_audits_complete",
+        "packet_built",
+        "packet_prepared",
+        "reviewer_task_created",
+        "isolated_launch_started",
+    ]

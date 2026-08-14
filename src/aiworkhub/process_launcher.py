@@ -4230,6 +4230,12 @@ class ProcessManager:
     # elected owner always records a terminal result, so this bound only guards
     # against a deadlocked owner; it never classifies a provider by elapsed time.
     _QUALITY_REVIEW_PREP_WAIT_SECONDS = 600.0
+    # The elected owner runs the heavy packet build under a strictly shorter
+    # ceiling than waiters so it always publishes a truthful terminal
+    # preparation failure (no provider exists yet) and wakes every waiter
+    # before any waiter's own ceiling fires. This never classifies a live
+    # provider by elapsed time -- there is no process during preparation.
+    _QUALITY_REVIEW_PREP_OWNER_SECONDS = 300.0
     _QUALITY_REVIEW_SOURCE_MAX_BYTES = 4_000
     _QUALITY_REVIEW_SOURCE_TOTAL_MAX_BYTES = 60_000
     _QUALITY_REVIEW_SOURCE_CONTEXT_LINES = 3
@@ -4381,7 +4387,10 @@ class ProcessManager:
         return evidence
 
     def _prepared_quality_review(
-        self, target_request_id: str, target_task_id: str
+        self,
+        target_request_id: str,
+        target_task_id: str,
+        progress: Any | None = None,
     ) -> dict[str, Any]:
         """Prepare the packet once per exact target, single-flight across lenses.
 
@@ -4392,6 +4401,11 @@ class ProcessManager:
         bounded condition and reuses the owner's result. The owner's success
         *and* failure propagate truthfully, so a waiter never masks a real
         preparation error with an independent rebuild.
+
+        The elected owner's build is itself bounded: it runs under
+        ``_QUALITY_REVIEW_PREP_OWNER_SECONDS`` and a build that outlives the
+        ceiling becomes a truthful ``quality_review_preparation_timeout``
+        terminal failure instead of a silent pid-null reservation.
         """
 
         key = (target_request_id, target_task_id)
@@ -4422,12 +4436,36 @@ class ProcessManager:
                 return {"ok": False, "error": "quality_review_preparation_timeout"}
             return result
 
-        try:
-            result = self._build_quality_review_packet(
-                target_request_id, target_task_id
-            )
-        except Exception as exc:  # noqa: BLE001 -- propagate owner failure truthfully
-            result = {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
+        result_box: dict[str, dict[str, Any]] = {}
+
+        def _run_owner_build() -> None:
+            try:
+                result_box["result"] = self._build_quality_review_packet(
+                    target_request_id, target_task_id, progress=progress
+                )
+            except Exception as exc:  # noqa: BLE001 -- propagate owner failure truthfully
+                result_box["result"] = {
+                    "ok": False,
+                    "error": f"quality_review_target_invalid:{exc}",
+                }
+
+        builder = threading.Thread(
+            target=_run_owner_build,
+            name=f"aiworkhub-reviewer-prep-{target_request_id[:8]}",
+            daemon=True,
+        )
+        builder.start()
+        builder.join(self._QUALITY_REVIEW_PREP_OWNER_SECONDS)
+        if builder.is_alive():
+            result = {
+                "ok": False,
+                "error": "quality_review_preparation_timeout",
+            }
+        else:
+            result = result_box.get("result") or {
+                "ok": False,
+                "error": "quality_review_preparation_no_result",
+            }
         with self._QUALITY_REVIEW_PREP_LOCK:
             if result.get("ok"):
                 cache = self.__dict__.setdefault("_quality_review_prepared", {})
@@ -4443,10 +4481,23 @@ class ProcessManager:
         return result
 
     def _build_quality_review_packet(
-        self, target_request_id: str, target_task_id: str
+        self,
+        target_request_id: str,
+        target_task_id: str,
+        progress: Any | None = None,
     ) -> dict[str, Any]:
-        """Run the one heavy, uncached preparation for an exact target."""
+        """Run the one heavy, uncached preparation for an exact target.
 
+        When ``progress`` is supplied the heavy phases are published as
+        reservation progress events so status reads observe forward motion
+        instead of a silent pid-null reservation.
+        """
+
+        def mark(phase: str) -> None:
+            if progress is not None:
+                progress(phase)
+
+        mark("packet_build_started")
         events = self._request_events(target_request_id)
         if not events:
             return {"ok": False, "error": "quality_review_target_request_not_found"}
@@ -4459,6 +4510,7 @@ class ProcessManager:
                 "error": "quality_review_target_not_review_ready",
                 "state": latest.get("state"),
             }
+        mark("target_events_loaded")
         try:
             card = _parse_card(self._show_task(target_task_id), target_task_id)
             terminal = card.get("terminal_review") or {}
@@ -4469,16 +4521,19 @@ class ProcessManager:
             assert_gc_safe_workspace_shape(
                 target_request_id, workspace.path, workspace.home, repo=self.repo
             )
+            mark("target_card_loaded")
             changed_hashes = evidence.get("changed_path_hashes")
             if not isinstance(changed_hashes, dict) or not changed_hashes:
                 raise WorkspaceError("quality_review_target_hashes_missing")
             current_hashes = _changed_path_hashes(workspace, list(changed_hashes))
             if current_hashes != changed_hashes:
                 raise WorkspaceError("quality_review_target_hashes_drifted")
+            mark("target_hashes_verified")
             source_evidence = self._quality_review_source_evidence(
                 workspace, current_hashes
             )
             initial_gate = evidence.get("quality_gate") or {}
+            mark("scope_audits_started")
             scoped_audits = quality_review_scope.build_scoped_audits(
                 authority_repo=Path(self.repo),
                 candidate_repo=workspace.path,
@@ -4499,6 +4554,7 @@ class ProcessManager:
                 terminal_validation=evidence.get("validation") or [],
                 lenses=quality_evidence.JUDGMENT_LENSES,
             )
+            mark("scope_audits_complete")
             target_claim_epoch = card.get("claim_epoch")
             if type(target_claim_epoch) is not int or target_claim_epoch < 1:
                 raise WorkspaceError("quality_review_target_claim_epoch_invalid")
@@ -4528,6 +4584,7 @@ class ProcessManager:
         ) as exc:
             return {"ok": False, "error": f"quality_review_target_invalid:{exc}"}
 
+        mark("packet_built")
         prepared = {
             "worker_adapter_id": str(latest.get("adapter_id") or ""),
             "workspace": workspace,
@@ -4554,6 +4611,39 @@ class ProcessManager:
             "pid": event.get("pid"),
             "shell": False,
         }
+
+    def _publish_reviewer_progress(
+        self, request_id: str, phase: str, detail: str | None = None
+    ) -> None:
+        """Append a bounded preparation progress event for a starting reservation.
+
+        The event preserves the reservation's identity fields and unexpired
+        epoch so reconciliation and live-receipt admission still see it as a
+        live pid-null reservation; it only adds observable preparation phase
+        and heartbeat fields. Publishing is a no-op once the reservation has
+        been terminalized, so a stale owner can never append progress after a
+        truthful terminal state.
+        """
+
+        base = self._latest_by_request().get(request_id) or {}
+        if base.get("state") != "starting":
+            return
+        event: dict[str, Any] = {
+            "request_id": request_id,
+            "task_id": base.get("task_id"),
+            "runner": base.get("runner"),
+            "topic": base.get("topic") or "quality_review",
+            "adapter_id": base.get("adapter_id"),
+            "state": "starting",
+            "reservation_expires_at_epoch": base.get(
+                "reservation_expires_at_epoch"
+            ),
+            "preparation_phase": phase,
+            "preparation_heartbeat_epoch": time.time(),
+        }
+        if detail:
+            event["preparation_detail"] = str(detail)[:300]
+        self._append_event(event)
 
     def _live_reviewer_receipt(self, reviewer_task_id: str) -> dict[str, Any] | None:
         """Return a bounded receipt for an already-live reviewer, else ``None``.
@@ -4697,10 +4787,16 @@ class ProcessManager:
             )
 
         launched: dict[str, Any] | None = None
+
+        def _progress(phase: str, detail: str | None = None) -> None:
+            self._publish_reviewer_progress(request_id, phase, detail)
+
         try:
             if not self._reviewer_reservation_still_held(request_id):
                 return
-            prep = self._prepared_quality_review(target_request_id, target_task_id)
+            prep = self._prepared_quality_review(
+                target_request_id, target_task_id, progress=_progress
+            )
             if not prep.get("ok"):
                 _fail(
                     "quality_review_preparation_failed:"
@@ -4711,6 +4807,7 @@ class ProcessManager:
             if prepared["worker_adapter_id"] == adapter_id:
                 _fail("quality_review_provider_not_independent")
                 return
+            _progress("packet_prepared")
             binding = {
                 "target_request_id": target_request_id,
                 "target_task_id": target_task_id,
@@ -4756,8 +4853,10 @@ class ProcessManager:
                     + str(created.get("stderr") or created.get("stdout") or "")[:500]
                 )
                 return
+            _progress("reviewer_task_created")
             if not self._reviewer_reservation_still_held(request_id):
                 return
+            _progress("isolated_launch_started")
             launched = self._launch_isolated(
                 task_id=reviewer_task_id,
                 runner=runner,
@@ -8114,10 +8213,17 @@ class ProcessManager:
                 )
         task_id = str(latest.get("task_id") or events[0].get("task_id") or "")
         card: dict[str, Any] | None = None
-        try:
-            card = _parse_card(self._show_task(task_id), task_id)
-        except Exception:
-            pass
+        if latest.get("state") != "starting" or int(latest.get("pid") or 0):
+            # A pid-null starting reservation is still under preparation; the
+            # reviewer task card may not exist yet and reading it can contend
+            # with the preparation owner's own store access. Keep status reads
+            # bounded by deriving the card only once a real process identity
+            # exists. Preparation progress is still observable via the latest
+            # event's preparation_phase/heartbeat fields below.
+            try:
+                card = _parse_card(self._show_task(task_id), task_id)
+            except Exception:
+                pass
         return {
             "ok": True,
             "request_id": request_id,
@@ -8126,6 +8232,10 @@ class ProcessManager:
             "process_alive": process_alive,
             "exit_code": code,
             "pid": latest.get("pid"),
+            "preparation_phase": latest.get("preparation_phase"),
+            "preparation_heartbeat_epoch": latest.get(
+                "preparation_heartbeat_epoch"
+            ),
             "runner": latest.get("runner"),
             "topic": latest.get("topic"),
             "adapter_id": latest.get("adapter_id"),
