@@ -3740,6 +3740,31 @@ class ProcessManager:
         for request_id, event in self._latest_by_request().items():
             state = event.get("state")
             if state == "provider_spawn_committed":
+                provider_pid = int(event.get("provider_pid") or 0)
+                if provider_pid:
+                    if (
+                        _pid_identity_evidence(
+                            provider_pid, event.get("provider_pid_start_ticks")
+                        ).verdict
+                        is not PidIdentityVerdict.MISMATCH
+                    ):
+                        # A live provider is never terminalized by elapsed or
+                        # quiet time, even when its bounded owner is gone.
+                        continue
+                    self._append_event({
+                        "request_id": request_id,
+                        "task_id": event.get("task_id"),
+                        "runner": event.get("runner"),
+                        "topic": event.get("topic"),
+                        "adapter_id": event.get("adapter_id"),
+                        "state": "blocked",
+                        "blocked_reason": "provider_spawn_committed_provider_dead",
+                        "reservation_expires_at_epoch": event.get(
+                            "reservation_expires_at_epoch"
+                        ),
+                    })
+                    reconciled += 1
+                    continue
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
@@ -3979,6 +4004,12 @@ class ProcessManager:
         for request_id, event in self._latest_by_request().items():
             state = event.get("state")
             if state == "provider_spawn_committed":
+                provider_pid = int(event.get("provider_pid") or 0)
+                if provider_pid and _pid_identity_evidence(
+                    provider_pid, event.get("provider_pid_start_ticks")
+                ).verdict is not PidIdentityVerdict.MISMATCH:
+                    active.add(request_id)
+                    continue
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
@@ -4714,6 +4745,11 @@ class ProcessManager:
                 continue
             state = event.get("state")
             if state == "provider_spawn_committed":
+                provider_pid = int(event.get("provider_pid") or 0)
+                if provider_pid and _pid_identity_evidence(
+                    provider_pid, event.get("provider_pid_start_ticks")
+                ).verdict is not PidIdentityVerdict.MISMATCH:
+                    return self._reviewer_receipt(request_id)
                 owner_pid = int(event.get("owner_pid") or 0)
                 if owner_pid and _pid_identity_evidence(
                     owner_pid, event.get("owner_pid_start_ticks")
@@ -4812,7 +4848,11 @@ class ProcessManager:
         with self._lock:
             return request_id in self._live
 
-    def _reviewer_spawn_transition(self, request_id: str) -> bool:
+    def _reviewer_spawn_transition(
+        self,
+        request_id: str,
+        binding: dict[str, Any] | None = None,
+    ) -> bool:
         """Atomically advance a still-held reservation to spawn-committed.
 
         This is the single cross-process registry-lock CAS handoff between the
@@ -4825,6 +4865,11 @@ class ProcessManager:
         timeout or reconcile only ever observes the exact still-preprovider
         state, and once this transition wins the reservation is never
         time-limited or killed by elapsed/quiet time.
+
+        The winning transition persists the exact request/task/packet binding
+        once, so a lost-ack/reload re-observing the same committed phase never
+        rebinds a different packet and a retry reconciles the original attempt
+        instead of minting a duplicate provider.
         """
 
         with self._registry_lock():
@@ -4833,7 +4878,7 @@ class ProcessManager:
                 return True
             if latest.get("state") != "starting":
                 return False
-            self._append_event({
+            committed: dict[str, Any] = {
                 "request_id": request_id,
                 "task_id": latest.get("task_id"),
                 "runner": latest.get("runner"),
@@ -4846,7 +4891,79 @@ class ProcessManager:
                 ),
                 "owner_pid": os.getpid(),
                 "owner_pid_start_ticks": _pid_start_ticks(os.getpid()),
-            })
+            }
+            if latest.get("quality_review_attempt") is not None:
+                committed["quality_review_attempt"] = latest["quality_review_attempt"]
+            if isinstance(binding, dict):
+                committed["packet"] = binding.get("packet")
+                committed["target_request_id"] = binding.get("target_request_id")
+                committed["target_task_id"] = binding.get("target_task_id")
+                committed["lens"] = binding.get("lens")
+                committed["target_claim_epoch"] = binding.get("target_claim_epoch")
+            self._append_event(committed)
+            return True
+
+    def _reviewer_attach_provider_identity(
+        self,
+        request_id: str,
+        *,
+        pid: int,
+        pid_start_ticks: int,
+    ) -> bool:
+        """Attach the spawned provider PID identity to a committed reservation.
+
+        This is the exact CAS on ``(pid, pid_start_ticks)``.  Re-attaching the
+        identical identity is idempotent (returns ``True`` and appends nothing),
+        so a lost-ack/reload that re-observes the same live provider never
+        spawns or commits a duplicate.  A different identity proves another
+        owner already attached a provider for this exact request/task/packet
+        binding: the caller is the losing spawner and must terminate its own
+        just-spawned process.  Liveness never depends on elapsed or quiet time.
+        """
+
+        with self._registry_lock():
+            latest = self._latest_by_request().get(request_id) or {}
+            state = latest.get("state")
+            if state == "running":
+                return (
+                    int(latest.get("pid") or 0) == int(pid)
+                    and latest.get("pid_start_ticks") == pid_start_ticks
+                )
+            if state != "provider_spawn_committed":
+                return False
+            existing_pid = int(latest.get("provider_pid") or 0)
+            if existing_pid:
+                return (
+                    existing_pid == int(pid)
+                    and latest.get("provider_pid_start_ticks") == pid_start_ticks
+                )
+            attached: dict[str, Any] = {
+                "request_id": request_id,
+                "task_id": latest.get("task_id"),
+                "runner": latest.get("runner"),
+                "topic": latest.get("topic") or "quality_review",
+                "adapter_id": latest.get("adapter_id"),
+                "model": latest.get("model"),
+                "state": "provider_spawn_committed",
+                "reservation_expires_at_epoch": latest.get(
+                    "reservation_expires_at_epoch"
+                ),
+                "owner_pid": latest.get("owner_pid"),
+                "owner_pid_start_ticks": latest.get("owner_pid_start_ticks"),
+                "provider_pid": int(pid),
+                "provider_pid_start_ticks": pid_start_ticks,
+            }
+            for key in (
+                "quality_review_attempt",
+                "packet",
+                "target_request_id",
+                "target_task_id",
+                "lens",
+                "target_claim_epoch",
+            ):
+                if latest.get(key) is not None:
+                    attached[key] = latest[key]
+            self._append_event(attached)
             return True
 
     def _terminalize_reviewer_attempt(
@@ -5705,7 +5822,9 @@ class ProcessManager:
                 # (B314_F004).
                 if (
                     reserved_request_id is not None
-                    and not self._reviewer_spawn_transition(reserved_request_id)
+                    and not self._reviewer_spawn_transition(
+                        reserved_request_id, binding=quality_review_binding
+                    )
                 ):
                     raise _ReviewerReservationTerminalized(reserved_request_id)
                 launch_phase = "supervisor_spawn"
@@ -5734,6 +5853,18 @@ class ProcessManager:
                 if start_ticks is None:
                     _terminate_process_group(process.pid, grace_seconds=5.0)
                     raise LaunchRejected("supervisor_pid_identity_unavailable")
+                if reserved_request_id is not None and not (
+                    self._reviewer_attach_provider_identity(
+                        reserved_request_id,
+                        pid=process.pid,
+                        pid_start_ticks=start_ticks,
+                    )
+                ):
+                    # Another owner already attached a different provider pid for
+                    # this exact request/task/packet binding: this spawn is the
+                    # loser and must never become live or durable.
+                    _terminate_process_group(process.pid, grace_seconds=5.0)
+                    raise _ReviewerReservationTerminalized(reserved_request_id)
                 live = _LiveProcess(
                     request_id=request_id,
                     task_id=task_id,

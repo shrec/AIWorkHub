@@ -41,6 +41,7 @@ def _starting(
     expires_at: float,
     pid: int = 0,
     pid_start_ticks: int | None = None,
+    quality_review_attempt: dict | None = None,
 ) -> dict[str, object]:
     event: dict[str, object] = {
         "request_id": request_id,
@@ -54,6 +55,8 @@ def _starting(
     if pid:
         event["pid"] = pid
         event["pid_start_ticks"] = pid_start_ticks
+    if quality_review_attempt is not None:
+        event["quality_review_attempt"] = quality_review_attempt
     return event
 
 
@@ -833,3 +836,238 @@ def test_launch_publishes_phased_progress_under_same_reservation(
         "reviewer_task_created",
         "isolated_launch_started",
     ]
+
+
+def test_provider_spawn_transition_persists_request_task_packet_identity(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="review-cas-1",
+            task_id="REVIEWER_CAS_1",
+            expires_at=time.time() + 120.0,
+            quality_review_attempt={
+                "target_request_id": "target-req",
+                "target_task_id": "TARGET_TASK",
+                "lens": "correctness",
+            },
+        )
+    )
+    binding = {
+        "target_request_id": "target-req",
+        "target_task_id": "TARGET_TASK",
+        "target_claim_epoch": 7,
+        "adapter_id": ADAPTER,
+        "source_workspace": {"path": "/tmp/reviewer-ws"},
+        "candidate_paths": ["candidate.py"],
+        "packet": {"packet_sha256": "c" * 64, "target": {"claim_epoch": 7}},
+        "lens": "correctness",
+    }
+
+    assert manager._reviewer_spawn_transition(
+        "review-cas-1", binding=binding
+    ) is True
+
+    committed = _latest(manager, "review-cas-1")
+    assert committed["state"] == "provider_spawn_committed"
+    assert committed["task_id"] == "REVIEWER_CAS_1"
+    assert committed["quality_review_attempt"] == {
+        "target_request_id": "target-req",
+        "target_task_id": "TARGET_TASK",
+        "lens": "correctness",
+    }
+    assert committed["packet"] == binding["packet"]
+    assert committed["target_request_id"] == "target-req"
+    assert committed["target_task_id"] == "TARGET_TASK"
+    assert committed["target_claim_epoch"] == 7
+    assert committed["owner_pid"] == os.getpid()
+    assert committed["owner_pid_start_ticks"] == (
+        process_launcher._pid_start_ticks(os.getpid())
+    )
+    # The packet binding is never rebound on re-observation of the committed phase.
+    assert manager._reviewer_spawn_transition(
+        "review-cas-1", binding={**binding, "target_claim_epoch": 99}
+    ) is True
+    assert _latest(manager, "review-cas-1")["target_claim_epoch"] == 7
+
+
+def test_provider_identity_attach_cas_is_idempotent_for_identical_identity(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="review-cas-2",
+            task_id="REVIEWER_CAS_2",
+            expires_at=time.time() + 120.0,
+        )
+    )
+    assert manager._reviewer_spawn_transition("review-cas-2", binding={}) is True
+
+    ticks = process_launcher._pid_start_ticks(os.getpid())
+    assert ticks is not None
+    assert manager._reviewer_attach_provider_identity(
+        "review-cas-2", pid=os.getpid(), pid_start_ticks=ticks
+    ) is True
+
+    committed = _latest(manager, "review-cas-2")
+    assert committed["state"] == "provider_spawn_committed"
+    assert committed["provider_pid"] == os.getpid()
+    assert committed["provider_pid_start_ticks"] == ticks
+
+    events_before = len(manager._request_events("review-cas-2"))
+    # Identical (pid, pid_start_ticks) reattachment is idempotent: no new event.
+    assert manager._reviewer_attach_provider_identity(
+        "review-cas-2", pid=os.getpid(), pid_start_ticks=ticks
+    ) is True
+    assert len(manager._request_events("review-cas-2")) == events_before
+    assert _latest(manager, "review-cas-2")["provider_pid"] == os.getpid()
+
+
+def test_provider_identity_attach_cas_loses_for_different_identity(tmp_path):
+    manager = _manager(tmp_path)
+    manager._append_event(
+        _starting(
+            request_id="review-cas-3",
+            task_id="REVIEWER_CAS_3",
+            expires_at=time.time() + 120.0,
+        )
+    )
+    assert manager._reviewer_spawn_transition("review-cas-3", binding={}) is True
+
+    ticks = process_launcher._pid_start_ticks(os.getpid())
+    assert ticks is not None
+    assert manager._reviewer_attach_provider_identity(
+        "review-cas-3", pid=os.getpid(), pid_start_ticks=ticks
+    ) is True
+
+    # A different PID identity loses the CAS and the winner stays attached.
+    assert manager._reviewer_attach_provider_identity(
+        "review-cas-3", pid=os.getpid() + 1, pid_start_ticks=ticks
+    ) is False
+    # The same PID with different start ticks is also a different identity.
+    assert manager._reviewer_attach_provider_identity(
+        "review-cas-3", pid=os.getpid(), pid_start_ticks=ticks + 1
+    ) is False
+
+    committed = _latest(manager, "review-cas-3")
+    assert committed["provider_pid"] == os.getpid()
+    assert committed["provider_pid_start_ticks"] == ticks
+
+
+def test_provider_spawn_committed_live_provider_is_never_terminalized(tmp_path):
+    manager = _manager(tmp_path)
+    # The bounded owner is proven dead, but the provider process is live with
+    # exact identity: it must never be terminalized by elapsed/quiet time.
+    manager._append_event({
+        "request_id": "review-live-1",
+        "task_id": "REVIEWER_LIVE_1",
+        "runner": RUNNER,
+        "topic": TOPIC,
+        "adapter_id": ADAPTER,
+        "state": "provider_spawn_committed",
+        "reservation_expires_at_epoch": time.time() - 1.0,
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": 1,
+        "provider_pid": os.getpid(),
+        "provider_pid_start_ticks": process_launcher._pid_start_ticks(os.getpid()),
+    })
+
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert _latest(manager, "review-live-1")["state"] == "provider_spawn_committed"
+    receipt = manager._live_reviewer_receipt("REVIEWER_LIVE_1")
+    assert receipt is not None
+    assert receipt["already_reserved"] is True
+    assert receipt["request_id"] == "review-live-1"
+    assert "review-live-1" in manager._active_request_ids()
+
+
+def test_provider_spawn_committed_dead_provider_is_terminalized_once(tmp_path):
+    manager = _manager(tmp_path)
+    # Both the owner and provider identities are proven mismatches: the
+    # reservation is terminalized exactly once with a truthful reason.
+    manager._append_event({
+        "request_id": "review-dead-1",
+        "task_id": "REVIEWER_DEAD_1",
+        "runner": RUNNER,
+        "topic": TOPIC,
+        "adapter_id": ADAPTER,
+        "state": "provider_spawn_committed",
+        "reservation_expires_at_epoch": time.time() + 120.0,
+        "owner_pid": os.getpid(),
+        "owner_pid_start_ticks": 1,
+        "provider_pid": os.getpid(),
+        "provider_pid_start_ticks": 1,
+    })
+
+    assert manager._reconcile_expired_starting_reservations() == 1
+    latest = _latest(manager, "review-dead-1")
+    assert latest["state"] == "blocked"
+    assert latest["blocked_reason"] == "provider_spawn_committed_provider_dead"
+    assert manager._reconcile_expired_starting_reservations() == 0
+    assert manager._live_reviewer_receipt("REVIEWER_DEAD_1") is None
+
+
+def test_claude_cli_and_vscode_lm_share_same_reservation_spawn_truth(tmp_path):
+    manager = _manager(tmp_path)
+    packet = {"packet_sha256": "d" * 64, "target": {"claim_epoch": 3}}
+    attempt = {
+        "target_request_id": "target-req",
+        "target_task_id": "TARGET_TASK",
+        "lens": "correctness",
+    }
+
+    # Both reviewer adapter paths flow through the identical reservation + spawn
+    # CAS, preserving their own adapter_id and the exact packet binding.
+    for request_id, task_id, adapter in (
+        ("review-claude-1", "REVIEWER_CLAUDE", "claude_cli"),
+        ("review-vscode-1", "REVIEWER_VSCODE", "vscode_lm"),
+    ):
+        manager._append_event({
+            "request_id": request_id,
+            "task_id": task_id,
+            "runner": RUNNER,
+            "topic": TOPIC,
+            "adapter_id": adapter,
+            "state": "starting",
+            "reservation_expires_at_epoch": time.time() + 120.0,
+            "quality_review_attempt": attempt,
+        })
+        assert manager._reviewer_spawn_transition(request_id, binding={
+            "target_request_id": "target-req",
+            "target_task_id": "TARGET_TASK",
+            "target_claim_epoch": 3,
+            "packet": packet,
+            "lens": "correctness",
+        }) is True
+        committed = _latest(manager, request_id)
+        assert committed["adapter_id"] == adapter
+        assert committed["packet"] == packet
+        assert committed["quality_review_attempt"] == attempt
+
+    ticks = process_launcher._pid_start_ticks(os.getpid())
+    assert ticks is not None
+    for request_id in ("review-claude-1", "review-vscode-1"):
+        assert manager._reviewer_attach_provider_identity(
+            request_id, pid=os.getpid(), pid_start_ticks=ticks
+        ) is True
+        assert _latest(manager, request_id)["provider_pid"] == os.getpid()
+
+    # A cross-adapter retry of the exact same reviewer task reconciles the same
+    # reservation (task identity, not adapter, is the shared truth).
+    manager._append_event(
+        _starting(
+            request_id="review-shared-1",
+            task_id="REVIEWER_SHARED",
+            expires_at=time.time() + 120.0,
+        )
+    )
+    receipt = manager.launch_quality_reviewer(
+        target_request_id="target-req",
+        target_task_id="TARGET_TASK",
+        reviewer_task_id="REVIEWER_SHARED",
+        runner=RUNNER,
+        adapter_id="claude_cli",
+        lens="correctness",
+    )
+    assert receipt["ok"] is True
+    assert receipt["already_reserved"] is True
+    assert receipt["request_id"] == "review-shared-1"
+    assert _starting_count(manager, "REVIEWER_SHARED") == 1
