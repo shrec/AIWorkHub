@@ -843,8 +843,82 @@ _POLYGLOT_CONTROL_NAMES = frozenset({
 })
 
 
+def _split_rust_use_body(body: str) -> list[str]:
+    """Split a Rust use-tree only at commas outside nested braces."""
+
+    rows: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(body):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return []
+        elif char == "," and depth == 0:
+            rows.append(body[start:index].strip())
+            start = index + 1
+    if depth != 0:
+        return []
+    rows.append(body[start:].strip())
+    return [row for row in rows if row]
+
+
+def _expand_rust_use_clause(clause: str, prefix: str = "") -> list[str]:
+    """Expand one balanced Rust use-tree into deterministic leaf targets."""
+
+    clause = clause.strip()
+    if not clause:
+        return []
+    opening = clause.find("{")
+    if opening < 0:
+        if clause == "self":
+            return [prefix] if prefix else []
+        return [f"{prefix}::{clause}" if prefix else clause]
+
+    depth = 0
+    closing = -1
+    for index in range(opening, len(clause)):
+        if clause[index] == "{":
+            depth += 1
+        elif clause[index] == "}":
+            depth -= 1
+            if depth == 0:
+                closing = index
+                break
+    if closing < 0 or clause[closing + 1:].strip():
+        return []
+    branch = clause[:opening].rstrip(":").strip()
+    branch_prefix = f"{prefix}::{branch}" if prefix and branch else branch or prefix
+    items = _split_rust_use_body(clause[opening + 1:closing])
+    if not items:
+        return []
+    leaves: list[str] = []
+    for item in items:
+        leaves.extend(_expand_rust_use_clause(item, branch_prefix))
+    return leaves
+
+
+def _rust_imports(text: str) -> list[tuple[str, int, str]]:
+    """Extract balanced Rust use-trees, visibility prefixes and aliases."""
+
+    rows: list[tuple[str, int, str]] = []
+    pattern = re.compile(
+        r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);"
+    )
+    for match in pattern.finditer(text):
+        signature = " ".join(match.group(0).split())[:500]
+        for target in _expand_rust_use_clause(match.group(1)):
+            rows.append((target, match.start(), signature))
+    return rows
+
+
 def _polyglot_imports(language: str, text: str) -> list[tuple[str, int, str]]:
     """Return directly observed import target, offset and signature."""
+
+    if language == "rust":
+        return _rust_imports(text)
 
     patterns: dict[str, tuple[re.Pattern[str], ...]] = {
         "javascript": (
@@ -855,7 +929,6 @@ def _polyglot_imports(language: str, text: str) -> list[tuple[str, int, str]]:
             re.compile(r"(?m)^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]"),
             re.compile(r"(?m)^\s*import\s+['\"]([^'\"]+)['\"]"),
         ),
-        "rust": (re.compile(r"(?m)^\s*use\s+([A-Za-z_][\w:]*)"),),
         "go": (re.compile(r"(?m)^\s*(?:import\s+)?(?:[A-Za-z_.]\w*\s+)?\"([\w./-]+)\""),),
         "java": (re.compile(r"(?m)^\s*import\s+(?:static\s+)?([\w.]+)\s*;"),),
         "csharp": (re.compile(r"(?m)^\s*using\s+(?:static\s+)?([\w.]+)\s*;"),),
@@ -1063,7 +1136,7 @@ def _extract_polyglot_lexical(
     for pattern in _polyglot_function_patterns(language):
         for match in pattern.finditer(masked):
             name = match.group("name")
-            if name in _POLYGLOT_CONTROL_NAMES:
+            if language != "rust" and name in _POLYGLOT_CONTROL_NAMES:
                 continue
             identity = (match.start(), name)
             if identity in seen_functions:
