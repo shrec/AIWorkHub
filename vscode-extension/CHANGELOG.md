@@ -1,5 +1,16 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.62 — 2026-08-14
+
+### Fixed
+
+- Bind reviewer-spawn ownership to an exact PID/start-ticks compare-and-swap so
+  a recycled process identity is never accepted as the live reviewer launch.
+- Recover lost-ack and extension-host reload handoff idempotently without
+  leaking a reservation or double-launching a reviewer.
+- Terminalize live providers only on process/terminal evidence, never on
+  elapsed or quiet time.
+
 ## 0.9.61 — 2026-08-14
 
 ### Fixed

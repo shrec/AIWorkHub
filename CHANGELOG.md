@@ -6,6 +6,23 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.62] - 2026-08-14
+
+### Fixed
+
+- Bind reviewer-spawn ownership to an exact PID/start-ticks compare-and-swap so
+  a recycled or stale process identity is never accepted as the live reviewer
+  launch.
+- Recover lost-ack and extension-host reload handoff for reviewer spawns with
+  idempotent re-binding instead of leaking a reservation or double-launching.
+- Terminalize live providers only on process/terminal evidence; elapsed or
+  quiet time alone never kills a running model.
+
+### Validation
+
+- Release metadata check for v0.9.62 passes; extension and release-metadata
+  suites pass.
+
 ## [0.9.61] - 2026-08-14
 
 ### Fixed

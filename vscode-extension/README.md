@@ -12,21 +12,15 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.61
+## What's new in 0.9.62
 
-- Reviewer packet preparation now publishes bounded progress phases and no
-  longer makes exact status reads wait behind a silent pid-null reservation.
-- A wedged pre-provider packet build terminalizes all single-flight waiters
-  truthfully; live model processes remain governed by provider/process terminal
-  evidence rather than elapsed time.
-- Concurrent correctness, security and code-quality reviews still reuse one
-  immutable target packet while retaining distinct launch identities.
-
-- Malformed empty-string/non-object MCP parameters are rejected before
-  dispatch with a bounded redacted protocol alert.
-- Valid empty-object calls and parallel healthy clients remain serviceable.
-- Repository-owned sideband sockets remain portable under long retained
-  workspace paths without falling back to global system temp directories.
+- Reviewer spawn ownership is bound by an exact PID/start-ticks
+  compare-and-swap, so a recycled or stale process identity can never stand in
+  for the live reviewer launch.
+- Lost acknowledgements and extension-host reloads recover the spawn handoff
+  idempotently without leaking a reservation or double-launching.
+- Live model providers are terminalized only by process/terminal evidence;
+  elapsed or quiet time alone never kills a running provider.
 
 See the packaged **Changelog** for the complete release summary.
 
