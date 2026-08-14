@@ -6,6 +6,20 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.56] - 2026-08-14
+
+### Fixed
+
+- Fail closed on empty relative Python import module targets instead of
+  calling `Path.with_suffix()` on `/` and aborting the entire Source Graph
+  refresh before canonical generation publication.
+
+### Validation
+
+- Source Graph regression suite passes: 106 passed.
+- A repository-sized private full-index build exercises the repaired resolver
+  without touching the canonical generation.
+
 ## [0.9.55] - 2026-08-14
 
 ### Fixed

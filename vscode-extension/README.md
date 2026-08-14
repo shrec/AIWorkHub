@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.55
+## What's new in 0.9.56
 
-- Slow provider, reviewer and finalization calls no longer monopolize the MCP
-  event loop or block independent bootstrap, status and dashboard requests.
-- Fallback stdio dispatch is bounded, host-adaptive and exactly correlated by
-  JSON-RPC request ID, allowing independent clients to progress concurrently.
+- Source Graph refresh no longer aborts when a relative Python import has an
+  empty module component after exact symbol normalization.
+- Failed import disambiguation remains unresolved and fail-closed instead of
+  preventing a new canonical generation from being built.
 
 See the packaged **Changelog** for the complete release summary.
 

@@ -1,5 +1,12 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.56 — 2026-08-14
+
+### Fixed
+
+- Prevent an empty relative Python import module from aborting Source Graph
+  refresh with `PosixPath('/') has an empty name` before publication.
+
 ## 0.9.55 — 2026-08-14
 
 ### Fixed
