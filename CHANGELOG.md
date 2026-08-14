@@ -6,6 +6,22 @@ noted by package/extension version and release tag.
 
 ## [Unreleased]
 
+## [0.9.55] - 2026-08-14
+
+### Fixed
+
+- Run synchronous FastMCP tools outside the SDK event loop so slow provider,
+  reviewer and finalization calls no longer block bootstrap, status or dashboard
+  requests on the shared MCP runtime.
+- Dispatch fallback stdio JSON-RPC requests through a bounded adaptive worker
+  pool while preserving exact request-id correlation and serialized writes.
+
+### Validation
+
+- MCP server, runtime wiring, schema, lifecycle serialization, app-server mux
+  and control-plane concurrency regressions pass: 75 passed.
+- Changed-file Ruff and whitespace validation pass.
+
 ## [0.9.54] - 2026-08-14
 
 ### Fixed

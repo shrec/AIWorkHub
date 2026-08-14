@@ -12,12 +12,12 @@ The extension opens as a retained editor tab and runs one repository-scoped
 MCP stdio runtime on the workspace host. It does not open a browser, bind a
 port, expose a LAN service or require an AIWorkHub cloud account.
 
-## What's new in 0.9.54
+## What's new in 0.9.55
 
-- Fresh authenticated Source Graph zero-hit queries now count as real worker
-  invocations while evidence usefulness remains separately observable.
-- Concurrent Codex app-server sideband requests retain exact child/response
-  correlation, including late-response isolation and duplicate coalescing.
+- Slow provider, reviewer and finalization calls no longer monopolize the MCP
+  event loop or block independent bootstrap, status and dashboard requests.
+- Fallback stdio dispatch is bounded, host-adaptive and exactly correlated by
+  JSON-RPC request ID, allowing independent clients to progress concurrently.
 
 See the packaged **Changelog** for the complete release summary.
 

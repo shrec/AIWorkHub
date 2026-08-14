@@ -1,5 +1,14 @@
 # AIWorkHub for VS Code — Changelog
 
+## 0.9.55 — 2026-08-14
+
+### Fixed
+
+- Keep bootstrap, status and dashboard calls responsive while long-running
+  provider, reviewer or finalization tools execute on the shared MCP runtime.
+- Correlate concurrent fallback stdio responses by exact JSON-RPC request ID
+  with bounded host-adaptive dispatch and serialized output writes.
+
 ## 0.9.54 — 2026-08-14
 
 ### Fixed
