@@ -41,6 +41,13 @@ node_modules/
 /docs/AUDIT_2026-08-03.md
 /docs/LIVE_BUG_BACKLOG_2026-08-03.md
 
+# Local manager instructions and generated design drafts.
+/AGENTS.md
+/kilo.json
+/docs/assets/aiworkhub-architecture.png
+/docs/assets/aiworkhub-architecture.svg
+/docs/launch/AIWORKHUB_VIDEO_SCRIPT_3MIN_KA.md
+
 # Legacy local release/task evidence; canonical tracked eval fixtures remain visible.
 /eval/aiworkhub_local_release_*.json
 /eval/aiworkhub_p0_context_lifecycle_gap_*.json
