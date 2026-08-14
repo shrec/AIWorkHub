@@ -54,13 +54,9 @@ def test_completion_gate_requires_every_requested_aiworkhub_surface(monkeypatch)
     assert result["reason"] == "required_aiworkhub_mcp_calls_missing:kb"
 
 
-def test_completion_gate_rejects_zero_hit_source_graph_for_code_tasks(monkeypatch) -> None:
-    """B834 + B950: a source_graph call that was successful (canonical) but
-    cached / zero-hit (``live_source_graph_calls == 0``) is still fail-closed
-    (B834 -- ``satisfied is False``), but it must NOT be reported as a bare
-    ``missing:source_graph`` while the same evidence's
-    ``successful_call_count_by_tool.source_graph`` reads > 0 (the B950
-    self-contradiction). It is reported as ``stale_or_cached`` instead."""
+def test_completion_gate_rejects_cache_only_source_graph_for_code_tasks(monkeypatch) -> None:
+    """A successful ledger entry that is not a fresh live invocation remains
+    fail-closed and is reported consistently as stale/cached, not missing."""
     monkeypatch.setattr(
         process_launcher.worker_ai_tools_mcp,
         "verify_audit_ledger",

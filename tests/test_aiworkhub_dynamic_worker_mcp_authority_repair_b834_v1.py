@@ -639,10 +639,10 @@ def test_declared_input_fallback_rejects_symlink(
 
 
 # ---------------------------------------------------------------------------
-# Live-call gate: zero-hit and cache-hit calls must NOT satisfy it
+# Live-call gate: fresh zero-hit calls count; cache replays do not
 # ---------------------------------------------------------------------------
 
-def test_zero_hit_call_does_not_satisfy_the_live_call_gate(
+def test_zero_hit_call_counts_as_live_invocation_truth(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     _mute_chmod(monkeypatch)
@@ -663,9 +663,9 @@ def test_zero_hit_call_does_not_satisfy_the_live_call_gate(
         ctx.audit_ledger_path, ctx.audit_hmac_key_path,
         task_id=ctx.task_id, runner=ctx.runner, topic=ctx.topic, request_id="req1",
     )
-    # Exactly one live call recorded (the first, non-empty one); the zero-hit
-    # call must not count even though it was ok=true and not cached.
-    assert verification["live_source_graph_calls"] == 1
+    # Both authenticated fresh calls are live invocations.  Their evidence
+    # usefulness remains distinct in hit_count and zero_hit_calls.
+    assert verification["live_source_graph_calls"] == 2
     assert verification["fresh_source_graph_calls"] == 2
     assert verification["source_graph_zero_hit_calls"] == 1
     assert verification["source_graph_failed_calls"] == 0

@@ -231,6 +231,43 @@ def test_no_injection_but_live_calls_pass(tmp_path, monkeypatch):
     assert gate["satisfaction_by_tool"]["session_current_state"] == "live_worker_call"
 
 
+def test_fresh_zero_hit_source_graph_call_satisfies_invocation_gate(
+    tmp_path,
+    monkeypatch,
+):
+    """NF184: evidence usefulness must not erase authenticated invocation truth."""
+    monkeypatch.setattr(
+        pl.worker_ai_tools_mcp,
+        "verify_audit_ledger",
+        lambda *_a, **_k: {
+            "ok": True,
+            "live_source_graph_calls": 1,
+            "fresh_source_graph_calls": 1,
+            "source_graph_hit_count": 0,
+            "source_graph_zero_hit_calls": 1,
+            "successful_call_count_by_tool": {"source_graph": 1},
+            "policy_violations": 0,
+            "reason": "",
+        },
+    )
+    stdout = tmp_path / "zero-hit-worker.log"
+    stdout.write_text("authenticated worker call\n", encoding="utf-8")
+    metadata = _metadata(
+        tmp_path,
+        bundle_sha=_sha(),
+        sections=_sections(("source_graph", False, 0, "")),
+        stdout=stdout,
+    )
+
+    gate = pl._worker_mcp_live_call_gate(metadata, "req")
+
+    assert gate["satisfied"] is True
+    assert gate["missing_tools"] == []
+    assert gate["stale_tools"] == []
+    assert gate["satisfaction_by_tool"]["source_graph"] == "live_worker_call"
+    assert gate["verification"]["source_graph_zero_hit_calls"] == 1
+
+
 def test_live_calls_with_denied_request_recover_as_policy_warning(tmp_path, monkeypatch):
     _patch_verify(monkeypatch, live_source_graph=1, policy_violations=1)
     stdout = tmp_path / "worker.log"

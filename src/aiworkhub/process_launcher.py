@@ -2906,14 +2906,12 @@ def _worker_mcp_live_call_gate(metadata: dict[str, Any], request_id: str) -> dic
     satisfaction_by_tool: dict[str, str] = {}
     missing: list[str] = []
     stale: list[str] = []
-    # Source Graph freshness (B834) is unchanged: ONLY a live fresh non-empty
-    # canonical call OR a verified-injected, non-degraded source_graph section
-    # SATISFIES the gate -- never a cached/empty call and never an unverified
-    # injection. But a source_graph that WAS called successfully yet returned
-    # cached/zero-hit is NOT absent: it is reported as "stale_or_cached" (a
-    # distinct, still-fail-closed reason) rather than a bare "missing", so the
-    # terminal evidence can never say "missing:source_graph" while that same
-    # evidence's successful_call_count_by_tool.source_graph reads > 0 (B950).
+    # Source Graph freshness is invocation truth: an authenticated, successful,
+    # non-cached authoritative call satisfies continuous use even when the
+    # bounded query returns zero rows.  Result adequacy stays observable through
+    # hit_count/zero_hit_calls and may guide re-query/review, but it must not be
+    # rewritten into "the tool was never called".  Cached-only, failed,
+    # non-authoritative and unverified activity remains fail-closed.
     if verification.get("live_source_graph_calls", 0) > 0:
         satisfaction_by_tool["source_graph"] = "live_worker_call"
     elif injected_acknowledged and "source_graph" in injected_tools:

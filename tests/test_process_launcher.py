@@ -3006,9 +3006,9 @@ def test_rework_overlay_not_live_when_cache_hit(tmp_path: Path) -> None:
     assert result["fresh_source_graph_calls"] == 0
 
 
-def test_rework_overlay_not_live_when_zero_hits(tmp_path: Path) -> None:
-    """A fresh but zero-hit rework_overlay call is fresh telemetry but not
-    live -- the gate requires at least one result row."""
+def test_rework_overlay_zero_hit_is_still_a_live_invocation(tmp_path: Path) -> None:
+    """A fresh authenticated zero-hit overlay call is live invocation truth;
+    evidence usefulness remains visible in the zero-hit counters."""
     key = os.urandom(32)
     key_path = tmp_path / "audit.key"
     key_path.write_bytes(key)
@@ -3028,8 +3028,9 @@ def test_rework_overlay_not_live_when_zero_hits(tmp_path: Path) -> None:
         request_id="req-nf129",
     )
     assert result["ok"] is True
-    assert result["live_source_graph_calls"] == 0
+    assert result["live_source_graph_calls"] == 1
     assert result["fresh_source_graph_calls"] == 1
+    assert result["source_graph_zero_hit_calls"] == 1
 
 
 def test_rework_overlay_authority_label_remains_distinct(tmp_path: Path) -> None:

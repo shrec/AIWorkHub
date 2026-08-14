@@ -1509,8 +1509,9 @@ def verify_audit_ledger(
             and authority_state == "request_scoped_predecessor"
         )
         # A fresh call is real tool-use telemetry even when its bounded query
-        # returns zero rows.  Keep it distinct from the non-empty "live" count
-        # used by the fail-closed completion gate.
+        # returns zero rows.  Result usefulness is reported independently by
+        # source_graph_hit_count/source_graph_zero_hit_calls; it must not be
+        # confused with whether the authenticated invocation happened.
         if (
             tool == "source_graph"
             and entry.get("ok")
@@ -1519,17 +1520,15 @@ def verify_audit_ledger(
             and authoritative_source_graph
         ):
             result["fresh_source_graph_calls"] += 1
-        # A "live" source_graph call must be a genuinely fresh, non-empty,
-        # successful authoritative lookup -- a cache hit or a zero-hit
-        # response is real telemetry but must NOT satisfy the completion
-        # gate merely because ``ok`` happens to be true (B834: previously any
-        # ok=True source_graph entry counted, including empty/cached ones).
+        # "Live" means a genuinely fresh, successful authoritative invocation.
+        # A zero-hit result is still a real live call; query usefulness remains
+        # visible through the separate hit/zero-hit counters.  Cache replays,
+        # denied calls, failures and non-authoritative sources never count.
         if (
             tool == "source_graph"
             and entry.get("ok")
             and not entry.get("violation")
             and not entry.get("cache_hit")
-            and int(entry.get("hit_count") or 0) > 0
             and authoritative_source_graph
         ):
             result["live_source_graph_calls"] += 1
